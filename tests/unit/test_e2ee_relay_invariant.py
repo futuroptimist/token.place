@@ -252,7 +252,7 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog
     assert _to_text(sink_response.get_json()).find(E2EE_SENTINEL_LOGS) == -1
 
 
-@pytest.mark.parametrize("field_name", ["messages", "prompt", "content", "response", "text"])
+@pytest.mark.parametrize("field_name", ["messages", "prompt", "input", "content", "response", "text"])
 def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client, field_name):
     relay.known_servers["server-key"] = {
         "public_key": "server-key",

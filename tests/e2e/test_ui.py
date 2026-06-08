@@ -22,6 +22,10 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 0QIDAQAB
 -----END PUBLIC KEY-----"""
 SERVER_PUBLIC_KEY_B64 = base64.b64encode(SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
+ALT_SERVER_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
+alt-test-public-key
+-----END PUBLIC KEY-----"""
+ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
 
 
 def patch_landing_crypto_for_visible_envelopes(page: Page):
@@ -43,12 +47,15 @@ def route_landing_relay_chat(
     assistant_content: str = "Relay chat path restored.",
     models_payload: dict | None = None,
     next_status: int = 200,
+    next_server_keys: list[str] | None = None,
+    request_statuses: list[int] | None = None,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
         "next_calls": 0,
         "relay_requests": [],
         "retrieve_requests": [],
+        "cancel_requests": [],
         "chat_completions": [],
         "v2_requests": [],
     }
@@ -82,10 +89,12 @@ def route_landing_relay_chat(
                 body=json.dumps({"error": {"code": "no_registered_compute_nodes"}}),
             )
             return
+        server_keys = next_server_keys or [SERVER_PUBLIC_KEY_B64]
+        selected_index = min(state["next_calls"] - 1, len(server_keys) - 1)
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"server_public_key": SERVER_PUBLIC_KEY_B64}),
+            body=json.dumps({"server_public_key": server_keys[selected_index]}),
         )
 
     page.route("**/api/v1/relay/servers/next", handle_next)
@@ -93,10 +102,14 @@ def route_landing_relay_chat(
     def handle_request(route):
         payload = route.request.post_data_json
         state["relay_requests"].append(payload)
+        status = 200
+        if request_statuses:
+            status = request_statuses[min(len(state["relay_requests"]) - 1, len(request_statuses) - 1)]
+        body = {"message": "Request received"} if status == 200 else {"error": {"code": "server_unavailable"}}
         route.fulfill(
-            status=200,
+            status=status,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"message": "Request received"}),
+            body=json.dumps(body),
         )
 
     page.route("**/api/v1/relay/requests", handle_request)
@@ -118,14 +131,10 @@ def route_landing_relay_chat(
                             "request_id": request_id,
                             "client_public_key": client_public_key,
                             "api_v1_response": {
-                                "choices": [
-                                    {
-                                        "message": {
-                                            "role": "assistant",
-                                            "content": assistant_content,
-                                        }
-                                    }
-                                ]
+                                "message": {
+                                    "role": "assistant",
+                                    "content": assistant_content,
+                                }
                             },
                         }
                     ),
@@ -136,6 +145,13 @@ def route_landing_relay_chat(
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
+    page.route(
+        "**/api/v1/relay/requests/cancel",
+        lambda route: (
+            state["cancel_requests"].append(route.request.post_data_json),
+            route.fulfill(status=200, headers={"Content-Type": "application/json"}, body=json.dumps({"status": "cancelled"})),
+        ),
+    )
     page.route(
         "**/api/v1/chat/completions",
         lambda route: (
@@ -494,11 +510,52 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     assert len(state["relay_requests"]) == 2
     assert {payload["server_public_key"] for payload in state["relay_requests"]} == {SERVER_PUBLIC_KEY_B64}
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
-    assert [envelope["api_v1_request"]["messages"][0]["content"] for envelope in envelopes] == [
-        "first turn",
-        "second turn",
+    assert envelopes[0]["api_v1_request"]["messages"] == [{"role": "user", "content": "first turn"}]
+    assert envelopes[1]["api_v1_request"]["messages"] == [
+        {"role": "user", "content": "first turn"},
+        {"role": "assistant", "content": "Sticky relay response."},
+        {"role": "user", "content": "second turn"},
     ]
     assert all(envelope["api_v1_request"]["model"] == "llama-3-8b-instruct" for envelope in envelopes)
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_reselects_server_after_terminal_dispatch_error(page: Page, base_url: str, setup_servers):
+    """A 404/410 dispatch clears sticky affinity so the next turn can choose a replacement."""
+
+    state = route_landing_relay_chat(
+        page,
+        assistant_content="Replacement server answered.",
+        next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        request_statuses=[404, 200],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    textarea = page.locator("textarea").first
+    textarea.fill("first attempt")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").last.wait_for(state="visible")
+    assert "Please try again to select another server." in page.locator(".assistant-message").last.inner_text()
+
+    textarea.fill("second attempt")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function(
+        """
+        () => Array.from(document.querySelectorAll('.assistant-message'))
+            .some((node) => node.textContent.includes('Replacement server answered.'))
+        """
+    )
+
+    assert state["next_calls"] == 2
+    assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
+        SERVER_PUBLIC_KEY_B64,
+        ALT_SERVER_PUBLIC_KEY_B64,
+    ]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -607,7 +664,7 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
                             "version": 1,
                             "request_id": route.request.post_data_json["request_id"],
                             "client_public_key": route.request.post_data_json["client_public_key"],
-                            "api_v1_response": {"choices": [{"message": {"role": "assistant", "content": "Fallback model acknowledged."}}]},
+                            "api_v1_response": {"message": {"role": "assistant", "content": "Fallback model acknowledged."}},
                         }
                     ),
                     "cipherkey": "test-cipherkey",

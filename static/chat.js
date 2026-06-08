@@ -1,6 +1,7 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
+const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
@@ -83,9 +84,6 @@ new Vue({
         },
         hasClientKeypair() {
             return Boolean(this.clientPrivateKey && this.clientPublicKey);
-        },
-        hasSelectedServerPublicKey() {
-            return Boolean(this.selectedServerPublicKey && this.selectedServerPublicKeyB64);
         },
         canSendMessage() {
             return Boolean(
@@ -293,6 +291,34 @@ new Vue({
                 }
             }
             return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        },
+
+        clearSelectedServer() {
+            this.selectedServerPublicKey = null;
+            this.selectedServerPublicKeyB64 = null;
+            this.serverPublicKey = null;
+            this.selectedServerKeyLabel = '';
+        },
+
+        createApiV1Messages(messageContent) {
+            const messages = Array.isArray(this.chatHistory)
+                ? this.chatHistory
+                    .filter((entry) => entry && (entry.role === 'user' || entry.role === 'assistant'))
+                    .map((entry) => ({
+                        role: entry.role,
+                        content: typeof entry.content === 'string' ? entry.content : this.getDisplayContent(entry)
+                    }))
+                    .filter((entry) => typeof entry.content === 'string' && entry.content.trim())
+                : [];
+
+            const latest = messages.length > 0 ? messages[messages.length - 1] : null;
+            if (!latest || latest.role !== 'user' || latest.content !== messageContent) {
+                messages.push({
+                    role: 'user',
+                    content: messageContent
+                });
+            }
+            return messages;
         },
 
         generateClientKeys() {
@@ -584,8 +610,31 @@ new Vue({
             return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
-        async retrieveRelayResponse(clientPublicKeyB64, requestId) {
-            const timeoutMs = 30000;
+        async cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken) {
+            if (!clientPublicKeyB64 || !requestId || !cancelToken) {
+                return;
+            }
+            try {
+                await fetch('/api/v1/relay/requests/cancel', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        client_public_key: clientPublicKeyB64,
+                        request_id: requestId,
+                        cancel_token: cancelToken,
+                        status: 'cancelled',
+                        reason: 'client_timeout'
+                    })
+                });
+            } catch (error) {
+                console.warn('Unable to cancel timed-out API v1 relay request:', error);
+            }
+        },
+
+        async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
+            const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
             const pollIntervalMs = 500;
             const deadline = Date.now() + timeoutMs;
 
@@ -617,9 +666,10 @@ new Vue({
                 return response.json();
             }
 
+            await this.cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken);
             return {
                 error: {
-                    userMessage: 'The LLM server took too long to respond. Please start a new chat session and try again.'
+                    userMessage: 'The LLM server took too long to respond. Please try again.'
                 }
             };
         },
@@ -637,6 +687,7 @@ new Vue({
             }
 
             const requestId = this.createRequestId();
+            const cancelToken = this.createRequestId();
             const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
             const plaintextEnvelope = {
                 protocol: 'tokenplace_api_v1_relay_e2ee',
@@ -645,12 +696,7 @@ new Vue({
                 client_public_key: clientPublicKeyB64,
                 api_v1_request: {
                     model: this.selectedModelId,
-                    messages: [
-                        {
-                            role: 'user',
-                            content: messageContent
-                        }
-                    ],
+                    messages: this.createApiV1Messages(messageContent),
                     options: {}
                 }
             };
@@ -673,7 +719,8 @@ new Vue({
                     version: 1,
                     ciphertext: encryptedData.ciphertext,
                     cipherkey: encryptedData.cipherkey,
-                    iv: encryptedData.iv
+                    iv: encryptedData.iv,
+                    cancel_token: cancelToken
                 };
 
                 const dispatchResponse = await fetch('/api/v1/relay/requests', {
@@ -692,16 +739,19 @@ new Vue({
                         errorData = null;
                     }
                     const unavailable = dispatchResponse.status === 404 || dispatchResponse.status === 410;
+                    if (unavailable) {
+                        this.clearSelectedServer();
+                    }
                     return {
                         error: {
                             userMessage: unavailable
-                                ? 'The selected LLM server is unavailable. Please start a new chat session before trying another server.'
+                                ? 'The selected LLM server is unavailable. Please try again to select another server.'
                                 : this.getUserFacingApiError(errorData)
                         }
                     };
                 }
 
-                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId);
+                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
                 if (encryptedResponse && encryptedResponse.error) {
                     return encryptedResponse;
                 }
@@ -839,6 +889,13 @@ new Vue({
                         });
                     }
                     // For API response, extract last message
+                    else if (response.message && typeof response.message === 'object') {
+                        const assistantMessage = response.message;
+                        if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
+                            throw new Error('invalid_assistant_response_content');
+                        }
+                        this.appendAssistantMessage(assistantMessage);
+                    }
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {

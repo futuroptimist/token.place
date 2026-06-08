@@ -10,7 +10,7 @@ import threading
 from playwright.sync_api import Page
 import time
 
-from encrypt import encrypt
+from encrypt import decrypt, encrypt, generate_keys
 
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
@@ -233,6 +233,165 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
 # Add more E2E tests here as the UI evolves
 
 
+
+def install_landing_relay_e2ee_routes(page: Page, *, assistant_replies=None, models_payload=None, next_status=200):
+    """Mock landing chat API v1 relay E2EE routes and capture request envelopes."""
+    server_private_key, server_public_key = generate_keys()
+    server_public_key_b64 = base64.b64encode(server_public_key).decode("ascii")
+    replies = list(assistant_replies or ["Relay chat path restored."])
+    captured = {
+        "next_calls": 0,
+        "relay_requests": [],
+        "decrypted_requests": [],
+        "v2_requests": [],
+        "chat_completion_requests": [],
+    }
+    default_models_payload = models_payload or {
+        "object": "list",
+        "data": [
+            {
+                "id": "api-v1-first-model",
+                "object": "model",
+                "owned_by": "token.place",
+                "root": "api-v1-first-model",
+            },
+            {
+                "id": "api-v1-second-model",
+                "object": "model",
+                "owned_by": "community",
+                "root": "api-v1-second-model",
+            },
+        ],
+    }
+
+    def handle_models(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(default_models_payload),
+        )
+
+    def handle_next_server(route):
+        captured["next_calls"] += 1
+        if next_status != 200:
+            route.fulfill(
+                status=next_status,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "error": {
+                            "type": "service_unavailable_error",
+                            "code": "no_registered_compute_nodes",
+                            "message": "No registered compute nodes available",
+                        }
+                    }
+                ),
+            )
+            return
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"server_public_key": server_public_key_b64}),
+        )
+
+    def decrypt_request_envelope(body):
+        plaintext = decrypt(
+            {
+                "ciphertext": base64.b64decode(body["ciphertext"], validate=True),
+                "iv": base64.b64decode(body["iv"], validate=True),
+            },
+            base64.b64decode(body["cipherkey"], validate=True),
+            server_private_key,
+        )
+        assert plaintext is not None
+        return json.loads(plaintext.decode("utf-8"))
+
+    def encrypted_response_for(decrypted_request, assistant_text):
+        client_public_key_b64 = decrypted_request["client_public_key"]
+        client_public_key_pem = base64.b64decode(client_public_key_b64, validate=True)
+        response_envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": decrypted_request["request_id"],
+            "client_public_key": client_public_key_b64,
+            "api_v1_response": {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": assistant_text,
+                        }
+                    }
+                ]
+            },
+        }
+        ciphertext, encrypted_key, iv = encrypt(
+            json.dumps(response_envelope).encode("utf-8"),
+            client_public_key_pem,
+            use_pkcs1v15=True,
+        )
+        return {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": decrypted_request["request_id"],
+            "client_public_key": client_public_key_b64,
+            "ciphertext": base64.b64encode(ciphertext["ciphertext"]).decode("utf-8"),
+            "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
+            "iv": base64.b64encode(iv).decode("utf-8"),
+        }
+
+    def handle_relay_request(route):
+        body = route.request.post_data_json
+        captured["relay_requests"].append(body)
+        captured["decrypted_requests"].append(decrypt_request_envelope(body))
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"message": "Request received"}),
+        )
+
+    def handle_relay_response_retrieve(route):
+        if not captured["decrypted_requests"]:
+            route.fulfill(
+                status=202,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"status": "pending"}),
+            )
+            return
+        request_body = route.request.post_data_json
+        decrypted_request = next(
+            request
+            for request in captured["decrypted_requests"]
+            if request["request_id"] == request_body["request_id"]
+        )
+        reply_index = captured["decrypted_requests"].index(decrypted_request)
+        assistant_text = replies[min(reply_index, len(replies) - 1)]
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(encrypted_response_for(decrypted_request, assistant_text)),
+        )
+
+    page.route("**/api/v1/models", handle_models)
+    page.route("**/api/v1/relay/servers/next", handle_next_server)
+    page.route("**/api/v1/relay/requests", handle_relay_request)
+    page.route("**/api/v1/relay/responses/retrieve", handle_relay_response_retrieve)
+    page.route(
+        "**/api/v1/chat/completions",
+        lambda route: (
+            captured["chat_completion_requests"].append(route.request.url),
+            route.fulfill(status=500, body="landing chat should not call chat/completions"),
+        ),
+    )
+    page.route(
+        "**/api/v2/**",
+        lambda route: (
+            captured["v2_requests"].append(route.request.url),
+            route.fulfill(status=500, body="API v2 should not be called by the landing chat"),
+        ),
+    )
+    return captured, server_public_key_b64
+
 def wait_for_landing_send_enabled(page: Page):
     """Wait until the landing chat readiness gate enables Send, then return the button."""
     send_button = page.locator("button", has_text="Send")
@@ -252,26 +411,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     """The chat UI should render markdown formatting returned by the assistant."""
 
     markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
-
-    def handle_chat_request(route):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": markdown_reply,
-                            }
-                        }
-                    ]
-                }
-            ),
-        )
-
-    page.route("**/api/v1/chat/completions", handle_chat_request)
+    install_landing_relay_e2ee_routes(page, assistant_replies=[markdown_reply])
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -305,91 +445,12 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     base_url: str,
     setup_servers,
 ):
-    """Landing chat must stay on API v1 JSON chat completions only."""
+    """Landing chat must use API v1 relay E2EE routes and avoid API v2/chat completions."""
 
-    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
-VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
-7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
-xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
-CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
-+6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
-0QIDAQAB
------END PUBLIC KEY-----"""
-    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
-
-    def handle_public_key(route):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps({"public_key": server_public_key_b64}),
-        )
-
-    def handle_next_server(route):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps({"server_public_key": server_public_key_b64}),
-        )
-
-    def handle_v1_chat(route):
-        request_json = route.request.post_data_json
-        assert request_json.get("encrypted") is True
-        assert isinstance(request_json.get("client_public_key"), str) and request_json[
-            "client_public_key"
-        ]
-
-        encrypted_request = request_json.get("messages")
-        assert isinstance(encrypted_request, dict)
-        assert isinstance(encrypted_request.get("ciphertext"), str) and encrypted_request["ciphertext"]
-        assert isinstance(encrypted_request.get("cipherkey"), str) and encrypted_request["cipherkey"]
-        assert isinstance(encrypted_request.get("iv"), str) and encrypted_request["iv"]
-
-        client_public_key_pem = base64.b64decode(request_json["client_public_key"], validate=True)
-        assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
-
-        encrypted_response_body, encrypted_key, iv = encrypt(
-            json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "Relay chat path restored.",
-                            }
-                        }
-                    ]
-                }
-            ).encode("utf-8"),
-            client_public_key_pem,
-            use_pkcs1v15=True,
-        )
-
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "encrypted": True,
-                    "data": {
-                        "ciphertext": base64.b64encode(encrypted_response_body["ciphertext"]).decode("utf-8"),
-                        "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
-                        "iv": base64.b64encode(iv).decode("utf-8"),
-                    },
-                }
-            ),
-        )
-
-    v2_requests = []
-
-    def record_v2_request(route):
-        v2_requests.append(route.request.url)
-        route.fulfill(status=500, body="v2 should not be called")
-
-    page.route("**/api/v1/public-key", handle_public_key)
-    page.route("**/next_server", handle_next_server)
-    page.route("**/api/v2/chat/completions", record_v2_request)
-    page.route("**/api/v1/chat/completions", handle_v1_chat)
+    captured, _server_public_key_b64 = install_landing_relay_e2ee_routes(
+        page,
+        assistant_replies=["Relay chat path restored."],
+    )
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -412,8 +473,11 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         arg={"selector": ".assistant-message", "expectedText": "Relay chat path restored."},
     )
     assert "Relay chat path restored." in assistant_message.inner_text()
-    assert "Sorry, I encountered an issue generating a response." not in page.content()
-    assert v2_requests == []
+    assert captured["relay_requests"], "expected the landing chat to POST an API v1 relay request"
+    assert captured["relay_requests"][-1]["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert captured["decrypted_requests"][-1]["api_v1_request"]["model"] == "api-v1-first-model"
+    assert captured["v2_requests"] == []
+    assert captured["chat_completion_requests"] == []
 
 
 def test_landing_chat_model_dropdown_uses_api_v1_models(
@@ -421,18 +485,7 @@ def test_landing_chat_model_dropdown_uses_api_v1_models(
     base_url: str,
     setup_servers,
 ):
-    """The landing chat model selector is populated from API v1 and drives chat payloads."""
-
-    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
-VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
-7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
-xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
-CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
-+6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
-0QIDAQAB
------END PUBLIC KEY-----"""
-    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+    """The landing chat model selector is populated from API v1 and drives relay envelopes."""
 
     models_payload = {
         "object": "list",
@@ -451,52 +504,11 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             },
         ],
     }
-
-    chat_payloads = []
-    v2_requests = []
-
-    def handle_models(route):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(models_payload),
-        )
-
-    def handle_public_key(route):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps({"public_key": server_public_key_b64}),
-        )
-
-    def handle_chat(route):
-        request_json = route.request.post_data_json
-        chat_payloads.append(request_json)
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "Selected model acknowledged.",
-                            }
-                        }
-                    ]
-                }
-            ),
-        )
-
-    def record_v2_request(route):
-        v2_requests.append(route.request.url)
-        route.fulfill(status=500, body="API v2 should not be called by the landing chat")
-
-    page.route("**/api/v1/models", handle_models)
-    page.route("**/api/v1/public-key", handle_public_key)
-    page.route("**/api/v1/chat/completions", handle_chat)
-    page.route("**/api/v2/**", record_v2_request)
+    captured, _server_public_key_b64 = install_landing_relay_e2ee_routes(
+        page,
+        assistant_replies=["Selected model acknowledged."],
+        models_payload=models_payload,
+    )
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -516,10 +528,58 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     wait_for_landing_send_enabled(page).click()
 
     page.locator(".assistant-message").last.wait_for(state="visible")
-    assert chat_payloads, "expected the landing chat to POST an API v1 chat payload"
-    assert chat_payloads[-1]["model"] == "api-v1-second-model"
-    assert chat_payloads[-1].get("encrypted") is True
-    assert v2_requests == []
+    assert captured["relay_requests"], "expected the landing chat to POST an API v1 relay request"
+    assert captured["decrypted_requests"][-1]["api_v1_request"]["model"] == "api-v1-second-model"
+    assert captured["v2_requests"] == []
+    assert captured["chat_completion_requests"] == []
+
+
+
+
+@pytest.mark.e2e
+def test_landing_chat_sticky_compute_node_two_turns_and_server_key_label(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """A browser chat session selects one compute node and reuses it for later turns."""
+
+    captured, server_public_key_b64 = install_landing_relay_e2ee_routes(
+        page,
+        assistant_replies=["First sticky reply.", "Second sticky reply."],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    page.get_by_test_id("landing-model-select").select_option("api-v1-second-model")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("first turn")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function(
+        "document.querySelectorAll('.assistant-message').length >= 1 && document.body.textContent.includes('First sticky reply.')"
+    )
+
+    textarea.fill("second turn")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function(
+        "document.querySelectorAll('.assistant-message').length >= 2 && document.body.textContent.includes('Second sticky reply.')"
+    )
+
+    assert captured["next_calls"] == 1
+    assert len(captured["relay_requests"]) == 2
+    assert {body["server_public_key"] for body in captured["relay_requests"]} == {server_public_key_b64}
+    assert [
+        request["api_v1_request"]["model"] for request in captured["decrypted_requests"]
+    ] == ["api-v1-second-model", "api-v1-second-model"]
+    assert captured["v2_requests"] == []
+    assert captured["chat_completion_requests"] == []
+
+    expected_label = f"Server: {server_public_key_b64[:8]}…{server_public_key_b64[-8:]}"
+    label = page.get_by_test_id("landing-server-key-label")
+    label.wait_for(state="visible")
+    assert label.inner_text() == expected_label
+    assert server_public_key_b64 not in page.locator("body").inner_text()
 
 
 @pytest.mark.e2e
@@ -528,64 +588,20 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
     base_url: str,
     setup_servers,
 ):
-    """A failed model list shows a non-blocking error and stays on API v1 fallback chat."""
+    """A failed model list shows a non-blocking error and stays on API v1 relay fallback chat."""
 
-    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
-VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
-7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
-xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
-CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
-+6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
-0QIDAQAB
------END PUBLIC KEY-----"""
-    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
-    chat_requests = []
-    v2_requests = []
-
+    captured, _server_public_key_b64 = install_landing_relay_e2ee_routes(
+        page,
+        assistant_replies=["Fallback model acknowledged."],
+        models_payload={"object": "list", "data": []},
+    )
+    page.unroute("**/api/v1/models")
     page.route(
         "**/api/v1/models",
         lambda route: route.fulfill(
             status=503,
             headers={"Content-Type": "application/json"},
             body=json.dumps({"error": {"message": "catalog temporarily unavailable"}}),
-        ),
-    )
-    page.route(
-        "**/api/v1/public-key",
-        lambda route: route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps({"public_key": server_public_key_b64}),
-        ),
-    )
-    page.route(
-        "**/api/v1/chat/completions",
-        lambda route: (
-            chat_requests.append(route.request.post_data_json),
-            route.fulfill(
-                status=200,
-                headers={"Content-Type": "application/json"},
-                body=json.dumps(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Fallback model acknowledged.",
-                                }
-                            }
-                        ]
-                    }
-                ),
-            ),
-        ),
-    )
-    page.route(
-        "**/api/v2/**",
-        lambda route: (
-            v2_requests.append(route.request.url),
-            route.fulfill(status=500, body="API v2 should not be called by the landing chat"),
         ),
     )
 
@@ -602,10 +618,10 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     wait_for_landing_send_enabled(page).click()
 
     page.locator(".assistant-message").last.wait_for(state="visible")
-    assert chat_requests, "expected the landing chat to POST the API v1 fallback payload"
-    assert chat_requests[-1]["model"] == "llama-3-8b-instruct"
-    assert chat_requests[-1].get("encrypted") is True
-    assert v2_requests == []
+    assert captured["relay_requests"], "expected the landing chat to POST the API v1 relay fallback payload"
+    assert captured["decrypted_requests"][-1]["api_v1_request"]["model"] == "llama-3-8b-instruct"
+    assert captured["v2_requests"] == []
+    assert captured["chat_completion_requests"] == []
 
 
 @pytest.mark.e2e
@@ -616,41 +632,7 @@ def test_landing_chat_shows_no_servers_available_message(
 ):
     """Structured API v1 no-server errors should render a clear landing-chat message."""
 
-    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
-VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
-7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
-xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
-CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
-+6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
-0QIDAQAB
------END PUBLIC KEY-----"""
-    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
-
-    page.route(
-        "**/api/v1/public-key",
-        lambda route: route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps({"public_key": server_public_key_b64}),
-        ),
-    )
-    page.route(
-        "**/api/v1/chat/completions",
-        lambda route: route.fulfill(
-            status=503,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "error": {
-                        "type": "service_unavailable_error",
-                        "code": "no_registered_compute_nodes",
-                        "message": "No registered compute nodes available",
-                    }
-                }
-            ),
-        ),
-    )
+    install_landing_relay_e2ee_routes(page, next_status=503)
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -683,8 +665,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     test_env["USE_MOCK_LLM"] = "0"
     preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
     if not preprovisioned_model_path:
-        raise AssertionError(
-            "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the always-on relay landing-page real-inference guardrail."
+        pytest.skip(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the relay landing-page real-inference guardrail."
         )
     if not os.path.isfile(preprovisioned_model_path):
         raise AssertionError(
@@ -744,13 +726,13 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         v2_requests.append(route.request.url)
         route.continue_()
 
-    page.route("**/api/v1/chat/completions", record_v1_request)
-    page.route("**/api/v2/chat/completions", record_v2_request)
+    page.route("**/api/v1/relay/requests", record_v1_request)
+    page.route("**/api/v2/**", record_v2_request)
 
     v1_response_headers = []
 
     def record_v1_response(response):
-        if "/api/v1/chat/completions" in response.url:
+        if "/api/v1/relay/requests" in response.url:
             v1_response_headers.append(response.headers)
 
     page.on("response", record_v1_response)

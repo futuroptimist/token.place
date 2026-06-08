@@ -252,12 +252,19 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog
     assert _to_text(sink_response.get_json()).find(E2EE_SENTINEL_LOGS) == -1
 
 
-def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client):
+@pytest.mark.parametrize("field", ["messages", "prompt", "input", "content", "response", "text"])
+def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client, field):
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
         "last_ping": relay.datetime.now(),
         "last_ping_duration": 10,
+        relay.API_V1_SERVER_MARKER: True,
     }
+    plaintext_value = (
+        [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}]
+        if field == "messages"
+        else E2EE_SENTINEL_RELAY_STATE
+    )
 
     resp = relay_client.post(
         "/api/v1/relay/requests",
@@ -267,7 +274,7 @@ def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client)
             "ciphertext": "c",
             "cipherkey": "k",
             "iv": "i",
-            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
+            field: plaintext_value,
         },
     )
 
@@ -275,13 +282,20 @@ def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client)
     assert "forbidden" in resp.get_json()["error"]["message"]
 
 
-def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client):
+@pytest.mark.parametrize("field", ["messages", "prompt", "input", "content", "response", "text"])
+def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client, field):
     monkeypatch.setenv("TOKENPLACE_RELAY_SERVER_BEARER_TOKEN", "token")
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
         "last_ping": relay.datetime.now(),
         "last_ping_duration": 10,
+        relay.API_V1_SERVER_MARKER: True,
     }
+    plaintext_value = (
+        [{"role": "assistant", "content": E2EE_SENTINEL_RELAY_STATE}]
+        if field == "messages"
+        else E2EE_SENTINEL_RELAY_STATE
+    )
 
     resp = relay_client.post(
         "/api/v1/relay/responses",
@@ -290,7 +304,7 @@ def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch,
             "ciphertext": "c",
             "cipherkey": "k",
             "iv": "i",
-            "content": E2EE_SENTINEL_RELAY_STATE,
+            field: plaintext_value,
         },
         headers={"Authorization": "Bearer token"},
     )

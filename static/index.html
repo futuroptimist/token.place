@@ -134,6 +134,13 @@
         .model-error {
             color: #ffcc66;
         }
+        .server-key-label {
+            margin: 0 0 12px;
+            padding: 0;
+            color: #b7f7ff;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 13px;
+        }
         .message-input {
             width: 100%;
             padding: 15px;
@@ -335,7 +342,8 @@
         }
 
         body.light-mode .model-selector-container label,
-        body.light-mode .model-status {
+        body.light-mode .model-status,
+        body.light-mode .server-key-label {
             color: #555555;
         }
 
@@ -424,6 +432,12 @@
                 <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
                 <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
             </div>
+            <p
+                v-if="selectedServerKeyLabel"
+                class="server-key-label"
+                data-testid="landing-server-key-label"
+                aria-live="polite"
+            >{{ selectedServerKeyLabel }}</p>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>

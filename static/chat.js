@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
     el: '#app',
@@ -9,18 +10,72 @@ new Vue({
         serverPublicKey: null,
         clientPrivateKey: null,
         clientPublicKey: null,
+        availableModels: [],
+        selectedModelId: '',
+        modelsLoading: false,
+        modelsError: '',
         isGeneratingResponse: false,
         isTouchInput: false,
         relayApiV1NonStreaming: true
     },
     mounted() {
         this.detectTouchInput();
+        this.fetchModels();
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
+    },
+    computed: {
+        selectedModel() {
+            if (!Array.isArray(this.availableModels)) {
+                return null;
+            }
+            const catalogueModel = this.availableModels.find((model) => model && model.id === this.selectedModelId) || null;
+            if (catalogueModel) {
+                return catalogueModel;
+            }
+            if (this.modelsError && this.selectedModelId === EMERGENCY_MODEL_FALLBACK_ID) {
+                return {
+                    id: EMERGENCY_MODEL_FALLBACK_ID,
+                    object: 'model',
+                    owned_by: 'emergency-fallback',
+                    root: EMERGENCY_MODEL_FALLBACK_ID
+                };
+            }
+            return null;
+        },
+        selectedModelSummary() {
+            const model = this.selectedModel;
+            if (!model) {
+                return '';
+            }
+            const fields = [];
+            if (model.owned_by) {
+                fields.push(`owned by ${model.owned_by}`);
+            }
+            if (model.root && model.root !== model.id) {
+                fields.push(`root ${model.root}`);
+            }
+            return fields.join(' · ');
+        },
+        hasClientKeypair() {
+            return Boolean(this.clientPrivateKey && this.clientPublicKey);
+        },
+        hasServerPublicKey() {
+            return Boolean(this.serverPublicKey);
+        },
+        canSendMessage() {
+            return Boolean(
+                this.newMessage.trim() &&
+                this.hasClientKeypair &&
+                this.hasServerPublicKey &&
+                this.selectedModel &&
+                !this.isGeneratingResponse
+            );
+        }
     },
     methods: {
         detectTouchInput() {
@@ -46,6 +101,37 @@ new Vue({
                 this.isTouchInput = false;
             }
         },
+        fetchModels() {
+            this.modelsLoading = true;
+            this.modelsError = '';
+
+            return fetch('/api/v1/models')
+                .then(response => {
+                    if (response.ok) {
+                        return response.json();
+                    }
+                    throw new Error('Failed to fetch API v1 models');
+                })
+                .then(data => {
+                    const models = data && Array.isArray(data.data) ? data.data : [];
+                    this.availableModels = models.filter((model) => model && typeof model.id === 'string' && model.id);
+                    if (this.availableModels.length > 0) {
+                        this.selectedModelId = this.availableModels[0].id;
+                    } else {
+                        this.selectedModelId = '';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching API v1 models:', error);
+                    this.availableModels = [];
+                    this.modelsError = 'Could not load the API v1 model list. Using the emergency API v1 fallback model.';
+                    this.selectedModelId = EMERGENCY_MODEL_FALLBACK_ID;
+                })
+                .finally(() => {
+                    this.modelsLoading = false;
+                });
+        },
+
         normalizeServerPublicKey(rawKey) {
             if (typeof rawKey !== 'string') {
                 return null;
@@ -374,6 +460,11 @@ new Vue({
                 return null;
             }
 
+            if (!this.selectedModel) {
+                console.error('No API v1 catalogue model selected');
+                return null;
+            }
+
             try {
                 // Encrypt the chat history
                 const encryptedData = await this.encrypt(
@@ -387,7 +478,7 @@ new Vue({
 
                 // Create the API request payload
                 const payload = {
-                    model: "llama-3-8b-instruct",
+                    model: this.selectedModelId,
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedData,
@@ -525,7 +616,7 @@ new Vue({
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
-            if (!messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
+            if (!messageContent || !this.canSendMessage) {
                 return;
             }
 

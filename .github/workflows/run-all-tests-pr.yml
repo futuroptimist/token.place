@@ -1,0 +1,194 @@
+name: run_all_tests.sh PR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-run-all-tests:
+    name: Linux run_all_tests.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TEST_COVERAGE: '1'
+      TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Validate dependency compatibility
+        run: python scripts/validate_dependencies.py
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium with Linux system dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Preflight run_all_tests.sh cannot skip the real desktop-bridge guardrail
+        run: |
+          set -euo pipefail
+          case "$TOKENPLACE_REAL_E2E_MODEL_PATH" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) echo "TOKENPLACE_REAL_E2E_MODEL_PATH must be absolute and under github.workspace: $TOKENPLACE_REAL_E2E_MODEL_PATH" >&2; exit 1 ;;
+          esac
+          test -s "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Run ./run_all_tests.sh
+        id: run_all_tests
+        run: |
+          set +e
+          ./run_all_tests.sh 2>&1 | tee run_all_tests.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "## Linux run_all_tests.sh failed"
+              echo ""
+              echo "\`./run_all_tests.sh\` exited with status $status. Open this job's log or the uploaded run_all_tests log artifact for details."
+              echo ""
+              echo "The job is intentionally red because run_all_tests.sh is the visible PR signal."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          {
+            echo "## Linux run_all_tests.sh passed"
+            echo ""
+            echo "\`./run_all_tests.sh\` executed successfully with TOKENPLACE_REAL_E2E_MODEL_PATH=$TOKENPLACE_REAL_E2E_MODEL_PATH."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run_all_tests.sh log on failure
+        if: ${{ failure() && steps.run_all_tests.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-run-all-tests-log
+          path: run_all_tests.log
+          if-no-files-found: error
+
+  macos-run-all-tests:
+    name: macOS run_all_tests.sh
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TEST_COVERAGE: '1'
+      TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+      # Build llama_cpp_python from source with Metal enabled while avoiding
+      # Apple clang's fragile native CPU feature probe on macos-latest arm64.
+      CMAKE_ARGS: >-
+        -DGGML_METAL=on
+        -DGGML_NATIVE=off
+        -DCMAKE_OSX_ARCHITECTURES=arm64
+        -DCMAKE_APPLE_SILICON_PROCESSOR=arm64
+      FORCE_CMAKE: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Validate dependency compatibility
+        run: python scripts/validate_dependencies.py
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
+
+      - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Preflight run_all_tests.sh cannot skip the real desktop-bridge guardrail
+        run: |
+          set -euo pipefail
+          case "$TOKENPLACE_REAL_E2E_MODEL_PATH" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) echo "TOKENPLACE_REAL_E2E_MODEL_PATH must be absolute and under github.workspace: $TOKENPLACE_REAL_E2E_MODEL_PATH" >&2; exit 1 ;;
+          esac
+          test -s "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Run ./run_all_tests.sh
+        id: run_all_tests
+        run: |
+          set +e
+          ./run_all_tests.sh 2>&1 | tee run_all_tests.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "## macOS run_all_tests.sh failed"
+              echo ""
+              echo "\`./run_all_tests.sh\` exited with status $status. Open this job's log or the uploaded run_all_tests log artifact for details."
+              echo ""
+              echo "The job is intentionally red because run_all_tests.sh is the visible PR signal."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          {
+            echo "## macOS run_all_tests.sh passed"
+            echo ""
+            echo "\`./run_all_tests.sh\` executed successfully with TOKENPLACE_REAL_E2E_MODEL_PATH=$TOKENPLACE_REAL_E2E_MODEL_PATH."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run_all_tests.sh log on failure
+        if: ${{ failure() && steps.run_all_tests.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-run-all-tests-log
+          path: run_all_tests.log
+          if-no-files-found: error

@@ -3046,16 +3046,14 @@ class TestRelayClient:
             'protocol': 'tokenplace_api_v1_relay_e2ee',
             'next_ping_in_x_seconds': 0.25,
         }
-        mock_poll.side_effect = [invalid_response, next_response]
+        def poll_then_stop():
+            if mock_poll.call_count == 1:
+                return invalid_response
+            relay_client.stop()
+            return next_response
 
-        def stop_after_second_sleep(seconds):
-            if mock_sleep.call_count >= 2:
-                relay_client.stop()
-            return None
+        mock_poll.side_effect = poll_then_stop
 
-        mock_sleep.side_effect = stop_after_second_sleep
-
-        relay_client.start()
         relay_client.poll_api_v1_encrypted_work_continuously()
 
         assert mock_poll.call_count == 2

@@ -1,45 +1,13 @@
-import os
-import time
-import subprocess
 import requests
-import sys
-from contextlib import contextmanager
 
-API_PORT = 5056
-BASE_URL = f"http://localhost:{API_PORT}"
+from tests.integration.relay_fixture import start_relay_with_mock
 
 
-@contextmanager
-def start_relay_with_mock():
-    env = os.environ.copy()
-    env["USE_MOCK_LLM"] = "1"
-    cmd = [sys.executable, "relay.py", "--port", str(API_PORT)]
-    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        for _ in range(10):
-            try:
-                response = requests.get(f"{BASE_URL}/v1/health", timeout=1)
-                if response.status_code == 200:
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-        else:
-            raise RuntimeError("relay failed to start for DSPACE compatibility test")
-        yield
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
-def _post_dspace_chat(payload: dict[str, object]) -> requests.Response:
+def _post_dspace_chat(base_url: str, payload: dict[str, object]) -> requests.Response:
     """Helper to send a DSPACE-style chat completion request."""
 
     return requests.post(
-        f"{BASE_URL}/api/v1/chat/completions",
+        f"{base_url}/api/v1/chat/completions",
         json=payload,
         headers={"Authorization": "Bearer test", "Content-Type": "application/json"},
         timeout=10,
@@ -63,14 +31,16 @@ def _base_dspace_payload() -> dict[str, object]:
 
 
 def test_dspace_can_request_gpt5_alias():
-    with start_relay_with_mock():
-        response = _post_dspace_chat(_base_dspace_payload())
+    with start_relay_with_mock("DSPACE compatibility test") as base_url:
+        response = _post_dspace_chat(base_url, _base_dspace_payload())
 
         assert response.status_code == 200, response.text
         data = response.json()
 
         assert data["model"] == "gpt-5-chat-latest"
-        assert data["choices"], "Expected at least one choice in the completion response"
+        assert data["choices"], (
+            "Expected at least one choice in the completion response"
+        )
         message = data["choices"][0]["message"]
         assert message["role"] == "assistant"
         assert isinstance(message["content"], str) and message["content"].strip()
@@ -79,17 +49,19 @@ def test_dspace_can_request_gpt5_alias():
 def test_dspace_receives_usage_metrics():
     """DSPACE relies on usage counters to show token consumption to users."""
 
-    with start_relay_with_mock():
+    with start_relay_with_mock("DSPACE compatibility test") as base_url:
         payload = _base_dspace_payload()
         payload["metadata"] = {"client": "dspace", "conversation_id": "demo"}
 
-        response = _post_dspace_chat(payload)
+        response = _post_dspace_chat(base_url, payload)
 
         assert response.status_code == 200, response.text
         data = response.json()
 
         usage = data.get("usage")
-        assert isinstance(usage, dict), "Usage payload missing from chat completion response"
+        assert isinstance(usage, dict), (
+            "Usage payload missing from chat completion response"
+        )
 
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
@@ -97,17 +69,20 @@ def test_dspace_receives_usage_metrics():
 
         assert isinstance(prompt_tokens, int) and prompt_tokens >= 0
         assert isinstance(completion_tokens, int) and completion_tokens >= 0
-        assert isinstance(total_tokens, int) and total_tokens == prompt_tokens + completion_tokens
+        assert (
+            isinstance(total_tokens, int)
+            and total_tokens == prompt_tokens + completion_tokens
+        )
 
 
 def test_dspace_metadata_round_trip():
     """Metadata should round-trip so DSPACE can track the active conversation."""
 
-    with start_relay_with_mock():
+    with start_relay_with_mock("DSPACE compatibility test") as base_url:
         payload = _base_dspace_payload()
         payload["metadata"] = {"client": "dspace", "conversation_id": "conv-42"}
 
-        response = _post_dspace_chat(payload)
+        response = _post_dspace_chat(base_url, payload)
 
         assert response.status_code == 200, response.text
         body = response.json()

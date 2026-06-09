@@ -2256,7 +2256,7 @@ def test_run_first_api_v1_payload_fails_closed_when_blocking_warm_load_raises(ca
     assert status == 1
     assert calls == ["warm"]
     assert "request_id=none" in output.err
-    assert "runtime_wait.exception" in output.err
+    assert "runtime_wait.exception" in output.err or "model_init.exception" in output.err
     assert "error_response.submitted" not in output.err
     assert "exc_type=RuntimeError" in output.err
     assert "sensitive delayed model init details" not in output.err

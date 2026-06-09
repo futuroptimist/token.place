@@ -645,7 +645,12 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        model_id = data.get("model")
+        requested_model_id = data.get("model")
+        model_id = (
+            resolve_model_alias(requested_model_id) or requested_model_id
+            if requested_model_id
+            else requested_model_id
+        )
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")
         is_encrypted_request = data.get("encrypted", False)
@@ -717,7 +722,7 @@ def _handle_text_completion_request(data):
             "id": f"cmpl-{uuid.uuid4().hex[:12]}",
             "object": "text_completion",
             "created": int(time.time()),
-            "model": model_id,
+            "model": requested_model_id,
             "choices": [
                 {
                     "index": 0,
@@ -872,7 +877,8 @@ def get_model(model_id):
     try:
         log_info(f"API request: GET /models/{model_id}")
         models = get_models_info()
-        model = next((m for m in models if m["id"] == model_id), None)
+        resolved_model_id = resolve_model_alias(model_id) or model_id
+        model = next((m for m in models if m["id"] == resolved_model_id), None)
 
         if not model:
             log_warning(f"Model '{model_id}' not found")
@@ -1191,7 +1197,7 @@ def _stable_openai_model_created(model_id: str) -> int:
     return 1_700_000_000 + (zlib.crc32(model_id.encode("utf-8")) % 31_536_000)
 
 
-def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
+def _format_openai_model_payload(model: dict[str, object]) -> dict[str, object]:
     """Build a stable OpenAI-compatible model payload."""
 
     created_ts = _stable_openai_model_created(model["id"])
@@ -1199,7 +1205,7 @@ def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
         "id": model["id"],
         "object": "model",
         "created": created_ts,
-        "owned_by": "token.place",
+        "owned_by": model.get("owned_by") or model.get("owner") or model.get("provider") or "unknown",
         "permission": [{
             "id": f"modelperm-{model['id']}",
             "object": "model_permission",

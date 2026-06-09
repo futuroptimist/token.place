@@ -2,7 +2,7 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
-const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
+const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
 
 new Vue({
     el: '#app',
@@ -63,25 +63,10 @@ new Vue({
                 return {
                     id: EMERGENCY_MODEL_FALLBACK_ID,
                     object: 'model',
-                    owned_by: 'emergency-fallback',
                     root: EMERGENCY_MODEL_FALLBACK_ID
                 };
             }
             return null;
-        },
-        selectedModelSummary() {
-            const model = this.selectedModel;
-            if (!model) {
-                return '';
-            }
-            const fields = [];
-            if (model.owned_by) {
-                fields.push(`owned by ${model.owned_by}`);
-            }
-            if (model.root && model.root !== model.id) {
-                fields.push(`root ${model.root}`);
-            }
-            return fields.join(' · ');
         },
         hasClientKeypair() {
             return Boolean(this.clientPrivateKey && this.clientPublicKey);

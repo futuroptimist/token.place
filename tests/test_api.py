@@ -503,7 +503,7 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3-8b-instruct",
+            "model": "llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": "hello staging"}],
         },
     )
@@ -523,7 +523,7 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
 
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
         'temperature': 0.2,
         'stop': ['END'],
@@ -552,7 +552,7 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     response = client.post(
         '/api/v1/chat/completions',
         json={
-            'model': 'llama-3-8b-instruct',
+            'model': 'llama-3.1-8b-instruct',
             'messages': [{'role': 'user', 'content': 'fallback please'}],
         },
     )
@@ -579,7 +579,7 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     response = client.post(
         '/api/v1/chat/completions',
         json={
-            'model': 'llama-3-8b-instruct',
+            'model': 'llama-3.1-8b-instruct',
             'messages': [{'role': 'user', 'content': 'no fallback please'}],
         },
     )
@@ -595,7 +595,7 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
 
 
 def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
 
     class ProviderShouldNotRun:
         def complete_chat(self, **kwargs):
@@ -616,7 +616,7 @@ def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client,
 
 
 def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
     monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda msgs: None)
 
     captured = {}
@@ -645,7 +645,7 @@ def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_fr
 
 
 def test_api_v1_completions_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
 
     captured = {}
 
@@ -671,7 +671,7 @@ def test_api_v1_completions_distributed_with_fallback_allows_model_absent_from_l
 
 
 def test_api_v1_completions_local_provider_rejects_unsupported_model(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
 
     class ProviderShouldNotRun:
         def complete_chat(self, **kwargs):
@@ -1037,7 +1037,7 @@ def test_v1_chat_completion_rejects_stream_flag(client, mock_llama):
     """API v1 chat completions should reject the stream flag with a clear error."""
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Count from 1 to 5"}
@@ -1058,7 +1058,7 @@ def test_v1_completions_reject_stream_flag(client, mock_llama):
     """Legacy completions endpoint should also reject streaming attempts."""
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "prompt": "Return a short response.",
         "stream": True,
     }
@@ -1077,7 +1077,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
-        lambda: [{"id": "llama-3-8b-instruct"}],
+        lambda: [{"id": "llama-3.1-8b-instruct"}],
     )
     monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
 
@@ -1107,7 +1107,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
     )
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
     }
 
@@ -1117,8 +1117,8 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
     assert response.is_json
 
     body = response.get_json()
-    assert body["model"] == "llama-3-8b-instruct"
-    assert captured["model_id"] == "llama-3-8b-instruct"
+    assert body["model"] == "llama-3.1-8b-instruct"
+    assert captured["model_id"] == "llama-3.1-8b-instruct"
     assert captured["messages"] == payload["messages"]
     assert body["choices"][0]["message"]["content"] == "Llama response"
 
@@ -1128,7 +1128,7 @@ def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatc
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
-        lambda: [{"id": "llama-3-8b-instruct"}],
+        lambda: [{"id": "llama-3.1-8b-instruct"}],
     )
 
     class ProviderShouldNotBeCalled:
@@ -1206,7 +1206,7 @@ def test_v1_encrypted_chat_completion_rejects_stream_flag(client, client_keys, m
     ciphertext_dict, cipherkey, iv = encrypt(json.dumps(messages).encode('utf-8'), server_public_key_bytes)
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "encrypted": True,
         "stream": True,
         "client_public_key": client_keys['public_key_b64'],
@@ -1228,7 +1228,7 @@ def test_v1_encrypted_chat_completion_rejects_stream_flag(client, client_keys, m
 def test_completions_endpoint(client, mock_llama):
     """Test the regular completions endpoint (redirects to chat)"""
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "prompt": "What is the capital of France?",
         "max_tokens": 100
     }
@@ -1290,7 +1290,7 @@ def test_get_model_not_found(client):
 
 def test_completions_encryption_error(client, monkeypatch, mock_llama):
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'prompt': 'hi',
         'encrypted': True,
         'client_public_key': 'bogus'
@@ -1309,7 +1309,7 @@ def test_create_completion_encrypted_success(client, monkeypatch, mock_llama):
         lambda m, msgs, **kwargs: msgs + [{'role':'assistant','content':'ok'}],
     )
     monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda data, key: {'ciphertext':'a','cipherkey':'b','iv':'c'})
-    payload = {'model':'llama-3-8b-instruct','prompt':'hi','encrypted':True,'client_public_key':'x'}
+    payload = {'model':'llama-3.1-8b-instruct','prompt':'hi','encrypted':True,'client_public_key':'x'}
     res = client.post('/api/v1/completions', json=payload)
     assert res.status_code == 200
     d = res.get_json()
@@ -1324,7 +1324,7 @@ def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
             ModelError('boom', status_code=404, error_type='model_not_found')
         ),
     )
-    payload = {'model':'llama-3-8b-instruct','messages':[{'role':'user','content':'hi'}]}
+    payload = {'model':'llama-3.1-8b-instruct','messages':[{'role':'user','content':'hi'}]}
     res = client.post('/api/v1/chat/completions', json=payload)
     assert res.status_code == 404
     body = res.get_json()
@@ -1337,7 +1337,7 @@ def test_create_completion_exception(client, monkeypatch, mock_llama):
         'api.v1.compute_provider.generate_response',
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('oops')),
     )
-    payload = {'model':'llama-3-8b-instruct','prompt':'hi'}
+    payload = {'model':'llama-3.1-8b-instruct','prompt':'hi'}
     res = client.post('/api/v1/completions', json=payload)
     assert res.status_code == 400
     assert 'error' in res.get_json()
@@ -1371,7 +1371,7 @@ def test_chat_completion_invalid_body(client):
 def test_chat_completion_decrypt_failure(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: None)
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'encrypted': True,
         'client_public_key': base64.b64encode(b'x').decode(),
         'messages': {'ciphertext': base64.b64encode(b'c').decode(), 'cipherkey': base64.b64encode(b'k').decode(), 'iv': base64.b64encode(b'i').decode()}
@@ -1384,7 +1384,7 @@ def test_chat_completion_decrypt_failure(client, monkeypatch):
 def test_chat_completion_json_error(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: b'not-json')
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'encrypted': True,
         'client_public_key': base64.b64encode(b'x').decode(),
         'messages': {'ciphertext': base64.b64encode(b'c').decode(), 'cipherkey': base64.b64encode(b'k').decode(), 'iv': base64.b64encode(b'i').decode()}
@@ -1394,7 +1394,7 @@ def test_chat_completion_json_error(client, monkeypatch):
     assert 'Failed to parse JSON' in res.get_json()['error']['message']
 
 def test_chat_completion_missing_messages(client):
-    payload = {"model": "llama-3-8b-instruct"}
+    payload = {"model": "llama-3.1-8b-instruct"}
     res = client.post("/api/v1/chat/completions", json=payload)
     assert res.status_code == 400
     data = res.get_json()
@@ -1402,14 +1402,14 @@ def test_chat_completion_missing_messages(client):
 
 
 def test_chat_completion_messages_wrong_type(client):
-    payload = {"model": "llama-3-8b-instruct", "messages": "not-a-list"}
+    payload = {"model": "llama-3.1-8b-instruct", "messages": "not-a-list"}
     res = client.post("/api/v1/chat/completions", json=payload)
     assert res.status_code == 400
     assert 'Invalid type for messages' in res.get_json()['error']['message']
 
 
 def test_chat_completion_invalid_role(client):
-    payload = {"model": "llama-3-8b-instruct", "messages": [{"role": "bad", "content": "hi"}]}
+    payload = {"model": "llama-3.1-8b-instruct", "messages": [{"role": "bad", "content": "hi"}]}
     res = client.post("/api/v1/chat/completions", json=payload)
     assert res.status_code == 400
     assert 'Invalid role' in res.get_json()['error']['message']
@@ -1424,7 +1424,7 @@ def test_chat_completion_encrypt_failure_on_response(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: b'[{"role":"user","content":"hi"}]')
     monkeypatch.setattr('api.v1.validation.validate_encrypted_request', lambda data: None)
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'encrypted': True,
         'client_public_key': base64.b64encode(b'x').decode(),
         'messages': {
@@ -1448,9 +1448,9 @@ def test_openai_alias_routes_extended(client):
     for alias, api in endpoints:
         if 'completions' in alias:
             if alias.endswith('/completions'):
-                payload = {'model': 'llama-3-8b-instruct', 'prompt': 'hi'}
+                payload = {'model': 'llama-3.1-8b-instruct', 'prompt': 'hi'}
             else:
-                payload = {'model': 'llama-3-8b-instruct', 'messages': [{'role': 'user', 'content': 'hi'}]}
+                payload = {'model': 'llama-3.1-8b-instruct', 'messages': [{'role': 'user', 'content': 'hi'}]}
             res_alias = client.post(alias, json=payload)
             res_api = client.post(api, json=payload)
         else:
@@ -1509,11 +1509,11 @@ def test_get_public_key_exception(client, monkeypatch):
 
 
 def test_chat_completion_validation_error(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
     from api.v1.validation import ValidationError
     monkeypatch.setattr('api.v1.routes.validate_encrypted_request', lambda d: (_ for _ in ()).throw(ValidationError('bad', field='f', code='c')))
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'encrypted': True,
         'client_public_key': base64.b64encode(b'x').decode(),
         'messages': {
@@ -1648,7 +1648,7 @@ def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_uns
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3-8b-instruct",
+            "model": "llama-3.1-8b-instruct",
             "encrypted": True,
             "client_public_key": client_keys["public_key_b64"],
             "messages": encrypted_messages,

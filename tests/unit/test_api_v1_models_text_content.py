@@ -31,7 +31,7 @@ def test_generate_response_rejects_image_content_blocks(monkeypatch):
     ]
 
     with pytest.raises(models.ModelError) as exc:
-        models.generate_response("llama-3-8b-instruct", messages)
+        models.generate_response("llama-3.1-8b-instruct", messages)
 
     assert exc.value.status_code == 400
     assert "do not support image content" in exc.value.message
@@ -92,7 +92,7 @@ def test_generate_response_normalises_text_blocks(monkeypatch):
         }
     ]
 
-    result = models.generate_response("llama-3-8b-instruct", messages)
+    result = models.generate_response("llama-3.1-8b-instruct", messages)
 
     assert captured["messages"][0]["content"] == "First segment\n\nSecond segment"
     assert result[-1]["role"] == "assistant"
@@ -116,7 +116,7 @@ def test_generate_response_rejects_invalid_text_content_shapes(monkeypatch, cont
 
     with pytest.raises(models.ModelError) as exc:
         models.generate_response(
-            "llama-3-8b-instruct",
+            "llama-3.1-8b-instruct",
             [{"role": "user", "content": content}],
         )
 

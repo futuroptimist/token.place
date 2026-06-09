@@ -146,7 +146,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     response = provider.complete_chat(
-        model_id="llama-3-8b-instruct",
+        model_id="llama-3.1-8b-instruct",
         messages=[{"role": "user", "content": "hi"}],
         options={"temperature": 0.2},
     )
@@ -197,7 +197,7 @@ def test_distributed_compute_provider_treats_retrieve_404_as_unknown_request(mon
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -252,7 +252,7 @@ def test_distributed_compute_provider_rejects_response_client_key_binding_mismat
         provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
         try:
             provider.complete_chat(
-                model_id="llama-3-8b-instruct",
+                model_id="llama-3.1-8b-instruct",
                 messages=[{"role": "user", "content": "hi"}],
             )
             raise AssertionError("expected ComputeProviderError")
@@ -281,7 +281,7 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
     )
 
     result = provider.complete_chat(
-        model_id="llama-3-8b-instruct",
+        model_id="llama-3.1-8b-instruct",
         messages=[{"role": "user", "content": "hello"}],
     )
 
@@ -311,7 +311,7 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -338,7 +338,7 @@ def test_distributed_compute_provider_maps_encryption_failure_to_provider_error(
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -365,7 +365,7 @@ def test_distributed_compute_provider_maps_next_server_json_error(monkeypatch):
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -391,7 +391,7 @@ def test_distributed_compute_provider_maps_next_server_5xx(monkeypatch):
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -430,7 +430,7 @@ def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypa
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -471,7 +471,7 @@ def test_distributed_compute_provider_maps_decrypted_payload_shape_errors(monkey
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -529,7 +529,7 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
 
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "first"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -539,7 +539,7 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
 
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "second"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -605,7 +605,7 @@ def test_api_v1_chat_completion_emits_execution_backend_path_header_for_fallback
         response = client.post(
             "/api/v1/chat/completions",
             json={
-                "model": "llama-3-8b-instruct",
+                "model": "llama-3.1-8b-instruct",
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
@@ -636,7 +636,7 @@ def test_api_v1_chat_completion_returns_structured_error_when_distributed_only(m
         response = client.post(
             "/api/v1/chat/completions",
             json={
-                "model": "llama-3-8b-instruct",
+                "model": "llama-3.1-8b-instruct",
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
@@ -667,7 +667,7 @@ def test_distributed_compute_provider_maps_next_server_request_exception(monkeyp
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -699,7 +699,7 @@ def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch)
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -743,7 +743,7 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -807,7 +807,7 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
     )
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -867,7 +867,7 @@ def test_distributed_compute_provider_cancel_failure_does_not_mask_timeout(monke
     )
     try:
         provider.complete_chat(
-            model_id="llama-3-8b-instruct",
+            model_id="llama-3.1-8b-instruct",
             messages=[{"role": "user", "content": "hi"}],
         )
         raise AssertionError("expected ComputeProviderError")
@@ -912,7 +912,7 @@ def test_distributed_compute_provider_maps_relay_410_cancelled_and_expired(monke
         )
         try:
             provider.complete_chat(
-                model_id="llama-3-8b-instruct",
+                model_id="llama-3.1-8b-instruct",
                 messages=[{"role": "user", "content": terminal_code}],
             )
             raise AssertionError("expected ComputeProviderError")

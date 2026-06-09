@@ -27,7 +27,7 @@ def test_get_public_key_exception(client, monkeypatch):
 
 def test_chat_completion_encrypted_validation_error(client, monkeypatch):
     monkeypatch.setattr(routes, 'validate_encrypted_request', MagicMock(side_effect=ValidationError('bad', 'field', 'code')))
-    payload = {'model': 'llama-3-8b-instruct', 'encrypted': True, 'client_public_key': 'x', 'messages': {}}
+    payload = {'model': 'llama-3.1-8b-instruct', 'encrypted': True, 'client_public_key': 'x', 'messages': {}}
     resp = client.post('/api/v1/chat/completions', json=payload)
     assert resp.status_code == 400
     data = resp.get_json()
@@ -118,7 +118,7 @@ def test_relay_unregister_openai_alias_delegates(client, monkeypatch):
 
 
 def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
-    canonical_id = 'llama-3-8b-instruct'
+    canonical_id = 'llama-3.1-8b-instruct'
     payload = {
         'model': 'gpt-5-chat-latest',
         'messages': [
@@ -156,7 +156,7 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
 
 
 def test_chat_completion_model_error_preserves_status_and_type(client, monkeypatch):
-    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "resolve_model_alias", lambda model_id: None)
     monkeypatch.setattr(
@@ -176,7 +176,7 @@ def test_chat_completion_model_error_preserves_status_and_type(client, monkeypat
     monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _Provider())
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
     }
     response = client.post("/api/v1/chat/completions", json=payload)
@@ -189,12 +189,12 @@ def test_chat_completion_model_error_preserves_status_and_type(client, monkeypat
 
 def test_chat_completion_echoes_request_metadata(client, monkeypatch):
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'llama-3.1-8b-instruct',
         'messages': [{'role': 'user', 'content': 'Hello'}],
         'metadata': {'client': 'dspace', 'conversation_id': 'conv-99'},
     }
 
-    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3.1-8b-instruct'}])
     monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
     monkeypatch.setattr(
@@ -205,7 +205,7 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 
     class _Provider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == 'llama-3-8b-instruct'
+            assert model_id == 'llama-3.1-8b-instruct'
             return {'role': 'assistant', 'content': 'Mock reply'}
 
     monkeypatch.setattr(routes, 'get_api_v1_compute_provider', lambda: _Provider())
@@ -220,16 +220,16 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monkeypatch):
     class _DistributedProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "Paris"}
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "user", "content": "Capital of France?"}],
     }
 
-    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
     monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
@@ -260,12 +260,12 @@ def test_chat_completion_rejects_streaming_for_api_v1(client, monkeypatch):
             return {"role": "assistant", "content": "Paris"}
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "user", "content": "Capital of France?"}],
         "stream": True,
     }
 
-    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
 
@@ -281,7 +281,7 @@ def test_chat_completion_rejects_streaming_for_api_v1(client, monkeypatch):
 def test_chat_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _DistributedProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "Paris"}
 
@@ -294,13 +294,13 @@ def test_chat_completion_encrypted_response_sets_provider_headers(client, monkey
     }
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "messages": encrypted_payload,
         "encrypted": True,
         "client_public_key": "client-key",
     }
 
-    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
     monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
@@ -330,13 +330,13 @@ def test_chat_completion_encrypted_response_sets_provider_headers(client, monkey
 def test_legacy_completion_sets_provider_headers(client, monkeypatch):
     class _LocalProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "hello"}
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "prompt": "hi",
     }
 
@@ -361,7 +361,7 @@ def test_legacy_completion_rejects_streaming_for_api_v1(client, monkeypatch):
             return {"role": "assistant", "content": "hello"}
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "prompt": "hi",
         "stream": True,
     }
@@ -381,13 +381,13 @@ def test_legacy_completion_rejects_streaming_for_api_v1(client, monkeypatch):
 def test_legacy_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _LocalProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "hello"}
 
     payload = {
-        "model": "llama-3-8b-instruct",
+        "model": "llama-3.1-8b-instruct",
         "prompt": "hi",
         "encrypted": True,
         "client_public_key": "client-key",

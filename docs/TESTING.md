@@ -443,3 +443,5 @@ This wraps `./run_all_tests.sh` and runs every available test.
 
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md) - Detailed ideas for test improvements
 - [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation
+
+<!-- CI signal smoke test -->

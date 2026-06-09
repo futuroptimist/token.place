@@ -14,17 +14,17 @@ def test_get_model_instance_mock():
 
 
 @patch.dict(os.environ, {"USE_MOCK_LLM": "1"})
-def test_get_model_instance_v2_catalogue():
+def test_get_model_instance_does_not_fall_back_to_api_v2_catalogue():
     import api.v1.models as models
     import api.v2.models as models_v2
 
-    # Reload both catalogues so the environment flag is picked up and the
-    # fallback to the v2 listings is available within the v1 loader.
     importlib.reload(models_v2)
     importlib.reload(models)
 
-    inst = models.get_model_instance('mistral-7b-instruct')
-    assert inst == "MOCK_MODEL"
+    assert any(entry["id"] == "mistral-7b-instruct" for entry in models_v2.get_models_info())
+    with pytest.raises(models.ModelError) as exc:
+        models.get_model_instance('mistral-7b-instruct')
+    assert exc.value.error_type == "model_not_found"
 
 
 @patch.dict(os.environ, {"USE_MOCK_LLM": "1"})

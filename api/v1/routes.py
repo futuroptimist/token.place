@@ -509,12 +509,12 @@ def _handle_chat_completion_request(data):
         )
         if not _is_relay_capable_provider_path(resolved_provider_path):
             supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
-            if model_id not in supported_model_ids:
+            if model_id not in supported_model_ids and requested_model_id not in supported_model_ids:
                 return format_error_response(
-                    f"Model '{model_id}' is not supported by API v1.",
+                    f"Model '{model_id}' not found.",
                     error_type="invalid_request_error",
                     param="model",
-                    code="model_not_supported",
+                    code="model_not_found",
                     status_code=400,
                 )
         assistant_message = _call_provider_complete_chat(
@@ -645,7 +645,12 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        model_id = data.get("model")
+        requested_model_id = data.get("model")
+        model_id = resolve_model_alias(requested_model_id) or requested_model_id
+        if model_id != requested_model_id:
+            log_info(
+                f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
+            )
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")
         is_encrypted_request = data.get("encrypted", False)
@@ -662,7 +667,7 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        if not model_id:
+        if not requested_model_id:
             log_warning("Missing required parameter: model")
             return format_error_response(
                 "Missing required parameter: model",
@@ -696,12 +701,12 @@ def _handle_text_completion_request(data):
         )
         if not _is_relay_capable_provider_path(resolved_provider_path):
             supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
-            if model_id not in supported_model_ids:
+            if model_id not in supported_model_ids and requested_model_id not in supported_model_ids:
                 return format_error_response(
-                    f"Model '{model_id}' is not supported by API v1.",
+                    f"Model '{model_id}' not found.",
                     error_type="invalid_request_error",
                     param="model",
-                    code="model_not_supported",
+                    code="model_not_found",
                     status_code=400,
                 )
         assistant_message = _call_provider_complete_chat(
@@ -717,7 +722,7 @@ def _handle_text_completion_request(data):
             "id": f"cmpl-{uuid.uuid4().hex[:12]}",
             "object": "text_completion",
             "created": int(time.time()),
-            "model": model_id,
+            "model": requested_model_id,
             "choices": [
                 {
                     "index": 0,
@@ -1199,7 +1204,9 @@ def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
         "id": model["id"],
         "object": "model",
         "created": created_ts,
-        "owned_by": "token.place",
+        "owned_by": model.get("owned_by", "Meta"),
+        "provider": model.get("provider", "meta"),
+        "source": model.get("source", "meta-llama/Llama-3.1-8B-Instruct"),
         "permission": [{
             "id": f"modelperm-{model['id']}",
             "object": "model_permission",

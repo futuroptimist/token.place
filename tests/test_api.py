@@ -612,7 +612,7 @@ def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client,
     assert response.status_code == 400
     body = response.get_json()
     assert body['error']['param'] == 'model'
-    assert body['error']['code'] == 'model_not_supported'
+    assert body['error']['code'] == 'model_not_found'
 
 
 def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
@@ -688,7 +688,7 @@ def test_api_v1_completions_local_provider_rejects_unsupported_model(client, mon
     assert response.status_code == 400
     body = response.get_json()
     assert body['error']['param'] == 'model'
-    assert body['error']['code'] == 'model_not_supported'
+    assert body['error']['code'] == 'model_not_found'
 
 
 def test_chat_completion_rejects_empty_messages(client):
@@ -1118,7 +1118,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
 
     body = response.get_json()
     assert body["model"] == "llama-3-8b-instruct"
-    assert captured["model_id"] == "llama-3-8b-instruct"
+    assert captured["model_id"] == "llama-3.1-8b-instruct"
     assert captured["messages"] == payload["messages"]
     assert body["choices"][0]["message"]["content"] == "Llama response"
 

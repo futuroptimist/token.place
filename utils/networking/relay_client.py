@@ -479,6 +479,7 @@ class RelayClient:
     """
 
     _API_V1_LOCAL_LLAMA_RUNTIME_IDS = {
+        "llama-3.1-8b-instruct",
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
         "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
@@ -486,8 +487,9 @@ class RelayClient:
         "meta-llama-3-8b-instruct-q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
-        "gpt-3.5-turbo": "llama-3-8b-instruct",
-        "gpt-5-chat-latest": "llama-3-8b-instruct",
+        "llama-3-8b-instruct": "llama-3.1-8b-instruct",
+        "gpt-3.5-turbo": "llama-3.1-8b-instruct",
+        "gpt-5-chat-latest": "llama-3.1-8b-instruct",
     }
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {
         "llama-3-8b-instruct:alignment": "llama-3-8b-instruct",
@@ -1899,8 +1901,9 @@ class RelayClient:
         manager_defines_supports_model = callable(
             getattr(type(self.model_manager), "supports_api_v1_model", None)
         )
+        requested_ids = self._api_v1_requested_model_ids(normalized_model)
         if callable(supports_api_v1_model) and manager_defines_supports_model:
-            return bool(supports_api_v1_model(normalized_model))
+            return any(bool(supports_api_v1_model(requested_id)) for requested_id in requested_ids)
 
         if getattr(self.model_manager, "use_mock_llm", False) is True:
             return True
@@ -1915,7 +1918,6 @@ class RelayClient:
             )
             if value
         }
-        requested_ids = self._api_v1_requested_model_ids(normalized_model)
         if requested_ids & configured_ids:
             return True
 

@@ -118,7 +118,7 @@ def test_relay_unregister_openai_alias_delegates(client, monkeypatch):
 
 
 def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
-    canonical_id = 'llama-3-8b-instruct'
+    canonical_id = 'llama-3.1-8b-instruct'
     payload = {
         'model': 'gpt-5-chat-latest',
         'messages': [
@@ -220,7 +220,7 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monkeypatch):
     class _DistributedProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "Paris"}
 
@@ -281,7 +281,7 @@ def test_chat_completion_rejects_streaming_for_api_v1(client, monkeypatch):
 def test_chat_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _DistributedProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "Paris"}
 
@@ -330,7 +330,7 @@ def test_chat_completion_encrypted_response_sets_provider_headers(client, monkey
 def test_legacy_completion_sets_provider_headers(client, monkeypatch):
     class _LocalProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "hello"}
@@ -381,7 +381,7 @@ def test_legacy_completion_rejects_streaming_for_api_v1(client, monkeypatch):
 def test_legacy_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _LocalProvider:
         def complete_chat(self, model_id, messages, options):
-            assert model_id == "llama-3-8b-instruct"
+            assert model_id == "llama-3.1-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
             return {"role": "assistant", "content": "hello"}

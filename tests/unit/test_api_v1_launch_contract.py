@@ -138,7 +138,7 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3-8b-instruct",
+            "model": "llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         },
@@ -156,22 +156,31 @@ def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["object"] == "list"
-    assert payload["data"]
-    for model in payload["data"]:
-        assert model["object"] == "model"
-        assert model["owned_by"] == "token.place"
-        assert "permission" in model
-        assert isinstance(model["permission"], list)
-        assert model["permission"]
-        assert model["permission"][0]["object"] == "model_permission"
-        assert "metadata" not in model
-        assert "adapter" not in model
+    assert len(payload["data"]) == 1
+    model = payload["data"][0]
+    assert model["id"] == "llama-3.1-8b-instruct"
+    assert model["object"] == "model"
+    assert model["owned_by"] == "Meta"
+    assert model["provider"] == "meta"
+    assert model["source"] == "meta-llama/Llama-3.1-8B-Instruct"
+    assert "token.place" not in {model.get("owned_by"), model.get("provider")}
+    assert "permission" in model
+    assert isinstance(model["permission"], list)
+    assert model["permission"]
+    assert model["permission"][0]["object"] == "model_permission"
+    assert "metadata" not in model
+    assert "adapter" not in model
 
 
 def test_landing_page_model_example_documents_openai_permission_objects():
     html = INDEX_HTML.read_text(encoding="utf-8")
     models_section = html.split("/api/v1/models/{model_id}", 1)[0]
 
+    assert '"id": "llama-3.1-8b-instruct"' in models_section
+    assert '"owned_by": "Meta"' in models_section
+    assert '"provider": "meta"' in models_section
+    assert '"source": "meta-llama/Llama-3.1-8B-Instruct"' in models_section
+    assert "llama-3-8b-instruct:alignment" not in models_section
     assert '"permission": [' in models_section
     assert '"permission": ["..."]' not in models_section
     assert '"object": "model_permission"' in models_section
@@ -184,7 +193,7 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
     original_compute_generator = compute_provider.generate_response
 
     def fake_generate_response(model_id, messages, **options):
-        assert model_id == "llama-3-8b-instruct"
+        assert model_id == "llama-3.1-8b-instruct"
         assert options == {"temperature": 0.2}
         return messages + [{"role": "assistant", "content": "request-local bridge"}]
 
@@ -192,7 +201,7 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
 
     result = routes._call_provider_complete_chat(
         compute_provider.LocalApiV1ComputeProvider(),
-        model_id="llama-3-8b-instruct",
+        model_id="llama-3.1-8b-instruct",
         messages=[{"role": "user", "content": "hello"}],
         options={"temperature": 0.2},
     )
@@ -200,3 +209,58 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
     assert result == {"role": "assistant", "content": "request-local bridge"}
     assert compute_provider.generate_response is original_compute_generator
     assert compute_provider._active_generate_response() is original_compute_generator
+
+
+def test_api_v1_launch_catalog_keeps_legacy_id_invisible_but_accepted(client, monkeypatch):
+    """The old non-3.1 launch ID remains a request alias, not a listed model."""
+
+    list_response = client.get("/api/v1/models")
+    assert list_response.status_code == 200
+    listed_ids = [model["id"] for model in list_response.get_json()["data"]]
+    assert listed_ids == ["llama-3.1-8b-instruct"]
+    assert "llama-3-8b-instruct" not in listed_ids
+
+    captured = {}
+
+    def fake_generate_response(model_id, messages, **_options):
+        captured["model_id"] = model_id
+        return messages + [{"role": "assistant", "content": "alias accepted"}]
+
+    monkeypatch.setattr(compute_provider, "generate_response", fake_generate_response)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["model"] == "llama-3-8b-instruct"
+    assert captured["model_id"] == "llama-3.1-8b-instruct"
+
+
+def test_api_v1_alignment_model_is_not_listed_or_accepted(client):
+    listed_ids = [model["id"] for model in client.get("/api/v1/models").get_json()["data"]]
+    assert "llama-3-8b-instruct:alignment" not in listed_ids
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["error"]["code"] == "model_not_found"
+
+
+def test_landing_page_does_not_render_model_owner_line():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert "selectedModelSummary" not in html
+    assert "owned by token.place" not in html
+    assert "owned by" not in html

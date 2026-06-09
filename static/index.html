@@ -447,7 +447,6 @@
                 </select>
                 <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>
                 <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
-                <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
             </div>
             <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label">{{ selectedServerKeyLabel }}</p>
             <div
@@ -511,13 +510,15 @@
   "object": "list",
   "data": [
     {
-      "id": "llama-3-8b-instruct",
+      "id": "llama-3.1-8b-instruct",
       "object": "model",
       "created": CREATED_UNIX_SECONDS,
-      "owned_by": "token.place",
+      "owned_by": "Meta",
+      "provider": "meta",
+      "source": "meta-llama/Llama-3.1-8B-Instruct",
       "permission": [
         {
-          "id": "modelperm-llama-3-8b-instruct",
+          "id": "modelperm-llama-3.1-8b-instruct",
           "object": "model_permission",
           "created": CREATED_UNIX_SECONDS,
           "allow_create_engine": false,
@@ -531,7 +532,7 @@
           "is_blocking": false
         }
       ],
-      "root": "llama-3-8b-instruct",
+      "root": "llama-3.1-8b-instruct",
       "parent": null
     }
   ]
@@ -562,7 +563,7 @@
             <p>Creates a non-streaming chat completion. API v1 rejects <code>stream: true</code>. Encrypted mode sends ciphertext under <code>messages</code> and includes the client public key so only the client can decrypt the response.</p>
             <p><strong>Encrypted Request Body:</strong></p>
             <pre>{
-  "model": "llama-3-8b-instruct",
+  "model": "llama-3.1-8b-instruct",
   "encrypted": true,
   "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
   "messages": {

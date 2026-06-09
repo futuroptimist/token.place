@@ -1077,7 +1077,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
-        lambda: [{"id": "llama-3-8b-instruct"}],
+        lambda: [{"id": "llama-3.1-8b-instruct"}],
     )
     monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
 
@@ -1118,7 +1118,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
 
     body = response.get_json()
     assert body["model"] == "llama-3-8b-instruct"
-    assert captured["model_id"] == "llama-3-8b-instruct"
+    assert captured["model_id"] == "llama-3.1-8b-instruct"
     assert captured["messages"] == payload["messages"]
     assert body["choices"][0]["message"]["content"] == "Llama response"
 

@@ -103,23 +103,29 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
+CANONICAL_MODEL_ID = "llama-3.1-8b-instruct"
+LEGACY_LLAMA_3_MODEL_ID = "llama-3-8b-instruct"
+
 MODEL_ALIASES: Dict[str, str] = {
-    # Temporary OpenAI-client compatibility aliases that route to the fixed
-    # Meta Llama 3.1 8B backend; these are not first-class GPT model support.
-    # Any removal should happen in a dedicated compatibility/deprecation PR.
-    "gpt-3.5-turbo": "llama-3-8b-instruct",
-    "gpt-5-chat-latest": "llama-3-8b-instruct",
+    # Invisible compatibility aliases that route to the fixed Meta Llama 3.1
+    # 8B launch model; these are not listed as public API v1 catalogue items.
+    LEGACY_LLAMA_3_MODEL_ID: CANONICAL_MODEL_ID,
+    "gpt-3.5-turbo": CANONICAL_MODEL_ID,
+    "gpt-5-chat-latest": CANONICAL_MODEL_ID,
 }
 
 
 AVAILABLE_MODELS = [
     {
-        "id": "llama-3-8b-instruct",
+        "id": CANONICAL_MODEL_ID,
         "name": "Meta Llama 3.1 8B Instruct",
         "description": (
             "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
             "Q4_K_M quantisation that comfortably fits within a 24 GB RTX 4090."
         ),
+        "owned_by": "Meta",
+        "provider": "meta",
+        "source": "meta-llama/Llama-3.1-8B-Instruct",
         "parameters": "8B",
         "quantization": "Q4_K_M",
         "context_length": 8192,
@@ -128,22 +134,6 @@ AVAILABLE_MODELS = [
             "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
         ),
         "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        "adapters": [
-            {
-                "id": "llama-3-8b-instruct:alignment",
-                "name": "Meta Llama 3.1 8B Alignment Assistant",
-                "description": (
-                    "Alignment-tuned variant emphasising helpful, honest, and harmless replies "
-                    "using constitutional guardrails."
-                ),
-                "instructions": (
-                    "You are the alignment-focused variant of Meta Llama 3.1 8B. Follow the "
-                    "provided safety charter to remain helpful, honest, harmless, and to call "
-                    "out uncertain answers."
-                ),
-                "share_base": True,
-            }
-        ],
     }
 ]
 
@@ -187,18 +177,8 @@ def _get_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
         if entry["id"] == model_id:
             return entry
 
-    # Fall back to the v2 catalogue so chat completions can load any model
-    # surfaced via the API v2 listings. Import lazily to avoid a hard dependency
-    # when the v2 module is unused (e.g. in legacy API v1 only deployments).
-    try:
-        from api.v2.models import get_models_info as get_v2_models_info  # type: ignore
-    except Exception as exc:  # pragma: no cover - defensive logging branch
-        log_warning(f"Unable to load API v2 catalogue: {exc}")
-        return None
-
-    for entry in get_v2_models_info():
-        if entry["id"] == model_id:
-            return entry
+    # API v1 launch catalog is intentionally separate from API v2. Do not
+    # silently pull API v2 model IDs into API v1 runtime validation.
     return None
 
 
@@ -256,13 +236,16 @@ def get_model_instance(model_id):
     if not model_id:
         raise ModelError("Model ID cannot be empty", status_code=400, error_type="invalid_request_error")
 
-    # First check if the model ID exists in available models
+    # First check if the model ID exists in available models, accepting
+    # documented invisible compatibility aliases without listing them publicly.
+    requested_model_id = model_id
+    model_id = resolve_model_alias(model_id) or model_id
     model_meta = _get_model_metadata(model_id)
     if not model_meta:
         available_ids = [m["id"] for m in _iter_model_entries()]
-        logger.warning(f"Model {model_id} not found. Available models: {available_ids}")
+        logger.warning(f"Model {requested_model_id} not found. Available models: {available_ids}")
         raise ModelError(
-            f"Model '{model_id}' not found. Available models: {', '.join(available_ids)}",
+            f"Model '{requested_model_id}' not found. Available models: {', '.join(available_ids)}",
             status_code=400,
             error_type="model_not_found"
         )
@@ -334,6 +317,7 @@ def generate_response(model_id, messages, **options):
         ModelError: If there's an error with the model or input
     """
     start_time = time.time()
+    model_id = resolve_model_alias(model_id) or model_id
     logger.info(f"Generating response using model: {model_id}")
 
     # Validate input

@@ -138,7 +138,7 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3-8b-instruct",
+            "model": "llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         },
@@ -156,10 +156,12 @@ def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["object"] == "list"
-    assert payload["data"]
+    assert [model["id"] for model in payload["data"]] == ["llama-3.1-8b-instruct"]
     for model in payload["data"]:
         assert model["object"] == "model"
-        assert model["owned_by"] == "token.place"
+        assert model["owned_by"] == "Meta"
+        assert model["provider"] == "meta"
+        assert model["source"] == "meta-llama/Llama-3.1-8B-Instruct"
         assert "permission" in model
         assert isinstance(model["permission"], list)
         assert model["permission"]

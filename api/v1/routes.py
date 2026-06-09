@@ -110,6 +110,17 @@ def _looks_like_model_error(exc: Exception) -> bool:
     return exc.__class__.__name__ == "ModelError" and hasattr(exc, "status_code")
 
 
+def _is_supported_api_v1_model_request(
+    *, requested_model_id: str | None, resolved_model_id: str | None
+) -> bool:
+    """Return True when a requested/canonical model is in the public v1 catalog."""
+
+    supported_model_ids = {
+        entry.get("id") for entry in get_models_info() if isinstance(entry, dict)
+    }
+    return resolved_model_id in supported_model_ids or requested_model_id in supported_model_ids
+
+
 def _format_model_error_response(exc: Exception):
     """Format model errors from the active or an equivalent reloaded module."""
 
@@ -508,8 +519,10 @@ def _handle_chat_completion_request(data):
             % (resolved_provider_name, resolved_provider_path)
         )
         if not _is_relay_capable_provider_path(resolved_provider_path):
-            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
-            if model_id not in supported_model_ids:
+            if not _is_supported_api_v1_model_request(
+                requested_model_id=requested_model_id,
+                resolved_model_id=model_id,
+            ):
                 return format_error_response(
                     f"Model '{model_id}' is not supported by API v1.",
                     error_type="invalid_request_error",
@@ -645,7 +658,12 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        model_id = data.get("model")
+        requested_model_id = data.get("model")
+        model_id = (
+            (resolve_model_alias(requested_model_id) or requested_model_id)
+            if requested_model_id
+            else requested_model_id
+        )
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")
         is_encrypted_request = data.get("encrypted", False)
@@ -695,8 +713,10 @@ def _handle_text_completion_request(data):
             % (resolved_provider_name, resolved_provider_path)
         )
         if not _is_relay_capable_provider_path(resolved_provider_path):
-            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
-            if model_id not in supported_model_ids:
+            if not _is_supported_api_v1_model_request(
+                requested_model_id=requested_model_id,
+                resolved_model_id=model_id,
+            ):
                 return format_error_response(
                     f"Model '{model_id}' is not supported by API v1.",
                     error_type="invalid_request_error",
@@ -1195,11 +1215,11 @@ def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
     """Build a stable OpenAI-compatible model payload."""
 
     created_ts = _stable_openai_model_created(model["id"])
-    return {
+    payload = {
         "id": model["id"],
         "object": "model",
         "created": created_ts,
-        "owned_by": "token.place",
+        "owned_by": model.get("owned_by", "Meta"),
         "permission": [{
             "id": f"modelperm-{model['id']}",
             "object": "model_permission",
@@ -1217,6 +1237,11 @@ def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
         "root": model["id"],
         "parent": None
     }
+    if model.get("provider"):
+        payload["provider"] = model["provider"]
+    if model.get("source"):
+        payload["source"] = model["source"]
+    return payload
 
 
 @v1_bp.route('/health', methods=['GET'])

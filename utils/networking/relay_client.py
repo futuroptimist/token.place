@@ -479,6 +479,7 @@ class RelayClient:
     """
 
     _API_V1_LOCAL_LLAMA_RUNTIME_IDS = {
+        "llama-3.1-8b-instruct",
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
         "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
@@ -486,12 +487,11 @@ class RelayClient:
         "meta-llama-3-8b-instruct-q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
-        "gpt-3.5-turbo": "llama-3-8b-instruct",
-        "gpt-5-chat-latest": "llama-3-8b-instruct",
+        "llama-3-8b-instruct": "llama-3.1-8b-instruct",
+        "gpt-3.5-turbo": "llama-3.1-8b-instruct",
+        "gpt-5-chat-latest": "llama-3.1-8b-instruct",
     }
-    _API_V1_LOCAL_ADAPTER_BASE_MODELS = {
-        "llama-3-8b-instruct:alignment": "llama-3-8b-instruct",
-    }
+    _API_V1_LOCAL_ADAPTER_BASE_MODELS: Dict[str, str] = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant", "function"}
 
     def __init__(
@@ -1733,13 +1733,7 @@ class RelayClient:
     def _api_v1_adapter_system_message(model_id: str) -> Optional[Dict[str, str]]:
         """Return local API v1 adapter instructions that do not require server imports."""
 
-        adapter_instructions = {
-            "llama-3-8b-instruct:alignment": (
-                "You are the alignment-focused variant of Meta Llama 3.1 8B. "
-                "Follow the provided safety charter to remain helpful, honest, "
-                "harmless, and to call out uncertain answers."
-            ),
-        }
+        adapter_instructions: Dict[str, str] = {}
         instructions = adapter_instructions.get(model_id.strip().lower())
         if not instructions:
             return None
@@ -1821,8 +1815,6 @@ class RelayClient:
         adapter_base = cls._API_V1_LOCAL_ADAPTER_BASE_MODELS.get(normalized_model)
         if adapter_base:
             ids.add(adapter_base)
-        if ":" in normalized_model:
-            ids.add(normalized_model.split(":", 1)[0])
         ids.add(cls._api_v1_catalogue_resolved_model_id(normalized_model))
         return {value for value in ids if value}
 

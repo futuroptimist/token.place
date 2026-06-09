@@ -1,10 +1,12 @@
-"""Adapter support tests for api.v1.models."""
+"""Regression tests ensuring hallucinated API v1 adapters stay removed."""
 
 import importlib
 from typing import Dict
 
+import pytest
+
 ADAPTER_ID = "llama-3-8b-instruct:alignment"
-BASE_ID = "llama-3-8b-instruct"
+BASE_ID = "llama-3.1-8b-instruct"
 
 
 def _reload_models(monkeypatch, env: Dict[str, str] | None = None):
@@ -18,25 +20,19 @@ def _reload_models(monkeypatch, env: Dict[str, str] | None = None):
     return models
 
 
-def test_get_models_info_exposes_adapter_metadata(monkeypatch):
+def test_get_models_info_does_not_expose_alignment_adapter(monkeypatch):
     models = _reload_models(monkeypatch, {"USE_MOCK_LLM": "1"})
 
     info = models.get_models_info()
-    adapter_entry = next((item for item in info if item["id"] == ADAPTER_ID), None)
 
-    assert adapter_entry is not None, "adapter should be listed alongside base models"
-    assert adapter_entry["base_model_id"] == BASE_ID
-    assert adapter_entry.get("adapter", {}).get("instructions"), "instructions are required"
+    assert [item["id"] for item in info] == [BASE_ID]
+    assert all(item.get("adapter") is None for item in info)
 
 
-def test_generate_response_injects_adapter_prompt(monkeypatch):
+def test_generate_response_rejects_removed_alignment_adapter(monkeypatch):
     models = _reload_models(monkeypatch, {"USE_MOCK_LLM": "1"})
-    monkeypatch.setattr(models.random, "choice", lambda seq: seq[0])
 
-    messages = [{"role": "user", "content": "hello"}]
-    response = models.generate_response(ADAPTER_ID, messages)
+    with pytest.raises(models.ModelError) as exc:
+        models.generate_response(ADAPTER_ID, [{"role": "user", "content": "hello"}])
 
-    assert response[0]["role"] == "system"
-    assert response[0]["name"].startswith("adapter:")
-    assert "alignment" in response[0]["content"].lower()
-    assert response[-1]["role"] == "assistant"
+    assert exc.value.error_type == "model_not_found"

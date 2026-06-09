@@ -103,19 +103,27 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
+CANONICAL_LAUNCH_MODEL_ID = "llama-3.1-8b-instruct"
+
 MODEL_ALIASES: Dict[str, str] = {
+    # Invisible compatibility alias for clients that integrated before the
+    # launch catalogue ID was corrected to match Meta Llama 3.1.
+    "llama-3-8b-instruct": CANONICAL_LAUNCH_MODEL_ID,
     # Temporary OpenAI-client compatibility aliases that route to the fixed
     # Meta Llama 3.1 8B backend; these are not first-class GPT model support.
     # Any removal should happen in a dedicated compatibility/deprecation PR.
-    "gpt-3.5-turbo": "llama-3-8b-instruct",
-    "gpt-5-chat-latest": "llama-3-8b-instruct",
+    "gpt-3.5-turbo": CANONICAL_LAUNCH_MODEL_ID,
+    "gpt-5-chat-latest": CANONICAL_LAUNCH_MODEL_ID,
 }
 
 
 AVAILABLE_MODELS = [
     {
-        "id": "llama-3-8b-instruct",
+        "id": CANONICAL_LAUNCH_MODEL_ID,
         "name": "Meta Llama 3.1 8B Instruct",
+        "owned_by": "Meta",
+        "provider": "meta",
+        "source_model": "meta-llama/Llama-3.1-8B-Instruct",
         "description": (
             "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
             "Q4_K_M quantisation that comfortably fits within a 24 GB RTX 4090."
@@ -128,22 +136,6 @@ AVAILABLE_MODELS = [
             "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
         ),
         "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        "adapters": [
-            {
-                "id": "llama-3-8b-instruct:alignment",
-                "name": "Meta Llama 3.1 8B Alignment Assistant",
-                "description": (
-                    "Alignment-tuned variant emphasising helpful, honest, and harmless replies "
-                    "using constitutional guardrails."
-                ),
-                "instructions": (
-                    "You are the alignment-focused variant of Meta Llama 3.1 8B. Follow the "
-                    "provided safety charter to remain helpful, honest, harmless, and to call "
-                    "out uncertain answers."
-                ),
-                "share_base": True,
-            }
-        ],
     }
 ]
 
@@ -186,6 +178,9 @@ def _get_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
     for entry in _iter_model_entries():
         if entry["id"] == model_id:
             return entry
+
+    if ":" in model_id:
+        return None
 
     # Fall back to the v2 catalogue so chat completions can load any model
     # surfaced via the API v2 listings. Import lazily to avoid a hard dependency
@@ -255,6 +250,8 @@ def get_model_instance(model_id):
     # Check input
     if not model_id:
         raise ModelError("Model ID cannot be empty", status_code=400, error_type="invalid_request_error")
+
+    model_id = resolve_model_alias(model_id) or model_id
 
     # First check if the model ID exists in available models
     model_meta = _get_model_metadata(model_id)
@@ -334,6 +331,7 @@ def generate_response(model_id, messages, **options):
         ModelError: If there's an error with the model or input
     """
     start_time = time.time()
+    model_id = resolve_model_alias(model_id) or model_id
     logger.info(f"Generating response using model: {model_id}")
 
     # Validate input

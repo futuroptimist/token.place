@@ -1954,14 +1954,14 @@ class TestRelayClient:
         assert RelayClient._valid_api_v1_assistant_message(message) == message
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_api_v1_adapter_model_uses_shared_llama_runtime(
+    def test_process_client_request_api_v1_removed_adapter_model_returns_error(
         self,
         mock_post,
         relay_client,
         mock_crypto_manager,
         mock_model_manager,
     ):
-        """API v1 adapter IDs should share the local Llama base runtime."""
+        """Removed API v1 adapter IDs should fail closed at the compute node."""
 
         request_data = TEST_VALID_RESPONSE.copy()
         mock_model_manager.use_mock_llm = False
@@ -1987,15 +1987,9 @@ class TestRelayClient:
         assert relay_client.process_client_request(request_data) is True
 
         mock_model_manager.llama_cpp_get_response.assert_not_called()
-        runtime_messages = mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
-            "messages"
-        ]
-        assert runtime_messages[0]["role"] == "system"
-        assert runtime_messages[0]["name"] == "adapter:llama-3-8b-instruct:alignment"
-        assert "alignment-focused variant" in runtime_messages[0]["content"]
-        assert runtime_messages[1] == {"role": "user", "content": "Hello"}
+        mock_model_manager.runtime.create_chat_completion.assert_not_called()
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert "error" not in encrypted_envelope["api_v1_response"]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_normalises_multipart_content_blocks(

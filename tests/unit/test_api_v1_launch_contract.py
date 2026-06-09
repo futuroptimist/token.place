@@ -138,7 +138,7 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3-8b-instruct",
+            "model": "llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         },
@@ -156,16 +156,30 @@ def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["object"] == "list"
-    assert payload["data"]
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["id"] == "llama-3.1-8b-instruct"
     for model in payload["data"]:
         assert model["object"] == "model"
-        assert model["owned_by"] == "token.place"
+        assert model["owned_by"] == "Meta"
         assert "permission" in model
         assert isinstance(model["permission"], list)
         assert model["permission"]
         assert model["permission"][0]["object"] == "model_permission"
         assert "metadata" not in model
         assert "adapter" not in model
+
+
+
+def test_api_v1_model_detail_keeps_old_alias_invisible_and_rejects_alignment(client):
+    alias_response = client.get("/api/v1/models/llama-3-8b-instruct")
+    assert alias_response.status_code == 200
+    alias_payload = alias_response.get_json()
+    assert alias_payload["id"] == "llama-3.1-8b-instruct"
+    assert alias_payload["owned_by"] == "Meta"
+
+    alignment_response = client.get("/api/v1/models/llama-3-8b-instruct:alignment")
+    assert alignment_response.status_code == 404
+    assert alignment_response.get_json()["error"]["code"] == "model_not_found"
 
 
 def test_landing_page_model_example_documents_openai_permission_objects():
@@ -178,13 +192,17 @@ def test_landing_page_model_example_documents_openai_permission_objects():
     assert '"allow_sampling": true' in models_section
     assert '"created": CREATED_UNIX_SECONDS' in models_section
     assert '"created": 1700000000' not in models_section
+    assert '"id": "llama-3.1-8b-instruct"' in models_section
+    assert '"owned_by": "Meta"' in models_section
+    assert "llama-3-8b-instruct:alignment" not in html
+    assert "owned by token.place" not in html.lower()
 
 
 def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
     original_compute_generator = compute_provider.generate_response
 
     def fake_generate_response(model_id, messages, **options):
-        assert model_id == "llama-3-8b-instruct"
+        assert model_id == "llama-3.1-8b-instruct"
         assert options == {"temperature": 0.2}
         return messages + [{"role": "assistant", "content": "request-local bridge"}]
 
@@ -192,7 +210,7 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
 
     result = routes._call_provider_complete_chat(
         compute_provider.LocalApiV1ComputeProvider(),
-        model_id="llama-3-8b-instruct",
+        model_id="llama-3.1-8b-instruct",
         messages=[{"role": "user", "content": "hello"}],
         options={"temperature": 0.2},
     )

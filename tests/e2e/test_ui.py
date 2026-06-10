@@ -47,6 +47,7 @@ def route_landing_relay_chat(
     assistant_content: str = "Relay chat path restored.",
     models_payload: dict | None = None,
     next_status: int = 200,
+    next_statuses: list[int] | None = None,
     next_server_keys: list[str] | None = None,
     request_statuses: list[int] | None = None,
     retrieve_statuses: list[int] | None = None,
@@ -83,9 +84,12 @@ def route_landing_relay_chat(
 
     def handle_next(route):
         state["next_calls"] += 1
-        if next_status != 200:
+        status = next_status
+        if next_statuses:
+            status = next_statuses[min(state["next_calls"] - 1, len(next_statuses) - 1)]
+        if status != 200:
             route.fulfill(
-                status=next_status,
+                status=status,
                 headers={"Content-Type": "application/json"},
                 body=json.dumps({"error": {"code": "no_registered_compute_nodes"}}),
             )
@@ -547,18 +551,18 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
         ("retrieve", 410),
     ],
 )
-def test_landing_chat_terminal_server_failure_requires_explicit_new_chat_retry(
+def test_landing_chat_sticky_server_auto_failover_preserves_history(
     page: Page,
     base_url: str,
     setup_servers,
     terminal_endpoint: str,
     terminal_status: int,
 ):
-    """A terminal selected-server error locks the chat until the user explicitly starts fresh."""
+    """Terminal selected-server errors retry once with the next API v1 relay server."""
 
     route_kwargs = {
-        "request_statuses": [terminal_status, 200] if terminal_endpoint == "dispatch" else None,
-        "retrieve_statuses": [terminal_status, 200] if terminal_endpoint == "retrieve" else None,
+        "request_statuses": [200, 200, terminal_status, 200, 200] if terminal_endpoint == "dispatch" else None,
+        "retrieve_statuses": [200, 200, terminal_status, 200, 200] if terminal_endpoint == "retrieve" else None,
     }
     state = route_landing_relay_chat(
         page,
@@ -569,50 +573,94 @@ def test_landing_chat_terminal_server_failure_requires_explicit_new_chat_retry(
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
+    page.evaluate(
+        """
+        () => {
+            window.__landingReloadEvents = 0;
+            window.addEventListener('beforeunload', () => { window.__landingReloadEvents += 1; });
+        }
+        """
+    )
     patch_landing_crypto_for_visible_envelopes(page)
 
     textarea = page.locator("textarea").first
-    textarea.fill("first attempt")
+    textarea.fill("first turn")
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").last.wait_for(state="visible")
+    initial_label = page.get_by_test_id("landing-server-key-label").inner_text()
 
-    failure = page.get_by_test_id("landing-selected-server-failure")
-    failure.wait_for(state="visible")
-    assert "Start a new chat to select another server" in failure.inner_text()
-    assert page.locator(".assistant-message").last.inner_text().count("Start a new chat") == 1
+    textarea.fill("second turn")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").nth(1).wait_for(state="visible")
     assert state["next_calls"] == 1
-    assert len(state["relay_requests"]) == 1
-    if terminal_endpoint == "retrieve":
-        assert len(state["retrieve_requests"]) == 1
 
-    textarea.fill("second attempt without explicit retry")
-    page.evaluate("() => document.querySelector('#app').__vue__.sendMessage()")
-    page.wait_for_timeout(250)
-    assert state["next_calls"] == 1
-    assert len(state["relay_requests"]) == 1
-    if terminal_endpoint == "retrieve":
-        assert len(state["retrieve_requests"]) == 1
-
-    page.get_by_test_id("landing-new-chat-retry").click()
-    failure.wait_for(state="hidden")
-    assert page.locator(".message").count() == 0
-
-    textarea.fill("fresh attempt")
+    textarea.fill("failover turn")
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function(
         """
         () => Array.from(document.querySelectorAll('.assistant-message'))
             .some((node) => node.textContent.includes('Replacement server answered.'))
+            && document.querySelectorAll('.assistant-message').length >= 3
         """
     )
+
+    failover_status = page.get_by_test_id("landing-selected-server-failure")
+    failover_status.wait_for(state="visible")
+    assert "The previous LLM server disconnected. Continuing with another available server." in failover_status.inner_text()
+    new_label = page.get_by_test_id("landing-server-key-label").inner_text()
+    assert re.fullmatch(r"Server: [0-9a-f]{8}…[0-9a-f]{8}", new_label)
+    assert new_label != initial_label
+    assert page.locator(".user-message", has_text="first turn").count() == 1
+    assert page.locator(".user-message", has_text="second turn").count() == 1
+    assert page.locator(".user-message", has_text="failover turn").count() == 1
+
+    textarea.fill("post failover turn")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").nth(3).wait_for(state="visible")
 
     assert state["next_calls"] == 2
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
         SERVER_PUBLIC_KEY_B64,
+        SERVER_PUBLIC_KEY_B64,
+        SERVER_PUBLIC_KEY_B64,
+        ALT_SERVER_PUBLIC_KEY_B64,
         ALT_SERVER_PUBLIC_KEY_B64,
     ]
-    fresh_envelope = json.loads(state["relay_requests"][1]["ciphertext"])
-    assert fresh_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "fresh attempt"}]
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[2]["request_id"] != envelopes[3]["request_id"]
+    assert envelopes[3]["api_v1_request"]["messages"][-1] == {"role": "user", "content": "failover turn"}
+    assert envelopes[3]["api_v1_request"]["messages"][0] == {"role": "user", "content": "first turn"}
+    assert envelopes[4]["api_v1_request"]["messages"][-1] == {"role": "user", "content": "post failover turn"}
+    assert page.evaluate("() => window.__landingReloadEvents") == 0
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_failover_no_server_keeps_history(page: Page, base_url: str, setup_servers):
+    """If failover cannot find another relay server, history stays visible and no refresh is needed."""
+
+    state = route_landing_relay_chat(
+        page,
+        next_statuses=[200, 503],
+        request_statuses=[404],
+        next_server_keys=[SERVER_PUBLIC_KEY_B64],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("please preserve me")
+    wait_for_landing_send_enabled(page).click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "No LLM servers are available right now. Your chat history is still here." in assistant_message.inner_text()
+    assert page.get_by_test_id("landing-selected-server-failure").inner_text().count("Your chat history is still here") == 1
+    assert page.locator(".user-message", has_text="please preserve me").count() == 1
+    assert state["next_calls"] == 2
+    assert len(state["relay_requests"]) == 1
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

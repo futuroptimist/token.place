@@ -76,8 +76,7 @@ new Vue({
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
                 this.selectedModel &&
-                !this.isGeneratingResponse &&
-                !this.selectedServerTerminalFailure
+                !this.isGeneratingResponse
             );
         }
     },
@@ -222,13 +221,9 @@ new Vue({
             return `Server: ${fingerprint.slice(0, 8)}…${fingerprint.slice(-8)}`;
         },
 
-        async ensureSelectedServer() {
-            if (this.selectedServerTerminalFailure) {
-                return {
-                    error: {
-                        userMessage: this.selectedServerTerminalFailure
-                    }
-                };
+        async ensureSelectedServer(options = {}) {
+            if (options.forceRefresh) {
+                this.clearSelectedServer();
             }
 
             if (this.selectedServerPublicKey && this.selectedServerPublicKeyB64) {
@@ -265,13 +260,15 @@ new Vue({
                     ? this.encodePemToBase64(normalizedKey)
                     : rawKeyText.replace(/\s+/g, '');
                 this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
-                this.selectedServerTerminalFailure = '';
+                if (this.selectedServerTerminalFailure !== 'The previous LLM server disconnected. Continuing with another available server.') {
+                    this.selectedServerTerminalFailure = '';
+                }
                 return true;
             } catch (error) {
                 console.error('Error selecting API v1 compute node:', error);
                 return {
                     error: {
-                        userMessage: 'Unable to select an LLM server right now. Please start a new chat session and try again.'
+                        userMessage: 'Unable to select an LLM server right now. Your chat history is still here.'
                     }
                 };
             }
@@ -297,7 +294,7 @@ new Vue({
         },
 
         markSelectedServerTerminalFailure(message) {
-            this.selectedServerTerminalFailure = message || 'The selected LLM server is unavailable or expired. Start a new chat to select another server.';
+            this.selectedServerTerminalFailure = message || 'The previous LLM server disconnected. Continuing with another available server.';
         },
 
         startNewChatAfterSelectedServerFailure() {
@@ -609,10 +606,10 @@ new Vue({
                 return null;
             }
             if (status === 404) {
-                return 'The selected LLM server response was not found. Start a new chat to select another server.';
+                return 'The selected LLM server response was not found.';
             }
             if (status === 410) {
-                return 'The selected LLM server request expired. Start a new chat to select another server.';
+                return 'The selected LLM server request expired.';
             }
             if (status >= 500) {
                 return 'The relay is unavailable right now. Please try again later.';
@@ -667,12 +664,10 @@ new Vue({
 
                 if (!response.ok) {
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
-                    if (response.status === 404 || response.status === 410) {
-                        this.markSelectedServerTerminalFailure(userMessage);
-                    }
                     return {
                         error: {
-                            userMessage
+                            userMessage,
+                            terminalSelectedServerFailure: response.status === 404 || response.status === 410
                         }
                     };
                 }
@@ -688,6 +683,34 @@ new Vue({
             };
         },
 
+        getBoundedFailoverAttemptLimit() {
+            const liveNodeCount = Number.isInteger(this.computeNodeCount) && this.computeNodeCount > 0
+                ? this.computeNodeCount
+                : 2;
+            return Math.max(2, Math.min(liveNodeCount, 3));
+        },
+
+        isTerminalSelectedServerError(status, errorPayload) {
+            if (status === 404 || status === 410) {
+                return true;
+            }
+
+            const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
+            const errorCode = error && typeof error.code === 'string' ? error.code : '';
+            return [
+                'selected_server_unavailable',
+                'selected_server_expired',
+                'selected_server_removed',
+                'selected_server_not_found',
+                'selected_server_terminal',
+                'server_unavailable'
+            ].includes(errorCode);
+        },
+
+        getNoServersAvailableMessage() {
+            return 'No LLM servers are available right now. Your chat history is still here.';
+        },
+
         // Send a message through the relay-blind API v1 E2EE request routes.
         async sendMessageApi(messageContent) {
             if (!this.selectedModel) {
@@ -695,11 +718,45 @@ new Vue({
                 return null;
             }
 
-            const selectedServer = await this.ensureSelectedServer();
-            if (selectedServer !== true) {
-                return selectedServer;
+            const maxAttempts = this.getBoundedFailoverAttemptLimit();
+            let forceRefreshServer = false;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                const selectedServer = await this.ensureSelectedServer({ forceRefresh: forceRefreshServer });
+                forceRefreshServer = false;
+                if (selectedServer !== true) {
+                    const selectedError = selectedServer && selectedServer.error ? selectedServer.error : {};
+                    const userMessage = selectedError.userMessage === 'No LLM servers are available right now.'
+                        ? this.getNoServersAvailableMessage()
+                        : selectedError.userMessage || this.getNoServersAvailableMessage();
+                    this.markSelectedServerTerminalFailure(userMessage);
+                    return {
+                        error: {
+                            userMessage
+                        }
+                    };
+                }
+
+                const requestResult = await this.sendMessageApiToSelectedServer(messageContent);
+                if (!requestResult || !requestResult.error || !requestResult.error.terminalSelectedServerFailure) {
+                    return requestResult;
+                }
+
+                this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
+                this.clearSelectedServer();
+                forceRefreshServer = true;
             }
 
+            const userMessage = 'Unable to continue with another LLM server right now. Your chat history is still here.';
+            this.markSelectedServerTerminalFailure(userMessage);
+            return {
+                error: {
+                    userMessage
+                }
+            };
+        },
+
+        async sendMessageApiToSelectedServer(messageContent) {
             const requestId = this.createRequestId();
             const cancelToken = this.createRequestId();
             const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
@@ -752,16 +809,14 @@ new Vue({
                     } catch (_jsonError) {
                         errorData = null;
                     }
-                    const unavailable = dispatchResponse.status === 404 || dispatchResponse.status === 410;
+                    const unavailable = this.isTerminalSelectedServerError(dispatchResponse.status, errorData);
                     const userMessage = unavailable
-                        ? 'The selected LLM server is unavailable or expired. Start a new chat to select another server.'
+                        ? 'The selected LLM server is unavailable or expired.'
                         : this.getUserFacingApiError(errorData);
-                    if (unavailable) {
-                        this.markSelectedServerTerminalFailure(userMessage);
-                    }
                     return {
                         error: {
-                            userMessage
+                            userMessage,
+                            terminalSelectedServerFailure: unavailable
                         }
                     };
                 }
@@ -800,7 +855,6 @@ new Vue({
                 return null;
             }
         },
-
 
         calculateTypingChunkSize(content) {
             if (!content || typeof content !== 'string') {

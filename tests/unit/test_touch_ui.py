@@ -83,5 +83,8 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js
-    assert "dispatchResponse.status === 404 || dispatchResponse.status === 410" in chat_js
+    assert "isTerminalSelectedServerError" in chat_js
+    assert "dispatchResponse.status" in chat_js
+    assert "terminalSelectedServerFailure" in chat_js
     assert "this.clearSelectedServer()" in chat_js
+    assert "The previous LLM server disconnected. Continuing with another available server." in chat_js

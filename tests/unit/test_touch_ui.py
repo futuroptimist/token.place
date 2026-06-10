@@ -92,14 +92,14 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "applySupersededSuccess" in chat_js
     assert "await this.refreshComputeNodeCount({ applySupersededSuccess: true });" in chat_js
     assert "Math.max(maxFailovers, 1)" in chat_js
-    assert "let originalFailedServerPublicKeyB64 = '';" in chat_js
-    assert "!originalFailedServerPublicKeyB64" in chat_js
-    assert "originalFailedServerPublicKeyB64 = this.selectedServerPublicKeyB64 || '';" in chat_js
+    assert "const terminallyFailedServerPublicKeysB64 = new Set();" in chat_js
+    assert "terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);" in chat_js
     assert "const maxReselectAttempts = Math.max(maxFailovers + 1, 1);" in chat_js
     assert "reselectAttempts >= maxReselectAttempts" in chat_js
     assert "sendMessageApiOnce" in chat_js
     assert "ensureSelectedServer({ forceReselect: true })" in chat_js
-    assert "originalFailedServerPublicKeyB64 && this.selectedServerPublicKeyB64 === originalFailedServerPublicKeyB64" in chat_js
+    assert "terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)" in chat_js
+    assert "originalFailedServerPublicKeyB64" not in chat_js
     assert "failedServerPublicKeyB64" not in chat_js
     assert "continue;" in chat_js
     assert "The previous LLM server disconnected. Continuing with another available server." in chat_js

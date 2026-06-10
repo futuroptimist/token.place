@@ -769,6 +769,67 @@ def test_landing_chat_failover_rejects_repeated_same_server_after_stale_count_re
     assert state["chat_completions"] == []
 
 
+@pytest.mark.e2e
+def test_landing_chat_failover_rejects_all_terminally_failed_servers(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """A replacement that fails terminally is not selected for the same failed turn again."""
+
+    state = route_landing_relay_chat(
+        page,
+        assistant_content="Initial answer before replacement failure.",
+        next_server_keys=[
+            SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+        ],
+        request_statuses=[200, 404, 404],
+        diagnostics_counts=[1, 3],
+    )
+    navigations = []
+    page.on("framenavigated", lambda frame: navigations.append(frame.url) if frame == page.main_frame else None)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    initial_navigation_count = len(navigations)
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    textarea = page.locator("textarea").first
+    textarea.fill("first turn remains visible after replacement fails")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").last.wait_for(state="visible")
+
+    textarea.fill("second turn cannot revisit failed replacement")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function(
+        """
+        () => document.body.textContent.includes('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.')
+        """
+    )
+
+    body_text = page.locator("body").inner_text()
+    assert "first turn remains visible after replacement fails" in body_text
+    assert "Initial answer before replacement failure." in body_text
+    assert "second turn cannot revisit failed replacement" in body_text
+    assert "The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here." in body_text
+
+    request_server_keys = [payload["server_public_key"] for payload in state["relay_requests"]]
+    assert request_server_keys == [
+        SERVER_PUBLIC_KEY_B64,
+        SERVER_PUBLIC_KEY_B64,
+        ALT_SERVER_PUBLIC_KEY_B64,
+    ]
+    assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
+    assert state["diagnostics_calls"] >= 2
+    assert state["next_calls"] == 4
+    assert len(navigations) == initial_navigation_count
+    assert state["v2_requests"] == []
+    assert state["chat_completions"] == []
+
+
 def test_landing_chat_model_dropdown_uses_api_v1_models(
     page: Page,
     base_url: str,

@@ -840,13 +840,13 @@ new Vue({
             let reselectAttempts = 0;
             let failovers = 0;
             let needsDispatch = true;
-            let originalFailedServerPublicKeyB64 = '';
+            const terminallyFailedServerPublicKeysB64 = new Set();
 
             while (failovers <= maxFailovers) {
                 if (needsDispatch) {
                     const response = await this.sendMessageApiOnce(messageContent);
-                    if (response && response.error && response.error.terminalSelectedServer === true && !originalFailedServerPublicKeyB64) {
-                        originalFailedServerPublicKeyB64 = this.selectedServerPublicKeyB64 || '';
+                    if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
+                        terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
                     if (!response || !response.error || response.error.terminalSelectedServer !== true) {
                         if (response && !(response.error && response.error.terminalSelectedServer === true)) {
@@ -888,7 +888,7 @@ new Vue({
                     this.markSelectedServerTerminalFailure(userMessage);
                     return { error: { userMessage } };
                 }
-                if (originalFailedServerPublicKeyB64 && this.selectedServerPublicKeyB64 === originalFailedServerPublicKeyB64) {
+                if (terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)) {
                     this.clearSelectedServer();
                     this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
                     continue;

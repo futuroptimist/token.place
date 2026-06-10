@@ -89,9 +89,13 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "getFailoverAttemptLimit" in chat_js
     assert "const replacementCount = Math.max(this.computeNodeCount - 1, 0);" in chat_js
     assert "return Math.min(replacementCount, 3);" in chat_js
+    assert "await this.refreshComputeNodeCount();" in chat_js
+    assert "const maxReselectAttempts = Math.max(maxFailovers + 1, 1);" in chat_js
+    assert "reselectAttempts >= maxReselectAttempts" in chat_js
     assert "sendMessageApiOnce" in chat_js
     assert "ensureSelectedServer({ forceReselect: true })" in chat_js
     assert "failedServerPublicKeyB64 && this.selectedServerPublicKeyB64 === failedServerPublicKeyB64" in chat_js
+    assert "continue;" in chat_js
     assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
     assert "No LLM servers are available right now. Your chat history is still here." in chat_js
     assert "this.clearSelectedServer()" in chat_js

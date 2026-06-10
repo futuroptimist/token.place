@@ -88,14 +88,14 @@ new Vue({
             try {
                 const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
                 if (requestId !== this.computeNodeCountRequestId) {
-                    return;
+                    return false;
                 }
                 if (!response.ok) {
                     throw new Error('Failed to fetch relay diagnostics');
                 }
                 const data = await response.json();
                 if (requestId !== this.computeNodeCountRequestId) {
-                    return;
+                    return false;
                 }
                 if (
                     !data ||
@@ -114,13 +114,15 @@ new Vue({
                     hour: '2-digit',
                     minute: '2-digit'
                 });
+                return true;
             } catch (error) {
                 if (requestId !== this.computeNodeCountRequestId) {
-                    return;
+                    return false;
                 }
                 console.warn('Unable to refresh compute-node count:', error);
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';
+                return false;
             }
         },
 
@@ -828,19 +830,32 @@ new Vue({
         },
 
         async sendMessageApi(messageContent) {
-            const maxFailovers = this.getFailoverAttemptLimit();
+            let maxFailovers = this.getFailoverAttemptLimit();
+            let refreshedFailoverCapacity = false;
+            let reselectAttempts = 0;
             let failovers = 0;
+            let needsDispatch = true;
 
             while (failovers <= maxFailovers) {
-                const response = await this.sendMessageApiOnce(messageContent);
-                if (!response || !response.error || response.error.terminalSelectedServer !== true) {
-                    if (response && !(response.error && response.error.terminalSelectedServer === true)) {
-                        this.clearSelectedServerNotice();
+                if (needsDispatch) {
+                    const response = await this.sendMessageApiOnce(messageContent);
+                    if (!response || !response.error || response.error.terminalSelectedServer !== true) {
+                        if (response && !(response.error && response.error.terminalSelectedServer === true)) {
+                            this.clearSelectedServerNotice();
+                        }
+                        return response;
                     }
-                    return response;
+                }
+                needsDispatch = false;
+
+                if (failovers >= maxFailovers && !refreshedFailoverCapacity) {
+                    refreshedFailoverCapacity = true;
+                    await this.refreshComputeNodeCount();
+                    maxFailovers = this.getFailoverAttemptLimit();
                 }
 
-                if (failovers >= maxFailovers) {
+                const maxReselectAttempts = Math.max(maxFailovers + 1, 1);
+                if (failovers >= maxFailovers || reselectAttempts >= maxReselectAttempts) {
                     this.clearSelectedServer();
                     this.markSelectedServerTerminalFailure('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.');
                     return {
@@ -850,10 +865,10 @@ new Vue({
                     };
                 }
 
-                failovers += 1;
                 const failedServerPublicKeyB64 = this.selectedServerPublicKeyB64;
                 this.clearSelectedServer();
                 this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
+                reselectAttempts += 1;
                 const selectedServer = await this.ensureSelectedServer({ forceReselect: true });
                 if (selectedServer !== true) {
                     const userMessage = selectedServer && selectedServer.error && selectedServer.error.userMessage
@@ -864,13 +879,11 @@ new Vue({
                 }
                 if (failedServerPublicKeyB64 && this.selectedServerPublicKeyB64 === failedServerPublicKeyB64) {
                     this.clearSelectedServer();
-                    this.markSelectedServerTerminalFailure('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.');
-                    return {
-                        error: {
-                            userMessage: 'The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.'
-                        }
-                    };
+                    this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
+                    continue;
                 }
+                failovers += 1;
+                needsDispatch = true;
             }
 
             return {

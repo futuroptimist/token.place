@@ -52,6 +52,7 @@ def route_landing_relay_chat(
     request_statuses: list[int] | None = None,
     retrieve_statuses: list[int] | None = None,
     diagnostics_count: int | None = None,
+    diagnostics_counts: list[int] | None = None,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -83,20 +84,27 @@ def route_landing_relay_chat(
         ),
     )
 
-    if diagnostics_count is not None:
-        page.route(
-            "**/relay/diagnostics",
-            lambda route: route.fulfill(
+    if diagnostics_count is not None or diagnostics_counts:
+        state["diagnostics_calls"] = 0
+
+        def handle_diagnostics(route):
+            state["diagnostics_calls"] += 1
+            if diagnostics_counts:
+                count = diagnostics_counts[min(state["diagnostics_calls"] - 1, len(diagnostics_counts) - 1)]
+            else:
+                count = diagnostics_count
+            route.fulfill(
                 status=200,
                 headers={"Content-Type": "application/json"},
                 body=json.dumps(
                     {
-                        "total_registered_compute_nodes": diagnostics_count,
-                        "total_api_v1_registered_compute_nodes": diagnostics_count,
+                        "total_registered_compute_nodes": count,
+                        "total_api_v1_registered_compute_nodes": count,
                     }
                 ),
-            ),
-        )
+            )
+
+        page.route("**/relay/diagnostics", handle_diagnostics)
 
     def handle_next(route):
         state["next_calls"] += 1
@@ -583,8 +591,8 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     state = route_landing_relay_chat(
         page,
         assistant_content="Replacement server answered.",
-        next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
-        diagnostics_count=2,
+        next_server_keys=[SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        diagnostics_counts=[1, 2],
         **route_kwargs,
     )
     navigations = []
@@ -637,7 +645,8 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
         """
     )
 
-    assert state["next_calls"] == 2
+    assert state["next_calls"] == 3
+    assert state["diagnostics_calls"] >= 2
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
         SERVER_PUBLIC_KEY_B64,
         SERVER_PUBLIC_KEY_B64,

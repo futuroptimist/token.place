@@ -155,6 +155,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_failover_no_servers_keeps_history",
     "tests/e2e/test_ui.py::test_landing_chat_failover_rejects_repeated_same_server_after_stale_count_refresh",
     "tests/e2e/test_ui.py::test_landing_chat_failover_rejects_all_terminally_failed_servers",
+    "tests/e2e/test_ui.py::test_landing_chat_failover_skips_failed_replacements_until_live_candidate",
     "tests/e2e/test_ui.py::test_landing_chat_model_dropdown_uses_api_v1_models",
     "tests/e2e/test_ui.py::test_landing_chat_model_catalog_failure_uses_api_v1_fallback",
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",

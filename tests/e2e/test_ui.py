@@ -824,7 +824,78 @@ def test_landing_chat_failover_rejects_all_terminally_failed_servers(
     ]
     assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
     assert state["diagnostics_calls"] >= 2
-    assert state["next_calls"] == 4
+    assert state["next_calls"] == 6
+    assert len(navigations) == initial_navigation_count
+    assert state["v2_requests"] == []
+    assert state["chat_completions"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Skipped failed keys do not exhaust the accepted replacement dispatch budget."""
+
+    live_server_public_key_b64 = base64.b64encode(
+        b"-----BEGIN PUBLIC KEY-----\nlive-third-server\n-----END PUBLIC KEY-----"
+    ).decode("ascii")
+    state = route_landing_relay_chat(
+        page,
+        assistant_content="Recovered on the live third server.",
+        next_server_keys=[
+            SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            live_server_public_key_b64,
+        ],
+        request_statuses=[200, 404, 404, 200],
+        diagnostics_counts=[1, 3],
+    )
+    navigations = []
+    page.on("framenavigated", lambda frame: navigations.append(frame.url) if frame == page.main_frame else None)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    initial_navigation_count = len(navigations)
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    textarea = page.locator("textarea").first
+    textarea.fill("first turn remains visible before live candidate")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").last.wait_for(state="visible")
+
+    textarea.fill("second turn reaches an untried live server")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").nth(1).wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => {
+            const messages = Array.from(document.querySelectorAll('.assistant-message'));
+            return messages.length >= 2 && messages[messages.length - 1].textContent.includes('Recovered on the live third server.');
+        }
+        """
+    )
+
+    body_text = page.locator("body").inner_text()
+    assert "first turn remains visible before live candidate" in body_text
+    assert "second turn reaches an untried live server" in body_text
+    assert "Recovered on the live third server." in body_text
+    assert "No replacement LLM server accepted this request" not in body_text
+
+    request_server_keys = [payload["server_public_key"] for payload in state["relay_requests"]]
+    assert request_server_keys == [
+        SERVER_PUBLIC_KEY_B64,
+        SERVER_PUBLIC_KEY_B64,
+        ALT_SERVER_PUBLIC_KEY_B64,
+        live_server_public_key_b64,
+    ]
+    assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
+    assert request_server_keys.count(live_server_public_key_b64) == 1
+    assert state["diagnostics_calls"] >= 2
+    assert state["next_calls"] == 5
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []
     assert state["chat_completions"] == []

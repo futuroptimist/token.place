@@ -837,7 +837,7 @@ new Vue({
         async sendMessageApi(messageContent) {
             let maxFailovers = this.getFailoverAttemptLimit();
             let refreshedFailoverCapacity = false;
-            let reselectAttempts = 0;
+            let skippedFailedServerSelections = 0;
             let failovers = 0;
             let needsDispatch = true;
             const terminallyFailedServerPublicKeysB64 = new Set();
@@ -866,8 +866,8 @@ new Vue({
                     maxFailovers = refreshed ? this.getFailoverAttemptLimit() : Math.max(maxFailovers, 1);
                 }
 
-                const maxReselectAttempts = Math.max(maxFailovers + 1, 1);
-                if (failovers >= maxFailovers || reselectAttempts >= maxReselectAttempts) {
+                const maxSkippedFailedServerSelections = Math.max(maxFailovers + terminallyFailedServerPublicKeysB64.size, 1);
+                if (failovers >= maxFailovers || skippedFailedServerSelections >= maxSkippedFailedServerSelections) {
                     this.clearSelectedServer();
                     this.markSelectedServerTerminalFailure('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.');
                     return {
@@ -879,7 +879,6 @@ new Vue({
 
                 this.clearSelectedServer();
                 this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
-                reselectAttempts += 1;
                 const selectedServer = await this.ensureSelectedServer({ forceReselect: true });
                 if (selectedServer !== true) {
                     const userMessage = selectedServer && selectedServer.error && selectedServer.error.userMessage
@@ -889,10 +888,12 @@ new Vue({
                     return { error: { userMessage } };
                 }
                 if (terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)) {
+                    skippedFailedServerSelections += 1;
                     this.clearSelectedServer();
                     this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
                     continue;
                 }
+                skippedFailedServerSelections = 0;
                 failovers += 1;
                 needsDispatch = true;
             }

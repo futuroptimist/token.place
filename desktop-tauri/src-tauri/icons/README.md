@@ -56,7 +56,7 @@ These assets are used by the Tauri desktop app build under:
 
 - `desktop-tauri/src-tauri/tauri.conf.json`
 
-They are also required by the GitHub Actions desktop release workflow:
+They are also required by the canonical GitHub Actions desktop release workflow (`Desktop Tauri Release`):
 
 - `.github/workflows/desktop-release.yml`
 

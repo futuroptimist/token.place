@@ -76,8 +76,7 @@ new Vue({
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
                 this.selectedModel &&
-                !this.isGeneratingResponse &&
-                !this.selectedServerTerminalFailure
+                !this.isGeneratingResponse
             );
         }
     },
@@ -222,13 +221,10 @@ new Vue({
             return `Server: ${fingerprint.slice(0, 8)}…${fingerprint.slice(-8)}`;
         },
 
-        async ensureSelectedServer() {
-            if (this.selectedServerTerminalFailure) {
-                return {
-                    error: {
-                        userMessage: this.selectedServerTerminalFailure
-                    }
-                };
+        async ensureSelectedServer(options = {}) {
+            const forceReselect = Boolean(options.forceReselect);
+            if (forceReselect) {
+                this.clearSelectedServer();
             }
 
             if (this.selectedServerPublicKey && this.selectedServerPublicKeyB64) {
@@ -265,13 +261,12 @@ new Vue({
                     ? this.encodePemToBase64(normalizedKey)
                     : rawKeyText.replace(/\s+/g, '');
                 this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
-                this.selectedServerTerminalFailure = '';
                 return true;
             } catch (error) {
                 console.error('Error selecting API v1 compute node:', error);
                 return {
                     error: {
-                        userMessage: 'Unable to select an LLM server right now. Please start a new chat session and try again.'
+                        userMessage: 'Unable to select an LLM server right now. Your chat history is still here.'
                     }
                 };
             }
@@ -297,7 +292,11 @@ new Vue({
         },
 
         markSelectedServerTerminalFailure(message) {
-            this.selectedServerTerminalFailure = message || 'The selected LLM server is unavailable or expired. Start a new chat to select another server.';
+            this.selectedServerTerminalFailure = message || 'The previous LLM server disconnected. Continuing with another available server.';
+        },
+
+        clearSelectedServerNotice() {
+            this.selectedServerTerminalFailure = '';
         },
 
         startNewChatAfterSelectedServerFailure() {
@@ -609,10 +608,10 @@ new Vue({
                 return null;
             }
             if (status === 404) {
-                return 'The selected LLM server response was not found. Start a new chat to select another server.';
+                return 'The previous LLM server disconnected. Continuing with another available server.';
             }
             if (status === 410) {
-                return 'The selected LLM server request expired. Start a new chat to select another server.';
+                return 'The previous LLM server disconnected. Continuing with another available server.';
             }
             if (status >= 500) {
                 return 'The relay is unavailable right now. Please try again later.';
@@ -643,6 +642,30 @@ new Vue({
             }
         },
 
+        isTerminalSelectedServerError(status, errorPayload) {
+            if (status === 404 || status === 410) {
+                return true;
+            }
+            const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
+            const errorCode = error && typeof error.code === 'string' ? error.code : '';
+            return [
+                'selected_server_terminal',
+                'selected_server_unavailable',
+                'selected_server_expired',
+                'selected_server_removed',
+                'server_unavailable',
+                'server_expired',
+                'server_removed'
+            ].includes(errorCode);
+        },
+
+        getFailoverAttemptLimit() {
+            const liveCount = Number.isInteger(this.computeNodeCount) && this.computeNodeCount > 0
+                ? this.computeNodeCount - 1
+                : 1;
+            return Math.max(1, Math.min(liveCount, 3));
+        },
+
         async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
             const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
             const pollIntervalMs = 500;
@@ -666,13 +689,17 @@ new Vue({
                 }
 
                 if (!response.ok) {
-                    const userMessage = this.getUserFacingRelayRetrieveError(response.status);
-                    if (response.status === 404 || response.status === 410) {
-                        this.markSelectedServerTerminalFailure(userMessage);
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_jsonError) {
+                        errorData = null;
                     }
+                    const userMessage = this.getUserFacingRelayRetrieveError(response.status);
                     return {
                         error: {
-                            userMessage
+                            userMessage,
+                            terminalSelectedServer: this.isTerminalSelectedServerError(response.status, errorData)
                         }
                     };
                 }
@@ -689,7 +716,7 @@ new Vue({
         },
 
         // Send a message through the relay-blind API v1 E2EE request routes.
-        async sendMessageApi(messageContent) {
+        async sendMessageApiOnce(messageContent) {
             if (!this.selectedModel) {
                 console.error('No API v1 catalogue model selected');
                 return null;
@@ -752,16 +779,14 @@ new Vue({
                     } catch (_jsonError) {
                         errorData = null;
                     }
-                    const unavailable = dispatchResponse.status === 404 || dispatchResponse.status === 410;
+                    const unavailable = this.isTerminalSelectedServerError(dispatchResponse.status, errorData);
                     const userMessage = unavailable
-                        ? 'The selected LLM server is unavailable or expired. Start a new chat to select another server.'
+                        ? 'The previous LLM server disconnected. Continuing with another available server.'
                         : this.getUserFacingApiError(errorData);
-                    if (unavailable) {
-                        this.markSelectedServerTerminalFailure(userMessage);
-                    }
                     return {
                         error: {
-                            userMessage
+                            userMessage,
+                            terminalSelectedServer: unavailable
                         }
                     };
                 }
@@ -799,6 +824,49 @@ new Vue({
                 console.error('API v1 relay request error:', error);
                 return null;
             }
+        },
+
+        async sendMessageApi(messageContent) {
+            const maxFailovers = this.getFailoverAttemptLimit();
+            let failovers = 0;
+
+            while (failovers <= maxFailovers) {
+                const response = await this.sendMessageApiOnce(messageContent);
+                if (!response || !response.error || response.error.terminalSelectedServer !== true) {
+                    if (response && !(response.error && response.error.terminalSelectedServer === true)) {
+                        this.clearSelectedServerNotice();
+                    }
+                    return response;
+                }
+
+                if (failovers >= maxFailovers) {
+                    this.clearSelectedServer();
+                    this.markSelectedServerTerminalFailure('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.');
+                    return {
+                        error: {
+                            userMessage: 'The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.'
+                        }
+                    };
+                }
+
+                failovers += 1;
+                this.clearSelectedServer();
+                this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
+                const selectedServer = await this.ensureSelectedServer({ forceReselect: true });
+                if (selectedServer !== true) {
+                    const userMessage = selectedServer && selectedServer.error && selectedServer.error.userMessage
+                        ? selectedServer.error.userMessage
+                        : 'No LLM servers are available right now. Your chat history is still here.';
+                    this.markSelectedServerTerminalFailure(userMessage);
+                    return { error: { userMessage } };
+                }
+            }
+
+            return {
+                error: {
+                    userMessage: 'The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.'
+                }
+            };
         },
 
 
@@ -853,7 +921,7 @@ new Vue({
             const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
 
             const codeToMessage = {
-                no_registered_compute_nodes: 'No LLM servers are available right now.',
+                no_registered_compute_nodes: 'No LLM servers are available right now. Your chat history is still here.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',

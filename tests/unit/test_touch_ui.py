@@ -80,8 +80,15 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" in chat_js
+    assert "MAX_STICKY_SERVER_FAILOVERS_PER_SEND" in chat_js
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js
-    assert "dispatchResponse.status === 404 || dispatchResponse.status === 410" in chat_js
+    assert "isTerminalSelectedServerRelayError" in chat_js
+    assert "dispatchResponse.status, errorData" in chat_js
+    assert "terminalSelectedServer" in chat_js
+    assert "beginStickyServerFailoverStatus" in chat_js
     assert "this.clearSelectedServer()" in chat_js
+    assert "STICKY_SERVER_FAILOVER_STATUS_MESSAGE" in chat_js
+    assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
+    assert "No LLM servers are available right now. Your chat history is still here." in chat_js

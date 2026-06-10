@@ -182,9 +182,13 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
         "root_page_loads",
+        "landing_chat",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_sticky_server_two_turns_and_key_label",
         "landing_chat_terminal_server_failure_requires_explicit_new_chat_retry",
+        "landing_chat_automatically_fails_over_sticky_server_without_losing_history",
+        "landing_chat_no_server_available_after_failover_keeps_history",
+        "failover",
         "sticky",
         "server_key",
         "landing_chat_model_dropdown_uses_api_v1_models",

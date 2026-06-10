@@ -2,6 +2,9 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+const MAX_STICKY_SERVER_FAILOVERS_PER_SEND = 3;
+const STICKY_SERVER_FAILOVER_STATUS_MESSAGE = 'The previous LLM server disconnected. Continuing with another available server.';
+const NO_LLM_SERVERS_AVAILABLE_MESSAGE = 'No LLM servers are available right now. Your chat history is still here.';
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
 
 new Vue({
@@ -76,8 +79,7 @@ new Vue({
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
                 this.selectedModel &&
-                !this.isGeneratingResponse &&
-                !this.selectedServerTerminalFailure
+                !this.isGeneratingResponse
             );
         }
     },
@@ -223,14 +225,6 @@ new Vue({
         },
 
         async ensureSelectedServer() {
-            if (this.selectedServerTerminalFailure) {
-                return {
-                    error: {
-                        userMessage: this.selectedServerTerminalFailure
-                    }
-                };
-            }
-
             if (this.selectedServerPublicKey && this.selectedServerPublicKeyB64) {
                 return true;
             }
@@ -246,7 +240,7 @@ new Vue({
                     }
                     return {
                         error: {
-                            userMessage: this.getUserFacingApiError(errorData)
+                            userMessage: this.getUserFacingApiError(errorData, { noServersKeepsHistory: true })
                         }
                     };
                 }
@@ -265,13 +259,12 @@ new Vue({
                     ? this.encodePemToBase64(normalizedKey)
                     : rawKeyText.replace(/\s+/g, '');
                 this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
-                this.selectedServerTerminalFailure = '';
                 return true;
             } catch (error) {
                 console.error('Error selecting API v1 compute node:', error);
                 return {
                     error: {
-                        userMessage: 'Unable to select an LLM server right now. Please start a new chat session and try again.'
+                        userMessage: 'Unable to select an LLM server right now. Your chat history is still here.'
                     }
                 };
             }
@@ -297,7 +290,25 @@ new Vue({
         },
 
         markSelectedServerTerminalFailure(message) {
-            this.selectedServerTerminalFailure = message || 'The selected LLM server is unavailable or expired. Start a new chat to select another server.';
+            this.selectedServerTerminalFailure = message || STICKY_SERVER_FAILOVER_STATUS_MESSAGE;
+        },
+
+        beginStickyServerFailoverStatus() {
+            this.markSelectedServerTerminalFailure(STICKY_SERVER_FAILOVER_STATUS_MESSAGE);
+            this.clearSelectedServer();
+        },
+
+        finishStickyServerFailoverStatus() {
+            if (this.selectedServerTerminalFailure === STICKY_SERVER_FAILOVER_STATUS_MESSAGE) {
+                this.selectedServerTerminalFailure = '';
+            }
+        },
+
+        calculateMaxStickyServerFailovers() {
+            const liveNodeCount = Number.isInteger(this.computeNodeCount) && this.computeNodeCount > 0
+                ? this.computeNodeCount
+                : 1;
+            return Math.max(1, Math.min(liveNodeCount, MAX_STICKY_SERVER_FAILOVERS_PER_SEND));
         },
 
         startNewChatAfterSelectedServerFailure() {
@@ -604,20 +615,20 @@ new Vue({
             }
         },
 
-        getUserFacingRelayRetrieveError(status) {
+        getUserFacingRelayRetrieveError(status, errorPayload) {
             if (status === 202) {
                 return null;
             }
             if (status === 404) {
-                return 'The selected LLM server response was not found. Start a new chat to select another server.';
+                return 'The selected LLM server response was not found.';
             }
             if (status === 410) {
-                return 'The selected LLM server request expired. Start a new chat to select another server.';
+                return 'The selected LLM server request expired.';
             }
             if (status >= 500) {
                 return 'The relay is unavailable right now. Please try again later.';
             }
-            return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
+            return this.getUserFacingApiError(errorPayload);
         },
 
         async cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken) {
@@ -643,6 +654,26 @@ new Vue({
             }
         },
 
+        isTerminalSelectedServerRelayError(status, errorPayload) {
+            if (status === 404 || status === 410) {
+                return true;
+            }
+
+            const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
+            const code = error && typeof error.code === 'string' ? error.code : '';
+            const terminalCodes = new Set([
+                'server_unavailable',
+                'selected_server_terminal',
+                'selected_server_unavailable',
+                'selected_server_expired',
+                'server_expired',
+                'server_removed',
+                'expired',
+                'cancelled'
+            ]);
+            return terminalCodes.has(code);
+        },
+
         async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
             const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
             const pollIntervalMs = 500;
@@ -666,13 +697,16 @@ new Vue({
                 }
 
                 if (!response.ok) {
-                    const userMessage = this.getUserFacingRelayRetrieveError(response.status);
-                    if (response.status === 404 || response.status === 410) {
-                        this.markSelectedServerTerminalFailure(userMessage);
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_jsonError) {
+                        errorData = null;
                     }
                     return {
                         error: {
-                            userMessage
+                            userMessage: this.getUserFacingRelayRetrieveError(response.status, errorData),
+                            terminalSelectedServer: this.isTerminalSelectedServerRelayError(response.status, errorData)
                         }
                     };
                 }
@@ -688,18 +722,7 @@ new Vue({
             };
         },
 
-        // Send a message through the relay-blind API v1 E2EE request routes.
-        async sendMessageApi(messageContent) {
-            if (!this.selectedModel) {
-                console.error('No API v1 catalogue model selected');
-                return null;
-            }
-
-            const selectedServer = await this.ensureSelectedServer();
-            if (selectedServer !== true) {
-                return selectedServer;
-            }
-
+        async dispatchApiV1RelayRequest(messageContent) {
             const requestId = this.createRequestId();
             const cancelToken = this.createRequestId();
             const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
@@ -715,92 +738,127 @@ new Vue({
                 }
             };
 
-            try {
-                const encryptedData = await this.encrypt(
-                    JSON.stringify(plaintextEnvelope),
-                    this.selectedServerPublicKey
-                );
+            const encryptedData = await this.encrypt(
+                JSON.stringify(plaintextEnvelope),
+                this.selectedServerPublicKey
+            );
 
-                if (!encryptedData) {
-                    throw new Error('Failed to encrypt relay request envelope');
-                }
-
-                const relayPayload = {
-                    server_public_key: this.selectedServerPublicKeyB64,
-                    client_public_key: clientPublicKeyB64,
-                    request_id: requestId,
-                    protocol: 'tokenplace_api_v1_relay_e2ee',
-                    version: 1,
-                    ciphertext: encryptedData.ciphertext,
-                    cipherkey: encryptedData.cipherkey,
-                    iv: encryptedData.iv,
-                    cancel_token: cancelToken
-                };
-
-                const dispatchResponse = await fetch('/api/v1/relay/requests', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(relayPayload)
-                });
-
-                if (!dispatchResponse.ok) {
-                    let errorData = null;
-                    try {
-                        errorData = await dispatchResponse.json();
-                    } catch (_jsonError) {
-                        errorData = null;
-                    }
-                    const unavailable = dispatchResponse.status === 404 || dispatchResponse.status === 410;
-                    const userMessage = unavailable
-                        ? 'The selected LLM server is unavailable or expired. Start a new chat to select another server.'
-                        : this.getUserFacingApiError(errorData);
-                    if (unavailable) {
-                        this.markSelectedServerTerminalFailure(userMessage);
-                    }
-                    return {
-                        error: {
-                            userMessage
-                        }
-                    };
-                }
-
-                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
-                if (encryptedResponse && encryptedResponse.error) {
-                    return encryptedResponse;
-                }
-
-                const responseCiphertext = encryptedResponse.chat_history || encryptedResponse.ciphertext;
-                const decryptedJson = await this.decrypt(
-                    responseCiphertext,
-                    encryptedResponse.cipherkey,
-                    encryptedResponse.iv
-                );
-
-                if (!decryptedJson) {
-                    throw new Error('Failed to decrypt relay response');
-                }
-
-                const responseEnvelope = JSON.parse(decryptedJson);
-                if (
-                    !responseEnvelope ||
-                    responseEnvelope.protocol !== 'tokenplace_api_v1_relay_e2ee' ||
-                    responseEnvelope.version !== 1 ||
-                    responseEnvelope.request_id !== requestId ||
-                    responseEnvelope.client_public_key !== clientPublicKeyB64 ||
-                    !responseEnvelope.api_v1_response
-                ) {
-                    throw new Error('Invalid relay response envelope');
-                }
-
-                return responseEnvelope.api_v1_response;
-            } catch (error) {
-                console.error('API v1 relay request error:', error);
-                return null;
+            if (!encryptedData) {
+                throw new Error('Failed to encrypt relay request envelope');
             }
+
+            const relayPayload = {
+                server_public_key: this.selectedServerPublicKeyB64,
+                client_public_key: clientPublicKeyB64,
+                request_id: requestId,
+                protocol: 'tokenplace_api_v1_relay_e2ee',
+                version: 1,
+                ciphertext: encryptedData.ciphertext,
+                cipherkey: encryptedData.cipherkey,
+                iv: encryptedData.iv,
+                cancel_token: cancelToken
+            };
+
+            const dispatchResponse = await fetch('/api/v1/relay/requests', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(relayPayload)
+            });
+
+            if (!dispatchResponse.ok) {
+                let errorData = null;
+                try {
+                    errorData = await dispatchResponse.json();
+                } catch (_jsonError) {
+                    errorData = null;
+                }
+                return {
+                    error: {
+                        userMessage: this.isTerminalSelectedServerRelayError(dispatchResponse.status, errorData)
+                            ? 'The selected LLM server is unavailable or expired.'
+                            : this.getUserFacingApiError(errorData),
+                        terminalSelectedServer: this.isTerminalSelectedServerRelayError(dispatchResponse.status, errorData)
+                    }
+                };
+            }
+
+            const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
+            if (encryptedResponse && encryptedResponse.error) {
+                return encryptedResponse;
+            }
+
+            const responseCiphertext = encryptedResponse.chat_history || encryptedResponse.ciphertext;
+            const decryptedJson = await this.decrypt(
+                responseCiphertext,
+                encryptedResponse.cipherkey,
+                encryptedResponse.iv
+            );
+
+            if (!decryptedJson) {
+                throw new Error('Failed to decrypt relay response');
+            }
+
+            const responseEnvelope = JSON.parse(decryptedJson);
+            if (
+                !responseEnvelope ||
+                responseEnvelope.protocol !== 'tokenplace_api_v1_relay_e2ee' ||
+                responseEnvelope.version !== 1 ||
+                responseEnvelope.request_id !== requestId ||
+                responseEnvelope.client_public_key !== clientPublicKeyB64 ||
+                !responseEnvelope.api_v1_response
+            ) {
+                throw new Error('Invalid relay response envelope');
+            }
+
+            return responseEnvelope.api_v1_response;
         },
 
+        // Send a message through the relay-blind API v1 E2EE request routes.
+        async sendMessageApi(messageContent) {
+            if (!this.selectedModel) {
+                console.error('No API v1 catalogue model selected');
+                return null;
+            }
+
+            const maxFailovers = this.calculateMaxStickyServerFailovers();
+            let failoverAttempts = 0;
+
+            while (failoverAttempts <= maxFailovers) {
+                const selectedServer = await this.ensureSelectedServer();
+                if (selectedServer !== true) {
+                    return selectedServer;
+                }
+
+                try {
+                    const response = await this.dispatchApiV1RelayRequest(messageContent);
+                    if (response && response.error && response.error.terminalSelectedServer) {
+                        if (failoverAttempts >= maxFailovers) {
+                            return {
+                                error: {
+                                    userMessage: 'The selected LLM server is unavailable or expired. Your chat history is still here.'
+                                }
+                            };
+                        }
+                        failoverAttempts += 1;
+                        this.beginStickyServerFailoverStatus();
+                        continue;
+                    }
+                    this.finishStickyServerFailoverStatus();
+                    return response;
+                } catch (error) {
+                    console.error('API v1 relay request error:', error);
+                    return null;
+                }
+            }
+
+            return {
+                error: {
+                    userMessage: 'The selected LLM server is unavailable or expired. Your chat history is still here.'
+                }
+            };
+        },
 
         calculateTypingChunkSize(content) {
             if (!content || typeof content !== 'string') {
@@ -847,13 +905,15 @@ new Vue({
             return message.content;
         },
 
-        getUserFacingApiError(errorPayload) {
+        getUserFacingApiError(errorPayload, options = {}) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
             const errorCode = error && typeof error.code === 'string' ? error.code : '';
             const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
 
             const codeToMessage = {
-                no_registered_compute_nodes: 'No LLM servers are available right now.',
+                no_registered_compute_nodes: options.noServersKeepsHistory
+                    ? NO_LLM_SERVERS_AVAILABLE_MESSAGE
+                    : 'No LLM servers are available right now.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',

@@ -83,5 +83,29 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js
-    assert "dispatchResponse.status === 404 || dispatchResponse.status === 410" in chat_js
+    assert "isTerminalSelectedServerError" in chat_js
+    assert "dispatchResponse.status" in chat_js
+    assert "status === 404 || status === 410" in chat_js
+    assert "getFailoverAttemptLimit" in chat_js
+    assert "const replacementCount = Math.max(this.computeNodeCount - 1, 0);" in chat_js
+    assert "return Math.min(replacementCount, 3);" in chat_js
+    assert "applySupersededSuccess" in chat_js
+    assert "await this.refreshComputeNodeCount({ applySupersededSuccess: true });" in chat_js
+    assert "Math.max(maxFailovers, 1)" in chat_js
+    assert "const terminallyFailedServerPublicKeysB64 = new Set();" in chat_js
+    assert "terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);" in chat_js
+    assert "let skippedFailedServerSelections = 0;" in chat_js
+    assert "const maxSkippedFailedServerSelections = Math.max(maxFailovers + terminallyFailedServerPublicKeysB64.size, 1);" in chat_js
+    assert "skippedFailedServerSelections >= maxSkippedFailedServerSelections" in chat_js
+    assert "sendMessageApiOnce" in chat_js
+    assert "ensureSelectedServer({ forceReselect: true })" in chat_js
+    assert "terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)" in chat_js
+    assert "skippedFailedServerSelections += 1;" in chat_js
+    assert "skippedFailedServerSelections = 0;" in chat_js
+    assert "originalFailedServerPublicKeyB64" not in chat_js
+    assert "failedServerPublicKeyB64" not in chat_js
+    assert "reselectAttempts" not in chat_js
+    assert "continue;" in chat_js
+    assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
+    assert "No LLM servers are available right now. Your chat history is still here." in chat_js
     assert "this.clearSelectedServer()" in chat_js

@@ -462,7 +462,7 @@
                     data-testid="landing-new-chat-retry"
                     @click="startNewChatAfterSelectedServerFailure"
                 >
-                    Start a new chat and retry
+                    Start a new chat
                 </button>
             </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">

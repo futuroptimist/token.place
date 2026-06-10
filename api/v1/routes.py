@@ -646,9 +646,9 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
+        requested_model_id = data.get("model")
         validate_required_fields(data, ["model"])
         validate_field_type(data, "model", str)
-        requested_model_id = data["model"]
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")

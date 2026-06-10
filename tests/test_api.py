@@ -691,6 +691,61 @@ def test_api_v1_completions_local_provider_rejects_unsupported_model(client, mon
     assert body['error']['code'] == 'model_not_supported'
 
 
+def test_v1_completions_rejects_non_string_model_without_500(client, monkeypatch):
+    alias = MagicMock(return_value='llama-3.1-8b-instruct')
+    monkeypatch.setattr('api.v1.routes.resolve_model_alias', alias)
+
+    response = client.post('/api/v1/completions', json={
+        'model': {},
+        'prompt': 'hello',
+    })
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['type'] == 'invalid_request_error'
+    assert body['error']['param'] == 'model'
+    assert 'Invalid type for model: expected str' in body['error']['message']
+    alias.assert_not_called()
+
+
+def test_v1_completions_legacy_alias_routes_canonical_but_echoes_requested_model(
+    client, monkeypatch
+):
+    requested_model_id = 'llama-3-8b-instruct'
+    canonical_model_id = 'llama-3.1-8b-instruct'
+    captured = {}
+
+    class FakeLocalProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured['model_id'] = model_id
+            captured['messages'] = messages
+            return {'role': 'assistant', 'content': 'alias routed'}
+
+    monkeypatch.setattr(
+        'api.v1.routes.get_models_info', lambda: [{'id': canonical_model_id}]
+    )
+    monkeypatch.setattr(
+        'api.v1.routes.get_api_v1_compute_provider', lambda: FakeLocalProvider()
+    )
+    monkeypatch.setattr(
+        'api.v1.routes.get_api_v1_resolved_provider_path',
+        lambda _provider: 'local',
+    )
+    monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'local')
+
+    response = client.post('/api/v1/completions', json={
+        'model': requested_model_id,
+        'prompt': 'hello',
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert captured['model_id'] == canonical_model_id
+    assert captured['messages'] == [{'role': 'user', 'content': 'hello'}]
+    assert body['model'] == requested_model_id
+    assert body['choices'][0]['text'] == 'alias routed'
+
+
 def test_chat_completion_rejects_empty_messages(client):
     """Empty chat message arrays should be rejected as invalid input."""
 

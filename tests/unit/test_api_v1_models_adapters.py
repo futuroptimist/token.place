@@ -1,10 +1,11 @@
-"""Adapter support tests for api.v1.models."""
+"""Guardrails ensuring the removed API v1 alignment adapter stays unavailable."""
 
 import importlib
 from typing import Dict
 
 ADAPTER_ID = "llama-3-8b-instruct:alignment"
-BASE_ID = "llama-3-8b-instruct"
+CANONICAL_ADAPTER_ID = "llama-3.1-8b-instruct:alignment"
+BASE_ID = "llama-3.1-8b-instruct"
 
 
 def _reload_models(monkeypatch, env: Dict[str, str] | None = None):
@@ -18,25 +19,25 @@ def _reload_models(monkeypatch, env: Dict[str, str] | None = None):
     return models
 
 
-def test_get_models_info_exposes_adapter_metadata(monkeypatch):
+def test_get_models_info_does_not_expose_alignment_adapter(monkeypatch):
     models = _reload_models(monkeypatch, {"USE_MOCK_LLM": "1"})
 
-    info = models.get_models_info()
-    adapter_entry = next((item for item in info if item["id"] == ADAPTER_ID), None)
+    ids = [item["id"] for item in models.get_models_info()]
 
-    assert adapter_entry is not None, "adapter should be listed alongside base models"
-    assert adapter_entry["base_model_id"] == BASE_ID
-    assert adapter_entry.get("adapter", {}).get("instructions"), "instructions are required"
+    assert ids == [BASE_ID]
+    assert ADAPTER_ID not in ids
+    assert CANONICAL_ADAPTER_ID not in ids
 
 
-def test_generate_response_injects_adapter_prompt(monkeypatch):
+def test_generate_response_rejects_removed_alignment_adapter(monkeypatch):
     models = _reload_models(monkeypatch, {"USE_MOCK_LLM": "1"})
-    monkeypatch.setattr(models.random, "choice", lambda seq: seq[0])
 
-    messages = [{"role": "user", "content": "hello"}]
-    response = models.generate_response(ADAPTER_ID, messages)
-
-    assert response[0]["role"] == "system"
-    assert response[0]["name"].startswith("adapter:")
-    assert "alignment" in response[0]["content"].lower()
-    assert response[-1]["role"] == "assistant"
+    with monkeypatch.context() as _context:
+        messages = [{"role": "user", "content": "hello"}]
+        for removed_id in (ADAPTER_ID, CANONICAL_ADAPTER_ID):
+            try:
+                models.generate_response(removed_id, list(messages))
+            except models.ModelError as exc:
+                assert exc.error_type == "model_not_found"
+            else:  # pragma: no cover - assertion branch
+                raise AssertionError(f"{removed_id} should not be accepted")

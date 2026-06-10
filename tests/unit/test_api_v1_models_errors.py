@@ -14,7 +14,7 @@ def test_invalid_response_structure(monkeypatch):
     monkeypatch.setattr(models, "get_model_instance", lambda _mid: Dummy())
     messages = [{"role": "user", "content": "hi"}]
     with pytest.raises(models.ModelError) as exc:
-        models.generate_response("llama-3-8b-instruct", messages)
+        models.generate_response("llama-3.1-8b-instruct", messages)
     assert exc.value.error_type == "model_response_error"
 
 @patch.dict(os.environ, {"USE_MOCK_LLM": "0"})
@@ -27,5 +27,5 @@ def test_model_exception(monkeypatch):
     monkeypatch.setattr(models, "get_model_instance", lambda _mid: Dummy())
     messages = [{"role": "user", "content": "hi"}]
     with pytest.raises(models.ModelError) as exc:
-        models.generate_response("llama-3-8b-instruct", messages)
+        models.generate_response("llama-3.1-8b-instruct", messages)
     assert exc.value.error_type == "model_inference_error"

@@ -64,10 +64,10 @@ def route_landing_relay_chat(
         "object": "list",
         "data": [
             {
-                "id": "llama-3-8b-instruct",
+                "id": "llama-3.1-8b-instruct",
                 "object": "model",
-                "owned_by": "token.place",
-                "root": "llama-3-8b-instruct",
+                "owned_by": "Meta",
+                "root": "llama-3.1-8b-instruct",
             }
         ],
     }
@@ -461,6 +461,11 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     page.wait_for_load_state("networkidle")
     patch_landing_crypto_for_visible_envelopes(page)
 
+    model_select = page.get_by_test_id("landing-model-select")
+    model_select.wait_for(state="visible")
+    assert model_select.locator("option").all_inner_texts() == ["llama-3.1-8b-instruct"]
+    assert "owned by token.place" not in page.locator("body").inner_text().lower()
+
     textarea = page.locator("textarea").first
     textarea.fill("hello")
     wait_for_landing_send_enabled(page).click()
@@ -485,7 +490,7 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     assert state["relay_requests"][0]["server_public_key"] == SERVER_PUBLIC_KEY_B64
     request_envelope = json.loads(state["relay_requests"][0]["ciphertext"])
     assert request_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
-    assert request_envelope["api_v1_request"]["model"] == "llama-3-8b-instruct"
+    assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
     assert request_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "hello"}]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
@@ -527,7 +532,7 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
         {"role": "assistant", "content": "Sticky relay response."},
         {"role": "user", "content": "second turn"},
     ]
-    assert all(envelope["api_v1_request"]["model"] == "llama-3-8b-instruct" for envelope in envelopes)
+    assert all(envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct" for envelope in envelopes)
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -625,7 +630,7 @@ def test_landing_chat_model_dropdown_uses_api_v1_models(
             {
                 "id": "api-v1-first-model",
                 "object": "model",
-                "owned_by": "token.place",
+                "owned_by": "Meta",
                 "root": "api-v1-first-model",
             },
             {
@@ -653,6 +658,7 @@ def test_landing_chat_model_dropdown_uses_api_v1_models(
         "api-v1-first-model",
         "api-v1-second-model",
     ]
+    assert "owned by token.place" not in page.locator("body").inner_text().lower()
 
     model_select.select_option("api-v1-second-model")
 
@@ -740,8 +746,8 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
 
     model_select = page.get_by_test_id("landing-model-select")
     model_select.wait_for(state="visible")
-    assert model_select.input_value() == "llama-3-8b-instruct"
-    assert "llama-3-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
+    assert model_select.input_value() == "llama-3.1-8b-instruct"
+    assert "llama-3.1-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
@@ -750,7 +756,7 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
     page.locator(".assistant-message").last.wait_for(state="visible")
     assert state["relay_requests"], "expected the landing chat to POST the API v1 fallback relay payload"
     request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
-    assert request_envelope["api_v1_request"]["model"] == "llama-3-8b-instruct"
+    assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

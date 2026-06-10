@@ -89,7 +89,9 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "getFailoverAttemptLimit" in chat_js
     assert "const replacementCount = Math.max(this.computeNodeCount - 1, 0);" in chat_js
     assert "return Math.min(replacementCount, 3);" in chat_js
-    assert "await this.refreshComputeNodeCount();" in chat_js
+    assert "applySupersededSuccess" in chat_js
+    assert "await this.refreshComputeNodeCount({ applySupersededSuccess: true });" in chat_js
+    assert "Math.max(maxFailovers, 1)" in chat_js
     assert "const maxReselectAttempts = Math.max(maxFailovers + 1, 1);" in chat_js
     assert "reselectAttempts >= maxReselectAttempts" in chat_js
     assert "sendMessageApiOnce" in chat_js

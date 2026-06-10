@@ -81,20 +81,25 @@ new Vue({
         }
     },
     methods: {
-        async refreshComputeNodeCount() {
+        async refreshComputeNodeCount(options = {}) {
+            // Failover capacity refreshes must be allowed to apply their own
+            // successful diagnostics result even if the background poller starts
+            // another request before they finish; otherwise a stale count of one
+            // can incorrectly suppress probing for a newly registered replacement.
+            const applySupersededSuccess = options && options.applySupersededSuccess === true;
             const requestId = this.computeNodeCountRequestId + 1;
             this.computeNodeCountRequestId = requestId;
 
             try {
                 const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
-                if (requestId !== this.computeNodeCountRequestId) {
+                if (requestId !== this.computeNodeCountRequestId && !applySupersededSuccess) {
                     return false;
                 }
                 if (!response.ok) {
                     throw new Error('Failed to fetch relay diagnostics');
                 }
                 const data = await response.json();
-                if (requestId !== this.computeNodeCountRequestId) {
+                if (requestId !== this.computeNodeCountRequestId && !applySupersededSuccess) {
                     return false;
                 }
                 if (
@@ -850,8 +855,11 @@ new Vue({
 
                 if (failovers >= maxFailovers && !refreshedFailoverCapacity) {
                     refreshedFailoverCapacity = true;
-                    await this.refreshComputeNodeCount();
-                    maxFailovers = this.getFailoverAttemptLimit();
+                    const refreshed = await this.refreshComputeNodeCount({ applySupersededSuccess: true });
+                    // If diagnostics could not be applied because another refresh
+                    // raced or failed, allow one bounded next-server probe rather
+                    // than failing closed from a possibly stale local count.
+                    maxFailovers = refreshed ? this.getFailoverAttemptLimit() : Math.max(maxFailovers, 1);
                 }
 
                 const maxReselectAttempts = Math.max(maxFailovers + 1, 1);

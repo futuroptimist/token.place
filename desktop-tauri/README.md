@@ -71,8 +71,8 @@ After a successful repair, the sidecar automatically re-execs once so the active
 
 ## Cutting a desktop release
 
-Desktop binaries are published by the GitHub Actions workflow
-`.github/workflows/desktop-release.yml`.
+Desktop binaries released as GitHub Release assets are published only by the canonical GitHub Actions workflow
+`Desktop Tauri Release` (`.github/workflows/desktop-release.yml`).
 
 1. Create an explicit desktop tag on the commit you want to release:
    ```bash
@@ -91,8 +91,8 @@ Desktop binaries are published by the GitHub Actions workflow
      an explicit preview warning and uses ad-hoc signing for dev/preview builds.
      Those builds are not equivalent to fully Developer ID signed + notarized
      Gatekeeper-ready releases.
-  - If signing credentials are configured, CI validates with `codesign`.
-    Strict Gatekeeper notarization checks are skipped unless notarization is added.
+   - If signing credentials are configured, CI validates with `codesign`.
+     Strict Gatekeeper notarization checks are skipped unless notarization is added.
 
 ### Unpaid macOS preview releases
 

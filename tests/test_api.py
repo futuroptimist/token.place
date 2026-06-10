@@ -692,7 +692,13 @@ def test_api_v1_completions_local_provider_rejects_unsupported_model(client, mon
 
 
 def test_v1_completions_rejects_non_string_model_without_500(client, monkeypatch):
-    alias = MagicMock(return_value='llama-3.1-8b-instruct')
+    alias_called = False
+
+    def alias(_model_id):
+        nonlocal alias_called
+        alias_called = True
+        raise AssertionError('resolve_model_alias should not be called')
+
     monkeypatch.setattr('api.v1.routes.resolve_model_alias', alias)
 
     response = client.post('/api/v1/completions', json={
@@ -705,7 +711,7 @@ def test_v1_completions_rejects_non_string_model_without_500(client, monkeypatch
     assert body['error']['type'] == 'invalid_request_error'
     assert body['error']['param'] == 'model'
     assert 'Invalid type for model: expected str' in body['error']['message']
-    alias.assert_not_called()
+    assert alias_called is False
 
 
 def test_v1_completions_legacy_alias_routes_canonical_but_echoes_requested_model(

@@ -51,6 +51,7 @@ def route_landing_relay_chat(
     next_server_keys: list[str] | None = None,
     request_statuses: list[int] | None = None,
     retrieve_statuses: list[int] | None = None,
+    diagnostics_count: int | None = None,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -81,6 +82,21 @@ def route_landing_relay_chat(
             body=json.dumps(models_payload or default_models),
         ),
     )
+
+    if diagnostics_count is not None:
+        page.route(
+            "**/relay/diagnostics",
+            lambda route: route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": diagnostics_count,
+                        "total_api_v1_registered_compute_nodes": diagnostics_count,
+                    }
+                ),
+            ),
+        )
 
     def handle_next(route):
         state["next_calls"] += 1
@@ -568,6 +584,7 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
         page,
         assistant_content="Replacement server answered.",
         next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        diagnostics_count=2,
         **route_kwargs,
     )
     navigations = []
@@ -658,6 +675,7 @@ def test_landing_chat_failover_no_servers_keeps_history(
         next_statuses=[200, 503],
         request_statuses=[200, 404],
         next_server_keys=[SERVER_PUBLIC_KEY_B64],
+        diagnostics_count=1,
     )
 
     page.goto(base_url)
@@ -673,7 +691,7 @@ def test_landing_chat_failover_no_servers_keeps_history(
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function(
         """
-        () => document.body.textContent.includes('No LLM servers are available right now. Your chat history is still here.')
+        () => document.body.textContent.includes('The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here.')
         """
     )
 
@@ -681,8 +699,8 @@ def test_landing_chat_failover_no_servers_keeps_history(
     assert "first turn remains visible" in body_text
     assert "Initial answer." in body_text
     assert "second turn cannot fail over" in body_text
-    assert "No LLM servers are available right now. Your chat history is still here." in body_text
-    assert state["next_calls"] == 2
+    assert "The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here." in body_text
+    assert state["next_calls"] == 1
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []

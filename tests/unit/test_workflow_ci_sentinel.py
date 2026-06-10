@@ -138,6 +138,48 @@ def test_image_workflow_keeps_pull_request_validate_only() -> None:
     ), "ci-image.yml publish job must stay push-only so PR and workflow_dispatch runs validate only"
 
 
+def test_helm_workflow_publish_decision_is_idempotent() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    on_block = _workflow_on_block(workflow_data, "ci-helm.yml")
+
+    publish_input = on_block["workflow_dispatch"]["inputs"]["publish"]
+    assert publish_input["type"] == "boolean"
+    assert publish_input["default"] == "false"
+
+    publish_job = workflow_data["jobs"]["publish"]
+    publish_runs = _step_runs(publish_job)
+
+    assert "github.event_name != 'pull_request'" in publish_job["if"]
+    assert "chart_source_paths=(" in publish_runs
+    assert '"charts/tokenplace/**"' in publish_runs
+    assert "chart_related_paths=(" in publish_runs
+    assert '".github/workflows/ci-helm.yml"' in publish_runs
+    assert "helm show chart \"${CHART_REF}\" --version \"${CHART_VERSION}\"" in publish_runs
+    assert "action=fail" in publish_runs
+    assert (
+        "Publish failed: chart files changed but chart version ${CHART_VERSION} already exists; "
+        "bump charts/tokenplace/Chart.yaml version."
+    ) in workflow_text
+    assert (
+        "Publish skipped: chart version ${CHART_VERSION} already exists and no chart files changed."
+    ) in workflow_text
+    assert "steps.publish_decision.outputs.action == 'publish'" in workflow_text
+    assert "helm push \"${package_file}\" \"${chart_registry}\"" in publish_runs
+
+
+def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+
+    for job_name in ("validate-and-package", "publish"):
+        steps = _job_steps(workflow_data["jobs"][job_name])
+        checkout_steps = [step for step in steps if step.get("uses") == "actions/checkout@v4"]
+        assert checkout_steps, f"{job_name} must check out the repository"
+        assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0", (
+            f"{job_name} must fetch enough history for chart publish diff decisions"
+        )
+
+
 def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
     chart = yaml.safe_load(
         Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8")

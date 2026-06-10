@@ -97,8 +97,10 @@ Kubernetes continuously verifies the relay’s health:
 
 Sugarkube is the canonical deploy surface. The chart source is `charts/tokenplace`
 and the OCI chart ref is `oci://ghcr.io/futuroptimist/charts/tokenplace`.
-`ci-helm.yml` validates, packages, and publishes immutable chart versions; the
-publish job refuses to overwrite an existing chart version.
+`ci-helm.yml` validates and packages the chart on PRs, main pushes, and manual
+runs. Main pushes publish immutable chart versions only when chart source files
+changed and the chart version is new; unchanged chart source with an existing
+version is reported as a successful no-op.
 
 1. Find a successful `ci-image.yml` run and copy the immutable Sugarkube tag from
    the workflow summary.

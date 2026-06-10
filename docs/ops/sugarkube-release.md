@@ -50,9 +50,13 @@ default.
 
 ## Chart contract
 
-`ci-helm.yml` validates `charts/tokenplace`, packages it, and publishes the
-chart to GHCR as an immutable OCI artifact. The publish job refuses to overwrite
-an existing chart version.
+`ci-helm.yml` validates `charts/tokenplace` and packages it on pull requests,
+main-branch pushes, and manual dispatches. Pushes to `main` publish to GHCR only
+when chart source files changed and the `charts/tokenplace/Chart.yaml` version is
+not already present as an immutable OCI artifact. If the chart source changed but
+the version already exists, the workflow fails with a version-bump message; if no
+chart source changed, an already-published version is a successful no-op. Manual
+dispatches are validate/package-only unless the `publish` input is set.
 
 Before deploying, confirm the chart version you intend to use:
 

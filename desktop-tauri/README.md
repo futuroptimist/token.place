@@ -71,8 +71,8 @@ After a successful repair, the sidecar automatically re-execs once so the active
 
 ## Cutting a desktop release
 
-Desktop binaries are published by the GitHub Actions workflow
-`.github/workflows/desktop-release.yml`.
+Desktop binaries are published only by the canonical GitHub Actions workflow
+`Desktop Tauri Release` (`.github/workflows/desktop-release.yml`).
 
 1. Create an explicit desktop tag on the commit you want to release:
    ```bash

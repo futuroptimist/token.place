@@ -388,6 +388,7 @@ def _handle_chat_completion_request(data):
                 status_code=400,
             )
 
+        validate_field_type(data, "model", str)
         requested_model_id = data["model"]
         response_model_id = requested_model_id
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
@@ -645,12 +646,10 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        requested_model_id = data.get("model")
-        model_id = (
-            resolve_model_alias(requested_model_id) or requested_model_id
-            if requested_model_id
-            else requested_model_id
-        )
+        validate_required_fields(data, ["model"])
+        validate_field_type(data, "model", str)
+        requested_model_id = data["model"]
+        model_id = resolve_model_alias(requested_model_id) or requested_model_id
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")
         is_encrypted_request = data.get("encrypted", False)
@@ -761,6 +760,13 @@ def _handle_text_completion_request(data):
         response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
         return response
 
+    except ValidationError as e:
+        return format_error_response(
+            e.message,
+            param=e.field,
+            code=e.code,
+            status_code=400,
+        )
     except ModelError as e:
         log_warning(f"Model error during response generation: {e.message}")
         return format_error_response(

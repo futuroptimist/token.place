@@ -117,6 +117,41 @@ def test_relay_unregister_openai_alias_delegates(client, monkeypatch):
     assert response.get_json()["error"]["message"] == "ok"
 
 
+def test_chat_completion_rejects_non_string_model_before_alias_resolution(client, monkeypatch):
+    alias = MagicMock(return_value='llama-3.1-8b-instruct')
+    monkeypatch.setattr(routes, 'resolve_model_alias', alias)
+
+    response = client.post(
+        '/api/v1/chat/completions',
+        json={
+            'model': {'id': 'gpt-5-chat-latest'},
+            'messages': [{'role': 'user', 'content': 'Hello'}],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert 'Invalid type for model: expected str' in body['error']['message']
+    alias.assert_not_called()
+
+
+def test_legacy_completion_rejects_non_string_model_before_alias_resolution(client, monkeypatch):
+    alias = MagicMock(return_value='llama-3.1-8b-instruct')
+    monkeypatch.setattr(routes, 'resolve_model_alias', alias)
+
+    response = client.post(
+        '/api/v1/completions',
+        json={'model': {'id': 'gpt-5-chat-latest'}, 'prompt': 'hi'},
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert 'Invalid type for model: expected str' in body['error']['message']
+    alias.assert_not_called()
+
+
 def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
     canonical_id = 'llama-3.1-8b-instruct'
     payload = {

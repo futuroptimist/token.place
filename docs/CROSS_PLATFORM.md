@@ -271,8 +271,9 @@ Recent cross-platform improvements now cover:
 2. **CI/CD Pipeline**:
    - ✅ Matrix testing across all supported platforms via `utils/testing/platform_matrix.py`
      and the accompanying regression in `tests/unit/test_platform_matrix.py`
-   - ⚠️ Legacy desktop automation previously used `desktop/package:all` for Electron builds;
-     Tauri packaging automation will be introduced in a follow-up implementation PR
+   - ✅ Canonical desktop release packaging uses the `Desktop Tauri Release` workflow
+     (`.github/workflows/desktop-release.yml`) to build `desktop-tauri/` artifacts;
+     legacy Electron automation is not a release path
    - ✅ Containerized testing environments with `scripts/run_tests_in_container.py`
      orchestrating the Docker-based test runner defined in
      `docker/test-runner.Dockerfile`

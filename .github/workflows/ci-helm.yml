@@ -12,9 +12,14 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, tag, or SHA to publish
+        description: Branch, tag, or SHA to validate/package
         required: false
         default: main
+      publish:
+        description: Publish this ref if the chart version is not already present in GHCR
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   validate-and-package:
@@ -228,11 +233,11 @@ jobs:
       packages: write
 
     steps:
-      - name: Download packaged chart artifact
-        uses: actions/download-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          name: tokenplace-chart-package
-          path: dist
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          fetch-depth: 0
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -245,8 +250,96 @@ jobs:
             --username "${{ github.actor }}" \
             --password-stdin
 
+      - name: Decide whether to publish chart
+        id: publish_decision
+        env:
+          CHART_REF: ${{ needs.validate-and-package.outputs.chart_ref }}
+          CHART_VERSION: ${{ needs.validate-and-package.outputs.chart_version }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          MANUAL_PUBLISH: ${{ inputs.publish || 'false' }}
+        run: |
+          set -euo pipefail
+
+          chart_exists=false
+          if helm show chart "${CHART_REF}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
+            chart_exists=true
+          fi
+
+          chart_related_changed=false
+          chart_source_changed=false
+          changed_files=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            zero_sha=0000000000000000000000000000000000000000
+            if [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "${zero_sha}" ]; then
+              if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                git fetch --no-tags --depth=1 origin "${BEFORE_SHA}"
+              fi
+              changed_files="$(git diff --name-only "${BEFORE_SHA}" HEAD)"
+            elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              changed_files="$(git diff --name-only HEAD^ HEAD)"
+            else
+              changed_files="$(git ls-tree -r --name-only HEAD)"
+            fi
+
+            if printf '%s\n' "${changed_files}" | grep -Eq '^(charts/tokenplace/|\.github/workflows/ci-helm\.yml$)'; then
+              chart_related_changed=true
+            fi
+            if printf '%s\n' "${changed_files}" | grep -Eq '^charts/tokenplace/'; then
+              chart_source_changed=true
+            fi
+          fi
+
+          decision=skip
+          reason="Publish skipped: chart version ${CHART_VERSION} was validated and packaged, but publishing is not requested for ${EVENT_NAME}."
+
+          if [ "${EVENT_NAME}" = "push" ]; then
+            if [ "${chart_source_changed}" = "true" ] && [ "${chart_exists}" = "false" ]; then
+              decision=publish
+              reason="Publishing new chart version ${CHART_VERSION} to ${CHART_REF}."
+            elif [ "${chart_source_changed}" = "true" ] && [ "${chart_exists}" = "true" ]; then
+              decision=fail
+              reason="Publish failed: chart files changed but chart version ${CHART_VERSION} already exists; bump charts/tokenplace/Chart.yaml version."
+            elif [ "${chart_exists}" = "true" ]; then
+              reason="Publish skipped: chart version ${CHART_VERSION} already exists and no chart files changed."
+            else
+              reason="Publish skipped: chart version ${CHART_VERSION} does not exist, but no chart files changed on this push."
+            fi
+          elif [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${MANUAL_PUBLISH}" = "true" ] && [ "${chart_exists}" = "false" ]; then
+              decision=publish
+              reason="Publishing new chart version ${CHART_VERSION} to ${CHART_REF}."
+            elif [ "${MANUAL_PUBLISH}" = "true" ] && [ "${chart_exists}" = "true" ]; then
+              decision=fail
+              reason="Publish failed: chart version ${CHART_VERSION} already exists; refusing to overwrite immutable OCI artifact."
+            elif [ "${chart_exists}" = "true" ]; then
+              reason="Publish skipped: chart version ${CHART_VERSION} already exists and manual publish was not requested."
+            else
+              reason="Publish skipped: chart version ${CHART_VERSION} does not exist and manual publish was not requested."
+            fi
+          fi
+
+          echo "decision=${decision}" >> "$GITHUB_OUTPUT"
+          echo "chart_exists=${chart_exists}" >> "$GITHUB_OUTPUT"
+          echo "chart_related_changed=${chart_related_changed}" >> "$GITHUB_OUTPUT"
+          echo "chart_source_changed=${chart_source_changed}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+
+          if [ "${decision}" = "fail" ]; then
+            echo "${reason}" >&2
+            exit 1
+          fi
+
+      - name: Download packaged chart artifact
+        if: steps.publish_decision.outputs.decision == 'publish'
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenplace-chart-package
+          path: dist
+
       - name: Push chart to OCI registry
         id: push
+        if: steps.publish_decision.outputs.decision == 'publish'
         run: |
           set -euo pipefail
           package_file="$(find dist -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
@@ -254,18 +347,21 @@ jobs:
           test -f "${package_file}"
           chart_ref="${{ needs.validate-and-package.outputs.chart_ref }}"
           chart_registry="${chart_ref%/*}"
-          if helm show chart "${chart_ref}" --version "${{ needs.validate-and-package.outputs.chart_version }}" >/dev/null 2>&1; then
-            echo "Chart ${chart_ref}:${{ needs.validate-and-package.outputs.chart_version }} already exists. Refusing to overwrite immutable OCI artifact; stop and resolve manually." >&2
-            exit 1
-          fi
           helm push "${package_file}" "${chart_registry}"
           echo "chart_ref=${chart_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Publish chart summary
+        if: always() && steps.publish_decision.outputs.reason != ''
         run: |
           {
-            echo "## Helm chart published"
+            echo "## Helm chart publish decision"
             echo ""
-            echo "Chart reference: \`${{ steps.push.outputs.chart_ref }}\`"
+            echo "Chart reference: \`${{ needs.validate-and-package.outputs.chart_ref }}\`"
             echo "Chart version: \`${{ needs.validate-and-package.outputs.chart_version }}\`"
+            echo "Chart exists in GHCR: \`${{ steps.publish_decision.outputs.chart_exists }}\`"
+            echo "Chart-related files changed: \`${{ steps.publish_decision.outputs.chart_related_changed }}\`"
+            echo "Chart source files changed: \`${{ steps.publish_decision.outputs.chart_source_changed }}\`"
+            echo "Decision: \`${{ steps.publish_decision.outputs.decision }}\`"
+            echo ""
+            echo "${{ steps.publish_decision.outputs.reason }}"
           } >> "$GITHUB_STEP_SUMMARY"

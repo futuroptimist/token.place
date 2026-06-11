@@ -156,16 +156,28 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
     assert "chart_related_paths=(" in publish_runs
     assert '".github/workflows/ci-helm.yml"' in publish_runs
     assert "helm show chart \"${CHART_REF}\" --version \"${CHART_VERSION}\"" in publish_runs
+    assert "chart_lookup_status=not_found" in publish_runs
+    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" in publish_runs
+    assert "chart_lookup_status=error" in publish_runs
     assert "action=fail" in publish_runs
     assert (
         "Publish failed: chart files changed but chart version ${CHART_VERSION} already exists; "
         "bump charts/tokenplace/Chart.yaml version."
     ) in workflow_text
     assert (
+        "Publish failed: could not determine whether chart version ${CHART_VERSION} exists"
+        in workflow_text
+    )
+    assert (
         "Publish skipped: chart version ${CHART_VERSION} already exists and no chart files changed."
     ) in workflow_text
     assert "steps.publish_decision.outputs.action == 'publish'" in workflow_text
     assert "helm push \"${package_file}\" \"${chart_registry}\"" in publish_runs
+    assert "first-parent fallback" not in publish_runs
+    assert (
+        "unable to compare full pushed range; treating chart paths as changed"
+        in publish_runs
+    )
 
 
 def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
@@ -175,9 +187,13 @@ def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
         steps = _job_steps(workflow_data["jobs"][job_name])
         checkout_steps = [step for step in steps if step.get("uses") == "actions/checkout@v4"]
         assert checkout_steps, f"{job_name} must check out the repository"
-        assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0", (
+        checkout_with = checkout_steps[0].get("with", {})
+        assert checkout_with.get("fetch-depth") == "0", (
             f"{job_name} must fetch enough history for chart publish diff decisions"
         )
+        assert checkout_with.get("ref") == (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}"
+        ), f"{job_name} must pin push checkouts to the triggering commit"
 
 
 def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:

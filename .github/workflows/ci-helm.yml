@@ -36,7 +36,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
           fetch-depth: 0
 
       - name: Set up Helm
@@ -237,7 +237,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
           fetch-depth: 0
 
       - name: Set up Helm
@@ -280,9 +280,19 @@ jobs:
           )
 
           chart_exists=false
-          if helm show chart "${CHART_REF}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
+          chart_lookup_status=error
+          chart_lookup_log="$(mktemp)"
+          if helm show chart "${CHART_REF}" --version "${CHART_VERSION}" >"${chart_lookup_log}" 2>&1; then
             chart_exists=true
+            chart_lookup_status=found
+          elif grep -Eiq '(not found|404|manifest unknown|name unknown)' "${chart_lookup_log}"; then
+            chart_exists=false
+            chart_lookup_status=not_found
+          else
+            chart_lookup_status=error
           fi
+          chart_lookup_details="$(tr '\n' ' ' <"${chart_lookup_log}" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+          rm -f "${chart_lookup_log}"
 
           chart_source_changed=false
           chart_related_changed=false
@@ -303,23 +313,9 @@ jobs:
                 chart_related_changed=true
               fi
             else
-              compare_note="first-parent fallback for ${after}"
-              if git rev-parse "${after}^" >/dev/null 2>&1; then
-                if git diff --quiet "${after}^" "${after}" -- "${chart_source_paths[@]}"; then
-                  chart_source_changed=false
-                else
-                  chart_source_changed=true
-                fi
-                if git diff --quiet "${after}^" "${after}" -- "${chart_related_paths[@]}"; then
-                  chart_related_changed=false
-                else
-                  chart_related_changed=true
-                fi
-              else
-                compare_note="unable to compare; treating chart paths as changed"
-                chart_source_changed=true
-                chart_related_changed=true
-              fi
+              compare_note="unable to compare full pushed range; treating chart paths as changed"
+              chart_source_changed=true
+              chart_related_changed=true
             fi
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             compare_note="manual dispatch publish=${MANUAL_PUBLISH}"
@@ -327,7 +323,10 @@ jobs:
 
           action=skip
           reason="Publish skipped: ${EVENT_NAME} does not request chart publishing."
-          if [[ "${EVENT_NAME}" == "push" ]]; then
+          if [[ "${chart_lookup_status}" == "error" ]]; then
+            action=fail
+            reason="Publish failed: could not determine whether chart version ${CHART_VERSION} exists in ${CHART_REF}; registry lookup must succeed or return a confirmed not-found response before publishing. ${chart_lookup_details}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ "${chart_source_changed}" == "true" && "${chart_exists}" == "false" ]]; then
               action=publish
               reason="Publishing new chart version ${CHART_VERSION} to ${CHART_REF}."
@@ -354,6 +353,7 @@ jobs:
 
           echo "action=${action}" >> "$GITHUB_OUTPUT"
           echo "chart_exists=${chart_exists}" >> "$GITHUB_OUTPUT"
+          echo "chart_lookup_status=${chart_lookup_status}" >> "$GITHUB_OUTPUT"
           echo "chart_changed=${chart_source_changed}" >> "$GITHUB_OUTPUT"
           echo "chart_related_changed=${chart_related_changed}" >> "$GITHUB_OUTPUT"
           echo "compare_note=${compare_note}" >> "$GITHUB_OUTPUT"
@@ -388,6 +388,7 @@ jobs:
             echo "Chart reference: \`${{ needs.validate-and-package.outputs.chart_ref }}\`"
             echo "Chart version: \`${{ needs.validate-and-package.outputs.chart_version }}\`"
             echo "Chart exists in GHCR: \`${{ steps.publish_decision.outputs.chart_exists }}\`"
+            echo "Chart lookup status: \`${{ steps.publish_decision.outputs.chart_lookup_status }}\`"
             echo "Chart source files changed: \`${{ steps.publish_decision.outputs.chart_changed }}\`"
             echo "Chart-related files changed: \`${{ steps.publish_decision.outputs.chart_related_changed }}\`"
             echo "Comparison: \`${{ steps.publish_decision.outputs.compare_note }}\`"

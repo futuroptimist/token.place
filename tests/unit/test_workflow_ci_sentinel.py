@@ -157,7 +157,8 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
     assert '".github/workflows/ci-helm.yml"' in publish_runs
     assert "helm show chart \"${CHART_REF}\" --version \"${CHART_VERSION}\"" in publish_runs
     assert "chart_lookup_status=not_found" in publish_runs
-    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" in publish_runs
+    assert "is_confirmed_missing_chart" in publish_runs
+    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
     assert "chart_lookup_status=error" in publish_runs
     assert "action=fail" in publish_runs
     assert (
@@ -182,6 +183,44 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
         "Publish failed: manual publish requested but chart version ${CHART_VERSION} already exists; "
         "refusing to overwrite immutable OCI artifact."
     ) in workflow_text
+
+
+def test_helm_chart_lookup_only_confirms_canonical_missing_errors() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert "is_confirmed_missing_chart()" in publish_runs
+    assert 'elif is_confirmed_missing_chart "${chart_lookup_log}"; then' in publish_runs
+    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    assert "404" not in publish_runs, (
+        "A bare HTTP 404 must not be sufficient to classify chart lookup output "
+        "as a confirmed missing chart"
+    )
+    assert "version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
+    assert "chart version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
+    assert "manifest unknown" in publish_runs
+    assert "name unknown" in publish_runs
+    assert "unauthorized" in publish_runs
+    assert "forbidden" in publish_runs
+    assert "rate limit" in publish_runs
+    assert "service unavailable" in publish_runs
+
+
+def test_helm_chart_lookup_errors_fail_closed_before_push() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert 'if [[ "${chart_lookup_status}" == "error" ]]; then' in publish_runs
+    assert (
+        "registry lookup must succeed or return a confirmed not-found response before publishing"
+        in workflow_text
+    )
+    error_branch = publish_runs.split('if [[ "${chart_lookup_status}" == "error" ]]; then', 1)[1].split(
+        'elif [[ "${EVENT_NAME}" == "push" ]]; then', 1
+    )[0]
+    assert "action=fail" in error_branch
+    assert "action=publish" not in error_branch
 
 
 def test_helm_manual_publish_existing_chart_fails_instead_of_skipping() -> None:

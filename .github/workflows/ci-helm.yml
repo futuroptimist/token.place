@@ -279,13 +279,23 @@ jobs:
             "docs/RPI_DEPLOYMENT_GUIDE.md"
           )
 
+          is_confirmed_missing_chart() {
+            local lookup_log="$1"
+
+            if grep -Eiq '(unauthorized|forbidden|denied|rate limit|too many requests|timeout|timed out|tls|certificate|connection|connection reset|connection refused|i/o timeout|temporary failure|server error|internal server error|bad gateway|service unavailable|gateway timeout|^[[:space:]]*<html)' "${lookup_log}"; then
+              return 1
+            fi
+
+            grep -Eiq '(^|[[:space:]:])((MANIFEST|NAME)_UNKNOWN|manifest unknown|name unknown|version[[:space:]]+[^[:space:]]+[[:space:]]+not found|chart version[[:space:]]+[^[:space:]]+[[:space:]]+not found)([[:space:].:]|$)' "${lookup_log}"
+          }
+
           chart_exists=false
           chart_lookup_status=error
           chart_lookup_log="$(mktemp)"
           if helm show chart "${CHART_REF}" --version "${CHART_VERSION}" >"${chart_lookup_log}" 2>&1; then
             chart_exists=true
             chart_lookup_status=found
-          elif grep -Eiq '(not found|404|manifest unknown|name unknown)' "${chart_lookup_log}"; then
+          elif is_confirmed_missing_chart "${chart_lookup_log}"; then
             chart_exists=false
             chart_lookup_status=not_found
           else

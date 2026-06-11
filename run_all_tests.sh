@@ -52,12 +52,27 @@ ensure_playwright_browsers() {
     local chromium_binary
     local chromium_patterns
 
-    cache_dir="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
+        cache_dir="$PLAYWRIGHT_BROWSERS_PATH"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        cache_dir="$HOME/Library/Caches/ms-playwright"
+    else
+        cache_dir="$HOME/.cache/ms-playwright"
+    fi
     chromium_patterns=(
+        # Linux cache layouts used by current and older Playwright releases.
         "*/chrome-linux/headless_shell"
         "*/chrome-headless-shell-linux64/chrome-headless-shell"
         "*/chrome-linux/chrome"
         "*/chrome-linux64/chrome"
+        # macOS cache layouts used by GitHub Actions' macos-latest runner.
+        # Include both Intel (chrome-mac) and Apple Silicon
+        # (chrome-mac-arm64) bundle directories; macos-latest can resolve to
+        # arm64 runners where Playwright stores Chromium under the suffixed
+        # directory.
+        "*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium"
+        "*/chrome-mac*/headless_shell"
+        "*/chrome-headless-shell-mac*/chrome-headless-shell"
     )
 
     detect_chromium_binary() {
@@ -69,7 +84,12 @@ ensure_playwright_browsers() {
         fi
 
         for pattern in "${chromium_patterns[@]}"; do
-            found_binary=$(find "$cache_dir" -maxdepth 3 -path "$pattern" -type f 2>/dev/null | head -n 1 || true)
+            # Use portable find options only: macOS/BSD find does not support
+            # GNU find's -maxdepth, and this script is exercised directly on
+            # macos-latest in PR checks. The Playwright cache is small enough
+            # that an unrestricted cache-dir search is cheap and avoids falsely
+            # missing preinstalled Chromium on macOS.
+            found_binary=$(find "$cache_dir" -path "$pattern" -type f 2>/dev/null | head -n 1 || true)
             if [ -n "$found_binary" ]; then
                 echo "$found_binary"
                 return

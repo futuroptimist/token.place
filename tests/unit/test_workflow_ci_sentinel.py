@@ -304,6 +304,13 @@ def test_ci_installs_playwright_chromium_with_system_dependencies() -> None:
     )
 
 
+def test_run_all_tests_detects_macos_arm64_playwright_chromium_cache() -> None:
+    runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
+
+    assert '"*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium"' in runner
+    assert '"*/chrome-mac*/headless_shell"' in runner
+
+
 def test_run_all_tests_uses_absolute_default_real_e2e_model_path() -> None:
     runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
 

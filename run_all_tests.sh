@@ -66,8 +66,12 @@ ensure_playwright_browsers() {
         "*/chrome-linux/chrome"
         "*/chrome-linux64/chrome"
         # macOS cache layouts used by GitHub Actions' macos-latest runner.
-        "*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"
-        "*/chrome-mac/headless_shell"
+        # Include both Intel (chrome-mac) and Apple Silicon
+        # (chrome-mac-arm64) bundle directories; macos-latest can resolve to
+        # arm64 runners where Playwright stores Chromium under the suffixed
+        # directory.
+        "*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium"
+        "*/chrome-mac*/headless_shell"
         "*/chrome-headless-shell-mac*/chrome-headless-shell"
     )
 

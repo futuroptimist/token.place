@@ -207,6 +207,22 @@ Stress tests include:
 These tests are skipped by default in CI to keep build times reasonable, but can be
 enabled for release validation or when investigating performance regressions.
 
+
+### Promotion smoke checks
+
+Before promoting the 0.1.0 staging candidate to production, follow the repeatable
+[production promotion checklist](PRODUCTION_PROMOTION.md). When an external
+staging or production relay is available, the optional smoke helper can verify
+read-only JSON endpoints without sending prompts or secrets:
+
+```bash
+RUN_PROMOTION_SMOKE=1 TOKENPLACE_SMOKE_BASE_URL=https://staging.example.com \
+  python scripts/promotion_smoke.py
+```
+
+Normal local and CI test runs remain offline because the helper skips unless
+`RUN_PROMOTION_SMOKE=1` and an explicit target URL are configured.
+
 ## User Journeys and E2E Testing
 
 token.place tests are organized around key user journeys that represent how users interact with the system:

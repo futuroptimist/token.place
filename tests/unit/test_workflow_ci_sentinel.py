@@ -178,6 +178,34 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
         "unable to compare full pushed range; treating chart paths as changed"
         in publish_runs
     )
+    assert (
+        "Publish failed: manual publish requested but chart version ${CHART_VERSION} already exists; "
+        "refusing to overwrite immutable OCI artifact."
+    ) in workflow_text
+
+
+def test_helm_manual_publish_existing_chart_fails_instead_of_skipping() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert (
+        'elif [[ "${MANUAL_PUBLISH}" == "true" && "${chart_exists}" == "true" ]]; then'
+        in publish_runs
+    )
+    assert (
+        "action=fail\n"
+        '    reason="Publish failed: manual publish requested but chart version '
+        '${CHART_VERSION} already exists; refusing to overwrite immutable OCI artifact."'
+        in publish_runs
+    ), (
+        "Manual publish must fail closed instead of skipping when the immutable chart "
+        "already exists"
+    )
+    assert (
+        "Publish skipped: manual dispatch validate/package only; chart version ${CHART_VERSION} already exists."
+        in workflow_text
+    ), "Manual validate/package-only dispatches must still succeed without publishing"
 
 
 def test_helm_workflow_checkout_has_history_for_push_diff() -> None:

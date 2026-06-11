@@ -343,7 +343,8 @@ jobs:
               action=publish
               reason="Publishing new chart version ${CHART_VERSION} to ${CHART_REF} from manual dispatch."
             elif [[ "${MANUAL_PUBLISH}" == "true" && "${chart_exists}" == "true" ]]; then
-              reason="Publish skipped: manual publish requested but chart version ${CHART_VERSION} already exists; immutable OCI artifacts are never overwritten."
+              action=fail
+              reason="Publish failed: manual publish requested but chart version ${CHART_VERSION} already exists; refusing to overwrite immutable OCI artifact."
             elif [[ "${chart_exists}" == "true" ]]; then
               reason="Publish skipped: manual dispatch validate/package only; chart version ${CHART_VERSION} already exists."
             else

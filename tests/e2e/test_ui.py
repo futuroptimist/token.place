@@ -1187,6 +1187,11 @@ def test_landing_chat_cancelled_compute_error_renders_request_expired_message(
             }
         ],
     )
+    console_errors: list[str] = []
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -1203,6 +1208,7 @@ def test_landing_chat_cancelled_compute_error_renders_request_expired_message(
         in assistant_message.inner_text()
     )
     assert "internal cancellation details should not be shown" not in body_text
+    assert not any("Unexpected response format" in message for message in console_errors)
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -1227,6 +1233,11 @@ def test_landing_chat_structured_error_without_safe_code_hides_raw_message(
         page,
         api_v1_responses=[{"error": error_payload}],
     )
+    console_errors: list[str] = []
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
@@ -1243,6 +1254,7 @@ def test_landing_chat_structured_error_without_safe_code_hides_raw_message(
         in assistant_message.inner_text()
     )
     assert "Desktop runtime failed: /private/path" not in body_text
+    assert not any("Unexpected response format" in message for message in console_errors)
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

@@ -962,7 +962,7 @@ new Vue({
                 return error.userMessage;
             }
 
-            const errorCode = typeof error.code === 'string' ? error.code : '';
+            const errorCode = typeof error.code === 'string' ? error.code.trim() : '';
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now. Your chat history is still here.',
                 compute_node_model_unsupported: 'The selected model is not available on this LLM server. Please try again.',
@@ -971,6 +971,7 @@ new Vue({
                 compute_node_invalid_model_output: 'The LLM server returned an invalid response. Please try again.',
                 compute_node_internal_error: 'The LLM server failed while generating a response. Please try again.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
+                compute_node_request_cancelled: 'The LLM server request expired before it could be answered. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
                 compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
@@ -981,10 +982,8 @@ new Vue({
                 return codeToMessage[errorCode];
             }
 
-            if (!errorCode && typeof error.message === 'string' && error.message.trim()) {
-                return error.message;
-            }
-
+            // Raw error.message values can contain internal relay or compute-node details.
+            // Only explicit userMessage values and known safe error codes are rendered.
             return fallbackMessage;
         },
 
@@ -994,7 +993,7 @@ new Vue({
                 return null;
             }
 
-            const code = typeof error.code === 'string' && error.code.trim() ? error.code : '';
+            const code = typeof error.code === 'string' && error.code.trim() ? error.code.trim() : '';
             return {
                 userMessage: this.getUserFacingApiError(response),
                 terminalSelectedServer: error.terminalSelectedServer === true,

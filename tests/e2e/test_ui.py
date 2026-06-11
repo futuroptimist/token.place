@@ -1169,6 +1169,85 @@ def test_landing_chat_unknown_structured_compute_error_uses_generic_fallback(
 
 
 @pytest.mark.e2e
+def test_landing_chat_cancelled_compute_error_renders_request_expired_message(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Known API v1 cancellation errors render the safe timeout-style message."""
+
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {
+                "error": {
+                    "code": " compute_node_request_cancelled ",
+                    "message": "internal cancellation details should not be shown",
+                }
+            }
+        ],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("hello cancelled error")
+    wait_for_landing_send_enabled(page).click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    body_text = page.locator("body").inner_text()
+    assert (
+        "The LLM server request expired before it could be answered. Please try again."
+        in assistant_message.inner_text()
+    )
+    assert "internal cancellation details should not be shown" not in body_text
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "error_payload",
+    [
+        {"message": "Desktop runtime failed: /private/path"},
+        {"code": 500, "message": "Desktop runtime failed: /private/path"},
+    ],
+)
+def test_landing_chat_structured_error_without_safe_code_hides_raw_message(
+    page: Page,
+    base_url: str,
+    setup_servers,
+    error_payload: dict,
+):
+    """Structured API v1 errors without a known string code never render raw messages."""
+
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[{"error": error_payload}],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("hello raw hidden")
+    wait_for_landing_send_enabled(page).click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    body_text = page.locator("body").inner_text()
+    assert (
+        "Sorry, I encountered an issue generating a response. Please try again."
+        in assistant_message.inner_text()
+    )
+    assert "Desktop runtime failed: /private/path" not in body_text
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
 def test_landing_chat_decrypted_terminal_error_triggers_failover(
     page: Page,
     base_url: str,

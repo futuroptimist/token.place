@@ -190,12 +190,17 @@ def test_helm_chart_lookup_only_confirms_canonical_missing_errors() -> None:
     publish_runs = _step_runs(workflow_data["jobs"]["publish"])
 
     assert "is_confirmed_missing_chart()" in publish_runs
-    assert 'elif is_confirmed_missing_chart "${chart_lookup_log}"; then' in publish_runs
+    assert (
+        'elif is_confirmed_missing_chart "${chart_lookup_log}" "${CHART_VERSION}"; then'
+        in publish_runs
+    )
     assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
     assert "404" not in publish_runs, (
         "A bare HTTP 404 must not be sufficient to classify chart lookup output "
         "as a confirmed missing chart"
     )
+    assert 'grep -Fq ":${chart_version}: not found"' in publish_runs
+    assert 'grep -Fq "/manifests/${chart_version} not found:"' in publish_runs
     assert "version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
     assert "chart version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
     assert "manifest unknown" in publish_runs

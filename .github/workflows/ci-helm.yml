@@ -281,9 +281,17 @@ jobs:
 
           is_confirmed_missing_chart() {
             local lookup_log="$1"
+            local chart_version="$2"
 
             if grep -Eiq '(unauthorized|forbidden|denied|rate limit|too many requests|timeout|timed out|tls|certificate|connection|connection reset|connection refused|i/o timeout|temporary failure|server error|internal server error|bad gateway|service unavailable|gateway timeout|^[[:space:]]*<html)' "${lookup_log}"; then
               return 1
+            fi
+
+            if grep -Fq ":${chart_version}: not found" "${lookup_log}"; then
+              return 0
+            fi
+            if grep -Fq "/manifests/${chart_version} not found:" "${lookup_log}"; then
+              return 0
             fi
 
             grep -Eiq '(^|[[:space:]:])((MANIFEST|NAME)_UNKNOWN|manifest unknown|name unknown|version[[:space:]]+[^[:space:]]+[[:space:]]+not found|chart version[[:space:]]+[^[:space:]]+[[:space:]]+not found)([[:space:].:]|$)' "${lookup_log}"
@@ -295,7 +303,7 @@ jobs:
           if helm show chart "${CHART_REF}" --version "${CHART_VERSION}" >"${chart_lookup_log}" 2>&1; then
             chart_exists=true
             chart_lookup_status=found
-          elif is_confirmed_missing_chart "${chart_lookup_log}"; then
+          elif is_confirmed_missing_chart "${chart_lookup_log}" "${CHART_VERSION}"; then
             chart_exists=false
             chart_lookup_status=not_found
           else

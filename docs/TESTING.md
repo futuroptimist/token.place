@@ -355,6 +355,30 @@ To add a new visual test:
    ```
 5. Capture screenshots and compare with baselines or create new ones
 
+## Promotion smoke checks
+
+The repeatable `v0.1.0` staging-to-production checklist lives in
+[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It covers the release-specific
+smoke risks for API v1 model identity (`llama-3.1-8b-instruct` as the only public
+model), landing dropdown count, absence of `owned by token.place`, live
+compute-node diagnostics, two-node round-robin, sticky server routing, automatic
+history-preserving failover, relay-blind privacy invariants, production secrets,
+rate-limit storage, and rollback readiness.
+
+For endpoint-only external smoke checks, use the opt-in helper:
+
+```bash
+RUN_PROMOTION_SMOKE=1 \
+TOKENPLACE_SMOKE_ENV=staging \
+TOKENPLACE_SMOKE_BASE_URL=https://staging.token.place \
+python scripts/promotion_smoke.py
+```
+
+The helper is safe by default: normal test runs never contact live services, and
+production-looking targets require `TOKENPLACE_SMOKE_ALLOW_PROD=1`. It validates
+`/livez`, `/healthz`, `/relay/diagnostics`, and `/api/v1/models` without sending
+prompts or touching chat-completion routes.
+
 ## Test Coverage and Continuous Integration
 
 token.place uses pytest-cov to track test coverage:

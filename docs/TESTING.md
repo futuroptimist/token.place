@@ -207,6 +207,26 @@ Stress tests include:
 These tests are skipped by default in CI to keep build times reasonable, but can be
 enabled for release validation or when investigating performance regressions.
 
+
+### Promotion smoke checks
+
+The staging-to-prod promotion guide includes an optional endpoint-only smoke helper that is safe by
+default. Normal local and CI test runs do not contact staging or production because the script exits
+without network requests unless `RUN_PROMOTION_SMOKE=1` is set.
+
+```bash
+RUN_PROMOTION_SMOKE=1 \
+TOKENPLACE_SMOKE_BASE_URL=https://staging.token.place \
+python scripts/promotion_smoke.py
+```
+
+The helper validates `/livez`, `/healthz`, `/relay/diagnostics`, and `/api/v1/models`; it asserts the
+0.1.0 launch catalog has exactly one public model, `llama-3.1-8b-instruct`. Production smoke runs
+also require `TOKENPLACE_SMOKE_ALLOW_PROD=1`. See
+[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md) for the full manual checklist covering desktop
+registration, landing dropdown model count, sticky routing, automatic failover, DOM public-key
+redaction, and the landing chat's API v1-only E2EE route usage.
+
 ## User Journeys and E2E Testing
 
 token.place tests are organized around key user journeys that represent how users interact with the system:

@@ -60,6 +60,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [CONTRIBUTING.md](../CONTRIBUTING.md): Contribution guidelines for developers
 - [STYLE_GUIDE.md](STYLE_GUIDE.md): Style and branding guidelines, including proper name stylization
 - [TESTING.md](TESTING.md): Comprehensive guide to the testing approach
+- [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md): Repeatable 0.1.0 staging-to-prod checklist and smoke helper
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md): Ideas for further testing improvements
 - [ARCHITECTURE.md](ARCHITECTURE.md): Detailed architectural overview of the system
 - [LLM_ASSISTANT_GUIDE.md](LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase

@@ -22,7 +22,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
     [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md),
-    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md),
+    [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md)
 - **Learn the encryption model**
   - Start here: [encrypt.py](../encrypt.py)
   - Also see: [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md),
@@ -39,6 +40,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
 ## Key checklists
 
 - **Testing:** [TESTING.md](TESTING.md) summarises the suites executed by `run_all_tests.sh`.
+- **Production promotion:** [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md) captures the
+  repeatable 0.1.0 staging-to-prod checklist and opt-in smoke helper.
 - **Security:** [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md) contains the rolling
   hardening checklist and threat model; use
   [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.

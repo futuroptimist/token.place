@@ -45,6 +45,7 @@ def route_landing_relay_chat(
     page: Page,
     *,
     assistant_content: str = "Relay chat path restored.",
+    api_v1_responses: list[dict] | None = None,
     models_payload: dict | None = None,
     next_status: int = 200,
     next_statuses: list[int] | None = None,
@@ -158,6 +159,16 @@ def route_landing_relay_chat(
                 body=json.dumps({"error": {"code": "selected_server_terminal"}}),
             )
             return
+        retrieve_index = len(state["retrieve_requests"]) - 1
+        if api_v1_responses:
+            api_v1_response = api_v1_responses[min(retrieve_index, len(api_v1_responses) - 1)]
+        else:
+            api_v1_response = {
+                "message": {
+                    "role": "assistant",
+                    "content": assistant_content,
+                }
+            }
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
@@ -169,12 +180,7 @@ def route_landing_relay_chat(
                             "version": 1,
                             "request_id": request_id,
                             "client_public_key": client_public_key,
-                            "api_v1_response": {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": assistant_content,
-                                }
-                            },
+                            "api_v1_response": api_v1_response,
                         }
                     ),
                     "cipherkey": "test-cipherkey",
@@ -1068,6 +1074,151 @@ def test_landing_chat_shows_no_servers_available_message(
     assert state["next_calls"] == 1
     assert state["relay_requests"] == []
     assert state["chat_completions"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_structured_compute_error_renders_safe_message(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Decrypted API v1 compute errors render as assistant messages, not format errors."""
+
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {
+                "error": {
+                    "code": "compute_node_model_unsupported",
+                    "message": "Requested model is not available in the desktop runtime",
+                }
+            }
+        ],
+    )
+    console_errors: list[str] = []
+    console_warnings: list[str] = []
+
+    def record_console_message(msg):
+        if msg.type == "error":
+            console_errors.append(msg.text)
+        elif msg.type == "warning":
+            console_warnings.append(msg.text)
+
+    page.on("console", record_console_message)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("hello structured error")
+    wait_for_landing_send_enabled(page).click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "The selected model is not available on this LLM server. Please try again." in assistant_message.inner_text()
+    body_text = page.locator("body").inner_text()
+    assert "hello structured error" in body_text
+    assert not any("Unexpected response format" in message for message in console_errors)
+    assert any("compute_node_model_unsupported" in message for message in console_warnings)
+    assert state["relay_requests"], "expected the landing chat to POST an API v1 relay payload"
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_unknown_structured_compute_error_uses_generic_fallback(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Unknown structured API v1 errors fall back safely instead of throwing."""
+
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {
+                "error": {
+                    "code": "compute_node_future_error",
+                    "message": "internal detail should not be shown",
+                }
+            }
+        ],
+    )
+    console_errors: list[str] = []
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("hello unknown error")
+    wait_for_landing_send_enabled(page).click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "Sorry, I encountered an issue generating a response. Please try again." in assistant_message.inner_text()
+    body_text = page.locator("body").inner_text()
+    assert "hello unknown error" in body_text
+    assert "internal detail should not be shown" not in body_text
+    assert not any("Unexpected response format" in message for message in console_errors)
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_decrypted_terminal_error_triggers_failover(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Terminal structured API v1 errors still reselect a server before rendering."""
+
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {
+                "error": {
+                    "code": "selected_server_terminal",
+                    "terminalSelectedServer": True,
+                }
+            },
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Replacement server answered after decrypted terminal error.",
+                }
+            },
+        ],
+        next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        diagnostics_counts=[1, 2],
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("hello decrypted terminal")
+    wait_for_landing_send_enabled(page).click()
+
+    page.wait_for_function(
+        """
+        () => document.body.textContent.includes('Replacement server answered after decrypted terminal error.')
+        """
+    )
+    body_text = page.locator("body").inner_text()
+    assert "hello decrypted terminal" in body_text
+    assert "Replacement server answered after decrypted terminal error." in body_text
+    assert "Sorry, I encountered an issue generating a response" not in body_text
+    assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
+        SERVER_PUBLIC_KEY_B64,
+        ALT_SERVER_PUBLIC_KEY_B64,
+    ]
+    assert state["next_calls"] == 2
+    assert state["chat_completions"] == []
+    assert state["v2_requests"] == []
 
 
 @pytest.mark.e2e

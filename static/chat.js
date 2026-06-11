@@ -953,11 +953,23 @@ new Vue({
 
         getUserFacingApiError(errorPayload) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
-            const errorCode = error && typeof error.code === 'string' ? error.code : '';
             const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
+            if (!error || typeof error !== 'object') {
+                return fallbackMessage;
+            }
 
+            if (typeof error.userMessage === 'string' && error.userMessage.trim()) {
+                return error.userMessage;
+            }
+
+            const errorCode = typeof error.code === 'string' ? error.code : '';
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now. Your chat history is still here.',
+                compute_node_model_unsupported: 'The selected model is not available on this LLM server. Please try again.',
+                compute_node_options_unsupported: 'The selected LLM server does not support one of the requested options. Please try again.',
+                compute_node_invalid_request: 'The LLM server rejected the request format. Please try again.',
+                compute_node_invalid_model_output: 'The LLM server returned an invalid response. Please try again.',
+                compute_node_internal_error: 'The LLM server failed while generating a response. Please try again.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
@@ -965,7 +977,29 @@ new Vue({
                 compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
             };
 
-            return codeToMessage[errorCode] || fallbackMessage;
+            if (Object.prototype.hasOwnProperty.call(codeToMessage, errorCode)) {
+                return codeToMessage[errorCode];
+            }
+
+            if (!errorCode && typeof error.message === 'string' && error.message.trim()) {
+                return error.message;
+            }
+
+            return fallbackMessage;
+        },
+
+        normalizeApiV1ResponseError(response) {
+            const error = response && typeof response === 'object' ? response.error : null;
+            if (!error || typeof error !== 'object') {
+                return null;
+            }
+
+            const code = typeof error.code === 'string' && error.code.trim() ? error.code : '';
+            return {
+                userMessage: this.getUserFacingApiError(response),
+                terminalSelectedServer: error.terminalSelectedServer === true,
+                code
+            };
         },
 
         isInvalidAssistantResponseContent(content) {
@@ -1002,10 +1036,14 @@ new Vue({
 
                 // Process the response
                 if (response) {
-                    if (response.error && typeof response.error.userMessage === 'string') {
+                    const normalizedError = this.normalizeApiV1ResponseError(response);
+                    if (normalizedError) {
+                        if (normalizedError.code) {
+                            console.warn('API v1 structured error rendered:', { code: normalizedError.code });
+                        }
                         this.chatHistory.push({
                             role: 'assistant',
-                            content: response.error.userMessage
+                            content: normalizedError.userMessage
                         });
                     }
                     // For API response, extract last message

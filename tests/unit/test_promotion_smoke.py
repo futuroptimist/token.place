@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 SPEC = importlib.util.spec_from_file_location(
     "promotion_smoke", Path("scripts/promotion_smoke.py")
 )
@@ -38,7 +37,9 @@ def test_config_from_env_normalizes_staging_url() -> None:
 
 
 def test_config_from_env_refuses_production_without_acknowledgement() -> None:
-    with pytest.raises(promotion_smoke.SmokeConfigError, match="TOKENPLACE_SMOKE_ALLOW_PROD"):
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="TOKENPLACE_SMOKE_ALLOW_PROD"
+    ):
         promotion_smoke.config_from_env(
             {
                 "RUN_PROMOTION_SMOKE": "1",
@@ -114,7 +115,9 @@ def test_validate_diagnostics_requires_consistent_api_v1_live_node_count() -> No
         }
     )
 
-    with pytest.raises(promotion_smoke.SmokeCheckError, match="must match listed nodes"):
+    with pytest.raises(
+        promotion_smoke.SmokeCheckError, match="must match listed nodes"
+    ):
         promotion_smoke.validate_diagnostics(
             {
                 "total_registered_compute_nodes": 2,
@@ -125,7 +128,9 @@ def test_validate_diagnostics_requires_consistent_api_v1_live_node_count() -> No
 
 
 def test_run_smoke_checks_uses_expected_json_endpoints_without_network() -> None:
-    config = promotion_smoke.SmokeConfig(base_url="https://staging.token.place/", environment="staging")
+    config = promotion_smoke.SmokeConfig(
+        base_url="https://staging.token.place/", environment="staging"
+    )
     responses = {
         "https://staging.token.place/livez": {"status": "alive"},
         "https://staging.token.place/healthz": {"status": "ok"},
@@ -155,3 +160,101 @@ def test_run_smoke_checks_uses_expected_json_endpoints_without_network() -> None
         "/relay/diagnostics ok",
         "/api/v1/models ok",
     ]
+
+
+def test_config_from_env_rejects_pathful_base_url() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="must not include a path"
+    ):
+        promotion_smoke.config_from_env(
+            {
+                "RUN_PROMOTION_SMOKE": "1",
+                "TOKENPLACE_SMOKE_BASE_URL": "https://staging.token.place/api",
+            }
+        )
+
+
+def test_config_from_env_rejects_query_or_fragment_base_url() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="params, query, or fragment"
+    ):
+        promotion_smoke.config_from_env(
+            {
+                "RUN_PROMOTION_SMOKE": "1",
+                "TOKENPLACE_SMOKE_BASE_URL": "https://staging.token.place/?debug=1",
+            }
+        )
+
+
+def test_config_from_env_refuses_production_like_subdomain_without_acknowledgement() -> (
+    None
+):
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="TOKENPLACE_SMOKE_ALLOW_PROD"
+    ):
+        promotion_smoke.config_from_env(
+            {
+                "RUN_PROMOTION_SMOKE": "1",
+                "TOKENPLACE_SMOKE_BASE_URL": "https://prod.token.place",
+            }
+        )
+
+
+def test_config_from_env_refuses_production_like_cname_without_acknowledgement() -> (
+    None
+):
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="TOKENPLACE_SMOKE_ALLOW_PROD"
+    ):
+        promotion_smoke.config_from_env(
+            {
+                "RUN_PROMOTION_SMOKE": "1",
+                "TOKENPLACE_SMOKE_BASE_URL": "https://relay.prod.example.com",
+            }
+        )
+
+
+def test_endpoint_url_uses_root_relative_endpoint() -> None:
+    assert (
+        promotion_smoke.endpoint_url("https://staging.token.place/", "/livez")
+        == "https://staging.token.place/livez"
+    )
+
+
+def test_validate_healthz_rejects_degraded_details_even_when_status_ok() -> None:
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="degraded details"):
+        promotion_smoke.validate_healthz(
+            {"status": "ok", "details": {"knownServers": "empty"}}
+        )
+
+
+def test_validate_models_rejects_non_object_entries() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeCheckError, match="entries must be objects"
+    ):
+        promotion_smoke.validate_models(
+            {
+                "object": "list",
+                "data": ["oops", {"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+            }
+        )
+
+
+def test_run_smoke_checks_rejects_unknown_endpoint_without_network() -> None:
+    config = promotion_smoke.SmokeConfig(
+        base_url="https://staging.token.place/", environment="staging"
+    )
+
+    def fail_fetcher(
+        url: str, timeout_seconds: float
+    ):  # pragma: no cover - must not run
+        raise AssertionError(
+            f"unexpected fetch of {url} with timeout {timeout_seconds}"
+        )
+
+    with pytest.raises(
+        promotion_smoke.SmokeConfigError, match="Unsupported smoke endpoint"
+    ):
+        promotion_smoke.run_smoke_checks(
+            config, fetcher=fail_fetcher, endpoints=("/unknown",)
+        )

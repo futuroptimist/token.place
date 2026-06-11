@@ -48,7 +48,7 @@ def _env_truthy(value: str | None) -> bool:
 
 
 def normalize_base_url(raw_base_url: str) -> str:
-    """Validate and normalize a configured HTTP(S) base URL."""
+    """Validate and normalize a configured HTTP(S) root base URL."""
     raw = raw_base_url.strip()
     if not raw:
         raise SmokeConfigError(f"{BASE_URL_ENV} must not be empty")
@@ -57,20 +57,35 @@ def normalize_base_url(raw_base_url: str) -> str:
         raise SmokeConfigError(f"{BASE_URL_ENV} must use http:// or https://")
     if not parsed.netloc:
         raise SmokeConfigError(f"{BASE_URL_ENV} must include a host")
-    return raw.rstrip("/") + "/"
+    if parsed.path.strip("/"):
+        raise SmokeConfigError(f"{BASE_URL_ENV} must not include a path")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise SmokeConfigError(
+            f"{BASE_URL_ENV} must not include params, query, or fragment"
+        )
+    return f"{parsed.scheme}://{parsed.netloc.rstrip('/')}" + "/"
 
 
 def _looks_like_prod(base_url: str, environment: str) -> bool:
-    host = urlparse(base_url).hostname or ""
+    host = (urlparse(base_url).hostname or "").lower()
     env = environment.strip().lower()
-    return env in {"prod", "production"} or host in {"token.place", "www.token.place"}
+    labels = set(host.split("."))
+    production_hosts = {"token.place", "www.token.place"}
+    return (
+        env in {"prod", "production"}
+        or host in production_hosts
+        or (host.endswith(".token.place") and host != "staging.token.place")
+        or bool(labels & {"prod", "production"})
+    )
 
 
 def config_from_env(env: dict[str, str] | None = None) -> SmokeConfig:
     """Build a safe smoke configuration from environment variables."""
     values = os.environ if env is None else env
     if not _env_truthy(values.get(ENABLE_ENV)):
-        raise SmokeConfigError(f"Set {ENABLE_ENV}=1 to run external promotion smoke checks")
+        raise SmokeConfigError(
+            f"Set {ENABLE_ENV}=1 to run external promotion smoke checks"
+        )
     base_url = normalize_base_url(values.get(BASE_URL_ENV, ""))
     environment = values.get(ENVIRONMENT_ENV, "staging").strip().lower() or "staging"
     allow_prod = _env_truthy(values.get(ALLOW_PROD_ENV))
@@ -78,14 +93,16 @@ def config_from_env(env: dict[str, str] | None = None) -> SmokeConfig:
         raise SmokeConfigError(
             f"Refusing production-looking target without {ALLOW_PROD_ENV}=1"
         )
-    return SmokeConfig(base_url=base_url, environment=environment, allow_prod=allow_prod)
+    return SmokeConfig(
+        base_url=base_url, environment=environment, allow_prod=allow_prod
+    )
 
 
 def endpoint_url(base_url: str, endpoint: str) -> str:
     """Join a normalized or raw base URL with a root-relative endpoint."""
     if not endpoint.startswith("/"):
         raise SmokeConfigError("endpoint must be root-relative")
-    return urljoin(normalize_base_url(base_url), endpoint.lstrip("/"))
+    return urljoin(normalize_base_url(base_url), endpoint)
 
 
 def validate_livez(payload: Any) -> None:
@@ -96,20 +113,32 @@ def validate_livez(payload: Any) -> None:
 def validate_healthz(payload: Any) -> None:
     if not isinstance(payload, dict) or payload.get("status") != "ok":
         raise SmokeCheckError("/healthz must return JSON status=ok")
+    details = payload.get("details")
+    if details:
+        raise SmokeCheckError("/healthz must not include degraded details")
 
 
 def validate_diagnostics(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise SmokeCheckError("/relay/diagnostics must return a JSON object")
-    required = ("total_registered_compute_nodes", "total_api_v1_registered_compute_nodes")
+    required = (
+        "total_registered_compute_nodes",
+        "total_api_v1_registered_compute_nodes",
+    )
     for key in required:
         value = payload.get(key)
         if not isinstance(value, int) or value < 0:
-            raise SmokeCheckError(f"/relay/diagnostics {key} must be a non-negative integer")
+            raise SmokeCheckError(
+                f"/relay/diagnostics {key} must be a non-negative integer"
+            )
     nodes = payload.get("api_v1_registered_compute_nodes")
     if nodes is not None and not isinstance(nodes, list):
-        raise SmokeCheckError("/relay/diagnostics api_v1_registered_compute_nodes must be a list")
-    if isinstance(nodes, list) and payload["total_api_v1_registered_compute_nodes"] != len(nodes):
+        raise SmokeCheckError(
+            "/relay/diagnostics api_v1_registered_compute_nodes must be a list"
+        )
+    if isinstance(nodes, list) and payload[
+        "total_api_v1_registered_compute_nodes"
+    ] != len(nodes):
         raise SmokeCheckError(
             "/relay/diagnostics total_api_v1_registered_compute_nodes must match listed nodes"
         )
@@ -117,11 +146,15 @@ def validate_diagnostics(payload: Any) -> None:
 
 def validate_models(payload: Any) -> None:
     if not isinstance(payload, dict) or payload.get("object") != "list":
-        raise SmokeCheckError("/api/v1/models must return an OpenAI-compatible list object")
+        raise SmokeCheckError(
+            "/api/v1/models must return an OpenAI-compatible list object"
+        )
     data = payload.get("data")
     if not isinstance(data, list):
         raise SmokeCheckError("/api/v1/models data must be a list")
-    ids = [model.get("id") for model in data if isinstance(model, dict)]
+    if not all(isinstance(model, dict) for model in data):
+        raise SmokeCheckError("/api/v1/models data entries must be objects")
+    ids = [model.get("id") for model in data]
     if ids != [EXPECTED_MODEL_ID]:
         raise SmokeCheckError(
             f"/api/v1/models must expose exactly [{EXPECTED_MODEL_ID!r}], got {ids!r}"
@@ -140,9 +173,17 @@ VALIDATORS = {
 
 
 def fetch_json(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> Any:
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "tokenplace-promotion-smoke/1"})
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "tokenplace-promotion-smoke/1",
+        },
+    )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - explicit operator URL only
+        with urlopen(
+            request, timeout=timeout_seconds
+        ) as response:  # nosec B310 - explicit operator URL only
             status = getattr(response, "status", response.getcode())
             body = response.read().decode("utf-8")
     except HTTPError as exc:  # pragma: no cover - unit tests exercise via fake fetchers
@@ -166,8 +207,13 @@ def run_smoke_checks(
     """Run configured endpoint checks and return human-readable successes."""
     successes: list[str] = []
     for endpoint in endpoints:
-        payload = fetcher(endpoint_url(config.base_url, endpoint), config.timeout_seconds)
-        VALIDATORS[endpoint](payload)
+        validator = VALIDATORS.get(endpoint)
+        if validator is None:
+            raise SmokeConfigError(f"Unsupported smoke endpoint: {endpoint}")
+        payload = fetcher(
+            endpoint_url(config.base_url, endpoint), config.timeout_seconds
+        )
+        validator(payload)
         successes.append(f"{endpoint} ok")
     return successes
 

@@ -105,7 +105,15 @@ def test_validate_models_requires_exact_launch_model() -> None:
         )
 
 
-def test_validate_diagnostics_requires_consistent_api_v1_live_node_count() -> None:
+def test_validate_diagnostics_accepts_matching_live_node_counts() -> None:
+    promotion_smoke.validate_diagnostics(
+        {
+            "total_registered_compute_nodes": 0,
+            "registered_compute_nodes": [],
+            "total_api_v1_registered_compute_nodes": 0,
+            "api_v1_registered_compute_nodes": [],
+        }
+    )
     promotion_smoke.validate_diagnostics(
         {
             "total_registered_compute_nodes": 2,
@@ -115,12 +123,61 @@ def test_validate_diagnostics_requires_consistent_api_v1_live_node_count() -> No
         }
     )
 
+
+def test_validate_diagnostics_requires_registered_compute_nodes_list() -> None:
     with pytest.raises(
-        promotion_smoke.SmokeCheckError, match="must match listed nodes"
+        promotion_smoke.SmokeCheckError, match="registered_compute_nodes must be a list"
+    ):
+        promotion_smoke.validate_diagnostics(
+            {
+                "total_registered_compute_nodes": 0,
+                "total_api_v1_registered_compute_nodes": 0,
+                "api_v1_registered_compute_nodes": [],
+            }
+        )
+
+
+def test_validate_diagnostics_requires_api_v1_registered_compute_nodes_list() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeCheckError,
+        match="api_v1_registered_compute_nodes must be a list",
+    ):
+        promotion_smoke.validate_diagnostics(
+            {
+                "total_registered_compute_nodes": 0,
+                "registered_compute_nodes": [],
+                "total_api_v1_registered_compute_nodes": 0,
+            }
+        )
+
+
+def test_validate_diagnostics_rejects_registered_total_mismatch() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeCheckError,
+        match="total_registered_compute_nodes must match registered_compute_nodes",
     ):
         promotion_smoke.validate_diagnostics(
             {
                 "total_registered_compute_nodes": 2,
+                "registered_compute_nodes": [{}],
+                "total_api_v1_registered_compute_nodes": 1,
+                "api_v1_registered_compute_nodes": [{}],
+            }
+        )
+
+
+def test_validate_diagnostics_rejects_api_v1_registered_total_mismatch() -> None:
+    with pytest.raises(
+        promotion_smoke.SmokeCheckError,
+        match=(
+            "total_api_v1_registered_compute_nodes "
+            "must match api_v1_registered_compute_nodes"
+        ),
+    ):
+        promotion_smoke.validate_diagnostics(
+            {
+                "total_registered_compute_nodes": 2,
+                "registered_compute_nodes": [{}, {}],
                 "total_api_v1_registered_compute_nodes": 2,
                 "api_v1_registered_compute_nodes": [{}],
             }
@@ -136,6 +193,7 @@ def test_run_smoke_checks_uses_expected_json_endpoints_without_network() -> None
         "https://staging.token.place/healthz": {"status": "ok"},
         "https://staging.token.place/relay/diagnostics": {
             "total_registered_compute_nodes": 2,
+            "registered_compute_nodes": [{}, {}],
             "total_api_v1_registered_compute_nodes": 2,
             "api_v1_registered_compute_nodes": [{}, {}],
         },

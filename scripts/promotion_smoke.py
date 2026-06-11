@@ -121,27 +121,29 @@ def validate_healthz(payload: Any) -> None:
 def validate_diagnostics(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise SmokeCheckError("/relay/diagnostics must return a JSON object")
-    required = (
+    required_totals = (
         "total_registered_compute_nodes",
         "total_api_v1_registered_compute_nodes",
     )
-    for key in required:
+    for key in required_totals:
         value = payload.get(key)
         if not isinstance(value, int) or value < 0:
             raise SmokeCheckError(
                 f"/relay/diagnostics {key} must be a non-negative integer"
             )
-    nodes = payload.get("api_v1_registered_compute_nodes")
-    if nodes is not None and not isinstance(nodes, list):
-        raise SmokeCheckError(
-            "/relay/diagnostics api_v1_registered_compute_nodes must be a list"
-        )
-    if isinstance(nodes, list) and payload[
-        "total_api_v1_registered_compute_nodes"
-    ] != len(nodes):
-        raise SmokeCheckError(
-            "/relay/diagnostics total_api_v1_registered_compute_nodes must match listed nodes"
-        )
+
+    required_lists = (
+        ("registered_compute_nodes", "total_registered_compute_nodes"),
+        ("api_v1_registered_compute_nodes", "total_api_v1_registered_compute_nodes"),
+    )
+    for list_key, total_key in required_lists:
+        nodes = payload.get(list_key)
+        if not isinstance(nodes, list):
+            raise SmokeCheckError(f"/relay/diagnostics {list_key} must be a list")
+        if payload[total_key] != len(nodes):
+            raise SmokeCheckError(
+                f"/relay/diagnostics {total_key} must match {list_key} length"
+            )
 
 
 def validate_models(payload: Any) -> None:

@@ -138,6 +138,136 @@ def test_image_workflow_keeps_pull_request_validate_only() -> None:
     ), "ci-image.yml publish job must stay push-only so PR and workflow_dispatch runs validate only"
 
 
+def test_helm_workflow_publish_decision_is_idempotent() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    on_block = _workflow_on_block(workflow_data, "ci-helm.yml")
+
+    publish_input = on_block["workflow_dispatch"]["inputs"]["publish"]
+    assert publish_input["type"] == "boolean"
+    assert publish_input["default"] == "false"
+
+    publish_job = workflow_data["jobs"]["publish"]
+    publish_runs = _step_runs(publish_job)
+
+    assert "github.event_name != 'pull_request'" in publish_job["if"]
+    assert "chart_source_paths=(" in publish_runs
+    assert '"charts/tokenplace/**"' in publish_runs
+    assert "chart_related_paths=(" in publish_runs
+    assert '".github/workflows/ci-helm.yml"' in publish_runs
+    assert "helm show chart \"${CHART_REF}\" --version \"${CHART_VERSION}\"" in publish_runs
+    assert "chart_lookup_status=not_found" in publish_runs
+    assert "is_confirmed_missing_chart" in publish_runs
+    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    assert "chart_lookup_status=error" in publish_runs
+    assert "action=fail" in publish_runs
+    assert (
+        "Publish failed: chart files changed but chart version ${CHART_VERSION} already exists; "
+        "bump charts/tokenplace/Chart.yaml version."
+    ) in workflow_text
+    assert (
+        "Publish failed: could not determine whether chart version ${CHART_VERSION} exists"
+        in workflow_text
+    )
+    assert (
+        "Publish skipped: chart version ${CHART_VERSION} already exists and no chart files changed."
+    ) in workflow_text
+    assert "steps.publish_decision.outputs.action == 'publish'" in workflow_text
+    assert "helm push \"${package_file}\" \"${chart_registry}\"" in publish_runs
+    assert "first-parent fallback" not in publish_runs
+    assert (
+        "unable to compare full pushed range; treating chart paths as changed"
+        in publish_runs
+    )
+    assert (
+        "Publish failed: manual publish requested but chart version ${CHART_VERSION} already exists; "
+        "refusing to overwrite immutable OCI artifact."
+    ) in workflow_text
+
+
+def test_helm_chart_lookup_only_confirms_canonical_missing_errors() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert "is_confirmed_missing_chart()" in publish_runs
+    assert (
+        'elif is_confirmed_missing_chart "${chart_lookup_log}" "${CHART_VERSION}"; then'
+        in publish_runs
+    )
+    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    assert "404" not in publish_runs, (
+        "A bare HTTP 404 must not be sufficient to classify chart lookup output "
+        "as a confirmed missing chart"
+    )
+    assert 'grep -Fq ":${chart_version}: not found"' in publish_runs
+    assert 'grep -Fq "/manifests/${chart_version} not found:"' in publish_runs
+    assert "version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
+    assert "chart version[[:space:]]+[^[:space:]]+[[:space:]]+not found" in publish_runs
+    assert "manifest unknown" in publish_runs
+    assert "name unknown" in publish_runs
+    assert "unauthorized" in publish_runs
+    assert "forbidden" in publish_runs
+    assert "rate limit" in publish_runs
+    assert "service unavailable" in publish_runs
+
+
+def test_helm_chart_lookup_errors_fail_closed_before_push() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert 'if [[ "${chart_lookup_status}" == "error" ]]; then' in publish_runs
+    assert (
+        "registry lookup must succeed or return a confirmed not-found response before publishing"
+        in workflow_text
+    )
+    error_branch = publish_runs.split('if [[ "${chart_lookup_status}" == "error" ]]; then', 1)[1].split(
+        'elif [[ "${EVENT_NAME}" == "push" ]]; then', 1
+    )[0]
+    assert "action=fail" in error_branch
+    assert "action=publish" not in error_branch
+
+
+def test_helm_manual_publish_existing_chart_fails_instead_of_skipping() -> None:
+    workflow_text = (WORKFLOW_DIR / "ci-helm.yml").read_text(encoding="utf-8")
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+    publish_runs = _step_runs(workflow_data["jobs"]["publish"])
+
+    assert (
+        'elif [[ "${MANUAL_PUBLISH}" == "true" && "${chart_exists}" == "true" ]]; then'
+        in publish_runs
+    )
+    assert (
+        "action=fail\n"
+        '    reason="Publish failed: manual publish requested but chart version '
+        '${CHART_VERSION} already exists; refusing to overwrite immutable OCI artifact."'
+        in publish_runs
+    ), (
+        "Manual publish must fail closed instead of skipping when the immutable chart "
+        "already exists"
+    )
+    assert (
+        "Publish skipped: manual dispatch validate/package only; chart version ${CHART_VERSION} already exists."
+        in workflow_text
+    ), "Manual validate/package-only dispatches must still succeed without publishing"
+
+
+def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-helm.yml")
+
+    for job_name in ("validate-and-package", "publish"):
+        steps = _job_steps(workflow_data["jobs"][job_name])
+        checkout_steps = [step for step in steps if step.get("uses") == "actions/checkout@v4"]
+        assert checkout_steps, f"{job_name} must check out the repository"
+        checkout_with = checkout_steps[0].get("with", {})
+        assert checkout_with.get("fetch-depth") == "0", (
+            f"{job_name} must fetch enough history for chart publish diff decisions"
+        )
+        assert checkout_with.get("ref") == (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}"
+        ), f"{job_name} must pin push checkouts to the triggering commit"
+
+
 def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
     chart = yaml.safe_load(
         Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8")

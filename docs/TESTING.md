@@ -443,3 +443,29 @@ This wraps `./run_all_tests.sh` and runs every available test.
 
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md) - Detailed ideas for test improvements
 - [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation
+
+## Promotion smoke checks
+
+The `v0.1.0` staging-to-prod checklist is documented in
+[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It freezes the launch promotion risks that
+must be checked every time: exactly one public API v1 model (`llama-3.1-8b-instruct`), no
+misleading `owned by token.place` landing-page owner text, accurate `/relay/diagnostics` live node
+counts, sticky landing-chat routing, automatic history-preserving failover, no full public key in
+the DOM, no landing-chat `/api/v2` calls, and no landing-chat direct
+`/api/v1/chat/completions` calls.
+
+The optional endpoint helper is safe by default and does not contact live services unless it is
+enabled with `RUN_PROMOTION_SMOKE=1` and `TOKENPLACE_SMOKE_BASE_URL`:
+
+```bash
+RUN_PROMOTION_SMOKE=1 TOKENPLACE_SMOKE_ENV=staging TOKENPLACE_SMOKE_BASE_URL=https://staging.token.place python scripts/promotion_smoke.py
+```
+
+Production requires a second explicit guard:
+
+```bash
+RUN_PROMOTION_SMOKE=1 TOKENPLACE_SMOKE_ENV=prod TOKENPLACE_SMOKE_ALLOW_PROD=1 TOKENPLACE_SMOKE_BASE_URL=https://token.place python scripts/promotion_smoke.py
+```
+
+Normal unit tests cover the helper's URL handling, endpoint validation, and model response
+assertions without requiring staging or production network access.

@@ -22,7 +22,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
     [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md),
-    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md), and
+    [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md)
 - **Learn the encryption model**
   - Start here: [encrypt.py](../encrypt.py)
   - Also see: [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md),

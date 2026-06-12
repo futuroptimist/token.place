@@ -12,6 +12,7 @@ from api.v1 import compute_provider, routes
 INDEX_HTML = Path(relay.INDEX_HTML_PATH)
 
 PUBLIC_CLIENT_ROUTES = {
+    ("GET", "/api/v1/meta"),
     ("GET", "/api/v1/models"),
     ("GET", "/api/v1/models/{model_id}"),
     ("GET", "/api/v1/public-key"),

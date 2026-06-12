@@ -239,6 +239,25 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     print(f"✓ Found {len(headings)} headings on the page")
 
 
+
+
+def test_landing_release_badge_renders_without_api_call(page: Page, base_url: str, setup_servers):
+    """Landing page should render public release/environment metadata from the initial HTML."""
+    page.route("**/api/v1/meta", lambda route: route.fulfill(status=500, body="badge must not wait for meta API"))
+
+    page.goto(base_url)
+    page.wait_for_load_state("domcontentloaded")
+
+    badge = page.get_by_test_id("release-badge")
+    badge.wait_for(state="visible")
+    badge_text = badge.inner_text().lower()
+    assert "dev" in badge_text
+
+    meta = page.evaluate("window.tokenplaceReleaseMeta")
+    assert meta["environment"] == "dev"
+    assert meta["version"] in {"0.1.1", "dev"}
+    assert meta["badge"].lower() == badge_text
+
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""
     counts = iter([3, 5])

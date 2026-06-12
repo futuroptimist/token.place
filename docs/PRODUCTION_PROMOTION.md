@@ -1,6 +1,6 @@
-# token.place 0.1.0 staging-to-production promotion checklist
+# token.place staging-to-production promotion checklist
 
-Use this checklist for every `v0.1.0` relay promotion from staging to production. It is intentionally
+Use this checklist for every relay promotion from staging to production. It is intentionally
 repeatable and focused on the launch risks that have regressed before: API v1 model identity,
 landing-chat routing, relay-blind E2EE privacy, live compute-node diagnostics, production secrets,
 and rollback readiness.
@@ -9,7 +9,7 @@ and rollback readiness.
 
 - Promote only an already-verified staging artifact. Do not rebuild between staging sign-off and
   production unless the new artifact repeats this checklist from the beginning.
-- Keep API v1 as the only active runtime target for `v0.1.0`; it is non-streaming by design.
+- Keep API v1 as the only active runtime target for the current 0.1.x release line; it is non-streaming by design.
 - Keep relay-owned state, logs, diagnostics, and payloads ciphertext-only plus safe routing metadata.
   Never capture or paste plaintext prompts, messages, responses, tool arguments, or model output.
 - Use synthetic smoke prompts only; do not send sensitive, customer, or private content.
@@ -40,6 +40,8 @@ Run these checks against staging before production promotion:
       `total_api_v1_registered_compute_nodes`.
 - [ ] `GET /api/v1/models` returns exactly one public model: `llama-3.1-8b-instruct`.
 - [ ] The landing page model dropdown has exactly one model.
+- [ ] The landing page release badge shows the expected environment and version/ref for the target,
+      for example `staging v0.1.1` or `prod v0.1.1`.
 - [ ] The landing UI does not show `owned by token.place`.
 - [ ] Two compute nodes round-robin across new browser clients.
 - [ ] One browser chat remains sticky to its selected server across multiple turns.
@@ -63,6 +65,8 @@ promotion complete:
       `total_api_v1_registered_compute_nodes`.
 - [ ] `GET /api/v1/models` returns exactly one public model: `llama-3.1-8b-instruct`.
 - [ ] The landing page model dropdown has exactly one model.
+- [ ] The landing page release badge shows the expected environment and version/ref for the target,
+      for example `staging v0.1.1` or `prod v0.1.1`.
 - [ ] The landing UI does not show `owned by token.place`.
 - [ ] Two compute nodes round-robin across new browser clients.
 - [ ] One browser chat remains sticky to its selected server across multiple turns.
@@ -106,6 +110,7 @@ The helper checks only safe JSON endpoints:
 - `/healthz`
 - `/relay/diagnostics`
 - `/api/v1/models`
+- `/api/v1/meta`
 
 Browser-only checklist items such as dropdown count, missing owner text, no full public key in the
 DOM, no landing-chat `/api/v2` calls, no landing-chat `/api/v1/chat/completions` calls, sticky

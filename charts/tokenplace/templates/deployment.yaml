@@ -59,6 +59,16 @@ spec:
         - name: relay
           {{- $relayPort := printf "%v" .Values.containerPort }}
           {{- $selfDispatchURL := "http://127.0.0.1:$(RELAY_PORT)" }}
+          {{- $deployEnv := default "" .Values.deployEnv }}
+          {{- if not $deployEnv }}
+          {{- if eq .Values.ingress.host "token.place" }}
+          {{- $deployEnv = "prod" }}
+          {{- else if eq .Values.ingress.host "staging.token.place" }}
+          {{- $deployEnv = "staging" }}
+          {{- else }}
+          {{- $deployEnv = "dev" }}
+          {{- end }}
+          {{- end }}
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
@@ -66,6 +76,10 @@ spec:
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
+                "TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)
+                "TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)
+                "TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)
+                "TOKENPLACE_IMAGE_TAG" (dict "name" "TOKENPLACE_IMAGE_TAG" "value" .Values.image.tag)
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
                 "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")

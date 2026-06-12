@@ -14,6 +14,10 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# Public release environment label exposed through TOKENPLACE_DEPLOY_ENV.
+# Leave empty to infer prod/staging/dev from ingress.host when rendered.
+deployEnv: ""
+
 containerPort: 5010
 
 serviceAccount:

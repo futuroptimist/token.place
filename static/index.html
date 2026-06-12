@@ -279,6 +279,38 @@
         th {
             background-color: rgba(0, 255, 255, 0.1);
         }
+
+        .release-badge {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            z-index: 20;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            max-width: calc(100vw - 24px);
+            padding: 6px 10px;
+            border: 1px solid rgba(0, 255, 255, 0.45);
+            border-radius: 999px;
+            background-color: rgba(17, 17, 17, 0.82);
+            color: #ffffff;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            line-height: 1;
+            text-transform: uppercase;
+            backdrop-filter: blur(8px);
+            pointer-events: none;
+        }
+        .release-badge::before {
+            content: '';
+            width: 7px;
+            height: 7px;
+            border-radius: 999px;
+            background-color: #00ffff;
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.75);
+        }
         @media (max-width: 768px) {
             .container {
                 width: 90%;
@@ -408,12 +440,31 @@
             background-color: #e8e8e8;
         }
 
+
+        body.light-mode .release-badge {
+            border-color: rgba(0, 123, 255, 0.35);
+            background-color: rgba(255, 255, 255, 0.88);
+            color: #333333;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+        }
+
+        body.light-mode .release-badge::before {
+            background-color: #007bff;
+            box-shadow: 0 0 10px rgba(0, 123, 255, 0.5);
+        }
         body.light-mode .api-endpoint {
             border-left-color: #007bff;
         }
     </style>
 </head>
 <body class="dark-mode">
+    <div
+        id="release-badge"
+        class="release-badge"
+        data-testid="release-badge"
+        aria-label="token.place release environment and version"
+    >__TOKENPLACE_RELEASE_BADGE_TEXT__</div>
+    <script id="tokenplace-release-meta" type="application/json">__TOKENPLACE_RELEASE_META_JSON__</script>
     <div id="app" class="container">
         <h1>Welcome to token.place!</h1>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources, aiming to democratize AI access.</p>
@@ -501,6 +552,11 @@
         <p>OpenAI-compatible aliases are also registered at <code>/v1/models</code>, <code>/v1/models/{model_id}</code>, <code>/v1/public-key</code>, <code>/v1/public-key/rotate</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/images/generations</code>, <code>/v1/health</code>, and <code>/v1/relay/unregister</code>.</p>
 
         <h3>Public/client API v1 launch contract</h3>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/meta</span></h3>
+            <p>Returns public-safe release metadata used by the landing badge: <code>version</code>, <code>environment</code>, optional short <code>ref</code>, <code>display_version</code>, and <code>badge</code>. It never includes secrets or plaintext model payloads.</p>
+        </div>
 
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models</span></h3>
@@ -693,6 +749,32 @@
             <button id="toggleMode"></button>
         </div>
     </div>
+
+
+    <script>
+        (function() {
+            const fallbackMeta = { environment: 'dev', version: 'dev', display_version: 'dev', badge: 'dev dev' };
+            const metaElement = document.getElementById('tokenplace-release-meta');
+            const badgeElement = document.getElementById('release-badge');
+            let meta = fallbackMeta;
+            if (metaElement) {
+                const rawMeta = metaElement.textContent.trim();
+                if (rawMeta && !rawMeta.includes('__TOKENPLACE_RELEASE_META_JSON__')) {
+                    try {
+                        meta = Object.assign({}, fallbackMeta, JSON.parse(rawMeta));
+                    } catch (error) {
+                        meta = fallbackMeta;
+                    }
+                }
+            }
+            if (badgeElement) {
+                const badgeText = (meta.badge || `${meta.environment} ${meta.display_version || meta.version}`).trim();
+                badgeElement.textContent = badgeText || fallbackMeta.badge;
+                badgeElement.title = `token.place ${meta.environment} ${meta.version}${meta.ref ? ` (${meta.ref})` : ''}`;
+            }
+            window.tokenplaceReleaseMeta = meta;
+        })();
+    </script>
 
     <!-- Vue.js -->
     <script src="__TOKENPLACE_VUE_SCRIPT_SRC__"></script>

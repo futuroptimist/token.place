@@ -34,22 +34,22 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - Keep `server/server_app.py` as compatibility-only shim behavior.
 - Keep sugarkube/k3s scope relay-only (`relay.py`) in short-to-medium-term planning.
 
-### API boundary for `v0.1.0` (must-follow)
+### API boundary for production relay paths (must-follow)
 
-- API v1 is the active API for `v0.1.0` and the only active runtime integration target.
+- API v1 is the active production API and the only active runtime integration target.
 - API v1 relay/client-server inference is **non-streaming by design**: return responses only
   after full model generation is complete. Do not add streaming to API v1.
-- API v2 exists but is incomplete and is deferred until **after** API v1 is fully launched on
-  sugarkube and `v0.1.0` is finalized.
+- API v2 exists but is incomplete and is deferred until a future API v2 migration is explicitly
+  approved after the API v1 production baseline.
 - Deprecated legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and
   `/next_server` are historical compatibility only. Do not use them in active production paths, do
   not extend them for new features, and do not reintroduce them as fallbacks.
-- Until that launch happens, the following traffic must be **API v1-only**:
+- The following active runtime traffic must remain **API v1-only**:
   - desktop-tauri network/API calls,
   - `relay.py`,
   - relay landing-page chat UI served by `relay.py` (`static/index.html` + `static/chat.js`),
   - `server.py` API traffic.
-- Relay-path traffic in `v0.1.0` is **non-streaming by design**. Do not add v2 or SSE paths for
+- Relay-path traffic in production is **non-streaming by design**. Do not add v2 or SSE paths for
   the landing-page relay chat flow.
 - Desktop prompt smoke tests may still use local `llama_cpp_python` streaming because that path is
   local-only and not relay/API traffic.

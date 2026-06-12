@@ -223,17 +223,17 @@ See also:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 
-## API v1 E2EE architecture baseline (v0.1.0)
+## API v1 E2EE architecture baseline
 
-- **This baseline applies to the active v0.1.0 relay/client-server runtime path** (including distributed relay and desktop integration paths being finalized for v0.1.0).
-- **API v1 is the active API for v0.1.0** and the only approved runtime integration target.
+- **This baseline applies to the active production relay/client-server runtime path** (including distributed relay and desktop integration paths launched for v0.1.0).
+- **API v1 is the active production API** and the only approved runtime integration target.
 - **API v1 is non-streaming** for relay/client-server inference paths; return responses only after
   full model generation is complete.
 - **Do not add streaming to API v1** for active relay/client-server paths.
-- **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until API v1 is
-  launched and v0.1.0 is finalized.
+- **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until a future
+  migration is explicitly approved after the API v1 production baseline.
 - **If later sections of this README show API v2 streaming or `/api/v2/chat/completions` examples,
-  treat them as experimental/reference-only** and not as approved runtime integration guidance for v0.1.0.
+  treat them as experimental/reference-only** and not as approved runtime integration guidance for production.
 - **Deprecated legacy relay endpoints**: `/sink`, `/faucet`, `/source`, `/retrieve`,
   `/next_server`. Do not use, extend, or reintroduce these as active production fallbacks.
 - Relay-blind E2EE remains mandatory: relay surfaces may see ciphertext + safe routing metadata
@@ -281,7 +281,7 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- v0.1.0 runtime/release alignment: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- v0.1.0 launch record: Git tags `v0.1.0` and `desktop-v0.1.0` were both pushed and resolved to the same commit; see [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md) for the promoted artifact evidence.
 - Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - Pre-publish gate: `ci-helm.yml` checks whether the current chart version already exists at `oci://ghcr.io/futuroptimist/charts/tokenplace`. It publishes only new chart versions when chart source files changed, skips unchanged already-published versions as a no-op, and fails changed chart source with an already-published version so maintainers bump `charts/tokenplace/Chart.yaml`.
@@ -298,6 +298,7 @@ Once Sugarkube P5 lands, the equivalent generic command is:
 just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
 ```
 
+- Production promotion checklist: [`docs/PRODUCTION_PROMOTION.md`](docs/PRODUCTION_PROMOTION.md)
 - GHCR-first release workflow: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

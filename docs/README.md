@@ -42,8 +42,11 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Security:** [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md) contains the rolling
   hardening checklist and threat model; use
   [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.
-- **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md) and stepwise updates in
-  [CHANGELOG_STEP.md](CHANGELOG_STEP.md).
+- **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md), stepwise updates in
+  [CHANGELOG_STEP.md](CHANGELOG_STEP.md), and historical launch records such as
+  [releases/v0.1.0.md](releases/v0.1.0.md).
+- **Promotion:** Use the evergreen [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md) checklist for
+  staging-to-production relay promotions.
 
 ## Prompt docs
 

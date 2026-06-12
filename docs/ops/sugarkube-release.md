@@ -114,7 +114,10 @@ specific, so record the command actually used rather than inventing one here.
 
 Production uses the same GHCR image and OCI Helm chart path, with release and
 namespace `tokenplace/tokenplace`, host `token.place`, and an explicit immutable
-image tag. After promotion, repeat the real external proof against production:
+image tag. The reusable promotion checklist lives in
+[`docs/PRODUCTION_PROMOTION.md`](../PRODUCTION_PROMOTION.md), with historical v0.1.0 evidence in
+[`docs/releases/v0.1.0.md`](../releases/v0.1.0.md). After promotion, repeat the real external proof
+against production:
 
 - A separate production desktop/compute node registers to `https://token.place`
   and appears in `/healthz` and `/relay/diagnostics`.
@@ -130,7 +133,10 @@ Cloudflare Tunnel/DNS/WAF routing is external to Helm and remains an external
 release gate because desktop/compute-node registration can be blocked before it
 reaches `relay.py`; validate HTTPS `/`, `/livez`, `/healthz`, and
 `/relay/diagnostics`, and check Cloudflare Security Events by `cf-ray` when a
-desktop/compute node sees a pre-app 403 before changing relay code.
+desktop/compute node sees a pre-app 403 before changing relay code. Browser
+Integrity Check stays enabled globally; targeted Cloudflare custom WAF skip
+rules for `/api/v1/relay/` on `staging.token.place` and `token.place` are
+documented in the production promotion checklist.
 
 ## Local-development appendix
 

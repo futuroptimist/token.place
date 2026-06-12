@@ -70,6 +70,68 @@ current token.place chart source is `0.1.1`; Sugarkube `docs/apps/tokenplace.ver
 should pin `0.1.1` unless an operator explicitly documents why a different
 package is being held back.
 
+## Cluster and tunnel guardrails
+
+Staging and production are intentionally separate Sugarkube clusters and Cloudflare Tunnel
+connectors:
+
+- Staging: `sugarkube3-sugarkube5`, Cloudflare tunnel `sugarkube-staging`, hostname
+  `staging.token.place`.
+- Production: `sugarkube0-sugarkube2`, Cloudflare tunnel `sugarkube-prod`, hostname `token.place`.
+
+Do not run production promotion from the staging cluster. It can repoint the staging cluster's
+single `tokenplace` release to production host values, making `staging.token.place` return 404 while
+`token.place` still routes to the separate production tunnel/cluster. Before staging deploys, verify
+that the shell and Kubernetes context are on `sugarkube3-sugarkube5`; before production deploys,
+verify `sugarkube0-sugarkube2`:
+
+```bash
+hostname
+kubectl get nodes -o wide
+kubectl -n cloudflare get deploy,pod -l app.kubernetes.io/name=cloudflare-tunnel
+```
+
+## Cloudflare Browser Integrity Check skip rules
+
+Do not disable Browser Integrity Check globally. Desktop compute nodes are non-browser API clients,
+and Cloudflare can return a pre-app `403` with `error code: 1010` when Browser Integrity Check
+blocks registration or polling. Add targeted custom WAF skip rules only for API v1 relay paths and
+leave the normal browser security posture intact elsewhere.
+
+Staging rule:
+
+- Name: `Skip BIC for staging token.place relay API`
+- Expression: `(http.host eq "staging.token.place" and starts_with(http.request.uri.path, "/api/v1/relay/"))`
+- Action: `Skip`
+- WAF component skipped: `Browser Integrity Check`
+- Log matching requests: enabled
+
+Production rule:
+
+- Name: `Skip BIC for prod token.place relay API`
+- Expression: `(http.host eq "token.place" and starts_with(http.request.uri.path, "/api/v1/relay/"))`
+- Action: `Skip`
+- WAF component skipped: `Browser Integrity Check`
+- Log matching requests: enabled
+
+Quick validation after the skips are active:
+
+Validate both `https://staging.token.place/api/v1/relay/servers/register` and
+`https://token.place/api/v1/relay/servers/register`:
+
+```bash
+for HOST in staging.token.place token.place; do
+  curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+    -H 'Content-Type: application/json' \
+    --data '{}'
+done
+```
+
+Expected result for each environment: not a Cloudflare `403 error code: 1010`. Any relay-owned
+app response is acceptable, including `401 Missing or invalid relay server token` when
+`SERVER_REGISTRATION_TOKENS` are configured or a `400` response because the `{}` payload is
+intentionally invalid.
+
 ## Staging deploy path
 
 Run these steps from the appropriate repositories and replace every placeholder

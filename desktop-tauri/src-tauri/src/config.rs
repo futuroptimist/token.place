@@ -80,7 +80,9 @@ impl Default for DesktopConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relay_base_urls, DesktopConfig, DEFAULT_RELAY_BASE_URL};
+    use super::{
+        normalize_relay_base_urls, DesktopConfig, DEFAULT_RELAY_BASE_URL, MAX_RELAY_BASE_URLS,
+    };
 
     #[test]
     fn desktop_config_defaults_to_token_place_relay() {
@@ -118,6 +120,46 @@ mod tests {
         assert_eq!(
             normalize_relay_base_urls(&urls, "https://fallback.example"),
             vec!["https://token.place", "https://staging.token.place"]
+        );
+    }
+
+    #[test]
+    fn relay_base_url_normalization_caps_at_max_while_preserving_order_and_deduping() {
+        let urls = vec![
+            "https://relay-01.example",
+            " https://relay-02.example ",
+            "https://relay-03.example",
+            "https://relay-04.example",
+            "https://relay-05.example",
+            "https://relay-03.example",
+            "https://relay-06.example",
+            "https://relay-07.example",
+            "https://relay-08.example",
+            "https://relay-09.example",
+            "https://relay-10.example",
+            "https://relay-11.example",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+        let normalized = normalize_relay_base_urls(&urls, "https://fallback.example");
+
+        assert_eq!(normalized.len(), MAX_RELAY_BASE_URLS);
+        assert_eq!(
+            normalized,
+            vec![
+                "https://relay-01.example",
+                "https://relay-02.example",
+                "https://relay-03.example",
+                "https://relay-04.example",
+                "https://relay-05.example",
+                "https://relay-06.example",
+                "https://relay-07.example",
+                "https://relay-08.example",
+                "https://relay-09.example",
+                "https://relay-10.example",
+            ]
         );
     }
 

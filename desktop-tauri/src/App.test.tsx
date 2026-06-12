@@ -1504,6 +1504,22 @@ describe('desktop app start failure handling', () => {
     expect(screen.queryByText('Delete')).toBeNull();
   });
 
+  it('enforces the documented maximum of 10 relay URL fields', async () => {
+    render(<App />);
+
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    expect(await screen.findByLabelText('Relay URL 1')).toBeTruthy();
+
+    for (let relayNumber = 2; relayNumber <= 10; relayNumber += 1) {
+      expect(addButton.disabled).toBe(false);
+      fireEvent.click(addButton);
+      expect(await screen.findByLabelText(`Relay URL ${relayNumber}`)).toBeTruthy();
+    }
+
+    expect(screen.queryByLabelText('Relay URL 11')).toBeNull();
+    expect(addButton.disabled).toBe(true);
+  });
+
   it('disables relay URL editing while the operator is running', async () => {
     mockInitialComputeStatus({ running: true, registered: true, relay_runtime_state: 'ready' });
 

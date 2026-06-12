@@ -281,8 +281,8 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- v0.1.0 runtime/release alignment: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
-- Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
+- Release alignment: Git semver tag `vX.Y.Z`, chart `appVersion`, chart package version, and release image tag should be recorded together for each production promotion.
+- Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only). The v0.1.0 production launch promoted `main-d94c243`; see [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md).
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - Pre-publish gate: `ci-helm.yml` checks whether the current chart version already exists at `oci://ghcr.io/futuroptimist/charts/tokenplace`. It publishes only new chart versions when chart source files changed, skips unchanged already-published versions as a no-op, and fails changed chart source with an already-published version so maintainers bump `charts/tokenplace/Chart.yaml`.
 
@@ -298,7 +298,9 @@ Once Sugarkube P5 lands, the equivalent generic command is:
 just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
 ```
 
+- Production promotion checklist: [`docs/PRODUCTION_PROMOTION.md`](docs/PRODUCTION_PROMOTION.md)
 - GHCR-first release workflow: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
+- v0.1.0 historical launch record: [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)

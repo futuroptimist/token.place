@@ -39,7 +39,7 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Release alignment: record the Git semver tag, chart `appVersion`, chart package version, and immutable relay image tag together for each promotion; the v0.1.0 launch record is in [releases/v0.1.0.md](releases/v0.1.0.md).
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not staging sign-off or production promotion material
@@ -491,12 +491,12 @@ curl -fsS https://staging.token.place/metrics | head -n 40
 
 ### Image tag, chart version, and Git tag must be validated independently
 
-For final v0.1.0 release readiness, verify all four identifiers explicitly (separate from staging candidate validation):
+For release readiness, verify all identifiers explicitly (separate from staging candidate validation):
 
-- Git release tag: `v0.1.0`
-- Chart package version: `0.1.1` (with chart `appVersion: "0.1.0"`)
-- Chart appVersion: `"0.1.0"`
-- Relay image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Git release tag: `vX.Y.Z`
+- Desktop Git release tag when applicable, for example `desktop-vX.Y.Z`
+- Chart package version and chart `appVersion`
+- Immutable relay image tag, either `main-<shortsha>` for a promoted main artifact or `ghcr.io/futuroptimist/tokenplace-relay:vX.Y.Z` for a semver release
 
 Example image-tag existence checks:
 
@@ -506,7 +506,11 @@ IMAGE_TAG=main-REPLACE_SHORTSHA
 docker manifest inspect "ghcr.io/futuroptimist/tokenplace-relay:${IMAGE_TAG}" >/dev/null
 
 # Final release-tag validation.
-docker manifest inspect ghcr.io/futuroptimist/tokenplace-relay:v0.1.0 >/dev/null
+RELEASE_TAG=vX.Y.Z
+docker manifest inspect "ghcr.io/futuroptimist/tokenplace-relay:${RELEASE_TAG}" >/dev/null
+git fetch --tags origin
+git ls-remote --tags origin "${RELEASE_TAG}" "desktop-${RELEASE_TAG}"
+git rev-parse "${RELEASE_TAG}" "desktop-${RELEASE_TAG}"
 ~~~
 
 ### Relay-only health output expectations (staging and production)

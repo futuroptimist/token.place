@@ -132,6 +132,55 @@ reaches `relay.py`; validate HTTPS `/`, `/livez`, `/healthz`, and
 `/relay/diagnostics`, and check Cloudflare Security Events by `cf-ray` when a
 desktop/compute node sees a pre-app 403 before changing relay code.
 
+### Cluster and tunnel context guardrail
+
+Staging and production are separate Sugarkube clusters and separate Cloudflare Tunnel
+connectors:
+
+- Staging: `sugarkube3`-`sugarkube5`, tunnel `sugarkube-staging`, host
+  `staging.token.place`.
+- Production: `sugarkube0`-`sugarkube2`, tunnel `sugarkube-prod`, host `token.place`.
+
+Do not run production promotion from the staging cluster. That repoints the staging
+cluster's single `tokenplace` release to production host values and makes
+`staging.token.place` return 404 while `token.place` still routes to the separate
+production tunnel and cluster. Before every deploy, confirm the node and tunnel context:
+
+```bash
+hostname
+kubectl get nodes -o wide
+kubectl -n cloudflare get deploy,pod -l app.kubernetes.io/name=cloudflare-tunnel
+```
+
+### Cloudflare Browser Integrity Check skip rules
+
+Keep Browser Integrity Check enabled globally. Desktop compute nodes are non-browser
+API clients, and Cloudflare can return a pre-app `403` with `error code: 1010` when
+BIC blocks relay registration or polling. Use targeted custom WAF skip rules for
+`/api/v1/relay/` only:
+
+- Staging rule name: `Skip BIC for staging token.place relay API`
+  - Expression: `(http.host eq "staging.token.place" and starts_with(http.request.uri.path, "/api/v1/relay/"))`
+  - Action: `Skip`
+  - WAF component skipped: `Browser Integrity Check`
+  - Log matching requests: enabled
+- Production rule name: `Skip BIC for prod token.place relay API`
+  - Expression: `(http.host eq "token.place" and starts_with(http.request.uri.path, "/api/v1/relay/"))`
+  - Action: `Skip`
+  - WAF component skipped: `Browser Integrity Check`
+  - Log matching requests: enabled
+
+Validate the production rule with an intentionally invalid app request:
+
+```bash
+curl -i -X POST https://token.place/api/v1/relay/servers/register \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+```
+
+Expected: not a Cloudflare `403 error code: 1010`. An app-level validation error is
+acceptable because `{}` is intentionally invalid.
+
 ## Local-development appendix
 
 Local image builds, root `docker-compose.yml`, and raw `k8s/` manifests are for

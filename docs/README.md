@@ -20,6 +20,7 @@ testing, and deploying token.place. For an expanded overview of every directory,
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),
     [docker-compose.yml](../docker-compose.yml), [k8s/](../k8s/),
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
+    [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
     [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md),
     [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
@@ -42,8 +43,9 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Security:** [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md) contains the rolling
   hardening checklist and threat model; use
   [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.
-- **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md) and stepwise updates in
-  [CHANGELOG_STEP.md](CHANGELOG_STEP.md).
+- **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md), stepwise updates in
+  [CHANGELOG_STEP.md](CHANGELOG_STEP.md), and historical launch records such as
+  [releases/v0.1.0.md](releases/v0.1.0.md).
 
 ## Prompt docs
 

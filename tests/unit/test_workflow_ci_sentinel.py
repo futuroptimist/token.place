@@ -431,19 +431,27 @@ def test_macos_run_all_tests_pr_job_uses_python_312_and_node_20() -> None:
 def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None:
     macos_job = _run_all_tests_jobs()["macos-run-all-tests"]
     env = macos_job.get("env", {})
+    step_runs = _step_runs(macos_job)
 
     assert env.get("FORCE_CMAKE") == "1"
-    cmake_args = str(env.get("CMAKE_ARGS", ""))
-    assert "-DGGML_METAL=on" in cmake_args, (
-        "macOS Apple Silicon CI must build llama_cpp_python with Metal enabled "
-        "so GPU-capable desktop modes do not silently fall back to CPU."
+    assert "CMAKE_ARGS" not in env, (
+        "macos-latest may run on Intel or Apple Silicon; CMAKE_ARGS must be "
+        "derived from uname -m instead of hard-coding an arm64 cross-build."
     )
-    assert "-DGGML_NATIVE=off" in cmake_args, (
-        "macos-latest arm64 runners must disable fragile native CPU feature "
-        "probing so dependency validation does not fail before run_all_tests.sh."
+    assert "Configure macOS Metal llama-cpp build" in str(macos_job), (
+        "macOS CI must configure llama_cpp_python before installing Python dependencies."
     )
-    assert "-DCMAKE_OSX_ARCHITECTURES=arm64" in cmake_args
-    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in cmake_args
+    assert "-DGGML_METAL=on" in step_runs, (
+        "macOS CI must build llama_cpp_python with Metal enabled so "
+        "GPU-capable desktop modes do not silently fall back to CPU."
+    )
+    assert "-DGGML_NATIVE=off" in step_runs, (
+        "macos-latest runners must disable fragile native CPU feature probing "
+        "so dependency validation does not fail before run_all_tests.sh."
+    )
+    assert "-DCMAKE_OSX_ARCHITECTURES=${arch}" in step_runs
+    assert "uname -m" in step_runs
+    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in step_runs
 
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:

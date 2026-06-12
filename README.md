@@ -223,27 +223,27 @@ See also:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 
-## API v1 E2EE architecture baseline (v0.1.0)
+## API v1 E2EE architecture baseline
 
-- **This baseline applies to the active v0.1.0 relay/client-server runtime path** (including distributed relay and desktop integration paths being finalized for v0.1.0).
-- **API v1 is the active API for v0.1.0** and the only approved runtime integration target.
+- **This baseline applies to the active relay/client-server runtime path** (including distributed relay and desktop integration paths launched for v0.1.0).
+- **API v1 is the active runtime API** and the only approved runtime integration target.
 - **API v1 is non-streaming** for relay/client-server inference paths; return responses only after
   full model generation is complete.
 - **Do not add streaming to API v1** for active relay/client-server paths.
-- **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until API v1 is
-  launched and v0.1.0 is finalized.
+- **API v2 exists but is incomplete**; do not route runtime traffic through API v2 for production
+  runtime paths until a future release explicitly promotes it.
 - **If later sections of this README show API v2 streaming or `/api/v2/chat/completions` examples,
-  treat them as experimental/reference-only** and not as approved runtime integration guidance for v0.1.0.
+  treat them as experimental/reference-only** and not as approved runtime integration guidance.
 - **Deprecated legacy relay endpoints**: `/sink`, `/faucet`, `/source`, `/retrieve`,
   `/next_server`. Do not use, extend, or reintroduce these as active production fallbacks.
 - Relay-blind E2EE remains mandatory: relay surfaces may see ciphertext + safe routing metadata
   only, and must never store or expose plaintext model payload content.
 
-Known migration gap: `relay.py`, desktop-tauri paths, and relay landing-page HTML chat flow are
-not fully aligned yet; some E2E pieces still hit legacy routes. This migration is tracked as
-follow-up implementation work.
+Known migration gaps after the v0.1.0 launch remain tracked as follow-up implementation work; do
+not preserve or expand legacy relay routes for new production behavior.
 
-See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md).
+See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md). The completed
+launch evidence is recorded in [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md).
 
 ## Canonical entrypoints
 
@@ -281,9 +281,9 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- v0.1.0 runtime/release alignment: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
-- Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
+- Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `vX.Y.Z` -> `ghcr.io/futuroptimist/tokenplace-relay:vX.Y.Z`)
+- Completed v0.1.0 launch artifact record: image `ghcr.io/futuroptimist/tokenplace-relay:main-d94c243`, chart version `0.1.0`, and chart digest `sha256:52f55f9a3147194d092579a640382540da467dd2aa1f1cd416e30e970713cf1d`; see [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md)
 - Pre-publish gate: `ci-helm.yml` checks whether the current chart version already exists at `oci://ghcr.io/futuroptimist/charts/tokenplace`. It publishes only new chart versions when chart source files changed, skips unchanged already-published versions as a no-op, and fails changed chart source with an already-published version so maintainers bump `charts/tokenplace/Chart.yaml`.
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo. The current app-specific deploy command is:

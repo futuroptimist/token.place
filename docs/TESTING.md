@@ -357,13 +357,14 @@ To add a new visual test:
 
 ## Promotion smoke checks
 
-The repeatable `v0.1.0` staging-to-production checklist lives in
-[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It covers the release-specific
-smoke risks for API v1 model identity (`llama-3.1-8b-instruct` as the only public
+The repeatable production promotion checklist lives in
+[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It covers the reusable smoke
+risks for API v1 model identity (`llama-3.1-8b-instruct` as the only public
 model), landing dropdown count, absence of `owned by token.place`, live
 compute-node diagnostics, two-node round-robin, sticky server routing, automatic
 history-preserving failover, relay-blind privacy invariants, production secrets,
-rate-limit storage, and rollback readiness.
+rate-limit storage, and rollback readiness. The completed `v0.1.0` launch record
+lives in [releases/v0.1.0.md](releases/v0.1.0.md).
 
 For endpoint-only external smoke checks, use the opt-in helper:
 

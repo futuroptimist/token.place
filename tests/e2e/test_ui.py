@@ -238,6 +238,11 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     assert len(headings) > 0, "Page should contain at least one heading"
     print(f"✓ Found {len(headings)} headings on the page")
 
+    badge = page.get_by_test_id("release-badge")
+    badge.wait_for(state="visible")
+    assert "testing" in badge.inner_text().lower()
+    assert "0.1.1" in badge.inner_text()
+
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""

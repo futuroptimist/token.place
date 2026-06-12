@@ -224,6 +224,53 @@
             cursor: not-allowed;
             opacity: 0.55;
         }
+        .release-badge {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            z-index: 1000;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            max-width: min(260px, calc(100vw - 24px));
+            padding: 5px 9px;
+            border: 1px solid rgba(0, 255, 255, 0.45);
+            border-radius: 999px;
+            background: rgba(17, 17, 17, 0.82);
+            color: #ffffff;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+            font-size: 12px;
+            line-height: 1.2;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            pointer-events: none;
+            backdrop-filter: blur(8px);
+        }
+        .release-badge__env {
+            color: #00ffff;
+            font-weight: 700;
+        }
+        .release-badge__version {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        body.light-mode .release-badge {
+            background: rgba(255, 255, 255, 0.88);
+            border-color: rgba(0, 120, 140, 0.4);
+            color: #111111;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.16);
+        }
+        body.light-mode .release-badge__env {
+            color: #007c89;
+        }
+        @media (max-width: 768px) {
+            .release-badge {
+                bottom: 8px;
+                left: 8px;
+                font-size: 11px;
+            }
+        }
         .mode-toggle-container {
             display: flex;
             justify-content: center;
@@ -414,6 +461,11 @@
     </style>
 </head>
 <body class="dark-mode">
+    <script id="tokenplace-release-metadata" type="application/json">{"environment":"dev","version":"dev","ref":"","placeholder":true}</script>
+    <div class="release-badge" data-testid="release-badge" aria-label="token.place release metadata">
+        <span class="release-badge__env" data-testid="release-badge-env">dev</span>
+        <span class="release-badge__version" data-testid="release-badge-version">dev</span>
+    </div>
     <div id="app" class="container">
         <h1>Welcome to token.place!</h1>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources, aiming to democratize AI access.</p>
@@ -598,6 +650,11 @@
         </div>
 
         <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/meta</span></h3>
+            <p>Returns public-safe release metadata for UI and diagnostics display: deployment environment, release version, and optional short public image/git reference. Secrets and plaintext model payload content are never included.</p>
+        </div>
+
+        <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/community/providers</span></h3>
             <p>Lists community-operated relay and server providers as <code>{"object":"list","data":[...]}</code>, with optional metadata.</p>
         </div>
@@ -710,6 +767,27 @@
         crossorigin="anonymous"
         referrerpolicy="no-referrer"
     ></script>
+    <script>
+        (function renderReleaseBadge() {
+            var metadataElement = document.getElementById('tokenplace-release-metadata');
+            var envElement = document.querySelector('[data-testid="release-badge-env"]');
+            var versionElement = document.querySelector('[data-testid="release-badge-version"]');
+            if (!metadataElement || !envElement || !versionElement) {
+                return;
+            }
+            try {
+                var metadata = JSON.parse(metadataElement.textContent || '{}');
+                var environment = metadata.environment || 'dev';
+                var displayVersion = metadata.display_version || metadata.version || 'dev';
+                envElement.textContent = environment;
+                versionElement.textContent = displayVersion;
+                versionElement.title = metadata.badge_label || (environment + ' ' + displayVersion);
+            } catch (error) {
+                envElement.textContent = 'dev';
+                versionElement.textContent = 'dev';
+            }
+        })();
+    </script>
     <script src="/static/chat_typing.js"></script>
     <script src="/static/chat.js"></script>
 

@@ -16,6 +16,10 @@ fullnameOverride: ""
 
 containerPort: 5010
 
+# Public deployment environment shown in release metadata. Leave empty to infer
+# prod/staging from ingress.host or fall back to dev.
+deployEnv: ""
+
 serviceAccount:
   create: false
   annotations: {}

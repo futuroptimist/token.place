@@ -115,12 +115,16 @@ git ls-remote --tags origin \
 git rev-parse "${RELEASE_TAG}^{commit}" "${DESKTOP_TAG}^{commit}"
 ```
 
-Compare the local `^{commit}` results when checking release/desktop commit equality; the peeled
-remote `^{}` refs are supporting evidence that annotated tags resolve to those same target commits
-instead of tag object IDs. If the relay and desktop tags point to different commits, do not rewrite
-tags in the promotion process. Record the actual commits in the release notes and ask maintainers to
-review the mismatch. If a release has no desktop artifact or desktop tag, record that fact and skip
-the desktop-tag comparison instead of failing the whole checklist.
+The remote check intentionally requests both the normal tag refs and any peeled `^{}` refs. Lightweight
+tags normally return only the normal `refs/tags/...` lines, so missing `^{}` lines are not a failure;
+annotated tags should also show peeled `^{}` lines that identify their target commits.
+
+Compare the local `^{commit}` results when checking release/desktop commit equality, and use the
+remote output as supporting evidence that the requested tags exist and annotated tags peel to the
+same commit targets instead of tag object IDs. If the relay and desktop tags point to different
+commits, do not rewrite tags in the promotion process. Record the actual commits in the release
+notes and ask maintainers to review the mismatch. If a release has no desktop artifact or desktop
+tag, record that fact and skip the desktop-tag comparison instead of failing the whole checklist.
 
 ## Staging smoke checklist
 

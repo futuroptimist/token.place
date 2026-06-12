@@ -85,6 +85,54 @@ def test_release_version_file_fallback_is_cached(monkeypatch):
     assert chart_reads["count"] == 1
 
 
+def test_release_version_falls_back_to_package_metadata(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    chart_dir = tmp_path / "charts" / "tokenplace"
+    chart_dir.mkdir(parents=True)
+    (chart_dir / "Chart.yaml").write_text("apiVersion: v2\nname: tokenplace\n", encoding="utf-8")
+    package_dir = tmp_path / "desktop-tauri"
+    package_dir.mkdir()
+    (package_dir / "package.json").write_text('{"version": "9.8.7"}', encoding="utf-8")
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+
+    assert release_metadata.resolve_release_version() == "9.8.7"
+
+
+def test_release_version_uses_dev_when_metadata_files_are_missing(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+
+    assert release_metadata.resolve_release_version() == "dev"
+
+
+def test_release_version_ignores_invalid_package_json(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    chart_dir = tmp_path / "charts" / "tokenplace"
+    chart_dir.mkdir(parents=True)
+    (chart_dir / "Chart.yaml").write_text("apiVersion: v2\nname: tokenplace\n", encoding="utf-8")
+    package_dir = tmp_path / "desktop-tauri"
+    package_dir.mkdir()
+    (package_dir / "package.json").write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+
+    assert release_metadata.resolve_release_version() == "dev"
+
+
+def test_host_parsing_handles_urls_loopback_and_ipv6(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+
+    assert release_metadata.infer_release_environment(None) == "dev"
+    assert release_metadata.infer_release_environment("https://token.place/app") == "prod"
+    assert release_metadata.infer_release_environment("127.0.0.1:5000") == "dev"
+    assert release_metadata.infer_release_environment("[::1]:5000") == "dev"
+
+
 def test_release_metadata_json_does_not_expose_unrelated_secrets(monkeypatch):
     _clear_metadata_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")

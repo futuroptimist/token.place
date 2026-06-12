@@ -223,7 +223,7 @@ def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -
             relay_input_ready = bool(
                 d.find_elements(
                     By.XPATH,
-                    "(//label[normalize-space()='Relay URL']/following::input[1])[1]",
+                    "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]",
                 )
             )
             runtime_path_ready = bool(
@@ -319,7 +319,7 @@ def wait_for_start_operator_enabled(
         with contextlib.suppress(Exception):
             relay_value = driver.find_element(
                 By.XPATH,
-                "(//label[normalize-space()='Relay URL']/following::input[1])[1]",
+                "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]",
             ).get_attribute("value")
         with contextlib.suppress(Exception):
             status_snippet = " | ".join(
@@ -548,7 +548,7 @@ def main() -> int:
         )
         assert model_input.get_attribute("value") == model_path
         assert_model_path_exists(model_path)
-        fill_input_by_label(driver, "Relay URL", relay_url)
+        fill_input_by_label(driver, "Relay URL 1", relay_url)
 
         wait_for_start_operator_enabled(driver, relay_log, driver_log)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()

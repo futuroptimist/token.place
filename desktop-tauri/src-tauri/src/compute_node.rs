@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::config::normalize_relay_base_urls;
 use crate::operator_logs::{
     append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
     OperatorLogSink,
@@ -27,6 +28,8 @@ use tokio::sync::Mutex;
 pub struct ComputeNodeRequest {
     pub model_path: String,
     pub relay_base_url: String,
+    #[serde(default)]
+    pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
 }
 
@@ -196,6 +199,10 @@ fn sanitize_relay_target(relay_url: &str) -> String {
     "unknown".into()
 }
 
+fn normalized_request_relay_urls(request: &ComputeNodeRequest) -> Vec<String> {
+    normalize_relay_base_urls(&request.relay_base_urls, &request.relay_base_url)
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -216,7 +223,10 @@ fn startup_failure_status(
     ComputeNodeStatus {
         running: false,
         registered: false,
-        active_relay_url: request.relay_base_url.clone(),
+        active_relay_url: normalized_request_relay_urls(request)
+            .first()
+            .cloned()
+            .unwrap_or_else(|| request.relay_base_url.clone()),
         requested_mode: format!("{:?}", request.mode).to_lowercase(),
         effective_mode: "cpu".into(),
         backend_available: "unknown".into(),
@@ -575,6 +585,11 @@ pub async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let relay_base_urls = normalized_request_relay_urls(&request);
+    let primary_relay_url = relay_base_urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| request.relay_base_url.clone());
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -723,7 +738,7 @@ pub async fn start_compute_node(
     eprintln!(
         "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} cancellation_token_reset=true",
         session_id,
-        sanitize_relay_target(&request.relay_base_url),
+        sanitize_relay_target(&primary_relay_url),
         bridge_script,
         interpreter,
         selected_resource_root.display(),
@@ -736,7 +751,7 @@ pub async fn start_compute_node(
         &format!(
             "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
             session_id,
-            sanitize_relay_target(&request.relay_base_url),
+            sanitize_relay_target(&primary_relay_url),
             sanitize_path_for_operator_log(Path::new(&bridge_script)),
             sanitize_freeform_bridge_log_line(&interpreter),
             sanitize_path_for_operator_log(&selected_resource_root),
@@ -755,8 +770,11 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
-        .arg("--relay-url")
-        .arg(&request.relay_base_url)
+        .args(
+            relay_base_urls
+                .iter()
+                .flat_map(|relay_url| ["--relay-url", relay_url.as_str()]),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -808,7 +826,7 @@ pub async fn start_compute_node(
             eprintln!(
                 "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
                 session_id,
-                sanitize_relay_target(&request.relay_base_url)
+                sanitize_relay_target(&primary_relay_url)
             );
             *child_slot = pending_child.take();
             let mut stdin_slot = state.stdin.lock().await;
@@ -817,7 +835,7 @@ pub async fn start_compute_node(
             *status = ComputeNodeStatus {
                 running: true,
                 registered: false,
-                active_relay_url: request.relay_base_url.clone(),
+                active_relay_url: primary_relay_url.clone(),
                 requested_mode: format!("{:?}", request.mode).to_lowercase(),
                 effective_mode: "cpu".into(),
                 backend_available: "unknown".into(),
@@ -1615,6 +1633,7 @@ mod tests {
         let request = ComputeNodeRequest {
             model_path: "model.gguf".into(),
             relay_base_url: "https://relay.example".into(),
+            relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
         };
         let status = startup_failure_status(
@@ -1793,6 +1812,7 @@ mod tests {
         let request = ComputeNodeRequest {
             model_path: "model.gguf".into(),
             relay_base_url: "https://relay.example".into(),
+            relay_base_urls: vec![],
             mode: ComputeMode::Auto,
         };
 

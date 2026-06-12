@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -48,6 +48,7 @@ class ComputeNodeRuntimeConfig:
     relay_url: str
     relay_port: Optional[int]
     use_configured_relay_fallbacks: bool = True
+    relay_urls: Tuple[str, ...] = ()
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
@@ -280,6 +281,7 @@ class ComputeNodeRuntime:
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
             include_configured_servers=runtime_config.use_configured_relay_fallbacks,
+            explicit_relay_urls=runtime_config.relay_urls[1:],
         )
         if request_adapters is None:
             self.request_adapters = [

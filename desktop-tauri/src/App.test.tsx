@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { App } from './App';
+import { App, normalizeDesktopConfig } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -75,6 +75,22 @@ describe('desktop app start failure handling', () => {
         });
       }
       return Promise.resolve(undefined);
+    });
+  });
+
+  it('normalizes untrusted relay URLs and preferred mode from persisted config', () => {
+    expect(
+      normalizeDesktopConfig({
+        model_path: 123,
+        relay_base_url: 42,
+        relay_base_urls: [' https://token.place ', 123, 'https://staging.token.place'],
+        preferred_mode: 'bogus',
+      })
+    ).toEqual({
+      model_path: '',
+      relay_base_url: 'https://token.place',
+      relay_base_urls: ['https://token.place', 'https://staging.token.place'],
+      preferred_mode: 'auto',
     });
   });
 
@@ -1428,4 +1444,170 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Error:/).textContent).toContain('event failure path');
   });
+
+  it('renders one relay URL field from legacy config and migrates it on save', async () => {
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    await waitFor(() => expect(relayInput.value).toBe('https://token.place'));
+    expect(screen.getByText(/Configured relay URLs:/).textContent).toContain('https://token.place');
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'save_config' &&
+            args?.config?.relay_base_url === 'https://token.place' &&
+            Array.isArray(args?.config?.relay_base_urls) &&
+            args.config.relay_base_urls.length === 1 &&
+            args.config.relay_base_urls[0] === 'https://token.place'
+        )
+      ).toBe(true)
+    );
+  });
+
+  it('loads and displays multiple persisted relay URLs', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: ['https://token.place', 'https://staging.token.place'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+
+    expect((await screen.findByLabelText('Relay URL 1') as HTMLInputElement).value).toBe('https://token.place');
+    expect((await screen.findByLabelText('Relay URL 2') as HTMLInputElement).value).toBe('https://staging.token.place');
+    expect(screen.getByText(/Configured relay URLs:/).textContent).toContain('https://token.place, https://staging.token.place');
+  });
+
+  it('adds and removes relay URL fields while keeping one field', async () => {
+    render(<App />);
+
+    const addButton = await screen.findByText('Add new relay URL');
+    fireEvent.click(addButton);
+
+    const secondRelayInput = (await screen.findByLabelText('Relay URL 2')) as HTMLInputElement;
+    expect(secondRelayInput.value).toBe('');
+    fireEvent.change(secondRelayInput, { target: { value: ' https://staging.token.place ' } });
+
+    const deleteSecondRelayButton = await screen.findByLabelText('Delete relay URL 2');
+    fireEvent.click(deleteSecondRelayButton);
+
+    await waitFor(() => expect(screen.queryByLabelText('Relay URL 2')).toBeNull());
+    expect(screen.getByLabelText('Relay URL 1')).toBeTruthy();
+    expect(screen.queryByText('Delete')).toBeNull();
+  });
+
+  it('enforces the documented maximum of 10 relay URL fields', async () => {
+    render(<App />);
+
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    expect(await screen.findByLabelText('Relay URL 1')).toBeTruthy();
+
+    for (let relayNumber = 2; relayNumber <= 10; relayNumber += 1) {
+      expect(addButton.disabled).toBe(false);
+      fireEvent.click(addButton);
+      expect(await screen.findByLabelText(`Relay URL ${relayNumber}`)).toBeTruthy();
+    }
+
+    expect(screen.queryByLabelText('Relay URL 11')).toBeNull();
+    expect(addButton.disabled).toBe(true);
+  });
+
+  it('disables relay URL editing while the operator is running', async () => {
+    mockInitialComputeStatus({ running: true, registered: true, relay_runtime_state: 'ready' });
+
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+
+    await waitFor(() => expect(relayInput.disabled).toBe(true));
+    expect(addButton.disabled).toBe(true);
+    expect(screen.getByText('Stop the operator to edit relay URLs. Changes apply on next start.')).toBeTruthy();
+  });
+
+  it('disables relay URL editing while the operator is starting', async () => {
+    let resolveStart: (() => void) | undefined;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    await waitFor(() => expect(relayInput.disabled).toBe(true));
+    expect(addButton.disabled).toBe(true);
+
+    resolveStart?.();
+  });
+
+  it('saves normalized relay_base_urls and first-url relay_base_url compatibility', async () => {
+    render(<App />);
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    fireEvent.change(relayInput, { target: { value: ' https://staging.token.place ' } });
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'save_config' &&
+            args?.config?.relay_base_url === 'https://staging.token.place' &&
+            args?.config?.relay_base_urls?.[0] === 'https://staging.token.place'
+        )
+      ).toBe(true)
+    );
+  });
+
+  it('starts the operator with the normalized configured relay list and primary relay URL', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://legacy.example',
+          relay_base_urls: [
+            ' https://token.place ',
+            'https://staging.token.place',
+            'https://token.place',
+            '',
+          ],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'start_compute_node' &&
+            args?.request?.relay_base_url === 'https://token.place' &&
+            JSON.stringify(args?.request?.relay_base_urls) ===
+              JSON.stringify(['https://token.place', 'https://staging.token.place'])
+        )
+      ).toBe(true)
+    );
+  });
+
 });

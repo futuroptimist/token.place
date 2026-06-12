@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
@@ -503,7 +503,9 @@ def _structured_startup_error_payload(
         "running": False,
         "registered": False,
         "relay_runtime_state": "failed",
-        "active_relay_url": getattr(args, "relay_url", "https://token.place"),
+        "active_relay_url": _normalize_relay_urls(
+            getattr(args, "relay_url", "https://token.place")
+        )[0],
         "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
         "effective_mode": "pending",
         "backend_available": "pending",
@@ -536,6 +538,27 @@ def _sleep_with_cancel(seconds: float) -> bool:
         time.sleep(0.1)
     return stop_requested()
 
+
+
+def _normalize_relay_urls(raw_relay_urls: Any) -> List[str]:
+    """Return a trimmed, de-duplicated relay list from argparse or tests."""
+
+    if isinstance(raw_relay_urls, str):
+        candidates = [raw_relay_urls]
+    elif isinstance(raw_relay_urls, (list, tuple)):
+        candidates = list(raw_relay_urls)
+    else:
+        candidates = []
+
+    normalized: List[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        trimmed = candidate.strip()
+        if trimmed and trimmed not in normalized:
+            normalized.append(trimmed)
+
+    return normalized or ["https://token.place"]
 
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
@@ -616,7 +639,9 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
-    relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
+    relay_urls = _normalize_relay_urls(args.relay_url)
+    relay_url = resolve_relay_url(relay_urls[0], prefer_cli=True)
+    relay_urls = [relay_url, *relay_urls[1:]]
     relay_port = resolve_relay_port(args.relay_port, relay_url)
     print(
         "desktop.compute_node_bridge.start "
@@ -637,6 +662,7 @@ def run(args: argparse.Namespace) -> int:
             relay_url=relay_url,
             relay_port=relay_port,
             use_configured_relay_fallbacks=False,
+            relay_urls=tuple(relay_urls),
         )
     )
     start_relay_session = getattr(runtime, "start_relay_session", None)
@@ -1322,7 +1348,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
-    parser.add_argument("--relay-url", default="https://token.place")
+    parser.add_argument("--relay-url", action="append", default=None)
     parser.add_argument("--relay-port", type=int, default=None)
     args = parser.parse_args()
 

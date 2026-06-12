@@ -22,7 +22,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
     [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md),
-    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+    [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md),
+    [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md)
 - **Learn the encryption model**
   - Start here: [encrypt.py](../encrypt.py)
   - Also see: [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md),
@@ -43,7 +44,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
   hardening checklist and threat model; use
   [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.
 - **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md) and stepwise updates in
-  [CHANGELOG_STEP.md](CHANGELOG_STEP.md).
+  [CHANGELOG_STEP.md](CHANGELOG_STEP.md). Historical launch evidence lives in
+  [releases/v0.1.0.md](releases/v0.1.0.md).
 
 ## Prompt docs
 

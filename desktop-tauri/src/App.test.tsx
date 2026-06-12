@@ -1383,6 +1383,167 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
   });
 
+
+  it('renders one relay URL field from legacy config', async () => {
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    expect(relayInput.value).toBe('https://token.place');
+    expect(screen.getByText('Add new relay URL')).toBeTruthy();
+    expect((screen.getByText('Delete') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('loads and displays multiple persisted relay URLs', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://primary.example',
+          relay_base_urls: ['https://primary.example', 'https://staging.example'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+
+    expect(((await screen.findByLabelText('Relay URL 1')) as HTMLInputElement).value).toBe(
+      'https://primary.example'
+    );
+    expect((screen.getByLabelText('Relay URL 2') as HTMLInputElement).value).toBe(
+      'https://staging.example'
+    );
+    expect(screen.getByText(/Configured relay URLs:/).textContent).toContain(
+      'https://primary.example, https://staging.example'
+    );
+  });
+
+  it('adds relay URL fields up to the documented maximum', async () => {
+    render(<App />);
+    await screen.findByLabelText('Relay URL 1');
+
+    fireEvent.click(screen.getByText('Add new relay URL'));
+
+    expect(await screen.findByLabelText('Relay URL 2')).toBeTruthy();
+    for (let index = 2; index < 10; index += 1) {
+      fireEvent.click(screen.getByText('Add new relay URL'));
+    }
+    expect(screen.getByLabelText('Relay URL 10')).toBeTruthy();
+    expect((screen.getByText('Add new relay URL') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('deletes a non-final relay URL but does not delete the last field', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://primary.example',
+          relay_base_urls: ['https://primary.example', 'https://staging.example'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    await screen.findByLabelText('Relay URL 2');
+
+    const deleteButtons = screen.getAllByText('Delete') as HTMLButtonElement[];
+    expect(deleteButtons[0].disabled).toBe(false);
+    fireEvent.click(deleteButtons[1]);
+
+    await waitFor(() => expect(screen.queryByLabelText('Relay URL 2')).toBeNull());
+    expect((screen.getByLabelText('Relay URL 1') as HTMLInputElement).value).toBe(
+      'https://primary.example'
+    );
+    expect((screen.getByText('Delete') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('disables relay URL editing while the operator is running', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+    });
+
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    await waitFor(() => expect(relayInput.disabled).toBe(true));
+    expect((screen.getByText('Add new relay URL') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('Stop the operator to edit relay URLs. Changes apply on next start.')).toBeTruthy();
+  });
+
+  it('disables relay URL editing while operator startup is pending', async () => {
+    let resolveStart: (() => void) | undefined;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect((screen.getByLabelText('Relay URL 1') as HTMLInputElement).disabled).toBe(true));
+    expect((screen.getByText('Add new relay URL') as HTMLButtonElement).disabled).toBe(true);
+    resolveStart?.();
+  });
+
+  it('saves relay_base_urls plus first-url relay_base_url compatibility', async () => {
+    render(<App />);
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+
+    fireEvent.change(relayInput, { target: { value: ' https://updated.example ' } });
+
+    await waitFor(() => {
+      const saveCall = invokeMock.mock.calls.find((call) => call[0] === 'save_config');
+      expect(saveCall?.[1]?.config?.relay_base_url).toBe('https://updated.example');
+      expect(saveCall?.[1]?.config?.relay_base_urls).toEqual(['https://updated.example']);
+    });
+  });
+
+  it('starts the operator with normalized relay URL list and primary relay URL', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://legacy.example',
+          relay_base_urls: [
+            ' https://primary.example ',
+            '',
+            'https://staging.example',
+            'https://primary.example',
+          ],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => {
+      const startCall = invokeMock.mock.calls.find((call) => call[0] === 'start_compute_node');
+      expect(startCall?.[1]?.request?.relay_base_url).toBe('https://primary.example');
+      expect(startCall?.[1]?.request?.relay_base_urls).toEqual([
+        'https://primary.example',
+        'https://staging.example',
+      ]);
+    });
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

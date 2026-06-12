@@ -17,6 +17,8 @@ PUBLIC_METADATA_ENV_VARS = (
 def _clear_metadata_env(monkeypatch):
     for name in PUBLIC_METADATA_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
 
 
 def test_prod_host_inference_yields_prod(monkeypatch):
@@ -47,6 +49,40 @@ def test_release_metadata_prefers_safe_env_values(monkeypatch):
         "label": "prod v0.1.1",
         "ref": "abcdef123456",
     }
+
+
+def test_legacy_token_place_env_does_not_override_public_host(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+
+    assert release_metadata.infer_release_environment("staging.token.place") == "staging"
+
+
+def test_non_deploy_environment_values_map_to_dev(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "testing")
+
+    assert release_metadata.infer_release_environment("example.com") == "dev"
+
+
+def test_release_version_file_fallback_is_cached(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    chart_reads = {"count": 0}
+
+    def fake_read_chart_app_version() -> str:
+        chart_reads["count"] += 1
+        return "0.1.1"
+
+    release_metadata._read_chart_app_version.cache_clear()
+    monkeypatch.setattr(
+        release_metadata,
+        "_read_chart_app_version",
+        release_metadata.lru_cache(maxsize=1)(fake_read_chart_app_version),
+    )
+
+    assert release_metadata.resolve_release_version() == "0.1.1"
+    assert release_metadata.resolve_release_version() == "0.1.1"
+    assert chart_reads["count"] == 1
 
 
 def test_release_metadata_json_does_not_expose_unrelated_secrets(monkeypatch):

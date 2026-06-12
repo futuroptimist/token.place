@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata, release_metadata_json
+from release_metadata import get_release_metadata
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -128,7 +128,10 @@ def _render_index_html(host: str | None = None) -> str:
     metadata = get_release_metadata(host)
     return (
         html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
-        .replace(RELEASE_METADATA_PLACEHOLDER, release_metadata_json(host))
+        .replace(
+            RELEASE_METADATA_PLACEHOLDER,
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+        )
         .replace(RELEASE_BADGE_TEXT_PLACEHOLDER, metadata["label"])
     )
 

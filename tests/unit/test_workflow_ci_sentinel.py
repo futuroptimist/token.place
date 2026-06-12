@@ -282,8 +282,16 @@ def test_canonical_chart_sets_release_metadata_env_defaults() -> None:
     assert '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)' in deployment
     assert '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)' in deployment
     assert '"TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)' in deployment
+    assert 'and (not $deployEnv) .Values.ingress.host' in deployment
+    assert 'and (not $deployEnv) .Values.ingress.enabled .Values.ingress.host' not in deployment
     assert 'eq .Values.ingress.host "token.place"' in deployment
     assert 'eq .Values.ingress.host "staging.token.place"' in deployment
+
+
+def test_canonical_relay_image_copies_release_metadata_module() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert "release_metadata.py /app/" in dockerfile
 
 
 def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:

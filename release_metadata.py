@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ def _clean_public_token(value: Any, *, max_length: int = 64) -> str:
     return text[:max_length]
 
 
+@lru_cache(maxsize=1)
 def _read_chart_app_version() -> str:
     chart_path = _REPO_ROOT / "charts" / "tokenplace" / "Chart.yaml"
     try:
@@ -34,6 +36,7 @@ def _read_chart_app_version() -> str:
     return ""
 
 
+@lru_cache(maxsize=1)
 def _read_package_version() -> str:
     package_path = _REPO_ROOT / "desktop-tauri" / "package.json"
     try:
@@ -67,9 +70,9 @@ def _hostname_from_host(host: str | None) -> str:
 
 
 def infer_release_environment(host: str | None = None) -> str:
-    """Resolve the public deploy environment from env vars or request host."""
+    """Resolve the public deploy environment from explicit deploy env or request host."""
 
-    explicit = os.environ.get("TOKENPLACE_DEPLOY_ENV") or os.environ.get("TOKEN_PLACE_ENV")
+    explicit = os.environ.get("TOKENPLACE_DEPLOY_ENV")
     if explicit:
         normalized = explicit.strip().lower()
         aliases = {
@@ -80,9 +83,11 @@ def infer_release_environment(host: str | None = None) -> str:
             "development": "dev",
             "local": "dev",
             "localhost": "dev",
+            "testing": "dev",
+            "test": "dev",
             "dev": "dev",
         }
-        return aliases.get(normalized, _clean_public_token(normalized, max_length=32) or "dev")
+        return aliases.get(normalized, "dev")
 
     hostname = _hostname_from_host(host)
     if hostname == "token.place":

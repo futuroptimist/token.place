@@ -60,7 +60,7 @@ spec:
           {{- $relayPort := printf "%v" .Values.containerPort }}
           {{- $selfDispatchURL := "http://127.0.0.1:$(RELAY_PORT)" }}
           {{- $deployEnv := default "" .Values.deployEnv }}
-          {{- if and (not $deployEnv) .Values.ingress.enabled .Values.ingress.host }}
+          {{- if and (not $deployEnv) .Values.ingress.host }}
           {{- if eq .Values.ingress.host "token.place" }}
           {{- $deployEnv = "prod" }}
           {{- else if eq .Values.ingress.host "staging.token.place" }}

@@ -192,9 +192,6 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
         "root_page_loads",
-        "release",
-        "version",
-        "env",
         "test_release_badge_renders_without_api_call",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_sticky_server_two_turns_and_key_label",

@@ -424,6 +424,169 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect((modelInput as HTMLInputElement).value).toBe('/tmp/model.gguf'));
   });
 
+  it('renders one relay URL field from legacy single-url config', async () => {
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    await waitFor(() => expect(relayInput.value).toBe('https://token.place'));
+    expect(screen.queryByLabelText('Relay URL 2')).toBeNull();
+  });
+
+  it('loads and displays multiple persisted relay URLs', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://primary.example',
+          relay_base_urls: ['https://primary.example', 'https://staging.example'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+
+    const primaryInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const stagingInput = (await screen.findByLabelText('Relay URL 2')) as HTMLInputElement;
+    expect(primaryInput.value).toBe('https://primary.example');
+    expect(stagingInput.value).toBe('https://staging.example');
+    expect(screen.getByText(/Configured relay URLs:/).textContent).toContain(
+      'https://primary.example, https://staging.example'
+    );
+  });
+
+  it('adds and deletes relay URL fields while keeping one field minimum', async () => {
+    render(<App />);
+
+    const addButton = await screen.findByText('Add new relay URL');
+    fireEvent.click(addButton);
+
+    const secondInput = (await screen.findByLabelText('Relay URL 2')) as HTMLInputElement;
+    fireEvent.change(secondInput, { target: { value: 'https://staging.example' } });
+    expect(secondInput.value).toBe('https://staging.example');
+
+    const deleteButton = screen.getByText('Delete');
+    fireEvent.click(deleteButton);
+
+    await waitFor(() => expect(screen.queryByLabelText('Relay URL 2')).toBeNull());
+    expect(screen.getByLabelText('Relay URL 1')).toBeTruthy();
+    expect(screen.queryByText('Delete')).toBeNull();
+  });
+
+  it('disables relay URL editing while the operator is running', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'ready',
+    });
+
+    render(<App />);
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    expect(relayInput.disabled).toBe(true);
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    expect(addButton.disabled).toBe(true);
+    expect(
+      screen.getByText('Stop the operator to edit relay URLs. Changes apply on next start.')
+    ).toBeTruthy();
+  });
+
+  it('disables relay URL editing while the operator is starting', async () => {
+    let resolveStart: (() => void) | undefined;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Relay URL 1') as HTMLInputElement).disabled).toBe(true)
+    );
+    expect((screen.getByText('Add new relay URL') as HTMLButtonElement).disabled).toBe(true);
+    resolveStart?.();
+  });
+
+  it('caps relay URL fields at the documented maximum of 10', async () => {
+    render(<App />);
+
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    for (let index = 1; index < 10; index += 1) {
+      fireEvent.click(addButton);
+    }
+
+    expect(screen.getByLabelText('Relay URL 10')).toBeTruthy();
+    expect(screen.queryByLabelText('Relay URL 11')).toBeNull();
+    expect(addButton.disabled).toBe(true);
+  });
+
+  it('saves normalized relay URL list and legacy first-url compatibility field', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: [' https://primary.example ', '', 'https://primary.example'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'save_config' &&
+            args?.config?.relay_base_url === 'https://primary.example' &&
+            JSON.stringify(args.config.relay_base_urls) === '["https://primary.example"]'
+        )
+      ).toBe(true)
+    );
+  });
+
+  it('starts the operator with the normalized primary relay URL and configured list', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: [' https://primary.example ', 'https://staging.example'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'start_compute_node' &&
+            args?.request?.relay_base_url === 'https://primary.example' &&
+            JSON.stringify(args.request.relay_base_urls) ===
+              '["https://primary.example","https://staging.example"]'
+        )
+      ).toBe(true)
+    );
+  });
+
   it('surfaces bridge startup exits through compute_node_event errors', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_compute_node') {

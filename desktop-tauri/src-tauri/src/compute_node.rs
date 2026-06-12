@@ -56,6 +56,18 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    #[serde(default)]
+    pub configured_relay_urls: Vec<String>,
+    #[serde(default)]
+    pub relay_statuses: Vec<Value>,
+    #[serde(default)]
+    pub registered_relay_count: usize,
+    #[serde(default)]
+    pub configured_relay_count: usize,
+    #[serde(default)]
+    pub active_relay_urls: Vec<String>,
+    #[serde(default)]
+    pub registered_relay_urls: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -245,6 +257,12 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        configured_relay_urls: normalized_request_relay_urls(request),
+        relay_statuses: Vec::new(),
+        registered_relay_count: 0,
+        configured_relay_count: normalized_request_relay_urls(request).len(),
+        active_relay_urls: Vec::new(),
+        registered_relay_urls: Vec::new(),
     }
 }
 
@@ -350,6 +368,48 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .get("log_file_path")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+    }
+    if let Some(configured_relay_urls) = payload
+        .get("configured_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.configured_relay_urls = configured_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(relay_statuses) = payload.get("relay_statuses").and_then(Value::as_array) {
+        status.relay_statuses = relay_statuses.clone();
+    }
+    if let Some(registered_relay_count) = payload
+        .get("registered_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.registered_relay_count = registered_relay_count as usize;
+    }
+    if let Some(configured_relay_count) = payload
+        .get("configured_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.configured_relay_count = configured_relay_count as usize;
+    }
+    if let Some(active_relay_urls) = payload.get("active_relay_urls").and_then(Value::as_array) {
+        status.active_relay_urls = active_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(registered_relay_urls) = payload
+        .get("registered_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.registered_relay_urls = registered_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
     }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
@@ -512,6 +572,12 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "code",
         "message",
         "last_error",
+        "configured_relay_urls",
+        "relay_statuses",
+        "registered_relay_count",
+        "configured_relay_count",
+        "active_relay_urls",
+        "registered_relay_urls",
     ] {
         if let Some(value) = map.get(key) {
             summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
@@ -854,6 +920,12 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                configured_relay_urls: relay_base_urls.clone(),
+                relay_statuses: Vec::new(),
+                registered_relay_count: 0,
+                configured_relay_count: relay_base_urls.len(),
+                active_relay_urls: Vec::new(),
+                registered_relay_urls: Vec::new(),
             };
             true
         }

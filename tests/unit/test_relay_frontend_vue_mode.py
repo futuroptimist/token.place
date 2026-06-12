@@ -121,11 +121,15 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_OPERATOR_TOKEN", "do-not-leak")
 
     with relay.app.test_client() as client:
-        response = client.get("/api/v1/meta", headers={"Host": "token.place"})
+        meta_response = client.get("/api/v1/meta", headers={"Host": "token.place"})
+        version_response = client.get("/api/v1/version", headers={"Host": "token.place"})
 
-    assert response.status_code == 200
-    body = response.get_json()
+    assert meta_response.status_code == 200
+    assert version_response.status_code == 200
+    assert version_response.get_json() == meta_response.get_json()
+    body = meta_response.get_json()
     assert body["environment"] == "staging"
     assert body["version"] == "v0.1.1"
     assert body["label"] == "staging v0.1.1"
-    assert "do-not-leak" not in response.get_data(as_text=True)
+    assert "do-not-leak" not in meta_response.get_data(as_text=True)
+    assert "do-not-leak" not in version_response.get_data(as_text=True)

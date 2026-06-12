@@ -923,9 +923,19 @@ def index():
     response.make_conditional(request)
     return response
 
+
+def _release_metadata_response():
+    return jsonify(get_release_metadata(request.host))
+
+
 @app.route('/api/v1/meta', methods=['GET'])
 def api_v1_meta():
-    return jsonify(get_release_metadata(request.host))
+    return _release_metadata_response()
+
+
+@app.route('/api/v1/version', methods=['GET'])
+def api_v1_version():
+    return _release_metadata_response()
 
 
 # Generic route for serving static files

@@ -21,6 +21,7 @@ PUBLIC_CLIENT_ROUTES = {
     ("POST", "/api/v1/images/generations"),
     ("GET", "/api/v1/health"),
     ("GET", "/api/v1/meta"),
+    ("GET", "/api/v1/version"),
     ("GET", "/api/v1/community/providers"),
     ("GET", "/api/v1/community/leaderboard"),
     ("POST", "/api/v1/community/contributions"),

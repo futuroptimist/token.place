@@ -16,6 +16,9 @@ fullnameOverride: ""
 
 containerPort: 5010
 
+# Public release environment label for the landing badge; blank infers from ingress.host.
+deployEnv: ""
+
 serviceAccount:
   create: false
   annotations: {}

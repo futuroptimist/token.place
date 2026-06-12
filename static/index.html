@@ -224,6 +224,33 @@
             cursor: not-allowed;
             opacity: 0.55;
         }
+
+        .release-badge {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            z-index: 10;
+            display: inline-flex;
+            align-items: center;
+            max-width: calc(100vw - 24px);
+            padding: 6px 10px;
+            border: 1px solid rgba(0, 255, 255, 0.35);
+            border-radius: 999px;
+            background-color: rgba(17, 17, 17, 0.78);
+            color: #ffffff;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 12px;
+            line-height: 1;
+            letter-spacing: 0.04em;
+            pointer-events: none;
+            backdrop-filter: blur(8px);
+        }
+        .release-badge-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
         .mode-toggle-container {
             display: flex;
             justify-content: center;
@@ -386,6 +413,13 @@
             border-bottom: 1px solid #0056b3;
         }
 
+
+        body.light-mode .release-badge {
+            border-color: rgba(0, 123, 255, 0.35);
+            background-color: rgba(255, 255, 255, 0.84);
+            color: #333333;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+        }
         body.light-mode .mode-toggle-container {
             background-color: #f5f5f5;
         }
@@ -414,6 +448,15 @@
     </style>
 </head>
 <body class="dark-mode">
+    <script id="tokenplace-release-metadata" type="application/json">{"environment":"dev","label":"dev dev","version":"dev"}</script>
+    <div
+        class="release-badge"
+        data-testid="release-badge"
+        aria-label="token.place release metadata"
+    >
+        <span class="release-badge-label" data-testid="release-badge-label">dev dev</span>
+    </div>
+
     <div id="app" class="container">
         <h1>Welcome to token.place!</h1>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources, aiming to democratize AI access.</p>
@@ -595,6 +638,16 @@
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/health</span></h3>
             <p>Returns API health metadata: <code>status</code>, <code>version</code>, <code>service</code>, and a current <code>timestamp</code>.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/meta</span></h3>
+            <p>Returns public-safe deployment metadata for the landing badge: <code>environment</code>, <code>version</code>, <code>label</code>, and optional short <code>ref</code>. It never exposes secrets or relay payload content.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/version</span></h3>
+            <p>Alias for <code>/api/v1/meta</code> for simple public release/version checks.</p>
         </div>
 
         <div class="api-endpoint">

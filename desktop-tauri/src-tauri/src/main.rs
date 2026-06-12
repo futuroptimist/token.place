@@ -277,7 +277,9 @@ fn load_config(
         return Ok(DesktopConfig::default());
     }
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| e.to_string())
+    serde_json::from_str::<DesktopConfig>(&raw)
+        .map(DesktopConfig::normalized)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -288,7 +290,7 @@ fn save_config(
 ) -> Result<(), String> {
     let dir = resolve_config_dir(&app, &state).map_err(|e| e.to_string())?;
     let path = config_path(&dir);
-    let raw = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let raw = serde_json::to_string_pretty(&config.normalized()).map_err(|e| e.to_string())?;
     fs::write(path, raw).map_err(|e| e.to_string())
 }
 

@@ -16,8 +16,19 @@ interface BackendInfo {
 interface DesktopConfig {
   model_path: string;
   relay_base_url: string;
+  relay_base_urls: string[];
   preferred_mode: BackendMode;
 }
+
+const DEFAULT_RELAY_BASE_URL = 'https://token.place';
+export const MAX_RELAY_BASE_URLS = 10;
+
+type PartialDesktopConfig = Partial<DesktopConfig> & {
+  model_path?: string;
+  relay_base_url?: string;
+  relay_base_urls?: unknown;
+  preferred_mode?: BackendMode;
+};
 
 interface ComputeNodeStatus {
   running: boolean;
@@ -91,6 +102,90 @@ function formatErrorMessage(error: unknown): string {
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
+}
+
+export function normalizeRelayUrls(
+  relayBaseUrls: unknown,
+  legacyRelayBaseUrl = '',
+  fallback = DEFAULT_RELAY_BASE_URL
+): string[] {
+  const rawUrls = Array.isArray(relayBaseUrls) ? relayBaseUrls : [];
+  const normalized: string[] = [];
+
+  for (const rawUrl of rawUrls) {
+    if (typeof rawUrl !== 'string') {
+      continue;
+    }
+    const trimmed = rawUrl.trim();
+    if (!trimmed || normalized.includes(trimmed)) {
+      continue;
+    }
+    normalized.push(trimmed);
+    if (normalized.length >= MAX_RELAY_BASE_URLS) {
+      break;
+    }
+  }
+
+  if (normalized.length === 0) {
+    const legacy = legacyRelayBaseUrl.trim();
+    normalized.push(legacy || fallback);
+  }
+
+  return normalized;
+}
+
+export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopConfig {
+  const relayBaseUrls = normalizeRelayUrls(config.relay_base_urls, config.relay_base_url);
+  return {
+    model_path: typeof config.model_path === 'string' ? config.model_path : '',
+    relay_base_url: relayBaseUrls[0] || DEFAULT_RELAY_BASE_URL,
+    relay_base_urls: relayBaseUrls,
+    preferred_mode: config.preferred_mode ?? 'auto',
+  };
+}
+
+function configForSave(config: DesktopConfig): DesktopConfig {
+  return normalizeDesktopConfig(config);
+}
+
+export function primaryRelayUrl(config: DesktopConfig): string {
+  return normalizeRelayUrls(config.relay_base_urls, config.relay_base_url)[0] || DEFAULT_RELAY_BASE_URL;
+}
+
+export function updateRelayUrlAtIndex(
+  config: DesktopConfig,
+  index: number,
+  value: string
+): DesktopConfig {
+  const relayBaseUrls = [...config.relay_base_urls];
+  relayBaseUrls[index] = value;
+  return {
+    ...config,
+    relay_base_url: primaryRelayUrl({ ...config, relay_base_urls: relayBaseUrls }),
+    relay_base_urls: relayBaseUrls,
+  };
+}
+
+export function addRelayUrl(config: DesktopConfig): DesktopConfig {
+  if (config.relay_base_urls.length >= MAX_RELAY_BASE_URLS) {
+    return config;
+  }
+  return { ...config, relay_base_urls: [...config.relay_base_urls, ''] };
+}
+
+export function removeRelayUrl(config: DesktopConfig, index: number): DesktopConfig {
+  if (config.relay_base_urls.length <= 1) {
+    return config;
+  }
+  const relayBaseUrls = config.relay_base_urls.filter((_, currentIndex) => currentIndex !== index);
+  if (relayBaseUrls.length === 0) {
+    relayBaseUrls.push(DEFAULT_RELAY_BASE_URL);
+  }
+  return {
+    ...config,
+    relay_base_url: primaryRelayUrl({ ...config, relay_base_urls: relayBaseUrls }),
+    relay_base_urls: relayBaseUrls,
+  };
 }
 
 function mergeComputeStatusEvent(
@@ -222,7 +317,8 @@ export function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
-    relay_base_url: 'https://token.place',
+    relay_base_url: DEFAULT_RELAY_BASE_URL,
+    relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
@@ -254,8 +350,12 @@ export function App() {
 
     const initializeConfigAndArtifact = async () => {
       try {
-        const loadedConfig = await invoke<DesktopConfig>('load_config');
-        setConfig(loadedConfig);
+        const loadedConfig = await invoke<PartialDesktopConfig>('load_config');
+        const normalizedConfig = normalizeDesktopConfig(loadedConfig);
+        setConfig(normalizedConfig);
+        if (JSON.stringify(loadedConfig) !== JSON.stringify(normalizedConfig)) {
+          invoke('save_config', { config: normalizedConfig }).catch((e) => setError(formatErrorMessage(e)));
+        }
         const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
         computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
@@ -357,7 +457,7 @@ export function App() {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      invoke('save_config', { config: next }).catch((e) => setError(formatErrorMessage(e)));
+      invoke('save_config', { config: configForSave(next) }).catch((e) => setError(formatErrorMessage(e)));
       saveTimerRef.current = null;
     }, 300);
   };
@@ -438,7 +538,7 @@ export function App() {
         registered: false,
         relay_runtime_state: 'starting',
         sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
-        active_relay_url: config.relay_base_url,
+        active_relay_url: primaryRelayUrl(config),
         requested_mode: config.preferred_mode,
         effective_mode: null,
         backend_available: null,
@@ -454,7 +554,8 @@ export function App() {
       await invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
-          relay_base_url: config.relay_base_url,
+          relay_base_url: primaryRelayUrl(config),
+          relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
         },
       });
@@ -529,7 +630,7 @@ export function App() {
       setIsForwarding(true);
       setError('');
       await invoke('encrypt_and_forward', {
-        relay_base_url: config.relay_base_url,
+        relay_base_url: primaryRelayUrl(config),
         final_output: output,
       });
     } catch (e) {
@@ -595,12 +696,51 @@ export function App() {
         partial offload. Unsupported platforms fall back to CPU with diagnostics.
       </p>
 
-      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
-      <input
-        value={config.relay_base_url}
-        style={{ width: '100%' }}
-        onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })}
-      />
+      <section aria-labelledby="relay-urls-heading" style={{ marginTop: 12 }}>
+        <h2 id="relay-urls-heading" style={{ fontSize: 16, marginBottom: 8 }}>Relay URLs</h2>
+        {(computeStatus.running || isStartingComputeNode) && (
+          <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>
+            Stop the operator to edit relay URLs. Changes apply on next start.
+          </p>
+        )}
+        {config.relay_base_urls.map((relayUrl, index) => {
+          const inputId = `relay-url-${index}`;
+          const relayControlsDisabled = computeStatus.running || isStartingComputeNode;
+          return (
+            <div key={index} style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
+              <label htmlFor={inputId} style={{ minWidth: 92 }}>Relay URL {index + 1}</label>
+              <input
+                id={inputId}
+                value={relayUrl}
+                disabled={relayControlsDisabled}
+                style={{ width: '100%' }}
+                onChange={(e) => updateConfig(updateRelayUrlAtIndex(config, index, e.target.value))}
+              />
+              {index > 0 && (
+                <button
+                  type="button"
+                  disabled={relayControlsDisabled}
+                  onClick={() => updateConfig(removeRelayUrl(config, index))}
+                  aria-label={`Delete relay URL ${index + 1}`}
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          onClick={() => updateConfig(addRelayUrl(config))}
+          disabled={computeStatus.running || isStartingComputeNode || config.relay_base_urls.length >= MAX_RELAY_BASE_URLS}
+          style={{ marginTop: 8 }}
+        >
+          Add new relay URL
+        </button>
+        <p style={{ marginTop: 6, fontSize: 12, color: '#555' }}>
+          Up to {MAX_RELAY_BASE_URLS} relay URLs are supported. Blank entries are ignored when saved or started.
+        </p>
+      </section>
 
       <section style={{ marginTop: 14, border: '1px solid #ddd', padding: 12 }}>
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
@@ -618,7 +758,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
-        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{displayStatusValue(computeStatus.active_relay_url, config.relay_base_url)}</code></p>
+        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{displayStatusValue(computeStatus.active_relay_url, primaryRelayUrl(config))}</code></p>
+        <p style={{ marginBottom: 0 }}>Configured relay URLs: <code>{normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).join(', ')}</code></p>
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{displayStatusValue(computeStatus.requested_mode, config.preferred_mode)}</code></p>
         <p style={{ marginBottom: 0 }}>Effective mode: <code>{displayStatusValue(computeStatus.effective_mode, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend available: <code>{displayStatusValue(computeStatus.backend_available, 'pending')}</code></p>

@@ -928,11 +928,6 @@ def api_v1_meta():
     return jsonify(get_release_metadata(request.host))
 
 
-@app.route('/api/v1/version', methods=['GET'])
-def api_v1_version():
-    return jsonify(get_release_metadata(request.host))
-
-
 # Generic route for serving static files
 @app.route('/static/<path:path>')
 def serve_static(path):

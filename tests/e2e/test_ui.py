@@ -248,7 +248,6 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
         route.fulfill(status=500, body="release metadata should be embedded")
 
     page.route("**/api/v1/meta", reject_metadata_api)
-    page.route("**/api/v1/version", reject_metadata_api)
 
     page.goto(base_url, wait_until="domcontentloaded")
 

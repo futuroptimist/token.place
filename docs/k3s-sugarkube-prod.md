@@ -28,7 +28,7 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Current runtime alignment: chart `appVersion: "0.1.1"`; historical v0.1.0 evidence includes Git tag `v0.1.0` and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`.
 - Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact)
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not production sign-off

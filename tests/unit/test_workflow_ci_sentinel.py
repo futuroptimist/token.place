@@ -464,3 +464,17 @@ def test_run_all_tests_pr_tiny_gguf_path_is_absolute_workspace_path() -> None:
         assert "scripts/provision-ci-tiny-gguf.sh" in _step_runs(
             job
         ), f"{job_name} must provision the tiny real GGUF before run_all_tests.sh."
+
+
+def test_chart_app_version_and_release_env_metadata_defaults_are_current() -> None:
+    chart = yaml.safe_load(Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load(Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8"))
+    deployment = Path("charts/tokenplace/templates/deployment.yaml").read_text(encoding="utf-8")
+
+    assert chart["appVersion"] == "0.1.1"
+    assert values["deployEnv"] == ""
+    assert '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)' in deployment
+    assert '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)' in deployment
+    assert '"TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)' in deployment
+    assert 'else if eq $ingressHost "staging.token.place"' in deployment
+    assert 'eq $ingressHost "token.place"' in deployment

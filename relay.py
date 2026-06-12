@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
+
+from release_metadata import build_release_metadata
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -101,6 +103,7 @@ _ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
 STATIC_DIR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
 VUE_SCRIPT_PLACEHOLDER = "__TOKENPLACE_VUE_SCRIPT_SRC__"
+RELEASE_META_PLACEHOLDER = "__TOKENPLACE_RELEASE_META_JSON__"
 VUE_DEV_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"
 VUE_PROD_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"
 
@@ -118,10 +121,20 @@ def _vue_script_src_for_mode(mode: str) -> str:
     return VUE_DEV_SCRIPT_SRC if mode == "development" else VUE_PROD_SCRIPT_SRC
 
 
-def _render_index_html() -> str:
+def _json_for_script_tag(payload: dict[str, Any]) -> str:
+    """Serialize JSON so it is safe inside an application/json script tag."""
+
+    return json.dumps(payload, sort_keys=True).replace("</", "<\\/")
+
+
+def _render_index_html(host: str | None = None) -> str:
     with open(INDEX_HTML_PATH, encoding="utf-8") as index_file:
         html = index_file.read()
-    return html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
+    metadata = build_release_metadata(host=host)
+    return (
+        html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
+        .replace(RELEASE_META_PLACEHOLDER, _json_for_script_tag(metadata))
+    )
 
 
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
@@ -905,11 +918,19 @@ def _pop_stream_chunks_for_client(client_public_key):
 
 @app.route('/')
 def index():
-    response = Response(_render_index_html(), mimetype='text/html')
+    response = Response(_render_index_html(host=request.host), mimetype='text/html')
     response.last_modified = os.path.getmtime(INDEX_HTML_PATH)
     response.add_etag()
     response.make_conditional(request)
     return response
+
+
+@app.route('/api/v1/meta', methods=['GET'])
+def api_v1_meta():
+    """Return public-safe release metadata for deployed clients."""
+
+    return jsonify(build_release_metadata(host=request.host))
+
 
 # Generic route for serving static files
 @app.route('/static/<path:path>')

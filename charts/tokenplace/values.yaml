@@ -24,6 +24,10 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
+# Optional public deploy-environment label for the landing badge (for example prod or staging).
+# When blank, the chart infers common environments from ingress.host.
+deployEnv: ""
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000

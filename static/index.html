@@ -76,6 +76,32 @@
         [v-cloak] {
             display: none;
         }
+        .release-badge {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            z-index: 50;
+            max-width: calc(100vw - 24px);
+            padding: 6px 10px;
+            border: 1px solid rgba(0, 255, 255, 0.42);
+            border-radius: 999px;
+            background: rgba(17, 17, 17, 0.78);
+            color: #ffffff;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+            backdrop-filter: blur(8px);
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            line-height: 1.2;
+            pointer-events: none;
+            text-transform: lowercase;
+        }
+        body.light-mode .release-badge {
+            border-color: rgba(0, 123, 255, 0.35);
+            background: rgba(255, 255, 255, 0.82);
+            color: #111111;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+        }
         .chat-container {
             background-color: rgba(255, 255, 255, 0.1);
             border-radius: 10px;
@@ -414,6 +440,10 @@
     </style>
 </head>
 <body class="dark-mode">
+    <script id="tokenplace-release-meta" type="application/json">__TOKENPLACE_RELEASE_META_JSON__</script>
+    <div class="release-badge" data-testid="release-badge" aria-label="token.place release metadata">
+        <span id="release-badge-label">dev dev</span>
+    </div>
     <div id="app" class="container">
         <h1>Welcome to token.place!</h1>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources, aiming to democratize AI access.</p>
@@ -597,6 +627,12 @@
             <p>Returns API health metadata: <code>status</code>, <code>version</code>, <code>service</code>, and a current <code>timestamp</code>.</p>
         </div>
 
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/meta</span></h3>
+            <p>Returns public-safe release metadata for clients and status pages: deploy environment, release version, display label, and optional short Git/image reference. It never exposes secrets or private relay payload data.</p>
+        </div>
+
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/community/providers</span></h3>
             <p>Lists community-operated relay and server providers as <code>{"object":"list","data":[...]}</code>, with optional metadata.</p>
@@ -693,6 +729,35 @@
             <button id="toggleMode"></button>
         </div>
     </div>
+
+    <script>
+        (function renderReleaseBadge() {
+            const defaultMetadata = { environment: 'dev', display_version: 'dev', label: 'dev dev' };
+            const labelElement = document.getElementById('release-badge-label');
+            const metadataElement = document.getElementById('tokenplace-release-meta');
+            if (!labelElement || !metadataElement) {
+                return;
+            }
+
+            let metadata = defaultMetadata;
+            const rawMetadata = (metadataElement.textContent || '').trim();
+            if (rawMetadata && !rawMetadata.includes('__TOKENPLACE_RELEASE_META_JSON__')) {
+                try {
+                    const parsed = JSON.parse(rawMetadata);
+                    if (parsed && typeof parsed === 'object') {
+                        metadata = parsed;
+                    }
+                } catch (error) {
+                    console.warn('Unable to parse release metadata:', error);
+                }
+            }
+
+            const safeLabel = typeof metadata.label === 'string' && metadata.label.trim()
+                ? metadata.label.trim()
+                : `${metadata.environment || 'dev'} ${metadata.display_version || metadata.version || 'dev'}`.trim();
+            labelElement.textContent = safeLabel || defaultMetadata.label;
+        })();
+    </script>
 
     <!-- Vue.js -->
     <script src="__TOKENPLACE_VUE_SCRIPT_SRC__"></script>

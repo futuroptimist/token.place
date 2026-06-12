@@ -225,13 +225,13 @@ See also:
 
 ## API v1 E2EE architecture baseline (v0.1.0)
 
-- **This baseline applies to the active v0.1.0 relay/client-server runtime path** (including distributed relay and desktop integration paths being finalized for v0.1.0).
+- **This baseline applies to the active v0.1.0 relay/client-server runtime path** (including distributed relay and desktop integration paths maintained across v0.1.x).
 - **API v1 is the active API for v0.1.0** and the only approved runtime integration target.
 - **API v1 is non-streaming** for relay/client-server inference paths; return responses only after
   full model generation is complete.
 - **Do not add streaming to API v1** for active relay/client-server paths.
 - **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until API v1 is
-  launched and v0.1.0 is finalized.
+  ready for a future runtime target.
 - **If later sections of this README show API v2 streaming or `/api/v2/chat/completions` examples,
   treat them as experimental/reference-only** and not as approved runtime integration guidance for v0.1.0.
 - **Deprecated legacy relay endpoints**: `/sink`, `/faucet`, `/source`, `/retrieve`,
@@ -281,7 +281,7 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- v0.1.0 runtime/release alignment: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Current runtime/release alignment: chart `appVersion: "0.1.1"`; historical v0.1.0 evidence includes Git tag `v0.1.0` and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`.
 - Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - Pre-publish gate: `ci-helm.yml` checks whether the current chart version already exists at `oci://ghcr.io/futuroptimist/charts/tokenplace`. It publishes only new chart versions when chart source files changed, skips unchanged already-published versions as a no-op, and fails changed chart source with an already-published version so maintainers bump `charts/tokenplace/Chart.yaml`.
@@ -1000,6 +1000,7 @@ Request body:
 #### Health Check
 ```
 GET /api/v1/health
+GET /api/v1/meta
 # or
 GET /v1/health
 ```
@@ -1007,6 +1008,9 @@ Returns the service's readiness metadata. The JSON payload includes `status`, `v
 `service`, and a Unix `timestamp`. Override the reported service identifier by setting the
 `SERVICE_NAME` environment variable; blank or whitespace-only overrides are ignored so the
 default `token.place` label is preserved.
+
+`GET /api/v1/meta` returns public-safe deployment metadata for clients and status pages,
+including environment, release version, display label, and optional short Git/image reference.
 
 #### Image Generations
 ```

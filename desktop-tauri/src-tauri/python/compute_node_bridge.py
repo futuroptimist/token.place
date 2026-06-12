@@ -1185,7 +1185,7 @@ def run(args: argparse.Namespace) -> int:
                         last_error = relay_error
                     else:
                         last_error = (
-                            "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
+                            "relay appears unreachable, old, or incompatible with desktop-v0.1.1 "
                             "operator; update relay.py to repo HEAD"
                         )
                 elif api_v1_payload:
@@ -1252,7 +1252,7 @@ def run(args: argparse.Namespace) -> int:
                         last_error = None
                     else:
                         last_error = (
-                            "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
+                            "relay appears unreachable, old, or incompatible with desktop-v0.1.1 "
                             "operator; update relay.py to repo HEAD"
                         )
 

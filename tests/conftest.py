@@ -168,6 +168,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_compute_node_count_failure_is_graceful",
     "tests/e2e/test_ui.py::test_compute_node_count_rejects_null_diagnostics",
     "tests/e2e/test_ui.py::test_compute_node_count_ignores_stale_refresh",
+    "tests/e2e/test_ui.py::test_release_badge_renders_public_metadata",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
 REAL_DESKTOP_BRIDGE_E2E_NODEID = "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
@@ -198,6 +199,8 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         "failover",
         "sticky",
         "server_key",
+        "model",
+        "landing_chat",
         "landing_chat_model_dropdown_uses_api_v1_models",
         "landing_chat_model_catalog_failure_uses_api_v1_fallback",
         "landing_chat_shows_no_servers_available_message",
@@ -212,6 +215,10 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         "compute_node_count_rejects_null_diagnostics",
         "compute_node_count_ignores_stale_refresh",
         "landing_chat_real_inference_with_desktop_bridge_api_v1",
+        "release_badge_renders_public_metadata",
+        "release",
+        "version",
+        "env",
     }
     target_path = "tests/e2e/test_ui.py"
 

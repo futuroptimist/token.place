@@ -44,7 +44,7 @@ runtime fallback for API v1 desktop relay requests.
 - API v2 exists in the repository, but it is currently incomplete.
 - Do **not** route active runtime traffic through API v2 yet.
 - Do **not** migrate server, relay, client, desktop, or relay HTML chat UI runtime paths to API v2
-  until API v1 is launched and v0.1.0 is finalized.
+  until API v2 is explicitly approved as a future runtime target.
 
 ## Deprecated legacy relay endpoints
 

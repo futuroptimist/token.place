@@ -39,7 +39,7 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Current runtime alignment: chart `appVersion: "0.1.1"`; historical v0.1.0 evidence includes Git tag `v0.1.0` and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`.
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not staging sign-off or production promotion material
@@ -491,11 +491,11 @@ curl -fsS https://staging.token.place/metrics | head -n 40
 
 ### Image tag, chart version, and Git tag must be validated independently
 
-For final v0.1.0 release readiness, verify all four identifiers explicitly (separate from staging candidate validation):
+For final release readiness, verify all four identifiers explicitly (separate from staging candidate validation):
 
 - Git release tag: `v0.1.0`
-- Chart package version: `0.1.1` (with chart `appVersion: "0.1.0"`)
-- Chart appVersion: `"0.1.0"`
+- Chart package version: `0.1.1` (with chart `appVersion: "0.1.1"`)
+- Chart appVersion: `"0.1.1"`
 - Relay image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 
 Example image-tag existence checks:

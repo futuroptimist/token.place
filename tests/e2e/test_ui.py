@@ -239,6 +239,21 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     print(f"✓ Found {len(headings)} headings on the page")
 
 
+
+
+def test_release_badge_renders_public_metadata(page: Page, base_url: str, setup_servers):
+    """Landing page should render the release/environment badge without API calls."""
+
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    badge = page.get_by_test_id("release-badge")
+    badge.wait_for(state="visible")
+    badge_text = badge.inner_text().strip()
+
+    assert re.fullmatch(r"(dev|prod|staging) (dev|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?|[A-Za-z0-9][A-Za-z0-9._-]{0,127})", badge_text)
+    assert "secret" not in badge_text.lower()
+    assert "TOKENPLACE" not in badge_text
+
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""
     counts = iter([3, 5])

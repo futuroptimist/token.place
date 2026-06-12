@@ -40,6 +40,7 @@ def test_static_index_uses_runtime_vue_placeholder() -> None:
     html = INDEX_HTML_PATH.read_text(encoding="utf-8")
 
     assert relay.VUE_SCRIPT_PLACEHOLDER in html
+    assert relay.RELEASE_META_PLACEHOLDER in html
     assert "dist/vue.js" not in html
 
 

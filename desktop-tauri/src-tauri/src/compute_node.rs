@@ -34,6 +34,17 @@ pub struct ComputeNodeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RelayStatus {
+    pub relay_url: String,
+    pub registered: bool,
+    pub relay_runtime_state: Option<String>,
+    pub last_error: Option<String>,
+    pub last_seen: Option<u64>,
+    pub last_request_id: Option<String>,
+    pub request_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
     pub running: bool,
     pub registered: bool,
@@ -56,6 +67,12 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    pub configured_relay_urls: Vec<String>,
+    pub relay_statuses: Vec<RelayStatus>,
+    pub registered_relay_count: u64,
+    pub configured_relay_count: u64,
+    pub active_relay_urls: Vec<String>,
+    pub registered_relay_urls: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -220,10 +237,11 @@ fn startup_failure_status(
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
 ) -> ComputeNodeStatus {
+    let configured_relay_urls = normalized_request_relay_urls(request);
     ComputeNodeStatus {
         running: false,
         registered: false,
-        active_relay_url: normalized_request_relay_urls(request)
+        active_relay_url: configured_relay_urls
             .first()
             .cloned()
             .unwrap_or_else(|| request.relay_base_url.clone()),
@@ -245,6 +263,12 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        configured_relay_count: configured_relay_urls.len() as u64,
+        configured_relay_urls,
+        relay_statuses: Vec::new(),
+        registered_relay_count: 0,
+        active_relay_urls: Vec::new(),
+        registered_relay_urls: Vec::new(),
     }
 }
 
@@ -351,6 +375,51 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if let Some(configured_relay_urls) = payload
+        .get("configured_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.configured_relay_urls = configured_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(relay_statuses) = payload.get("relay_statuses").and_then(Value::as_array) {
+        status.relay_statuses = relay_statuses
+            .iter()
+            .filter_map(|value| serde_json::from_value::<RelayStatus>(value.clone()).ok())
+            .collect();
+    }
+    if let Some(registered_relay_count) = payload
+        .get("registered_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.registered_relay_count = registered_relay_count;
+    }
+    if let Some(configured_relay_count) = payload
+        .get("configured_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.configured_relay_count = configured_relay_count;
+    }
+    if let Some(active_relay_urls) = payload.get("active_relay_urls").and_then(Value::as_array) {
+        status.active_relay_urls = active_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(registered_relay_urls) = payload
+        .get("registered_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.registered_relay_urls = registered_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -405,12 +474,19 @@ fn finalize_bridge_exit(
 
     status.running = false;
     status.registered = false;
+    status.registered_relay_count = 0;
+    status.active_relay_urls.clear();
+    status.registered_relay_urls.clear();
     let preserve_failed_state = status.relay_runtime_state.as_deref() == Some("failed")
         || status.warm_load_state.as_deref() == Some("failed");
     if preserve_failed_state {
         status.relay_runtime_state = Some("failed".into());
     } else {
         status.relay_runtime_state = Some("stopped".into());
+    }
+    for relay_status in &mut status.relay_statuses {
+        relay_status.registered = false;
+        relay_status.relay_runtime_state = status.relay_runtime_state.clone();
     }
 
     let exit_error = bridge_exit_error(exit_status, saw_startup_event);
@@ -854,6 +930,20 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                configured_relay_urls: relay_base_urls.clone(),
+                relay_statuses: relay_base_urls
+                    .iter()
+                    .map(|relay_url| RelayStatus {
+                        relay_url: relay_url.clone(),
+                        registered: false,
+                        relay_runtime_state: Some("starting".into()),
+                        ..RelayStatus::default()
+                    })
+                    .collect(),
+                registered_relay_count: 0,
+                configured_relay_count: relay_base_urls.len() as u64,
+                active_relay_urls: Vec::new(),
+                registered_relay_urls: Vec::new(),
             };
             true
         }

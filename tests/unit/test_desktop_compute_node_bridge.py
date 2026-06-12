@@ -1318,11 +1318,12 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
 
 def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallbacks(monkeypatch):
     _reset_cancel_queue()
-    captured = {}
+    captured = {'configs': []}
 
     class CapturingRuntime:
         def __init__(self, config):
             captured['config'] = config
+            captured['configs'].append(config)
             self.model_manager = FakeModelManager()
             self.relay_client = SimpleNamespace(relay_url=config.relay_url)
 
@@ -1381,11 +1382,12 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
 
 def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
     _reset_cancel_queue()
-    captured = {}
+    captured = {'configs': []}
 
     class CapturingRuntime:
         def __init__(self, config):
             captured['config'] = config
+            captured['configs'].append(config)
             self.model_manager = FakeModelManager()
             self.relay_client = SimpleNamespace(relay_url=config.relay_url)
 
@@ -1435,12 +1437,15 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
     status = compute_node_bridge.run(args)
 
     assert status == 0
-    assert captured['config'].relay_url == 'http://127.0.0.1:5010'
-    assert captured['config'].use_configured_relay_fallbacks is False
-    assert captured['config'].relay_urls == (
+    assert [config.relay_url for config in captured['configs']] == [
         'http://127.0.0.1:5010',
         'https://staging.token.place',
-    )
+    ]
+    assert all(config.use_configured_relay_fallbacks is False for config in captured['configs'])
+    assert [config.relay_urls for config in captured['configs']] == [
+        ('http://127.0.0.1:5010',),
+        ('https://staging.token.place',),
+    ]
 
 
 def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):

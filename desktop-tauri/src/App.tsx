@@ -20,6 +20,16 @@ interface DesktopConfig {
   preferred_mode: BackendMode;
 }
 
+interface RelayStatus {
+  relay_url: string;
+  registered: boolean;
+  relay_runtime_state: string | null;
+  last_error: string | null;
+  last_seen?: number | null;
+  last_request_id?: string | null;
+  request_count?: number | null;
+}
+
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
 export const MAX_RELAY_BASE_URLS = 10;
 
@@ -52,6 +62,12 @@ interface ComputeNodeStatus {
   sequence: number | null;
   updated_at_ms: number | null;
   log_file_path: string | null;
+  configured_relay_urls: string[];
+  relay_statuses: RelayStatus[];
+  registered_relay_count: number;
+  configured_relay_count: number;
+  active_relay_urls: string[];
+  registered_relay_urls: string[];
 }
 
 interface ModelArtifactInfo {
@@ -94,6 +110,12 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
+  configured_relay_urls: [],
+  relay_statuses: [],
+  registered_relay_count: 0,
+  configured_relay_count: 0,
+  active_relay_urls: [],
+  registered_relay_urls: [],
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -102,6 +124,30 @@ function formatErrorMessage(error: unknown): string {
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
+}
+
+function stringArrayFromPayload(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function relayStatusesFromPayload(value: unknown): RelayStatus[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => item !== null && typeof item === 'object')
+    .map((item) => ({
+      relay_url: typeof item.relay_url === 'string' ? item.relay_url : 'unknown',
+      registered: typeof item.registered === 'boolean' ? item.registered : false,
+      relay_runtime_state: typeof item.relay_runtime_state === 'string' ? item.relay_runtime_state : null,
+      last_error: typeof item.last_error === 'string' ? item.last_error : null,
+      last_seen: typeof item.last_seen === 'number' ? item.last_seen : null,
+      last_request_id: typeof item.last_request_id === 'string' ? item.last_request_id : null,
+      request_count: typeof item.request_count === 'number' ? item.request_count : null,
+    }));
 }
 
 export function normalizeRelayUrls(
@@ -226,6 +272,10 @@ function mergeComputeStatusEvent(
   ) {
     return prev;
   }
+  const configuredRelayUrls = stringArrayFromPayload(payload.configured_relay_urls);
+  const relayStatuses = relayStatusesFromPayload(payload.relay_statuses);
+  const activeRelayUrls = stringArrayFromPayload(payload.active_relay_urls);
+  const registeredRelayUrls = stringArrayFromPayload(payload.registered_relay_urls);
 
   return {
     running:
@@ -310,6 +360,20 @@ function mergeComputeStatusEvent(
           : typeof payload.message === 'string'
             ? payload.message
             : prev.last_error,
+    configured_relay_urls: configuredRelayUrls ?? prev.configured_relay_urls,
+    relay_statuses: relayStatuses ?? prev.relay_statuses,
+    registered_relay_count:
+      typeof payload.registered_relay_count === 'number'
+        ? payload.registered_relay_count
+        : payload.type === 'error'
+          ? 0
+          : prev.registered_relay_count,
+    configured_relay_count:
+      typeof payload.configured_relay_count === 'number'
+        ? payload.configured_relay_count
+        : prev.configured_relay_count,
+    active_relay_urls: activeRelayUrls ?? prev.active_relay_urls,
+    registered_relay_urls: registeredRelayUrls ?? prev.registered_relay_urls,
   };
 }
 
@@ -349,6 +413,15 @@ export function App() {
     relayRuntimeState === 'ready' ||
     relayRuntimeState === 'processing';
   const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
+  const relayStatuses = computeStatus.relay_statuses ?? [];
+  const configuredRelayUrlsForDisplay = normalizeRelayUrls(config.relay_base_urls, config.relay_base_url);
+  const configuredRelayCount = computeStatus.configured_relay_count || configuredRelayUrlsForDisplay.length;
+  const registeredRelayCount = computeNodeRegistered ? computeStatus.registered_relay_count || 1 : 0;
+  const registeredLabel = !computeNodeRegistered
+    ? `no (${registeredRelayCount}/${configuredRelayCount} relays)`
+    : registeredRelayCount >= configuredRelayCount
+      ? `yes (${registeredRelayCount}/${configuredRelayCount} relays)`
+      : `partial (${registeredRelayCount}/${configuredRelayCount} relays)`;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
@@ -558,6 +631,17 @@ export function App() {
         model_path: config.model_path,
         last_error: null,
         log_file_path: null,
+        configured_relay_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
+        relay_statuses: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).map((relayUrl) => ({
+          relay_url: relayUrl,
+          registered: false,
+          relay_runtime_state: 'starting',
+          last_error: null,
+        })),
+        registered_relay_count: 0,
+        configured_relay_count: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length,
+        active_relay_urls: [],
+        registered_relay_urls: [],
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -764,12 +848,26 @@ export function App() {
           </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeNodeRegistered ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Registered: <strong>{registeredLabel}</strong></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{displayStatusValue(computeStatus.active_relay_url, primaryRelayUrl(config))}</code></p>
-        <p style={{ marginBottom: 0 }}>Configured relay URLs: <code>{normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).join(', ')}</code></p>
+        <p style={{ marginBottom: 0 }}>Configured relay URLs: <code>{configuredRelayUrlsForDisplay.join(', ')}</code></p>
+        {relayStatuses.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <strong>Relay statuses</strong>
+            <ul style={{ marginTop: 4, paddingLeft: 20 }}>
+              {relayStatuses.map((relayStatus) => (
+                <li key={relayStatus.relay_url}>
+                  <code>{relayStatus.relay_url}</code>: {relayStatus.registered ? 'registered' : 'not registered'}
+                  {' '}(<code>{relayStatus.relay_runtime_state || 'pending'}</code>)
+                  {relayStatus.last_error ? ` — ${relayStatus.last_error}` : ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{displayStatusValue(computeStatus.requested_mode, config.preferred_mode)}</code></p>
         <p style={{ marginBottom: 0 }}>Effective mode: <code>{displayStatusValue(computeStatus.effective_mode, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend available: <code>{displayStatusValue(computeStatus.backend_available, 'pending')}</code></p>

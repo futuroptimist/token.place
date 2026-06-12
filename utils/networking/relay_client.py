@@ -12,7 +12,7 @@ import os
 import hashlib
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
@@ -502,6 +502,7 @@ class RelayClient:
         model_manager,
         *,
         include_configured_servers: bool = True,
+        explicit_relay_urls: Optional[Sequence[str]] = None,
     ):
         """
         Initialize the RelayClient.
@@ -514,6 +515,8 @@ class RelayClient:
             model_manager: Instance of ModelManager for LLM interaction
             include_configured_servers: When True, include configured/env relay fallbacks
                 and relay cluster-only mode. When False, use only the explicit base relay.
+            explicit_relay_urls: Additional explicit relay URLs supplied by the desktop
+                start request. These are included even when configured fallbacks are disabled.
         """
         self.base_url = base_url
         self.port = port
@@ -603,6 +606,11 @@ class RelayClient:
             self._registration_token = _normalise_registration_token(
                 os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
             )
+
+        if explicit_relay_urls:
+            for entry in explicit_relay_urls:
+                if isinstance(entry, str) and entry.strip() and entry not in configured_servers:
+                    configured_servers.append(entry)
 
         self._relay_urls = self._build_relay_targets(
             base_url,

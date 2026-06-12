@@ -1376,6 +1376,71 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
     assert status == 0
     assert captured['config'].relay_url == 'http://127.0.0.1:5010'
     assert captured['config'].use_configured_relay_fallbacks is False
+    assert captured['config'].relay_urls == ('http://127.0.0.1:5010',)
+
+
+def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
+    _reset_cancel_queue()
+    captured = {}
+
+    class CapturingRuntime:
+        def __init__(self, config):
+            captured['config'] = config
+            self.model_manager = FakeModelManager()
+            self.relay_client = SimpleNamespace(relay_url=config.relay_url)
+
+        def ensure_model_ready(self):
+            return True
+
+        def ensure_api_v1_runtime_ready(self):
+            return self.ensure_model_ready()
+
+        def register_and_poll_once(self):
+            return {'next_ping_in_x_seconds': 0}
+
+        def process_relay_request(self, _payload):
+            return True
+
+        def stop(self):
+            return None
+
+    module = ModuleType('utils.compute_node_runtime')
+    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
+        relay_url=relay_url,
+        relay_port=relay_port,
+        **kwargs,
+    )
+    module.ComputeNodeRuntime = CapturingRuntime
+    module.is_api_v1_relay_payload = lambda _payload: False
+    module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url.strip()
+    module.normalize_compute_mode = lambda mode: mode
+    module.apply_compute_mode = lambda _model_manager, mode: mode
+    module.SUPPORTED_COMPUTE_MODES = {'auto', 'cpu', 'cuda', 'metal'}
+    module.compute_mode_diagnostics = lambda _model_manager: {}
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url=[
+            ' http://127.0.0.1:5010 ',
+            'https://staging.token.place',
+            'https://staging.token.place',
+        ],
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert captured['config'].relay_url == 'http://127.0.0.1:5010'
+    assert captured['config'].use_configured_relay_fallbacks is False
+    assert captured['config'].relay_urls == (
+        'http://127.0.0.1:5010',
+        'https://staging.token.place',
+    )
 
 
 def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):

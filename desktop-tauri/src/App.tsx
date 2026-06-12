@@ -23,11 +23,11 @@ interface DesktopConfig {
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
 export const MAX_RELAY_BASE_URLS = 10;
 
-type PartialDesktopConfig = Partial<DesktopConfig> & {
-  model_path?: string;
-  relay_base_url?: string;
+type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'relay_base_url' | 'relay_base_urls' | 'preferred_mode'> & {
+  model_path?: unknown;
+  relay_base_url?: unknown;
   relay_base_urls?: unknown;
-  preferred_mode?: BackendMode;
+  preferred_mode?: unknown;
 };
 
 interface ComputeNodeStatus {
@@ -134,13 +134,23 @@ export function normalizeRelayUrls(
   return normalized;
 }
 
+function normalizeBackendMode(preferredMode: unknown): BackendMode {
+  return preferredMode === 'cpu' ||
+    preferredMode === 'gpu' ||
+    preferredMode === 'hybrid' ||
+    preferredMode === 'auto'
+    ? preferredMode
+    : 'auto';
+}
+
 export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopConfig {
-  const relayBaseUrls = normalizeRelayUrls(config.relay_base_urls, config.relay_base_url);
+  const legacyRelayBaseUrl = typeof config.relay_base_url === 'string' ? config.relay_base_url : '';
+  const relayBaseUrls = normalizeRelayUrls(config.relay_base_urls, legacyRelayBaseUrl);
   return {
     model_path: typeof config.model_path === 'string' ? config.model_path : '',
     relay_base_url: relayBaseUrls[0] || DEFAULT_RELAY_BASE_URL,
     relay_base_urls: relayBaseUrls,
-    preferred_mode: config.preferred_mode ?? 'auto',
+    preferred_mode: normalizeBackendMode(config.preferred_mode),
   };
 }
 

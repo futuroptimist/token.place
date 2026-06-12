@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_RELAY_BASE_URL: &str = "https://token.place";
 pub const MAX_RELAY_BASE_URLS: usize = 10;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopConfig {
     #[serde(default)]
     pub model_path: String,

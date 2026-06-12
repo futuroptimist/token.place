@@ -266,20 +266,30 @@ fn detect_backend() -> BackendInfo {
     detect_backend_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
+fn load_config_from_path(path: &std::path::Path) -> Result<DesktopConfig, String> {
+    if !path.exists() {
+        return Ok(DesktopConfig::default());
+    }
+
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str::<DesktopConfig>(&raw).map_err(|e| e.to_string())?;
+    let normalized = parsed.clone().normalized();
+
+    if parsed != normalized {
+        let migrated = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+        fs::write(path, migrated).map_err(|e| e.to_string())?;
+    }
+
+    Ok(normalized)
+}
+
 #[tauri::command]
 fn load_config(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
 ) -> Result<DesktopConfig, String> {
     let dir = resolve_config_dir(&app, &state).map_err(|e| e.to_string())?;
-    let path = config_path(&dir);
-    if !path.exists() {
-        return Ok(DesktopConfig::default());
-    }
-    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str::<DesktopConfig>(&raw)
-        .map(DesktopConfig::normalized)
-        .map_err(|e| e.to_string())
+    load_config_from_path(&config_path(&dir))
 }
 
 #[tauri::command]
@@ -490,6 +500,30 @@ mod tests {
             .find_map(|(env_key, value)| (env_key == key).then_some(value))
             .flatten()
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn load_config_from_path_persists_normalized_legacy_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = config_path(temp.path());
+        std::fs::write(
+            &path,
+            r#"{
+                "model_path": "/tmp/model.gguf",
+                "relay_base_url": " https://staging.token.place ",
+                "preferred_mode": "auto"
+            }"#,
+        )
+        .expect("write legacy config");
+
+        let loaded = load_config_from_path(&path).expect("load config");
+        let persisted: DesktopConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read migrated config"))
+                .expect("parse migrated config");
+
+        assert_eq!(loaded.relay_base_url, "https://staging.token.place");
+        assert_eq!(loaded.relay_base_urls, vec!["https://staging.token.place"]);
+        assert_eq!(persisted, loaded);
     }
 
     #[test]

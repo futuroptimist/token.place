@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { App } from './App';
+import { App, normalizeDesktopConfig } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -75,6 +75,22 @@ describe('desktop app start failure handling', () => {
         });
       }
       return Promise.resolve(undefined);
+    });
+  });
+
+  it('normalizes untrusted relay URLs and preferred mode from persisted config', () => {
+    expect(
+      normalizeDesktopConfig({
+        model_path: 123,
+        relay_base_url: 42,
+        relay_base_urls: [' https://token.place ', 123, 'https://staging.token.place'],
+        preferred_mode: 'bogus',
+      })
+    ).toEqual({
+      model_path: '',
+      relay_base_url: 'https://token.place',
+      relay_base_urls: ['https://token.place', 'https://staging.token.place'],
+      preferred_mode: 'auto',
     });
   });
 

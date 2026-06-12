@@ -38,6 +38,18 @@ pub struct ComputeNodeStatus {
     pub running: bool,
     pub registered: bool,
     pub active_relay_url: String,
+    #[serde(default)]
+    pub configured_relay_urls: Vec<String>,
+    #[serde(default)]
+    pub relay_statuses: Vec<Value>,
+    #[serde(default)]
+    pub registered_relay_count: usize,
+    #[serde(default)]
+    pub configured_relay_count: usize,
+    #[serde(default)]
+    pub registered_relay_urls: Vec<String>,
+    #[serde(default)]
+    pub active_relay_urls: Vec<String>,
     pub requested_mode: String,
     pub effective_mode: String,
     pub backend_available: String,
@@ -227,6 +239,12 @@ fn startup_failure_status(
             .first()
             .cloned()
             .unwrap_or_else(|| request.relay_base_url.clone()),
+        configured_relay_urls: normalized_request_relay_urls(request),
+        relay_statuses: Vec::new(),
+        registered_relay_count: 0,
+        configured_relay_count: normalized_request_relay_urls(request).len(),
+        registered_relay_urls: Vec::new(),
+        active_relay_urls: Vec::new(),
         requested_mode: format!("{:?}", request.mode).to_lowercase(),
         effective_mode: "cpu".into(),
         backend_available: "unknown".into(),
@@ -276,6 +294,48 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(active_relay_url) = payload.get("active_relay_url").and_then(Value::as_str) {
         status.active_relay_url = active_relay_url.into();
+    }
+    if let Some(configured_relay_urls) = payload
+        .get("configured_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.configured_relay_urls = configured_relay_urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(relay_statuses) = payload.get("relay_statuses").and_then(Value::as_array) {
+        status.relay_statuses = relay_statuses.clone();
+    }
+    if let Some(count) = payload
+        .get("registered_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.registered_relay_count = count as usize;
+    }
+    if let Some(count) = payload
+        .get("configured_relay_count")
+        .and_then(Value::as_u64)
+    {
+        status.configured_relay_count = count as usize;
+    }
+    if let Some(urls) = payload
+        .get("registered_relay_urls")
+        .and_then(Value::as_array)
+    {
+        status.registered_relay_urls = urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    if let Some(urls) = payload.get("active_relay_urls").and_then(Value::as_array) {
+        status.active_relay_urls = urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
     }
     if let Some(requested_mode) = payload.get("requested_mode").and_then(Value::as_str) {
         status.requested_mode = requested_mode.into();
@@ -1083,6 +1143,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         status.running = false;
         status.registered = false;
         status.relay_runtime_state = Some("stopped".into());
+        status.registered_relay_count = 0;
+        status.registered_relay_urls.clear();
+        status.active_relay_urls.clear();
         status.last_error = None;
         status.updated_at_ms = Some(current_time_ms());
     }

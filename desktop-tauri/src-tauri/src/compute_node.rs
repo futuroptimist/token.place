@@ -27,6 +27,8 @@ use tokio::sync::Mutex;
 pub struct ComputeNodeRequest {
     pub model_path: String,
     pub relay_base_url: String,
+    #[serde(default)]
+    pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
 }
 
@@ -1615,6 +1617,7 @@ mod tests {
         let request = ComputeNodeRequest {
             model_path: "model.gguf".into(),
             relay_base_url: "https://relay.example".into(),
+            relay_base_urls: vec!["https://relay.example".into()],
             mode: ComputeMode::Cpu,
         };
         let status = startup_failure_status(
@@ -1793,6 +1796,7 @@ mod tests {
         let request = ComputeNodeRequest {
             model_path: "model.gguf".into(),
             relay_base_url: "https://relay.example".into(),
+            relay_base_urls: vec!["https://relay.example".into()],
             mode: ComputeMode::Auto,
         };
 

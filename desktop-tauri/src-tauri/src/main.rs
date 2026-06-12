@@ -11,7 +11,7 @@ mod subprocess_logging;
 
 use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
-use config::{config_path, DesktopConfig};
+use config::{config_path, normalize_desktop_config, DesktopConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sidecar::{InferenceRequest, SidecarState};
@@ -277,7 +277,8 @@ fn load_config(
         return Ok(DesktopConfig::default());
     }
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| e.to_string())
+    let config: DesktopConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(normalize_desktop_config(config))
 }
 
 #[tauri::command]
@@ -288,6 +289,7 @@ fn save_config(
 ) -> Result<(), String> {
     let dir = resolve_config_dir(&app, &state).map_err(|e| e.to_string())?;
     let path = config_path(&dir);
+    let config = normalize_desktop_config(config);
     let raw = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(path, raw).map_err(|e| e.to_string())
 }

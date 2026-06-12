@@ -106,13 +106,9 @@ jobs:
     env:
       TEST_COVERAGE: '1'
       TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
-      # Build llama_cpp_python from source with Metal enabled while avoiding
-      # Apple clang's fragile native CPU feature probe on macos-latest arm64.
-      CMAKE_ARGS: >-
-        -DGGML_METAL=on
-        -DGGML_NATIVE=off
-        -DCMAKE_OSX_ARCHITECTURES=arm64
-        -DCMAKE_APPLE_SILICON_PROCESSOR=arm64
+      # Build llama_cpp_python from source with Metal enabled. CMAKE_ARGS is
+      # written after checkout from the actual runner architecture so macos-latest
+      # works on both Intel and Apple Silicon hosts.
       FORCE_CMAKE: '1'
     steps:
       - uses: actions/checkout@v4
@@ -130,6 +126,17 @@ jobs:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: package-lock.json
+
+      - name: Configure macOS Metal llama-cpp build
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off -DCMAKE_OSX_ARCHITECTURES=${arch}"
+          if [ "$arch" = "arm64" ]; then
+            cmake_args="${cmake_args} -DCMAKE_APPLE_SILICON_PROCESSOR=arm64"
+          fi
+          echo "CMAKE_ARGS=${cmake_args}" >> "$GITHUB_ENV"
+          echo "Configured macOS llama-cpp build for ${arch}: ${cmake_args}"
 
       - name: Validate dependency compatibility
         run: python scripts/validate_dependencies.py

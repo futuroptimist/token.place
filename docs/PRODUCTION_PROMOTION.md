@@ -1,4 +1,4 @@
-# token.place production promotion checklist
+# token.place staging-to-production promotion checklist
 
 Use this checklist for every relay promotion from staging to production. It is intentionally
 repeatable and focused on the release risks that have regressed before: API v1 model identity,
@@ -11,8 +11,7 @@ version, digest, and smoke-test evidence.
 
 - Promote only an already-verified staging artifact. Do not rebuild between staging sign-off and
   production unless the new artifact repeats this checklist from the beginning.
-- Keep API v1 as the active runtime target; it is non-streaming by design for the current relay
-  architecture.
+- Keep API v1 as the only active runtime target for the current 0.1.x release line; it is non-streaming by design.
 - Keep relay-owned state, logs, diagnostics, and payloads ciphertext-only plus safe routing metadata.
   Never capture or paste plaintext prompts, messages, responses, tool arguments, or model output.
 - Use synthetic smoke prompts only; do not send sensitive, customer, or private content.

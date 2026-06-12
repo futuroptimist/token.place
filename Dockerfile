@@ -21,7 +21,7 @@ COPY --chown=relay:relay api /app/api
 COPY --chown=relay:relay config /app/config
 COPY --chown=relay:relay utils /app/utils
 COPY --chown=relay:relay static /app/static
-COPY --chown=relay:relay relay.py config.py encrypt.py /app/
+COPY --chown=relay:relay relay.py config.py encrypt.py release_metadata.py /app/
 COPY --chown=relay:relay docker/relay/entrypoint.sh /usr/local/bin/relay-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/relay-entrypoint.sh

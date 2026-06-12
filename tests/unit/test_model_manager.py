@@ -2489,10 +2489,11 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
+    stop_stdout = threading.Event()
+
     class HangingStdout:
         def __iter__(self):
-            while True:
-                time.sleep(1)
+            while not stop_stdout.wait(1):
                 yield ''
 
     class FakeStdin:
@@ -2512,12 +2513,14 @@ def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
 
         def terminate(self):
             self.terminated = True
+            stop_stdout.set()
 
         def wait(self, timeout=None):
             raise TimeoutError('still hung')
 
         def kill(self):
             self.killed = True
+            stop_stdout.set()
 
         def poll(self):
             return None

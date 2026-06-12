@@ -268,6 +268,32 @@ def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
         ), f"{job_name} must pin push checkouts to the triggering commit"
 
 
+def test_canonical_chart_sets_release_metadata_env_defaults() -> None:
+    chart = yaml.safe_load(
+        Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8")
+    )
+    values = yaml.safe_load(
+        Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
+    )
+    deployment = Path("charts/tokenplace/templates/deployment.yaml").read_text(encoding="utf-8")
+
+    assert chart["appVersion"] == "0.1.1"
+    assert "deployEnv" in values
+    assert '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)' in deployment
+    assert '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)' in deployment
+    assert '"TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)' in deployment
+    assert 'and (not $deployEnv) .Values.ingress.host' in deployment
+    assert 'and (not $deployEnv) .Values.ingress.enabled .Values.ingress.host' not in deployment
+    assert 'eq .Values.ingress.host "token.place"' in deployment
+    assert 'eq .Values.ingress.host "staging.token.place"' in deployment
+
+
+def test_canonical_relay_image_copies_release_metadata_module() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert "release_metadata.py /app/" in dockerfile
+
+
 def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
     chart = yaml.safe_load(
         Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8")
@@ -405,19 +431,27 @@ def test_macos_run_all_tests_pr_job_uses_python_312_and_node_20() -> None:
 def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None:
     macos_job = _run_all_tests_jobs()["macos-run-all-tests"]
     env = macos_job.get("env", {})
+    step_runs = _step_runs(macos_job)
 
     assert env.get("FORCE_CMAKE") == "1"
-    cmake_args = str(env.get("CMAKE_ARGS", ""))
-    assert "-DGGML_METAL=on" in cmake_args, (
-        "macOS Apple Silicon CI must build llama_cpp_python with Metal enabled "
-        "so GPU-capable desktop modes do not silently fall back to CPU."
+    assert "CMAKE_ARGS" not in env, (
+        "macos-latest may run on Intel or Apple Silicon; CMAKE_ARGS must be "
+        "derived from uname -m instead of hard-coding an arm64 cross-build."
     )
-    assert "-DGGML_NATIVE=off" in cmake_args, (
-        "macos-latest arm64 runners must disable fragile native CPU feature "
-        "probing so dependency validation does not fail before run_all_tests.sh."
+    assert "Configure macOS Metal llama-cpp build" in str(macos_job), (
+        "macOS CI must configure llama_cpp_python before installing Python dependencies."
     )
-    assert "-DCMAKE_OSX_ARCHITECTURES=arm64" in cmake_args
-    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in cmake_args
+    assert "-DGGML_METAL=on" in step_runs, (
+        "macOS CI must build llama_cpp_python with Metal enabled so "
+        "GPU-capable desktop modes do not silently fall back to CPU."
+    )
+    assert "-DGGML_NATIVE=off" in step_runs, (
+        "macos-latest runners must disable fragile native CPU feature probing "
+        "so dependency validation does not fail before run_all_tests.sh."
+    )
+    assert "-DCMAKE_OSX_ARCHITECTURES=${arch}" in step_runs
+    assert "uname -m" in step_runs
+    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in step_runs
 
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:

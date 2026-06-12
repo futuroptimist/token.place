@@ -100,3 +100,36 @@ def test_production_served_html_excludes_dev_vue_paths(monkeypatch):
         assert response.status_code == 200
         assert "dist/vue.js" not in body
         assert relay.VUE_SCRIPT_PLACEHOLDER not in body
+
+
+def test_render_index_html_injects_release_badge_metadata(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "v0.1.1")
+    monkeypatch.delenv("TOKENPLACE_DEPLOY_ENV", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_ENV", raising=False)
+
+    html = relay._render_index_html("token.place")
+
+    assert 'data-testid="release-badge"' in html
+    assert 'prod v0.1.1' in html
+    assert relay.RELEASE_METADATA_PLACEHOLDER not in html
+    assert relay.RELEASE_BADGE_TEXT_PLACEHOLDER not in html
+
+
+def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "v0.1.1")
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_OPERATOR_TOKEN", "do-not-leak")
+
+    with relay.app.test_client() as client:
+        meta_response = client.get("/api/v1/meta", headers={"Host": "token.place"})
+        version_response = client.get("/api/v1/version", headers={"Host": "token.place"})
+
+    assert meta_response.status_code == 200
+    assert version_response.status_code == 200
+    assert version_response.get_json() == meta_response.get_json()
+    body = meta_response.get_json()
+    assert body["environment"] == "staging"
+    assert body["version"] == "v0.1.1"
+    assert body["label"] == "staging v0.1.1"
+    assert "do-not-leak" not in meta_response.get_data(as_text=True)
+    assert "do-not-leak" not in version_response.get_data(as_text=True)

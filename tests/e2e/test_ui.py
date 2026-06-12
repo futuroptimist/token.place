@@ -239,6 +239,31 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     print(f"✓ Found {len(headings)} headings on the page")
 
 
+def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup_servers):
+    """Landing page should render release/env metadata without waiting on API calls."""
+    metadata_api_calls = []
+
+    def reject_metadata_api(route):
+        metadata_api_calls.append(route.request.url)
+        route.fulfill(status=500, body="release metadata should be embedded")
+
+    page.route("**/api/v1/meta", reject_metadata_api)
+    page.route("**/api/v1/version", reject_metadata_api)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    badge = page.get_by_test_id("release-badge")
+    badge.wait_for(state="visible")
+    badge_label = badge.inner_text().strip()
+    assert badge_label
+    metadata_text = page.locator("#tokenplace-release-metadata").text_content()
+    assert metadata_text is not None
+    metadata = json.loads(metadata_text)
+    assert set(metadata) <= {"environment", "version", "label", "ref"}
+    assert metadata["label"] == badge_label
+    assert metadata_api_calls == []
+
+
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""
     counts = iter([3, 5])

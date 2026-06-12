@@ -116,20 +116,21 @@ Production rule:
 
 Quick validation after the skips are active:
 
-```bash
-curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
-  -H 'Content-Type: application/json' \
-  --data '{}'
+Validate both `https://staging.token.place/api/v1/relay/servers/register` and
+`https://token.place/api/v1/relay/servers/register`:
 
-curl -i -X POST https://token.place/api/v1/relay/servers/register \
-  -H 'Content-Type: application/json' \
-  --data '{}'
+```bash
+for HOST in staging.token.place token.place; do
+  curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+    -H 'Content-Type: application/json' \
+    --data '{}'
+done
 ```
 
 Expected result for each environment: not a Cloudflare `403 error code: 1010`. Any relay-owned
 app response is acceptable, including `401 Missing or invalid relay server token` when
-`SERVER_REGISTRATION_TOKENS` are configured or a `400` validation error for the intentionally
-invalid `{}` payload.
+`SERVER_REGISTRATION_TOKENS` are configured or a `400` response because the `{}` payload is
+intentionally invalid.
 
 ## Staging deploy path
 

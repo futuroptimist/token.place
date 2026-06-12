@@ -84,20 +84,21 @@ posture for the landing page and all other paths.
 
 Quick validation for both environments:
 
-```bash
-curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
-  -H 'Content-Type: application/json' \
-  --data '{}'
+Validate both `https://staging.token.place/api/v1/relay/servers/register` and
+`https://token.place/api/v1/relay/servers/register`:
 
-curl -i -X POST https://token.place/api/v1/relay/servers/register \
-  -H 'Content-Type: application/json' \
-  --data '{}'
+```bash
+for HOST in staging.token.place token.place; do
+  curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+    -H 'Content-Type: application/json' \
+    --data '{}'
+done
 ```
 
 Expected result after each Cloudflare skip: the response is not a Cloudflare `403 error code: 1010`.
 Any relay-owned app response is acceptable, including `401 Missing or invalid relay server token`
-when `SERVER_REGISTRATION_TOKENS` are configured or a `400` validation error for the intentionally
-invalid `{}` payload.
+when `SERVER_REGISTRATION_TOKENS` are configured or a `400` response because the `{}` payload is
+intentionally invalid.
 
 ## Tag verification
 
@@ -105,15 +106,21 @@ For releases with Git tags, maintainers should verify the remote tags and local 
 before promotion:
 
 ```bash
+RELEASE_TAG=vX.Y.Z
+DESKTOP_TAG=desktop-${RELEASE_TAG}
 git fetch --tags origin
-git ls-remote --tags origin 'refs/tags/vX.Y.Z^{}' 'refs/tags/desktop-vX.Y.Z^{}'
-git rev-parse vX.Y.Z^{commit} desktop-vX.Y.Z^{commit}
+git ls-remote --tags origin \
+  "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}" \
+  "refs/tags/${DESKTOP_TAG}" "refs/tags/${DESKTOP_TAG}^{}"
+git rev-parse "${RELEASE_TAG}^{commit}" "${DESKTOP_TAG}^{commit}"
 ```
 
-Use the peeled commit refs above so annotated tags resolve to their target commits instead of tag
-object IDs. If the relay and desktop tags point to different commits, do not rewrite tags in the
-promotion process. Record the actual commits in the release notes and ask maintainers to review the
-mismatch.
+Compare the local `^{commit}` results when checking release/desktop commit equality; the peeled
+remote `^{}` refs are supporting evidence that annotated tags resolve to those same target commits
+instead of tag object IDs. If the relay and desktop tags point to different commits, do not rewrite
+tags in the promotion process. Record the actual commits in the release notes and ask maintainers to
+review the mismatch. If a release has no desktop artifact or desktop tag, record that fact and skip
+the desktop-tag comparison instead of failing the whole checklist.
 
 ## Staging smoke checklist
 

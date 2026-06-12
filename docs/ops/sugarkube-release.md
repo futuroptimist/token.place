@@ -114,16 +114,22 @@ Production rule:
 - WAF component skipped: `Browser Integrity Check`
 - Log matching requests: enabled
 
-Quick production validation after the skip is active:
+Quick validation after the skips are active:
 
 ```bash
+curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+
 curl -i -X POST https://token.place/api/v1/relay/servers/register \
   -H 'Content-Type: application/json' \
   --data '{}'
 ```
 
-Expected result: not a Cloudflare `403 error code: 1010`. An app-level validation error is
-acceptable because `{}` is intentionally invalid.
+Expected result for each environment: not a Cloudflare `403 error code: 1010`. Any relay-owned
+app response is acceptable, including `401 Missing or invalid relay server token` when
+`SERVER_REGISTRATION_TOKENS` are configured or a `400` validation error for the intentionally
+invalid `{}` payload.
 
 ## Staging deploy path
 

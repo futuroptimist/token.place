@@ -82,16 +82,22 @@ Production rule:
 This keeps the skip restricted to `/api/v1/relay/` while preserving the normal browser security
 posture for the landing page and all other paths.
 
-Quick production validation:
+Quick validation for both environments:
 
 ```bash
+curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+
 curl -i -X POST https://token.place/api/v1/relay/servers/register \
   -H 'Content-Type: application/json' \
   --data '{}'
 ```
 
-Expected result after the Cloudflare skip: the response is not a Cloudflare `403 error code: 1010`.
-An app-level validation error is acceptable because `{}` is intentionally invalid.
+Expected result after each Cloudflare skip: the response is not a Cloudflare `403 error code: 1010`.
+Any relay-owned app response is acceptable, including `401 Missing or invalid relay server token`
+when `SERVER_REGISTRATION_TOKENS` are configured or a `400` validation error for the intentionally
+invalid `{}` payload.
 
 ## Tag verification
 
@@ -100,12 +106,14 @@ before promotion:
 
 ```bash
 git fetch --tags origin
-git ls-remote --tags origin vX.Y.Z desktop-vX.Y.Z
-git rev-parse vX.Y.Z desktop-vX.Y.Z
+git ls-remote --tags origin 'refs/tags/vX.Y.Z^{}' 'refs/tags/desktop-vX.Y.Z^{}'
+git rev-parse vX.Y.Z^{commit} desktop-vX.Y.Z^{commit}
 ```
 
-If the relay and desktop tags point to different commits, do not rewrite tags in the promotion
-process. Record the actual commits in the release notes and ask maintainers to review the mismatch.
+Use the peeled commit refs above so annotated tags resolve to their target commits instead of tag
+object IDs. If the relay and desktop tags point to different commits, do not rewrite tags in the
+promotion process. Record the actual commits in the release notes and ask maintainers to review the
+mismatch.
 
 ## Staging smoke checklist
 

@@ -470,8 +470,8 @@
             aria-live="polite"
             v-cloak
         >
-            <span><strong>{{ computeNodeCountLabel }}</strong></span>
-            <small v-if="computeNodeCountLastUpdated">Updated {{ computeNodeCountLastUpdated }}</small>
+            <span><strong v-if="computeNodeCountLabel" v-text="computeNodeCountLabel"></strong></span>
+            <small v-if="computeNodeCountLastUpdatedLabel" v-text="computeNodeCountLastUpdatedLabel"></small>
         </div>
         <div class="chat-container" v-cloak>
             <div class="model-selector-container">
@@ -484,21 +484,21 @@
                     data-testid="landing-model-select"
                     :disabled="modelsLoading || (!modelsError && availableModels.length === 0)"
                 >
-                    <option v-if="modelsError" :value="selectedModelId">{{ selectedModelId }} (emergency fallback)</option>
+                    <option v-if="modelsError" :value="selectedModelId" v-text="`${selectedModelId} (emergency fallback)`"></option>
                     <option v-else-if="availableModels.length === 0" value="">No API v1 models available</option>
-                    <option v-for="model in availableModels" :key="model.id" :value="model.id">{{ model.id }}</option>
+                    <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
                 </select>
                 <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>
-                <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
+                <p v-else-if="modelsError" class="model-status model-error" v-text="modelsError"></p>
             </div>
-            <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label">{{ selectedServerKeyLabel }}</p>
+            <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div
                 v-if="selectedServerTerminalFailure"
                 class="selected-server-failure"
                 data-testid="landing-selected-server-failure"
                 role="alert"
             >
-                <div>{{ selectedServerTerminalFailure }}</div>
+                <div v-text="selectedServerTerminalFailure"></div>
                 <button
                     type="button"
                     class="retry-chat-button"

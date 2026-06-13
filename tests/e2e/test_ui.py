@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+from pathlib import Path
 import pytest
 import queue
 import re
@@ -262,6 +263,49 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert set(metadata) <= {"environment", "version", "label", "ref"}
     assert metadata["label"] == badge_label
     assert metadata_api_calls == []
+
+
+def test_landing_page_source_has_no_raw_vue_mustache_interpolation():
+    """Visible landing HTML should not ship raw Vue mustache text nodes."""
+    html = Path("static/index.html").read_text(encoding="utf-8")
+
+    assert re.search(r"{{\s*[A-Za-z_$][^}]*}}", html) is None
+
+
+def test_landing_first_paint_hides_vue_variables_before_chat_js(
+    page: Page, base_url: str, setup_servers
+):
+    """Raw Vue bindings must not be visible while the landing app is still hydrating."""
+    held_chat_js_route = {}
+    chat_js_seen = threading.Event()
+
+    def hold_chat_js(route):
+        held_chat_js_route["route"] = route
+        chat_js_seen.set()
+
+    page.route("**/static/chat.js", hold_chat_js)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert chat_js_seen.wait(timeout=5), "chat.js request was not intercepted"
+
+    body_text = page.locator("body").inner_text()
+    forbidden_fragments = [
+        "{{",
+        "}}",
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdated",
+        "selectedModelId",
+        "model.id",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
+    ]
+    for fragment in forbidden_fragments:
+        assert fragment not in body_text
+
+    status_text = page.locator(".compute-node-status").inner_text()
+    assert "Updated" not in status_text
+    assert "Live compute nodes: loading…" not in status_text
+
+    held_chat_js_route["route"].abort()
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

@@ -16,6 +16,13 @@ def test_chat_js_defines_touch_detection_hook():
     assert "detectTouchInput" in chat_js, "chat.js must implement touch detection helper"
 
 
+def test_landing_page_visible_html_avoids_raw_vue_mustache_interpolation():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert not re.search(r"{{\s*[A-Za-z_$][^}]*}}", index_html), (
+        "landing page must not ship user-visible raw Vue mustache text that can flash before hydration"
+    )
+
+
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "/api/v1/relay/servers/next" in chat_js, (

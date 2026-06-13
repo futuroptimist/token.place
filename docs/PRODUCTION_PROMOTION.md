@@ -16,7 +16,7 @@ version, digest, and smoke-test evidence.
   Never capture or paste plaintext prompts, messages, responses, tool arguments, or model output.
 - Use synthetic smoke prompts only; do not send sensitive, customer, or private content.
 - Record exact artifact identifiers, environment URLs, command output summaries, Cloudflare rule
-  evidence, and rollback steps in the release notes or promotion issue.
+  evidence, desktop multi-relay results, and rollback steps in the release notes or promotion issue.
 
 ## Environment guardrails
 
@@ -38,6 +38,21 @@ hostname
 kubectl get nodes -o wide
 kubectl -n cloudflare get deploy,pod -l app.kubernetes.io/name=cloudflare-tunnel
 ```
+
+
+## Version and chart metadata
+
+For every release, record both application version metadata and deploy-package metadata. These values
+may intentionally differ:
+
+- Chart `appVersion` is the token.place application/release version shown by public release metadata
+  endpoints and the landing-page badge. For v0.1.1 this is `0.1.1`.
+- Chart `version` is the immutable Helm/OCI deployment package version. If chart source changes after
+  an app release version is chosen, the chart package version must be bumped instead of overwriting an
+  existing OCI chart package. For v0.1.1 deployments, chart `version` may be `0.1.2` while
+  `appVersion` remains `0.1.1`.
+- Do not bump the app or desktop version just to satisfy Helm chart immutability; bump only the chart
+  package version when chart files changed and CI requires a new package.
 
 ## Pre-promotion gates
 
@@ -170,6 +185,34 @@ promotion complete:
       are still present after rollout.
 - [ ] Rollback remains available until the production smoke window is complete.
 
+
+## Multi-relay desktop validation
+
+For v0.1.x, one desktop compute node can serve both production and staging because API v1 exposes a
+single model, `llama-3.1-8b-instruct`, and the desktop runtime reuses one warmed llama.cpp runtime
+while polling each configured relay. Validate simultaneous prod+staging registration before closing
+the release:
+
+- [ ] Build and install desktop on Windows and macOS release targets.
+- [ ] Configure exactly these relay URLs in the desktop Compute node operator panel:
+      `https://token.place` and `https://staging.token.place`.
+- [ ] Confirm relay URL fields are stopped-only: start the operator, verify editing is disabled, and
+      stop the operator before making changes that apply on the next start.
+- [ ] Start one desktop operator and confirm the desktop status shows registered `2/2` (or an
+      equivalent registered count where both configured relays are healthy).
+- [ ] Confirm `https://token.place/relay/diagnostics` reports the node by incrementing
+      `total_api_v1_registered_compute_nodes`.
+- [ ] Confirm `https://staging.token.place/relay/diagnostics` reports the same operator by
+      incrementing `total_api_v1_registered_compute_nodes`.
+- [ ] Send one landing chat through production and one landing chat through staging.
+- [ ] If practical, stop one relay or block one route and confirm partial failure does not kill the
+      other relay registration/poll loop; the healthy relay should continue serving work and status
+      should show the remaining registered count.
+- [ ] Stop the operator and verify both relay registrations unregister or expire from diagnostics.
+- [ ] Confirm relay logs remain relay-blind: ciphertext only plus safe routing metadata, with no
+      plaintext prompts, messages, responses, tool arguments, model output, private keys, or full
+      public keys.
+
 ## Optional JSON endpoint smoke helper
 
 `scripts/promotion_smoke.py` provides a small offline-testable harness for the JSON endpoint portion
@@ -201,6 +244,20 @@ The helper checks only safe JSON endpoints:
 - `/healthz`
 - `/relay/diagnostics`
 - `/api/v1/models`
+
+If `TOKENPLACE_SMOKE_EXPECT_VERSION` or `TOKENPLACE_SMOKE_EXPECT_ENV` is set, the helper also checks
+`/api/v1/version` for public-safe release metadata without making those expectations mandatory in
+normal runs. Example:
+
+```bash
+RUN_PROMOTION_SMOKE=1 \
+TOKENPLACE_SMOKE_ENV=production \
+TOKENPLACE_SMOKE_ALLOW_PROD=1 \
+TOKENPLACE_SMOKE_BASE_URL=https://token.place \
+TOKENPLACE_SMOKE_EXPECT_VERSION=0.1.1 \
+TOKENPLACE_SMOKE_EXPECT_ENV=prod \
+python scripts/promotion_smoke.py
+```
 
 Browser-only checklist items such as dropdown count, missing owner text, no full public key in the
 DOM, no landing-chat `/api/v2` calls, no landing-chat `/api/v1/chat/completions` calls, sticky

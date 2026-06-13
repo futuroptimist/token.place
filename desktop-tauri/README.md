@@ -64,10 +64,43 @@ After a successful repair, the sidecar automatically re-execs once so the active
 ## Privacy defaults
 
 - Prompt/response plaintext stays in-memory by default.
-- The app only persists non-plaintext settings (model path, relay URL,
+- The app only persists non-plaintext settings (model path, relay URLs,
   preferred mode) in app-local config.
-- Relay URL defaults to `https://token.place` and remains user-editable.
+- Relay URLs default to `https://token.place`, remain user-editable while the operator is stopped,
+  and migrate automatically from the legacy single Relay URL config field.
 - Log lines are redacted to metadata (byte counts, request ids).
+
+
+## Multi-relay compute-node operation
+
+The Compute node operator panel supports multiple relay URLs for v0.1.x desktop nodes. Use this when
+one machine should serve both production and staging during release validation.
+
+1. Stop the operator before editing relay URLs. Relay URL fields are stopped-only, and changes apply
+   on the next Start operator action.
+2. Add one URL per field with **Add new relay URL**. Blank entries are ignored when saved or started.
+3. For prod+staging validation, configure:
+   - `https://token.place`
+   - `https://staging.token.place`
+4. Start the operator and wait for the shared llama.cpp runtime to warm. For v0.1.x, one node can
+   serve both prod and staging because API v1 exposes one model: `llama-3.1-8b-instruct`.
+5. Confirm status shows the configured relay URLs and a registered count such as `2/2` when both
+   relays accept registration. Status entries use relay labels/counts only; docs and examples must
+   not include full public keys.
+
+Partial failures are isolated per relay. If one relay URL is unreachable, unauthorized, or blocked by
+network policy, the other relay poll/register loop continues and the status count reflects only the
+healthy registrations. Fix the failed route, then restart if needed so the changed stopped-only relay
+configuration is applied cleanly.
+
+When the operator stops, desktop cancels polling and attempts to unregister from every configured
+relay. Operators should confirm each relay diagnostics page drops or expires the registration:
+
+- `https://token.place/relay/diagnostics`
+- `https://staging.token.place/relay/diagnostics`
+
+Relay and desktop logs must remain relay-blind: ciphertext only plus safe routing metadata, without
+plaintext prompts, responses, private keys, decrypted payloads, or full public keys.
 
 ## Cutting a desktop release
 

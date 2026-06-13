@@ -44,12 +44,24 @@ new Vue({
     computed: {
         computeNodeCountLabel() {
             if (this.computeNodeCountStatus === 'loading') {
-                return 'Live compute nodes: loading…';
+                return '';
             }
             if (this.computeNodeCountStatus === 'error') {
                 return 'Live compute nodes: unavailable';
             }
             return `Live compute nodes: ${this.computeNodeCount}`;
+        },
+        computeNodeCountLastUpdatedLabel() {
+            if (!this.computeNodeCountLastUpdated) {
+                return '';
+            }
+            return `Updated ${this.computeNodeCountLastUpdated}`;
+        },
+        selectedModelFallbackLabel() {
+            if (!this.selectedModelId) {
+                return '';
+            }
+            return `${this.selectedModelId} (emergency fallback)`;
         },
         selectedModel() {
             if (!Array.isArray(this.availableModels)) {

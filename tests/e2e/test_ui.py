@@ -264,6 +264,33 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
+def test_landing_first_paint_hides_vue_template_variables_when_chat_js_blocked(
+    page: Page, base_url: str, setup_servers
+):
+    """Initial HTML must not expose Vue template variables when hydration is delayed or blocked."""
+
+    page.route("**/static/chat.js", lambda route: route.abort())
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    body_text = page.locator("body").inner_text()
+    forbidden_fragments = [
+        "{{",
+        "}}",
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdated",
+        "selectedModelId",
+        "model.id",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
+    ]
+    for fragment in forbidden_fragments:
+        assert fragment not in body_text
+
+    status_text = page.locator(".compute-node-status").text_content() or ""
+    assert "Updated" not in status_text
+    assert "Live compute nodes: loading…" not in status_text
+
+
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""
     counts = iter([3, 5])

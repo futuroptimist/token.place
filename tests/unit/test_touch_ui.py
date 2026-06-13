@@ -10,6 +10,15 @@ def test_send_button_has_touch_optimized_binding():
     )
 
 
+def test_landing_page_uses_vue_bindings_instead_of_raw_mustache_text():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert not re.search(r"\{\{\s*[A-Za-z_$][^}]*\}\}", index_html), (
+        "landing page must not ship raw Vue mustache text nodes that can flash before hydration"
+    )
+    assert 'v-text="computeNodeCountLabel"' in index_html
+    assert 'v-text="computeNodeCountLastUpdatedLabel"' in index_html
+
+
 def test_chat_js_defines_touch_detection_hook():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "isTouchInput" in chat_js, "chat.js must expose touch detection state"

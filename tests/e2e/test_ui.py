@@ -264,6 +264,54 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
+def test_landing_source_has_no_raw_vue_text_interpolation():
+    """Landing HTML must not expose Vue mustaches before hydration."""
+    html = os.path.join(os.path.dirname(__file__), "..", "..", "static", "index.html")
+    with open(html, encoding="utf-8") as handle:
+        source = handle.read()
+
+    assert re.search(r"{{\s*[A-Za-z_$][^}]*}}", source) is None
+
+
+def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
+    page: Page, base_url: str, setup_servers
+):
+    """Initial paint should be safe even when Vue initialization is blocked."""
+    blocked_chat_js = {"called": False}
+
+    def block_chat_js(route):
+        blocked_chat_js["called"] = True
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/javascript"},
+            body="// chat.js intentionally blocked before Vue initializes",
+        )
+
+    page.route("**/static/chat.js", block_chat_js)
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    body_text = page.locator("body").inner_text()
+    forbidden_fragments = [
+        "{{",
+        "}}",
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdated",
+        "selectedModelId",
+        "model.id",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
+    ]
+    for fragment in forbidden_fragments:
+        assert fragment not in body_text
+
+    status_text = page.locator(".compute-node-status").inner_text().strip()
+    assert "Updated" not in status_text
+    assert "Live compute nodes: loading…" not in status_text
+    assert "Live compute nodes:" not in status_text
+
+    assert blocked_chat_js["called"], "expected chat.js to be blocked"
+
+
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
     """Landing page should render and refresh the relay diagnostics compute-node count."""
     counts = iter([3, 5])

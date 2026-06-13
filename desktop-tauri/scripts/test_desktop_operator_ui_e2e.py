@@ -554,12 +554,14 @@ def main() -> int:
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
 
         wait_for_running_stability(driver, "yes", stable_seconds=3.0)
-        wait.until(
-            lambda d: d.find_element(
-                By.XPATH,
-                "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
-            )
+        # Multi-relay UI labels registered operators as `yes (N/M relays)`.
+        # Treat any label beginning with `yes` as the ready state while
+        # preserving the existing single-relay `yes` match.
+        registered_ready_xpath = (
+            "//p[contains(.,'Registered:')]"
+            "//strong[starts-with(normalize-space(), 'yes')]"
         )
+        wait.until(lambda d: d.find_element(By.XPATH, registered_ready_xpath))
 
         prompt = driver.find_element(
             By.XPATH,

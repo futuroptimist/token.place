@@ -48,6 +48,7 @@ def _run_with_retries(
     attempts: int,
     retry_messages: tuple[str, ...],
     delay_seconds: float = 2.0,
+    max_delay_seconds: float = 15.0,
 ) -> str:
     last_result: subprocess.CompletedProcess[str] | None = None
     for attempt in range(1, attempts + 1):
@@ -61,11 +62,12 @@ def _run_with_retries(
         if not should_retry:
             break
 
+        retry_delay = min(delay_seconds * (2 ** (attempt - 1)), max_delay_seconds)
         print(
             f"::warning::Command {' '.join(cmd)} failed with a transient disk image error; "
-            f"retrying attempt {attempt + 1}/{attempts}."
+            f"retrying attempt {attempt + 1}/{attempts} after {retry_delay:g}s."
         )
-        time.sleep(delay_seconds)
+        time.sleep(retry_delay)
 
     if last_result is None:
         _fail(f"Command failed ({' '.join(cmd)}): no attempts were run")
@@ -94,7 +96,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
     with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:
         _run_with_retries(
             ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount_dir, str(dmg_path)],
-            attempts=4,
+            attempts=8,
             retry_messages=("Resource temporarily unavailable", "Resource busy"),
         )
         try:

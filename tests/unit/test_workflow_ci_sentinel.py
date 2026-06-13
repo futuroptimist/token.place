@@ -302,7 +302,7 @@ def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
 
-    assert chart["version"] == "0.1.1"
+    assert chart["version"] == "0.1.2"
     assert values["image"]["tag"] == "main-latest"
     assert values["image"]["pullPolicy"] == "Always"
 

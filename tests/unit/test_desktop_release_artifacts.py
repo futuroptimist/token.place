@@ -215,7 +215,7 @@ def test_validator_fails_after_transient_hdiutil_retry_budget(monkeypatch) -> No
         raise AssertionError('expected exhausted transient hdiutil failures to exit')
 
     assert len(calls) == 3
-    assert sleeps == [0.01, 0.01]
+    assert sleeps == [0.01, 0.02]
     assert 'Resource busy' in message
 
 
@@ -291,7 +291,7 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     assert attach_calls == [
         (
             ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            4,
+            8,
             ('Resource temporarily unavailable', 'Resource busy'),
         )
     ]

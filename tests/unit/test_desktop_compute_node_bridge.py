@@ -1503,16 +1503,25 @@ def test_run_multi_relay_status_reports_partial_success(capsys, monkeypatch):
             self.relay_client.stop()
             self.relay_client.unregister_from_relay()
 
+    PartialMultiRelayRuntime.instances = []
+    PartialMultiRelayRuntime.poll_started = []
     _install_fake_runtime_module(monkeypatch, runtime_cls=PartialMultiRelayRuntime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
 
-    def stop_after_both_polled():
-        return set(PartialMultiRelayRuntime.poll_started) >= {
+    stop_state = {'both_polled': False, 'count': 0}
+
+    def stop_after_partial_status_can_emit():
+        if set(PartialMultiRelayRuntime.poll_started) >= {
             'https://token.place',
             'https://staging.token.place',
-        }
+        }:
+            stop_state['both_polled'] = True
+        if not stop_state['both_polled']:
+            return False
+        stop_state['count'] += 1
+        return stop_state['count'] > 4
 
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_both_polled)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_partial_status_can_emit)
     args = SimpleNamespace(
         model='/tmp/model.gguf',
         mode='cpu',

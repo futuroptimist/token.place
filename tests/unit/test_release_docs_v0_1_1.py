@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 CHANGELOG = Path("CHANGELOG.md")
@@ -7,7 +8,19 @@ PROMOTION_DOC = Path("docs/PRODUCTION_PROMOTION.md")
 TESTING_DOC = Path("docs/TESTING.md")
 DESKTOP_README = Path("desktop-tauri/README.md")
 PARITY_CONTRACT = Path("docs/architecture/desktop_operator_parity_contract.md")
+DESKTOP_PARITY_CHECKLIST = Path("docs/desktop_parity_validation.md")
 RELEASE_DOC = Path("docs/releases/v0.1.1.md")
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _missing_required_phrases(text: str, required: tuple[str, ...]) -> list[str]:
+    normalized_text = _collapse_whitespace(text)
+    return [
+        item for item in required if _collapse_whitespace(item) not in normalized_text
+    ]
 
 
 def test_changelog_has_concise_v0_1_0_and_v0_1_1_sections() -> None:
@@ -47,7 +60,7 @@ def test_promotion_docs_include_multi_relay_and_chart_version_validation() -> No
         "Chart `version` is the immutable Helm/OCI deployment package version",
         "chart `version` may be `0.1.2` while\n  `appVersion` remains `0.1.1`",
     )
-    missing = [item for item in required if item not in text]
+    missing = _missing_required_phrases(text, required)
     assert not missing
 
 
@@ -75,7 +88,7 @@ def test_desktop_docs_explain_stopped_only_multi_relay_operation() -> None:
         "Partial failures are isolated per relay",
         "unregister from every configured\nrelay",
     )
-    missing = [item for item in required if item not in text]
+    missing = _missing_required_phrases(text, required)
     assert not missing
 
 
@@ -85,13 +98,32 @@ def test_multi_relay_docs_examples_avoid_full_public_keys() -> None:
         for path in (DESKTOP_README, PARITY_CONTRACT, PROMOTION_DOC, RELEASE_DOC)
     )
 
+    normalized_combined = _collapse_whitespace(combined)
     assert (
-        "must\n   not include full public keys" in combined
-        or "without exposing full public keys" in combined
+        _collapse_whitespace("must\n   not include full public keys")
+        in normalized_combined
+        or "without exposing full public keys" in normalized_combined
     )
     assert "full public keys" in combined
     assert "-----BEGIN PUBLIC KEY-----" not in combined
     assert "client_public_key" not in DESKTOP_README.read_text(encoding="utf-8")
+
+
+def test_shared_desktop_parity_checklist_includes_multi_relay_guardrails() -> None:
+    text = DESKTOP_PARITY_CHECKLIST.read_text(encoding="utf-8")
+
+    required = (
+        "Multi-relay prod+staging registration",
+        "https://token.place` and `https://staging.token.place",
+        "registered count such as `2/2`",
+        "Per-relay failure isolation",
+        "does not kill the other relay registration, polling loop",
+        "Stopped-only relay URL editing",
+        "Relay URL changes are blocked while the operator is running",
+        "Stop must unregister from every configured relay",
+    )
+    missing = _missing_required_phrases(text, required)
+    assert not missing
 
 
 def test_release_specific_evidence_doc_covers_v0_1_1_guardrails() -> None:
@@ -107,5 +139,5 @@ def test_release_specific_evidence_doc_covers_v0_1_1_guardrails() -> None:
         "registered `2/2`",
         "ciphertext only plus safe routing metadata",
     )
-    missing = [item for item in required if item not in text]
+    missing = _missing_required_phrases(text, required)
     assert not missing

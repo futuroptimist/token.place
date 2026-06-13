@@ -193,15 +193,25 @@ def validate_release_metadata(
     version = payload.get("version")
     environment = payload.get("environment")
     label = payload.get("label")
+    ref = payload.get("ref")
     if not all(
         isinstance(value, str) and value for value in (version, environment, label)
     ):
         raise SmokeCheckError(
             "/api/v1/version must include non-empty string environment, version, and label"
         )
+    if ref is not None and (not isinstance(ref, str) or not ref):
+        raise SmokeCheckError(
+            "/api/v1/version ref must be a non-empty string when present"
+        )
     if expected_version and version != expected_version:
         raise SmokeCheckError(
             f"/api/v1/version version={version!r}, expected {expected_version!r}"
+        )
+    expected_label = f"{environment} {version if version != 'dev' else ref or version}"
+    if label != expected_label:
+        raise SmokeCheckError(
+            f"/api/v1/version label={label!r}, expected {expected_label!r}"
         )
     if expected_environment and environment != expected_environment:
         raise SmokeCheckError(
@@ -226,9 +236,7 @@ def fetch_json(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> An
         },
     )
     try:
-        with urlopen(
-            request, timeout=timeout_seconds
-        ) as response:  # nosec B310 - explicit operator URL only
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - explicit operator URL only
             status = getattr(response, "status", response.getcode())
             body = response.read().decode("utf-8")
     except HTTPError as exc:  # pragma: no cover - unit tests exercise via fake fetchers

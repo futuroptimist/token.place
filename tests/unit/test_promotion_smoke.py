@@ -550,3 +550,37 @@ def test_release_metadata_validator_checks_expected_version_and_environment() ->
             expected_version="0.1.1",
             expected_environment="prod",
         )
+
+
+def test_release_metadata_validator_rejects_inconsistent_label() -> None:
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="label='staging 0.1.0'"):
+        promotion_smoke.validate_release_metadata(
+            {"environment": "staging", "version": "0.1.1", "label": "staging 0.1.0"},
+            expected_version="0.1.1",
+            expected_environment="staging",
+        )
+
+
+def test_release_metadata_validator_uses_ref_for_dev_label() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "dev",
+            "version": "dev",
+            "label": "dev abc123def456",
+            "ref": "abc123def456",
+        },
+        expected_version="dev",
+        expected_environment="dev",
+    )
+
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="label='dev dev'"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "dev",
+                "version": "dev",
+                "label": "dev dev",
+                "ref": "abc123def456",
+            },
+            expected_version="dev",
+            expected_environment="dev",
+        )

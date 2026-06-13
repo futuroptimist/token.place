@@ -23,6 +23,9 @@ ENABLE_ENV = "RUN_PROMOTION_SMOKE"
 BASE_URL_ENV = "TOKENPLACE_SMOKE_BASE_URL"
 ENVIRONMENT_ENV = "TOKENPLACE_SMOKE_ENV"
 ALLOW_PROD_ENV = "TOKENPLACE_SMOKE_ALLOW_PROD"
+EXPECT_VERSION_ENV = "TOKENPLACE_SMOKE_EXPECT_VERSION"
+EXPECT_ENVIRONMENT_ENV = "TOKENPLACE_SMOKE_EXPECT_ENV"
+RELEASE_METADATA_ENDPOINT = "/api/v1/version"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 JSON_ENDPOINTS = ("/livez", "/healthz", "/relay/diagnostics", "/api/v1/models")
 
@@ -41,6 +44,8 @@ class SmokeConfig:
     environment: str
     allow_prod: bool = False
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    expected_version: str | None = None
+    expected_environment: str | None = None
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -93,8 +98,16 @@ def config_from_env(env: dict[str, str] | None = None) -> SmokeConfig:
         raise SmokeConfigError(
             f"Refusing production-looking target without {ALLOW_PROD_ENV}=1"
         )
+    expected_version = values.get(EXPECT_VERSION_ENV, "").strip() or None
+    expected_environment = (
+        values.get(EXPECT_ENVIRONMENT_ENV, "").strip().lower() or None
+    )
     return SmokeConfig(
-        base_url=base_url, environment=environment, allow_prod=allow_prod
+        base_url=base_url,
+        environment=environment,
+        allow_prod=allow_prod,
+        expected_version=expected_version,
+        expected_environment=expected_environment,
     )
 
 
@@ -166,6 +179,46 @@ def validate_models(payload: Any) -> None:
         raise SmokeCheckError("/api/v1/models launch model must be owned_by=Meta")
 
 
+def validate_release_metadata(
+    payload: Any, *, expected_version: str | None, expected_environment: str | None
+) -> None:
+    if not isinstance(payload, dict):
+        raise SmokeCheckError("/api/v1/version must return a JSON object")
+    allowed_keys = {"environment", "version", "label", "ref"}
+    extra_keys = set(payload) - allowed_keys
+    if extra_keys:
+        raise SmokeCheckError(
+            f"/api/v1/version exposes unexpected keys: {sorted(extra_keys)!r}"
+        )
+    version = payload.get("version")
+    environment = payload.get("environment")
+    label = payload.get("label")
+    ref = payload.get("ref")
+    if not all(
+        isinstance(value, str) and value for value in (version, environment, label)
+    ):
+        raise SmokeCheckError(
+            "/api/v1/version must include non-empty string environment, version, and label"
+        )
+    if ref is not None and (not isinstance(ref, str) or not ref):
+        raise SmokeCheckError(
+            "/api/v1/version ref must be a non-empty string when present"
+        )
+    if expected_version and version != expected_version:
+        raise SmokeCheckError(
+            f"/api/v1/version version={version!r}, expected {expected_version!r}"
+        )
+    expected_label = f"{environment} {version if version != 'dev' else ref or version}"
+    if label != expected_label:
+        raise SmokeCheckError(
+            f"/api/v1/version label={label!r}, expected {expected_label!r}"
+        )
+    if expected_environment and environment != expected_environment:
+        raise SmokeCheckError(
+            f"/api/v1/version environment={environment!r}, expected {expected_environment!r}"
+        )
+
+
 VALIDATORS = {
     "/livez": validate_livez,
     "/healthz": validate_healthz,
@@ -183,9 +236,7 @@ def fetch_json(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> An
         },
     )
     try:
-        with urlopen(
-            request, timeout=timeout_seconds
-        ) as response:  # nosec B310 - explicit operator URL only
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - explicit operator URL only
             status = getattr(response, "status", response.getcode())
             body = response.read().decode("utf-8")
     except HTTPError as exc:  # pragma: no cover - unit tests exercise via fake fetchers
@@ -217,6 +268,17 @@ def run_smoke_checks(
         )
         validator(payload)
         successes.append(f"{endpoint} ok")
+    if config.expected_version or config.expected_environment:
+        payload = fetcher(
+            endpoint_url(config.base_url, RELEASE_METADATA_ENDPOINT),
+            config.timeout_seconds,
+        )
+        validate_release_metadata(
+            payload,
+            expected_version=config.expected_version,
+            expected_environment=config.expected_environment,
+        )
+        successes.append(f"{RELEASE_METADATA_ENDPOINT} ok")
     return successes
 
 
@@ -240,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
             environment=config.environment,
             allow_prod=config.allow_prod,
             timeout_seconds=args.timeout,
+            expected_version=config.expected_version,
+            expected_environment=config.expected_environment,
         )
         successes = run_smoke_checks(config)
     except (SmokeConfigError, SmokeCheckError) as exc:

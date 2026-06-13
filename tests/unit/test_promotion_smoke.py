@@ -461,3 +461,126 @@ def test_main_prints_successes_with_injected_offline_runner(
     assert exit_code == 0
     assert captured.out == "/livez ok\n/healthz ok\n"
     assert captured.err == ""
+
+
+def test_config_from_env_accepts_optional_release_metadata_expectations() -> None:
+    config = promotion_smoke.config_from_env(
+        {
+            "RUN_PROMOTION_SMOKE": "1",
+            "TOKENPLACE_SMOKE_BASE_URL": "https://staging.token.place",
+            "TOKENPLACE_SMOKE_EXPECT_VERSION": "0.1.1",
+            "TOKENPLACE_SMOKE_EXPECT_ENV": "staging",
+        }
+    )
+
+    assert config.expected_version == "0.1.1"
+    assert config.expected_environment == "staging"
+
+
+def test_run_smoke_checks_optionally_validates_release_metadata_offline() -> None:
+    config = promotion_smoke.SmokeConfig(
+        base_url="https://staging.token.place/",
+        environment="staging",
+        expected_version="0.1.1",
+        expected_environment="staging",
+    )
+    responses = {
+        "https://staging.token.place/livez": {"status": "alive"},
+        "https://staging.token.place/healthz": {"status": "ok"},
+        "https://staging.token.place/relay/diagnostics": {
+            "total_registered_compute_nodes": 1,
+            "registered_compute_nodes": [{}],
+            "total_api_v1_registered_compute_nodes": 1,
+            "api_v1_registered_compute_nodes": [{}],
+        },
+        "https://staging.token.place/api/v1/models": {
+            "object": "list",
+            "data": [{"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+        },
+        "https://staging.token.place/api/v1/version": {
+            "environment": "staging",
+            "version": "0.1.1",
+            "label": "staging 0.1.1",
+        },
+    }
+    called: list[str] = []
+
+    def fake_fetcher(url: str, timeout_seconds: float):
+        called.append(url)
+        return responses[url]
+
+    successes = promotion_smoke.run_smoke_checks(config, fetcher=fake_fetcher)
+
+    assert called[-1] == "https://staging.token.place/api/v1/version"
+    assert successes[-1] == "/api/v1/version ok"
+
+
+def test_release_metadata_validator_rejects_secret_shaped_extra_keys() -> None:
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="unexpected keys"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "prod",
+                "version": "0.1.1",
+                "label": "prod 0.1.1",
+                "database_password": "secret",
+            },
+            expected_version="0.1.1",
+            expected_environment="prod",
+        )
+
+
+def test_release_metadata_validator_checks_expected_version_and_environment() -> None:
+    payload = {"environment": "staging", "version": "0.1.1", "label": "staging 0.1.1"}
+
+    promotion_smoke.validate_release_metadata(
+        payload,
+        expected_version="0.1.1",
+        expected_environment="staging",
+    )
+
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected '0.1.0'"):
+        promotion_smoke.validate_release_metadata(
+            payload,
+            expected_version="0.1.0",
+            expected_environment="staging",
+        )
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected 'prod'"):
+        promotion_smoke.validate_release_metadata(
+            payload,
+            expected_version="0.1.1",
+            expected_environment="prod",
+        )
+
+
+def test_release_metadata_validator_rejects_inconsistent_label() -> None:
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="label='staging 0.1.0'"):
+        promotion_smoke.validate_release_metadata(
+            {"environment": "staging", "version": "0.1.1", "label": "staging 0.1.0"},
+            expected_version="0.1.1",
+            expected_environment="staging",
+        )
+
+
+def test_release_metadata_validator_uses_ref_for_dev_label() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "dev",
+            "version": "dev",
+            "label": "dev abc123def456",
+            "ref": "abc123def456",
+        },
+        expected_version="dev",
+        expected_environment="dev",
+    )
+
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="label='dev dev'"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "dev",
+                "version": "dev",
+                "label": "dev dev",
+                "ref": "abc123def456",
+            },
+            expected_version="dev",
+            expected_environment="dev",
+        )

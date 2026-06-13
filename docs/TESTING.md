@@ -259,7 +259,7 @@ during tests or `https://token.place/api/v1` in production.
 
 **User Journey**: Users run token.place on different operating systems.
 
-Desktop operator Windows/macOS parity is covered by the shared checklist in [Desktop parity validation checklist](desktop_parity_validation.md). Use it for release validation across Windows CUDA, macOS Metal, CPU fallback, packaged resource resolution, warm-load before register, API v1 E2EE multi-turn chat, Stop, Start after Stop, staging queue-depth checks, and two-node round-robin evidence.
+Desktop operator Windows/macOS parity is covered by the shared checklist in [Desktop parity validation checklist](desktop_parity_validation.md). Use it for release validation across Windows CUDA, macOS Metal, CPU fallback, packaged resource resolution, warm-load before register, API v1 E2EE multi-turn chat, Stop, Start after Stop, staging queue-depth checks, multi-relay prod+staging registration, and two-node round-robin evidence. Relay URL editing is stopped-only in desktop; tests and docs should preserve that changes apply on the next start.
 
 **Test Files**:
 - `tests/unit/test_path_handling.py` - Quick checks for path utilities on each OS
@@ -357,13 +357,16 @@ To add a new visual test:
 
 ## Promotion smoke checks
 
-The repeatable `v0.1.0` staging-to-production checklist lives in
-[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It covers the release-specific
-smoke risks for API v1 model identity (`llama-3.1-8b-instruct` as the only public
+The repeatable 0.1.x staging-to-production checklist lives in
+[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It preserves the historical v0.1.0 API v1
+launch contract while adding evergreen v0.1.1 release validation for the environment/version badge
+and desktop multi-relay prod+staging operation. It covers API v1 model identity
+(`llama-3.1-8b-instruct` as the only public
 model), landing dropdown count, absence of `owned by token.place`, live
-compute-node diagnostics, two-node round-robin, sticky server routing, automatic
+compute-node diagnostics, desktop registered-count status for `https://token.place` plus
+`https://staging.token.place`, two-node round-robin, sticky server routing, automatic
 history-preserving failover, relay-blind privacy invariants, production secrets,
-rate-limit storage, and rollback readiness.
+rate-limit storage, chart `version` versus `appVersion`, and rollback readiness.
 
 For endpoint-only external smoke checks, use the opt-in helper:
 
@@ -377,7 +380,9 @@ python scripts/promotion_smoke.py
 The helper is safe by default: normal test runs never contact live services, and
 production-looking targets require `TOKENPLACE_SMOKE_ALLOW_PROD=1`. It validates
 `/livez`, `/healthz`, `/relay/diagnostics`, and `/api/v1/models` without sending
-prompts or touching chat-completion routes.
+prompts or touching chat-completion routes. Optional metadata checks are enabled only when
+`TOKENPLACE_SMOKE_EXPECT_VERSION` and/or `TOKENPLACE_SMOKE_EXPECT_ENV` are supplied; those checks
+fetch `/api/v1/version` and are covered by offline unit tests.
 
 ## Test Coverage and Continuous Integration
 

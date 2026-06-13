@@ -1544,6 +1544,119 @@ def test_run_multi_relay_status_reports_partial_success(capsys, monkeypatch):
     assert PartialMultiRelayRuntime.instances[0].crypto_manager is PartialMultiRelayRuntime.instances[1].crypto_manager
 
 
+def test_run_multi_relay_status_uses_canonical_relay_client_urls(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class CanonicalRelayClient(FakeRelayClient):
+        def __init__(self, relay_url):
+            self.relay_url = 'https://token.place' if relay_url == 'token.place' else relay_url.rstrip('/')
+            self._api_v1_registered_relays = set()
+
+        def api_v1_registration_fresh(self, relay_url=None):
+            return (relay_url or self.relay_url) in self._api_v1_registered_relays
+
+        def stop(self):
+            return None
+
+        def unregister_from_relay(self):
+            self._api_v1_registered_relays.clear()
+            return True
+
+    class CanonicalRuntime(FakeRuntime):
+        poll_started = False
+
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.model_manager = kwargs.get('model_manager') or FakeModelManager()
+            self.crypto_manager = kwargs.get('crypto_manager') or object()
+            self.relay_client = CanonicalRelayClient(config.relay_url)
+            self._processed = []
+
+        def ensure_api_v1_runtime_ready(self):
+            return True
+
+        def register_and_poll_once(self):
+            CanonicalRuntime.poll_started = True
+            self.relay_client._api_v1_registered_relays.add(self.relay_client.relay_url)
+            return {'next_ping_in_x_seconds': 0, 'error': None}
+
+        def stop(self):
+            self.relay_client.stop()
+            self.relay_client.unregister_from_relay()
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=CanonicalRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    stop_counter = {'count': 0}
+
+    def stop_after_status_can_emit():
+        stop_counter['count'] += 1
+        return CanonicalRuntime.poll_started and stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_status_can_emit)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url=['token.place'],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    registered_event = next(
+        event for event in events
+        if event.get('type') == 'status' and event.get('registered_relay_count') == 1
+    )
+
+    assert registered_event['registered'] is True
+    assert registered_event['configured_relay_urls'] == ['https://token.place']
+    assert registered_event['registered_relay_urls'] == ['https://token.place']
+    assert registered_event['relay_statuses'][0]['relay_url'] == 'https://token.place'
+
+
+def test_run_reports_relay_poll_exception_as_structured_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class FailingPollRuntime(FakeRuntime):
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.model_manager = kwargs.get('model_manager') or FakeModelManager()
+            self.crypto_manager = kwargs.get('crypto_manager') or object()
+            self.relay_client = FakeRelayClient()
+            self.relay_client.relay_url = config.relay_url
+            self._processed = []
+
+        def ensure_api_v1_runtime_ready(self):
+            return True
+
+        def register_and_poll_once(self):
+            raise RuntimeError('network unavailable')
+
+        def stop(self):
+            return None
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FailingPollRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+
+    assert 'desktop.compute_node_bridge.poll.exception' in output.err
+    assert error_event['relay_runtime_state'] == 'failed'
+    assert error_event['registered'] is False
+    assert error_event['last_error'] == 'relay poll failed: RuntimeError: network unavailable'
+    assert error_event['message'] == error_event['last_error']
+    assert error_event['relay_statuses'][0]['last_error'] == error_event['last_error']
+
+
 def test_run_multi_relay_processes_each_relay_and_serializes_inference(capsys, monkeypatch):
     _reset_cancel_queue()
 
@@ -1633,8 +1746,19 @@ def test_run_multi_relay_processes_each_relay_and_serializes_inference(capsys, m
     )
 
     assert compute_node_bridge.run(args) == 0
-    capsys.readouterr()
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    processing_event = next(
+        event for event in events
+        if event.get('type') == 'status'
+        and event.get('relay_runtime_state') == 'processing'
+        and event.get('registered_relay_count', 0) > 0
+    )
 
+    assert processing_event['registered'] is True
+    assert any(
+        status['relay_runtime_state'] == 'processing' and status['request_count'] == 1
+        for status in processing_event['relay_statuses']
+    )
     assert sorted(MultiWorkRuntime.processed_relays) == [
         ('https://staging.token.place', 'req-b'),
         ('https://token.place', 'req-a'),

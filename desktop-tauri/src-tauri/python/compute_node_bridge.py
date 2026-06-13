@@ -748,18 +748,20 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     relay_status_lock = threading.Lock()
+    configured_relay_urls = [relay_runtime.relay_client.relay_url for relay_runtime in runtimes]
     relay_status_map: Dict[str, Dict[str, Any]] = {
-        relay_runtime.relay_client.relay_url: {
-            "relay_url": relay_runtime.relay_client.relay_url,
+        canonical_relay_url: {
+            "relay_url": canonical_relay_url,
             "registered": False,
             "relay_runtime_state": "starting",
             "last_error": None,
             "last_request_id": None,
             "request_count": 0,
         }
-        for relay_runtime in runtimes
+        for canonical_relay_url in configured_relay_urls
     }
     inference_lock = threading.Lock()
+    poll_failure_fatal = False
 
     def update_relay_status(relay_url_value: str, **updates: Any) -> None:
         with relay_status_lock:
@@ -776,9 +778,30 @@ def run(args: argparse.Namespace) -> int:
             )
             relay_status.update(updates)
 
+    def increment_relay_request_count(relay_url_value: str) -> int:
+        with relay_status_lock:
+            relay_status = relay_status_map.setdefault(
+                relay_url_value,
+                {
+                    "relay_url": relay_url_value,
+                    "registered": False,
+                    "relay_runtime_state": "starting",
+                    "last_error": None,
+                    "last_request_id": None,
+                    "request_count": 0,
+                },
+            )
+            request_count = int(relay_status.get("request_count") or 0) + 1
+            relay_status["request_count"] = request_count
+            return request_count
+
     def relay_status_snapshot() -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
         with relay_status_lock:
-            statuses = [dict(relay_status_map[url]) for url in relay_urls if url in relay_status_map]
+            statuses = [
+                dict(relay_status_map[url])
+                for url in configured_relay_urls
+                if url in relay_status_map
+            ]
         registered_count = sum(1 for status in statuses if status.get("registered") is True)
         errors = [status for status in statuses if status.get("last_error")]
         if len(errors) == 1 and len(statuses) == 1:
@@ -802,10 +825,15 @@ def run(args: argparse.Namespace) -> int:
         relay_state = _relay_runtime_state(
             warm_load_state, running=running, warm_load_enabled=warm_load_enabled
         )
+        payload_relay_state = (extra or {}).get("relay_runtime_state", relay_state)
         statuses, registered_count, relay_errors = relay_status_snapshot()
-        fresh_registered = running and relay_state == "ready" and registered_count > 0
+        fresh_registered = (
+            running
+            and payload_relay_state in {"ready", "processing"}
+            and registered_count > 0
+        )
         diagnostics = _status_diagnostics(compute_mode_diagnostics(runtime.model_manager), relay_state)
-        configured_count = len(relay_urls)
+        configured_count = len(configured_relay_urls)
         registered_relay_urls = [
             status["relay_url"] for status in statuses if status.get("registered") is True
         ]
@@ -815,7 +843,7 @@ def run(args: argparse.Namespace) -> int:
             "registered": fresh_registered,
             "relay_runtime_state": relay_state,
             "active_relay_url": active_relay_url,
-            "configured_relay_urls": list(relay_urls),
+            "configured_relay_urls": list(configured_relay_urls),
             "relay_statuses": statuses,
             "registered_relay_count": registered_count,
             "configured_relay_count": configured_count,
@@ -1232,7 +1260,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
     def poll_relay_loop(relay_runtime: Any) -> None:
-        nonlocal last_error
+        nonlocal last_error, poll_failure_fatal
         active_relay_url = relay_runtime.relay_client.relay_url
         worker = relay_poll_workers[active_relay_url]
         while not stop_requested():
@@ -1251,6 +1279,38 @@ def run(args: argparse.Namespace) -> int:
                     on_cancel=lambda relay=active_relay_url, rt=relay_runtime: request_poll_cancel(rt, relay),
                 )
             except KeyboardInterrupt:
+                break
+            except Exception as exc:
+                relay_last_error = f"relay poll failed: {type(exc).__name__}"
+                if str(exc):
+                    relay_last_error = f"{relay_last_error}: {exc}"
+                last_error = relay_last_error
+                poll_failure_fatal = True
+                update_relay_status(
+                    active_relay_url,
+                    registered=False,
+                    relay_runtime_state="failed",
+                    last_error=relay_last_error,
+                )
+                print(
+                    "desktop.compute_node_bridge.poll.exception "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                emit_operator_event(
+                    build_status_payload(
+                        event_type="error",
+                        running=True,
+                        registered=False,
+                        active_relay_url=active_relay_url,
+                        current_last_error=last_error,
+                        extra={
+                            "relay_runtime_state": "failed",
+                            "message": last_error,
+                        },
+                    )
+                )
                 break
             if relay_response is _POLL_CANCELLED:
                 print(
@@ -1329,7 +1389,7 @@ def run(args: argparse.Namespace) -> int:
                     relay_runtime_state="processing",
                     last_error=None,
                     last_request_id=request_id,
-                    request_count=relay_status_map.get(active_relay_url, {}).get("request_count", 0) + 1,
+                    request_count=increment_relay_request_count(active_relay_url),
                 )
                 print(
                     f"desktop.compute_node_bridge.request_route runtime_path={runtime_path} "
@@ -1496,7 +1556,7 @@ def run(args: argparse.Namespace) -> int:
             current_last_error=last_error,
         )
     )
-    return 1 if warm_load_fatal else 0
+    return 1 if warm_load_fatal or poll_failure_fatal else 0
 
 
 def main() -> int:

@@ -39,7 +39,7 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.1"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.2`
+- Chart metadata: chart package version `0.1.2` preserves `appVersion: "0.1.1"`; the historical `v0.1.0` Git tag and `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0` image are immutable release-artifact examples, not a current alignment requirement.
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not staging sign-off or production promotion material

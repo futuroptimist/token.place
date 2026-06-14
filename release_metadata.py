@@ -199,6 +199,8 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
         )
 
     public_version = release_version if release_version != "dev" else display_version
+    if environment == "staging" and deploy_ref:
+        public_version = display_version
     metadata = {
         "environment": environment,
         "version": public_version,
@@ -213,3 +215,22 @@ def release_metadata_json(host: str | None = None) -> str:
     """Return compact JSON suitable for embedding in static HTML."""
 
     return json.dumps(get_release_metadata(host), sort_keys=True, separators=(",", ":"))
+
+
+def resolve_asset_version(host: str | None = None) -> str:
+    """Resolve a short public cache-busting token for landing-page JS assets."""
+
+    metadata = get_release_metadata(host)
+    candidates = [
+        metadata.get("ref", ""),
+        _image_tag(),
+        _immutable_git_ref(),
+        metadata.get("version", ""),
+        resolve_release_version(),
+        "dev",
+    ]
+    for candidate in candidates:
+        token = _clean_public_token(candidate, max_length=32)
+        if token:
+            return token
+    return "dev"

@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata
+from release_metadata import get_release_metadata, resolve_asset_version
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -105,6 +105,7 @@ INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
 VUE_SCRIPT_PLACEHOLDER = "__TOKENPLACE_VUE_SCRIPT_SRC__"
 RELEASE_METADATA_PLACEHOLDER = '{"environment":"dev","label":"dev dev","version":"dev"}'
 RELEASE_BADGE_TEXT_PLACEHOLDER = "dev dev"
+ASSET_VERSION_PLACEHOLDER = "__TOKENPLACE_ASSET_VERSION__"
 VUE_DEV_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"
 VUE_PROD_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"
 
@@ -133,6 +134,7 @@ def _render_index_html(host: str | None = None) -> str:
             json.dumps(metadata, sort_keys=True, separators=(",", ":")),
         )
         .replace(RELEASE_BADGE_TEXT_PLACEHOLDER, metadata["label"])
+        .replace(ASSET_VERSION_PLACEHOLDER, resolve_asset_version(host))
     )
 
 
@@ -918,14 +920,14 @@ def _pop_stream_chunks_for_client(client_public_key):
 @app.route('/')
 def index():
     response = Response(_render_index_html(request.host), mimetype='text/html')
-    response.last_modified = os.path.getmtime(INDEX_HTML_PATH)
-    response.add_etag()
-    response.make_conditional(request)
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 
 def _release_metadata_response():
-    return jsonify(get_release_metadata(request.host))
+    response = jsonify(get_release_metadata(request.host))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route('/api/v1/meta', methods=['GET'])
@@ -943,7 +945,10 @@ def api_v1_version():
 def serve_static(path):
     if path == 'index.html':
         return index()
-    return send_from_directory(STATIC_DIR_PATH, path)
+    response = send_from_directory(STATIC_DIR_PATH, path)
+    if path in {'chat.js', 'chat_typing.js'}:
+        response.headers['Cache-Control'] = 'no-cache'
+    return response
 
 
 

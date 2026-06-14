@@ -11,6 +11,11 @@ from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _PUBLIC_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_IMMUTABLE_IMAGE_TAG_RE = re.compile(
+    r"^(?:main-[0-9A-Fa-f]{7,40}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+)
+_SEMVER_IMAGE_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$")
+_MUTABLE_IMAGE_TAGS = {"dev", "latest", "main", "staging", "prod", "production"}
 
 
 def _clean_public_token(value: Any, *, max_length: int = 64) -> str:
@@ -99,29 +104,76 @@ def infer_release_environment(host: str | None = None) -> str:
     return "dev"
 
 
+def resolve_app_release_version() -> str:
+    """Resolve the app/release version from explicit env or local files."""
+
+    return resolve_release_version()
+
+
+def resolve_image_tag() -> str:
+    """Resolve the public deployed image tag, when supplied by deploy tooling."""
+
+    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=64)
+
+
+def _is_immutable_image_tag(tag: str) -> bool:
+    normalized = tag.strip().lower()
+    return bool(tag and normalized not in _MUTABLE_IMAGE_TAGS and _IMMUTABLE_IMAGE_TAG_RE.match(tag))
+
+
+def _is_semver_image_tag(tag: str) -> bool:
+    return bool(tag and _SEMVER_IMAGE_TAG_RE.match(tag))
+
+
 def resolve_short_ref() -> str:
-    """Resolve an optional public short git SHA or image tag."""
+    """Resolve an optional public immutable deploy ref from image tag or git SHA."""
+
+    image_tag = resolve_image_tag()
+    if _is_immutable_image_tag(image_tag):
+        return image_tag
 
     git_sha = _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)
     if git_sha:
-        return git_sha[:12]
-    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=48)
+        short_sha = git_sha[:12]
+        return short_sha if short_sha.startswith("main-") else f"main-{short_sha}"
+
+    return image_tag if image_tag and image_tag.lower() not in _MUTABLE_IMAGE_TAGS else ""
+
+
+def _staging_display_version(app_version: str, deploy_ref: str) -> str:
+    return deploy_ref or app_version or "dev"
+
+
+def _prod_display_version(app_version: str, image_tag: str, deploy_ref: str) -> str:
+    if app_version and app_version != "dev":
+        return app_version
+    if _is_semver_image_tag(image_tag):
+        return image_tag
+    return deploy_ref or app_version or "dev"
 
 
 def get_release_metadata(host: str | None = None) -> dict[str, str]:
     """Return public-safe release metadata for pages and JSON endpoints."""
 
-    version = resolve_release_version()
+    app_version = resolve_app_release_version()
     environment = infer_release_environment(host)
-    short_ref = resolve_short_ref()
-    badge_value = version if version != "dev" else (short_ref or version)
+    image_tag = resolve_image_tag()
+    deploy_ref = resolve_short_ref()
+
+    if environment == "staging":
+        display_version = _staging_display_version(app_version, deploy_ref)
+    elif environment == "prod":
+        display_version = _prod_display_version(app_version, image_tag, deploy_ref)
+    else:
+        display_version = app_version if app_version != "dev" else (deploy_ref or app_version)
+
     metadata = {
         "environment": environment,
-        "version": version,
-        "label": f"{environment} {badge_value}",
+        "version": display_version,
+        "label": f"{environment} {display_version}",
     }
-    if short_ref:
-        metadata["ref"] = short_ref
+    if deploy_ref and deploy_ref != display_version or (deploy_ref and environment == "staging"):
+        metadata["ref"] = deploy_ref
     return metadata
 
 

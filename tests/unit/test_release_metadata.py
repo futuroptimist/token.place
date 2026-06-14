@@ -47,7 +47,7 @@ def test_release_metadata_prefers_safe_env_values(monkeypatch):
         "environment": "prod",
         "version": "v0.1.1",
         "label": "prod v0.1.1",
-        "ref": "abcdef123456",
+        "ref": "main-abcdef123456",
     }
 
 
@@ -147,3 +147,60 @@ def test_release_metadata_json_does_not_expose_unrelated_secrets(monkeypatch):
     assert "super-secret-token" not in payload
     assert "super-secret-password" not in payload
     assert set(metadata) <= {"environment", "version", "label", "ref"}
+
+
+def test_staging_prefers_immutable_image_tag_over_release_version(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_prod_prefers_release_version_and_keeps_ref(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    assert release_metadata.get_release_metadata("token.place") == {
+        "environment": "prod",
+        "version": "0.1.1",
+        "label": "prod 0.1.1",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_prod_uses_semver_image_tag_without_release_version(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "v0.1.1")
+
+    assert release_metadata.get_release_metadata("token.place") == {
+        "environment": "prod",
+        "version": "v0.1.1",
+        "label": "prod v0.1.1",
+    }
+
+
+def test_deployed_like_image_tag_without_metadata_files_does_not_fall_back_to_dev(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    metadata = release_metadata.get_release_metadata("staging.token.place")
+
+    assert metadata["version"] == "main-830d0a4"
+    assert metadata["label"] == "staging main-830d0a4"

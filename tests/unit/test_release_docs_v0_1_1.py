@@ -31,7 +31,7 @@ def test_changelog_has_concise_v0_1_0_and_v0_1_1_sections() -> None:
     assert "multiple relay URLs" in text
     assert "production and staging relays at the same time" in text
     assert "shared warmed llama.cpp runtime" in text
-    assert "Helm chart package version\n  may be `0.1.2`" in text
+    assert "Helm chart package version\n  may be `0.1.3`" in text
     assert "## v0.1.0 - Initial production release" in text
     assert "Initial production release" in text
 
@@ -58,7 +58,7 @@ def test_promotion_docs_include_multi_relay_and_chart_version_validation() -> No
         "both relay registrations unregister or expire",
         "Chart `appVersion` is the token.place application/release version",
         "Chart `version` is the immutable Helm/OCI deployment package version",
-        "chart `version` may be `0.1.2` while\n  `appVersion` remains `0.1.1`",
+        "chart `version` may be `0.1.3` while\n  `appVersion` remains `0.1.1`",
     )
     missing = _missing_required_phrases(text, required)
     assert not missing
@@ -131,7 +131,7 @@ def test_release_specific_evidence_doc_covers_v0_1_1_guardrails() -> None:
 
     required = (
         "App/desktop release version: `0.1.1`",
-        "Helm chart package version: `0.1.2`",
+        "Helm chart package version: `0.1.3`",
         "Helm chart `appVersion`: `0.1.1`",
         "environment/version badge",
         "single Relay URL field",

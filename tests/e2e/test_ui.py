@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import threading
-from playwright.sync_api import Page
+from playwright.sync_api import Page, sync_playwright
 import time
 
 
@@ -1720,3 +1720,53 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             bridge_process.kill()
+
+
+def test_release_badge_embedded_metadata_agree_for_staging(monkeypatch):
+    """Rendered landing metadata should show the immutable staging deploy image tag."""
+    import relay
+
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(relay._render_index_html("staging.token.place"), wait_until="domcontentloaded")
+        badge_label = page.get_by_test_id("release-badge-label").inner_text().strip()
+        metadata_text = page.locator("#tokenplace-release-metadata").text_content()
+        browser.close()
+    assert metadata_text is not None
+    metadata = json.loads(metadata_text)
+    assert badge_label == "staging main-830d0a4"
+    assert metadata == {
+        "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_release_badge_embedded_metadata_agree_for_prod(monkeypatch):
+    """Rendered landing metadata should show the finalized prod release version."""
+    import relay
+
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(relay._render_index_html("token.place"), wait_until="domcontentloaded")
+        badge_label = page.get_by_test_id("release-badge-label").inner_text().strip()
+        metadata_text = page.locator("#tokenplace-release-metadata").text_content()
+        browser.close()
+    assert metadata_text is not None
+    metadata = json.loads(metadata_text)
+    assert badge_label == "prod 0.1.1"
+    assert metadata["environment"] == "prod"
+    assert metadata["version"] == "0.1.1"
+    assert metadata["label"] == "prod 0.1.1"
+    assert metadata["ref"] == "main-830d0a4"

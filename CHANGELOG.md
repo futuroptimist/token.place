@@ -16,7 +16,7 @@ All notable changes to token.place are tracked here. This project uses a lightwe
 - Documented stopped-only relay URL editing, partial relay failure behavior, registered-count status,
   and stop/unregister expectations for multi-relay operators.
 - Chart packaging note: the app and desktop release remain `0.1.1`; the Helm chart package version
-  may be `0.1.2` because OCI chart versions are immutable deployment packages, while chart
+  may be `0.1.3` because OCI chart versions are immutable deployment packages, while chart
   `appVersion` carries the token.place app release version.
 
 ## v0.1.0 - Initial production release

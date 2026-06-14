@@ -75,17 +75,19 @@ def test_static_index_route_uses_runtime_rendering(monkeypatch):
     assert relay.VUE_SCRIPT_PLACEHOLDER not in body
 
 
-def test_index_route_supports_conditional_get(monkeypatch):
+def test_index_route_is_dynamic_no_store_without_conditional_cache(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
 
     with relay.app.test_client() as client:
         first_response = client.get("/")
-        etag = first_response.headers.get("ETag")
-        assert etag
+        second_response = client.get("/", headers={"If-None-Match": "anything"})
+        static_index_response = client.get("/static/index.html")
 
-        second_response = client.get("/", headers={"If-None-Match": etag})
-
-    assert second_response.status_code == 304
+    for response in (first_response, second_response, static_index_response):
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
 
 
 def test_root_route_uses_development_vue_when_requested(monkeypatch):
@@ -145,6 +147,8 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert body["version"] == "v0.1.1"
     assert body["label"] == "staging main-830d0a4"
     assert body["ref"] == "main-830d0a4"
+    assert meta_response.headers["Cache-Control"] == "no-store"
+    assert version_response.headers["Cache-Control"] == "no-store"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)
     assert "do-not-leak" not in version_response.get_data(as_text=True)
 
@@ -192,3 +196,28 @@ def test_release_badge_and_embedded_metadata_agree_for_prod_release(monkeypatch)
     assert version_response.get_json() == expected
     assert _embedded_release_metadata(html) == expected
     assert '<span class="release-badge-label" data-testid="release-badge-label">prod 0.1.1</span>' in html
+
+
+def test_rendered_index_versions_landing_javascript_assets(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-d35648d")
+    monkeypatch.delenv("TOKENPLACE_GIT_SHA", raising=False)
+
+    html = relay._render_index_html("staging.token.place")
+
+    assert '/static/chat_typing.js?v=main-d35648d' in html
+    assert '/static/chat.js?v=main-d35648d' in html
+    assert 'src="/static/chat.js"' not in html
+    assert 'src="/static/chat_typing.js"' not in html
+    assert relay.ASSET_VERSION_PLACEHOLDER not in html
+
+
+def test_landing_javascript_assets_are_no_cache():
+    with relay.app.test_client() as client:
+        chat_response = client.get("/static/chat.js")
+        typing_response = client.get("/static/chat_typing.js")
+
+    assert chat_response.status_code == 200
+    assert typing_response.status_code == 200
+    assert chat_response.headers["Cache-Control"] == "no-cache"
+    assert typing_response.headers["Cache-Control"] == "no-cache"

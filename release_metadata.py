@@ -209,6 +209,20 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
     return metadata
 
 
+def resolve_asset_version(host: str | None = None) -> str:
+    """Resolve a short public token for cache-busting frontend assets."""
+
+    metadata = get_release_metadata(host)
+    candidate = (
+        metadata.get("ref")
+        or _image_tag()
+        or _immutable_git_ref()
+        or metadata.get("version")
+        or "dev"
+    )
+    return _clean_public_token(candidate, max_length=40) or "dev"
+
+
 def release_metadata_json(host: str | None = None) -> str:
     """Return compact JSON suitable for embedding in static HTML."""
 

@@ -764,14 +764,17 @@
         crossorigin="anonymous"
         referrerpolicy="no-referrer"
     ></script>
-    <script src="/static/chat_typing.js"></script>
-    <script src="/static/chat.js"></script>
+    <script src="__TOKENPLACE_CHAT_TYPING_SCRIPT_SRC__"></script>
+    <script src="__TOKENPLACE_CHAT_SCRIPT_SRC__"></script>
 
     <script>
         // Wait for the DOM to load
         document.addEventListener('DOMContentLoaded', function() {
             const toggleModeButton = document.getElementById('toggleMode');
             const body = document.body;
+            if (!toggleModeButton || !body) {
+                return;
+            }
 
             const switchTheme = () => {
                 if (body.classList.contains('dark-mode')) {

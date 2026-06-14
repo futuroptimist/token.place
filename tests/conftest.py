@@ -195,6 +195,8 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     target_names = {
         "root_page_loads",
         "test_release_badge_renders_without_api_call",
+        "landing_hydrates_without_staging_console_errors",
+        "landing_requests_cache_busted_chat_assets",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_sticky_server_two_turns_and_key_label",
         "landing_chat_sticky_server_auto_failover_preserves_history",

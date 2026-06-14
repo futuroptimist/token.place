@@ -28,6 +28,27 @@ alt-test-public-key
 ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
 
 
+def attach_landing_console_error_collector(page: Page):
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
+    page.on(
+        "console",
+        lambda msg: errors.append(f"console {msg.type}: {msg.text}")
+        if msg.type in {"error"}
+        else None,
+    )
+    return errors
+
+
+def assert_no_landing_console_regressions(errors):
+    forbidden = re.compile(
+        r"ReferenceError|TypeError|computeNodeCountLastUpdatedLabel|addEventListener|querySelector|Vue.*(?:warn|error)",
+        re.IGNORECASE,
+    )
+    matches = [error for error in errors if forbidden.search(error)]
+    assert matches == []
+
+
 def patch_landing_crypto_for_visible_envelopes(page: Page):
     """Make landing-chat E2EE envelopes inspectable without weakening production code."""
     page.evaluate(
@@ -239,6 +260,42 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     print(f"✓ Found {len(headings)} headings on the page")
 
 
+def test_landing_hydrates_without_staging_console_errors(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=1)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("() => Boolean(document.querySelector('#app')?.__vue__)")
+    page.wait_for_function(
+        "() => document.querySelector('.compute-node-status')?.textContent.includes('Live compute nodes: 1')"
+    )
+    page.wait_for_load_state("networkidle")
+
+    assert_no_landing_console_regressions(errors)
+
+
+def test_landing_requests_cache_busted_chat_assets(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    requested = {}
+
+    def record_static_script(route):
+        url = route.request.url
+        if "/static/chat.js" in url or "/static/chat_typing.js" in url:
+            requested[url.rsplit("/", 1)[-1].split("?", 1)[0]] = url
+        route.continue_()
+
+    page.route("**/static/chat*.js**", record_static_script)
+    route_landing_relay_chat(page, diagnostics_count=1)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("() => Boolean(document.querySelector('#app')?.__vue__)")
+    page.wait_for_load_state("networkidle")
+
+    assert set(requested) == {"chat.js", "chat_typing.js"}
+    for url in requested.values():
+        assert re.search(r"[?&]v=[A-Za-z0-9._-]+", url), url
+    assert_no_landing_console_regressions(errors)
+
+
 def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup_servers):
     """Landing page should render release/env metadata without waiting on API calls."""
     metadata_api_calls = []
@@ -268,6 +325,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
     """Initial paint should be safe even when Vue initialization is blocked."""
+    errors = attach_landing_console_error_collector(page)
     blocked_chat_js = {"called": False}
 
     def block_chat_js(route):
@@ -278,7 +336,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
             body="// chat.js intentionally blocked before Vue initializes",
         )
 
-    page.route("**/static/chat.js", block_chat_js)
+    page.route("**/static/chat.js**", block_chat_js)
     page.goto(base_url, wait_until="domcontentloaded")
 
     body_text = page.locator("body").inner_text()
@@ -286,6 +344,12 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     forbidden_visible_fragments = [
         "{{",
         "}}",
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdated",
+        "computeNodeCountLastUpdatedLabel",
+        "selectedModelId",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
     ]
     for fragment in forbidden_visible_fragments:
         assert fragment not in body_text
@@ -297,6 +361,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     assert "Live compute nodes:" not in status_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+    assert_no_landing_console_regressions(errors)
 
 
 def test_compute_node_status_hidden_when_loading_label_is_blank(

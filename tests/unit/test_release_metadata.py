@@ -327,3 +327,19 @@ def test_deployed_like_image_tag_does_not_fall_back_to_dev(monkeypatch, tmp_path
 
     assert metadata["version"] == "main-830d0a4"
     assert metadata["label"] == "staging main-830d0a4"
+
+
+def test_asset_version_prefers_deploy_ref(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-d35648d")
+
+    assert release_metadata.resolve_asset_version("staging.token.place") == "main-d35648d"
+
+
+def test_asset_version_falls_back_to_release_version(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+
+    assert release_metadata.resolve_asset_version("localhost") == "0.1.1"

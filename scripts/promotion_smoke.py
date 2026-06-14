@@ -276,7 +276,7 @@ def validate_release_metadata(
                 f"/api/v1/version label={label!r}, expected one of {expected!r} "
                 "or a deploy display matching the reported ref/version"
             )
-        if ref and display == version:
+        if ref and display == version and display != ref:
             raise SmokeCheckError(
                 f"/api/v1/version label={label!r}, expected deploy display for {environment!r}"
             )

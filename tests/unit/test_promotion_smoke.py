@@ -626,6 +626,19 @@ def test_release_metadata_validator_rejects_prefixed_version_badge_when_ref_pres
         )
 
 
+def test_release_metadata_validator_accepts_matching_semver_ref_display() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "staging",
+            "version": "v0.1.1",
+            "label": "staging v0.1.1",
+            "ref": "v0.1.1",
+        },
+        expected_version="v0.1.1",
+        expected_environment="staging",
+    )
+
+
 def test_release_metadata_validator_rejects_unprefixed_version_badge_when_ref_present() -> (
     None
 ):

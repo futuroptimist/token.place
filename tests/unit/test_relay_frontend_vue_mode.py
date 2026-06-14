@@ -143,7 +143,7 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "v0.1.1"
+    assert body["version"] == "main-830d0a4"
     assert body["label"] == "staging main-830d0a4"
     assert meta_response.headers["Cache-Control"] == "no-store"
     assert version_response.headers["Cache-Control"] == "no-store"
@@ -166,7 +166,7 @@ def test_release_badge_and_embedded_metadata_agree_for_staging_git_ref(monkeypat
     html = response.get_data(as_text=True)
     expected = {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }

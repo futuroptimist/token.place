@@ -465,7 +465,7 @@
 
         <h2>Try it out:</h2>
         <div
-            v-if="computeNodeCountLabel || computeNodeCountLastUpdatedLabel"
+            v-show="computeNodeCountLabel || computeNodeCountLastUpdatedLabel"
             class="compute-node-status"
             :class="{'status-error': computeNodeCountStatus === 'error'}"
             aria-live="polite"

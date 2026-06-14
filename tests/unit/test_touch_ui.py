@@ -10,6 +10,12 @@ def test_send_button_has_touch_optimized_binding():
     )
 
 
+def test_landing_source_has_no_raw_vue_text_interpolation():
+    """Landing HTML must not expose Vue mustaches before hydration."""
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert re.search(r"\{\{[\s\S]*?\}\}", index_html) is None
+
+
 def test_chat_js_defines_touch_detection_hook():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "isTouchInput" in chat_js, "chat.js must expose touch detection state"

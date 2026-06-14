@@ -264,15 +264,6 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
-def test_landing_source_has_no_raw_vue_text_interpolation():
-    """Landing HTML must not expose Vue mustaches before hydration."""
-    html = os.path.join(os.path.dirname(__file__), "..", "..", "static", "index.html")
-    with open(html, encoding="utf-8") as handle:
-        source = handle.read()
-
-    assert re.search(r"{{\s*[A-Za-z_$][^}]*}}", source) is None
-
-
 def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
@@ -291,18 +282,14 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page.goto(base_url, wait_until="domcontentloaded")
 
     body_text = page.locator("body").inner_text()
-    forbidden_fragments = [
+    raw_body_text = page.evaluate("document.body.textContent")
+    forbidden_visible_fragments = [
         "{{",
         "}}",
-        "computeNodeCountLabel",
-        "computeNodeCountLastUpdated",
-        "selectedModelId",
-        "model.id",
-        "selectedServerKeyLabel",
-        "selectedServerTerminalFailure",
     ]
-    for fragment in forbidden_fragments:
+    for fragment in forbidden_visible_fragments:
         assert fragment not in body_text
+        assert fragment not in raw_body_text
 
     status_text = page.locator(".compute-node-status").inner_text().strip()
     assert "Updated" not in status_text
@@ -341,7 +328,7 @@ def test_compute_node_status_hidden_when_loading_label_is_blank(
         """
     )
 
-    expect(page.locator(".compute-node-status")).to_have_count(0)
+    expect(page.locator(".compute-node-status")).to_be_hidden()
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

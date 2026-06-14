@@ -99,29 +99,59 @@ def infer_release_environment(host: str | None = None) -> str:
     return "dev"
 
 
+def resolve_image_tag() -> str:
+    """Resolve an optional public image tag deployed by the release chart."""
+
+    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=64)
+
+
 def resolve_short_ref() -> str:
-    """Resolve an optional public short git SHA or image tag."""
+    """Resolve an optional public immutable deploy ref from image tag or git SHA."""
+
+    image_tag = resolve_image_tag()
+    if image_tag:
+        return image_tag
 
     git_sha = _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)
     if git_sha:
-        return git_sha[:12]
-    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=48)
+        return f"main-{git_sha[:12]}"
+    return ""
+
+
+def _is_semver_tag(value: str) -> bool:
+    return bool(re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?", value))
+
+
+def resolve_badge_version(environment: str, release_version: str, deploy_ref: str) -> str:
+    """Resolve the compact public version token displayed in the release badge."""
+
+    if environment == "staging":
+        return deploy_ref or release_version or "dev"
+
+    if environment == "prod":
+        if release_version and release_version != "dev":
+            return release_version
+        if deploy_ref:
+            return deploy_ref if _is_semver_tag(deploy_ref) else deploy_ref
+        return release_version or "dev"
+
+    return release_version if release_version != "dev" else (deploy_ref or release_version)
 
 
 def get_release_metadata(host: str | None = None) -> dict[str, str]:
     """Return public-safe release metadata for pages and JSON endpoints."""
 
-    version = resolve_release_version()
+    release_version = resolve_release_version()
     environment = infer_release_environment(host)
-    short_ref = resolve_short_ref()
-    badge_value = version if version != "dev" else (short_ref or version)
+    deploy_ref = resolve_short_ref()
+    display_version = resolve_badge_version(environment, release_version, deploy_ref)
     metadata = {
         "environment": environment,
-        "version": version,
-        "label": f"{environment} {badge_value}",
+        "version": display_version,
+        "label": f"{environment} {display_version}",
     }
-    if short_ref:
-        metadata["ref"] = short_ref
+    if deploy_ref:
+        metadata["ref"] = deploy_ref
     return metadata
 
 

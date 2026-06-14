@@ -77,6 +77,7 @@ spec:
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
                 "TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)
                 "TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)
+                "TOKENPLACE_IMAGE_TAG" (dict "name" "TOKENPLACE_IMAGE_TAG" "value" .Values.image.tag)
                 "TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")

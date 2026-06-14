@@ -130,7 +130,7 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "main-830d0a4"
+    assert body["version"] == "v0.1.1"
     assert body["label"] == "staging main-830d0a4"
     assert body["ref"] == "main-830d0a4"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)

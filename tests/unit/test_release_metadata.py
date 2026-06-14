@@ -157,9 +157,38 @@ def test_staging_prefers_immutable_image_tag_for_display(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "main-830d0a4",
+        "version": "0.1.1",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
+    }
+
+
+def test_staging_accepts_sha_prefixed_image_tag(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "sha-830d0a4")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": "0.1.1",
+        "label": "staging sha-830d0a4",
+        "ref": "sha-830d0a4",
+    }
+
+
+def test_deploy_ref_prefers_git_sha_over_mutable_image_tag(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-latest")
+    monkeypatch.setenv("TOKENPLACE_GIT_SHA", "830d0a46beee297ac67de54f470c9939f9d514a1")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": "0.1.1",
+        "label": "staging main-830d0a46beee",
+        "ref": "830d0a46beee",
     }
 
 

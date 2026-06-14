@@ -13,7 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _PUBLIC_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SEMVER_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$")
 _IMMUTABLE_IMAGE_TAG_RE = re.compile(
-    r"^(?:main|master|staging|prod|release)-[0-9a-fA-F]{7,40}$|^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$"
+    r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
 )
 
 
@@ -120,9 +120,9 @@ def _is_immutable_image_tag(value: str) -> bool:
 
 
 def resolve_deploy_ref() -> str:
-    """Resolve an optional public deploy ref from image tag or short git SHA."""
+    """Resolve an optional public deploy ref from short git SHA or image tag."""
 
-    return _image_tag() or _short_git_sha()
+    return _short_git_sha() or _image_tag()
 
 
 def _immutable_git_ref() -> str:
@@ -174,9 +174,10 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
     else:
         display_version = release_version if release_version != "dev" else (deploy_ref or "dev")
 
+    public_version = release_version if release_version != "dev" else display_version
     metadata = {
         "environment": environment,
-        "version": display_version,
+        "version": public_version,
         "label": f"{environment} {display_version}",
     }
     if deploy_ref and (deploy_ref != display_version or environment == "staging"):

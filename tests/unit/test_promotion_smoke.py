@@ -579,6 +579,18 @@ def test_release_metadata_validator_accepts_staging_ref_label_with_app_version()
     )
 
 
+def test_release_metadata_validator_accepts_staging_image_tag_label_with_git_ref() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "staging",
+            "version": "0.1.1",
+            "label": "staging sha-830d0a4",
+            "ref": "main-830d0a4",
+        },
+        expected_version="0.1.1",
+        expected_environment="staging",
+    )
+
 def test_release_metadata_validator_rejects_inconsistent_label() -> None:
     with pytest.raises(promotion_smoke.SmokeCheckError, match="label='staging 0.1.0'"):
         promotion_smoke.validate_release_metadata(

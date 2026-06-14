@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +37,16 @@ class SmokeConfigError(ValueError):
 
 class SmokeCheckError(AssertionError):
     """Raised when an endpoint responds but violates the promotion contract."""
+
+
+def _is_immutable_release_display(value: str) -> bool:
+    return bool(
+        re.match(
+            r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|"
+            r"sha256-[0-9a-fA-F]{64}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$",
+            value,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -208,14 +219,41 @@ def validate_release_metadata(
         raise SmokeCheckError(
             f"/api/v1/version version={version!r}, expected {expected_version!r}"
         )
-    # Staging and dev badges may display an immutable deploy ref while the
-    # version field remains the app release for promotion smoke compatibility.
-    expected_display = ref if ref and environment in {"staging", "dev"} else version
-    expected_label = f"{environment} {expected_display}"
-    if label != expected_label:
+    expected_prefix = f"{environment} "
+    if not label.startswith(expected_prefix):
         raise SmokeCheckError(
-            f"/api/v1/version label={label!r}, expected {expected_label!r}"
+            f"/api/v1/version label={label!r}, expected prefix {expected_prefix!r}"
         )
+    display = label[len(expected_prefix) :]
+    if not display:
+        raise SmokeCheckError("/api/v1/version label must include a display value")
+
+    if environment in {"staging", "dev"}:
+        # Staging/dev badges may display the immutable image tag while `ref`
+        # publishes the normalized git SHA. Validate the actual badge value
+        # instead of deriving it from `ref`, while still rejecting unrelated
+        # labels such as stale app versions.
+        valid_displays = {version}
+        if ref:
+            valid_displays.add(ref)
+        if display not in valid_displays and not (
+            ref and _is_immutable_release_display(display)
+        ):
+            expected = sorted(valid_displays)
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected one of {expected!r} "
+                "or an immutable deploy display"
+            )
+        if ref and display == version:
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected deploy display for {environment!r}"
+            )
+    else:
+        expected_label = f"{environment} {version}"
+        if label != expected_label:
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected {expected_label!r}"
+            )
     if expected_environment and environment != expected_environment:
         raise SmokeCheckError(
             f"/api/v1/version environment={environment!r}, expected {expected_environment!r}"

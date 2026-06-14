@@ -49,7 +49,7 @@ may intentionally differ:
   endpoints and the landing-page badge. For v0.1.1 this is `0.1.1`.
 - Chart `version` is the immutable Helm/OCI deployment package version. If chart source changes after
   an app release version is chosen, the chart package version must be bumped instead of overwriting an
-  existing OCI chart package. For v0.1.1 deployments, chart `version` may be `0.1.2` while
+  existing OCI chart package. For v0.1.1 deployments, chart `version` may be `0.1.3` while
   `appVersion` remains `0.1.1`.
 - Do not bump the app or desktop version just to satisfy Helm chart immutability; bump only the chart
   package version when chart files changed and CI requires a new package.

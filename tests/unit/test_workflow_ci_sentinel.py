@@ -65,7 +65,6 @@ def _step_runs(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in _job_steps(job))
 
 
-
 def test_tiny_gguf_provisioning_accepts_macos_bsd_sha256sum(
     tmp_path: Path,
 ) -> None:
@@ -155,10 +154,12 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
     assert '"charts/tokenplace/**"' in publish_runs
     assert "chart_related_paths=(" in publish_runs
     assert '".github/workflows/ci-helm.yml"' in publish_runs
-    assert "helm show chart \"${CHART_REF}\" --version \"${CHART_VERSION}\"" in publish_runs
+    assert 'helm show chart "${CHART_REF}" --version "${CHART_VERSION}"' in publish_runs
     assert "chart_lookup_status=not_found" in publish_runs
     assert "is_confirmed_missing_chart" in publish_runs
-    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    assert (
+        "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    )
     assert "chart_lookup_status=error" in publish_runs
     assert "action=fail" in publish_runs
     assert (
@@ -173,7 +174,7 @@ def test_helm_workflow_publish_decision_is_idempotent() -> None:
         "Publish skipped: chart version ${CHART_VERSION} already exists and no chart files changed."
     ) in workflow_text
     assert "steps.publish_decision.outputs.action == 'publish'" in workflow_text
-    assert "helm push \"${package_file}\" \"${chart_registry}\"" in publish_runs
+    assert 'helm push "${package_file}" "${chart_registry}"' in publish_runs
     assert "first-parent fallback" not in publish_runs
     assert (
         "unable to compare full pushed range; treating chart paths as changed"
@@ -194,7 +195,9 @@ def test_helm_chart_lookup_only_confirms_canonical_missing_errors() -> None:
         'elif is_confirmed_missing_chart "${chart_lookup_log}" "${CHART_VERSION}"; then'
         in publish_runs
     )
-    assert "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    assert (
+        "grep -Eiq '(not found|404|manifest unknown|name unknown)'" not in publish_runs
+    )
     assert "404" not in publish_runs, (
         "A bare HTTP 404 must not be sufficient to classify chart lookup output "
         "as a confirmed missing chart"
@@ -221,9 +224,9 @@ def test_helm_chart_lookup_errors_fail_closed_before_push() -> None:
         "registry lookup must succeed or return a confirmed not-found response before publishing"
         in workflow_text
     )
-    error_branch = publish_runs.split('if [[ "${chart_lookup_status}" == "error" ]]; then', 1)[1].split(
-        'elif [[ "${EVENT_NAME}" == "push" ]]; then', 1
-    )[0]
+    error_branch = publish_runs.split(
+        'if [[ "${chart_lookup_status}" == "error" ]]; then', 1
+    )[1].split('elif [[ "${EVENT_NAME}" == "push" ]]; then', 1)[0]
     assert "action=fail" in error_branch
     assert "action=publish" not in error_branch
 
@@ -257,12 +260,14 @@ def test_helm_workflow_checkout_has_history_for_push_diff() -> None:
 
     for job_name in ("validate-and-package", "publish"):
         steps = _job_steps(workflow_data["jobs"][job_name])
-        checkout_steps = [step for step in steps if step.get("uses") == "actions/checkout@v4"]
+        checkout_steps = [
+            step for step in steps if step.get("uses") == "actions/checkout@v4"
+        ]
         assert checkout_steps, f"{job_name} must check out the repository"
         checkout_with = checkout_steps[0].get("with", {})
-        assert checkout_with.get("fetch-depth") == "0", (
-            f"{job_name} must fetch enough history for chart publish diff decisions"
-        )
+        assert (
+            checkout_with.get("fetch-depth") == "0"
+        ), f"{job_name} must fetch enough history for chart publish diff decisions"
         assert checkout_with.get("ref") == (
             "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}"
         ), f"{job_name} must pin push checkouts to the triggering commit"
@@ -275,15 +280,33 @@ def test_canonical_chart_sets_release_metadata_env_defaults() -> None:
     values = yaml.safe_load(
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
-    deployment = Path("charts/tokenplace/templates/deployment.yaml").read_text(encoding="utf-8")
+    deployment = Path("charts/tokenplace/templates/deployment.yaml").read_text(
+        encoding="utf-8"
+    )
 
     assert chart["appVersion"] == "0.1.1"
     assert "deployEnv" in values
-    assert '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)' in deployment
-    assert '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)' in deployment
-    assert '"TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)' in deployment
-    assert 'and (not $deployEnv) .Values.ingress.host' in deployment
-    assert 'and (not $deployEnv) .Values.ingress.enabled .Values.ingress.host' not in deployment
+    assert (
+        '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)'
+        in deployment
+    )
+    assert (
+        '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)'
+        in deployment
+    )
+    assert (
+        '"TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)'
+        in deployment
+    )
+    assert (
+        '"TOKENPLACE_IMAGE_TAG" (dict "name" "TOKENPLACE_IMAGE_TAG" "value" .Values.image.tag)'
+        in deployment
+    )
+    assert "and (not $deployEnv) .Values.ingress.host" in deployment
+    assert (
+        "and (not $deployEnv) .Values.ingress.enabled .Values.ingress.host"
+        not in deployment
+    )
     assert 'eq .Values.ingress.host "token.place"' in deployment
     assert 'eq .Values.ingress.host "staging.token.place"' in deployment
 
@@ -302,7 +325,7 @@ def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
 
-    assert chart["version"] == "0.1.2"
+    assert chart["version"] == "0.1.3"
     assert values["image"]["tag"] == "main-latest"
     assert values["image"]["pullPolicy"] == "Always"
 
@@ -438,9 +461,9 @@ def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None
         "macos-latest may run on Intel or Apple Silicon; CMAKE_ARGS must be "
         "derived from uname -m instead of hard-coding an arm64 cross-build."
     )
-    assert "Configure macOS Metal llama-cpp build" in str(macos_job), (
-        "macOS CI must configure llama_cpp_python before installing Python dependencies."
-    )
+    assert "Configure macOS Metal llama-cpp build" in str(
+        macos_job
+    ), "macOS CI must configure llama_cpp_python before installing Python dependencies."
     assert "-DGGML_METAL=on" in step_runs, (
         "macOS CI must build llama_cpp_python with Metal enabled so "
         "GPU-capable desktop modes do not silently fall back to CPU."

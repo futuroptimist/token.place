@@ -4,7 +4,6 @@ from pathlib import Path
 
 import relay
 
-
 INDEX_HTML_PATH = Path(relay.INDEX_HTML_PATH)
 
 
@@ -110,7 +109,7 @@ def test_render_index_html_injects_release_badge_metadata(monkeypatch):
     html = relay._render_index_html("token.place")
 
     assert 'data-testid="release-badge"' in html
-    assert 'prod v0.1.1' in html
+    assert "prod v0.1.1" in html
     assert relay.RELEASE_METADATA_PLACEHOLDER not in html
     assert relay.RELEASE_BADGE_TEXT_PLACEHOLDER not in html
 
@@ -118,18 +117,22 @@ def test_render_index_html_injects_release_badge_metadata(monkeypatch):
 def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "v0.1.1")
     monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
     monkeypatch.setenv("TOKENPLACE_OPERATOR_TOKEN", "do-not-leak")
 
     with relay.app.test_client() as client:
         meta_response = client.get("/api/v1/meta", headers={"Host": "token.place"})
-        version_response = client.get("/api/v1/version", headers={"Host": "token.place"})
+        version_response = client.get(
+            "/api/v1/version", headers={"Host": "token.place"}
+        )
 
     assert meta_response.status_code == 200
     assert version_response.status_code == 200
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "v0.1.1"
-    assert body["label"] == "staging v0.1.1"
+    assert body["version"] == "main-830d0a4"
+    assert body["label"] == "staging main-830d0a4"
+    assert body["ref"] == "main-830d0a4"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)
     assert "do-not-leak" not in version_response.get_data(as_text=True)

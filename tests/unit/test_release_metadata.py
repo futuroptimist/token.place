@@ -4,7 +4,6 @@ import json
 
 import release_metadata
 
-
 PUBLIC_METADATA_ENV_VARS = (
     "TOKENPLACE_RELEASE_VERSION",
     "TOKENPLACE_DEPLOY_ENV",
@@ -31,8 +30,14 @@ def test_prod_host_inference_yields_prod(monkeypatch):
 def test_staging_host_inference_yields_staging(monkeypatch):
     _clear_metadata_env(monkeypatch)
 
-    assert release_metadata.infer_release_environment("staging.token.place:443") == "staging"
-    assert release_metadata.get_release_metadata("staging.token.place:443")["environment"] == "staging"
+    assert (
+        release_metadata.infer_release_environment("staging.token.place:443")
+        == "staging"
+    )
+    assert (
+        release_metadata.get_release_metadata("staging.token.place:443")["environment"]
+        == "staging"
+    )
 
 
 def test_release_metadata_prefers_safe_env_values(monkeypatch):
@@ -51,11 +56,73 @@ def test_release_metadata_prefers_safe_env_values(monkeypatch):
     }
 
 
+def test_staging_badge_prefers_immutable_image_tag(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_prod_badge_prefers_release_version_and_keeps_deploy_ref(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    assert release_metadata.get_release_metadata("token.place") == {
+        "environment": "prod",
+        "version": "0.1.1",
+        "label": "prod 0.1.1",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_prod_badge_uses_semver_image_tag_without_release_version(
+    monkeypatch, tmp_path
+):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "v0.1.1")
+
+    assert release_metadata.get_release_metadata("token.place") == {
+        "environment": "prod",
+        "version": "v0.1.1",
+        "label": "prod v0.1.1",
+    }
+
+
+def test_deployed_metadata_uses_image_tag_when_files_are_missing(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
+
+    metadata = release_metadata.get_release_metadata("staging.token.place")
+
+    assert metadata["version"] == "main-830d0a4"
+    assert metadata["label"] == "staging main-830d0a4"
+    assert metadata["version"] != "dev"
+
+
 def test_legacy_token_place_env_does_not_override_public_host(monkeypatch):
     _clear_metadata_env(monkeypatch)
     monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
 
-    assert release_metadata.infer_release_environment("staging.token.place") == "staging"
+    assert (
+        release_metadata.infer_release_environment("staging.token.place") == "staging"
+    )
 
 
 def test_non_deploy_environment_values_map_to_dev(monkeypatch):
@@ -89,7 +156,9 @@ def test_release_version_falls_back_to_package_metadata(monkeypatch, tmp_path):
     _clear_metadata_env(monkeypatch)
     chart_dir = tmp_path / "charts" / "tokenplace"
     chart_dir.mkdir(parents=True)
-    (chart_dir / "Chart.yaml").write_text("apiVersion: v2\nname: tokenplace\n", encoding="utf-8")
+    (chart_dir / "Chart.yaml").write_text(
+        "apiVersion: v2\nname: tokenplace\n", encoding="utf-8"
+    )
     package_dir = tmp_path / "desktop-tauri"
     package_dir.mkdir()
     (package_dir / "package.json").write_text('{"version": "9.8.7"}', encoding="utf-8")
@@ -100,7 +169,9 @@ def test_release_version_falls_back_to_package_metadata(monkeypatch, tmp_path):
     assert release_metadata.resolve_release_version() == "9.8.7"
 
 
-def test_release_version_uses_dev_when_metadata_files_are_missing(monkeypatch, tmp_path):
+def test_release_version_uses_dev_when_metadata_files_are_missing(
+    monkeypatch, tmp_path
+):
     _clear_metadata_env(monkeypatch)
     monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
     release_metadata._read_chart_app_version.cache_clear()
@@ -113,7 +184,9 @@ def test_release_version_ignores_invalid_package_json(monkeypatch, tmp_path):
     _clear_metadata_env(monkeypatch)
     chart_dir = tmp_path / "charts" / "tokenplace"
     chart_dir.mkdir(parents=True)
-    (chart_dir / "Chart.yaml").write_text("apiVersion: v2\nname: tokenplace\n", encoding="utf-8")
+    (chart_dir / "Chart.yaml").write_text(
+        "apiVersion: v2\nname: tokenplace\n", encoding="utf-8"
+    )
     package_dir = tmp_path / "desktop-tauri"
     package_dir.mkdir()
     (package_dir / "package.json").write_text("{not-json", encoding="utf-8")
@@ -128,7 +201,9 @@ def test_host_parsing_handles_urls_loopback_and_ipv6(monkeypatch):
     _clear_metadata_env(monkeypatch)
 
     assert release_metadata.infer_release_environment(None) == "dev"
-    assert release_metadata.infer_release_environment("https://token.place/app") == "prod"
+    assert (
+        release_metadata.infer_release_environment("https://token.place/app") == "prod"
+    )
     assert release_metadata.infer_release_environment("127.0.0.1:5000") == "dev"
     assert release_metadata.infer_release_environment("[::1]:5000") == "dev"
 

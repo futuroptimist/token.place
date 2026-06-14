@@ -75,17 +75,15 @@ def test_static_index_route_uses_runtime_rendering(monkeypatch):
     assert relay.VUE_SCRIPT_PLACEHOLDER not in body
 
 
-def test_index_route_supports_conditional_get(monkeypatch):
+def test_index_route_ignores_conditional_get_for_dynamic_html(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
 
     with relay.app.test_client() as client:
-        first_response = client.get("/")
-        etag = first_response.headers.get("ETag")
-        assert etag
+        response = client.get("/", headers={"If-None-Match": "stale"})
 
-        second_response = client.get("/", headers={"If-None-Match": etag})
-
-    assert second_response.status_code == 304
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "ETag" not in response.headers
 
 
 def test_root_route_uses_development_vue_when_requested(monkeypatch):
@@ -192,3 +190,88 @@ def test_release_badge_and_embedded_metadata_agree_for_prod_release(monkeypatch)
     assert version_response.get_json() == expected
     assert _embedded_release_metadata(html) == expected
     assert '<span class="release-badge-label" data-testid="release-badge-label">prod 0.1.1</span>' in html
+
+
+def test_dynamic_index_and_metadata_are_no_store(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-d35648d")
+
+    with relay.app.test_client() as client:
+        first_response = client.get("/", headers={"Host": "staging.token.place"})
+        static_index_response = client.get(
+            "/static/index.html", headers={"Host": "staging.token.place"}
+        )
+        conditional_response = client.get(
+            "/", headers={"If-None-Match": "anything", "Host": "staging.token.place"}
+        )
+        meta_response = client.get(
+            "/api/v1/meta", headers={"Host": "staging.token.place"}
+        )
+        version_response = client.get(
+            "/api/v1/version", headers={"Host": "staging.token.place"}
+        )
+
+    for response in (
+        first_response,
+        static_index_response,
+        conditional_response,
+        meta_response,
+        version_response,
+    ):
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+
+
+def test_rendered_index_uses_deploy_ref_cache_busted_js_assets(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-d35648d")
+    monkeypatch.delenv("TOKENPLACE_GIT_SHA", raising=False)
+
+    html = relay._render_index_html("staging.token.place")
+
+    assert '/static/chat_typing.js?v=main-d35648d' in html
+    assert '/static/chat.js?v=main-d35648d' in html
+    assert '/static/chat.js"></script>' not in html
+    assert relay.ASSET_VERSION_PLACEHOLDER not in html
+
+
+def test_chat_js_assets_are_revalidated_when_requested_unversioned():
+    with relay.app.test_client() as client:
+        chat_response = client.get("/static/chat.js")
+        typing_response = client.get("/static/chat_typing.js")
+
+    assert chat_response.status_code == 200
+    assert typing_response.status_code == 200
+    assert chat_response.headers["Cache-Control"] == "no-cache"
+    assert typing_response.headers["Cache-Control"] == "no-cache"
+
+
+def test_static_template_runtime_bindings_are_consistent():
+    html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "{{" not in html
+    assert "}}" not in html
+    if "computeNodeCountLastUpdatedLabel" in html:
+        assert "computeNodeCountLastUpdatedLabel()" in chat_js
+    for binding in (
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdatedLabel",
+        "selectedModelId",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
+    ):
+        assert binding in chat_js
+
+
+def test_dark_mode_script_and_vue_updated_have_defensive_guards():
+    html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "if (!toggleModeButton || !body)" in html
+    assert 'typeof this.$el.querySelector !== "function"' in chat_js
+    assert "if (!container)" in chat_js

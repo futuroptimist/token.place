@@ -1118,7 +1118,13 @@ new Vue({
     },
     updated() {
         this.$nextTick(() => {
+            if (!this.$el || typeof this.$el.querySelector !== "function") {
+                return;
+            }
             const container = this.$el.querySelector(".chat-container");
+            if (!container) {
+                return;
+            }
             container.scrollTop = container.scrollHeight;
         });
     }

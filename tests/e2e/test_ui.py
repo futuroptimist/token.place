@@ -28,6 +28,32 @@ alt-test-public-key
 ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
 
 
+def attach_landing_console_error_collector(page: Page):
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
+    page.on(
+        "console",
+        lambda msg: errors.append(f"console {msg.type}: {msg.text}")
+        if msg.type in {"error"}
+        else None,
+    )
+    return errors
+
+
+def assert_no_landing_console_regressions(errors):
+    forbidden = (
+        "ReferenceError",
+        "TypeError",
+        "computeNodeCountLastUpdatedLabel",
+        "addEventListener",
+        "querySelector",
+        "Vue warn",
+        "Error in render",
+    )
+    matches = [error for error in errors if any(fragment in error for fragment in forbidden)]
+    assert matches == []
+
+
 def patch_landing_crypto_for_visible_envelopes(page: Page):
     """Make landing-chat E2EE envelopes inspectable without weakening production code."""
     page.evaluate(
@@ -278,7 +304,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
             body="// chat.js intentionally blocked before Vue initializes",
         )
 
-    page.route("**/static/chat.js", block_chat_js)
+    page.route("**/static/chat.js**", block_chat_js)
     page.goto(base_url, wait_until="domcontentloaded")
 
     body_text = page.locator("body").inner_text()
@@ -297,6 +323,39 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     assert "Live compute nodes:" not in status_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+
+
+def test_landing_hydrates_without_console_or_page_errors(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
+
+    assert_no_landing_console_regressions(errors)
+
+
+def test_landing_requests_cache_busted_chat_assets(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    script_requests = {}
+
+    def record_script(route):
+        url = route.request.url
+        if "/static/chat.js" in url:
+            script_requests["chat.js"] = url
+        if "/static/chat_typing.js" in url:
+            script_requests["chat_typing.js"] = url
+        route.continue_()
+
+    page.route("**/static/chat*.js**", record_script)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
+
+    assert set(script_requests) == {"chat.js", "chat_typing.js"}
+    assert "?v=" in script_requests["chat.js"] or "&v=" in script_requests["chat.js"]
+    assert "?v=" in script_requests["chat_typing.js"] or "&v=" in script_requests["chat_typing.js"]
+    assert_no_landing_console_regressions(errors)
 
 
 def test_compute_node_status_hidden_when_loading_label_is_blank(

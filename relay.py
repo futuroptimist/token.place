@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata
+from release_metadata import get_release_metadata, resolve_deploy_ref, resolve_release_version, _clean_public_token
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -105,6 +105,7 @@ INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
 VUE_SCRIPT_PLACEHOLDER = "__TOKENPLACE_VUE_SCRIPT_SRC__"
 RELEASE_METADATA_PLACEHOLDER = '{"environment":"dev","label":"dev dev","version":"dev"}'
 RELEASE_BADGE_TEXT_PLACEHOLDER = "dev dev"
+ASSET_VERSION_PLACEHOLDER = "__TOKENPLACE_ASSET_VERSION__"
 VUE_DEV_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"
 VUE_PROD_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"
 
@@ -122,12 +123,34 @@ def _vue_script_src_for_mode(mode: str) -> str:
     return VUE_DEV_SCRIPT_SRC if mode == "development" else VUE_PROD_SCRIPT_SRC
 
 
+def _asset_version() -> str:
+    """Resolve a short public cache-busting token for landing JS assets."""
+
+    version = (
+        resolve_deploy_ref()
+        or _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=80)
+        or _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)[:12]
+        or resolve_release_version()
+        or "dev"
+    )
+    return _clean_public_token(version, max_length=32) or "dev"
+
+
+def _no_store_response(body: str, *, mimetype: str) -> Response:
+    response = Response(body, mimetype=mimetype)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers.pop("ETag", None)
+    response.headers.pop("Last-Modified", None)
+    return response
+
+
 def _render_index_html(host: str | None = None) -> str:
     with open(INDEX_HTML_PATH, encoding="utf-8") as index_file:
         html = index_file.read()
     metadata = get_release_metadata(host)
     return (
         html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
+        .replace(ASSET_VERSION_PLACEHOLDER, _asset_version())
         .replace(
             RELEASE_METADATA_PLACEHOLDER,
             json.dumps(metadata, sort_keys=True, separators=(",", ":")),
@@ -917,15 +940,13 @@ def _pop_stream_chunks_for_client(client_public_key):
 
 @app.route('/')
 def index():
-    response = Response(_render_index_html(request.host), mimetype='text/html')
-    response.last_modified = os.path.getmtime(INDEX_HTML_PATH)
-    response.add_etag()
-    response.make_conditional(request)
-    return response
+    return _no_store_response(_render_index_html(request.host), mimetype='text/html')
 
 
 def _release_metadata_response():
-    return jsonify(get_release_metadata(request.host))
+    response = jsonify(get_release_metadata(request.host))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route('/api/v1/meta', methods=['GET'])
@@ -943,7 +964,10 @@ def api_v1_version():
 def serve_static(path):
     if path == 'index.html':
         return index()
-    return send_from_directory(STATIC_DIR_PATH, path)
+    response = send_from_directory(STATIC_DIR_PATH, path)
+    if path in {'chat.js', 'chat_typing.js'}:
+        response.headers['Cache-Control'] = 'no-cache'
+    return response
 
 
 

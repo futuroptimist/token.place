@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import threading
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 import time
 
 
@@ -310,6 +310,38 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     assert "Live compute nodes:" not in status_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+
+
+def test_compute_node_status_hidden_when_loading_label_is_blank(
+    page: Page, base_url: str, setup_servers
+):
+    """The compute-node status bar should stay hidden when loading has no content."""
+    page.goto(base_url)
+    page.wait_for_function(
+        """
+        () => {
+            const app = document.querySelector('#app');
+            return Boolean(
+                app &&
+                app.__vue__ &&
+                document.querySelector('.compute-node-status')
+            );
+        }
+        """
+    )
+
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.computeNodeCountStatus = 'loading';
+            vm.computeNodeCount = null;
+            vm.computeNodeCountLastUpdated = '';
+        }
+        """
+    )
+
+    expect(page.locator(".compute-node-status")).to_have_count(0)
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

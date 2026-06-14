@@ -465,12 +465,13 @@
 
         <h2>Try it out:</h2>
         <div
+            v-if="computeNodeCountLabel || computeNodeCountLastUpdatedLabel"
             class="compute-node-status"
             :class="{'status-error': computeNodeCountStatus === 'error'}"
             aria-live="polite"
             v-cloak
         >
-            <span><strong v-if="computeNodeCountLabel" v-text="computeNodeCountLabel"></strong></span>
+            <span><strong v-text="computeNodeCountLabel"></strong></span>
             <small v-if="computeNodeCountLastUpdatedLabel" v-text="computeNodeCountLastUpdatedLabel"></small>
         </div>
         <div class="chat-container" v-cloak>

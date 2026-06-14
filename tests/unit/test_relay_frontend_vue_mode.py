@@ -118,6 +118,7 @@ def test_render_index_html_injects_release_badge_metadata(monkeypatch):
 def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "v0.1.1")
     monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-830d0a4")
     monkeypatch.setenv("TOKENPLACE_OPERATOR_TOKEN", "do-not-leak")
 
     with relay.app.test_client() as client:
@@ -129,7 +130,8 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "v0.1.1"
-    assert body["label"] == "staging v0.1.1"
+    assert body["version"] == "main-830d0a4"
+    assert body["label"] == "staging main-830d0a4"
+    assert body["ref"] == "main-830d0a4"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)
     assert "do-not-leak" not in version_response.get_data(as_text=True)

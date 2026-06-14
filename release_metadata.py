@@ -11,6 +11,10 @@ from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _PUBLIC_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SEMVER_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$")
+_IMMUTABLE_IMAGE_TAG_RE = re.compile(
+    r"^(?:main|master|staging|prod|release)-[0-9a-fA-F]{7,40}$|^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$"
+)
 
 
 def _clean_public_token(value: Any, *, max_length: int = 64) -> str:
@@ -46,15 +50,14 @@ def _read_package_version() -> str:
     return _clean_public_token(data.get("version"))
 
 
-def resolve_release_version() -> str:
-    """Resolve the public release version, falling back to local metadata then dev."""
+def _release_version_from_env() -> str:
+    return _clean_public_token(os.environ.get("TOKENPLACE_RELEASE_VERSION"))
 
-    return (
-        _clean_public_token(os.environ.get("TOKENPLACE_RELEASE_VERSION"))
-        or _read_chart_app_version()
-        or _read_package_version()
-        or "dev"
-    )
+
+def resolve_release_version() -> str:
+    """Resolve the public app release version, falling back to local metadata then dev."""
+
+    return _release_version_from_env() or _read_chart_app_version() or _read_package_version() or "dev"
 
 
 def _hostname_from_host(host: str | None) -> str:
@@ -99,29 +102,85 @@ def infer_release_environment(host: str | None = None) -> str:
     return "dev"
 
 
-def resolve_short_ref() -> str:
-    """Resolve an optional public short git SHA or image tag."""
-
-    git_sha = _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)
-    if git_sha:
-        return git_sha[:12]
+def _image_tag() -> str:
     return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=48)
+
+
+def _short_git_sha() -> str:
+    git_sha = _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)
+    return git_sha[:12] if git_sha else ""
+
+
+def _is_semver_tag(value: str) -> bool:
+    return bool(_SEMVER_TAG_RE.match(value))
+
+
+def _is_immutable_image_tag(value: str) -> bool:
+    return bool(_IMMUTABLE_IMAGE_TAG_RE.match(value))
+
+
+def resolve_deploy_ref() -> str:
+    """Resolve an optional public deploy ref from image tag or short git SHA."""
+
+    return _image_tag() or _short_git_sha()
+
+
+def _immutable_git_ref() -> str:
+    git_sha = _short_git_sha()
+    if not git_sha:
+        return ""
+    return git_sha if "-" in git_sha else f"main-{git_sha}"
+
+
+def resolve_short_ref() -> str:
+    """Resolve an optional public deploy ref kept for backward compatibility."""
+
+    return resolve_deploy_ref()
+
+
+def _staging_display_version(release_version: str, image_tag: str, deploy_ref: str) -> str:
+    if image_tag and _is_immutable_image_tag(image_tag):
+        return image_tag
+    git_ref = _immutable_git_ref()
+    if git_ref:
+        return git_ref
+    if release_version != "dev":
+        return release_version
+    return deploy_ref or "dev"
+
+
+def _prod_display_version(release_version: str, image_tag: str, deploy_ref: str) -> str:
+    if _release_version_from_env():
+        return release_version
+    if image_tag and _is_semver_tag(image_tag):
+        return image_tag
+    if release_version != "dev":
+        return release_version
+    return deploy_ref or "dev"
 
 
 def get_release_metadata(host: str | None = None) -> dict[str, str]:
     """Return public-safe release metadata for pages and JSON endpoints."""
 
-    version = resolve_release_version()
+    release_version = resolve_release_version()
     environment = infer_release_environment(host)
-    short_ref = resolve_short_ref()
-    badge_value = version if version != "dev" else (short_ref or version)
+    image_tag = _image_tag()
+    deploy_ref = resolve_deploy_ref()
+
+    if environment == "staging":
+        display_version = _staging_display_version(release_version, image_tag, deploy_ref)
+    elif environment == "prod":
+        display_version = _prod_display_version(release_version, image_tag, deploy_ref)
+    else:
+        display_version = release_version if release_version != "dev" else (deploy_ref or "dev")
+
     metadata = {
         "environment": environment,
-        "version": version,
-        "label": f"{environment} {badge_value}",
+        "version": display_version,
+        "label": f"{environment} {display_version}",
     }
-    if short_ref:
-        metadata["ref"] = short_ref
+    if deploy_ref and (deploy_ref != display_version or environment == "staging"):
+        metadata["ref"] = deploy_ref
     return metadata
 
 

@@ -13,7 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _PUBLIC_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SEMVER_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$")
 _IMMUTABLE_IMAGE_TAG_RE = re.compile(
-    r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+    r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|sha256-[0-9a-fA-F]{7,64}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
 )
 
 

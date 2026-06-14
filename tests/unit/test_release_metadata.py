@@ -177,6 +177,24 @@ def test_staging_accepts_sha_prefixed_image_tag(monkeypatch):
     }
 
 
+def test_staging_accepts_cleaned_sha256_digest_image_ref(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv(
+        "TOKENPLACE_IMAGE_TAG",
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+
+    expected_ref = "sha256-0123456789abcdef0123456789abcdef012345678"
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": expected_ref,
+        "label": f"staging {expected_ref}",
+        "ref": expected_ref,
+    }
+
+
 def test_deploy_ref_prefers_git_sha_over_mutable_image_tag(monkeypatch):
     _clear_metadata_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")

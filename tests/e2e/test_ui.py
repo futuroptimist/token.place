@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import threading
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 import time
 
 
@@ -262,6 +262,73 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert set(metadata) <= {"environment", "version", "label", "ref"}
     assert metadata["label"] == badge_label
     assert metadata_api_calls == []
+
+
+def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
+    page: Page, base_url: str, setup_servers
+):
+    """Initial paint should be safe even when Vue initialization is blocked."""
+    blocked_chat_js = {"called": False}
+
+    def block_chat_js(route):
+        blocked_chat_js["called"] = True
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/javascript"},
+            body="// chat.js intentionally blocked before Vue initializes",
+        )
+
+    page.route("**/static/chat.js", block_chat_js)
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    body_text = page.locator("body").inner_text()
+    raw_body_text = page.evaluate("document.body.textContent")
+    forbidden_visible_fragments = [
+        "{{",
+        "}}",
+    ]
+    for fragment in forbidden_visible_fragments:
+        assert fragment not in body_text
+        assert fragment not in raw_body_text
+
+    status_text = page.locator(".compute-node-status").inner_text().strip()
+    assert "Updated" not in status_text
+    assert "Live compute nodes: loading…" not in status_text
+    assert "Live compute nodes:" not in status_text
+
+    assert blocked_chat_js["called"], "expected chat.js to be blocked"
+
+
+def test_compute_node_status_hidden_when_loading_label_is_blank(
+    page: Page, base_url: str, setup_servers
+):
+    """The compute-node status bar should stay hidden when loading has no content."""
+    page.goto(base_url)
+    page.wait_for_function(
+        """
+        () => {
+            const app = document.querySelector('#app');
+            return Boolean(
+                app &&
+                app.__vue__ &&
+                document.querySelector('.compute-node-status')
+            );
+        }
+        """
+    )
+
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.computeNodeCountStatus = 'loading';
+            vm.computeNodeCount = null;
+            vm.computeNodeCountLastUpdated = '';
+        }
+        """
+    )
+
+    expect(page.locator(".compute-node-status")).to_be_hidden()
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

@@ -150,6 +150,8 @@ BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_root_page_loads",
     "tests/e2e/test_ui.py::test_release_badge_renders_without_api_call",
+    "tests/e2e/test_ui.py::test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed",
+    "tests/e2e/test_ui.py::test_compute_node_status_hidden_when_loading_label_is_blank",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_sticky_server_two_turns_and_key_label",
     "tests/e2e/test_ui.py::test_landing_chat_sticky_server_auto_failover_preserves_history",

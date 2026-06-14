@@ -35,7 +35,7 @@ def attach_landing_console_error_collector(page: Page):
     page.on(
         "console",
         lambda msg: errors.append(f"console {msg.type}: {msg.text}")
-        if msg.type in {"error"}
+        if msg.type in {"error", "warning"}
         else None,
     )
     return errors

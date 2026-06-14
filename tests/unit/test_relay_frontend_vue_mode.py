@@ -143,7 +143,7 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "main-830d0a4"
+    assert body["version"] == "v0.1.1"
     assert body["label"] == "staging main-830d0a4"
     assert meta_response.headers["Cache-Control"] == "no-store"
     assert version_response.headers["Cache-Control"] == "no-store"
@@ -166,7 +166,7 @@ def test_release_badge_and_embedded_metadata_agree_for_staging_git_ref(monkeypat
     html = response.get_data(as_text=True)
     expected = {
         "environment": "staging",
-        "version": "main-830d0a4",
+        "version": "0.1.1",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -217,6 +217,15 @@ def test_landing_js_assets_are_revalidated_when_requested_unversioned():
 
     assert chat_response.headers['Cache-Control'] == 'no-cache'
     assert typing_response.headers['Cache-Control'] == 'no-cache'
+
+
+def test_versioned_landing_js_assets_do_not_force_revalidation():
+    with relay.app.test_client() as client:
+        chat_response = client.get('/static/chat.js?v=main-d35648d')
+        typing_response = client.get('/static/chat_typing.js?v=main-d35648d')
+
+    assert chat_response.headers.get('Cache-Control') != 'no-cache'
+    assert typing_response.headers.get('Cache-Control') != 'no-cache'
 
 
 def test_static_index_references_existing_compute_node_last_updated_computed():

@@ -947,7 +947,11 @@ def serve_static(path):
         return index()
     response = send_from_directory(STATIC_DIR_PATH, path)
     if path in {'chat.js', 'chat_typing.js'}:
-        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['Cache-Control'] = (
+            'public, max-age=31536000, immutable'
+            if 'v' in request.args
+            else 'no-cache'
+        )
     return response
 
 

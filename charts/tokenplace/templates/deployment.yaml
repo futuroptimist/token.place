@@ -68,6 +68,10 @@ spec:
           {{- end }}
           {{- end }}
           {{- $deployEnv = default "dev" $deployEnv }}
+          {{- $imageRef := .Values.image.tag }}
+          {{- if .Values.image.digest }}
+          {{- $imageRef = .Values.image.digest }}
+          {{- end }}
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
@@ -78,6 +82,7 @@ spec:
                 "TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)
                 "TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)
                 "TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)
+                "TOKENPLACE_IMAGE_TAG" (dict "name" "TOKENPLACE_IMAGE_TAG" "value" $imageRef)
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
                 "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +37,50 @@ class SmokeConfigError(ValueError):
 
 class SmokeCheckError(AssertionError):
     """Raised when an endpoint responds but violates the promotion contract."""
+
+
+_IMMUTABLE_RELEASE_DISPLAY_RE = re.compile(
+    r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|"
+    r"sha256-[0-9a-fA-F]{64}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+)
+_SHA_DISPLAY_RE = re.compile(
+    r"^(?:main|master|staging|prod|release|sha)-(?P<sha>[0-9a-fA-F]{7,40})$"
+)
+_SEMVER_DISPLAY_RE = re.compile(
+    r"^v?(?P<version>\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+)
+
+
+def _is_immutable_release_display(value: str) -> bool:
+    return bool(_IMMUTABLE_RELEASE_DISPLAY_RE.match(value))
+
+
+def _display_matches_ref_or_version(
+    display: str, *, ref: str | None, version: str
+) -> bool:
+    """Return whether a badge display belongs to this payload."""
+
+    if display == version or (ref and display == ref):
+        return True
+    if not _is_immutable_release_display(display):
+        return False
+
+    display_semver = _SEMVER_DISPLAY_RE.match(display)
+    version_semver = _SEMVER_DISPLAY_RE.match(version)
+    if display_semver and version_semver:
+        return display == version
+
+    if not ref:
+        return False
+    if display.startswith("sha256-") or ref.startswith("sha256-"):
+        return display == ref
+
+    display_sha = _SHA_DISPLAY_RE.match(display)
+    ref_sha = _SHA_DISPLAY_RE.match(ref)
+    if display_sha and ref_sha:
+        return display_sha.group("sha").lower() == ref_sha.group("sha").lower()
+
+    return False
 
 
 @dataclass(frozen=True)
@@ -208,11 +253,39 @@ def validate_release_metadata(
         raise SmokeCheckError(
             f"/api/v1/version version={version!r}, expected {expected_version!r}"
         )
-    expected_label = f"{environment} {version if version != 'dev' else ref or version}"
-    if label != expected_label:
+    expected_prefix = f"{environment} "
+    if not label.startswith(expected_prefix):
         raise SmokeCheckError(
-            f"/api/v1/version label={label!r}, expected {expected_label!r}"
+            f"/api/v1/version label={label!r}, expected prefix {expected_prefix!r}"
         )
+    display = label[len(expected_prefix) :]
+    if not display:
+        raise SmokeCheckError("/api/v1/version label must include a display value")
+
+    if environment in {"staging", "dev"}:
+        # Staging/dev badges may display the immutable image tag while `ref`
+        # publishes the normalized git SHA. Validate the actual badge value
+        # instead of deriving it from `ref`, while still rejecting unrelated
+        # labels such as stale app versions.
+        valid_displays = {version}
+        if ref:
+            valid_displays.add(ref)
+        if not _display_matches_ref_or_version(display, ref=ref, version=version):
+            expected = sorted(valid_displays)
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected one of {expected!r} "
+                "or a deploy display matching the reported ref/version"
+            )
+        if ref and display == version and display != ref:
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected deploy display for {environment!r}"
+            )
+    else:
+        expected_label = f"{environment} {version}"
+        if label != expected_label:
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected {expected_label!r}"
+            )
     if expected_environment and environment != expected_environment:
         raise SmokeCheckError(
             f"/api/v1/version environment={environment!r}, expected {expected_environment!r}"
@@ -236,7 +309,9 @@ def fetch_json(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> An
         },
     )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - explicit operator URL only
+        with urlopen(
+            request, timeout=timeout_seconds
+        ) as response:  # nosec B310 - explicit operator URL only
             status = getattr(response, "status", response.getcode())
             body = response.read().decode("utf-8")
     except HTTPError as exc:  # pragma: no cover - unit tests exercise via fake fetchers

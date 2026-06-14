@@ -12,7 +12,7 @@ if ! grep -qi raspberry "$CPUINFO_PATH"; then
 fi
 
 # Memory cgroup already enabled?
-if grep -qE '^memory\s+.*\s1$' "$CGROUPS_PATH"; then
+if grep -qE '^memory[[:space:]]+.*[[:space:]]1$' "$CGROUPS_PATH"; then
     exit 0
 fi
 
@@ -52,7 +52,7 @@ cmdline_path.write_text(" ".join(parts) + "\n", encoding="utf-8")
 PY
 
 # Check if the memory controller is enabled
-if grep -qE '^memory\s+.*\s1$' "$CGROUPS_PATH"; then
+if grep -qE '^memory[[:space:]]+.*[[:space:]]1$' "$CGROUPS_PATH"; then
     exit 0
 fi
 

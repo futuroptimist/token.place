@@ -51,7 +51,8 @@ def _read_package_version() -> str:
 
 
 def _release_version_from_env() -> str:
-    return _clean_public_token(os.environ.get("TOKENPLACE_RELEASE_VERSION"))
+    version = _clean_public_token(os.environ.get("TOKENPLACE_RELEASE_VERSION"))
+    return "" if version.lower() == "dev" else version
 
 
 def resolve_release_version() -> str:
@@ -108,7 +109,7 @@ def _image_tag() -> str:
 
 def _short_git_sha() -> str:
     git_sha = _clean_public_token(os.environ.get("TOKENPLACE_GIT_SHA"), max_length=64)
-    return git_sha[:12] if git_sha else ""
+    return git_sha[:7] if git_sha else ""
 
 
 def _is_semver_tag(value: str) -> bool:
@@ -119,17 +120,23 @@ def _is_immutable_image_tag(value: str) -> bool:
     return bool(_IMMUTABLE_IMAGE_TAG_RE.match(value))
 
 
-def resolve_deploy_ref() -> str:
-    """Resolve an optional public deploy ref from short git SHA or image tag."""
-
-    return _short_git_sha() or _image_tag()
-
-
 def _immutable_git_ref() -> str:
     git_sha = _short_git_sha()
     if not git_sha:
         return ""
     return git_sha if "-" in git_sha else f"main-{git_sha}"
+
+
+def resolve_deploy_ref() -> str:
+    """Resolve an optional immutable public deploy ref."""
+
+    git_ref = _immutable_git_ref()
+    if git_ref:
+        return git_ref
+    image_tag = _image_tag()
+    if image_tag and _is_immutable_image_tag(image_tag):
+        return image_tag
+    return ""
 
 
 def resolve_short_ref() -> str:
@@ -174,7 +181,10 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
     else:
         display_version = release_version if release_version != "dev" else (deploy_ref or "dev")
 
-    public_version = release_version if release_version != "dev" else display_version
+    if environment == "staging" or (environment == "prod" and not _release_version_from_env()):
+        public_version = display_version
+    else:
+        public_version = release_version if release_version != "dev" else display_version
     metadata = {
         "environment": environment,
         "version": public_version,

@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import json
+import re
+
 from pathlib import Path
 
 import relay
 
 
 INDEX_HTML_PATH = Path(relay.INDEX_HTML_PATH)
+
+
+def _embedded_release_metadata(html: str) -> dict[str, str]:
+    match = re.search(
+        r'<script id="tokenplace-release-metadata" type="application/json">([^<]+)</script>',
+        html,
+    )
+    assert match is not None
+    return json.loads(match.group(1))
 
 
 def test_flask_builtin_static_route_is_disabled():
@@ -130,8 +142,53 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "v0.1.1"
+    assert body["version"] == "main-830d0a4"
     assert body["label"] == "staging main-830d0a4"
     assert body["ref"] == "main-830d0a4"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)
     assert "do-not-leak" not in version_response.get_data(as_text=True)
+
+
+def test_release_badge_and_embedded_metadata_agree_for_staging_git_ref(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-latest")
+    monkeypatch.setenv("TOKENPLACE_GIT_SHA", "830d0a46beee297ac67de54f470c9939f9d514a1")
+
+    with relay.app.test_client() as client:
+        response = client.get("/", headers={"Host": "staging.token.place"})
+        meta_response = client.get("/api/v1/meta", headers={"Host": "staging.token.place"})
+        version_response = client.get("/api/v1/version", headers={"Host": "staging.token.place"})
+
+    html = response.get_data(as_text=True)
+    expected = {
+        "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+    assert response.status_code == 200
+    assert meta_response.get_json() == expected
+    assert version_response.get_json() == expected
+    assert _embedded_release_metadata(html) == expected
+    assert '<span class="release-badge-label" data-testid="release-badge-label">staging main-830d0a4</span>' in html
+
+
+def test_release_badge_and_embedded_metadata_agree_for_prod_release(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-latest")
+    monkeypatch.delenv("TOKENPLACE_GIT_SHA", raising=False)
+
+    with relay.app.test_client() as client:
+        response = client.get("/", headers={"Host": "token.place"})
+        meta_response = client.get("/api/v1/meta", headers={"Host": "token.place"})
+        version_response = client.get("/api/v1/version", headers={"Host": "token.place"})
+
+    html = response.get_data(as_text=True)
+    expected = {"environment": "prod", "version": "0.1.1", "label": "prod 0.1.1"}
+    assert response.status_code == 200
+    assert meta_response.get_json() == expected
+    assert version_response.get_json() == expected
+    assert _embedded_release_metadata(html) == expected
+    assert '<span class="release-badge-label" data-testid="release-badge-label">prod 0.1.1</span>' in html

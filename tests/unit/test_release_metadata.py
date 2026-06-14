@@ -47,7 +47,7 @@ def test_release_metadata_prefers_safe_env_values(monkeypatch):
         "environment": "prod",
         "version": "v0.1.1",
         "label": "prod v0.1.1",
-        "ref": "abcdef123456",
+        "ref": "main-abcdef1",
     }
 
 
@@ -157,7 +157,7 @@ def test_staging_prefers_immutable_image_tag_for_display(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -171,7 +171,7 @@ def test_staging_accepts_sha_prefixed_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "sha-830d0a4",
         "label": "staging sha-830d0a4",
         "ref": "sha-830d0a4",
     }
@@ -186,9 +186,53 @@ def test_deploy_ref_prefers_git_sha_over_mutable_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_staging_mutable_image_tag_with_git_sha_uses_normalized_git_ref(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-latest")
+    monkeypatch.setenv("TOKENPLACE_GIT_SHA", "830d0a46beee297ac67de54f470c9939f9d514a1")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
+        "version": "main-830d0a4",
+        "label": "staging main-830d0a4",
+        "ref": "main-830d0a4",
+    }
+
+
+def test_staging_mutable_image_tag_without_git_sha_falls_back_to_release(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-latest")
+
+    assert release_metadata.get_release_metadata("staging.token.place") == {
+        "environment": "staging",
         "version": "0.1.1",
-        "label": "staging main-830d0a46beee",
-        "ref": "830d0a46beee",
+        "label": "staging 0.1.1",
+    }
+
+
+def test_prod_dev_release_version_uses_semver_image_tag(monkeypatch, tmp_path):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setattr(release_metadata, "_REPO_ROOT", tmp_path)
+    release_metadata._read_chart_app_version.cache_clear()
+    release_metadata._read_package_version.cache_clear()
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "prod")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "dev")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "v0.1.1")
+
+    assert release_metadata.get_release_metadata("token.place") == {
+        "environment": "prod",
+        "version": "v0.1.1",
+        "label": "prod v0.1.1",
     }
 
 

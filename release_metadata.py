@@ -104,7 +104,7 @@ def infer_release_environment(host: str | None = None) -> str:
 
 
 def _image_tag() -> str:
-    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=48)
+    return _clean_public_token(os.environ.get("TOKENPLACE_IMAGE_TAG"), max_length=80)
 
 
 def _short_git_sha() -> str:
@@ -181,10 +181,7 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
     else:
         display_version = release_version if release_version != "dev" else (deploy_ref or "dev")
 
-    if environment == "staging" or (environment == "prod" and not _release_version_from_env()):
-        public_version = display_version
-    else:
-        public_version = release_version if release_version != "dev" else display_version
+    public_version = release_version if release_version != "dev" else display_version
     metadata = {
         "environment": environment,
         "version": public_version,

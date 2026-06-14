@@ -157,7 +157,7 @@ def test_staging_prefers_immutable_image_tag_for_display(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "main-830d0a4",
+        "version": "0.1.1",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -171,7 +171,7 @@ def test_staging_accepts_sha_prefixed_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "sha-830d0a4",
+        "version": "0.1.1",
         "label": "staging sha-830d0a4",
         "ref": "sha-830d0a4",
     }
@@ -186,10 +186,10 @@ def test_staging_accepts_cleaned_sha256_digest_image_ref(monkeypatch):
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
 
-    expected_ref = "sha256-0123456789abcdef0123456789abcdef012345678"
+    expected_ref = "sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": expected_ref,
+        "version": "0.1.1",
         "label": f"staging {expected_ref}",
         "ref": expected_ref,
     }
@@ -204,7 +204,7 @@ def test_deploy_ref_prefers_git_sha_over_mutable_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "main-830d0a4",
+        "version": "0.1.1",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -219,7 +219,7 @@ def test_staging_mutable_image_tag_with_git_sha_uses_normalized_git_ref(monkeypa
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "main-830d0a4",
+        "version": "0.1.1",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }

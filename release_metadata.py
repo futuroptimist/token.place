@@ -34,7 +34,7 @@ def _read_chart_app_version() -> str:
         for line in chart_path.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("appVersion:"):
                 _, raw_value = line.split(":", 1)
-                return _clean_public_token(raw_value.strip().strip('"\''))
+                return _clean_public_token(raw_value.strip().strip("\"'"))
     except OSError:
         return ""
     return ""
@@ -58,7 +58,12 @@ def _release_version_from_env() -> str:
 def resolve_release_version() -> str:
     """Resolve the public app release version, falling back to local metadata then dev."""
 
-    return _release_version_from_env() or _read_chart_app_version() or _read_package_version() or "dev"
+    return (
+        _release_version_from_env()
+        or _read_chart_app_version()
+        or _read_package_version()
+        or "dev"
+    )
 
 
 def _hostname_from_host(host: str | None) -> str:
@@ -145,12 +150,20 @@ def resolve_short_ref() -> str:
     return resolve_deploy_ref()
 
 
-def _staging_display_version(release_version: str, image_tag: str, deploy_ref: str) -> str:
-    if image_tag and _is_immutable_image_tag(image_tag):
-        return image_tag
+def _staging_display_version(
+    release_version: str, image_tag: str, deploy_ref: str
+) -> str:
     git_ref = _immutable_git_ref()
+    if (
+        image_tag
+        and _is_immutable_image_tag(image_tag)
+        and not (git_ref and _is_semver_tag(image_tag))
+    ):
+        return image_tag
     if git_ref:
         return git_ref
+    if image_tag and _is_immutable_image_tag(image_tag):
+        return image_tag
     if release_version != "dev":
         return release_version
     return deploy_ref or "dev"
@@ -175,11 +188,15 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
     deploy_ref = resolve_deploy_ref()
 
     if environment == "staging":
-        display_version = _staging_display_version(release_version, image_tag, deploy_ref)
+        display_version = _staging_display_version(
+            release_version, image_tag, deploy_ref
+        )
     elif environment == "prod":
         display_version = _prod_display_version(release_version, image_tag, deploy_ref)
     else:
-        display_version = release_version if release_version != "dev" else (deploy_ref or "dev")
+        display_version = (
+            release_version if release_version != "dev" else (deploy_ref or "dev")
+        )
 
     public_version = release_version if release_version != "dev" else display_version
     metadata = {

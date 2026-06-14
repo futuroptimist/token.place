@@ -276,7 +276,7 @@ def validate_release_metadata(
                 f"/api/v1/version label={label!r}, expected one of {expected!r} "
                 "or a deploy display matching the reported ref/version"
             )
-        if ref and display == version and not version.startswith("v"):
+        if ref and display == version:
             raise SmokeCheckError(
                 f"/api/v1/version label={label!r}, expected deploy display for {environment!r}"
             )
@@ -309,7 +309,9 @@ def fetch_json(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> An
         },
     )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - explicit operator URL only
+        with urlopen(
+            request, timeout=timeout_seconds
+        ) as response:  # nosec B310 - explicit operator URL only
             status = getattr(response, "status", response.getcode())
             body = response.read().decode("utf-8")
     except HTTPError as exc:  # pragma: no cover - unit tests exercise via fake fetchers

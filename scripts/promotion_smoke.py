@@ -68,7 +68,7 @@ def _display_matches_ref_or_version(
     display_semver = _SEMVER_DISPLAY_RE.match(display)
     version_semver = _SEMVER_DISPLAY_RE.match(version)
     if display_semver and version_semver:
-        return display_semver.group("version") == version_semver.group("version")
+        return display == version
 
     if not ref:
         return False

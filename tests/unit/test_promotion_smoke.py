@@ -606,6 +606,19 @@ def test_release_metadata_validator_rejects_stale_immutable_staging_badge() -> N
         )
 
 
+def test_release_metadata_validator_rejects_staging_version_badge_when_ref_present() -> None:
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="staging v0.1.1"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "staging",
+                "version": "0.1.1",
+                "label": "staging v0.1.1",
+                "ref": "main-830d0a4",
+            },
+            expected_version="0.1.1",
+            expected_environment="staging",
+        )
+
 def test_release_metadata_validator_accepts_prefixed_sha_display_matching_ref() -> None:
     promotion_smoke.validate_release_metadata(
         {
@@ -617,6 +630,7 @@ def test_release_metadata_validator_accepts_prefixed_sha_display_matching_ref() 
         expected_version="0.1.1",
         expected_environment="staging",
     )
+
 
 def test_release_metadata_validator_rejects_inconsistent_label() -> None:
     with pytest.raises(promotion_smoke.SmokeCheckError, match="label='staging 0.1.0'"):

@@ -262,11 +262,18 @@ def validate_release_metadata(
     if not display:
         raise SmokeCheckError("/api/v1/version label must include a display value")
 
-    if environment in {"staging", "dev"}:
-        # Staging/dev badges may display the immutable image tag while `ref`
-        # publishes the normalized git SHA. Validate the actual badge value
-        # instead of deriving it from `ref`, while still rejecting unrelated
-        # labels such as stale app versions.
+    if environment == "staging":
+        # Staging exposes the immutable deploy ref as the public version.
+        # Keep the contract strict so the badge display, version, and ref agree.
+        if ref and version != ref:
+            raise SmokeCheckError(
+                f"/api/v1/version version={version!r}, expected ref {ref!r}"
+            )
+        if label != f"{environment} {version}":
+            raise SmokeCheckError(
+                f"/api/v1/version label={label!r}, expected {environment} {version!r}"
+            )
+    elif environment == "dev":
         valid_displays = {version}
         if ref:
             valid_displays.add(ref)

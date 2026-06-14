@@ -468,12 +468,12 @@ def test_config_from_env_accepts_optional_release_metadata_expectations() -> Non
         {
             "RUN_PROMOTION_SMOKE": "1",
             "TOKENPLACE_SMOKE_BASE_URL": "https://staging.token.place",
-            "TOKENPLACE_SMOKE_EXPECT_VERSION": "0.1.1",
+            "TOKENPLACE_SMOKE_EXPECT_VERSION": "main-830d0a4",
             "TOKENPLACE_SMOKE_EXPECT_ENV": "staging",
         }
     )
 
-    assert config.expected_version == "0.1.1"
+    assert config.expected_version == "main-830d0a4"
     assert config.expected_environment == "staging"
 
 
@@ -481,7 +481,7 @@ def test_run_smoke_checks_optionally_validates_release_metadata_offline() -> Non
     config = promotion_smoke.SmokeConfig(
         base_url="https://staging.token.place/",
         environment="staging",
-        expected_version="0.1.1",
+        expected_version="main-830d0a4",
         expected_environment="staging",
     )
     responses = {
@@ -499,7 +499,7 @@ def test_run_smoke_checks_optionally_validates_release_metadata_offline() -> Non
         },
         "https://staging.token.place/api/v1/version": {
             "environment": "staging",
-            "version": "0.1.1",
+            "version": "main-830d0a4",
             "label": "staging main-830d0a4",
             "ref": "main-830d0a4",
         },
@@ -566,38 +566,39 @@ def test_release_metadata_validator_accepts_prod_version_label_with_ref() -> Non
     )
 
 
-def test_release_metadata_validator_accepts_staging_ref_label_with_app_version() -> (
+def test_release_metadata_validator_accepts_staging_ref_version_label() -> (
     None
 ):
     promotion_smoke.validate_release_metadata(
         {
             "environment": "staging",
-            "version": "0.1.1",
+            "version": "main-830d0a4",
             "label": "staging main-830d0a4",
             "ref": "main-830d0a4",
         },
-        expected_version="0.1.1",
+        expected_version="main-830d0a4",
         expected_environment="staging",
     )
 
 
-def test_release_metadata_validator_accepts_staging_image_tag_label_with_git_ref() -> (
+def test_release_metadata_validator_rejects_staging_image_tag_label_with_git_ref() -> (
     None
 ):
-    promotion_smoke.validate_release_metadata(
-        {
-            "environment": "staging",
-            "version": "0.1.1",
-            "label": "staging sha-830d0a4",
-            "ref": "main-830d0a4",
-        },
-        expected_version="0.1.1",
-        expected_environment="staging",
-    )
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected ref"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "staging",
+                "version": "sha-830d0a4",
+                "label": "staging sha-830d0a4",
+                "ref": "main-830d0a4",
+            },
+            expected_version="sha-830d0a4",
+            expected_environment="staging",
+        )
 
 
 def test_release_metadata_validator_rejects_stale_immutable_staging_badge() -> None:
-    with pytest.raises(promotion_smoke.SmokeCheckError, match="staging v0.1.0"):
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected ref"):
         promotion_smoke.validate_release_metadata(
             {
                 "environment": "staging",
@@ -613,7 +614,7 @@ def test_release_metadata_validator_rejects_stale_immutable_staging_badge() -> N
 def test_release_metadata_validator_rejects_prefixed_version_badge_when_ref_present() -> (
     None
 ):
-    with pytest.raises(promotion_smoke.SmokeCheckError, match="staging v0.1.1"):
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected ref"):
         promotion_smoke.validate_release_metadata(
             {
                 "environment": "staging",
@@ -642,7 +643,7 @@ def test_release_metadata_validator_accepts_matching_semver_ref_display() -> Non
 def test_release_metadata_validator_rejects_unprefixed_version_badge_when_ref_present() -> (
     None
 ):
-    with pytest.raises(promotion_smoke.SmokeCheckError, match="staging 0.1.1"):
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected ref"):
         promotion_smoke.validate_release_metadata(
             {
                 "environment": "staging",
@@ -656,16 +657,17 @@ def test_release_metadata_validator_rejects_unprefixed_version_badge_when_ref_pr
 
 
 def test_release_metadata_validator_accepts_prefixed_sha_display_matching_ref() -> None:
-    promotion_smoke.validate_release_metadata(
-        {
-            "environment": "staging",
-            "version": "0.1.1",
-            "label": "staging release-830d0a4",
-            "ref": "main-830d0a4",
-        },
-        expected_version="0.1.1",
-        expected_environment="staging",
-    )
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="expected ref"):
+        promotion_smoke.validate_release_metadata(
+            {
+                "environment": "staging",
+                "version": "release-830d0a4",
+                "label": "staging release-830d0a4",
+                "ref": "main-830d0a4",
+            },
+            expected_version="release-830d0a4",
+            expected_environment="staging",
+        )
 
 
 def test_release_metadata_validator_rejects_inconsistent_label() -> None:

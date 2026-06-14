@@ -199,7 +199,9 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
             release_version if release_version != "dev" else (deploy_ref or "dev")
         )
 
-    public_version = release_version if release_version != "dev" else display_version
+    public_version = display_version if environment == "staging" else (
+        release_version if release_version != "dev" else display_version
+    )
     metadata = {
         "environment": environment,
         "version": public_version,

@@ -172,7 +172,7 @@ def test_staging_prefers_immutable_image_tag_for_display(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -186,7 +186,7 @@ def test_staging_accepts_sha_prefixed_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "sha-830d0a4",
         "label": "staging sha-830d0a4",
         "ref": "sha-830d0a4",
     }
@@ -201,7 +201,7 @@ def test_staging_semver_image_tag_with_git_sha_displays_git_ref(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "v0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -221,7 +221,7 @@ def test_staging_accepts_cleaned_sha256_digest_image_ref(monkeypatch):
     )
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": expected_ref,
         "label": f"staging {expected_ref}",
         "ref": expected_ref,
     }
@@ -236,7 +236,7 @@ def test_deploy_ref_prefers_git_sha_over_mutable_image_tag(monkeypatch):
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -251,7 +251,7 @@ def test_staging_mutable_image_tag_with_git_sha_uses_normalized_git_ref(monkeypa
 
     assert release_metadata.get_release_metadata("staging.token.place") == {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -356,3 +356,17 @@ def test_asset_version_uses_full_cleaned_sha256_digest(monkeypatch):
     assert release_metadata.resolve_asset_version("staging.token.place") == (
         "sha256-" + "0123456789abcdef" * 4
     )
+
+
+def test_asset_version_distinguishes_different_sha256_digests(monkeypatch):
+    _clear_metadata_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "sha256:" + "0" * 63 + "1")
+    first = release_metadata.resolve_asset_version("staging.token.place")
+
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "sha256:" + "0" * 63 + "2")
+    second = release_metadata.resolve_asset_version("staging.token.place")
+
+    assert first == "sha256-" + "0" * 63 + "1"
+    assert second == "sha256-" + "0" * 63 + "2"
+    assert first != second

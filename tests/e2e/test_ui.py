@@ -369,12 +369,16 @@ def test_landing_badge_metadata_and_no_store_headers(page: Page, base_url: str, 
     badge_label = page.get_by_test_id("release-badge-label").inner_text().strip()
     metadata = json.loads(page.locator("#tokenplace-release-metadata").text_content())
     meta_response = page.request.get(f"{base_url}/api/v1/meta")
+    version_response = page.request.get(f"{base_url}/api/v1/version")
     api_metadata = meta_response.json()
+    version_metadata = version_response.json()
 
     assert response.headers.get("cache-control") == "no-store"
     assert meta_response.headers.get("cache-control") == "no-store"
+    assert version_response.headers.get("cache-control") == "no-store"
     assert metadata["label"] == badge_label
     assert api_metadata == metadata
+    assert version_metadata == metadata
     assert_no_landing_console_regressions(errors)
 
 def test_compute_node_status_hidden_when_loading_label_is_blank(

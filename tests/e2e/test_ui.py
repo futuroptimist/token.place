@@ -28,6 +28,27 @@ alt-test-public-key
 ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
 
 
+
+def attach_landing_console_error_collector(page: Page):
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
+    page.on(
+        "console",
+        lambda msg: errors.append(f"console {msg.type}: {msg.text}")
+        if msg.type in {"error", "warning"}
+        else None,
+    )
+    return errors
+
+
+def assert_no_landing_console_regressions(errors):
+    forbidden = re.compile(
+        r"ReferenceError|TypeError|computeNodeCountLastUpdatedLabel|addEventListener|querySelector|Vue warn|Vue error",
+        re.IGNORECASE,
+    )
+    matching = [error for error in errors if forbidden.search(error)]
+    assert matching == []
+
 def patch_landing_crypto_for_visible_envelopes(page: Page):
     """Make landing-chat E2EE envelopes inspectable without weakening production code."""
     page.evaluate(
@@ -268,6 +289,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
     """Initial paint should be safe even when Vue initialization is blocked."""
+    errors = attach_landing_console_error_collector(page)
     blocked_chat_js = {"called": False}
 
     def block_chat_js(route):
@@ -278,7 +300,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
             body="// chat.js intentionally blocked before Vue initializes",
         )
 
-    page.route("**/static/chat.js", block_chat_js)
+    page.route("**/static/chat.js*", block_chat_js)
     page.goto(base_url, wait_until="domcontentloaded")
 
     body_text = page.locator("body").inner_text()
@@ -286,6 +308,12 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     forbidden_visible_fragments = [
         "{{",
         "}}",
+        "computeNodeCountLabel",
+        "computeNodeCountLastUpdated",
+        "computeNodeCountLastUpdatedLabel",
+        "selectedModelId",
+        "selectedServerKeyLabel",
+        "selectedServerTerminalFailure",
     ]
     for fragment in forbidden_visible_fragments:
         assert fragment not in body_text
@@ -297,7 +325,61 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     assert "Live compute nodes:" not in status_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+    assert_no_landing_console_regressions(errors)
 
+
+
+def test_landing_loads_without_observed_console_regressions(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=2)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
+
+    assert_no_landing_console_regressions(errors)
+
+
+def test_landing_release_requests_versioned_chat_assets(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    requested = []
+
+    def record_script(route):
+        requested.append(route.request.url)
+        route.continue_()
+
+    page.route("**/static/chat.js*", record_script)
+    page.route("**/static/chat_typing.js*", record_script)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
+
+    assert any("/static/chat.js" in url for url in requested)
+    assert any("/static/chat_typing.js" in url for url in requested)
+    for url in requested:
+        assert "?v=" in url or "&v=" in url, f"unversioned landing asset requested: {url}"
+    assert_no_landing_console_regressions(errors)
+
+
+def test_landing_badge_metadata_and_no_store_headers(page: Page, base_url: str, setup_servers):
+    errors = attach_landing_console_error_collector(page)
+    response = page.goto(base_url, wait_until="domcontentloaded")
+
+    badge_label = page.get_by_test_id("release-badge-label").inner_text().strip()
+    metadata = json.loads(page.locator("#tokenplace-release-metadata").text_content())
+    meta_response = page.request.get(f"{base_url}/api/v1/meta")
+    version_response = page.request.get(f"{base_url}/api/v1/version")
+    api_metadata = meta_response.json()
+    version_metadata = version_response.json()
+
+    assert response.headers.get("cache-control") == "no-store"
+    assert meta_response.headers.get("cache-control") == "no-store"
+    assert version_response.headers.get("cache-control") == "no-store"
+    assert metadata["label"] == badge_label
+    assert api_metadata == metadata
+    assert version_metadata == metadata
+    assert_no_landing_console_regressions(errors)
 
 def test_compute_node_status_hidden_when_loading_label_is_blank(
     page: Page, base_url: str, setup_servers

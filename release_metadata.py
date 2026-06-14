@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -198,7 +199,9 @@ def get_release_metadata(host: str | None = None) -> dict[str, str]:
             release_version if release_version != "dev" else (deploy_ref or "dev")
         )
 
-    public_version = release_version if release_version != "dev" else display_version
+    public_version = display_version if environment == "staging" else (
+        release_version if release_version != "dev" else display_version
+    )
     metadata = {
         "environment": environment,
         "version": public_version,
@@ -213,3 +216,31 @@ def release_metadata_json(host: str | None = None) -> str:
     """Return compact JSON suitable for embedding in static HTML."""
 
     return json.dumps(get_release_metadata(host), sort_keys=True, separators=(",", ":"))
+
+
+def _asset_version_token(value: str) -> str:
+    token = _clean_public_token(value, max_length=128)
+    if token.startswith("sha256-") and len(token) >= len("sha256-") + 64:
+        return token
+    if len(token) > 64:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return token
+
+
+def resolve_asset_version(host: str | None = None) -> str:
+    """Resolve a public cache-busting token for landing-page JS assets."""
+
+    release_version = resolve_release_version()
+    image_tag = _image_tag()
+    candidates = [
+        resolve_deploy_ref(),
+        image_tag if _is_immutable_image_tag(image_tag) else "",
+        _immutable_git_ref(),
+        release_version if release_version != "dev" else "",
+        "dev",
+    ]
+    for candidate in candidates:
+        token = _asset_version_token(candidate)
+        if token:
+            return token
+    return "dev"

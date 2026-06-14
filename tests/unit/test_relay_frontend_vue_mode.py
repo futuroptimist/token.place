@@ -75,17 +75,18 @@ def test_static_index_route_uses_runtime_rendering(monkeypatch):
     assert relay.VUE_SCRIPT_PLACEHOLDER not in body
 
 
-def test_index_route_supports_conditional_get(monkeypatch):
+def test_index_route_is_dynamic_no_store_without_conditional_etag(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
 
     with relay.app.test_client() as client:
         first_response = client.get("/")
-        etag = first_response.headers.get("ETag")
-        assert etag
+        second_response = client.get("/", headers={"If-None-Match": "stale"})
 
-        second_response = client.get("/", headers={"If-None-Match": etag})
-
-    assert second_response.status_code == 304
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.headers["Cache-Control"] == "no-store"
+    assert "ETag" not in first_response.headers
+    assert "Last-Modified" not in first_response.headers
 
 
 def test_root_route_uses_development_vue_when_requested(monkeypatch):
@@ -142,8 +143,10 @@ def test_meta_endpoint_returns_public_safe_metadata(monkeypatch):
     assert version_response.get_json() == meta_response.get_json()
     body = meta_response.get_json()
     assert body["environment"] == "staging"
-    assert body["version"] == "v0.1.1"
+    assert body["version"] == "main-830d0a4"
     assert body["label"] == "staging main-830d0a4"
+    assert meta_response.headers["Cache-Control"] == "no-store"
+    assert version_response.headers["Cache-Control"] == "no-store"
     assert body["ref"] == "main-830d0a4"
     assert "do-not-leak" not in meta_response.get_data(as_text=True)
     assert "do-not-leak" not in version_response.get_data(as_text=True)
@@ -163,7 +166,7 @@ def test_release_badge_and_embedded_metadata_agree_for_staging_git_ref(monkeypat
     html = response.get_data(as_text=True)
     expected = {
         "environment": "staging",
-        "version": "0.1.1",
+        "version": "main-830d0a4",
         "label": "staging main-830d0a4",
         "ref": "main-830d0a4",
     }
@@ -192,3 +195,60 @@ def test_release_badge_and_embedded_metadata_agree_for_prod_release(monkeypatch)
     assert version_response.get_json() == expected
     assert _embedded_release_metadata(html) == expected
     assert '<span class="release-badge-label" data-testid="release-badge-label">prod 0.1.1</span>' in html
+
+
+def test_rendered_index_cache_busts_landing_js_with_deploy_ref(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELEASE_VERSION", "0.1.1")
+    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", "main-d35648d")
+
+    html = relay._render_index_html("staging.token.place")
+
+    assert '/static/chat_typing.js?v=main-d35648d' in html
+    assert '/static/chat.js?v=main-d35648d' in html
+    assert '/static/chat.js"></script>' not in html
+    assert relay.ASSET_VERSION_PLACEHOLDER not in html
+
+
+def test_landing_js_assets_are_revalidated_when_requested_unversioned():
+    with relay.app.test_client() as client:
+        chat_response = client.get('/static/chat.js')
+        typing_response = client.get('/static/chat_typing.js')
+
+    assert chat_response.headers['Cache-Control'] == 'no-cache'
+    assert typing_response.headers['Cache-Control'] == 'no-cache'
+
+
+def test_versioned_landing_js_assets_do_not_force_revalidation():
+    with relay.app.test_client() as client:
+        chat_response = client.get('/static/chat.js?v=main-d35648d')
+        typing_response = client.get('/static/chat_typing.js?v=main-d35648d')
+
+    assert chat_response.headers.get('Cache-Control') != 'no-cache'
+    assert typing_response.headers.get('Cache-Control') != 'no-cache'
+
+
+def test_static_index_references_existing_compute_node_last_updated_computed():
+    index_html = Path('static/index.html').read_text(encoding='utf-8')
+    chat_js = Path('static/chat.js').read_text(encoding='utf-8')
+
+    if 'computeNodeCountLastUpdatedLabel' in index_html:
+        assert re.search(r'computed:\s*{[\s\S]*computeNodeCountLastUpdatedLabel\s*\(', chat_js)
+
+
+def test_static_index_has_no_raw_mustache_interpolation():
+    index_html = Path('static/index.html').read_text(encoding='utf-8')
+    assert '{{' not in index_html
+    assert '}}' not in index_html
+
+
+def test_dark_mode_script_guards_missing_toggle_and_body():
+    index_html = Path('static/index.html').read_text(encoding='utf-8')
+    assert "if (!toggleModeButton || !body)" in index_html
+    assert "toggleModeButton.addEventListener('click', switchTheme)" in index_html
+
+
+def test_chat_updated_guards_non_element_and_missing_container():
+    chat_js = Path('static/chat.js').read_text(encoding='utf-8')
+    assert "if (!this.$el || typeof this.$el.querySelector !== 'function')" in chat_js
+    assert 'if (!container)' in chat_js

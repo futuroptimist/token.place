@@ -39,14 +39,48 @@ class SmokeCheckError(AssertionError):
     """Raised when an endpoint responds but violates the promotion contract."""
 
 
+_IMMUTABLE_RELEASE_DISPLAY_RE = re.compile(
+    r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|"
+    r"sha256-[0-9a-fA-F]{64}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+)
+_SHA_DISPLAY_RE = re.compile(
+    r"^(?:main|master|staging|prod|release|sha)-(?P<sha>[0-9a-fA-F]{7,40})$"
+)
+_SEMVER_DISPLAY_RE = re.compile(
+    r"^v?(?P<version>\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$"
+)
+
+
 def _is_immutable_release_display(value: str) -> bool:
-    return bool(
-        re.match(
-            r"^(?:(?:main|master|staging|prod|release|sha)-[0-9a-fA-F]{7,40}|"
-            r"sha256-[0-9a-fA-F]{64}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)$",
-            value,
-        )
-    )
+    return bool(_IMMUTABLE_RELEASE_DISPLAY_RE.match(value))
+
+
+def _display_matches_ref_or_version(
+    display: str, *, ref: str | None, version: str
+) -> bool:
+    """Return whether a badge display belongs to this payload."""
+
+    if display == version or (ref and display == ref):
+        return True
+    if not _is_immutable_release_display(display):
+        return False
+
+    display_semver = _SEMVER_DISPLAY_RE.match(display)
+    version_semver = _SEMVER_DISPLAY_RE.match(version)
+    if display_semver and version_semver:
+        return display_semver.group("version") == version_semver.group("version")
+
+    if not ref:
+        return False
+    if display.startswith("sha256-") or ref.startswith("sha256-"):
+        return display == ref
+
+    display_sha = _SHA_DISPLAY_RE.match(display)
+    ref_sha = _SHA_DISPLAY_RE.match(ref)
+    if display_sha and ref_sha:
+        return display_sha.group("sha").lower() == ref_sha.group("sha").lower()
+
+    return False
 
 
 @dataclass(frozen=True)
@@ -236,13 +270,11 @@ def validate_release_metadata(
         valid_displays = {version}
         if ref:
             valid_displays.add(ref)
-        if display not in valid_displays and not (
-            ref and _is_immutable_release_display(display)
-        ):
+        if not _display_matches_ref_or_version(display, ref=ref, version=version):
             expected = sorted(valid_displays)
             raise SmokeCheckError(
                 f"/api/v1/version label={label!r}, expected one of {expected!r} "
-                "or an immutable deploy display"
+                "or a deploy display matching the reported ref/version"
             )
         if ref and display == version:
             raise SmokeCheckError(

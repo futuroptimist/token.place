@@ -500,7 +500,8 @@ def test_run_smoke_checks_optionally_validates_release_metadata_offline() -> Non
         "https://staging.token.place/api/v1/version": {
             "environment": "staging",
             "version": "0.1.1",
-            "label": "staging 0.1.1",
+            "label": "staging main-830d0a4",
+            "ref": "main-830d0a4",
         },
     }
     called: list[str] = []
@@ -550,6 +551,32 @@ def test_release_metadata_validator_checks_expected_version_and_environment() ->
             expected_version="0.1.1",
             expected_environment="prod",
         )
+
+
+def test_release_metadata_validator_accepts_prod_version_label_with_ref() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "prod",
+            "version": "0.1.1",
+            "label": "prod 0.1.1",
+            "ref": "main-830d0a4",
+        },
+        expected_version="0.1.1",
+        expected_environment="prod",
+    )
+
+
+def test_release_metadata_validator_accepts_staging_ref_label_with_app_version() -> None:
+    promotion_smoke.validate_release_metadata(
+        {
+            "environment": "staging",
+            "version": "0.1.1",
+            "label": "staging main-830d0a4",
+            "ref": "main-830d0a4",
+        },
+        expected_version="0.1.1",
+        expected_environment="staging",
+    )
 
 
 def test_release_metadata_validator_rejects_inconsistent_label() -> None:

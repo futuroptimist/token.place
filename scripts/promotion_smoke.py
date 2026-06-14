@@ -208,7 +208,10 @@ def validate_release_metadata(
         raise SmokeCheckError(
             f"/api/v1/version version={version!r}, expected {expected_version!r}"
         )
-    expected_label = f"{environment} {version if version != 'dev' else ref or version}"
+    # Staging and dev badges may display an immutable deploy ref while the
+    # version field remains the app release for promotion smoke compatibility.
+    expected_display = ref if ref and environment in {"staging", "dev"} else version
+    expected_label = f"{environment} {expected_display}"
     if label != expected_label:
         raise SmokeCheckError(
             f"/api/v1/version label={label!r}, expected {expected_label!r}"

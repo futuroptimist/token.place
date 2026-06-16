@@ -285,11 +285,12 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
-def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
+def test_landing_first_paint_preserves_chat_layout_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
-    """Initial paint should be safe even when Vue initialization is blocked."""
+    """Initial paint should reserve the landing chat footprint before Vue initializes."""
     errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=1)
     blocked_chat_js = {"called": False}
 
     def block_chat_js(route):
@@ -297,11 +298,21 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/javascript"},
-            body="// chat.js intentionally blocked before Vue initializes",
+            body="// chat.js intentionally delayed before Vue initializes",
         )
 
     page.route("**/static/chat.js*", block_chat_js)
     page.goto(base_url, wait_until="domcontentloaded")
+
+    status = page.locator(".compute-node-status")
+    chat = page.locator(".chat-container")
+    expect(status).to_be_visible()
+    expect(chat).to_be_visible()
+    first_paint_height = chat.bounding_box()["height"]
+    assert first_paint_height >= 250
+    expect(page.locator("textarea").first).to_be_visible()
+    expect(page.get_by_role("button", name="Send")).to_be_visible()
+    expect(page.get_by_test_id("landing-model-select")).to_be_visible()
 
     body_text = page.locator("body").inner_text()
     raw_body_text = page.evaluate("document.body.textContent")
@@ -312,6 +323,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         "computeNodeCountLastUpdated",
         "computeNodeCountLastUpdatedLabel",
         "selectedModelId",
+        "model.id",
         "selectedServerKeyLabel",
         "selectedServerTerminalFailure",
     ]
@@ -319,14 +331,52 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         assert fragment not in body_text
         assert fragment not in raw_body_text
 
-    status_text = page.locator(".compute-node-status").inner_text().strip()
+    status_text = status.inner_text().strip()
     assert "Updated" not in status_text
     assert "Live compute nodes: loading…" not in status_text
     assert "Live compute nodes:" not in status_text
+    assert "No API v1 models available" not in body_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+    page.unroute("**/static/chat.js*", block_chat_js)
+    page.add_script_tag(url="/static/chat.js?v=delayed-test-release")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
     assert_no_landing_console_regressions(errors)
 
+
+def test_landing_hydration_fills_dynamic_fields_without_large_layout_jump(
+    page: Page, base_url: str, setup_servers
+):
+    """Hydration should fill compute/model text while preserving the first-paint chat footprint."""
+    errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=1)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    chat = page.locator(".chat-container")
+    expect(chat).to_be_visible()
+    first_paint_height = chat.bounding_box()["height"]
+
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    expect(status).to_be_visible()
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
+    assert "Live compute nodes: 1" in status.inner_text()
+    assert page.locator(".compute-node-status-updated").inner_text().startswith("Updated")
+
+    model_select = page.get_by_test_id("landing-model-select")
+    expect(model_select).to_be_visible()
+    assert model_select.locator("option").all_inner_texts() == ["llama-3.1-8b-instruct"]
+
+    hydrated_height = chat.bounding_box()["height"]
+    assert first_paint_height >= 250
+    assert hydrated_height >= 250
+    assert abs(hydrated_height - first_paint_height) < 80
+    assert_no_landing_console_regressions(errors)
 
 
 def test_landing_loads_without_observed_console_regressions(page: Page, base_url: str, setup_servers):
@@ -381,10 +431,10 @@ def test_landing_badge_metadata_and_no_store_headers(page: Page, base_url: str, 
     assert version_metadata == metadata
     assert_no_landing_console_regressions(errors)
 
-def test_compute_node_status_hidden_when_loading_label_is_blank(
+def test_compute_node_status_keeps_blank_loading_footprint(
     page: Page, base_url: str, setup_servers
 ):
-    """The compute-node status bar should stay hidden when loading has no content."""
+    """The compute-node status bar should stay visible but blank while loading."""
     page.goto(base_url)
     page.wait_for_function(
         """
@@ -410,7 +460,10 @@ def test_compute_node_status_hidden_when_loading_label_is_blank(
         """
     )
 
-    expect(page.locator(".compute-node-status")).to_be_hidden()
+    status = page.locator(".compute-node-status")
+    expect(status).to_be_visible()
+    assert status.inner_text().strip() == ""
+    assert status.bounding_box()["height"] >= 30
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

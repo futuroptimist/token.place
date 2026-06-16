@@ -234,6 +234,8 @@ def test_static_index_references_existing_compute_node_last_updated_computed():
 
     if 'computeNodeCountLastUpdatedLabel' in index_html:
         assert re.search(r'computed:\s*{[\s\S]*computeNodeCountLastUpdatedLabel\s*\(', chat_js)
+    if 'modelsLoaded' in index_html:
+        assert re.search(r'data:\s*{[\s\S]*modelsLoaded\s*:', chat_js)
 
 
 def test_static_index_has_no_raw_mustache_interpolation():

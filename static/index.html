@@ -81,6 +81,7 @@
             border-radius: 10px;
             padding: 20px;
             margin-top: 30px;
+            min-height: 260px;
         }
         .compute-node-status {
             display: flex;
@@ -94,6 +95,11 @@
             border-radius: 10px;
             background-color: rgba(0, 255, 255, 0.08);
             color: #ffffff;
+        }
+        .compute-node-status-label,
+        .compute-node-status-updated {
+            display: block;
+            min-height: 1em;
         }
         .compute-node-status strong {
             color: #00ffff;
@@ -465,16 +471,14 @@
 
         <h2>Try it out:</h2>
         <div
-            v-show="computeNodeCountLabel || computeNodeCountLastUpdatedLabel"
             class="compute-node-status"
             :class="{'status-error': computeNodeCountStatus === 'error'}"
             aria-live="polite"
-            v-cloak
         >
-            <span><strong v-text="computeNodeCountLabel"></strong></span>
-            <small v-if="computeNodeCountLastUpdatedLabel" v-text="computeNodeCountLastUpdatedLabel"></small>
+            <span class="compute-node-status-label"><strong v-text="computeNodeCountLabel"></strong></span>
+            <small class="compute-node-status-updated" v-text="computeNodeCountLastUpdatedLabel"></small>
         </div>
-        <div class="chat-container" v-cloak>
+        <div class="chat-container">
             <div class="model-selector-container">
                 <label for="model-select">Model</label>
                 <select
@@ -483,19 +487,21 @@
                     class="model-select"
                     aria-label="Model"
                     data-testid="landing-model-select"
+                    disabled
                     :disabled="modelsLoading || (!modelsError && availableModels.length === 0)"
                 >
                     <option v-if="modelsError" :value="selectedModelId" v-text="`${selectedModelId} (emergency fallback)`"></option>
-                    <option v-else-if="availableModels.length === 0" value="">No API v1 models available</option>
+                    <option v-else-if="modelsLoading || (!modelsLoaded && availableModels.length === 0)" value="" disabled></option>
+                    <option v-else-if="availableModels.length === 0" value="" disabled v-text="'No API v1 models available'"></option>
                     <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
                 </select>
-                <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>
-                <p v-else-if="modelsError" class="model-status model-error" v-text="modelsError"></p>
+                <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsLoading ? 'Loading API v1 models…' : modelsError"></p>
             </div>
             <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div
                 v-if="selectedServerTerminalFailure"
                 class="selected-server-failure"
+                v-cloak
                 data-testid="landing-selected-server-failure"
                 role="alert"
             >
@@ -509,7 +515,7 @@
                     Start a new chat
                 </button>
             </div>
-            <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
+            <div v-for="message in chatHistory" v-cloak :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>
             <div class="input-container">
@@ -530,6 +536,7 @@
                     @click="sendMessage"
                     @touchstart.prevent="sendMessage"
                     class="send-button"
+                    disabled
                     :class="{'touch-optimized': isTouchInput}"
                     :disabled="!canSendMessage"
                 >

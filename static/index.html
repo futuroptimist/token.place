@@ -133,6 +133,7 @@
         }
         .server-key-label {
             margin: 0 0 15px;
+            min-height: 1em;
             color: #cccccc;
             font-family: 'Courier New', Courier, monospace;
             font-size: 13px;
@@ -497,11 +498,10 @@
                 </select>
                 <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsLoading ? 'Loading API v1 models…' : modelsError"></p>
             </div>
-            <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
+            <p class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div
                 v-if="selectedServerTerminalFailure"
                 class="selected-server-failure"
-                v-cloak
                 data-testid="landing-selected-server-failure"
                 role="alert"
             >
@@ -515,7 +515,7 @@
                     Start a new chat
                 </button>
             </div>
-            <div v-for="message in chatHistory" v-cloak :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
+            <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>
             <div class="input-container">

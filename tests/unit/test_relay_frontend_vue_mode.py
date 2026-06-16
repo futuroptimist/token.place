@@ -244,6 +244,24 @@ def test_static_index_has_no_raw_mustache_interpolation():
     assert '}}' not in index_html
 
 
+def test_dynamic_landing_nodes_are_not_cloaked_or_layout_conditional():
+    index_html = Path('static/index.html').read_text(encoding='utf-8')
+
+    assert 'v-if="selectedServerKeyLabel" class="server-key-label"' not in index_html
+    assert re.search(
+        r'<p\s+class="server-key-label"\s+data-testid="landing-server-key-label"\s+v-text="selectedServerKeyLabel"></p>',
+        index_html,
+    )
+    assert not re.search(
+        r'<div[^>]*v-if="selectedServerTerminalFailure"[^>]*v-cloak',
+        index_html,
+    )
+    assert not re.search(
+        r'<div[^>]*v-for="message in chatHistory"[^>]*v-cloak',
+        index_html,
+    )
+
+
 def test_dark_mode_script_guards_missing_toggle_and_body():
     index_html = Path('static/index.html').read_text(encoding='utf-8')
     assert "if (!toggleModeButton || !body)" in index_html

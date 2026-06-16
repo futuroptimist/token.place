@@ -290,6 +290,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
 ):
     """Initial paint should be safe even when Vue initialization is blocked."""
     errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=1)
     blocked_chat_js = {"called": False}
 
     def block_chat_js(route):
@@ -322,21 +323,46 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
 
     status = page.locator(".compute-node-status")
     chat = page.locator(".chat-container")
+    send_button = page.locator(".send-button")
     expect(status).to_be_visible()
     expect(chat).to_be_visible()
     assert chat.bounding_box()["height"] >= 250
     expect(page.locator("textarea.message-input")).to_be_visible()
-    expect(page.locator(".send-button")).to_be_visible()
+    expect(send_button).to_be_visible()
+    expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
+    expect(page.get_by_test_id("landing-selected-server-failure")).not_to_be_visible()
 
     status_text = status.inner_text().strip()
     assert "Updated" not in status_text
     assert "Live compute nodes: loading…" not in status_text
     assert "Live compute nodes:" not in status_text
+    assert "Start a new chat" not in body_text
+    assert "Loading API v1 models…" not in body_text
     assert "No API v1 models available" not in body_text
     assert "emergency fallback" not in body_text
 
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
+
+    page.unroute("**/static/chat.js*", block_chat_js)
+    page.add_script_tag(url=f"{base_url}/static/chat.js?delayed-test=1")
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_function(
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            const select = document.querySelector('[data-testid=landing-model-select]');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 1') &&
+                status.textContent.includes('Updated') &&
+                select &&
+                Array.from(select.options).some((option) => option.textContent === 'llama-3.1-8b-instruct')
+            );
+        }
+        """
+    )
+    page.wait_for_load_state("networkidle")
     assert_no_landing_console_regressions(errors)
 
 

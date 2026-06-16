@@ -138,6 +138,9 @@
             font-family: 'Courier New', Courier, monospace;
             font-size: 13px;
         }
+        .selected-server-failure[v-if] {
+            display: none;
+        }
         .selected-server-failure {
             margin: 0 0 15px;
             padding: 12px;
@@ -496,7 +499,7 @@
                     <option v-else-if="availableModels.length === 0" value="" disabled v-text="'No API v1 models available'"></option>
                     <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
                 </select>
-                <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsLoading ? 'Loading API v1 models…' : modelsError"></p>
+                <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsError || (modelsLoaded && availableModels.length === 0 ? 'No API v1 models available' : '')"></p>
             </div>
             <p class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div

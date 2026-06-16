@@ -312,6 +312,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         "computeNodeCountLastUpdated",
         "computeNodeCountLastUpdatedLabel",
         "selectedModelId",
+        "model.id",
         "selectedServerKeyLabel",
         "selectedServerTerminalFailure",
     ]
@@ -319,14 +320,61 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         assert fragment not in body_text
         assert fragment not in raw_body_text
 
-    status_text = page.locator(".compute-node-status").inner_text().strip()
+    status = page.locator(".compute-node-status")
+    expect(status).to_be_visible()
+    status_text = status.inner_text().strip()
     assert "Updated" not in status_text
     assert "Live compute nodes: loading…" not in status_text
     assert "Live compute nodes:" not in status_text
 
+    chat_container = page.locator(".chat-container")
+    expect(chat_container).to_be_visible()
+    assert chat_container.bounding_box()["height"] >= 250
+    expect(page.locator("textarea").first).to_be_visible()
+    expect(page.locator(".send-button").first).to_be_visible()
+    expect(page.get_by_test_id("landing-model-select")).to_be_visible()
+
     assert blocked_chat_js["called"], "expected chat.js to be blocked"
     assert_no_landing_console_regressions(errors)
 
+
+def test_landing_hydrates_compute_status_and_models_without_layout_collapse(
+    page: Page, base_url: str, setup_servers
+):
+    errors = attach_landing_console_error_collector(page)
+    route_landing_relay_chat(page, diagnostics_count=1)
+
+    page.goto(base_url, wait_until="domcontentloaded")
+    chat_container = page.locator(".chat-container")
+    expect(chat_container).to_be_visible()
+    first_height = chat_container.bounding_box()["height"]
+
+    page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
+    page.wait_for_function(
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            const select = document.querySelector('[data-testid=landing-model-select]');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 1') &&
+                status.textContent.includes('Updated') &&
+                select &&
+                Array.from(select.options).map((option) => option.textContent.trim()).includes('llama-3.1-8b-instruct')
+            );
+        }
+        """
+    )
+
+    status = page.locator(".compute-node-status")
+    assert "Live compute nodes: 1" in status.inner_text()
+    assert re.search(r"Updated \d{2}:\d{2}", status.inner_text())
+    assert page.get_by_test_id("landing-model-select").locator("option").all_inner_texts() == ["llama-3.1-8b-instruct"]
+    hydrated_height = chat_container.bounding_box()["height"]
+    assert first_height >= 250
+    assert hydrated_height >= 250
+    assert abs(hydrated_height - first_height) < 80
+    assert_no_landing_console_regressions(errors)
 
 
 def test_landing_loads_without_observed_console_regressions(page: Page, base_url: str, setup_servers):
@@ -381,10 +429,10 @@ def test_landing_badge_metadata_and_no_store_headers(page: Page, base_url: str, 
     assert version_metadata == metadata
     assert_no_landing_console_regressions(errors)
 
-def test_compute_node_status_hidden_when_loading_label_is_blank(
+def test_compute_node_status_reserves_space_when_loading_label_is_blank(
     page: Page, base_url: str, setup_servers
 ):
-    """The compute-node status bar should stay hidden when loading has no content."""
+    """The compute-node status bar should stay visible but blank while loading."""
     page.goto(base_url)
     page.wait_for_function(
         """
@@ -410,7 +458,10 @@ def test_compute_node_status_hidden_when_loading_label_is_blank(
         """
     )
 
-    expect(page.locator(".compute-node-status")).to_be_hidden()
+    status = page.locator(".compute-node-status")
+    expect(status).to_be_visible()
+    assert status.inner_text().strip() == ""
+    assert status.bounding_box()["height"] >= 40
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):

@@ -285,6 +285,30 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
+def measure_landing_chat_layout(page: Page) -> dict:
+    """Return key landing chat geometry used to catch first-paint hydration shifts."""
+    return page.evaluate(
+        """
+        () => {
+            const chat = document.querySelector('.chat-container');
+            const select = document.querySelector('[data-testid=landing-model-select]');
+            const textarea = document.querySelector('textarea.message-input');
+            if (!chat || !select || !textarea) {
+                throw new Error('landing chat layout nodes are missing');
+            }
+            const chatRect = chat.getBoundingClientRect();
+            const selectRect = select.getBoundingClientRect();
+            const textareaRect = textarea.getBoundingClientRect();
+            return {
+                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                chatHeight: chatRect.height,
+                textareaTopRelativeToChat: textareaRect.top - chatRect.top,
+            };
+        }
+        """
+    )
+
+
 def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
@@ -332,6 +356,10 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
     expect(page.get_by_test_id("landing-selected-server-failure")).not_to_be_visible()
+    assert page.locator(".message").count() == 0
+
+    first_paint_layout = measure_landing_chat_layout(page)
+    assert 20 <= first_paint_layout["modelToTextareaGap"] <= 45
 
     status_text = status.inner_text().strip()
     assert "Updated" not in status_text
@@ -363,6 +391,14 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         """
     )
     page.wait_for_load_state("networkidle")
+    assert page.get_by_test_id("landing-model-select").input_value() == "llama-3.1-8b-instruct"
+    assert "Live compute nodes: 1" in status.inner_text()
+
+    hydrated_layout = measure_landing_chat_layout(page)
+    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
+    assert hydrated_layout["chatHeight"] >= 250
+    assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
     assert_no_landing_console_regressions(errors)
 
 
@@ -756,8 +792,12 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     textarea.fill("hello")
     wait_for_landing_send_enabled(page).click()
 
+    user_message = page.locator(".user-message").last
+    user_message.wait_for(state="visible")
     assistant_message = page.locator(".assistant-message").last
     assistant_message.wait_for(state="visible")
+    assert user_message.evaluate("node => !node.hasAttribute('v-cloak')")
+    assert assistant_message.evaluate("node => !node.hasAttribute('v-cloak')")
     page.wait_for_function(
         """
         ({ selector, expectedText }) => {

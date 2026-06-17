@@ -49,6 +49,29 @@ def assert_no_landing_console_regressions(errors):
     matching = [error for error in errors if forbidden.search(error)]
     assert matching == []
 
+
+def measure_landing_chat_layout(page: Page):
+    return page.evaluate(
+        """
+        () => {
+            const chat = document.querySelector('.chat-container');
+            const select = document.querySelector('[data-testid=landing-model-select]');
+            const textarea = document.querySelector('textarea.message-input');
+            if (!chat || !select || !textarea) {
+                throw new Error('landing chat layout targets are missing');
+            }
+            const chatRect = chat.getBoundingClientRect();
+            const selectRect = select.getBoundingClientRect();
+            const textareaRect = textarea.getBoundingClientRect();
+            return {
+                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                chatHeight: chatRect.height,
+                textareaTopRelativeToChat: textareaRect.top - chatRect.top,
+            };
+        }
+        """
+    )
+
 def patch_landing_crypto_for_visible_envelopes(page: Page):
     """Make landing-chat E2EE envelopes inspectable without weakening production code."""
     page.evaluate(
@@ -288,21 +311,39 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
 def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
-    """Initial paint should be safe even when Vue initialization is blocked."""
+    """Initial paint should match hydrated layout even when Vue initialization is delayed."""
     errors = attach_landing_console_error_collector(page)
     route_landing_relay_chat(page, diagnostics_count=1)
-    blocked_chat_js = {"called": False}
+    delayed_chat_js = {"called": False}
 
-    def block_chat_js(route):
-        blocked_chat_js["called"] = True
+    def delay_chat_js(route):
+        delayed_chat_js["called"] = True
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/javascript"},
-            body="// chat.js intentionally blocked before Vue initializes",
+            body="// chat.js intentionally delayed until after first-paint measurements",
         )
 
-    page.route("**/static/chat.js*", block_chat_js)
+    page.route("**/static/chat.js*", delay_chat_js)
     page.goto(base_url, wait_until="domcontentloaded")
+
+    status = page.locator(".compute-node-status")
+    chat = page.locator(".chat-container")
+    send_button = page.locator(".send-button")
+    model_select = page.get_by_test_id("landing-model-select")
+    textarea = page.locator("textarea.message-input")
+    expect(status).to_be_visible()
+    expect(chat).to_be_visible()
+    expect(textarea).to_be_visible()
+    expect(send_button).to_be_visible()
+    expect(send_button).to_be_disabled()
+    expect(model_select).to_be_visible()
+    expect(page.get_by_test_id("landing-selected-server-failure")).not_to_be_visible()
+    assert page.locator(".message").count() == 0
+
+    first_layout = measure_landing_chat_layout(page)
+    assert first_layout["chatHeight"] >= 250
+    assert 0 <= first_layout["modelToTextareaGap"] <= 64
 
     body_text = page.locator("body").inner_text()
     raw_body_text = page.evaluate("document.body.textContent")
@@ -321,18 +362,6 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         assert fragment not in body_text
         assert fragment not in raw_body_text
 
-    status = page.locator(".compute-node-status")
-    chat = page.locator(".chat-container")
-    send_button = page.locator(".send-button")
-    expect(status).to_be_visible()
-    expect(chat).to_be_visible()
-    assert chat.bounding_box()["height"] >= 250
-    expect(page.locator("textarea.message-input")).to_be_visible()
-    expect(send_button).to_be_visible()
-    expect(send_button).to_be_disabled()
-    expect(page.get_by_test_id("landing-model-select")).to_be_visible()
-    expect(page.get_by_test_id("landing-selected-server-failure")).not_to_be_visible()
-
     status_text = status.inner_text().strip()
     assert "Updated" not in status_text
     assert "Live compute nodes: loading…" not in status_text
@@ -342,10 +371,10 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     assert "No API v1 models available" not in body_text
     assert "emergency fallback" not in body_text
 
-    assert blocked_chat_js["called"], "expected chat.js to be blocked"
+    assert delayed_chat_js["called"], "expected chat.js to be delayed"
 
-    page.unroute("**/static/chat.js*", block_chat_js)
-    page.add_script_tag(url=f"{base_url}/static/chat.js?delayed-test=1")
+    page.unroute("**/static/chat.js*", delay_chat_js)
+    page.add_script_tag(url=f"{base_url}/static/chat.js?delayed-layout-test=1")
     page.wait_for_function("document.querySelector('#app') && document.querySelector('#app').__vue__")
     page.wait_for_function(
         """
@@ -363,8 +392,12 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         """
     )
     page.wait_for_load_state("networkidle")
+    hydrated_layout = measure_landing_chat_layout(page)
+    assert model_select.input_value() == "llama-3.1-8b-instruct"
+    assert abs(hydrated_layout["modelToTextareaGap"] - first_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_layout["textareaTopRelativeToChat"]) <= 4
+    assert abs(hydrated_layout["chatHeight"] - first_layout["chatHeight"]) <= 4
     assert_no_landing_console_regressions(errors)
-
 
 
 def test_landing_loads_without_observed_console_regressions(page: Page, base_url: str, setup_servers):
@@ -756,8 +789,14 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     textarea.fill("hello")
     wait_for_landing_send_enabled(page).click()
 
+    user_message = page.locator(".user-message").last
+    user_message.wait_for(state="visible")
+    assert user_message.inner_text().strip() == "hello"
+    assert user_message.evaluate("node => !node.hasAttribute('v-cloak') && getComputedStyle(node).display !== 'none'")
+
     assistant_message = page.locator(".assistant-message").last
     assistant_message.wait_for(state="visible")
+    assert assistant_message.evaluate("node => !node.hasAttribute('v-cloak') && getComputedStyle(node).display !== 'none'")
     page.wait_for_function(
         """
         ({ selector, expectedText }) => {

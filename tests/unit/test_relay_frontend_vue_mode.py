@@ -256,8 +256,13 @@ def test_dynamic_landing_nodes_are_not_cloaked_or_layout_conditional():
         r'<div[^>]*v-if="selectedServerTerminalFailure"[^>]*v-cloak',
         index_html,
     )
+    assert '<div v-for="message in chatHistory"' not in index_html
+    assert re.search(
+        r'<template\s+v-for="\(message, index\) in chatHistory">[\s\S]*class="message"',
+        index_html,
+    )
     assert not re.search(
-        r'<div[^>]*v-for="message in chatHistory"[^>]*v-cloak',
+        r'class="message"[\s\S]{0,200}v-cloak|v-cloak[\s\S]{0,200}class="message"',
         index_html,
     )
 

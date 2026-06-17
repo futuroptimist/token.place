@@ -19,6 +19,7 @@ new Vue({
         availableModels: [],
         selectedModelId: '',
         modelsLoading: false,
+        modelsLoaded: false,
         modelsError: '',
         isGeneratingResponse: false,
         isTouchInput: false,
@@ -162,6 +163,7 @@ new Vue({
         },
         fetchModels() {
             this.modelsLoading = true;
+            this.modelsLoaded = false;
             this.modelsError = '';
 
             return fetch('/api/v1/models')
@@ -188,6 +190,7 @@ new Vue({
                 })
                 .finally(() => {
                     this.modelsLoading = false;
+                    this.modelsLoaded = true;
                 });
         },
 

@@ -234,12 +234,32 @@ def test_static_index_references_existing_compute_node_last_updated_computed():
 
     if 'computeNodeCountLastUpdatedLabel' in index_html:
         assert re.search(r'computed:\s*{[\s\S]*computeNodeCountLastUpdatedLabel\s*\(', chat_js)
+    if 'modelsLoaded' in index_html:
+        assert re.search(r'data:\s*{[\s\S]*modelsLoaded\s*:', chat_js)
 
 
 def test_static_index_has_no_raw_mustache_interpolation():
     index_html = Path('static/index.html').read_text(encoding='utf-8')
     assert '{{' not in index_html
     assert '}}' not in index_html
+
+
+def test_dynamic_landing_nodes_are_not_cloaked_or_layout_conditional():
+    index_html = Path('static/index.html').read_text(encoding='utf-8')
+
+    assert 'v-if="selectedServerKeyLabel" class="server-key-label"' not in index_html
+    assert re.search(
+        r'<p\s+class="server-key-label"\s+data-testid="landing-server-key-label"\s+v-text="selectedServerKeyLabel"></p>',
+        index_html,
+    )
+    assert not re.search(
+        r'<div[^>]*v-if="selectedServerTerminalFailure"[^>]*v-cloak',
+        index_html,
+    )
+    assert not re.search(
+        r'<div[^>]*v-for="message in chatHistory"[^>]*v-cloak',
+        index_html,
+    )
 
 
 def test_dark_mode_script_guards_missing_toggle_and_body():

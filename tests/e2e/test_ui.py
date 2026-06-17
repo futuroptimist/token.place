@@ -285,6 +285,29 @@ def test_release_badge_renders_without_api_call(page: Page, base_url: str, setup
     assert metadata_api_calls == []
 
 
+def measure_landing_chat_layout(page: Page):
+    """Return layout metrics that should remain stable across Vue hydration."""
+    return page.evaluate(
+        """
+        () => {
+            const chat = document.querySelector('.chat-container');
+            const select = document.querySelector('[data-testid=landing-model-select]');
+            const textarea = document.querySelector('textarea.message-input');
+            if (!chat || !select || !textarea) {
+                throw new Error('missing landing chat layout node');
+            }
+            const chatRect = chat.getBoundingClientRect();
+            const selectRect = select.getBoundingClientRect();
+            const textareaRect = textarea.getBoundingClientRect();
+            return {
+                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                chatHeight: chatRect.height,
+                textareaTopRelativeToChat: textareaRect.top - chatRect.top,
+            };
+        }
+        """
+    )
+
 def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     page: Page, base_url: str, setup_servers
 ):
@@ -327,7 +350,12 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     expect(status).to_be_visible()
     expect(chat).to_be_visible()
     assert chat.bounding_box()["height"] >= 250
-    expect(page.locator("textarea.message-input")).to_be_visible()
+    message_nodes = page.locator(".message")
+    textarea = page.locator("textarea.message-input")
+    expect(textarea).to_be_visible()
+    assert message_nodes.count() == 0
+    first_paint_layout = measure_landing_chat_layout(page)
+    assert 20 <= first_paint_layout["modelToTextareaGap"] <= 70
     expect(send_button).to_be_visible()
     expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
@@ -363,6 +391,11 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         """
     )
     page.wait_for_load_state("networkidle")
+    hydrated_layout = measure_landing_chat_layout(page)
+    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
+    assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
+    assert page.get_by_test_id("landing-model-select").input_value() == "llama-3.1-8b-instruct"
     assert_no_landing_console_regressions(errors)
 
 
@@ -715,8 +748,12 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     textarea.fill("Show markdown please")
     wait_for_landing_send_enabled(page).click()
 
+    user_message = page.locator(".user-message").last
+    user_message.wait_for(state="visible")
     assistant_message = page.locator(".assistant-message").last
     assistant_message.wait_for(state="visible")
+    expect(user_message).not_to_have_attribute("v-cloak", "")
+    expect(assistant_message).not_to_have_attribute("v-cloak", "")
 
     assert assistant_message.locator("strong").inner_text() == "Bold"
 

@@ -259,7 +259,7 @@ def test_dynamic_landing_nodes_are_not_cloaked_or_layout_conditional():
     assert '<template v-for="(message, index) in chatHistory">' in index_html
     assert ':key="message.id || `${message.role}-${index}`"' in index_html
     assert not re.search(
-        r'<div[^>]*v-for="message in chatHistory"',
+        r'<div\b(?=[^>]*\bv-for="[^"]*chatHistory[^"]*")[^>]*>',
         index_html,
     )
     assert not re.search(

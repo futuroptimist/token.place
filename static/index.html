@@ -518,9 +518,15 @@
                     Start a new chat
                 </button>
             </div>
-            <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
-                <span v-html="renderMarkdown(getDisplayContent(message))"></span>
-            </div>
+            <template v-for="(message, index) in chatHistory">
+                <div
+                    :key="message.id || `${message.role}-${index}`"
+                    :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}"
+                    class="message"
+                >
+                    <span v-html="renderMarkdown(getDisplayContent(message))"></span>
+                </div>
+            </template>
             <div class="input-container">
                 <textarea
                     ref="messageInput"

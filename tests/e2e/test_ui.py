@@ -321,17 +321,45 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         assert fragment not in body_text
         assert fragment not in raw_body_text
 
+    def measure_landing_chat_layout():
+        return page.evaluate(
+            """
+            () => {
+                const chat = document.querySelector('.chat-container');
+                const select = document.querySelector('[data-testid=landing-model-select]');
+                const textarea = document.querySelector('textarea.message-input');
+                if (!chat || !select || !textarea) {
+                    throw new Error('missing landing chat layout target');
+                }
+                const chatRect = chat.getBoundingClientRect();
+                const selectRect = select.getBoundingClientRect();
+                const textareaRect = textarea.getBoundingClientRect();
+                return {
+                    modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                    chatHeight: chatRect.height,
+                    textareaTopRelativeToChat: textareaRect.top - chatRect.top,
+                };
+            }
+            """
+        )
+
     status = page.locator(".compute-node-status")
     chat = page.locator(".chat-container")
     send_button = page.locator(".send-button")
+    textarea = page.locator("textarea.message-input")
+    model_select = page.get_by_test_id("landing-model-select")
     expect(status).to_be_visible()
     expect(chat).to_be_visible()
-    assert chat.bounding_box()["height"] >= 250
-    expect(page.locator("textarea.message-input")).to_be_visible()
+    first_paint_layout = measure_landing_chat_layout()
+    assert first_paint_layout["chatHeight"] >= 250
+    assert 0 <= first_paint_layout["modelToTextareaGap"] <= 70
+    expect(textarea).to_be_visible()
     expect(send_button).to_be_visible()
     expect(send_button).to_be_disabled()
-    expect(page.get_by_test_id("landing-model-select")).to_be_visible()
+    expect(model_select).to_be_visible()
     expect(page.get_by_test_id("landing-selected-server-failure")).not_to_be_visible()
+    assert page.locator(".message").count() == 0
+    assert page.locator(".message:visible").count() == 0
 
     status_text = status.inner_text().strip()
     assert "Updated" not in status_text
@@ -363,6 +391,10 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
         """
     )
     page.wait_for_load_state("networkidle")
+    hydrated_layout = measure_landing_chat_layout()
+    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
+    assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
     assert_no_landing_console_regressions(errors)
 
 
@@ -1208,7 +1240,13 @@ def test_landing_chat_model_dropdown_uses_api_v1_models(
     textarea.fill("Use the selected model")
     wait_for_landing_send_enabled(page).click()
 
-    page.locator(".assistant-message").last.wait_for(state="visible")
+    user_message = page.locator(".user-message").last
+    assistant_message = page.locator(".assistant-message").last
+    user_message.wait_for(state="visible")
+    assistant_message.wait_for(state="visible")
+    expect(user_message).not_to_have_attribute("v-cloak", "")
+    expect(assistant_message).not_to_have_attribute("v-cloak", "")
+    assert page.locator(".user-message[v-cloak], .assistant-message[v-cloak]").count() == 0
     assert state["relay_requests"], "expected the landing chat to POST an API v1 relay payload"
     request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
     assert request_envelope["api_v1_request"]["model"] == "api-v1-second-model"

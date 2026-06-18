@@ -1447,6 +1447,69 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
     ]
 
 
+def test_run_clears_registration_token_for_secondary_desktop_relays(monkeypatch):
+    _reset_cancel_queue()
+    captured = []
+
+    class TokenRelayClient:
+        def __init__(self, relay_url):
+            self.relay_url = relay_url
+            self._registration_token = 'private-registration-token'
+
+    class CapturingRuntime:
+        def __init__(self, config, **_kwargs):
+            captured.append(self)
+            self.model_manager = FakeModelManager()
+            self.relay_client = TokenRelayClient(config.relay_url)
+
+        def ensure_model_ready(self):
+            return True
+
+        def ensure_api_v1_runtime_ready(self):
+            return self.ensure_model_ready()
+
+        def register_and_poll_once(self):
+            return {'next_ping_in_x_seconds': 0}
+
+        def process_relay_request(self, _payload):
+            return True
+
+        def stop(self):
+            return None
+
+    module = ModuleType('utils.compute_node_runtime')
+    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
+        relay_url=relay_url,
+        relay_port=relay_port,
+        **kwargs,
+    )
+    module.ComputeNodeRuntime = CapturingRuntime
+    module.is_api_v1_relay_payload = lambda _payload: False
+    module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url.strip()
+    module.normalize_compute_mode = lambda mode: mode
+    module.apply_compute_mode = lambda _model_manager, mode: mode
+    module.SUPPORTED_COMPUTE_MODES = {'auto', 'cpu', 'cuda', 'metal'}
+    module.compute_mode_diagnostics = lambda _model_manager: {}
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url=['https://trusted.example', 'https://public.example'],
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert [runtime.relay_client.relay_url for runtime in captured] == [
+        'https://trusted.example',
+        'https://public.example',
+    ]
+    assert captured[0].relay_client._registration_token == 'private-registration-token'
+    assert captured[1].relay_client._registration_token is None
 
 def test_normalize_relay_urls_accepts_repeated_json_and_comma_values():
     assert compute_node_bridge._normalize_relay_urls(

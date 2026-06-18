@@ -714,6 +714,13 @@ def run(args: argparse.Namespace) -> int:
 
     runtime = make_runtime(relay_url)
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
+    for relay_runtime in runtimes[1:]:
+        relay_client = getattr(relay_runtime, "relay_client", None)
+        if relay_client is not None and hasattr(relay_client, "_registration_token"):
+            # The process-wide registration token belongs to the trusted primary relay.
+            # Secondary desktop relay pollers may include public, staging, or fallback
+            # relays, so fail closed by never forwarding that secret to them.
+            relay_client._registration_token = None
     for relay_runtime in runtimes:
         start_relay_session = getattr(relay_runtime, "start_relay_session", None)
         if callable(start_relay_session):

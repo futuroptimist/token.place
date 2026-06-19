@@ -72,6 +72,62 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
 # preserving abuse limits.
 RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(CONTROL_PLANE_ROUTE_LIMIT_ENVS)
 
+PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/", "/v1/")
+PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = ("/relay/api/v1/",)
+PUBLIC_API_V1_CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+PUBLIC_API_V1_CORS_ALLOW_HEADERS = "Content-Type, Accept"
+PUBLIC_API_V1_CORS_MAX_AGE = "600"
+
+
+def _is_public_api_v1_cors_path(path: str) -> bool:
+    """Return True when the public browser API v1 CORS policy applies."""
+
+    normalized_path = _normalized_path(path)
+    excluded = any(
+        normalized_path == prefix.rstrip("/") or normalized_path.startswith(prefix)
+        for prefix in PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES
+    )
+    return not excluded and any(
+        normalized_path == prefix.rstrip("/") or normalized_path.startswith(prefix)
+        for prefix in PUBLIC_API_V1_CORS_PREFIXES
+    )
+
+
+def _add_public_api_v1_cors_headers(response):
+    """Attach non-credentialed wildcard CORS headers for public API v1."""
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+    return response
+
+
+def _build_public_api_v1_preflight_response():
+    response = jsonify()
+    response.set_data(b"")
+    response.status_code = 204
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = PUBLIC_API_V1_CORS_ALLOW_METHODS
+    response.headers["Access-Control-Allow-Headers"] = PUBLIC_API_V1_CORS_ALLOW_HEADERS
+    response.headers["Access-Control-Max-Age"] = PUBLIC_API_V1_CORS_MAX_AGE
+    response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+    return response
+
+
+def _install_public_api_v1_cors(app) -> None:
+    """Install application-owned wildcard CORS for public API v1 routes."""
+
+    @app.before_request
+    def _handle_public_api_v1_cors_preflight():
+        if request.method == "OPTIONS" and _is_public_api_v1_cors_path(request.path):
+            return _build_public_api_v1_preflight_response()
+        return None
+
+    @app.after_request
+    def _apply_public_api_v1_cors(response):
+        if _is_public_api_v1_cors_path(request.path):
+            return _add_public_api_v1_cors_headers(response)
+        return response
+
 
 def _normalized_path(path: str) -> str:
     return path.rstrip("/") or "/"
@@ -135,7 +191,10 @@ def _relay_server_token_is_valid() -> bool:
 def _relay_server_token_boundary_has_configured_token() -> bool:
     """Return True only when this request matched an explicit relay token."""
 
-    return bool(_load_relay_server_registration_tokens()) and _relay_server_token_is_valid()
+    return (
+        bool(_load_relay_server_registration_tokens())
+        and _relay_server_token_is_valid()
+    )
 
 
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
@@ -145,6 +204,8 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
         return True
     if normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS:
+        return True
+    if request.method == "OPTIONS" and _is_public_api_v1_cors_path(normalized_path):
         return True
     return (
         request.method == "POST"
@@ -459,6 +520,8 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 
 def init_app(app):
     """Initialize the API with the Flask app."""
+
+    _install_public_api_v1_cors(app)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {

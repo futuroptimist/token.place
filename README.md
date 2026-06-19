@@ -967,7 +967,24 @@ POST /api/v1/chat/completions
 # or
 POST /v1/chat/completions
 ```
-Creates a completion for chat messages.
+Creates a non-streaming completion for chat messages. API v1 can be called directly by browser applications from arbitrary origins: token.place returns `Access-Control-Allow-Origin: *` on public `/api/v1/*` and `/v1/*` responses. Browser calls are non-credentialed and must not use cookies or token.place authorization headers; JSON POST clients should send `Content-Type: application/json`. API v2 remains outside this API v1 browser launch contract.
+
+Minimal browser example:
+```js
+const response = await fetch("https://token.place/api/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama-3-8b-instruct",
+    messages: [{ role: "user", content: "Hello from a browser app!" }],
+  }),
+});
+
+const completion = await response.json();
+```
 
 Request body:
 ```json

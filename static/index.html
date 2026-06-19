@@ -561,6 +561,20 @@
         <p>OpenAI-compatible aliases are also registered at <code>/v1/models</code>, <code>/v1/models/{model_id}</code>, <code>/v1/public-key</code>, <code>/v1/public-key/rotate</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/images/generations</code>, <code>/v1/health</code>, and <code>/v1/relay/unregister</code>.</p>
 
         <h3>Public/client API v1 launch contract</h3>
+        <p>Public API v1 routes under <code>/api/v1/*</code> and OpenAI-compatible <code>/v1/*</code> aliases are directly callable by browser applications from arbitrary origins. token.place owns this CORS contract in the application and returns <code>Access-Control-Allow-Origin: *</code>; calls are non-credentialed and must not use cookies or token.place authorization headers. JSON POST clients should send <code>Content-Type: application/json</code>. API v2 remains outside this launch contract.</p>
+        <p><strong>Minimal browser fetch:</strong></p>
+        <pre>const response = await fetch("https://token.place/api/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json"
+  },
+  body: JSON.stringify({
+    model: "llama-3-8b-instruct",
+    messages: [{ role: "user", content: "Hello from a browser app!" }]
+  })
+});
+const completion = await response.json();</pre>
 
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models</span></h3>

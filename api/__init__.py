@@ -43,8 +43,35 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
 
-PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/", "/v1/")
-PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = ("/relay/api/v1/",)
+PUBLIC_API_V1_CORS_PATHS = frozenset(
+    {
+        "/api/v1/chat/completions",
+        "/api/v1/community/contributions",
+        "/api/v1/community/contributions/summary",
+        "/api/v1/community/leaderboard",
+        "/api/v1/community/providers",
+        "/api/v1/completions",
+        "/api/v1/health",
+        "/api/v1/images/generations",
+        "/api/v1/models",
+        "/api/v1/public-key",
+        "/api/v1/server-providers",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/health",
+        "/v1/images/generations",
+        "/v1/models",
+        "/v1/public-key",
+    }
+)
+PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/models", "/v1/models")
+PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = (
+    "/api/v1/relay",
+    "/api/v1/public-key/rotate",
+    "/v1/relay",
+    "/v1/public-key/rotate",
+    "/relay/api/v1",
+)
 PUBLIC_API_V1_CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
 PUBLIC_API_V1_CORS_ALLOW_HEADERS = "Content-Type, Accept"
 PUBLIC_API_V1_CORS_MAX_AGE = "600"
@@ -55,12 +82,14 @@ def _is_public_api_v1_cors_path(path: str) -> bool:
 
     normalized_path = _normalized_path(path)
     if any(
-        normalized_path.startswith(prefix.rstrip("/"))
+        _path_matches_exact_or_child(normalized_path, prefix)
         for prefix in PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES
     ):
         return False
+    if normalized_path in PUBLIC_API_V1_CORS_PATHS:
+        return True
     return any(
-        normalized_path.startswith(prefix)
+        _path_matches_exact_or_child(normalized_path, prefix)
         for prefix in PUBLIC_API_V1_CORS_PREFIXES
     )
 
@@ -132,6 +161,11 @@ RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(CONTROL_PLANE_ROUTE_LIMIT_ENVS)
 
 def _normalized_path(path: str) -> str:
     return path.rstrip("/") or "/"
+
+
+def _path_matches_exact_or_child(path: str, prefix: str) -> bool:
+    normalized_prefix = _normalized_path(prefix)
+    return path == normalized_prefix or path.startswith(f"{normalized_prefix}/")
 
 
 def _loaded_relay_server_registration_tokens() -> list[str] | None:

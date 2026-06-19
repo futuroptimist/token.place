@@ -117,7 +117,7 @@ def test_api_v1_rate_limit_error_response_includes_wildcard_cors(client):
 
 def test_api_v1_get_response_includes_wildcard_cors(client):
     response = client.get(
-        "/api/v1/meta",
+        "/api/v1/public-key",
         headers={"Origin": "https://cors-smoke.invalid"},
     )
 
@@ -156,6 +156,13 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("options", "/api/v2/chat/completions"),
         ("options", "/v2/chat/completions"),
         ("post", "/relay/api/v1/chat/completions"),
+        ("options", "/relay/api/v12/chat/completions"),
+        ("options", "/relay/api/v1something/chat/completions"),
+        ("options", "/api/v1/relay/servers/register"),
+        ("options", "/api/v1/relay/servers/poll"),
+        ("options", "/api/v1/relay/responses"),
+        ("post", "/api/v1/public-key/rotate"),
+        ("post", "/v1/public-key/rotate"),
         ("get", "/"),
     ],
 )

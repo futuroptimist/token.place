@@ -119,6 +119,8 @@ def test_api_v1_rate_limit_error_response_includes_wildcard_cors(client):
     "method,path",
     [
         ("get", "/api/v1/models"),
+        ("get", "/api/v1/health"),
+        ("get", "/v1/health"),
         ("get", "/api/v1/relay/servers/next"),
         ("post", "/api/v1/relay/requests"),
         ("post", "/api/v1/relay/responses/retrieve"),
@@ -139,6 +141,8 @@ def test_api_v1_public_response_includes_wildcard_cors(client, method, path):
     [
         "/api/v1/chat/completions",
         "/v1/chat/completions",
+        "/api/v1/health",
+        "/v1/health",
         "/api/v1/relay/servers/next",
         "/api/v1/relay/requests",
         "/api/v1/relay/responses/retrieve",
@@ -193,8 +197,6 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("options", "/v1/relay/unregister"),
         ("options", "/api/v1/public-key/rotate"),
         ("options", "/v1/public-key/rotate"),
-        ("options", "/api/v1/health"),
-        ("options", "/v1/health"),
         ("post", "/api/v1/relay/servers/register"),
         ("post", "/api/v1/relay/servers/poll"),
         ("post", "/api/v1/relay/servers/unregister"),
@@ -203,8 +205,6 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("post", "/v1/relay/unregister"),
         ("post", "/api/v1/public-key/rotate"),
         ("post", "/v1/public-key/rotate"),
-        ("get", "/api/v1/health"),
-        ("get", "/v1/health"),
         ("get", "/"),
     ],
 )

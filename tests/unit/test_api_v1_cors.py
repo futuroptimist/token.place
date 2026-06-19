@@ -123,6 +123,7 @@ def test_api_v1_rate_limit_error_response_includes_wildcard_cors(client):
         ("get", "/v1/health"),
         ("get", "/api/v1/relay/servers/next"),
         ("post", "/api/v1/relay/requests"),
+        ("post", "/api/v1/relay/requests/cancel"),
         ("post", "/api/v1/relay/responses/retrieve"),
     ],
 )
@@ -145,6 +146,7 @@ def test_api_v1_public_response_includes_wildcard_cors(client, method, path):
         "/v1/health",
         "/api/v1/relay/servers/next",
         "/api/v1/relay/requests",
+        "/api/v1/relay/requests/cancel",
         "/api/v1/relay/responses/retrieve",
     ],
 )

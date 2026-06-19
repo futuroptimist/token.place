@@ -56,6 +56,7 @@ PUBLIC_API_V1_CORS_PATHS = frozenset(
         "/api/v1/models",
         "/api/v1/public-key",
         "/api/v1/relay/requests",
+        "/api/v1/relay/requests/cancel",
         "/api/v1/relay/responses/retrieve",
         "/api/v1/relay/servers/next",
         "/api/v1/server-providers",

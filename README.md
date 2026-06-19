@@ -938,7 +938,30 @@ RTX 4090-class hardware, is documented in [docs/api_v2_model_catalog.md](docs/ap
 
 All routes are served under `/api/v1` (preferred) and are also available at
 `/v1` for compatibility with standard OpenAI clients. Set the base URL to
-`https://token.place/api/v1`.
+`https://token.place/api/v1`. API v1 is directly callable from browser
+applications on arbitrary origins: token.place returns
+`Access-Control-Allow-Origin: *` for public API v1 and `/v1` alias responses.
+Browser calls are non-credentialed and must not use cookies or token.place
+Authorization headers; JSON POST clients should send
+`Content-Type: application/json`. API v2 remains outside this API v1 browser
+launch contract.
+
+Minimal browser example:
+
+```js
+const response = await fetch("https://token.place/api/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama-3-8b-instruct",
+    messages: [{ role: "user", content: "Hello from a browser app!" }],
+  }),
+});
+const completion = await response.json();
+```
 
 #### List Models
 ```

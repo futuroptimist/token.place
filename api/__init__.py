@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import jsonify, request
+from flask import Response, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -42,6 +42,36 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/responses": "1200/hour",
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
+
+API_V1_CORS_ALLOWED_METHODS = "GET, POST, OPTIONS"
+API_V1_CORS_ALLOWED_HEADERS = "Content-Type, Accept"
+API_V1_CORS_MAX_AGE = "600"
+API_V1_CORS_EXPOSE_HEADERS = "Retry-After"
+
+
+def _is_public_api_v1_cors_path(path: str) -> bool:
+    """Return True for browser-callable public API v1 paths."""
+
+    return path.startswith("/api/v1/") or path.startswith("/v1/")
+
+
+def _apply_public_api_v1_cors_headers(response):
+    """Attach the fixed wildcard CORS contract to public API v1 responses."""
+
+    if _is_public_api_v1_cors_path(request.path):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = API_V1_CORS_EXPOSE_HEADERS
+    return response
+
+
+def _build_public_api_v1_preflight_response():
+    response = Response(status=204)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = API_V1_CORS_ALLOWED_METHODS
+    response.headers["Access-Control-Allow-Headers"] = API_V1_CORS_ALLOWED_HEADERS
+    response.headers["Access-Control-Max-Age"] = API_V1_CORS_MAX_AGE
+    response.headers["Access-Control-Expose-Headers"] = API_V1_CORS_EXPOSE_HEADERS
+    return response
 
 # Paths that support operations, health checking, metrics scraping, and
 # diagnostics must not consume the public user API quota. Kubernetes readiness
@@ -140,6 +170,9 @@ def _relay_server_token_boundary_has_configured_token() -> bool:
 
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
+
+    if request.method == "OPTIONS" and _is_public_api_v1_cors_path(path):
+        return True
 
     normalized_path = _normalized_path(path)
     if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
@@ -459,6 +492,16 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 
 def init_app(app):
     """Initialize the API with the Flask app."""
+
+    @app.before_request
+    def _handle_public_api_v1_cors_preflight():
+        if request.method == "OPTIONS" and _is_public_api_v1_cors_path(request.path):
+            return _build_public_api_v1_preflight_response()
+        return None
+
+    @app.after_request
+    def _add_public_api_v1_cors_headers(response):
+        return _apply_public_api_v1_cors_headers(response)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {

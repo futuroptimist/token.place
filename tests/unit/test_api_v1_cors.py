@@ -115,9 +115,9 @@ def test_api_v1_rate_limit_error_response_includes_wildcard_cors(client):
     assert "Access-Control-Allow-Credentials" not in response.headers
 
 
-def test_api_v1_get_response_includes_wildcard_cors(client):
+def test_api_v1_public_get_response_includes_wildcard_cors(client):
     response = client.get(
-        "/api/v1/public-key",
+        "/api/v1/models",
         headers={"Origin": "https://cors-smoke.invalid"},
     )
 
@@ -160,9 +160,28 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("options", "/relay/api/v1something/chat/completions"),
         ("options", "/api/v1/relay/servers/register"),
         ("options", "/api/v1/relay/servers/poll"),
+        ("options", "/api/v1/relay/servers/unregister"),
+        ("options", "/api/v1/relay/servers/next"),
         ("options", "/api/v1/relay/responses"),
+        ("options", "/api/v1/relay/responses/retrieve"),
+        ("options", "/api/v1/relay/unregister"),
+        ("options", "/v1/relay/unregister"),
+        ("options", "/api/v1/public-key/rotate"),
+        ("options", "/v1/public-key/rotate"),
+        ("options", "/api/v1/health"),
+        ("options", "/v1/health"),
+        ("post", "/api/v1/relay/servers/register"),
+        ("post", "/api/v1/relay/servers/poll"),
+        ("post", "/api/v1/relay/servers/unregister"),
+        ("get", "/api/v1/relay/servers/next"),
+        ("post", "/api/v1/relay/responses"),
+        ("post", "/api/v1/relay/responses/retrieve"),
+        ("post", "/api/v1/relay/unregister"),
+        ("post", "/v1/relay/unregister"),
         ("post", "/api/v1/public-key/rotate"),
         ("post", "/v1/public-key/rotate"),
+        ("get", "/api/v1/health"),
+        ("get", "/v1/health"),
         ("get", "/"),
     ],
 )

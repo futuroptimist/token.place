@@ -26,6 +26,14 @@ from config import get_config
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 LOGGER = logging.getLogger("tokenplace.api")
 
+PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/", "/v1/")
+PUBLIC_API_V1_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Accept",
+    "Access-Control-Max-Age": "600",
+}
+
 CONTROL_PLANE_ROUTE_CLASS = "compute_node_control_plane"
 CONTROL_PLANE_DEFAULT_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_RATE_LIMIT"
 CONTROL_PLANE_IP_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT"
@@ -142,6 +150,8 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
 
     normalized_path = _normalized_path(path)
+    if request.method == "OPTIONS" and _is_public_api_v1_cors_path(normalized_path):
+        return True
     if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
         return True
     if normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS:
@@ -151,6 +161,38 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
         and normalized_path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
         and _relay_server_token_is_valid()
     )
+
+
+def _is_public_api_v1_cors_path(path: str) -> bool:
+    """Return True when the fixed public API v1 browser CORS policy applies."""
+
+    return path.startswith(PUBLIC_API_V1_CORS_PREFIXES)
+
+
+def _install_public_api_v1_cors(app) -> None:
+    """Install application-owned wildcard CORS for public API v1 routes."""
+
+    @app.before_request
+    def _handle_public_api_v1_preflight():
+        if request.method != "OPTIONS" or not _is_public_api_v1_cors_path(request.path):
+            return None
+
+        response = app.response_class(status=204)
+        for header, value in PUBLIC_API_V1_CORS_HEADERS.items():
+            response.headers[header] = value
+        return response
+
+    @app.after_request
+    def _add_public_api_v1_cors_headers(response):
+        if not _is_public_api_v1_cors_path(request.path):
+            return response
+
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+        if request.method == "OPTIONS":
+            for header, value in PUBLIC_API_V1_CORS_HEADERS.items():
+                response.headers.setdefault(header, value)
+        return response
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
@@ -459,6 +501,8 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 
 def init_app(app):
     """Initialize the API with the Flask app."""
+
+    _install_public_api_v1_cors(app)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {

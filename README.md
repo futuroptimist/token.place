@@ -940,6 +940,37 @@ All routes are served under `/api/v1` (preferred) and are also available at
 `/v1` for compatibility with standard OpenAI clients. Set the base URL to
 `https://token.place/api/v1`.
 
+#### Browser CORS for API v1
+
+API v1 is directly callable from browser applications on arbitrary origins.
+token.place owns this CORS contract in the application layer, so staging,
+production, and non-Sugarkube deployments return the same wildcard policy:
+`Access-Control-Allow-Origin: *`.
+
+Browser calls are non-credentialed: do not send cookies, token.place
+authorization headers, API keys, or bearer tokens. JSON `POST` clients should
+send `Content-Type: application/json`. API v2 remains outside the API v1 launch
+contract and does not inherit this browser CORS policy.
+
+Minimal browser example:
+
+```js
+const response = await fetch("https://token.place/api/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama-3.1-8b-instruct",
+    messages: [{ role: "user", content: "Hello from a browser app!" }],
+  }),
+});
+
+const completion = await response.json();
+console.log(completion);
+```
+
 #### List Models
 ```
 GET /api/v1/models

@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import jsonify, request
+from flask import Response, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -42,6 +42,104 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/responses": "1200/hour",
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
+
+PUBLIC_API_V1_CORS_PATHS = frozenset(
+    {
+        "/api/v1/chat/completions",
+        "/api/v1/community/contributions",
+        "/api/v1/community/contributions/summary",
+        "/api/v1/community/leaderboard",
+        "/api/v1/community/providers",
+        "/api/v1/completions",
+        "/api/v1/health",
+        "/api/v1/images/generations",
+        "/api/v1/models",
+        "/api/v1/public-key",
+        "/api/v1/relay/requests",
+        "/api/v1/relay/requests/cancel",
+        "/api/v1/relay/responses/retrieve",
+        "/api/v1/relay/servers/next",
+        "/api/v1/server-providers",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/health",
+        "/v1/images/generations",
+        "/v1/models",
+        "/v1/public-key",
+    }
+)
+PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/models", "/v1/models")
+PUBLIC_API_V1_CORS_EXCLUDED_PATHS = frozenset(
+    {
+        "/api/v1/public-key/rotate",
+        "/api/v1/relay/responses",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/unregister",
+        "/v1/public-key/rotate",
+        "/v1/relay/unregister",
+    }
+)
+PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = ("/relay/api/v1",)
+PUBLIC_API_V1_CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+PUBLIC_API_V1_CORS_ALLOW_HEADERS = "Content-Type, Accept"
+PUBLIC_API_V1_CORS_MAX_AGE = "600"
+
+
+def _is_public_api_v1_cors_path(path: str) -> bool:
+    """Return True when the public browser API v1 CORS policy applies."""
+
+    normalized_path = _normalized_path(path)
+    if normalized_path in PUBLIC_API_V1_CORS_EXCLUDED_PATHS:
+        return False
+    if any(
+        _path_matches_exact_or_child(normalized_path, prefix)
+        for prefix in PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES
+    ):
+        return False
+    if normalized_path in PUBLIC_API_V1_CORS_PATHS:
+        return True
+    return any(
+        _path_matches_exact_or_child(normalized_path, prefix)
+        for prefix in PUBLIC_API_V1_CORS_PREFIXES
+    )
+
+
+def _apply_public_api_v1_cors_headers(response):
+    """Attach the fixed non-credentialed wildcard CORS API v1 contract."""
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+    response.headers.pop("Access-Control-Allow-Credentials", None)
+    return response
+
+
+def _install_public_api_v1_cors(app) -> None:
+    """Install application-owned wildcard CORS for public API v1 routes."""
+
+    @app.before_request
+    def _handle_public_api_v1_cors_preflight():
+        if request.method != "OPTIONS" or not _is_public_api_v1_cors_path(request.path):
+            return None
+
+        response = Response(status=204)
+        _apply_public_api_v1_cors_headers(response)
+        response.headers["Access-Control-Allow-Methods"] = (
+            PUBLIC_API_V1_CORS_ALLOW_METHODS
+        )
+        response.headers["Access-Control-Allow-Headers"] = (
+            PUBLIC_API_V1_CORS_ALLOW_HEADERS
+        )
+        response.headers["Access-Control-Max-Age"] = PUBLIC_API_V1_CORS_MAX_AGE
+        return response
+
+    @app.after_request
+    def _add_public_api_v1_cors_headers(response):
+        if _is_public_api_v1_cors_path(request.path):
+            return _apply_public_api_v1_cors_headers(response)
+        return response
+
 
 # Paths that support operations, health checking, metrics scraping, and
 # diagnostics must not consume the public user API quota. Kubernetes readiness
@@ -75,6 +173,11 @@ RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(CONTROL_PLANE_ROUTE_LIMIT_ENVS)
 
 def _normalized_path(path: str) -> str:
     return path.rstrip("/") or "/"
+
+
+def _path_matches_exact_or_child(path: str, prefix: str) -> bool:
+    normalized_prefix = _normalized_path(prefix)
+    return path == normalized_prefix or path.startswith(f"{normalized_prefix}/")
 
 
 def _loaded_relay_server_registration_tokens() -> list[str] | None:
@@ -143,6 +246,8 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
 
     normalized_path = _normalized_path(path)
     if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
+        return True
+    if request.method == "OPTIONS" and _is_public_api_v1_cors_path(normalized_path):
         return True
     if normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS:
         return True
@@ -459,6 +564,8 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 
 def init_app(app):
     """Initialize the API with the Flask app."""
+
+    _install_public_api_v1_cors(app)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {

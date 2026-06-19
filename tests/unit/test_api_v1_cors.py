@@ -115,14 +115,41 @@ def test_api_v1_rate_limit_error_response_includes_wildcard_cors(client):
     assert "Access-Control-Allow-Credentials" not in response.headers
 
 
-def test_api_v1_public_get_response_includes_wildcard_cors(client):
-    response = client.get(
-        "/api/v1/models",
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/api/v1/models"),
+        ("get", "/api/v1/relay/servers/next"),
+        ("post", "/api/v1/relay/requests"),
+        ("post", "/api/v1/relay/responses/retrieve"),
+    ],
+)
+def test_api_v1_public_response_includes_wildcard_cors(client, method, path):
+    response = getattr(client, method)(
+        path,
         headers={"Origin": "https://cors-smoke.invalid"},
     )
 
-    assert response.status_code == 200
     assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert "Access-Control-Allow-Credentials" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/chat/completions",
+        "/v1/chat/completions",
+        "/api/v1/relay/servers/next",
+        "/api/v1/relay/requests",
+        "/api/v1/relay/responses/retrieve",
+    ],
+)
+def test_api_v1_public_preflight_includes_wildcard_cors(client, path):
+    response = _preflight(client, path)
+
+    assert response.status_code in {200, 204}
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert "content-type" in _header_values(response, "Access-Control-Allow-Headers")
     assert "Access-Control-Allow-Credentials" not in response.headers
 
 
@@ -161,9 +188,7 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("options", "/api/v1/relay/servers/register"),
         ("options", "/api/v1/relay/servers/poll"),
         ("options", "/api/v1/relay/servers/unregister"),
-        ("options", "/api/v1/relay/servers/next"),
         ("options", "/api/v1/relay/responses"),
-        ("options", "/api/v1/relay/responses/retrieve"),
         ("options", "/api/v1/relay/unregister"),
         ("options", "/v1/relay/unregister"),
         ("options", "/api/v1/public-key/rotate"),
@@ -173,9 +198,7 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("post", "/api/v1/relay/servers/register"),
         ("post", "/api/v1/relay/servers/poll"),
         ("post", "/api/v1/relay/servers/unregister"),
-        ("get", "/api/v1/relay/servers/next"),
         ("post", "/api/v1/relay/responses"),
-        ("post", "/api/v1/relay/responses/retrieve"),
         ("post", "/api/v1/relay/unregister"),
         ("post", "/v1/relay/unregister"),
         ("post", "/api/v1/public-key/rotate"),

@@ -54,6 +54,9 @@ PUBLIC_API_V1_CORS_PATHS = frozenset(
         "/api/v1/images/generations",
         "/api/v1/models",
         "/api/v1/public-key",
+        "/api/v1/relay/requests",
+        "/api/v1/relay/responses/retrieve",
+        "/api/v1/relay/servers/next",
         "/api/v1/server-providers",
         "/v1/chat/completions",
         "/v1/completions",
@@ -63,13 +66,19 @@ PUBLIC_API_V1_CORS_PATHS = frozenset(
     }
 )
 PUBLIC_API_V1_CORS_PREFIXES = ("/api/v1/models", "/v1/models")
-PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = (
-    "/api/v1/relay",
-    "/api/v1/public-key/rotate",
-    "/v1/relay",
-    "/v1/public-key/rotate",
-    "/relay/api/v1",
+PUBLIC_API_V1_CORS_EXCLUDED_PATHS = frozenset(
+    {
+        "/api/v1/public-key/rotate",
+        "/api/v1/relay/responses",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/unregister",
+        "/v1/public-key/rotate",
+        "/v1/relay/unregister",
+    }
 )
+PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES = ("/relay/api/v1",)
 PUBLIC_API_V1_CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
 PUBLIC_API_V1_CORS_ALLOW_HEADERS = "Content-Type, Accept"
 PUBLIC_API_V1_CORS_MAX_AGE = "600"
@@ -79,6 +88,8 @@ def _is_public_api_v1_cors_path(path: str) -> bool:
     """Return True when the public browser API v1 CORS policy applies."""
 
     normalized_path = _normalized_path(path)
+    if normalized_path in PUBLIC_API_V1_CORS_EXCLUDED_PATHS:
+        return False
     if any(
         _path_matches_exact_or_child(normalized_path, prefix)
         for prefix in PUBLIC_API_V1_CORS_EXCLUDED_PREFIXES

@@ -808,11 +808,15 @@ def healthz():
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    active_upstream_servers = [] if relay_only_mode else configured_servers
+    required_upstream_servers = configured_servers if require_upstream_health else []
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
         "upstreamHealthRequired": require_upstream_health,
         "relayOnly": relay_only_mode,
+        "activeUpstreamServers": active_upstream_servers,
+        "requiredUpstreamServers": required_upstream_servers,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
@@ -1068,9 +1072,14 @@ def relay_diagnostics():
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
+    relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    active_upstream_servers = [] if relay_only_mode else configured_servers
+    required_upstream_servers = configured_servers if require_upstream_health else []
     diagnostics = {
-        "relay_only": (not require_upstream_health) and (not explicit_upstream_config),
+        "relay_only": relay_only_mode,
         "upstream_health_required": require_upstream_health,
+        "active_upstream_servers": active_upstream_servers,
+        "required_upstream_servers": required_upstream_servers,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
         "api_v1_registered_compute_nodes": api_v1_live_nodes,

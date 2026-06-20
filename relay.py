@@ -309,6 +309,26 @@ def _has_explicit_relay_upstream_config(configured_servers: List[str] | None = N
     return False
 
 
+def _upstream_reporting_state(configured_servers: List[str]) -> Dict[str, Any]:
+    """Return explicit upstream dependency fields for health and diagnostics output."""
+
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
+    relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    active_upstream_servers = [] if relay_only_mode else configured_servers
+    required_upstream_servers = configured_servers if require_upstream_health else []
+    legacy_configured_upstream_servers = [] if explicit_upstream_config else configured_servers
+    fallback_upstream_servers = legacy_configured_upstream_servers
+    return {
+        "relay_only": relay_only_mode,
+        "upstream_health_required": require_upstream_health,
+        "active_upstream_servers": active_upstream_servers,
+        "required_upstream_servers": required_upstream_servers,
+        "legacy_configured_upstream_servers": legacy_configured_upstream_servers,
+        "fallback_upstream_servers": fallback_upstream_servers,
+    }
+
+
 def _load_upstream_config() -> Dict[str, Any]:
     upstream_override = os.environ.get(UPSTREAM_URL_ENV)
     parsed_host = None
@@ -805,20 +825,22 @@ def healthz():
     _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
-    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
-    explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
-    relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    upstream_reporting = _upstream_reporting_state(configured_servers)
+    require_upstream_health = upstream_reporting["upstream_health_required"]
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
         "upstreamHealthRequired": require_upstream_health,
-        "relayOnly": relay_only_mode,
+        "relayOnly": upstream_reporting["relay_only"],
+        "activeUpstreamServers": upstream_reporting["active_upstream_servers"],
+        "requiredUpstreamServers": upstream_reporting["required_upstream_servers"],
+        "fallbackUpstreamServers": upstream_reporting["fallback_upstream_servers"],
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
     }
     status["configuredUpstreamServers"] = configured_servers
-    status["legacyConfiguredUpstreamServers"] = [] if explicit_upstream_config else configured_servers
+    status["legacyConfiguredUpstreamServers"] = upstream_reporting["legacy_configured_upstream_servers"]
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -1066,17 +1088,19 @@ def relay_diagnostics():
     live_nodes = _live_server_diagnostics()
     api_v1_live_nodes = _live_server_diagnostics(api_v1_only=True)
     configured_servers = app.config.get("relay_configured_servers", [])
-    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
-    explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
+    upstream_reporting = _upstream_reporting_state(configured_servers)
     diagnostics = {
-        "relay_only": (not require_upstream_health) and (not explicit_upstream_config),
-        "upstream_health_required": require_upstream_health,
+        "relay_only": upstream_reporting["relay_only"],
+        "upstream_health_required": upstream_reporting["upstream_health_required"],
+        "active_upstream_servers": upstream_reporting["active_upstream_servers"],
+        "required_upstream_servers": upstream_reporting["required_upstream_servers"],
+        "fallback_upstream_servers": upstream_reporting["fallback_upstream_servers"],
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
         "api_v1_registered_compute_nodes": api_v1_live_nodes,
         "total_api_v1_registered_compute_nodes": len(api_v1_live_nodes),
         "configured_upstream_servers": configured_servers,
-        "legacy_configured_upstream_servers": [] if explicit_upstream_config else configured_servers,
+        "legacy_configured_upstream_servers": upstream_reporting["legacy_configured_upstream_servers"],
     }
     response = jsonify(diagnostics)
     response.headers["Cache-Control"] = "no-store"

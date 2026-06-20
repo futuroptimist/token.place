@@ -536,8 +536,11 @@ After (explicit relay-only semantics):
   "relayOnly": true,
   "upstreamHealthRequired": false,
   "knownServers": 0,
+  "activeUpstreamServers": [],
+  "requiredUpstreamServers": [],
   "configuredUpstreamServers": ["https://token.place"],
   "legacyConfiguredUpstreamServers": ["https://token.place"],
+  "fallbackUpstreamServers": ["https://token.place"],
   "upstream": "http://gpu-server:3000",
   "details": {"knownServers": "empty"}
 }
@@ -546,8 +549,16 @@ After (explicit relay-only semantics):
 Interpretation:
 - `status: ok` reflects relay process readiness.
 - `knownServers: 0` means no registered external compute nodes yet (expected before node registration).
+- `activeUpstreamServers: []` and `requiredUpstreamServers: []` are the explicit signal that
+  relay-only staging is not actively dispatching to, or requiring readiness from, prod
+  `https://token.place`.
 - `configuredUpstreamServers` is retained as a stable compatibility key.
-- `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
+- `legacyConfiguredUpstreamServers` and `fallbackUpstreamServers` represent compatibility/default
+  fallback config, not a required staging dependency.
+- In `/relay/diagnostics`, use the snake_case equivalents (`relay_only`,
+  `upstream_health_required`, `active_upstream_servers`, `required_upstream_servers`, and
+  `legacy_configured_upstream_servers`) together with the registered compute-node counts to decide
+  whether a relay-only deployment has capacity.
 
 ## Guardrails
 

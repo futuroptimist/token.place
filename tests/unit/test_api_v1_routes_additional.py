@@ -286,6 +286,90 @@ def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monk
     assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
 
 
+def test_chat_completion_relay_only_uses_compute_node_path_without_local_llama(client, monkeypatch):
+    captured = {}
+
+    class _RelayOnlyProvider:
+        def complete_chat(self, model_id, messages, options):
+            assert model_id == "llama-3.1-8b-instruct"
+            return {"role": "assistant", "content": "Relay reply"}
+
+    def fake_provider_for_mode(**kwargs):
+        captured.update(kwargs)
+        return _RelayOnlyProvider()
+
+    def local_provider_should_not_be_used():
+        raise AssertionError("relay-only chat must not select local llama.cpp inference")
+
+    payload = {
+        "model": "llama-3.1-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
+    monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", local_provider_should_not_be_used)
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider_for_mode", fake_provider_for_mode)
+    monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.get_json()["choices"][0]["message"]["content"] == "Relay reply"
+    assert captured["mode"] == "distributed"
+    assert captured["distributed_fallback_enabled"] is False
+    assert captured["distributed_target_selection"].relay_only is True
+    assert captured["distributed_target_selection"].url == "https://staging.token.place"
+
+
+def test_chat_completion_relay_only_no_compute_node_returns_relay_specific_error(client, monkeypatch):
+    class _RelayOnlyProvider:
+        def complete_chat(self, model_id, messages, options):
+            raise compute_provider.ComputeProviderError(
+                "relay reported no registered compute nodes",
+                code="no_registered_compute_nodes",
+                error_type="service_unavailable_error",
+                public_message="No LLM servers are available right now.",
+                status_code=503,
+            )
+
+    payload = {
+        "model": "llama-3.1-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3.1-8b-instruct"}])
+    monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider_for_mode", lambda **_kwargs: _RelayOnlyProvider())
+    monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json=payload,
+        headers={"Origin": "https://staging.democratized.space"},
+    )
+
+    assert response.status_code == 503
+    body = response.get_json()
+    assert body["error"]["code"] == "no_registered_compute_nodes"
+    assert body["error"]["type"] == "service_unavailable_error"
+    assert "llama-cpp-python is not installed" not in body["error"]["message"]
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
 def test_chat_completion_rejects_streaming_for_api_v1(client, monkeypatch):
     provider_called = {"value": False}
 

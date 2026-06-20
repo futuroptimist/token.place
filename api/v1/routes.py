@@ -5,7 +5,7 @@ This module follows OpenAI API conventions to serve as a drop-in replacement.
 
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, current_app, request, jsonify
 import base64
 import time
 import zlib
@@ -232,6 +232,81 @@ def _request_relay_base_url() -> str:
     """Return a trusted API v1 relay base URL for desktop bridge work."""
 
     return _request_relay_target_selection().url
+
+
+def _env_truthy(value: str | None, *, default: bool = False) -> bool:
+    """Parse common boolean environment values without importing relay.py."""
+
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_explicit_relay_upstream_config() -> bool:
+    """Return True when relay upstreams were explicitly configured."""
+
+    for env_name in (
+        "TOKEN_PLACE_RELAY_UPSTREAMS",
+        "PERSONAL_GAMING_PC_URL",
+        "TOKENPLACE_RELAY_UPSTREAM_URL",
+    ):
+        if os.environ.get(env_name, "").strip():
+            return True
+
+    configured_servers = current_app.config.get("relay_configured_servers", [])
+    if not isinstance(configured_servers, list):
+        return False
+
+    normalized_servers = {
+        server.strip().rstrip("/").lower()
+        for server in configured_servers
+        if isinstance(server, str) and server.strip()
+    }
+    return bool(normalized_servers and normalized_servers != {"https://token.place"})
+
+
+def _request_relay_only_target_selection() -> DistributedTargetSelection | None:
+    """Select same-relay API v1 routing when this process is relay-only."""
+
+    if _env_truthy(os.environ.get("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"), default=False):
+        return None
+    if _has_explicit_relay_upstream_config():
+        return None
+
+    target_selection = get_api_v1_distributed_target_selection()
+    if target_selection.url and target_selection.relay_only:
+        return target_selection
+
+    public_base_url = current_app.config.get("public_base_url") or os.environ.get("TOKENPLACE_PUBLIC_BASE_URL")
+    if isinstance(public_base_url, str) and public_base_url.strip():
+        return DistributedTargetSelection(
+            url=public_base_url.strip().rstrip("/"),
+            source="relay_only_public_base_url",
+            relay_only=True,
+        )
+
+    return None
+
+
+def _select_chat_completion_provider(*, force_desktop_bridge_distributed: bool):
+    """Resolve the API v1 chat provider with relay-only precedence."""
+
+    if force_desktop_bridge_distributed:
+        return get_api_v1_compute_provider_for_mode(
+            mode="distributed",
+            distributed_target_selection=_request_relay_target_selection(),
+            distributed_fallback_enabled=False,
+        )
+
+    relay_only_target = _request_relay_only_target_selection()
+    if relay_only_target is not None:
+        return get_api_v1_compute_provider_for_mode(
+            mode="distributed",
+            distributed_target_selection=relay_only_target,
+            distributed_fallback_enabled=False,
+        )
+
+    return get_api_v1_compute_provider()
 
 
 def _get_service_name() -> str:
@@ -493,14 +568,8 @@ def _handle_chat_completion_request(data):
         )
 
         log_info(f"Generating response using model {model_id}")
-        provider = (
-            get_api_v1_compute_provider_for_mode(
-                mode="distributed",
-                distributed_target_selection=_request_relay_target_selection(),
-                distributed_fallback_enabled=False,
-            )
-            if force_desktop_bridge_distributed
-            else get_api_v1_compute_provider()
+        provider = _select_chat_completion_provider(
+            force_desktop_bridge_distributed=force_desktop_bridge_distributed,
         )
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)

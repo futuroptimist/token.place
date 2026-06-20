@@ -1303,6 +1303,9 @@ def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
 def test_healthz_requires_upstream_health_when_env_enabled(client, monkeypatch):
     """healthz should degrade when upstream resolution is required and fails."""
     monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
+    monkeypatch.setitem(
+        app.config, "upstream_url", "http://definitely-not-resolvable.invalid:3000"
+    )
     monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
     monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "1")
     monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
@@ -1315,9 +1318,35 @@ def test_healthz_requires_upstream_health_when_env_enabled(client, monkeypatch):
     assert payload["upstreamHealthRequired"] is True
     assert payload["relayOnly"] is False
     assert payload["activeUpstreamServers"] == ["https://token.place"]
-    assert payload["requiredUpstreamServers"] == ["https://token.place"]
+    assert payload["requiredUpstreamServers"] == [
+        "http://definitely-not-resolvable.invalid:3000"
+    ]
     assert payload["details"]["gpuHostResolution"] == "failed"
 
+
+def test_healthz_required_upstreams_report_checked_upstream_url(client, monkeypatch):
+    """Required upstreams should name the checked URL, not the configured pool."""
+    monkeypatch.setitem(app.config, "gpu_host", "gpu-server")
+    monkeypatch.setitem(app.config, "upstream_url", "http://gpu-server:3000")
+    monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: True)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "1")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_UPSTREAMS", "https://node-a")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://node-a"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["activeUpstreamServers"] == ["https://node-a"]
+    assert payload["requiredUpstreamServers"] == ["http://gpu-server:3000"]
+
+    diagnostics_response = client.get("/relay/diagnostics")
+    diagnostics_payload = diagnostics_response.get_json()
+
+    assert diagnostics_response.status_code == 200
+    assert diagnostics_payload["active_upstream_servers"] == ["https://node-a"]
+    assert diagnostics_payload["required_upstream_servers"] == ["http://gpu-server:3000"]
 
 def test_healthz_staging_relay_only_does_not_imply_prod_upstream(client, monkeypatch):
     """Staging relay-only health should be OK with zero registered external nodes."""

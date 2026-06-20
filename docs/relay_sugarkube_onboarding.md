@@ -550,6 +550,9 @@ Interpretation:
 - `knownServers: 0` means no registered external compute nodes yet (expected before node registration).
 - `activeUpstreamServers: []` means the relay-only process is not actively using the compatibility fallback pool for readiness.
 - `requiredUpstreamServers: []` plus `upstreamHealthRequired: false` means readiness does not depend on `https://token.place` or any other upstream.
+- When `upstreamHealthRequired: true`, `requiredUpstreamServers` reports the concrete
+  `upstream` URL that `/healthz` actually checks, not every URL retained in the
+  compatibility/configured upstream pool.
 - `configuredUpstreamServers` is retained as a stable compatibility key.
 - `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
 - Operators should rely on `relayOnly`, `upstreamHealthRequired`, `activeUpstreamServers`, `requiredUpstreamServers`, and registered compute-node counts when judging relay-only readiness.

@@ -309,6 +309,16 @@ def _has_explicit_relay_upstream_config(configured_servers: List[str] | None = N
     return False
 
 
+def _required_upstream_health_servers() -> List[str]:
+    """Return upstream resources actually checked when upstream health is required."""
+
+    upstream_url = app.config.get("upstream_url")
+    if not isinstance(upstream_url, str):
+        return []
+    upstream_url = upstream_url.strip()
+    return [upstream_url] if upstream_url else []
+
+
 def _load_upstream_config() -> Dict[str, Any]:
     upstream_override = os.environ.get(UPSTREAM_URL_ENV)
     parsed_host = None
@@ -809,7 +819,9 @@ def healthz():
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
     active_upstream_servers = [] if relay_only_mode else configured_servers
-    required_upstream_servers = configured_servers if require_upstream_health else []
+    required_upstream_servers = (
+        _required_upstream_health_servers() if require_upstream_health else []
+    )
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
@@ -1074,7 +1086,9 @@ def relay_diagnostics():
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
     active_upstream_servers = [] if relay_only_mode else configured_servers
-    required_upstream_servers = configured_servers if require_upstream_health else []
+    required_upstream_servers = (
+        _required_upstream_health_servers() if require_upstream_health else []
+    )
     diagnostics = {
         "relay_only": relay_only_mode,
         "upstream_health_required": require_upstream_health,

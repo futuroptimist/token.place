@@ -42,6 +42,7 @@ from api.v1.compute_provider import (
     get_api_v1_compute_provider,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_distributed_target_selection,
+    is_api_v1_implicit_relay_only_selection,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
     reset_api_v1_generate_response_override,
@@ -614,18 +615,15 @@ def _handle_chat_completion_request(data):
             f"path={execution_backend_path} detail={str(e)}"
         )
         try:
-            relay_only_error = get_api_v1_distributed_target_selection().relay_only
+            implicit_relay_only_error = is_api_v1_implicit_relay_only_selection()
         except Exception:
-            relay_only_error = False
-        provider_mode_configured = bool(
-            os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip()
-        )
+            implicit_relay_only_error = False
         public_code = (
             "no_compute_node_available"
             if (
                 e.code == "no_registered_compute_nodes"
-                and relay_only_error
-                and not provider_mode_configured
+                and implicit_relay_only_error
+                and not force_desktop_bridge_distributed
             )
             else e.code
         )

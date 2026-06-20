@@ -77,6 +77,21 @@ def _registered_routes() -> set[tuple[str, str]]:
     return routes
 
 
+def _clear_distributed_target_env(monkeypatch):
+    for env_name in (
+        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
+        "TOKENPLACE_RELAY_PUBLIC_URL",
+        "TOKEN_PLACE_RELAY_PUBLIC_URL",
+        "RELAY_PUBLIC_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+
 @pytest.fixture
 def client():
     relay.app.config["TESTING"] = True
@@ -275,6 +290,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
 ):
     compute_provider._build_api_v1_compute_provider.cache_clear()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
     monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
     monkeypatch.setattr(
@@ -336,6 +352,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
 ):
     compute_provider._build_api_v1_compute_provider.cache_clear()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
     monkeypatch.setattr(
         routes,
@@ -377,8 +394,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
 def test_local_public_chat_still_reports_missing_llama_dependency(monkeypatch, client):
     compute_provider._build_api_v1_compute_provider.cache_clear()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
-    monkeypatch.delenv("TOKENPLACE_RELAY_PUBLIC_URL", raising=False)
-    monkeypatch.delenv("TOKENPLACE_RELAY_INTERNAL_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
 
     response = client.post(
         "/api/v1/chat/completions",

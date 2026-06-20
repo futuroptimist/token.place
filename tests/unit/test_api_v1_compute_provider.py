@@ -13,6 +13,21 @@ from api.v1.compute_provider import (
 from relay import app
 
 
+def _clear_distributed_target_env(monkeypatch):
+    for env_name in (
+        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
+        "TOKENPLACE_RELAY_PUBLIC_URL",
+        "TOKEN_PLACE_RELAY_PUBLIC_URL",
+        "RELAY_PUBLIC_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+
 class _FakeResponse:
     def __init__(self, status_code, payload):
         self.status_code = status_code
@@ -546,6 +561,34 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_bridge_error"
         assert "compute node reported error" in str(exc)
+
+def test_public_relay_url_implicitly_selects_distributed_without_fallback(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert compute_provider.is_api_v1_implicit_relay_only_selection() is True
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_internal_relay_url_does_not_implicitly_self_dispatch(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:8080")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.LocalApiV1ComputeProvider)
+        assert compute_provider.is_api_v1_implicit_relay_only_selection() is False
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
 
 
 def test_get_provider_disables_local_fallback_when_configured(monkeypatch):

@@ -729,6 +729,26 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     )
 
 
+def is_api_v1_implicit_relay_only_selection(
+    target_selection: DistributedTargetSelection | None = None,
+) -> bool:
+    """Return True when env should implicitly select relay-only distributed mode.
+
+    Only public relay URLs are auto-selected. Internal loopback relay URLs may
+    point back at the same Gunicorn worker pool, so they require an explicit
+    provider mode to avoid blocking relay self-dispatch by default.
+    """
+
+    if os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
+        return False
+    selection = target_selection or _select_distributed_target()
+    return (
+        bool(selection.url)
+        and selection.relay_only
+        and selection.source.startswith("relay_public_env:")
+    )
+
+
 def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
     """Read and normalize API v1 provider environment configuration.
 
@@ -746,7 +766,7 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
         not in {"0", "false", "no", "off"}
     )
 
-    if not configured_mode and target_selection.relay_only and target_selection.url:
+    if is_api_v1_implicit_relay_only_selection(target_selection):
         mode = "distributed"
         distributed_fallback_enabled = False
 

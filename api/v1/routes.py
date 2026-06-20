@@ -613,10 +613,26 @@ def _handle_chat_completion_request(data):
             f"code={e.code} status={e.status_code} "
             f"path={execution_backend_path} detail={str(e)}"
         )
+        try:
+            relay_only_error = get_api_v1_distributed_target_selection().relay_only
+        except Exception:
+            relay_only_error = False
+        provider_mode_configured = bool(
+            os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip()
+        )
+        public_code = (
+            "no_compute_node_available"
+            if (
+                e.code == "no_registered_compute_nodes"
+                and relay_only_error
+                and not provider_mode_configured
+            )
+            else e.code
+        )
         return format_error_response(
             e.public_message,
             error_type=e.error_type,
-            code=e.code,
+            code=public_code,
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors

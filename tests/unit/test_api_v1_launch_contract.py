@@ -59,7 +59,9 @@ INTERNAL_RELAY_LIFECYCLE_ROUTES = {
     ("POST", "/relay/api/v1/source"),
 }
 
-DOCUMENTED_INTERNAL_ROUTES = COMPUTE_NODE_CONTROL_PLANE_ROUTES | INTERNAL_RELAY_LIFECYCLE_ROUTES
+DOCUMENTED_INTERNAL_ROUTES = (
+    COMPUTE_NODE_CONTROL_PLANE_ROUTES | INTERNAL_RELAY_LIFECYCLE_ROUTES
+)
 
 
 def _normalise_rule(rule: str) -> str:
@@ -94,7 +96,9 @@ def test_no_unclassified_api_v1_routes_leak_into_launch_contract():
     registered_api_v1 = {
         (method, path)
         for method, path in _registered_routes()
-        if path.startswith("/api/v1/") or path.startswith("/v1/") or path.startswith("/relay/api/v1/")
+        if path.startswith("/api/v1/")
+        or path.startswith("/v1/")
+        or path.startswith("/relay/api/v1/")
     }
     expected = PUBLIC_CLIENT_ROUTES | OPENAI_V1_ALIASES | DOCUMENTED_INTERNAL_ROUTES
 
@@ -109,7 +113,7 @@ def test_landing_page_documents_every_public_client_api_v1_route():
     public_section = html.split("Internal relay control-plane routes", 1)[0]
 
     for method, path in sorted(PUBLIC_CLIENT_ROUTES):
-        assert f"{method}</span> <span class=\"api-path\">{path}</span>" in public_section
+        assert f'{method}</span> <span class="api-path">{path}</span>' in public_section
 
 
 def test_landing_page_documents_openai_aliases_and_excludes_api_v2_launch_docs():
@@ -133,7 +137,9 @@ def test_landing_page_freezes_single_meta_llama_model_without_owner_display():
 
 def test_compute_node_control_plane_routes_are_documented_separately():
     html = INDEX_HTML.read_text(encoding="utf-8")
-    public_section, internal_section = html.split("Internal relay control-plane routes", 1)
+    public_section, internal_section = html.split(
+        "Internal relay control-plane routes", 1
+    )
 
     for method, path in sorted(COMPUTE_NODE_CONTROL_PLANE_ROUTES):
         assert f"{method} {path}" not in public_section
@@ -231,3 +237,158 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
     assert result == {"role": "assistant", "content": "request-local bridge"}
     assert compute_provider.generate_response is original_compute_generator
     assert compute_provider._active_generate_response() is original_compute_generator
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        import copy
+
+        return copy.deepcopy(self._payload)
+
+
+class _FakeCryptoManager:
+    public_key_b64 = "client-public-key"
+
+    def __init__(self):
+        self._encrypted = {}
+
+    def encrypt_message(self, message, _server_public_key):
+        token = f"cipher-{len(self._encrypted) + 1}"
+        self._encrypted[token] = message.copy()
+        return {
+            "chat_history": token,
+            "cipherkey": "encrypted-key",
+            "iv": "encrypted-iv",
+        }
+
+    def decrypt_message(self, encrypted_payload):
+        payload = self._encrypted.get(encrypted_payload.get("chat_history"))
+        return payload.copy() if isinstance(payload, dict) else payload
+
+
+def test_relay_only_public_chat_uses_compute_node_without_local_llama(
+    monkeypatch, client
+):
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(
+        routes,
+        "generate_response",
+        lambda *_args, **_kwargs: pytest.fail("local inference was called"),
+    )
+    fake_crypto = _FakeCryptoManager()
+
+    def fake_get(url, timeout):
+        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        if url == "https://staging.token.place/api/v1/relay/requests":
+            assert "messages" not in json
+            return _FakeResponse(200, {"status": "queued"})
+        if url == "https://staging.token.place/api/v1/relay/responses/retrieve":
+            encrypted = fake_crypto.encrypt_message(
+                {
+                    "protocol": "tokenplace_api_v1_relay_e2ee",
+                    "request_id": json["request_id"],
+                    "client_public_key": fake_crypto.public_key_b64,
+                    "api_v1_response": {
+                        "message": {"role": "assistant", "content": "hello from relay"}
+                    },
+                },
+                fake_crypto.public_key_b64,
+            )
+            return _FakeResponse(200, encrypted)
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["choices"][0]["message"]["content"] == "hello from relay"
+    assert (
+        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+    )
+
+
+def test_relay_only_public_chat_without_compute_node_returns_relay_error(
+    monkeypatch, client
+):
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setattr(
+        routes,
+        "generate_response",
+        lambda *_args, **_kwargs: pytest.fail("local inference was called"),
+    )
+
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(
+            503,
+            {
+                "error": {
+                    "code": "no_registered_compute_nodes",
+                    "message": "No registered compute nodes",
+                }
+            },
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        headers={"Origin": "https://staging.democratized.space"},
+    )
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["type"] == "service_unavailable_error"
+    assert payload["error"]["code"] == "no_compute_node_available"
+    assert "llama-cpp-python is not installed" not in payload["error"]["message"]
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
+def test_local_public_chat_still_reports_missing_llama_dependency(monkeypatch, client):
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_INTERNAL_URL", raising=False)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["type"] == "model_unavailable"
+    assert "llama-cpp-python is not installed" in payload["error"]["message"]

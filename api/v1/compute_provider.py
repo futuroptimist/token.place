@@ -730,14 +730,27 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
 
 
 def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
-    """Read and normalize API v1 provider environment configuration."""
+    """Read and normalize API v1 provider environment configuration.
 
-    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
+    Relay-only deployments publish the relay URL instead of a local model
+    runtime. Treat that as an explicit distributed API v1 target so public chat
+    requests do not fall through to the in-process llama.cpp loader. Local mode
+    remains the default when no relay-only target is configured.
+    """
+
+    configured_mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip().lower()
+    mode = configured_mode or "local"
+    target_selection = _select_distributed_target()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return mode, _select_distributed_target(), distributed_fallback_enabled
+
+    if not configured_mode and target_selection.relay_only and target_selection.url:
+        mode = "distributed"
+        distributed_fallback_enabled = False
+
+    return mode, target_selection, distributed_fallback_enabled
 
 
 def get_api_v1_distributed_target_selection() -> DistributedTargetSelection:

@@ -466,3 +466,42 @@ def test_explicit_local_public_chat_ignores_relay_public_url(monkeypatch, client
         "no_compute_node_available",
         "no_registered_compute_nodes",
     }
+
+
+def test_compute_error_remap_fails_closed_when_implicit_relay_check_fails(
+    monkeypatch, client
+):
+    _reset_api_v1_provider_state()
+
+    class FailingProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            raise compute_provider.ComputeProviderError(
+                "No registered compute nodes",
+                code="no_registered_compute_nodes",
+                status_code=503,
+            )
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: FailingProvider())
+    monkeypatch.setattr(
+        routes,
+        "get_api_v1_resolved_provider_path",
+        lambda _provider: "distributed",
+    )
+    monkeypatch.setattr(
+        routes,
+        "is_api_v1_implicit_relay_only_selection",
+        lambda: (_ for _ in ()).throw(RuntimeError("predicate failed")),
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["code"] == "no_registered_compute_nodes"
+    assert payload["error"]["message"] == "Unable to generate a response right now."

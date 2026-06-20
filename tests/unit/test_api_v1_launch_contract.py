@@ -162,6 +162,135 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     assert "Streaming is not supported" in payload["error"]["message"]
 
 
+
+def _clear_api_v1_relay_env(monkeypatch):
+    for env_name in (
+        "TOKENPLACE_API_V1_COMPUTE_PROVIDER",
+        "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK",
+        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
+        "TOKENPLACE_RELAY_PUBLIC_URL",
+        "TOKEN_PLACE_RELAY_PUBLIC_URL",
+        "RELAY_PUBLIC_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_relay_only_chat_uses_compute_node_without_local_llama(client, monkeypatch):
+    _clear_api_v1_relay_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    def fail_local_generate(*_args, **_kwargs):
+        raise AssertionError("relay-only chat must not call local llama inference")
+
+    def fake_distributed_complete(self, *, model_id, messages, options=None):
+        assert self.base_url == "https://staging.token.place"
+        assert model_id == "llama-3.1-8b-instruct"
+        assert messages == [{"role": "user", "content": "hello relay"}]
+        assert options == {}
+        compute_provider._last_backend_path.set("distributed_relay_e2ee")
+        return {"role": "assistant", "content": "hello from relay compute"}
+
+    monkeypatch.setattr(routes, "generate_response", fail_local_generate)
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "complete_chat",
+        fake_distributed_complete,
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello relay"}],
+        },
+        headers={"Origin": "https://staging.democratized.space"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+    payload = response.get_json()
+    assert payload["object"] == "chat.completion"
+    assert payload["choices"][0]["message"]["content"] == "hello from relay compute"
+
+
+def test_relay_only_chat_no_compute_node_returns_relay_specific_503(client, monkeypatch):
+    _clear_api_v1_relay_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    class NoNodesResponse:
+        status_code = 503
+
+        def json(self):
+            return {
+                "error": {
+                    "message": "No LLM servers are available right now.",
+                    "code": "no_registered_compute_nodes",
+                }
+            }
+
+    def fake_get(url, timeout):
+        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        return NoNodesResponse()
+
+    def fail_local_generate(*_args, **_kwargs):
+        raise AssertionError("relay-only no-node failures must not call local llama inference")
+
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(routes, "generate_response", fail_local_generate)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello relay"}],
+        },
+        headers={"Origin": "https://staging.democratized.space"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    payload = response.get_json()
+    assert payload["error"]["code"] == "no_registered_compute_nodes"
+    assert "llama-cpp-python" not in payload["error"]["message"]
+    assert payload["error"]["type"] == "service_unavailable_error"
+
+
+def test_local_chat_still_reports_missing_llama_dependency(client, monkeypatch):
+    from api.v1 import models
+
+    _clear_api_v1_relay_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "development")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    models._loaded_models.clear()
+    monkeypatch.setattr(models, "USE_MOCK_LLM", False)
+    monkeypatch.setattr(models, "Llama", None)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello local"}],
+        },
+    )
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["type"] == "model_unavailable"
+    assert "llama-cpp-python is not installed" in payload["error"]["message"]
+
+
 def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     response = client.get("/api/v1/models")
 

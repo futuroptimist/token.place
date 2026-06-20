@@ -42,6 +42,7 @@ from api.v1.compute_provider import (
     get_api_v1_compute_provider,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_distributed_target_selection,
+    is_api_v1_implicit_relay_only_selection,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
     reset_api_v1_generate_response_override,
@@ -613,10 +614,23 @@ def _handle_chat_completion_request(data):
             f"code={e.code} status={e.status_code} "
             f"path={execution_backend_path} detail={str(e)}"
         )
+        try:
+            implicit_relay_only_error = is_api_v1_implicit_relay_only_selection()
+        except Exception:
+            implicit_relay_only_error = False
+        public_code = (
+            "no_compute_node_available"
+            if (
+                e.code == "no_registered_compute_nodes"
+                and implicit_relay_only_error
+                and not force_desktop_bridge_distributed
+            )
+            else e.code
+        )
         return format_error_response(
             e.public_message,
             error_type=e.error_type,
-            code=e.code,
+            code=public_code,
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors

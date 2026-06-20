@@ -640,6 +640,23 @@ def _select_distributed_target() -> DistributedTargetSelection:
     return DistributedTargetSelection(url="", source="unset", relay_only=False)
 
 
+def _select_implicit_relay_public_target() -> DistributedTargetSelection:
+    """Resolve only public relay URLs eligible for implicit relay-only selection."""
+
+    for env_name in _RELAY_PUBLIC_URL_ENVS:
+        target = _validated_target_url(
+            os.environ.get(env_name),
+            source=f"env:{env_name}",
+        )
+        if target:
+            return DistributedTargetSelection(
+                url=target,
+                source=f"relay_public_env:{env_name}",
+                relay_only=True,
+            )
+    return DistributedTargetSelection(url="", source="unset", relay_only=False)
+
+
 @lru_cache(maxsize=16)
 def _build_api_v1_compute_provider(
     mode: str,
@@ -729,15 +746,47 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     )
 
 
-def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
-    """Read and normalize API v1 provider environment configuration."""
+def is_api_v1_implicit_relay_only_selection(
+    target_selection: DistributedTargetSelection | None = None,
+) -> bool:
+    """Return True when env should implicitly select relay-only distributed mode.
 
-    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
+    Only public relay URLs are auto-selected. Internal loopback relay URLs may
+    point back at the same Gunicorn worker pool, so they require an explicit
+    provider mode to avoid blocking relay self-dispatch by default.
+    """
+
+    if os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
+        return False
+    selection = target_selection or _select_implicit_relay_public_target()
+    return bool(selection.url) and selection.relay_only and selection.source.startswith(
+        "relay_public_env:"
+    )
+
+
+def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
+    """Read and normalize API v1 provider environment configuration.
+
+    Relay-only deployments publish the relay URL instead of a local model
+    runtime. Treat that as an explicit distributed API v1 target so public chat
+    requests do not fall through to the in-process llama.cpp loader. Local mode
+    remains the default when no relay-only target is configured.
+    """
+
+    configured_mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip().lower()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return mode, _select_distributed_target(), distributed_fallback_enabled
+
+    implicit_relay_public_target = _select_implicit_relay_public_target()
+    if is_api_v1_implicit_relay_only_selection(implicit_relay_public_target):
+        return "distributed", implicit_relay_public_target, False
+
+    mode = configured_mode or "local"
+    target_selection = _select_distributed_target()
+
+    return mode, target_selection, distributed_fallback_enabled
 
 
 def get_api_v1_distributed_target_selection() -> DistributedTargetSelection:

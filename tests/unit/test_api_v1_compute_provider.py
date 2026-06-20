@@ -572,6 +572,23 @@ def test_public_relay_url_implicitly_selects_distributed_without_fallback(monkey
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.base_url == "https://staging.token.place"
+        assert compute_provider.is_api_v1_implicit_relay_only_selection() is True
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_public_relay_url_wins_implicit_selection_when_internal_url_is_set(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.base_url == "https://staging.token.place"
         assert compute_provider.is_api_v1_implicit_relay_only_selection() is True
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()

@@ -301,6 +301,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     _reset_api_v1_provider_state()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
     monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
     monkeypatch.setattr(
@@ -363,6 +364,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     _reset_api_v1_provider_state()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
     monkeypatch.setattr(
         routes,
@@ -370,10 +372,9 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
         lambda *_args, **_kwargs: pytest.fail("local inference was called"),
     )
 
-    monkeypatch.setattr(
-        compute_provider.requests,
-        "get",
-        lambda *_args, **_kwargs: _FakeResponse(
+    def fake_no_node_get(url, timeout):
+        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        return _FakeResponse(
             503,
             {
                 "error": {
@@ -381,8 +382,9 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
                     "message": "No registered compute nodes",
                 }
             },
-        ),
-    )
+        )
+
+    monkeypatch.setattr(compute_provider.requests, "get", fake_no_node_get)
 
     response = client.post(
         "/api/v1/chat/completions",

@@ -640,6 +640,23 @@ def _select_distributed_target() -> DistributedTargetSelection:
     return DistributedTargetSelection(url="", source="unset", relay_only=False)
 
 
+def _select_implicit_relay_public_target() -> DistributedTargetSelection:
+    """Resolve only public relay URLs eligible for implicit relay-only selection."""
+
+    for env_name in _RELAY_PUBLIC_URL_ENVS:
+        target = _validated_target_url(
+            os.environ.get(env_name),
+            source=f"env:{env_name}",
+        )
+        if target:
+            return DistributedTargetSelection(
+                url=target,
+                source=f"relay_public_env:{env_name}",
+                relay_only=True,
+            )
+    return DistributedTargetSelection(url="", source="unset", relay_only=False)
+
+
 @lru_cache(maxsize=16)
 def _build_api_v1_compute_provider(
     mode: str,
@@ -741,11 +758,9 @@ def is_api_v1_implicit_relay_only_selection(
 
     if os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
         return False
-    selection = target_selection or _select_distributed_target()
-    return (
-        bool(selection.url)
-        and selection.relay_only
-        and selection.source.startswith("relay_public_env:")
+    selection = target_selection or _select_implicit_relay_public_target()
+    return bool(selection.url) and selection.relay_only and selection.source.startswith(
+        "relay_public_env:"
     )
 
 
@@ -766,9 +781,11 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
         not in {"0", "false", "no", "off"}
     )
 
-    if is_api_v1_implicit_relay_only_selection(target_selection):
+    implicit_relay_public_target = _select_implicit_relay_public_target()
+    if is_api_v1_implicit_relay_only_selection(implicit_relay_public_target):
         mode = "distributed"
         distributed_fallback_enabled = False
+        target_selection = implicit_relay_public_target
 
     return mode, target_selection, distributed_fallback_enabled
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import relay
-from api.v1 import compute_provider, routes
+from api.v1 import compute_provider, models, routes
 
 INDEX_HTML = Path(relay.INDEX_HTML_PATH)
 
@@ -90,6 +90,16 @@ def _clear_distributed_target_env(monkeypatch):
         "RELAY_PUBLIC_URL",
     ):
         monkeypatch.delenv(env_name, raising=False)
+
+
+def _reset_api_v1_provider_state():
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def _force_local_llama_missing(monkeypatch):
+    monkeypatch.setattr(models, "USE_MOCK_LLM", False)
+    monkeypatch.setattr(models, "Llama", None)
+    models._loaded_models.clear()
 
 
 @pytest.fixture
@@ -288,7 +298,7 @@ class _FakeCryptoManager:
 def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     monkeypatch, client
 ):
-    compute_provider._build_api_v1_compute_provider.cache_clear()
+    _reset_api_v1_provider_state()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
@@ -350,7 +360,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
 def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     monkeypatch, client
 ):
-    compute_provider._build_api_v1_compute_provider.cache_clear()
+    _reset_api_v1_provider_state()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
@@ -392,9 +402,21 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
 
 
 def test_local_public_chat_still_reports_missing_llama_dependency(monkeypatch, client):
-    compute_provider._build_api_v1_compute_provider.cache_clear()
+    _reset_api_v1_provider_state()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     _clear_distributed_target_env(monkeypatch)
+    _force_local_llama_missing(monkeypatch)
+    _reset_api_v1_provider_state()
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("relay dispatch was called"),
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail("relay dispatch was called"),
+    )
 
     response = client.post(
         "/api/v1/chat/completions",
@@ -408,3 +430,39 @@ def test_local_public_chat_still_reports_missing_llama_dependency(monkeypatch, c
     payload = response.get_json()
     assert payload["error"]["type"] == "model_unavailable"
     assert "llama-cpp-python is not installed" in payload["error"]["message"]
+
+
+def test_explicit_local_public_chat_ignores_relay_public_url(monkeypatch, client):
+    _reset_api_v1_provider_state()
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    _force_local_llama_missing(monkeypatch)
+    _reset_api_v1_provider_state()
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("relay dispatch was called"),
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail("relay dispatch was called"),
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["type"] == "model_unavailable"
+    assert "llama-cpp-python is not installed" in payload["error"]["message"]
+    assert payload["error"].get("code") not in {
+        "no_compute_node_available",
+        "no_registered_compute_nodes",
+    }

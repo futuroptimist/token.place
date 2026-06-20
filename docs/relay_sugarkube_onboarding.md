@@ -536,6 +536,8 @@ After (explicit relay-only semantics):
   "relayOnly": true,
   "upstreamHealthRequired": false,
   "knownServers": 0,
+  "activeUpstreamServers": [],
+  "requiredUpstreamServers": [],
   "configuredUpstreamServers": ["https://token.place"],
   "legacyConfiguredUpstreamServers": ["https://token.place"],
   "upstream": "http://gpu-server:3000",
@@ -546,8 +548,16 @@ After (explicit relay-only semantics):
 Interpretation:
 - `status: ok` reflects relay process readiness.
 - `knownServers: 0` means no registered external compute nodes yet (expected before node registration).
-- `configuredUpstreamServers` is retained as a stable compatibility key.
+- `activeUpstreamServers` is the explicit runtime upstream list; it is empty for relay-only
+  deployments that dispatch to registered compute nodes instead of an upstream fallback.
+- `requiredUpstreamServers` is the readiness dependency list; it is empty when
+  `upstreamHealthRequired: false`, so staging does not depend on prod `https://token.place`.
+- `configuredUpstreamServers` is retained as a stable compatibility key and may show legacy/default
+  fallback configuration.
 - `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
+- Operators should read `relayOnly`, `upstreamHealthRequired`, `activeUpstreamServers`,
+  `requiredUpstreamServers`, and the registered compute-node counts before treating any
+  compatibility/default upstream field as operationally active.
 
 ## Guardrails
 

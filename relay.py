@@ -808,6 +808,9 @@ def healthz():
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    active_upstream_servers = [] if relay_only_mode else configured_servers
+    required_upstream_servers = configured_servers if require_upstream_health else []
+    legacy_configured_upstream_servers = [] if explicit_upstream_config else configured_servers
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
@@ -818,7 +821,9 @@ def healthz():
         "registeredServers": _live_server_diagnostics(),
     }
     status["configuredUpstreamServers"] = configured_servers
-    status["legacyConfiguredUpstreamServers"] = [] if explicit_upstream_config else configured_servers
+    status["legacyConfiguredUpstreamServers"] = legacy_configured_upstream_servers
+    status["activeUpstreamServers"] = active_upstream_servers
+    status["requiredUpstreamServers"] = required_upstream_servers
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -1068,15 +1073,21 @@ def relay_diagnostics():
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
+    relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
+    active_upstream_servers = [] if relay_only_mode else configured_servers
+    required_upstream_servers = configured_servers if require_upstream_health else []
+    legacy_configured_upstream_servers = [] if explicit_upstream_config else configured_servers
     diagnostics = {
-        "relay_only": (not require_upstream_health) and (not explicit_upstream_config),
+        "relay_only": relay_only_mode,
         "upstream_health_required": require_upstream_health,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
         "api_v1_registered_compute_nodes": api_v1_live_nodes,
         "total_api_v1_registered_compute_nodes": len(api_v1_live_nodes),
         "configured_upstream_servers": configured_servers,
-        "legacy_configured_upstream_servers": [] if explicit_upstream_config else configured_servers,
+        "legacy_configured_upstream_servers": legacy_configured_upstream_servers,
+        "active_upstream_servers": active_upstream_servers,
+        "required_upstream_servers": required_upstream_servers,
     }
     response = jsonify(diagnostics)
     response.headers["Cache-Control"] = "no-store"

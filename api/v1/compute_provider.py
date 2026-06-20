@@ -774,8 +774,6 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
     """
 
     configured_mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip().lower()
-    mode = configured_mode or "local"
-    target_selection = _select_distributed_target()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
@@ -783,9 +781,10 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
 
     implicit_relay_public_target = _select_implicit_relay_public_target()
     if is_api_v1_implicit_relay_only_selection(implicit_relay_public_target):
-        mode = "distributed"
-        distributed_fallback_enabled = False
-        target_selection = implicit_relay_public_target
+        return "distributed", implicit_relay_public_target, False
+
+    mode = configured_mode or "local"
+    target_selection = _select_distributed_target()
 
     return mode, target_selection, distributed_fallback_enabled
 

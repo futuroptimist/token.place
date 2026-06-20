@@ -5,7 +5,7 @@ This module follows OpenAI API conventions to serve as a drop-in replacement.
 
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, current_app, request, jsonify
 import base64
 import time
 import zlib
@@ -232,6 +232,60 @@ def _request_relay_base_url() -> str:
     """Return a trusted API v1 relay base URL for desktop bridge work."""
 
     return _request_relay_target_selection().url
+
+
+def _current_app_is_relay_only() -> bool:
+    """Return True when this Flask app is configured as a relay-only deployment."""
+
+    configured_servers = current_app.config.get("relay_configured_servers")
+    if configured_servers is None:
+        return False
+
+    if configured_servers:
+        return False
+
+    require_upstream_health = os.getenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "").strip().lower()
+    if require_upstream_health in {"1", "true", "yes", "on"}:
+        return False
+
+    if current_app.config.get("upstream_url"):
+        return False
+
+    return True
+
+
+def _relay_only_target_selection() -> DistributedTargetSelection:
+    """Return the relay URL public API v1 should use in relay-only mode."""
+
+    public_base_url = (current_app.config.get("public_base_url") or "").strip().rstrip("/")
+    if public_base_url:
+        return DistributedTargetSelection(
+            url=public_base_url,
+            source="relay_only_app:public_base_url",
+            relay_only=True,
+        )
+
+    return _request_relay_target_selection()
+
+
+def _select_chat_completion_provider(*, force_desktop_bridge_distributed: bool):
+    """Select the API v1 chat provider without falling through to local inference in relay-only mode."""
+
+    if force_desktop_bridge_distributed:
+        return get_api_v1_compute_provider_for_mode(
+            mode="distributed",
+            distributed_target_selection=_request_relay_target_selection(),
+            distributed_fallback_enabled=False,
+        )
+
+    if _current_app_is_relay_only():
+        return get_api_v1_compute_provider_for_mode(
+            mode="distributed",
+            distributed_target_selection=_relay_only_target_selection(),
+            distributed_fallback_enabled=False,
+        )
+
+    return get_api_v1_compute_provider()
 
 
 def _get_service_name() -> str:
@@ -493,14 +547,8 @@ def _handle_chat_completion_request(data):
         )
 
         log_info(f"Generating response using model {model_id}")
-        provider = (
-            get_api_v1_compute_provider_for_mode(
-                mode="distributed",
-                distributed_target_selection=_request_relay_target_selection(),
-                distributed_fallback_enabled=False,
-            )
-            if force_desktop_bridge_distributed
-            else get_api_v1_compute_provider()
+        provider = _select_chat_completion_provider(
+            force_desktop_bridge_distributed=force_desktop_bridge_distributed
         )
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)

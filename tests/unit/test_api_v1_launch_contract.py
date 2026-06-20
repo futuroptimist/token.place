@@ -162,6 +162,85 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     assert "Streaming is not supported" in payload["error"]["message"]
 
 
+def test_relay_only_chat_uses_distributed_provider_without_local_llama(monkeypatch, client):
+    monkeypatch.setitem(relay.app.config, "relay_configured_servers", [])
+    monkeypatch.setitem(relay.app.config, "upstream_url", None)
+    monkeypatch.setitem(relay.app.config, "public_base_url", "https://staging.token.place")
+
+    captured = {}
+
+    class _DistributedProvider:
+        def complete_chat(self, *, model_id, messages, options):
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["options"] = options
+            return {"role": "assistant", "content": "relay response"}
+
+    def fail_local_provider():
+        raise AssertionError("relay-only chat must not select the local provider")
+
+    def fake_provider_for_mode(**kwargs):
+        captured["provider_kwargs"] = kwargs
+        return _DistributedProvider()
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", fail_local_provider)
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider_for_mode", fake_provider_for_mode)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["choices"][0]["message"]["content"] == "relay response"
+    provider_kwargs = captured["provider_kwargs"]
+    assert provider_kwargs["mode"] == "distributed"
+    assert provider_kwargs["distributed_fallback_enabled"] is False
+    target_selection = provider_kwargs["distributed_target_selection"]
+    assert target_selection.url == "https://staging.token.place"
+    assert target_selection.relay_only is True
+    assert captured["model_id"] == "llama-3.1-8b-instruct"
+
+
+def test_relay_only_chat_no_compute_node_reports_relay_specific_error_with_cors(
+    monkeypatch,
+    client,
+):
+    monkeypatch.setitem(relay.app.config, "relay_configured_servers", [])
+    monkeypatch.setitem(relay.app.config, "upstream_url", None)
+    monkeypatch.setitem(relay.app.config, "public_base_url", "https://staging.token.place")
+
+    def fake_provider_for_mode(**_kwargs):
+        raise compute_provider.ComputeProviderError(
+            "relay reported no registered compute nodes",
+            code="no_registered_compute_nodes",
+            error_type="service_unavailable_error",
+            public_message="No registered relay compute node is available right now.",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider_for_mode", fake_provider_for_mode)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3.1-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        headers={"Origin": "https://staging.democratized.space"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    payload = response.get_json()
+    assert payload["error"]["code"] == "no_registered_compute_nodes"
+    assert "relay compute node" in payload["error"]["message"]
+    assert "llama-cpp-python is not installed" not in payload["error"]["message"]
+
+
 def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     response = client.get("/api/v1/models")
 

@@ -45,7 +45,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
   [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.
 - **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md) and stepwise updates in
   [CHANGELOG_STEP.md](CHANGELOG_STEP.md). Historical launch evidence lives in
-  [releases/v0.1.0.md](releases/v0.1.0.md).
+  [releases/v0.1.0.md](releases/v0.1.0.md), with current release planning in
+  [releases/v0.1.2.md](releases/v0.1.2.md).
 
 ## Prompt docs
 

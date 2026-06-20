@@ -299,6 +299,7 @@ just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
 ```
 
 - GHCR-first release workflow: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
+- v0.1.2 observability release gate: [`docs/releases/v0.1.2.md`](docs/releases/v0.1.2.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)

@@ -1,6 +1,7 @@
 """
 Unit tests for the model manager module.
 """
+import logging
 import os
 import queue
 import threading
@@ -3435,3 +3436,278 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     monkeypatch.setattr(manager, 'get_llm_instance', _get_replacement)
     assert manager._ensure_replacement_llm(manager._llm_generation) is replacement
     assert stale.closed is True
+
+
+def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog, capsys):
+    """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
+    from utils.llm import model_manager as model_manager_module
+
+    plaintext_prompt = 'PLAINTEXT_PROMPT_SENTINEL_DO_NOT_LOG_7'
+    plaintext_output = 'PLAINTEXT_OUTPUT_SENTINEL_DO_NOT_LOG_7'
+    fake_parent = tmp_path / 'fake_site'
+    fake_pkg = fake_parent / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    state_path = tmp_path / 'fake_llama_state.json'
+    state_path.write_text(json.dumps({'created': 0, 'calls': [], 'actions': []}), encoding='utf-8')
+    fake_pkg.joinpath('__init__.py').write_text(
+        r'''
+import contextlib, json, os, time
+from pathlib import Path
+STATE = Path(os.environ['TOKEN_PLACE_FAKE_LLAMA_STATE'])
+LOCK = STATE.with_suffix(STATE.suffix + '.lock')
+SENTINEL_OUTPUT = os.environ['TOKEN_PLACE_FAKE_LLAMA_OUTPUT']
+
+def _load_unlocked():
+    try:
+        return json.loads(STATE.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {'created': 0, 'calls': [], 'actions': []}
+
+def _save_unlocked(data):
+    STATE.write_text(json.dumps(data, sort_keys=True), encoding='utf-8')
+
+@contextlib.contextmanager
+def _locked_state():
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 10
+    lock_fd = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            if time.monotonic() > deadline:
+                raise TimeoutError('timed out waiting for fake llama state lock')
+            time.sleep(0.01)
+    try:
+        data = _load_unlocked()
+        yield data
+        _save_unlocked(data)
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(LOCK)
+
+class Llama:
+    def __init__(self, **_kwargs):
+        with _locked_state() as data:
+            if data.get('fail_init'):
+                raise RuntimeError('fake init failure without plaintext')
+            data['created'] = int(data.get('created', 0)) + 1
+            self.generation = data['created']
+            data.setdefault('generations', []).append(self.generation)
+
+    def create_chat_completion(self, **kwargs):
+        with _locked_state() as data:
+            actions = data.get('actions') or []
+            action = actions.pop(0) if actions else None
+            data['actions'] = actions
+            request_id = kwargs.get('request_id') or (kwargs.get('metadata') or {}).get('request_id')
+            data.setdefault('calls', []).append({'generation': self.generation, 'request_id': request_id})
+        if action == 'request_error':
+            raise RuntimeError('fake request scoped exception without plaintext')
+        if action == 'abrupt_exit':
+            os._exit(23)
+        time.sleep(float(os.environ.get('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0')))
+        nonce = (kwargs.get('metadata') or {}).get('nonce') or request_id
+        return {'id': request_id, 'nonce': nonce, 'choices': [{'message': {'role': 'assistant', 'content': SENTINEL_OUTPUT + ' gen=' + str(self.generation) + ' request=' + str(request_id) + ' nonce=' + str(nonce)}}]}
+''',
+        encoding='utf-8',
+    )
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger='model_manager')
+    caplog.set_level(logging.DEBUG, logger='utils.llm')
+    caplog.set_level(logging.DEBUG, logger='utils.llm.model_manager')
+    caplog.set_level(logging.DEBUG, logger='token.place')
+
+    monkeypatch.syspath_prepend(str(fake_parent))
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_STATE', str(state_path))
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_OUTPUT', plaintext_output)
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '5')
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: False)
+    monkeypatch.setattr(model_manager_module, '_find_llama_cpp_spec_in_subprocess', lambda **_kwargs: {'module_path': str(fake_pkg / '__init__.py')})
+    monkeypatch.setattr(model_manager_module, '_run_llama_cpp_import_watchdog', lambda **_kwargs: {'module_path': str(fake_pkg / '__init__.py')})
+
+    (tmp_path / 'test_model.gguf').write_bytes(b'fake')
+    manager = model_manager_module.ModelManager(_RestartTestConfig(tmp_path))
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: model_manager_module._import_llama_cpp_subprocess_module(
+            module_path_hint=str(fake_pkg / '__init__.py'), timeout_seconds=5
+        ),
+    )
+    monkeypatch.setattr(manager, '_resolve_compute_plan', lambda: {
+        'requested_mode': 'cpu', 'effective_mode': 'cpu', 'backend_available': 'cpu',
+        'backend_selected': 'cpu', 'backend_used': 'cpu', 'n_gpu_layers': 0,
+        'fallback_reason': None,
+    })
+
+    def state():
+        return json.loads(state_path.read_text(encoding='utf-8'))
+
+    def save(data):
+        state_path.write_text(json.dumps(data), encoding='utf-8')
+
+    def set_actions(*actions):
+        data = state()
+        data['actions'] = list(actions)
+        data.pop('fail_init', None)
+        save(data)
+
+    def request(request_id, nonce=None):
+        nonce = nonce or f'nonce-{request_id}'
+        return manager.create_chat_completion_with_recovery(
+            messages=[{'role': 'user', 'content': f'{plaintext_prompt} {request_id} {nonce}'}],
+            request_id=request_id,
+            metadata={'request_id': request_id, 'nonce': nonce},
+        )
+
+    class LocalRelayProbe:
+        def __init__(self, relay_ids):
+            self.registered = {relay_id: True for relay_id in relay_ids}
+            self.ready = {relay_id: True for relay_id in relay_ids}
+            self.encrypted_requests = {}
+            self.encrypted_responses = {}
+            self.response_history = []
+            self.safe_logs = []
+            self.diagnostics = []
+
+        def encrypted_request_for(self, request_id, nonce):
+            payload = f'ciphertext-request:{request_id}:{nonce}'
+            self.encrypted_requests[request_id] = payload
+            self.safe_logs.append(f'queued encrypted request {request_id}')
+            return payload
+
+        def store_response(self, request_id, nonce, result):
+            content = result['choices'][0]['message']['content']
+            assert f'request={request_id}' in content
+            assert f'nonce={nonce}' in content
+            encrypted = f'ciphertext-response:{request_id}:{nonce}:{result["id"]}'
+            self.encrypted_responses.setdefault(request_id, []).append(encrypted)
+            self.response_history.append((request_id, encrypted))
+            self.safe_logs.append(f'stored encrypted response {request_id}')
+            return encrypted
+
+        def mark_failed(self, reason):
+            for relay_id in self.registered:
+                self.registered[relay_id] = False
+                self.ready[relay_id] = False
+            self.diagnostics.append({'event': 'worker_failed', 'reason': reason})
+
+        def ciphertext_blob(self):
+            return json.dumps({
+                'registered': self.registered,
+                'ready': self.ready,
+                'encrypted_requests': self.encrypted_requests,
+                'encrypted_responses': self.encrypted_responses,
+                'safe_logs': self.safe_logs,
+                'diagnostics': self.diagnostics,
+            }, sort_keys=True)
+
+    relay_probe = LocalRelayProbe(['relay-0', 'relay-1'])
+
+    def relay_request(request_id, nonce):
+        relay_probe.encrypted_request_for(request_id, nonce)
+        result = request(request_id, nonce=nonce)
+        relay_probe.store_response(request_id, nonce, result)
+        return result
+
+    seen_ids = set()
+    for index in range(100):
+        req_id = f'soak-{index}'
+        result = request(req_id)
+        assert result['id'] == req_id
+        assert req_id not in seen_ids
+        seen_ids.add(req_id)
+    assert state()['created'] == 1
+    assert manager.worker_lifecycle_status()['worker_restart_count'] == 0
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    set_actions('request_error')
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        request('request-error-once')
+    assert state()['created'] == 1
+    assert request('after-request-error')['choices'][0]['message']['content'].startswith(plaintext_output)
+    assert state()['created'] == 1
+
+    set_actions('abrupt_exit')
+    assert request('after-abrupt-exit')['id'] == 'after-abrupt-exit'
+    status = manager.worker_lifecycle_status()
+    assert state()['created'] == 2
+    assert status['worker_restart_count'] == 1
+    assert status['worker_state'] == 'ready'
+
+    before = state()['created']
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0.01')
+    results = []
+    relay_errors = []
+    barrier = threading.Barrier(2)
+
+    def _relay_call(name):
+        try:
+            barrier.wait(timeout=5)
+            nonce = f'nonce-{name}'
+            results.append(relay_request(name, nonce)['id'])
+        except Exception as exc:  # pragma: no cover - surfaced below with thread context
+            relay_errors.append((name, repr(exc)))
+
+    threads = [threading.Thread(target=_relay_call, args=(f'relay-{i}',), daemon=True) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    stuck_threads = [thread.name for thread in threads if thread.is_alive()]
+    assert stuck_threads == []
+    assert relay_errors == []
+    assert sorted(results) == ['relay-0', 'relay-1']
+    assert all(len(relay_probe.encrypted_responses[request_id]) == 1 for request_id in results)
+    assert len({encrypted for _request_id, encrypted in relay_probe.response_history}) == len(results)
+    assert state()['created'] == before
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    set_actions('abrupt_exit')
+    data = state()
+    data['fail_init'] = True
+    save(data)
+    persistent_error = None
+    with pytest.raises(RuntimeError, match='replacement failed|one restart attempt|fake init failure') as exc_info:
+        request('persistent-failure')
+    persistent_error = repr(exc_info.value)
+    relay_probe.mark_failed(persistent_error)
+    assert all(is_registered is False for is_registered in relay_probe.registered.values())
+    assert all(is_ready is False for is_ready in relay_probe.ready.values())
+    status = manager.worker_lifecycle_status()
+    assert status['worker_state'] in {'failed', 'recovering', 'stopped'}
+    assert status['worker_alive'] is False
+    assert manager.llm is None
+
+    data = state()
+    data.pop('fail_init', None)
+    data['actions'] = []
+    save(data)
+    with manager.llm_lock:
+        manager.llm = None
+        manager.worker_state = 'stopped'
+    recovered = request('after-stop-start')
+    assert recovered['id'] == 'after-stop-start'
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    calls = state()['calls']
+    assert sum(1 for call in calls if call.get('request_id') == 'after-abrupt-exit') == 2
+    assert len(seen_ids) == 100
+    assert state()['created'] <= 4
+    assert threading.active_count() < 80
+
+    diagnostics = json.dumps(manager.worker_lifecycle_status(), sort_keys=True)
+    captured = capsys.readouterr()
+    leak_checked_text = '\n'.join([
+        caplog.text,
+        diagnostics,
+        relay_probe.ciphertext_blob(),
+        persistent_error or '',
+        captured.out,
+        captured.err,
+    ])
+    assert plaintext_prompt not in leak_checked_text
+    assert plaintext_output not in leak_checked_text

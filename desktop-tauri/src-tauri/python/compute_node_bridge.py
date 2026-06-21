@@ -399,6 +399,20 @@ def _env_enabled(name: str, default: str = "0") -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _runtime_path_from_env() -> str:
     value = os.getenv("TOKENPLACE_DESKTOP_RUNTIME_PATH", RUNTIME_PATH_DEFAULT)
     if value.strip().lower() == "sidecar":
@@ -762,6 +776,10 @@ def run(args: argparse.Namespace) -> int:
     }
     inference_lock = threading.Lock()
     poll_failure_fatal = False
+    recovery_max_attempts = max(1, _env_int("TOKENPLACE_DESKTOP_RECOVERY_MAX_ATTEMPTS", 2))
+    recovery_backoff_seconds = max(0.0, _env_float("TOKENPLACE_DESKTOP_RECOVERY_BACKOFF_SECONDS", 0.1))
+    recovery_condition = threading.Condition()
+    recovery_in_progress = False
 
     def update_relay_status(relay_url_value: str, **updates: Any) -> None:
         with relay_status_lock:
@@ -1192,6 +1210,144 @@ def run(args: argparse.Namespace) -> int:
     registration_succeeded_by_relay: Dict[str, bool] = {}
     poll_threads: List[threading.Thread] = []
 
+    def mark_all_relays_recovering(error_message: Optional[str]) -> None:
+        for relay_url_value in configured_relay_urls:
+            update_relay_status(
+                relay_url_value,
+                registered=False,
+                relay_runtime_state="recovering",
+                last_error=error_message,
+            )
+
+    def unregister_all_relays_for_recovery(error_message: Optional[str]) -> None:
+        mark_all_relays_recovering(error_message)
+        for relay_runtime in runtimes:
+            active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
+            request_poll_cancel(relay_runtime, active_relay_url)
+            update_relay_status(
+                active_relay_url,
+                registered=False,
+                relay_runtime_state="recovering",
+                last_error=error_message,
+            )
+
+    def coordinate_shared_model_recovery(*, active_relay_url: str, reason: str) -> bool:
+        nonlocal warm_load_state, warm_load_failed, warm_load_duration_ms, last_error
+        nonlocal poll_failure_fatal, recovery_in_progress
+        with recovery_condition:
+            if recovery_in_progress:
+                while recovery_in_progress and not stop_requested():
+                    recovery_condition.wait(timeout=0.05)
+                return warm_load_state == "ready"
+            recovery_in_progress = True
+
+        try:
+            last_error = reason
+            warm_load_state = "recovering"
+            warm_load_failed = None
+            warm_load_duration_ms = None
+            unregister_all_relays_for_recovery(reason)
+            emit_operator_event(
+                build_status_payload(
+                    event_type="status",
+                    running=True,
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                    extra={"relay_runtime_state": "recovering"},
+                )
+            )
+            print(
+                "desktop.compute_node_bridge.recovery.start "
+                f"relay={_sanitize_relay_target(active_relay_url)} "
+                f"attempts={recovery_max_attempts} reason=shared_model_runtime_unhealthy",
+                file=sys.stderr,
+            )
+            for attempt in range(1, recovery_max_attempts + 1):
+                if stop_requested():
+                    return False
+                started_at = time.perf_counter()
+                try:
+                    ready = bool(runtime.ensure_api_v1_runtime_ready())
+                except Exception as exc:
+                    ready = False
+                    setattr(runtime.model_manager, 'last_runtime_init_error', str(exc))
+                    print(
+                        "desktop.compute_node_bridge.recovery.exception "
+                        f"attempt={attempt} exc_type={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                warm_load_duration_ms = int((time.perf_counter() - started_at) * 1000)
+                if ready:
+                    warm_load_state = "ready"
+                    warm_load_failed = None
+                    last_error = None
+                    for relay_runtime in runtimes:
+                        relay_client = getattr(relay_runtime, "relay_client", None)
+                        relay_start = getattr(relay_client, "start", None)
+                        if callable(relay_start):
+                            relay_start()
+                        poll_cancel_requested_by_relay[getattr(relay_client, "relay_url", relay_url)] = False
+                        update_relay_status(
+                            getattr(relay_client, "relay_url", relay_url),
+                            registered=False,
+                            relay_runtime_state="ready",
+                            last_error=None,
+                        )
+                    emit_operator_event(
+                        build_status_payload(
+                            event_type="status",
+                            running=True,
+                            registered=False,
+                            active_relay_url=active_relay_url,
+                            current_last_error=None,
+                            extra={"relay_runtime_state": "ready"},
+                        )
+                    )
+                    print(
+                        "desktop.compute_node_bridge.recovery.ready "
+                        f"relay={_sanitize_relay_target(active_relay_url)} attempt={attempt}",
+                        file=sys.stderr,
+                    )
+                    return True
+                warm_load_failed = (
+                    getattr(runtime.model_manager, 'last_runtime_init_error', None)
+                    or "API v1 shared model runtime recovery failed"
+                )
+                last_error = warm_load_failed
+                if attempt < recovery_max_attempts and _sleep_with_cancel(recovery_backoff_seconds):
+                    return False
+            warm_load_state = "failed"
+            terminal_error = (
+                "shared API v1 model runtime recovery exhausted; restart the desktop app "
+                "or verify local model/runtime configuration"
+            )
+            last_error = terminal_error
+            for relay_url_value in configured_relay_urls:
+                update_relay_status(
+                    relay_url_value,
+                    registered=False,
+                    relay_runtime_state="failed",
+                    last_error=terminal_error,
+                )
+            emit_operator_event(
+                build_status_payload(
+                    event_type="error",
+                    running=False,
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                    extra={"relay_runtime_state": "failed", "message": terminal_error},
+                )
+            )
+            print("desktop.compute_node_bridge.recovery.exhausted", file=sys.stderr)
+            poll_failure_fatal = True
+            return False
+        finally:
+            with recovery_condition:
+                recovery_in_progress = False
+                recovery_condition.notify_all()
+
     def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> None:
         if poll_cancel_requested_by_relay.get(active_relay_url):
             return
@@ -1265,6 +1421,16 @@ def run(args: argparse.Namespace) -> int:
         worker = relay_poll_workers[active_relay_url]
         while not stop_requested():
             active_relay_url = relay_runtime.relay_client.relay_url
+            if warm_load_state == "recovering":
+                update_relay_status(
+                    active_relay_url,
+                    registered=False,
+                    relay_runtime_state="recovering",
+                    last_error=last_error,
+                )
+                if _sleep_with_cancel(0.05):
+                    break
+                continue
             if warm_load_state == "failed":
                 update_relay_status(
                     active_relay_url,
@@ -1530,28 +1696,17 @@ def run(args: argparse.Namespace) -> int:
                         )
                     if not runtime_healthy:
                         registered = False
-                        if recovery_attempted and not recovery_succeeded:
-                            relay_state = "recovering"
-                            warm_load_state = "recovering"
-                            update_relay_status(
-                                active_relay_url,
-                                registered=False,
-                                relay_runtime_state="recovering",
-                                last_error=relay_last_error,
-                                last_request_id=request_id if request_id != "none" else None,
-                            )
-                            emit_operator_event(
-                                build_status_payload(
-                                    event_type="status",
-                                    running=True,
-                                    registered=False,
-                                    active_relay_url=active_relay_url,
-                                    current_last_error=last_error,
-                                    extra={"relay_runtime_state": "recovering"},
-                                )
-                            )
-                        relay_state = "failed"
-                        warm_load_state = "failed"
+                        relay_state = "recovering"
+                        recovery_ok = coordinate_shared_model_recovery(
+                            active_relay_url=active_relay_url,
+                            reason=relay_last_error or "shared model runtime unhealthy",
+                        )
+                        if recovery_ok:
+                            relay_state = "ready"
+                            relay_last_error = None
+                            last_error = None
+                        else:
+                            relay_state = warm_load_state
                 else:
                     last_error = None
                     print(

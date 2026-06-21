@@ -2013,7 +2013,16 @@ class RelayClient:
             )
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
-        has_direct_runtime_completion = callable(get_llm_instance)
+        recovery_completion = getattr(
+            self.model_manager,
+            "complete_chat_completion_with_worker_recovery",
+            None,
+        )
+        has_recovery_completion = (
+            callable(recovery_completion)
+            and type(recovery_completion).__module__ != 'unittest.mock'
+        )
+        has_direct_runtime_completion = callable(get_llm_instance) or has_recovery_completion
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2057,11 +2066,30 @@ class RelayClient:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = None
             create_chat_completion = None
-            if has_direct_runtime_completion:
+            if not has_recovery_completion and callable(get_llm_instance):
                 llm_instance = get_llm_instance()
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 
-            if callable(create_chat_completion):
+            if has_recovery_completion:
+                log_info(
+                    (
+                        "API v1 runtime generation branch selected: "
+                        "request_id={} model_id={} protocol={} route={} branch={}"
+                    ),
+                    request_id,
+                    model_id,
+                    "tokenplace_api_v1_relay_e2ee",
+                    "/api/v1/relay/responses",
+                    "recovery_non_streaming_completion",
+                )
+                completion = recovery_completion(
+                    messages=runtime_messages,
+                    options=self._api_v1_runtime_completion_kwargs(safe_options),
+                )
+                assistant_message = self._assistant_message_from_runtime_completion(
+                    completion
+                )
+            elif callable(create_chat_completion):
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "

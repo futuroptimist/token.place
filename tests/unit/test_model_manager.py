@@ -3089,3 +3089,198 @@ def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(request_scoped
     result = proxy.create_chat_completion(messages=[], stream=False)
     assert result['choices'][0]['message']['content'] == 'ok'
     assert result['choices'][0]['pid'] == proxy._process.pid
+
+class _RecoveryRuntime:
+    def __init__(self, outcomes, closes):
+        self.outcomes = list(outcomes)
+        self.closes = closes
+        self.calls = 0
+        self.closed = False
+
+    def create_chat_completion(self, **_kwargs):
+        self.calls += 1
+        outcome = self.outcomes.pop(0) if self.outcomes else {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def close(self):
+        self.closed = True
+        self.closes.append(self)
+
+
+def _minimal_model_manager(tmp_path):
+    cfg = MagicMock()
+    cfg.get.side_effect = lambda key, default=None: {
+        'model.filename': 'test_model.gguf',
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+    }.get(key, default)
+    (tmp_path / 'test_model.gguf').write_bytes(b'model')
+    return ModelManager(cfg)
+
+
+def test_model_manager_replaces_dead_worker_and_second_request_succeeds(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    manager = _minimal_model_manager(tmp_path)
+    old = _RecoveryRuntime([
+        model_manager_module.LlamaCppWorkerDeadError('dead')
+    ], [])
+    new = _RecoveryRuntime([
+        {'choices': [{'message': {'role': 'assistant', 'content': 'recovered'}}]}
+    ], old.closes)
+    created = [new]
+    manager.llm = old
+
+    def _get():
+        if manager.llm is None:
+            manager.llm = created.pop(0)
+        return manager.llm
+
+    manager.get_llm_instance = _get
+
+    result = manager.complete_chat_completion_with_worker_recovery(messages=[], options={})
+
+    assert result['choices'][0]['message']['content'] == 'recovered'
+    assert old.closed is True
+    assert manager.llm is new
+    assert old.calls == 1
+    assert new.calls == 1
+
+
+def test_model_manager_broken_pipe_or_eof_triggers_one_replacement(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    manager = _minimal_model_manager(tmp_path)
+    closes = []
+    old = _RecoveryRuntime([model_manager_module.LlamaCppWorkerBrokenPipeError('pipe')], closes)
+    new = _RecoveryRuntime([{'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}], closes)
+    manager.llm = old
+    creations = [new]
+
+    def _get():
+        if manager.llm is None:
+            manager.llm = creations.pop(0)
+        return manager.llm
+
+    manager.get_llm_instance = _get
+    assert manager.complete_chat_completion_with_worker_recovery(messages=[], options={})['choices'][0]['message']['content'] == 'ok'
+    assert creations == []
+    assert closes == [old]
+
+    manager.llm = _RecoveryRuntime([model_manager_module.LlamaCppWorkerEOFError('eof')], closes)
+    old2 = manager.llm
+    new2 = _RecoveryRuntime([{'choices': [{'message': {'role': 'assistant', 'content': 'ok2'}}]}], closes)
+    creations.append(new2)
+    assert manager.complete_chat_completion_with_worker_recovery(messages=[], options={})['choices'][0]['message']['content'] == 'ok2'
+    assert closes[-1] is old2
+
+
+def test_model_manager_request_scoped_inference_error_is_not_retried(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    manager = _minimal_model_manager(tmp_path)
+    runtime = _RecoveryRuntime([model_manager_module.LlamaCppInferenceRequestError('request')], [])
+    manager.llm = runtime
+    manager.get_llm_instance = lambda: manager.llm
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        manager.complete_chat_completion_with_worker_recovery(messages=[], options={})
+
+    assert runtime.calls == 1
+    assert runtime.closed is False
+    assert manager.llm is runtime
+
+
+def test_model_manager_concurrent_dead_worker_creates_one_replacement(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    manager = _minimal_model_manager(tmp_path)
+    closes = []
+    old = _RecoveryRuntime([model_manager_module.LlamaCppWorkerDeadError('dead')], closes)
+    manager.llm = old
+    created = []
+
+    def _get():
+        with manager.llm_lock:
+            if manager.llm is None:
+                created.append(_RecoveryRuntime([{'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}] * 4, closes))
+                manager.llm = created[-1]
+            return manager.llm
+
+    manager.get_llm_instance = _get
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _call():
+        barrier.wait()
+        results.append(manager.complete_chat_completion_with_worker_recovery(messages=[], options={}))
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 2
+    assert len(created) == 1
+    assert closes == [old]
+
+
+def test_model_manager_replacement_failure_attempted_once_surfaces_stable_error(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    manager = _minimal_model_manager(tmp_path)
+    closes = []
+    old = _RecoveryRuntime([model_manager_module.LlamaCppWorkerDeadError('dead')], closes)
+    replacement = _RecoveryRuntime([model_manager_module.LlamaCppWorkerEOFError('eof')], closes)
+    manager.llm = old
+    creations = [replacement]
+
+    def _get():
+        if manager.llm is None:
+            manager.llm = creations.pop(0)
+        return manager.llm
+
+    manager.get_llm_instance = _get
+
+    with pytest.raises(RuntimeError, match='replacement failed after one retry'):
+        manager.complete_chat_completion_with_worker_recovery(messages=[], options={})
+
+    assert creations == []
+    assert old in closes
+    assert replacement in closes
+    assert manager.llm is None
+
+
+def test_subprocess_liveness_dead_worker_closed_and_no_orphan(request_scoped_llama_proxy):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = request_scoped_llama_proxy()
+    pid = proxy._process.pid
+    proxy._process.kill()
+    proxy._process.wait(timeout=5)
+
+    assert proxy.is_alive() is False
+    with pytest.raises(model_manager_module.LlamaCppWorkerDeadError):
+        proxy.create_chat_completion(messages=[], stream=False)
+    proxy.close()
+    assert proxy._process.poll() is not None
+    assert proxy._process.pid == pid
+
+
+def test_model_manager_healthy_request_no_extra_restart_or_close(tmp_path):
+    manager = _minimal_model_manager(tmp_path)
+    closes = []
+    runtime = _RecoveryRuntime([{'choices': [{'message': {'role': 'assistant', 'content': 'healthy'}}]}], closes)
+    manager.llm = runtime
+    manager.get_llm_instance = lambda: manager.llm
+
+    result = manager.complete_chat_completion_with_worker_recovery(messages=[], options={'temperature': 0})
+
+    assert result['choices'][0]['message']['content'] == 'healthy'
+    assert runtime.calls == 1
+    assert closes == []
+    assert manager.llm is runtime

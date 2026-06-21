@@ -135,6 +135,22 @@ class LlamaCppInferenceRequestError(RuntimeError):
         super().__init__(message)
 
 
+class LlamaCppRestartableWorkerError(RuntimeError):
+    """Raised when the subprocess llama.cpp transport can be retried with a new worker."""
+
+
+class LlamaCppWorkerDeadError(LlamaCppRestartableWorkerError):
+    """Raised when the subprocess worker is no longer alive before a request."""
+
+
+class LlamaCppWorkerEOFError(LlamaCppRestartableWorkerError):
+    """Raised when the subprocess worker exits before returning a response."""
+
+
+class LlamaCppWorkerBrokenPipeError(LlamaCppRestartableWorkerError):
+    """Raised when the subprocess stdin transport is broken."""
+
+
 class LlamaCppRuntimeStageTimeout(TimeoutError):
     """Raised when a llama_cpp discovery/import stage exceeds its bounded timeout."""
 
@@ -750,7 +766,10 @@ def _read_llama_subprocess_message(
         except Exception:
             pass
         time.sleep(0.05)
-        result_queue.put(json.dumps({'status': 'error', 'error': _format_llama_subprocess_early_exit_detail(process, stage=stage)}))
+        if stage == 'llama_cpp_inference':
+            result_queue.put(json.dumps({'status': 'worker_eof', 'error': _format_llama_subprocess_early_exit_detail(process, stage=stage)}))
+        else:
+            result_queue.put(json.dumps({'status': 'error', 'error': _format_llama_subprocess_early_exit_detail(process, stage=stage)}))
 
     reader = threading.Thread(target=_reader, name=f'{stage}_stdout_reader', daemon=True)
     reader.start()
@@ -772,6 +791,8 @@ def _read_llama_subprocess_message(
         raise RuntimeError(f'{stage} returned malformed JSON') from exc
     if not isinstance(message, dict):
         raise RuntimeError(f'{stage} returned non-object JSON')
+    if message.get('status') == 'worker_eof':
+        raise LlamaCppWorkerEOFError(str(message.get('error') or f'{stage} worker exited before response'))
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
         if stage == 'llama_cpp_inference' and message.get('request_error'):
@@ -797,6 +818,7 @@ class _SubprocessLlamaProxy:
     ) -> None:
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._lock = Lock()
+        self._closed = False
         command = [sys.executable, '-u', '-c', _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)]
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
@@ -819,7 +841,7 @@ class _SubprocessLlamaProxy:
         self._start_stderr_tail_reader()
         try:
             self._send({'method': '__init__', 'args': args, 'kwargs': kwargs})
-        except (BrokenPipeError, OSError) as exc:
+        except (BrokenPipeError, OSError, LlamaCppRestartableWorkerError) as exc:
             raise RuntimeError(
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
             ) from exc
@@ -842,11 +864,29 @@ class _SubprocessLlamaProxy:
 
         threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True).start()
 
-    def _send(self, payload: Dict[str, Any]) -> None:
+    def is_alive(self) -> bool:
+        return not self._closed and self._process.poll() is None and self._process.stdin is not None
+
+    def _raise_if_unusable(self) -> None:
+        if self._closed:
+            raise LlamaCppWorkerDeadError('llama_cpp subprocess worker is closed')
+        if self._process.poll() is not None:
+            raise LlamaCppWorkerDeadError(
+                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_inference')
+            )
         if self._process.stdin is None:
-            raise RuntimeError('llama_cpp subprocess stdin is unavailable')
-        self._process.stdin.write(json.dumps(payload) + '\n')
-        self._process.stdin.flush()
+            raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess stdin is unavailable')
+
+    def _send(self, payload: Dict[str, Any]) -> None:
+        self._raise_if_unusable()
+        assert self._process.stdin is not None
+        try:
+            self._process.stdin.write(json.dumps(payload) + '\n')
+            self._process.stdin.flush()
+        except BrokenPipeError as exc:
+            raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess pipe is broken') from exc
+        except OSError as exc:
+            raise LlamaCppWorkerBrokenPipeError(f'llama_cpp subprocess write failed: {exc}') from exc
 
     def create_chat_completion(self, *args, **kwargs):
         stream = bool(kwargs.get('stream', False))
@@ -875,8 +915,16 @@ class _SubprocessLlamaProxy:
                 yield message.get('chunk')
 
     def close(self) -> None:
-        if self._process.poll() is None:
-            self._process.terminate()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=2)
+                except Exception:
+                    self._process.kill()
 
     def __del__(self) -> None:
         try:
@@ -1401,6 +1449,7 @@ class ModelManager:
         self.llm = None
         self.llm_lock = Lock()
         self.last_runtime_init_error: Optional[str] = None
+        self._llm_generation = 0
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -1882,6 +1931,61 @@ class ModelManager:
                             return None
 
         return self.llm
+
+    @staticmethod
+    def _is_restartable_llama_worker_error(exc: BaseException) -> bool:
+        return isinstance(exc, LlamaCppRestartableWorkerError)
+
+    @staticmethod
+    def _close_llm_proxy(llm: Any) -> None:
+        close = getattr(llm, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Ignoring error while closing stale llama.cpp worker", exc_info=True)
+
+    def _invalidate_llm_after_restartable_failure(self, failed_llm: Any) -> None:
+        with self.llm_lock:
+            if self.llm is failed_llm:
+                self._close_llm_proxy(failed_llm)
+                self.llm = None
+                self._llm_generation += 1
+            else:
+                self._close_llm_proxy(failed_llm)
+
+    def _get_recreated_llm_after_restartable_failure(self, failed_llm: Any):
+        self._invalidate_llm_after_restartable_failure(failed_llm)
+        return self.get_llm_instance()
+
+    def complete_chat_completion_with_worker_recovery(self, *, messages: List[Dict[str, Any]], options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run one non-streaming chat completion with one bounded worker replacement attempt."""
+
+        completion_options = dict(options or {})
+        completion_options['stream'] = False
+        llm_instance = self.get_llm_instance()
+        if llm_instance is None:
+            raise RuntimeError('llama_cpp runtime is unavailable')
+
+        try:
+            return llm_instance.create_chat_completion(messages=messages, **completion_options)
+        except LlamaCppInferenceRequestError:
+            raise
+        except Exception as exc:
+            if not self._is_restartable_llama_worker_error(exc):
+                raise
+            replacement = self._get_recreated_llm_after_restartable_failure(llm_instance)
+            if replacement is None:
+                raise RuntimeError('llama_cpp worker replacement failed') from exc
+            try:
+                return replacement.create_chat_completion(messages=messages, **completion_options)
+            except LlamaCppInferenceRequestError:
+                raise
+            except Exception as retry_exc:
+                if self._is_restartable_llama_worker_error(retry_exc):
+                    self._invalidate_llm_after_restartable_failure(replacement)
+                    raise RuntimeError('llama_cpp worker replacement failed after one retry') from retry_exc
+                raise
 
     def llama_cpp_get_response(self, chat_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """

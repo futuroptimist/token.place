@@ -68,6 +68,13 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    pub worker_state: Option<String>,
+    pub worker_generation: Option<u64>,
+    pub worker_restart_count: Option<u64>,
+    pub worker_alive: Option<bool>,
+    pub last_worker_error_code: Option<String>,
+    pub last_worker_exit_code: Option<i64>,
+    pub last_worker_restart_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -263,6 +270,13 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        worker_state: Some("failed".into()),
+        worker_generation: Some(0),
+        worker_restart_count: Some(0),
+        worker_alive: Some(false),
+        last_worker_error_code: Some("startup_failed".into()),
+        last_worker_exit_code: None,
+        last_worker_restart_at_ms: None,
     }
 }
 
@@ -410,6 +424,39 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .get("log_file_path")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+    }
+    if let Some(worker_generation) = payload.get("worker_generation").and_then(Value::as_u64) {
+        if status
+            .worker_generation
+            .is_some_and(|current| worker_generation < current)
+        {
+            return true;
+        }
+        status.worker_generation = Some(worker_generation);
+    }
+    if let Some(worker_state) = payload.get("worker_state").and_then(Value::as_str) {
+        status.worker_state = Some(worker_state.into());
+    }
+    if let Some(worker_restart_count) = payload.get("worker_restart_count").and_then(Value::as_u64)
+    {
+        status.worker_restart_count = Some(worker_restart_count);
+    }
+    if payload.get("worker_alive").is_some() {
+        status.worker_alive = payload.get("worker_alive").and_then(Value::as_bool);
+    }
+    if payload.get("last_worker_error_code").is_some() {
+        status.last_worker_error_code = payload
+            .get("last_worker_error_code")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("last_worker_exit_code").is_some() {
+        status.last_worker_exit_code = payload.get("last_worker_exit_code").and_then(Value::as_i64);
+    }
+    if payload.get("last_worker_restart_at_ms").is_some() {
+        status.last_worker_restart_at_ms = payload
+            .get("last_worker_restart_at_ms")
+            .and_then(Value::as_u64);
     }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
@@ -580,6 +627,13 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "last_error",
         "configured_relay_count",
         "registered_relay_count",
+        "worker_state",
+        "worker_generation",
+        "worker_restart_count",
+        "worker_alive",
+        "last_worker_error_code",
+        "last_worker_exit_code",
+        "last_worker_restart_at_ms",
     ] {
         if let Some(value) = map.get(key) {
             summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));

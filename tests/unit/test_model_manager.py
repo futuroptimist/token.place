@@ -3424,3 +3424,34 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     monkeypatch.setattr(manager, 'get_llm_instance', _get_replacement)
     assert manager._ensure_replacement_llm(manager._llm_generation) is replacement
     assert stale.closed is True
+
+def test_model_manager_worker_lifecycle_diagnostics_request_error_does_not_restart(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first', fail='request')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first])
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    diagnostics = manager.worker_lifecycle_diagnostics()
+    assert diagnostics['worker_generation'] == 0
+    assert diagnostics['worker_restart_count'] == 0
+    assert diagnostics['worker_alive'] is True
+    assert diagnostics['worker_state'] == 'ready'
+    assert diagnostics['last_worker_error_code'] is None
+    assert created == [first]
+
+
+def test_model_manager_worker_lifecycle_diagnostics_fatal_restart_code(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first', fail='dead')
+    second = _RestartableFakeWorker('second', fail='eof')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    with pytest.raises(RuntimeError, match='one restart attempt'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    diagnostics = manager.worker_lifecycle_diagnostics()
+    assert diagnostics['worker_restart_count'] == 2
+    assert diagnostics['worker_generation'] == 2
+    assert diagnostics['worker_state'] == 'failed'
+    assert diagnostics['last_worker_error_code'] == 'worker_eof'

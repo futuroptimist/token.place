@@ -424,6 +424,36 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
     )
 
 
+
+def _worker_lifecycle_diagnostics(model_manager: Any) -> Dict[str, Any]:
+    diagnostics = getattr(model_manager, "worker_lifecycle_diagnostics", None)
+    if callable(diagnostics):
+        try:
+            value = diagnostics()
+        except Exception:
+            value = {}
+        if isinstance(value, dict):
+            return value
+    return {
+        "worker_state": "ready" if getattr(model_manager, "llm", None) is not None else "stopped",
+        "worker_generation": 0,
+        "worker_restart_count": 0,
+        "worker_alive": getattr(model_manager, "llm", None) is not None,
+        "last_worker_error_code": None,
+        "last_worker_exit_code": None,
+        "last_worker_restart_at_ms": None,
+    }
+
+def _worker_log_fields(model_manager: Any) -> str:
+    meta = _worker_lifecycle_diagnostics(model_manager)
+    return (
+        f"worker_generation={meta.get('worker_generation', 0)} "
+        f"worker_restart_count={meta.get('worker_restart_count', 0)} "
+        f"worker_state={meta.get('worker_state', 'unknown')} "
+        f"last_worker_error_code={meta.get('last_worker_error_code') or 'none'} "
+        f"last_worker_exit_code={meta.get('last_worker_exit_code') if meta.get('last_worker_exit_code') is not None else 'none'}"
+    )
+
 def _env_enabled(name: str, default: str = "0") -> bool:
     value = os.getenv(name, default)
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
@@ -551,6 +581,13 @@ def _structured_startup_error_payload(
         "warm_load_duration_ms": None,
         "runtime_path": _runtime_path_from_env(),
         "relay_runtime_path": "bridge",
+        "worker_state": "failed",
+        "worker_generation": 0,
+        "worker_restart_count": 0,
+        "worker_alive": False,
+        "last_worker_error_code": "startup_failed",
+        "last_worker_exit_code": None,
+        "last_worker_restart_at_ms": None,
     }
     if operator_session_id is not None:
         payload["operator_session_id"] = operator_session_id
@@ -909,6 +946,7 @@ def run(args: argparse.Namespace) -> int:
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
         }
+        payload.update(_worker_lifecycle_diagnostics(runtime.model_manager))
         if extra:
             payload.update(extra)
         return payload
@@ -984,6 +1022,13 @@ def run(args: argparse.Namespace) -> int:
                 "desktop.compute_node_bridge.model_init.start "
                 f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
                 f"request_id={request_id} state={warm_load_state}",
+                file=sys.stderr,
+            )
+            print(
+                "desktop.compute_node_bridge.worker.initialization "
+                f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
+                f"request_id={request_id} state={warm_load_state} "
+                f"{_worker_log_fields(runtime.model_manager)}",
                 file=sys.stderr,
             )
         if warm_load_future is None:
@@ -1423,6 +1468,13 @@ def run(args: argparse.Namespace) -> int:
                 f"attempts={attempts} backoff_seconds={backoff_seconds:g}",
                 file=sys.stderr,
             )
+            print(
+                "desktop.compute_node_bridge.worker.recovery_start "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"attempts={attempts} backoff_seconds={backoff_seconds:g} "
+                f"{_worker_log_fields(runtime.model_manager)}",
+                file=sys.stderr,
+            )
             best_effort_unadvertise_all_relays()
             for attempt in range(1, attempts + 1):
                 if stop_requested():
@@ -1464,8 +1516,9 @@ def run(args: argparse.Namespace) -> int:
                             )
                         )
                         print(
-                            "desktop.compute_node_bridge.recovery.succeeded "
-                            f"attempt={attempt} request_id={request_id}",
+                            "desktop.compute_node_bridge.worker.recovery_result "
+                            f"attempt={attempt} request_id={request_id} result=succeeded "
+                            f"{_worker_log_fields(runtime.model_manager)}",
                             file=sys.stderr,
                         )
                         return True
@@ -1504,8 +1557,9 @@ def run(args: argparse.Namespace) -> int:
                 )
             )
             print(
-                "desktop.compute_node_bridge.recovery.exhausted "
-                f"request_id={request_id} action=restart_desktop_compute_node",
+                "desktop.compute_node_bridge.worker.terminal_failure "
+                f"request_id={request_id} safe_error_code=worker_recovery_exhausted "
+                f"action=restart_desktop_compute_node {_worker_log_fields(runtime.model_manager)}",
                 file=sys.stderr,
             )
             return False
@@ -1768,12 +1822,13 @@ def run(args: argparse.Namespace) -> int:
                         relay_last_error = f"relay request failed: {safe_error_code}"
                     last_error = relay_last_error
                     print(
-                        "desktop.compute_node_bridge.process_request.failed "
+                        "desktop.compute_node_bridge.worker.request_failure "
                         f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
                         f"safe_error_code={safe_error_code or 'none'} submitted={submitted} "
                         f"runtime_healthy={runtime_healthy} "
                         f"recovery_attempted={recovery_attempted} "
-                        f"recovery_succeeded={recovery_succeeded}",
+                        f"recovery_succeeded={recovery_succeeded} "
+                        f"{_worker_log_fields(runtime.model_manager)}",
                         file=sys.stderr,
                     )
                     if submitted:

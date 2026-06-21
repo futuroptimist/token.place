@@ -67,6 +67,13 @@ interface ComputeNodeStatus {
   sequence: number | null;
   updated_at_ms: number | null;
   log_file_path: string | null;
+  worker_state: string | null;
+  worker_generation: number | null;
+  worker_restart_count: number | null;
+  worker_alive: boolean | null;
+  last_worker_error_code: string | null;
+  last_worker_exit_code: number | null;
+  last_worker_restart_at_ms: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -115,6 +122,13 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
+  worker_state: null,
+  worker_generation: null,
+  worker_restart_count: null,
+  worker_alive: null,
+  last_worker_error_code: null,
+  last_worker_exit_code: null,
+  last_worker_restart_at_ms: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -281,6 +295,10 @@ function mergeComputeStatusEvent(
   ) {
     return prev;
   }
+  const payloadWorkerGeneration = typeof payload.worker_generation === 'number' ? payload.worker_generation : null;
+  if (payloadWorkerGeneration !== null && prev.worker_generation !== null && payloadWorkerGeneration < prev.worker_generation) {
+    return prev;
+  }
 
   return {
     running:
@@ -387,6 +405,28 @@ function mergeComputeStatusEvent(
         : typeof payload.log_file_path === 'string'
           ? payload.log_file_path
           : prev.log_file_path,
+    worker_state: typeof payload.worker_state === 'string' ? payload.worker_state : prev.worker_state,
+    worker_generation: payloadWorkerGeneration ?? prev.worker_generation,
+    worker_restart_count: typeof payload.worker_restart_count === 'number' ? payload.worker_restart_count : prev.worker_restart_count,
+    worker_alive: typeof payload.worker_alive === 'boolean' ? payload.worker_alive : prev.worker_alive,
+    last_worker_error_code:
+      payload.last_worker_error_code === null
+        ? null
+        : typeof payload.last_worker_error_code === 'string'
+          ? payload.last_worker_error_code
+          : prev.last_worker_error_code,
+    last_worker_exit_code:
+      payload.last_worker_exit_code === null
+        ? null
+        : typeof payload.last_worker_exit_code === 'number'
+          ? payload.last_worker_exit_code
+          : prev.last_worker_exit_code,
+    last_worker_restart_at_ms:
+      payload.last_worker_restart_at_ms === null
+        ? null
+        : typeof payload.last_worker_restart_at_ms === 'number'
+          ? payload.last_worker_restart_at_ms
+          : prev.last_worker_restart_at_ms,
     last_error:
       payload.last_error === null
         ? null
@@ -658,6 +698,9 @@ export function App() {
         model_path: config.model_path,
         last_error: null,
         log_file_path: null,
+        worker_state: 'starting',
+        worker_alive: false,
+        last_worker_error_code: null,
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -866,6 +909,12 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{formatRegisteredLabel(computeStatus, normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length)}</strong></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
+        <p style={{ marginBottom: 0 }}>Worker lifecycle: <strong>{displayStatusValue(computeStatus.worker_state, 'unknown')}</strong></p>
+        <p style={{ marginBottom: 0 }}>Worker alive: <strong>{computeStatus.worker_alive === null ? 'unknown' : computeStatus.worker_alive ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Worker generation: <code>{computeStatus.worker_generation ?? 'unknown'}</code></p>
+        <p style={{ marginBottom: 0 }}>Worker restarts: <code>{computeStatus.worker_restart_count ?? 0}</code></p>
+        <p style={{ marginBottom: 0 }}>Last worker error code: <code>{computeStatus.last_worker_error_code || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Last worker exit code: <code>{computeStatus.last_worker_exit_code ?? 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{displayStatusValue(computeStatus.active_relay_url, primaryRelayUrl(config))}</code></p>

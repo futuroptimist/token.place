@@ -1610,4 +1610,54 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+
+  it('shows worker lifecycle states and ignores stale generations', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      worker_state: 'ready',
+      worker_generation: 2,
+      worker_restart_count: 1,
+      worker_alive: true,
+      last_worker_error_code: null,
+    });
+    render(<App />);
+    await screen.findByText('Worker lifecycle:');
+    expect(screen.getByText('Worker lifecycle:').textContent).toContain('ready');
+    expect(screen.getByText('Worker alive:').textContent).toContain('yes');
+
+    eventHandlers.get('compute_node_event')?.({ payload: {
+      type: 'status', running: true, registered: false, operator_session_id: null,
+      sequence: 2, worker_state: 'recovering', worker_generation: 3,
+      worker_restart_count: 2, worker_alive: false,
+    }});
+    await waitFor(() => expect(screen.getByText('Worker lifecycle:').textContent).toContain('recovering'));
+    expect(screen.getByText('Worker restarts:').textContent).toContain('2');
+
+    eventHandlers.get('compute_node_event')?.({ payload: {
+      type: 'status', running: true, operator_session_id: null,
+      sequence: 3, worker_state: 'ready', worker_generation: 1,
+      worker_restart_count: 1, worker_alive: true,
+    }});
+    expect(screen.getByText('Worker lifecycle:').textContent).toContain('recovering');
+
+    eventHandlers.get('compute_node_event')?.({ payload: {
+      type: 'error', running: false, registered: false, operator_session_id: null,
+      sequence: 4, worker_state: 'failed', worker_generation: 3,
+      worker_restart_count: 3, worker_alive: false,
+      last_worker_error_code: 'worker_recovery_exhausted', message: 'terminal failure',
+    }});
+    await waitFor(() => expect(screen.getByText('Worker lifecycle:').textContent).toContain('failed'));
+    expect(screen.getByText('Last worker error code:').textContent).toContain('worker_recovery_exhausted');
+  });
+
+  it('renders older bridge statuses without worker fields', async () => {
+    mockInitialComputeStatus({ running: true, registered: true, relay_runtime_state: 'ready' });
+    render(<App />);
+    await screen.findByText('Worker lifecycle:');
+    expect(screen.getByText('Worker lifecycle:').textContent).toContain('unknown');
+    expect(screen.getByText('Worker restarts:').textContent).toContain('0');
+  });
+
 });

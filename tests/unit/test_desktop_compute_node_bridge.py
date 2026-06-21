@@ -4259,3 +4259,37 @@ def test_api_v1_unhealthy_result_without_recovery_attempt_sets_terminal_state(
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get('type') == 'status']
     assert status_events[-1]['relay_runtime_state'] == expected_state
+
+
+
+def test_worker_lifecycle_payload_and_log_fields_are_privacy_safe():
+    module = compute_node_bridge
+
+    class Manager:
+        llm = object()
+        def worker_lifecycle_diagnostics(self):
+            return {
+                'worker_state': 'recovering',
+                'worker_generation': 4,
+                'worker_restart_count': 2,
+                'worker_alive': False,
+                'last_worker_error_code': 'worker_dead',
+                'last_worker_exit_code': 9,
+                'last_worker_restart_at_ms': 12345,
+            }
+
+    manager = Manager()
+    diagnostics = module._worker_lifecycle_diagnostics(manager)
+    assert diagnostics['worker_state'] == 'recovering'
+    assert diagnostics['worker_generation'] == 4
+    fields = module._worker_log_fields(manager)
+    assert 'worker_generation=4' in fields
+    assert 'worker_restart_count=2' in fields
+    forbidden = [
+        'sentinel prompt secret',
+        'sentinel output secret',
+        '-----BEGIN PRIVATE KEY-----',
+        '/Users/alice/private/model.gguf',
+    ]
+    for value in forbidden:
+        assert value not in fields

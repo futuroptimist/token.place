@@ -22,6 +22,15 @@ logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
+class ApiV1RequestValidationError(ValueError):
+    """Structured, prompt-safe API v1 request validation failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def _load_jsonschema():
     """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
     try:
@@ -493,6 +502,37 @@ class RelayClient:
     }
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant", "function"}
+    _API_V1_MAX_MESSAGES = 64
+    _API_V1_MAX_MESSAGE_CHARS = 16_384
+    _API_V1_MAX_TOTAL_CONTENT_CHARS = 65_536
+    _API_V1_MAX_CONTENT_BLOCKS = 16
+    _API_V1_MAX_STOP_VALUES = 8
+    _API_V1_MAX_STOP_CHARS = 256
+    _API_V1_MAX_MODEL_CHARS = 256
+    _API_V1_MAX_REQUEST_ID_CHARS = 256
+    _API_V1_MIN_MAX_TOKENS = 1
+    _API_V1_MAX_MAX_TOKENS = 4096
+    _API_V1_MIN_SEED = 0
+    _API_V1_MAX_SEED = 2**31 - 1
+    _API_V1_SUPPORTED_OPTION_NAMES = {
+        "frequency_penalty",
+        "max_tokens",
+        "presence_penalty",
+        "seed",
+        "stop",
+        "stream",
+        "temperature",
+        "top_p",
+    }
+    _API_V1_UNSUPPORTED_FEATURE_OPTIONS = {
+        "logit_bias",
+        "logprobs",
+        "parallel_tool_calls",
+        "response_format",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+    }
 
     def __init__(
         self,
@@ -1680,6 +1720,246 @@ class RelayClient:
         return True
 
     @classmethod
+    def _api_v1_validate_string(
+        cls,
+        value: Any,
+        *,
+        field: str,
+        max_chars: int,
+        allow_empty: bool = False,
+    ) -> str:
+        if not isinstance(value, str):
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} must be a string",
+            )
+        if not allow_empty and not value:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} must be non-empty",
+            )
+        if len(value) > max_chars:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} exceeds size limit",
+            )
+        return value
+
+    @classmethod
+    def _api_v1_validate_number(
+        cls,
+        value: Any,
+        *,
+        field: str,
+        minimum: float,
+        maximum: float,
+        integer: bool = False,
+    ) -> Union[int, float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            expected = "integer" if integer else "number"
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} must be a finite {expected}",
+            )
+        if not math.isfinite(float(value)):
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} must be finite",
+            )
+        if integer and not isinstance(value, int):
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} must be an integer",
+            )
+        if value < minimum or value > maximum:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                f"Invalid API v1 request: {field} is outside supported range",
+            )
+        return value
+
+    @classmethod
+    def _api_v1_normalize_stop(cls, value: Any) -> Union[str, List[str]]:
+        if isinstance(value, str):
+            return cls._api_v1_validate_string(
+                value,
+                field="stop",
+                max_chars=cls._API_V1_MAX_STOP_CHARS,
+            )
+        if not isinstance(value, list) or not value:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                "Invalid API v1 request: stop must be a string or non-empty string list",
+            )
+        if len(value) > cls._API_V1_MAX_STOP_VALUES:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                "Invalid API v1 request: stop has too many values",
+            )
+        return [
+            cls._api_v1_validate_string(
+                item,
+                field="stop",
+                max_chars=cls._API_V1_MAX_STOP_CHARS,
+            )
+            for item in value
+        ]
+
+    @classmethod
+    def _validate_and_normalize_api_v1_messages(
+        cls, messages: Any
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(messages, list) or not messages:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                "Invalid API v1 request: messages must be a non-empty list",
+            )
+        if len(messages) > cls._API_V1_MAX_MESSAGES:
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                "Invalid API v1 request: too many messages",
+            )
+        normalized: List[Dict[str, Any]] = []
+        total_chars = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ApiV1RequestValidationError(
+                    "compute_node_invalid_request",
+                    "Invalid API v1 request: each message must be an object",
+                )
+            role = message.get("role")
+            if not isinstance(role, str) or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES:
+                raise ApiV1RequestValidationError(
+                    "compute_node_invalid_request",
+                    "Invalid API v1 request: unsupported message role",
+                )
+            if "content" not in message:
+                raise ApiV1RequestValidationError(
+                    "compute_node_invalid_request",
+                    "Invalid API v1 request: message content is required",
+                )
+            content = message.get("content")
+            if isinstance(content, str):
+                cls._api_v1_validate_string(
+                    content,
+                    field="message content",
+                    max_chars=cls._API_V1_MAX_MESSAGE_CHARS,
+                    allow_empty=True,
+                )
+                total_chars += len(content)
+            elif isinstance(content, list) and content:
+                if len(content) > cls._API_V1_MAX_CONTENT_BLOCKS:
+                    raise ApiV1RequestValidationError(
+                        "compute_node_invalid_request",
+                        "Invalid API v1 request: too many content blocks",
+                    )
+                block_chars = 0
+                for block in content:
+                    if not isinstance(block, dict):
+                        raise ApiV1RequestValidationError(
+                            "compute_node_invalid_request",
+                            "Invalid API v1 request: content blocks must be objects",
+                        )
+                    if block.get("type") not in {"input_text", "text"}:
+                        raise ApiV1RequestValidationError(
+                            "compute_node_invalid_request",
+                            "Invalid API v1 request: message content must be text",
+                        )
+                    if set(block) - {"type", "text"}:
+                        raise ApiV1RequestValidationError(
+                            "compute_node_invalid_request",
+                            "Invalid API v1 request: unsupported content block shape",
+                        )
+                    text = cls._api_v1_validate_string(
+                        block.get("text"),
+                        field="content block text",
+                        max_chars=cls._API_V1_MAX_MESSAGE_CHARS,
+                    )
+                    block_chars += len(text)
+                if block_chars > cls._API_V1_MAX_MESSAGE_CHARS:
+                    raise ApiV1RequestValidationError(
+                        "compute_node_invalid_request",
+                        "Invalid API v1 request: message content exceeds size limit",
+                    )
+                total_chars += block_chars
+            else:
+                raise ApiV1RequestValidationError(
+                    "compute_node_invalid_request",
+                    "Invalid API v1 request: message content must be text",
+                )
+            if total_chars > cls._API_V1_MAX_TOTAL_CONTENT_CHARS:
+                raise ApiV1RequestValidationError(
+                    "compute_node_invalid_request",
+                    "Invalid API v1 request: total message content exceeds size limit",
+                )
+            normalized.append(dict(message))
+        return normalized
+
+    def _validate_and_normalize_api_v1_options(
+        self, options: Any
+    ) -> Dict[str, Any]:
+        if not isinstance(options, dict):
+            raise ApiV1RequestValidationError(
+                "compute_node_invalid_request",
+                "Invalid API v1 request: options must be an object",
+            )
+        unsupported_features = sorted(
+            key for key in options if key in self._API_V1_UNSUPPORTED_FEATURE_OPTIONS
+        )
+        if unsupported_features:
+            raise ApiV1RequestValidationError(
+                "compute_node_options_unsupported",
+                "Unsupported API v1 request feature",
+            )
+        unknown = sorted(key for key in options if key not in self._API_V1_SUPPORTED_OPTION_NAMES)
+        if unknown:
+            raise ApiV1RequestValidationError(
+                "compute_node_options_unsupported",
+                "Unsupported API v1 request option",
+            )
+        normalized: Dict[str, Any] = {}
+        for key, value in options.items():
+            if key == "stream":
+                if value is not False:
+                    raise ApiV1RequestValidationError(
+                        "compute_node_options_unsupported",
+                        "Unsupported API v1 request feature: streaming",
+                    )
+            elif key == "max_tokens":
+                normalized[key] = self._api_v1_validate_number(
+                    value,
+                    field=key,
+                    minimum=self._API_V1_MIN_MAX_TOKENS,
+                    maximum=self._API_V1_MAX_MAX_TOKENS,
+                    integer=True,
+                )
+            elif key in {"temperature", "top_p"}:
+                normalized[key] = self._api_v1_validate_number(
+                    value,
+                    field=key,
+                    minimum=0.0,
+                    maximum=2.0 if key == "temperature" else 1.0,
+                )
+            elif key in {"frequency_penalty", "presence_penalty"}:
+                normalized[key] = self._api_v1_validate_number(
+                    value,
+                    field=key,
+                    minimum=-2.0,
+                    maximum=2.0,
+                )
+            elif key == "seed":
+                normalized[key] = self._api_v1_validate_number(
+                    value,
+                    field=key,
+                    minimum=self._API_V1_MIN_SEED,
+                    maximum=self._API_V1_MAX_SEED,
+                    integer=True,
+                )
+            elif key == "stop":
+                normalized[key] = self._api_v1_normalize_stop(value)
+        return normalized
+
+    @classmethod
     def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
         if not isinstance(messages, list) or not messages:
             return False
@@ -2003,12 +2283,26 @@ class RelayClient:
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
-        if not self._messages_are_valid_api_v1_chat(messages):
+        try:
+            request_id = self._api_v1_validate_string(
+                request_id,
+                field="request_id",
+                max_chars=self._API_V1_MAX_REQUEST_ID_CHARS,
+            )
+            model_id = self._api_v1_validate_string(
+                model_id,
+                field="model",
+                max_chars=self._API_V1_MAX_MODEL_CHARS,
+            ).strip()
+            messages = self._validate_and_normalize_api_v1_messages(messages)
+            options = self._validate_and_normalize_api_v1_options(options)
+        except ApiV1RequestValidationError as exc:
+            log_error("Rejected API v1 relay request during validation: {}", exc.code)
             return self._api_v1_response_envelope(
                 request_id,
                 error={
-                    "code": "compute_node_invalid_request",
-                    "message": "Invalid chat message format",
+                    "code": exc.code,
+                    "message": exc.message,
                 },
             )
 
@@ -2020,19 +2314,6 @@ class RelayClient:
                 error={
                     "code": "compute_node_model_unsupported",
                     "message": "Requested model is not available in the desktop runtime",
-                },
-            )
-
-        options_supported, unsupported_option = self._api_v1_supported_options(options)
-        if not options_supported:
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_options_unsupported",
-                    "message": (
-                        "Requested option is unsupported by the desktop runtime: "
-                        f"{unsupported_option}"
-                    ),
                 },
             )
 

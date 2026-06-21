@@ -2590,13 +2590,13 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_api_v1_forwards_openai_options_with_defaults(
+    def test_process_client_request_api_v1_rejects_unsupported_openai_features(
         self,
         mock_post,
         relay_client,
         mock_crypto_manager,
     ):
-        """OpenAI-style API v1 options should pass through with manager defaults."""
+        """Unsupported OpenAI feature options must not pass through to llama.cpp."""
 
         class _Config:
             def get(self, key, default):
@@ -2669,23 +2669,230 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
-        assert len(manager.runtime.calls) == 1
-        completion_kwargs = manager.runtime.calls[0]
-        assert completion_kwargs["messages"] == [{"role": "user", "content": "Hello"}]
-        assert completion_kwargs["max_tokens"] == 64
-        assert completion_kwargs["top_p"] == 0.9
-        assert completion_kwargs["stop"] == ["</s>"]
-        assert completion_kwargs["stream"] is False
-        assert completion_kwargs["temperature"] == 0.2
-        assert completion_kwargs["frequency_penalty"] == 0.1
-        assert completion_kwargs["presence_penalty"] == 0.2
-        assert completion_kwargs["response_format"] == {"type": "text"}
-        assert completion_kwargs["seed"] == 7
-        assert completion_kwargs["tools"] == []
-        assert completion_kwargs["tool_choice"] == "none"
+        assert manager.runtime.calls == []
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
-            "Tool-aware response"
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_options_unsupported"
+        )
+
+    @pytest.mark.parametrize(
+        "options,expected",
+        [
+            ({"max_tokens": 1}, {"max_tokens": 1}),
+            ({"max_tokens": 4096}, {"max_tokens": 4096}),
+            ({"temperature": 0.0}, {"temperature": 0.0}),
+            ({"temperature": 2.0}, {"temperature": 2.0}),
+            ({"top_p": 0.0}, {"top_p": 0.0}),
+            ({"top_p": 1.0}, {"top_p": 1.0}),
+            ({"frequency_penalty": -2.0}, {"frequency_penalty": -2.0}),
+            ({"frequency_penalty": 2.0}, {"frequency_penalty": 2.0}),
+            ({"presence_penalty": -2.0}, {"presence_penalty": -2.0}),
+            ({"presence_penalty": 2.0}, {"presence_penalty": 2.0}),
+            ({"seed": 0}, {"seed": 0}),
+            ({"seed": 2**31 - 1}, {"seed": 2**31 - 1}),
+            ({"stop": "END"}, {"stop": "END"}),
+            ({"stop": ["END"]}, {"stop": ["END"]}),
+            ({"stream": False}, {}),
+        ],
+    )
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_accepts_option_boundaries(
+        self,
+        mock_post,
+        options,
+        expected,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Every supported option accepts documented boundary values."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-option-boundary",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": options,
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        completion_kwargs = mock_model_manager.runtime.create_chat_completion.call_args.kwargs
+        for key, value in expected.items():
+            assert completion_kwargs[key] == value
+        assert completion_kwargs["stream"] is False
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert "error" not in encrypted_envelope["api_v1_response"]
+
+    @pytest.mark.parametrize(
+        "options,expected_code",
+        [
+            ({"max_tokens": True}, "compute_node_invalid_request"),
+            ({"max_tokens": 1.5}, "compute_node_invalid_request"),
+            ({"max_tokens": 0}, "compute_node_invalid_request"),
+            ({"max_tokens": 4097}, "compute_node_invalid_request"),
+            ({"temperature": False}, "compute_node_invalid_request"),
+            ({"temperature": float("nan")}, "compute_node_invalid_request"),
+            ({"temperature": float("inf")}, "compute_node_invalid_request"),
+            ({"temperature": -0.1}, "compute_node_invalid_request"),
+            ({"top_p": 1.1}, "compute_node_invalid_request"),
+            ({"frequency_penalty": -2.1}, "compute_node_invalid_request"),
+            ({"presence_penalty": 2.1}, "compute_node_invalid_request"),
+            ({"seed": -1}, "compute_node_invalid_request"),
+            ({"seed": 2**31}, "compute_node_invalid_request"),
+            ({"stop": ""}, "compute_node_invalid_request"),
+            ({"stop": ["END"] * 9}, "compute_node_invalid_request"),
+            ({"stop": "x" * 257}, "compute_node_invalid_request"),
+            ({"stream": True}, "compute_node_options_unsupported"),
+            ({"tools": []}, "compute_node_options_unsupported"),
+            ({"tool_choice": "none"}, "compute_node_options_unsupported"),
+            ({"response_format": {"type": "text"}}, "compute_node_options_unsupported"),
+            ({"unknown": 1}, "compute_node_options_unsupported"),
+        ],
+    )
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_invalid_options_before_worker(
+        self,
+        mock_post,
+        options,
+        expected_code,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Invalid, non-finite, oversized, and unsupported options are poison-safe."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-option",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "secret prompt text"}],
+                "options": options,
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        mock_model_manager.runtime.create_chat_completion.assert_not_called()
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        error = encrypted_envelope["api_v1_response"]["error"]
+        assert error["code"] == expected_code
+        assert "secret prompt text" not in json.dumps(error)
+
+    @pytest.mark.parametrize(
+        "messages,expected_code",
+        [
+            ([], "compute_node_invalid_request"),
+            ([{"role": "developer", "content": "x"}], "compute_node_invalid_request"),
+            ([{"role": "user"}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": 123}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": "x" * 16385}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": [{"type": "text", "text": ""}]}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": [{"type": "text", "text": "x", "extra": "y"}]}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": [{"type": "text", "text": "x"}] * 17}], "compute_node_invalid_request"),
+            ([{"role": "user", "content": "x"}] * 65, "compute_node_invalid_request"),
+        ],
+    )
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_invalid_messages_before_worker(
+        self,
+        mock_post,
+        messages,
+        expected_code,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Malformed and oversized messages are rejected before llama.cpp."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-message",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": messages,
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        mock_model_manager.runtime.create_chat_completion.assert_not_called()
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == expected_code
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejection_does_not_degrade_next_valid_request(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Rejected validation failures do not alter health/recovery before valid work."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+        original_registered_relays = set(relay_client._api_v1_registered_relays)
+        invalid_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-then-valid",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "secret rejected text"}],
+                "options": {"temperature": float("inf")},
+            },
+        }
+        valid_payload = {
+            **invalid_payload,
+            "request_id": "req-valid-after-invalid",
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+
+        mock_crypto_manager.decrypt_message.return_value = invalid_payload
+        assert relay_client.process_client_request(request_data) is True
+        first_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert first_envelope["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
+        assert mock_model_manager.runtime.create_chat_completion.call_count == 0
+        assert set(relay_client._api_v1_registered_relays) == original_registered_relays
+
+        mock_crypto_manager.decrypt_message.return_value = valid_payload
+        assert relay_client.process_client_request(request_data) is True
+        assert mock_model_manager.runtime.create_chat_completion.call_count == 1
+        second_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert second_envelope["api_v1_response"]["message"]["content"] == (
+            "The capital of France is Paris."
         )
 
     @patch('utils.networking.relay_client.requests.post')

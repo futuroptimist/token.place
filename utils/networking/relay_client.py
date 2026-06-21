@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
+from utils.compute_node_runtime import RelayProcessingResult
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -1609,6 +1610,34 @@ class RelayClient:
             )
             return False
 
+    def _api_v1_runtime_health_after_result(self, safe_error_code: Optional[str]) -> bool:
+        """Return a privacy-safe runtime health verdict after an API v1 result."""
+
+        health_probe = getattr(self.model_manager, "api_v1_runtime_is_healthy", None)
+        if callable(health_probe):
+            try:
+                return bool(health_probe())
+            except Exception:
+                log_error("API v1 runtime health probe failed", exc_info=True)
+                return False
+        if safe_error_code in {
+            "compute_node_invalid_request",
+            "compute_node_options_unsupported",
+            "compute_node_model_unsupported",
+        }:
+            return True
+        return safe_error_code != "compute_node_internal_error"
+
+    def _api_v1_response_error_code(self, response_envelope: Dict[str, Any]) -> Optional[str]:
+        api_v1_response = response_envelope.get("api_v1_response")
+        if not isinstance(api_v1_response, dict):
+            return None
+        error = api_v1_response.get("error")
+        if not isinstance(error, dict):
+            return None
+        code = error.get("code")
+        return code if isinstance(code, str) and code else "compute_node_internal_error"
+
 
     def submit_api_v1_error_response(
         self,
@@ -2281,7 +2310,7 @@ class RelayClient:
                 },
             )
 
-    def process_client_request(self, request_data: Dict[str, Any]) -> bool:
+    def process_client_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
         """
         Process a client request from the relay.
 
@@ -2289,32 +2318,55 @@ class RelayClient:
             request_data: Data received from the relay containing the encrypted client request
 
         Returns:
-            bool: True if processing succeeded, False otherwise
+            RelayProcessingResult: typed result separating inference success from
+            encrypted response/error envelope submission success.
         """
+        request_id = request_data.get("request_id") if isinstance(request_data, dict) else None
+        relay_url = self._api_v1_response_relay_url()
         try:
             try:
                 _validate_with_fallback(request_data, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid request data format: {}", str(e))
-                return False
+                return RelayProcessingResult.failed(
+                    safe_error_code="compute_node_invalid_request",
+                    runtime_remains_healthy=True,
+                    request_id=request_id,
+                    relay_url=relay_url,
+                )
 
             client_pub_key_b64 = _normalize_client_public_key_b64(request_data['client_public_key'])
             if client_pub_key_b64 is None:
                 log_error("Invalid client_public_key format in relay request metadata")
-                return False
+                return RelayProcessingResult.failed(
+                    safe_error_code="compute_node_invalid_request",
+                    runtime_remains_healthy=True,
+                    request_id=request_id,
+                    relay_url=relay_url,
+                )
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
             try:
                 client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
             except (AttributeError, binascii.Error, ValueError):
                 log_error("Invalid client_public_key encoding in relay request metadata")
-                return False
+                return RelayProcessingResult.failed(
+                    safe_error_code="compute_node_invalid_request",
+                    runtime_remains_healthy=True,
+                    request_id=request_id,
+                    relay_url=relay_url,
+                )
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
             if decrypted_chat_history is None:
                 log_info("Decryption failed. Skipping.")
-                return False
+                return RelayProcessingResult.failed(
+                    safe_error_code="compute_node_invalid_request",
+                    runtime_remains_healthy=True,
+                    request_id=request_id,
+                    relay_url=relay_url,
+                )
 
             log_info("Decrypted client request")
             api_v1_request_payload = _extract_api_v1_request_payload(
@@ -2328,10 +2380,37 @@ class RelayClient:
                     messages=api_v1_request_payload["messages"],
                     options=dict(api_v1_request_payload["options"]),
                 )
-                return self._post_api_v1_response(
+                safe_error_code = self._api_v1_response_error_code(response_envelope)
+                submitted = self._post_api_v1_response(
                     response_envelope,
                     client_pub_key_b64=client_pub_key_b64,
                     client_pub_key=client_pub_key,
+                )
+                if safe_error_code is None:
+                    return RelayProcessingResult(
+                        inference_succeeded=submitted,
+                        envelope_submitted=submitted,
+                        runtime_remains_healthy=True,
+                        request_id=api_v1_request_payload["request_id"],
+                        relay_url=relay_url,
+                    )
+                runtime_healthy = self._api_v1_runtime_health_after_result(safe_error_code)
+                if submitted:
+                    return RelayProcessingResult.submitted_error(
+                        safe_error_code=safe_error_code,
+                        runtime_remains_healthy=runtime_healthy,
+                        runtime_recovery_attempted=safe_error_code == "compute_node_internal_error",
+                        runtime_recovery_succeeded=runtime_healthy,
+                        request_id=api_v1_request_payload["request_id"],
+                        relay_url=relay_url,
+                    )
+                return RelayProcessingResult.failed(
+                    safe_error_code=safe_error_code,
+                    runtime_remains_healthy=runtime_healthy,
+                    runtime_recovery_attempted=safe_error_code == "compute_node_internal_error",
+                    runtime_recovery_succeeded=runtime_healthy,
+                    request_id=api_v1_request_payload["request_id"],
+                    relay_url=relay_url,
                 )
 
             chat_history = _extract_chat_history_and_validate_key_binding(
@@ -2339,7 +2418,12 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if chat_history is None:
-                return False
+                return RelayProcessingResult.failed(
+                    safe_error_code="compute_node_invalid_request",
+                    runtime_remains_healthy=True,
+                    request_id=request_id,
+                    relay_url=relay_url,
+                )
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)
@@ -2370,8 +2454,8 @@ class RelayClient:
                 )
                 if stream_response.status_code != 200:
                     log_error("Error status from /stream/source: {}", stream_response.status_code)
-                    return False
-                return True
+                    return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
+                return RelayProcessingResult.submitted_success(request_id=request_id, relay_url=relay_url)
 
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(chat_history)
@@ -2392,7 +2476,7 @@ class RelayClient:
                 _validate_with_fallback(source_payload, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid response payload format: {}", str(e))
-                return False
+                return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
 
             log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
 
@@ -2419,27 +2503,37 @@ class RelayClient:
 
             if source_response.status_code != 200:
                 log_error("Error status from /source: {}", source_response.status_code)
-                return False
+                return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
 
             response_content = source_response.text.strip()
             if not response_content:
                 log_error("Empty response from /source")
-                return False
+                return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
 
-            return True
+            return RelayProcessingResult.submitted_success(request_id=request_id, relay_url=relay_url)
 
         except requests.ConnectionError as e:
             log_error("Connection error when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
         except requests.Timeout as e:
             log_error("Request timeout when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
         except requests.RequestException as e:
             log_error("Request exception when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return RelayProcessingResult.failed(request_id=request_id, relay_url=relay_url)
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
-            return False
+            return RelayProcessingResult.failed(
+                safe_error_code="compute_node_internal_error",
+                runtime_remains_healthy=False,
+                request_id=request_id,
+                relay_url=relay_url,
+            )
+
+    def process_client_request(self, request_data: Dict[str, Any]) -> bool:
+        """Process a relay request and return encrypted-envelope submission success."""
+
+        return bool(self.process_client_request_result(request_data))
 
     def process_api_v1_chat_request(self, request_data: Dict[str, Any]) -> bool:
         """Relay API v1 plaintext dispatch is disabled pending an E2EE-compatible design."""

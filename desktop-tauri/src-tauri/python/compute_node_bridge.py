@@ -841,7 +841,7 @@ def run(args: argparse.Namespace) -> int:
             "type": event_type,
             "running": running,
             "registered": fresh_registered,
-            "relay_runtime_state": relay_state,
+            "relay_runtime_state": payload_relay_state,
             "active_relay_url": active_relay_url,
             "configured_relay_urls": list(configured_relay_urls),
             "relay_statuses": statuses,
@@ -883,7 +883,13 @@ def run(args: argparse.Namespace) -> int:
             payload.update(extra)
         return payload
 
-    def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+    def emit_status_event(
+        *,
+        registered: bool,
+        active_relay_url: str,
+        current_last_error: Optional[str],
+        relay_runtime_state: Optional[str] = None,
+    ) -> None:
         emit_operator_event(
             build_status_payload(
                 event_type="status",
@@ -891,6 +897,11 @@ def run(args: argparse.Namespace) -> int:
                 registered=registered,
                 active_relay_url=active_relay_url,
                 current_last_error=current_last_error,
+                extra=(
+                    {"relay_runtime_state": relay_runtime_state}
+                    if relay_runtime_state is not None
+                    else None
+                ),
             )
         )
 
@@ -1418,9 +1429,38 @@ def run(args: argparse.Namespace) -> int:
                 )
                 try:
                     with inference_lock:
-                        processed = relay_runtime.process_relay_request(relay_response)
+                        process_result = getattr(
+                            relay_runtime, "process_relay_request_result", None
+                        )
+                        if callable(process_result):
+                            processed = process_result(relay_response)
+                        else:
+                            submitted = bool(relay_runtime.process_relay_request(relay_response))
+                            processed = type(
+                                "LegacyRelayProcessingResult",
+                                (),
+                                {
+                                    "inference_succeeded": submitted,
+                                    "envelope_submitted": submitted,
+                                    "safe_error_code": None,
+                                    "runtime_remains_healthy": True,
+                                    "runtime_recovery_attempted": False,
+                                    "runtime_recovery_succeeded": False,
+                                },
+                            )()
                 except Exception as exc:
-                    processed = False
+                    processed = type(
+                        "RelayProcessingExceptionResult",
+                        (),
+                        {
+                            "inference_succeeded": False,
+                            "envelope_submitted": False,
+                            "safe_error_code": "compute_node_internal_error",
+                            "runtime_remains_healthy": True,
+                            "runtime_recovery_attempted": False,
+                            "runtime_recovery_succeeded": False,
+                        },
+                    )()
                     relay_last_error = "failed to process relay request"
                     last_error = relay_last_error
                     print(
@@ -1429,22 +1469,42 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
-                if not processed:
+                inference_succeeded = bool(getattr(processed, "inference_succeeded", bool(processed)))
+                envelope_submitted = bool(getattr(processed, "envelope_submitted", bool(processed)))
+                runtime_healthy = bool(getattr(processed, "runtime_remains_healthy", inference_succeeded))
+                safe_error_code = getattr(processed, "safe_error_code", None)
+                if not inference_succeeded:
                     relay_last_error = "failed to process relay request"
+                    if isinstance(safe_error_code, str) and safe_error_code:
+                        relay_last_error = f"failed to process relay request: {safe_error_code}"
                     last_error = relay_last_error
                     print(
                         "desktop.compute_node_bridge.process_request.failed "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"error_code={safe_error_code or 'unknown'} envelope_submitted={envelope_submitted} "
+                        f"runtime_healthy={runtime_healthy}",
                         file=sys.stderr,
                     )
-                    submit_api_v1_error_response(
-                        relay_response,
-                        code="compute_node_process_failed",
-                        message=last_error,
-                        active_relay_url=active_relay_url,
-                        request_id=request_id,
-                        relay_runtime=relay_runtime,
-                    )
+                    if envelope_submitted:
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted "
+                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                            f"code={safe_error_code or 'unknown'}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        submit_api_v1_error_response(
+                            relay_response,
+                            code="compute_node_process_failed",
+                            message=last_error,
+                            active_relay_url=active_relay_url,
+                            request_id=request_id,
+                            relay_runtime=relay_runtime,
+                        )
+                    if not runtime_healthy:
+                        relay_state = "failed"
+                        registered = False
+                        poll_failure_fatal = True
                 else:
                     last_error = None
                     print(
@@ -1452,6 +1512,9 @@ def run(args: argparse.Namespace) -> int:
                         f"relay={_sanitize_relay_target(active_relay_url)} "
                         f"request_id={request_id}",
                         file=sys.stderr,
+                    )
+                    relay_state = _relay_runtime_state(
+                        warm_load_state, running=True, warm_load_enabled=warm_load_enabled
                     )
                 wait_seconds = 0.0
                 print(
@@ -1480,6 +1543,7 @@ def run(args: argparse.Namespace) -> int:
                 registered=registered,
                 active_relay_url=active_relay_url,
                 current_last_error=last_error,
+                relay_runtime_state=relay_state,
             )
             if _sleep_with_cancel(wait_seconds):
                 print(
@@ -1554,6 +1618,7 @@ def run(args: argparse.Namespace) -> int:
             registered=False,
             active_relay_url=runtime.relay_client.relay_url,
             current_last_error=last_error,
+            extra={"relay_runtime_state": "failed"} if poll_failure_fatal else None,
         )
     )
     return 1 if warm_load_fatal or poll_failure_fatal else 0

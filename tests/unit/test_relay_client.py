@@ -2073,6 +2073,11 @@ class TestRelayClient:
         mock_post.return_value = source_response
 
         assert relay_client.process_client_request(request_data) is True
+        result = relay_client.process_client_request_result(request_data)
+        assert result.inference_succeeded is False
+        assert result.envelope_submitted is True
+        assert result.safe_error_code == "compute_node_invalid_request"
+        assert bool(result) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
@@ -2173,6 +2178,11 @@ class TestRelayClient:
         mock_post.return_value = source_response
 
         assert relay_client.process_client_request(request_data) is True
+        result = relay_client.process_client_request_result(request_data)
+        assert result.inference_succeeded is False
+        assert result.envelope_submitted is True
+        assert result.safe_error_code == "compute_node_internal_error"
+        assert bool(result) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (

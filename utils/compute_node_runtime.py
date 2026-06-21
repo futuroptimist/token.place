@@ -51,6 +51,86 @@ class ComputeNodeRuntimeConfig:
     relay_urls: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RelayProcessingResult:
+    """Typed outcome for a relay work item.
+
+    ``bool(result)`` intentionally preserves the legacy submission-oriented
+    semantics used by older poll loops: it is true only when an encrypted
+    response or safe error envelope was submitted to the relay. Callers that
+    need to know whether model inference actually succeeded must inspect
+    ``inference_succeeded`` instead.
+    """
+
+    inference_succeeded: bool
+    envelope_submitted: bool
+    safe_error_code: Optional[str] = None
+    runtime_remains_healthy: bool = True
+    runtime_recovery_attempted: bool = False
+    runtime_recovery_succeeded: bool = False
+    request_id: Optional[str] = None
+    relay_url: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.envelope_submitted
+
+    @classmethod
+    def submitted_success(
+        cls, *, request_id: Optional[str] = None, relay_url: Optional[str] = None
+    ) -> "RelayProcessingResult":
+        return cls(
+            inference_succeeded=True,
+            envelope_submitted=True,
+            runtime_remains_healthy=True,
+            request_id=request_id,
+            relay_url=relay_url,
+        )
+
+    @classmethod
+    def submitted_error(
+        cls,
+        *,
+        safe_error_code: str,
+        runtime_remains_healthy: bool,
+        runtime_recovery_attempted: bool = False,
+        runtime_recovery_succeeded: bool = False,
+        request_id: Optional[str] = None,
+        relay_url: Optional[str] = None,
+    ) -> "RelayProcessingResult":
+        return cls(
+            inference_succeeded=False,
+            envelope_submitted=True,
+            safe_error_code=safe_error_code,
+            runtime_remains_healthy=runtime_remains_healthy,
+            runtime_recovery_attempted=runtime_recovery_attempted,
+            runtime_recovery_succeeded=runtime_recovery_succeeded,
+            request_id=request_id,
+            relay_url=relay_url,
+        )
+
+    @classmethod
+    def failed(
+        cls,
+        *,
+        safe_error_code: Optional[str] = None,
+        runtime_remains_healthy: bool = False,
+        runtime_recovery_attempted: bool = False,
+        runtime_recovery_succeeded: bool = False,
+        request_id: Optional[str] = None,
+        relay_url: Optional[str] = None,
+    ) -> "RelayProcessingResult":
+        return cls(
+            inference_succeeded=False,
+            envelope_submitted=False,
+            safe_error_code=safe_error_code,
+            runtime_remains_healthy=runtime_remains_healthy,
+            runtime_recovery_attempted=runtime_recovery_attempted,
+            runtime_recovery_succeeded=runtime_recovery_succeeded,
+            request_id=request_id,
+            relay_url=relay_url,
+        )
+
+
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
 
 
@@ -87,8 +167,11 @@ class RelayRequestAdapter(Protocol):
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         """Return True when the adapter can process ``request_data``."""
 
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        """Process ``request_data`` and return a typed outcome."""
+
     def process(self, request_data: Dict[str, Any]) -> bool:
-        """Process ``request_data`` and return success."""
+        """Process ``request_data`` and return envelope-submission success."""
 
 
 class LegacyRelayRequestAdapter:
@@ -100,8 +183,23 @@ class LegacyRelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_legacy_relay_payload(request_data)
 
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        process_result = (
+            getattr(self._relay_client, "process_client_request_result", None)
+            if hasattr(type(self._relay_client), "process_client_request_result")
+            else None
+        )
+        if callable(process_result):
+            return process_result(request_data)
+        submitted = bool(self._relay_client.process_client_request(request_data))
+        return RelayProcessingResult(
+            inference_succeeded=submitted,
+            envelope_submitted=submitted,
+            runtime_remains_healthy=submitted,
+        )
+
     def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+        return bool(self.process_result(request_data))
 
 
 class ApiV1RelayRequestAdapter:
@@ -113,8 +211,24 @@ class ApiV1RelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_api_v1_relay_payload(request_data)
 
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        process_result = (
+            getattr(self._relay_client, "process_client_request_result", None)
+            if hasattr(type(self._relay_client), "process_client_request_result")
+            else None
+        )
+        if callable(process_result):
+            return process_result(request_data)
+        submitted = bool(self._relay_client.process_client_request(request_data))
+        return RelayProcessingResult(
+            inference_succeeded=submitted,
+            envelope_submitted=submitted,
+            runtime_remains_healthy=submitted,
+            request_id=request_data.get("request_id"),
+        )
+
     def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+        return bool(self.process_result(request_data))
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -395,17 +509,27 @@ class ComputeNodeRuntime:
         _log_info(f"Started relay polling thread for {relay_target}")
         return relay_thread
 
-    def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
+    def process_relay_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
         """Process relay payloads via registered protocol adapters."""
 
         for adapter in self.request_adapters:
             if adapter.can_process(request_data):
-                return adapter.process(request_data)
+                return adapter.process_result(request_data)
 
         _log_error(
             f"No relay request adapter matched payload keys: {sorted(request_data.keys())}"
         )
-        return False
+        return RelayProcessingResult.failed(
+            safe_error_code="compute_node_invalid_request",
+            runtime_remains_healthy=True,
+            request_id=request_data.get("request_id"),
+            relay_url=self.config.relay_url,
+        )
+
+    def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
+        """Process relay payloads and return encrypted-envelope submission success."""
+
+        return bool(self.process_relay_request_result(request_data))
 
     def start_relay_session(self) -> None:
         """Reset relay-client stop state before a fresh operator session polls."""

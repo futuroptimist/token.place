@@ -3637,16 +3637,120 @@ def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monke
     output = capsys.readouterr()
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get('type') == 'status']
-    failed_statuses = [
-        event for event in status_events if event.get('relay_runtime_state') == 'failed'
+    recovering_statuses = [
+        event for event in status_events if event.get('relay_runtime_state') == 'recovering'
     ]
-    assert ReRegisterAfterFailureRuntime.last_instance.poll_count == 1
-    assert failed_statuses
-    assert all(event['registered'] is False for event in failed_statuses)
+    assert ReRegisterAfterFailureRuntime.last_instance.poll_count == 2
+    assert recovering_statuses
+    assert all(event['registered'] is False for event in recovering_statuses)
     assert not any(
         event['registered'] is True and event.get('relay_runtime_state') == 'failed'
         for event in status_events
     )
+
+
+def test_multi_relay_shared_runtime_recovery_unregisters_and_restores(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+
+    class MultiRelayClient(FakeRelayClientRouting):
+        def __init__(self, relay_url):
+            super().__init__()
+            self.relay_url = relay_url
+            self.unregister_calls = 0
+            self.start_calls = 0
+            self._api_v1_registered_relays = set()
+
+        def start(self):
+            self.start_calls += 1
+
+        def unregister_from_relay(self):
+            self.unregister_calls += 1
+            self._api_v1_registered_relays.discard(self.relay_url)
+            return True
+
+        def api_v1_registration_fresh(self, relay_url=None):
+            return (relay_url or self.relay_url) in self._api_v1_registered_relays
+
+    class MultiRelayRecoveryRuntime(ApiV1Runtime):
+        instances = []
+        shared_manager = FakeModelManager()
+        ensure_calls = 0
+
+        def __init__(self, config, crypto_manager=None, model_manager=None):
+            self.model_manager = model_manager or MultiRelayRecoveryRuntime.shared_manager
+            self.crypto_manager = crypto_manager or object()
+            self.relay_client = MultiRelayClient(config.relay_url)
+            self._processed = []
+            self._responses = [
+                {
+                    'protocol': 'tokenplace_api_v1_relay_e2ee',
+                    'version': 1,
+                    'request_id': f'req-{len(MultiRelayRecoveryRuntime.instances) + 1}',
+                    'client_public_key': 'client-key',
+                    'chat_history': 'SECRET-PLAINTEXT-MUST-NOT-LOG',
+                    'cipherkey': 'key',
+                    'iv': 'iv',
+                    'next_ping_in_x_seconds': 0,
+                },
+                {'next_ping_in_x_seconds': 0},
+            ]
+            MultiRelayRecoveryRuntime.instances.append(self)
+
+        def ensure_api_v1_runtime_ready(self):
+            MultiRelayRecoveryRuntime.ensure_calls += 1
+            return True
+
+        def register_and_poll_once(self):
+            self.relay_client._api_v1_registered_relays.add(self.relay_client.relay_url)
+            if self._responses:
+                return self._responses.pop(0)
+            return {'next_ping_in_x_seconds': 0}
+
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=True,
+                safe_error_code='compute_node_internal_error',
+                runtime_healthy=False,
+                recovery_attempted=True,
+                recovery_succeeded=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MultiRelayRecoveryRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_RECOVERY_BACKOFF_SECONDS", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: (
+            len(MultiRelayRecoveryRuntime.instances) == 2
+            and all(instance.relay_client.start_calls >= 2 for instance in MultiRelayRecoveryRuntime.instances)
+        ),
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-one.test',
+        relay_urls=['https://relay-one.test', 'https://relay-two.test'],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    recovering = [event for event in events if event.get('relay_runtime_state') == 'recovering']
+    ready = [event for event in events if event.get('relay_runtime_state') == 'ready']
+    assert MultiRelayRecoveryRuntime.ensure_calls == 1
+    assert len({id(instance.model_manager) for instance in MultiRelayRecoveryRuntime.instances}) == 1
+    assert all(instance.relay_client.unregister_calls >= 1 for instance in MultiRelayRecoveryRuntime.instances)
+    assert recovering
+    assert all(status['registered'] is False for status in recovering[-1]['relay_statuses'])
+    assert ready
+    assert all(instance.relay_client.start_calls >= 2 for instance in MultiRelayRecoveryRuntime.instances)
+    assert 'SECRET-PLAINTEXT-MUST-NOT-LOG' not in output.err
 
 
 def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch):
@@ -3655,6 +3759,9 @@ def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch
     _reset_cancel_queue()
 
     class ErrorEnvelopeRuntime(ApiV1Runtime):
+        def ensure_api_v1_runtime_ready(self):
+            return False
+
         def process_relay_request_result(self, payload):
             self._processed.append(payload)
             return RelayProcessingResult(
@@ -3666,14 +3773,16 @@ def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=ErrorEnvelopeRuntime)
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_RECOVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_RECOVERY_BACKOFF_SECONDS", "0")
     monkeypatch.setattr(
         compute_node_bridge,
         'stop_requested',
-        lambda: bool(ErrorEnvelopeRuntime.last_instance._processed),
+        lambda: False,
     )
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
 
-    assert compute_node_bridge.run(args) == 0
+    assert compute_node_bridge.run(args) == 1
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' not in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted' in output.err
@@ -3681,4 +3790,4 @@ def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch
     status_events = [event for event in events if event.get('type') == 'status']
     assert status_events[-1]['registered'] is False
     assert status_events[-1]['relay_runtime_state'] == 'failed'
-    assert status_events[-1]['last_error'] == 'relay request failed: compute_node_internal_error'
+    assert 'shared model runtime recovery exhausted' in status_events[-1]['last_error']

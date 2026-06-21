@@ -1801,6 +1801,91 @@ mod tests {
     }
 
     #[test]
+    fn update_status_from_event_rejects_stale_worker_generation_without_overwriting_status() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            worker_state: Some("ready".into()),
+            worker_generation: Some(5),
+            worker_restart_count: Some(2),
+            worker_alive: Some(true),
+            last_worker_error_code: None,
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(10),
+            ..ComputeNodeStatus::default()
+        };
+
+        let stale_worker_event = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "failed",
+            "last_error": "stale event should not overwrite non-worker status",
+            "worker_state": "failed",
+            "worker_generation": 4,
+            "worker_restart_count": 99,
+            "worker_alive": false,
+            "last_worker_error_code": "stale_worker_failure",
+            "operator_session_id": "session-1",
+            "sequence": 11
+        });
+
+        assert!(!update_status_from_event(&mut status, &stale_worker_event));
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("ready"));
+        assert!(status.last_error.is_none());
+        assert_eq!(status.worker_state.as_deref(), Some("ready"));
+        assert_eq!(status.worker_generation, Some(5));
+        assert_eq!(status.worker_restart_count, Some(2));
+        assert_eq!(status.worker_alive, Some(true));
+        assert!(status.last_worker_error_code.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_allows_fresh_new_session_to_reset_worker_generation() {
+        let mut status = ComputeNodeStatus {
+            running: false,
+            registered: false,
+            relay_runtime_state: Some("stopped".into()),
+            worker_state: Some("failed".into()),
+            worker_generation: Some(9),
+            worker_restart_count: Some(4),
+            worker_alive: Some(false),
+            last_worker_error_code: Some("old_failure".into()),
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(20),
+            ..ComputeNodeStatus::default()
+        };
+
+        let fresh_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "starting",
+            "worker_state": "starting",
+            "worker_generation": 1,
+            "worker_restart_count": 0,
+            "worker_alive": false,
+            "last_worker_error_code": null,
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+
+        assert!(update_status_from_event(&mut status, &fresh_started_event));
+        assert!(status.running);
+        assert_eq!(status.operator_session_id.as_deref(), Some("new-session"));
+        assert_eq!(status.sequence, Some(1));
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("starting"));
+        assert_eq!(status.worker_state.as_deref(), Some("starting"));
+        assert_eq!(status.worker_generation, Some(1));
+        assert_eq!(status.worker_restart_count, Some(0));
+        assert_eq!(status.worker_alive, Some(false));
+        assert!(status.last_worker_error_code.is_none());
+    }
+
+    #[test]
     fn compute_node_status_cache_replays_warming_relay_runtime_fields() {
         let state = ComputeNodeState::default();
         let cached_status = ComputeNodeStatus {

@@ -4106,6 +4106,102 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
     assert all(instance.relay_client.start_calls >= 1 for instance in ExceptionThenSuccessRuntime.instances)
 
 
+def test_recovery_logs_redact_payload_keys_and_paths(capsys, monkeypatch):
+    _reset_cancel_queue()
+    recovery_calls = {'count': 0}
+    sentinels = {
+        'PROMPT_SENTINEL',
+        'OUTPUT_SENTINEL',
+        'PRIVATE_KEY',
+        'FULL_PUBLIC_KEY',
+        '/tmp/sentinel-model-path.gguf',
+        '/tmp/sentinel-runtime-path',
+        'path=/tmp/sentinel-path',
+    }
+
+    class SensitiveModelManager(FakeModelManager):
+        model_path = '/tmp/sentinel-model-path.gguf'
+
+        def worker_lifecycle_status(self):
+            return {
+                "worker_state": "recovering",
+                "worker_generation": 7,
+                "worker_restart_count": 1,
+                "worker_alive": False,
+                "last_worker_error_code": "worker_dead",
+                "last_worker_exit_code": None,
+                "last_worker_restart_at_ms": None,
+            }
+
+    class SensitiveRecoveryRuntime(ApiV1Runtime):
+        def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+            super().__init__(config)
+            self.model_manager = model_manager or SensitiveModelManager()
+            self.crypto_manager = SimpleNamespace(
+                private_key='PRIVATE_KEY',
+                full_public_key='FULL_PUBLIC_KEY',
+            )
+            self.relay_client = FakeRelayClientRouting()
+            self.relay_client.relay_url = config.relay_url
+
+        def ensure_api_v1_runtime_ready(self):
+            recovery_calls['count'] += 1
+            if recovery_calls['count'] == 1:
+                raise RuntimeError(
+                    'PROMPT_SENTINEL OUTPUT_SENTINEL decrypted generated output '
+                    'model_path=/tmp/sentinel-model-path.gguf '
+                    'runtime_path=/tmp/sentinel-runtime-path path=/tmp/sentinel-path'
+                )
+            return True
+
+        def process_relay_request_result(self, _payload):
+            return SimpleNamespace(
+                inference_succeeded=False,
+                submitted=True,
+                safe_error_code='compute_node_internal_error',
+                runtime_healthy=False,
+                recovery_attempted=True,
+                recovery_succeeded=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SensitiveRecoveryRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '0')
+    stop_checks = {'count': 0}
+
+    def stop_after_recovery():
+        stop_checks['count'] += 1
+        return recovery_calls['count'] >= 2 and stop_checks['count'] > 6
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_recovery)
+    args = SimpleNamespace(
+        model='/tmp/sentinel-model-path.gguf',
+        mode='cpu',
+        relay_url='https://user:PRIVATE_KEY@relay-a.example/path?query=FULL_PUBLIC_KEY#fragment',
+        relay_urls=[],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.recovery.start' in output.err
+    assert 'desktop.compute_node_bridge.recovery.attempt_exception' in output.err
+    assert 'desktop.compute_node_bridge.recovery.succeeded' in output.err
+    lifecycle_log_lines = '\n'.join(
+        line for line in output.err.splitlines()
+        if 'desktop.compute_node_bridge.recovery.' in line
+        or 'desktop.compute_node_bridge.worker.' in line
+    )
+    for sentinel in sentinels:
+        assert sentinel not in lifecycle_log_lines
+    assert 'decrypted' not in lifecycle_log_lines
+    assert 'generated output' not in lifecycle_log_lines
+    assert 'model_path' not in lifecycle_log_lines
+    assert 'runtime_path' not in lifecycle_log_lines
+
+
 def test_multi_relay_recovery_cancelled_before_first_attempt(capsys, monkeypatch):
     _reset_cancel_queue()
     cancel_recovery = {'value': False}

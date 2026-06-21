@@ -3515,6 +3515,8 @@ class Llama:
     )
 
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger='model_manager')
+    caplog.set_level(logging.DEBUG, logger='utils.llm')
     caplog.set_level(logging.DEBUG, logger='utils.llm.model_manager')
     caplog.set_level(logging.DEBUG, logger='token.place')
 

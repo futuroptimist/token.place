@@ -79,6 +79,8 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
+RECOVERY_ATTEMPTS_DEFAULT = 2
+RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 
 
 def _drain_stale_stdin_cancel_messages() -> int:
@@ -241,6 +243,34 @@ def _api_v1_warm_load_wait_seconds(default: float = API_V1_WARM_LOAD_WAIT_DEFAUL
     """Return bounded API v1 warm-load wait before fail-closed response submission."""
 
     raw_value = os.environ.get("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS")
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
+
+
+def _api_v1_recovery_attempts(default: int = RECOVERY_ATTEMPTS_DEFAULT) -> int:
+    raw_value = os.environ.get("TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS")
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def _api_v1_recovery_backoff_seconds(
+    default: float = RECOVERY_BACKOFF_DEFAULT_SECONDS,
+) -> float:
+    raw_value = os.environ.get("TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS")
     if raw_value is None:
         return default
     try:
@@ -1191,6 +1221,10 @@ def run(args: argparse.Namespace) -> int:
     poll_cancel_requested_by_relay: Dict[str, bool] = {}
     registration_succeeded_by_relay: Dict[str, bool] = {}
     poll_threads: List[threading.Thread] = []
+    recovery_lock = threading.Lock()
+    recovery_done = threading.Event()
+    recovery_done.set()
+    recovery_fatal = False
 
     def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> None:
         if poll_cancel_requested_by_relay.get(active_relay_url):
@@ -1259,12 +1293,242 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    def mark_all_relays_unregistered(
+        *,
+        relay_runtime_state: str,
+        error: Optional[str],
+        request_id: Optional[str] = None,
+    ) -> None:
+        for relay_runtime in runtimes:
+            relay_url_value = getattr(
+                getattr(relay_runtime, "relay_client", None),
+                "relay_url",
+                relay_url,
+            )
+            update_relay_status(
+                relay_url_value,
+                registered=False,
+                relay_runtime_state=relay_runtime_state,
+                last_error=error,
+                last_request_id=request_id if request_id and request_id != "none" else None,
+            )
+
+    def best_effort_unadvertise_all_relays() -> None:
+        for relay_runtime in runtimes:
+            relay_url_value = getattr(
+                getattr(relay_runtime, "relay_client", None),
+                "relay_url",
+                relay_url,
+            )
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            unregister = getattr(relay_client, "unregister_from_relay", None)
+            registered_relays = getattr(relay_client, "_api_v1_registered_relays", None)
+            was_registered = registration_succeeded_by_relay.get(relay_url_value, False) or (
+                isinstance(registered_relays, set) and bool(registered_relays)
+            )
+            if callable(unregister) and was_registered:
+                print(
+                    "desktop.compute_node_bridge.recovery.unregister.attempted "
+                    f"relay={_sanitize_relay_target(relay_url_value)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)}",
+                    file=sys.stderr,
+                )
+                try:
+                    unregistered = bool(unregister())
+                except Exception as exc:
+                    print(
+                        "desktop.compute_node_bridge.recovery.unregister.failed "
+                        f"relay={_sanitize_relay_target(relay_url_value)} "
+                        f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                        f"exc_type={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "desktop.compute_node_bridge.recovery.unregister.succeeded "
+                        f"relay={_sanitize_relay_target(relay_url_value)} "
+                        f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                        f"success={unregistered}",
+                        file=sys.stderr,
+                    )
+            elif callable(unregister):
+                print(
+                    "desktop.compute_node_bridge.recovery.unregister.skipped "
+                    f"relay={_sanitize_relay_target(relay_url_value)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    "reason=not_registered",
+                    file=sys.stderr,
+                )
+            else:
+                relay_stop = getattr(relay_client, "stop", None)
+                if callable(relay_stop):
+                    try:
+                        relay_stop()
+                    except Exception as exc:
+                        print(
+                            "desktop.compute_node_bridge.recovery.stop_failed "
+                            f"relay={_sanitize_relay_target(relay_url_value)} "
+                            f"exc_type={type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+
+    def recover_shared_runtime(active_relay_url: str, request_id: str) -> bool:
+        """Coordinate fail-closed recovery for the one shared model_manager."""
+
+        nonlocal warm_load_state, warm_load_failed, last_error, recovery_fatal
+
+        if recovery_lock.acquire(blocking=False):
+            coordinator = True
+            recovery_done.clear()
+        else:
+            coordinator = False
+
+        if not coordinator:
+            print(
+                "desktop.compute_node_bridge.recovery.join_existing "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                file=sys.stderr,
+            )
+            while True:
+                recovery_done.wait(timeout=0.05)
+                if recovery_done.is_set() and not recovery_lock.locked():
+                    break
+                if stop_requested():
+                    return False
+            return warm_load_state == "ready"
+
+        try:
+            attempts = _api_v1_recovery_attempts()
+            backoff_seconds = _api_v1_recovery_backoff_seconds()
+            last_error = "shared model runtime recovery in progress"
+            warm_load_state = "recovering"
+            mark_all_relays_unregistered(
+                relay_runtime_state="recovering",
+                error=last_error,
+                request_id=request_id,
+            )
+            emit_operator_event(
+                build_status_payload(
+                    event_type="status",
+                    running=True,
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                    extra={"relay_runtime_state": "recovering"},
+                )
+            )
+            print(
+                "desktop.compute_node_bridge.recovery.start "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"attempts={attempts} backoff_seconds={backoff_seconds:g}",
+                file=sys.stderr,
+            )
+            best_effort_unadvertise_all_relays()
+            for attempt in range(1, attempts + 1):
+                if stop_requested():
+                    print(
+                        "desktop.compute_node_bridge.recovery.cancelled "
+                        f"attempt={attempt} request_id={request_id}",
+                        file=sys.stderr,
+                    )
+                    return False
+                print(
+                    "desktop.compute_node_bridge.recovery.attempt "
+                    f"attempt={attempt} request_id={request_id}",
+                    file=sys.stderr,
+                )
+                try:
+                    if bool(runtime.ensure_api_v1_runtime_ready()):
+                        warm_load_state = "ready"
+                        warm_load_failed = None
+                        last_error = None
+                        for relay_runtime in runtimes:
+                            relay_start = getattr(relay_runtime, "start_relay_session", None)
+                            if callable(relay_start):
+                                relay_start()
+                            else:
+                                client_start = getattr(
+                                    getattr(relay_runtime, "relay_client", None), "start", None
+                                )
+                                if callable(client_start):
+                                    client_start()
+                        mark_all_relays_unregistered(relay_runtime_state="ready", error=None)
+                        emit_operator_event(
+                            build_status_payload(
+                                event_type="status",
+                                running=True,
+                                registered=False,
+                                active_relay_url=active_relay_url,
+                                current_last_error=None,
+                                extra={"relay_runtime_state": "ready"},
+                            )
+                        )
+                        print(
+                            "desktop.compute_node_bridge.recovery.succeeded "
+                            f"attempt={attempt} request_id={request_id}",
+                            file=sys.stderr,
+                        )
+                        return True
+                except Exception as exc:
+                    print(
+                        "desktop.compute_node_bridge.recovery.attempt_exception "
+                        f"attempt={attempt} request_id={request_id} "
+                        f"exc_type={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                if attempt < attempts and _sleep_with_cancel(backoff_seconds):
+                    print(
+                        "desktop.compute_node_bridge.recovery.cancelled_during_backoff "
+                        f"attempt={attempt} request_id={request_id}",
+                        file=sys.stderr,
+                    )
+                    return False
+
+            warm_load_state = "failed"
+            warm_load_failed = "shared model runtime recovery exhausted; restart the desktop compute node"
+            last_error = warm_load_failed
+            recovery_fatal = True
+            mark_all_relays_unregistered(
+                relay_runtime_state="failed",
+                error=last_error,
+                request_id=request_id,
+            )
+            emit_operator_event(
+                build_status_payload(
+                    event_type="error",
+                    running=False,
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                    extra={"relay_runtime_state": "failed", "message": last_error},
+                )
+            )
+            print(
+                "desktop.compute_node_bridge.recovery.exhausted "
+                f"request_id={request_id} action=restart_desktop_compute_node",
+                file=sys.stderr,
+            )
+            return False
+        finally:
+            recovery_done.set()
+            recovery_lock.release()
+
     def poll_relay_loop(relay_runtime: Any) -> None:
         nonlocal last_error, poll_failure_fatal, warm_load_state
         active_relay_url = relay_runtime.relay_client.relay_url
         worker = relay_poll_workers[active_relay_url]
         while not stop_requested():
             active_relay_url = relay_runtime.relay_client.relay_url
+            if warm_load_state == "recovering":
+                update_relay_status(
+                    active_relay_url,
+                    registered=False,
+                    relay_runtime_state="recovering",
+                    last_error=last_error,
+                )
+                if recovery_done.wait(timeout=0.05):
+                    continue
+                continue
             if warm_load_state == "failed":
                 update_relay_status(
                     active_relay_url,
@@ -1519,7 +1783,7 @@ def run(args: argparse.Namespace) -> int:
                             f"request_id={request_id} safe_error_code={safe_error_code or 'unknown'}",
                             file=sys.stderr,
                         )
-                    else:
+                    elif runtime_healthy:
                         submit_api_v1_error_response(
                             relay_response,
                             code="compute_node_process_failed",
@@ -1528,30 +1792,28 @@ def run(args: argparse.Namespace) -> int:
                             request_id=request_id,
                             relay_runtime=relay_runtime,
                         )
+                    else:
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped "
+                            f"relay={_sanitize_relay_target(active_relay_url)} "
+                            f"request_id={request_id} reason=shared_runtime_recovery",
+                            file=sys.stderr,
+                        )
                     if not runtime_healthy:
                         registered = False
-                        if recovery_attempted and not recovery_succeeded:
+                        if recovery_succeeded:
+                            relay_state = "ready"
+                            warm_load_state = "ready"
+                        elif recovery_attempted:
                             relay_state = "recovering"
-                            warm_load_state = "recovering"
-                            update_relay_status(
-                                active_relay_url,
-                                registered=False,
-                                relay_runtime_state="recovering",
-                                last_error=relay_last_error,
-                                last_request_id=request_id if request_id != "none" else None,
-                            )
-                            emit_operator_event(
-                                build_status_payload(
-                                    event_type="status",
-                                    running=True,
-                                    registered=False,
-                                    active_relay_url=active_relay_url,
-                                    current_last_error=last_error,
-                                    extra={"relay_runtime_state": "recovering"},
-                                )
-                            )
-                        relay_state = "failed"
-                        warm_load_state = "failed"
+                            recovered = recover_shared_runtime(active_relay_url, request_id)
+                            if recovered:
+                                relay_state = "ready"
+                            else:
+                                relay_state = "failed" if warm_load_state == "failed" else "recovering"
+                        else:
+                            relay_state = "failed"
+                            warm_load_state = "failed"
                 else:
                     last_error = None
                     print(
@@ -1664,7 +1926,7 @@ def run(args: argparse.Namespace) -> int:
             current_last_error=last_error,
         )
     )
-    return 1 if warm_load_fatal or poll_failure_fatal else 0
+    return 1 if warm_load_fatal or poll_failure_fatal or recovery_fatal else 0
 
 
 def main() -> int:

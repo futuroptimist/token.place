@@ -55,9 +55,16 @@ def main() -> int:
         if code != 0:
             return code
 
-    return _run(
+    code = _run(
         "desktop API v1 E2EE relay operator parity e2e",
         [sys.executable, str(SCRIPT_DIR / "test_desktop_relay_operator_parity_e2e.py")],
+    )
+    if code != 0:
+        return code
+
+    return _run(
+        "deterministic long-lived worker soak and fault-injection guardrail",
+        [sys.executable, "-m", "pytest", "-q", "tests/unit/test_long_lived_worker_soak.py"],
     )
 
 

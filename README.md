@@ -97,6 +97,12 @@ Desktop parity validation is a shared Windows/macOS release requirement. Before 
 python desktop-tauri/scripts/run_desktop_parity_checks.py
 ```
 
+To reproduce only the long-lived-worker zombie-node soak and fault-injection guardrail locally, run:
+
+```bash
+python -m pytest -q tests/unit/test_long_lived_worker_soak.py
+```
+
 ### Key environment variables
 
 Environment variables can be stored in a `.env` file and overridden in a `.env.local` file, which is ignored by git.

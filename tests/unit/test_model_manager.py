@@ -2881,6 +2881,27 @@ def _install_request_scoped_fake_llama(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(fake_site))
 
 
+@pytest.fixture
+def request_scoped_llama_proxy(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
+    proxies = []
+
+    def _make_proxy():
+        proxy = model_manager_module._SubprocessLlamaProxy(
+            model_path='model.gguf', timeout_seconds=5
+        )
+        proxies.append(proxy)
+        return proxy
+
+    try:
+        yield _make_proxy
+    finally:
+        for proxy in proxies:
+            proxy.close()
+
+
 def test_subprocess_llama_proxy_initialization_failure_still_terminates_worker(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -2896,11 +2917,33 @@ def test_subprocess_llama_proxy_initialization_failure_still_terminates_worker(t
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
-def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(tmp_path, monkeypatch):
+def test_llama_subprocess_request_error_is_typed_only_for_inference_stage():
+    from io import StringIO
+
     from utils.llm import model_manager as model_manager_module
 
-    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    process = SimpleNamespace(
+        stdout=StringIO(
+            'TOKEN_PLACE_LLAMA_CPP_JSON:'
+            '{"status":"error","request_error":true,"error":"init failed"}\n'
+        )
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=5,
+            stage='llama_cpp_init',
+        )
+
+    assert str(exc_info.value) == 'init failed'
+    assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
+
+
+def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(request_scoped_llama_proxy):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = request_scoped_llama_proxy()
 
     with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
         proxy.create_chat_completion(
@@ -2924,11 +2967,10 @@ def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(tmp_pa
     assert result['choices'][0]['pid'] == proxy._process.pid
 
 
-def test_subprocess_llama_proxy_malformed_request_does_not_terminate_worker(tmp_path, monkeypatch):
+def test_subprocess_llama_proxy_malformed_request_does_not_terminate_worker(request_scoped_llama_proxy):
     from utils.llm import model_manager as model_manager_module
 
-    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    proxy = request_scoped_llama_proxy()
 
     with proxy._lock:
         assert proxy._process.stdin is not None
@@ -2949,11 +2991,38 @@ def test_subprocess_llama_proxy_malformed_request_does_not_terminate_worker(tmp_
     assert result['choices'][0]['pid'] == proxy._process.pid
 
 
-def test_subprocess_llama_proxy_streaming_error_does_not_poison_worker(tmp_path, monkeypatch):
+def test_subprocess_llama_proxy_invalid_json_does_not_leak_or_terminate_worker(
+    request_scoped_llama_proxy,
+):
     from utils.llm import model_manager as model_manager_module
 
-    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    proxy = request_scoped_llama_proxy()
+
+    with proxy._lock:
+        assert proxy._process.stdin is not None
+        proxy._process.stdin.write('{"prompt": "TOP_SECRET_PROMPT"\n')
+        proxy._process.stdin.flush()
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            model_manager_module._read_llama_subprocess_message(
+                proxy._process,
+                timeout_seconds=5,
+                stage='llama_cpp_inference',
+            )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['reason'] == 'invalid_json'
+    assert 'TOP_SECRET_PROMPT' not in str(exc_info.value)
+    assert 'TOP_SECRET_PROMPT' not in json.dumps(diagnostics)
+
+    result = proxy.create_chat_completion(messages=[], stream=False)
+    assert result['choices'][0]['message']['content'] == 'ok'
+    assert result['choices'][0]['pid'] == proxy._process.pid
+
+
+def test_subprocess_llama_proxy_streaming_error_does_not_poison_worker(request_scoped_llama_proxy):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = request_scoped_llama_proxy()
 
     with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
         list(proxy.create_chat_completion(
@@ -2970,11 +3039,10 @@ def test_subprocess_llama_proxy_streaming_error_does_not_poison_worker(tmp_path,
     assert result['choices'][0]['pid'] == proxy._process.pid
 
 
-def test_subprocess_llama_proxy_unsupported_method_does_not_terminate_worker(tmp_path, monkeypatch):
+def test_subprocess_llama_proxy_unsupported_method_does_not_terminate_worker(request_scoped_llama_proxy):
     from utils.llm import model_manager as model_manager_module
 
-    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    proxy = request_scoped_llama_proxy()
 
     with proxy._lock:
         proxy._send({'method': 'unsupported', 'args': [], 'kwargs': {'messages': [{'content': 'SECRET'}]}})
@@ -2997,11 +3065,10 @@ def test_subprocess_llama_proxy_unsupported_method_does_not_terminate_worker(tmp
     assert result['choices'][0]['pid'] == proxy._process.pid
 
 
-def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(tmp_path, monkeypatch):
+def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(request_scoped_llama_proxy):
     from utils.llm import model_manager as model_manager_module
 
-    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    proxy = request_scoped_llama_proxy()
 
     with proxy._lock:
         proxy._send({'method': 'unsupported TOP_SECRET_METHOD', 'args': [], 'kwargs': {}})

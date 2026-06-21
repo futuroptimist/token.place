@@ -774,7 +774,7 @@ def _read_llama_subprocess_message(
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
-        if message.get('request_error'):
+        if stage == 'llama_cpp_inference' and message.get('request_error'):
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)

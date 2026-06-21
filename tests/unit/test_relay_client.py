@@ -2590,13 +2590,13 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_api_v1_forwards_openai_options_with_defaults(
+    def test_process_client_request_api_v1_forwards_supported_options_with_defaults(
         self,
         mock_post,
         relay_client,
         mock_crypto_manager,
     ):
-        """OpenAI-style API v1 options should pass through with manager defaults."""
+        """Supported API v1 options should pass through with manager defaults."""
 
         class _Config:
             def get(self, key, default):
@@ -2655,11 +2655,8 @@ class TestRelayClient:
                 "options": {
                     "frequency_penalty": 0.1,
                     "presence_penalty": 0.2,
-                    "response_format": {"type": "text"},
                     "seed": 7,
                     "temperature": 0.2,
-                    "tools": [],
-                    "tool_choice": "none",
                 },
             },
         }
@@ -2679,10 +2676,10 @@ class TestRelayClient:
         assert completion_kwargs["temperature"] == 0.2
         assert completion_kwargs["frequency_penalty"] == 0.1
         assert completion_kwargs["presence_penalty"] == 0.2
-        assert completion_kwargs["response_format"] == {"type": "text"}
         assert completion_kwargs["seed"] == 7
-        assert completion_kwargs["tools"] == []
-        assert completion_kwargs["tool_choice"] == "none"
+        assert "response_format" not in completion_kwargs
+        assert "tools" not in completion_kwargs
+        assert "tool_choice" not in completion_kwargs
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
             "Tool-aware response"
@@ -3560,3 +3557,178 @@ def test_start_after_stop_allows_api_v1_registration_again(mock_post):
 
     assert result['next_ping_in_x_seconds'] == 12
     assert mock_post.call_count == 2
+
+
+def _api_v1_validation_client(model_manager=None):
+    crypto = MagicMock()
+    crypto.public_key_b64 = TEST_VALID_RESPONSE["client_public_key"]
+    with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        mock_config = MagicMock()
+        mock_config.is_production = False
+        mock_config.get.side_effect = lambda key, default: {
+            'relay.request_timeout': 15,
+            'relay.cluster_only': True,
+        }.get(key, default)
+        mock_get_config.return_value = mock_config
+        return RelayClient(
+            base_url='http://localhost',
+            port=5000,
+            crypto_manager=crypto,
+            model_manager=model_manager or MagicMock(),
+            include_configured_servers=False,
+        )
+
+
+class _ApiV1RuntimeManager:
+    def __init__(self):
+        self.runtime = MagicMock()
+        self.runtime.create_chat_completion.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        }
+        self.use_mock_llm = True
+        self.worker_health = "healthy"
+        self.recovery_count = 0
+
+    def get_llm_instance(self):
+        return self.runtime
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, {"stream": False}),
+        ({"max_tokens": 1}, {"max_tokens": 1}),
+        ({"max_tokens": 8192}, {"max_tokens": 8192}),
+        ({"temperature": 0}, {"temperature": 0.0}),
+        ({"temperature": 2.0}, {"temperature": 2.0}),
+        ({"top_p": 0}, {"top_p": 0.0}),
+        ({"top_p": 1.0}, {"top_p": 1.0}),
+        ({"frequency_penalty": -2}, {"frequency_penalty": -2.0}),
+        ({"presence_penalty": 2.0}, {"presence_penalty": 2.0}),
+        ({"seed": 0}, {"seed": 0}),
+        ({"seed": 2**32 - 1}, {"seed": 2**32 - 1}),
+        ({"stop": ""}, {"stop": ""}),
+        ({"stop": ["END", "STOP"]}, {"stop": ["END", "STOP"]}),
+        ({"stream": False}, {"stream": False}),
+    ],
+)
+def test_api_v1_supported_option_boundaries_are_normalized(options, expected):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-valid-options",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options=options,
+    )
+
+    assert "error" not in envelope["api_v1_response"]
+    kwargs = manager.runtime.create_chat_completion.call_args.kwargs
+    for key, value in expected.items():
+        assert kwargs[key] == value
+    assert kwargs["stream"] is False
+
+
+@pytest.mark.parametrize(
+    ("options", "code"),
+    [
+        ({"max_tokens": True}, "compute_node_invalid_request"),
+        ({"max_tokens": 0}, "compute_node_invalid_request"),
+        ({"max_tokens": 8193}, "compute_node_invalid_request"),
+        ({"temperature": False}, "compute_node_invalid_request"),
+        ({"temperature": float("nan")}, "compute_node_invalid_request"),
+        ({"temperature": float("inf")}, "compute_node_invalid_request"),
+        ({"temperature": 2.01}, "compute_node_invalid_request"),
+        ({"top_p": -0.01}, "compute_node_invalid_request"),
+        ({"frequency_penalty": -2.01}, "compute_node_invalid_request"),
+        ({"presence_penalty": 2.01}, "compute_node_invalid_request"),
+        ({"seed": -1}, "compute_node_invalid_request"),
+        ({"seed": 1.5}, "compute_node_invalid_request"),
+        ({"stop": ["x"] * 17}, "compute_node_invalid_request"),
+        ({"stop": [True]}, "compute_node_invalid_request"),
+        ({"stop": "x" * 257}, "compute_node_invalid_request"),
+        ({"stream": True}, "compute_node_options_unsupported"),
+        ({"tools": []}, "compute_node_options_unsupported"),
+        ({"tool_choice": "auto"}, "compute_node_options_unsupported"),
+        ({"response_format": {"type": "json_object"}}, "compute_node_options_unsupported"),
+        ({"logprobs": True}, "compute_node_options_unsupported"),
+        ({"unknown_option": "value"}, "compute_node_options_unsupported"),
+        ({1: "value"}, "compute_node_invalid_request"),
+    ],
+)
+def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    before = (manager.worker_health, manager.recovery_count)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-invalid-options",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "SENTINEL PROMPT"}],
+        options=options,
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == code
+    assert "SENTINEL" not in json.dumps(error)
+    manager.runtime.create_chat_completion.assert_not_called()
+    assert (manager.worker_health, manager.recovery_count) == before
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [],
+        [{"role": "tool", "content": "hello"}],
+        [{"role": "user"}],
+        [{"role": "user", "content": "x", "tool_calls": []}],
+        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
+        [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
+        [{"role": "user", "content": [{"type": "text", "text": ""}]}],
+        [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
+        [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
+        [
+            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
+        ]
+        * 5,
+    ],
+)
+def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    before = (manager.worker_health, manager.recovery_count)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-invalid-messages",
+        model_id="llama-3-8b-instruct",
+        messages=messages,
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_request"
+    manager.runtime.create_chat_completion.assert_not_called()
+    assert (manager.worker_health, manager.recovery_count) == before
+
+
+def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+
+    rejected = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-rejected",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "poison"}],
+        options={"temperature": float("nan")},
+    )
+    accepted = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-accepted",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={},
+    )
+
+    assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
+    assert accepted["api_v1_response"]["message"]["content"] == "ok"
+    manager.runtime.create_chat_completion.assert_called_once()

@@ -2513,6 +2513,85 @@ class TestRelayClient:
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejection_skips_runtime_then_valid_succeeds(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """A rejected API v1 request must not poison the next valid desktop request."""
+
+        class _Runtime:
+            def __init__(self):
+                self.create_chat_completion = MagicMock(
+                    return_value={
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "Recovered"}}
+                        ]
+                    }
+                )
+
+        class _Manager:
+            use_mock_llm = False
+            api_model_id = "llama-3-8b-instruct"
+
+            def __init__(self):
+                self.runtime = _Runtime()
+                self.get_llm_instance = MagicMock(return_value=self.runtime)
+                self.llama_cpp_get_response = MagicMock(
+                    side_effect=AssertionError("legacy runtime must not be used")
+                )
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        rejected_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-rejected-process",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "SENTINEL PROMPT"}],
+                "options": {"response_format": {"type": "text"}},
+            },
+        }
+        valid_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-valid-process",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {"max_tokens": 8},
+            },
+        }
+
+        mock_crypto_manager.decrypt_message.return_value = rejected_payload
+        assert relay_client.process_client_request(request_data) is True
+        rejected_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        rejected_error = rejected_envelope["api_v1_response"]["error"]
+        assert rejected_error["code"] == "compute_node_options_unsupported"
+        assert "SENTINEL" not in json.dumps(rejected_error)
+        assert "response_format" in rejected_error["message"]
+        manager.get_llm_instance.assert_not_called()
+        manager.runtime.create_chat_completion.assert_not_called()
+        manager.llama_cpp_get_response.assert_not_called()
+
+        mock_crypto_manager.decrypt_message.return_value = valid_payload
+        assert relay_client.process_client_request(request_data) is True
+        valid_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert valid_envelope["api_v1_response"]["message"]["content"] == "Recovered"
+        manager.get_llm_instance.assert_called_once()
+        manager.runtime.create_chat_completion.assert_called_once()
+        manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_forwards_supported_generation_options(
         self,
         mock_post,
@@ -3607,6 +3686,7 @@ class _ApiV1RuntimeManager:
         ({"presence_penalty": 2.0}, {"presence_penalty": 2.0}),
         ({"seed": 0}, {"seed": 0}),
         ({"seed": 2**32 - 1}, {"seed": 2**32 - 1}),
+        ({"stop": "END"}, {"stop": "END"}),
         ({"stop": ["END", "STOP"]}, {"stop": ["END", "STOP"]}),
         ({"stream": False}, {"stream": False}),
     ],
@@ -3652,7 +3732,9 @@ def test_api_v1_supported_option_boundaries_are_normalized(options, expected):
         ({"stop": ""}, "compute_node_invalid_request"),
         ({"stop": "x" * 257}, "compute_node_invalid_request"),
         ({"stream": True}, "compute_node_options_unsupported"),
+        ({"response_format": {"type": "text"}}, "compute_node_options_unsupported"),
         ({"tools": []}, "compute_node_options_unsupported"),
+        ({"tool_choice": "none"}, "compute_node_options_unsupported"),
         ({"tool_choice": "auto"}, "compute_node_options_unsupported"),
         ({"response_format": {"type": "json_object"}}, "compute_node_options_unsupported"),
         ({"logprobs": True}, "compute_node_options_unsupported"),
@@ -3688,6 +3770,7 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
     "messages",
     [
         [],
+        [{"role": "function", "content": "x"}],
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],

@@ -2057,11 +2057,16 @@ class RelayClient:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = None
             create_chat_completion = None
-            if has_direct_runtime_completion:
+            recovery_completion = getattr(
+                self.model_manager, "complete_chat_once_with_recovery", None
+            )
+            if "complete_chat_once_with_recovery" not in dir(type(self.model_manager)):
+                recovery_completion = None
+            if has_direct_runtime_completion and not callable(recovery_completion):
                 llm_instance = get_llm_instance()
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 
-            if callable(create_chat_completion):
+            if callable(recovery_completion) or callable(create_chat_completion):
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "
@@ -2074,10 +2079,16 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
-                completion = create_chat_completion(
-                    messages=runtime_messages,
-                    **completion_kwargs,
-                )
+                if callable(recovery_completion):
+                    completion = recovery_completion(
+                        messages=runtime_messages,
+                        **completion_kwargs,
+                    )
+                else:
+                    completion = create_chat_completion(
+                        messages=runtime_messages,
+                        **completion_kwargs,
+                    )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
                 )

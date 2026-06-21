@@ -3089,3 +3089,190 @@ def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(request_scoped
     result = proxy.create_chat_completion(messages=[], stream=False)
     assert result['choices'][0]['message']['content'] == 'ok'
     assert result['choices'][0]['pid'] == proxy._process.pid
+
+
+def _patch_fake_llama_runtime(monkeypatch, manager, model_manager_module, llama_factory):
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: SimpleNamespace(Llama=llama_factory, __file__='/fake/llama_cpp/__init__.py'),
+    )
+    monkeypatch.setattr(manager, '_resolve_compute_plan', lambda: {
+        'requested_mode': 'cpu',
+        'effective_mode': 'cpu',
+        'backend_available': 'cpu',
+        'backend_selected': 'cpu',
+        'backend_used': 'cpu',
+        'n_gpu_layers': 0,
+        'fallback_reason': None,
+    })
+
+
+def test_model_manager_restart_replaces_dead_worker_and_second_request_succeeds(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            self.closed = False
+            created.append(self)
+
+        def create_chat_completion(self, **_kwargs):
+            if self is created[0]:
+                raise model_manager_module.LlamaCppWorkerDeadError('dead')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'recovered'}}]}
+
+        def close(self):
+            self.closed = True
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+
+    completion = standalone_model_manager.complete_chat_once_with_recovery(messages=[])
+
+    assert completion['choices'][0]['message']['content'] == 'recovered'
+    assert len(created) == 2
+    assert created[0].closed is True
+    assert standalone_model_manager.llm is created[1]
+
+
+def test_model_manager_broken_pipe_triggers_one_replacement(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def create_chat_completion(self, **_kwargs):
+            if self is created[0]:
+                raise model_manager_module.LlamaCppWorkerBrokenPipeError('pipe')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+        def close(self):
+            self.closed = True
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+
+    assert standalone_model_manager.complete_chat_once_with_recovery(messages=[])['choices'][0]['message']['content'] == 'ok'
+    assert len(created) == 2
+
+
+def test_model_manager_request_scoped_inference_error_not_retried(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            created.append(self)
+            self.closed = False
+
+        def create_chat_completion(self, **_kwargs):
+            raise model_manager_module.LlamaCppInferenceRequestError('request failed')
+
+        def close(self):
+            self.closed = True
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        standalone_model_manager.complete_chat_once_with_recovery(messages=[])
+
+    assert len(created) == 1
+    assert created[0].closed is False
+    assert standalone_model_manager.llm is created[0]
+
+
+def test_model_manager_concurrent_dead_worker_creates_one_replacement(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+    barrier = threading.Barrier(2)
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            self.closed = False
+            created.append(self)
+
+        def create_chat_completion(self, **_kwargs):
+            if self is created[0]:
+                barrier.wait(timeout=2)
+                raise model_manager_module.LlamaCppWorkerEOFError('eof')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+        def close(self):
+            self.closed = True
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+    standalone_model_manager.get_llm_instance()
+    results = []
+
+    def _call():
+        results.append(standalone_model_manager.complete_chat_once_with_recovery(messages=[]))
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert len(results) == 2
+    assert len(created) == 2
+    assert created[0].closed is True
+    assert standalone_model_manager.llm is created[1]
+
+
+def test_model_manager_replacement_failure_attempted_once(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def create_chat_completion(self, **_kwargs):
+            raise model_manager_module.LlamaCppWorkerDeadError('still dead')
+
+        def close(self):
+            self.closed = True
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerDeadError, match='still dead'):
+        standalone_model_manager.complete_chat_once_with_recovery(messages=[])
+
+    assert len(created) == 2
+
+
+def test_model_manager_healthy_request_does_not_restart(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created = []
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def create_chat_completion(self, **_kwargs):
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'healthy'}}]}
+
+    _patch_fake_llama_runtime(monkeypatch, standalone_model_manager, model_manager_module, FakeLlama)
+
+    result = standalone_model_manager.complete_chat_once_with_recovery(messages=[])
+
+    assert result['choices'][0]['message']['content'] == 'healthy'
+    assert len(created) == 1
+
+
+def test_subprocess_llama_proxy_detects_dead_before_write(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._process = SimpleNamespace(stdin=MagicMock(), stdout=MagicMock(), poll=lambda: 13)
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerDeadError):
+        proxy._send({'method': 'create_chat_completion'})

@@ -423,8 +423,8 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
-    if payload.get("worker_generation").is_some() {
-        status.worker_generation = payload.get("worker_generation").and_then(Value::as_u64);
+    if let Some(worker_generation) = payload.get("worker_generation").and_then(Value::as_u64) {
+        status.worker_generation = Some(worker_generation);
     }
     if payload.get("worker_restart_count").is_some() {
         status.worker_restart_count = payload.get("worker_restart_count").and_then(Value::as_u64);
@@ -1836,6 +1836,65 @@ mod tests {
         assert!(status.registered);
         assert_eq!(status.relay_runtime_state.as_deref(), Some("ready"));
         assert!(status.last_error.is_none());
+        assert_eq!(status.worker_state.as_deref(), Some("ready"));
+        assert_eq!(status.worker_generation, Some(5));
+        assert_eq!(status.worker_restart_count, Some(2));
+        assert_eq!(status.worker_alive, Some(true));
+        assert!(status.last_worker_error_code.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_preserves_generation_on_null_payload_for_stale_guard() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            worker_state: Some("ready".into()),
+            worker_generation: Some(5),
+            worker_restart_count: Some(2),
+            worker_alive: Some(true),
+            last_worker_error_code: Some("previous_worker_failure".into()),
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(10),
+            ..ComputeNodeStatus::default()
+        };
+
+        let fallback_status_event = serde_json::json!({
+            "type": "status",
+            "running": true,
+            "registered": true,
+            "relay_runtime_state": "ready",
+            "worker_generation": null,
+            "last_worker_error_code": null,
+            "operator_session_id": "session-1",
+            "sequence": 11
+        });
+
+        assert!(update_status_from_event(
+            &mut status,
+            &fallback_status_event
+        ));
+        assert_eq!(status.worker_generation, Some(5));
+        assert!(status.last_worker_error_code.is_none());
+
+        let stale_worker_event = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "failed",
+            "worker_state": "failed",
+            "worker_generation": 4,
+            "worker_restart_count": 99,
+            "worker_alive": false,
+            "last_worker_error_code": "stale_worker_failure",
+            "operator_session_id": "session-1",
+            "sequence": 12
+        });
+
+        assert!(!update_status_from_event(&mut status, &stale_worker_event));
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("ready"));
         assert_eq!(status.worker_state.as_deref(), Some("ready"));
         assert_eq!(status.worker_generation, Some(5));
         assert_eq!(status.worker_restart_count, Some(2));

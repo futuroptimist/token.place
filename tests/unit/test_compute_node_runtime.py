@@ -2,6 +2,7 @@ from unittest.mock import call, MagicMock
 
 import pytest
 
+from utils.processing_result import ProcessingResult
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
     apply_compute_mode,
@@ -384,8 +385,47 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
         "iv": "iv",
     }
 
-    assert runtime.process_relay_request(payload) is True
+    result = runtime.process_relay_request(payload)
+    assert bool(result) is True
+    assert result.inference_succeeded is True
     relay_client.process_client_request.assert_called_once_with(payload)
+
+
+
+def test_compute_node_runtime_result_preserves_error_envelope_semantics():
+    class ResultRelayClient:
+        def process_client_request_result(self, _payload):
+            return ProcessingResult(
+                inference_succeeded=False,
+                envelope_submitted=True,
+                safe_error_code="compute_node_internal_error",
+                runtime_healthy=False,
+            )
+
+    relay_client = ResultRelayClient()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=MagicMock(use_mock_llm=True),
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-error",
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+
+    result = runtime.process_relay_request(payload)
+
+    assert bool(result) is True
+    assert result.envelope_submitted is True
+    assert result.inference_succeeded is False
+    assert result.safe_error_code == "compute_node_internal_error"
+    assert result.runtime_healthy is False
 
 
 def test_compute_node_runtime_submit_api_v1_error_response_delegates_to_relay_client():
@@ -455,7 +495,7 @@ def test_compute_node_runtime_process_relay_request_returns_false_for_unknown_pa
         crypto_manager=crypto_manager,
     )
 
-    assert runtime.process_relay_request({"unexpected": "payload"}) is False
+    assert bool(runtime.process_relay_request({"unexpected": "payload"})) is False
     relay_client.process_client_request.assert_not_called()
 
 
@@ -479,7 +519,7 @@ def test_compute_node_runtime_respects_explicit_empty_adapter_list():
         "cipherkey": "cipher",
         "iv": "iv",
     }
-    assert runtime.process_relay_request(legacy_payload) is False
+    assert bool(runtime.process_relay_request(legacy_payload)) is False
     relay_client.process_client_request.assert_not_called()
 
 
@@ -584,7 +624,7 @@ def test_api_v1_relay_request_adapter_processes_api_v1_payload():
     }
     relay_client.process_client_request.return_value = True
     assert adapter.can_process(payload) is True
-    assert adapter.process(payload) is True
+    assert bool(adapter.process(payload)) is True
     relay_client.process_client_request.assert_called_once_with(payload)
 
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
@@ -732,7 +772,9 @@ def test_compute_node_runtime_default_path_is_api_v1_only():
         "processed": runtime.process_relay_request(legacy_payload),
     }
 
-    assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": False}
+    poll_result = runtime.register_and_poll_once()
+    assert poll_result["relayStatus"] == "ok"
+    assert bool(poll_result["processed"]) is False
     relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
     relay_client.process_client_request.assert_not_called()
 

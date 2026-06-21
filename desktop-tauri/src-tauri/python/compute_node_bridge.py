@@ -1418,9 +1418,9 @@ def run(args: argparse.Namespace) -> int:
                 )
                 try:
                     with inference_lock:
-                        processed = relay_runtime.process_relay_request(relay_response)
+                        process_result = relay_runtime.process_relay_request(relay_response)
                 except Exception as exc:
-                    processed = False
+                    process_result = None
                     relay_last_error = "failed to process relay request"
                     last_error = relay_last_error
                     print(
@@ -1429,22 +1429,76 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
-                if not processed:
-                    relay_last_error = "failed to process relay request"
+
+                envelope_submitted = bool(process_result)
+                inference_succeeded = bool(
+                    getattr(process_result, "inference_succeeded", envelope_submitted)
+                )
+                safe_error_code = getattr(process_result, "safe_error_code", None)
+                runtime_healthy = bool(getattr(process_result, "runtime_healthy", True))
+
+                if not inference_succeeded:
+                    relay_last_error = (
+                        f"inference failed: {safe_error_code}"
+                        if isinstance(safe_error_code, str) and safe_error_code
+                        else "failed to process relay request"
+                    )
                     last_error = relay_last_error
                     print(
                         "desktop.compute_node_bridge.process_request.failed "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}"
+                        + (f" safe_error_code={safe_error_code}" if safe_error_code else ""),
                         file=sys.stderr,
                     )
-                    submit_api_v1_error_response(
-                        relay_response,
-                        code="compute_node_process_failed",
-                        message=last_error,
-                        active_relay_url=active_relay_url,
-                        request_id=request_id,
-                        relay_runtime=relay_runtime,
-                    )
+                    if envelope_submitted and safe_error_code:
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted "
+                            f"relay={_sanitize_relay_target(active_relay_url)} "
+                            f"request_id={request_id} safe_error_code={safe_error_code}",
+                            file=sys.stderr,
+                        )
+                    elif not envelope_submitted:
+                        error_submitted = submit_api_v1_error_response(
+                            relay_response,
+                            code="compute_node_process_failed",
+                            message=last_error,
+                            active_relay_url=active_relay_url,
+                            request_id=request_id,
+                            relay_runtime=relay_runtime,
+                        )
+                        if error_submitted:
+                            print(
+                                "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted "
+                                f"relay={_sanitize_relay_target(active_relay_url)} "
+                                f"request_id={request_id} safe_error_code=compute_node_process_failed",
+                                file=sys.stderr,
+                            )
+                    health_check = getattr(relay_runtime, "api_v1_runtime_healthy", None)
+                    if callable(health_check):
+                        runtime_healthy = bool(health_check())
+                    if not runtime_healthy:
+                        relay_state = "recovering"
+                        update_relay_status(
+                            active_relay_url,
+                            registered=False,
+                            relay_runtime_state="recovering",
+                            last_error=last_error,
+                            last_request_id=request_id,
+                        )
+                        recover_once = getattr(relay_runtime, "recover_api_v1_runtime_once", None)
+                        recovered = bool(recover_once()) if callable(recover_once) else False
+                        runtime_healthy = recovered
+                        if recovered:
+                            relay_state = "ready"
+                        else:
+                            registered = False
+                            relay_state = "failed"
+                            relay_last_error = last_error
+                            print(
+                                "desktop.compute_node_bridge.runtime_recovery.failed "
+                                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                                file=sys.stderr,
+                            )
                 else:
                     last_error = None
                     print(

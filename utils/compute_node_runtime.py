@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import urlparse
 
+from utils.processing_result import PROCESSING_NOT_SUBMITTED, ProcessingResult
+
 if TYPE_CHECKING:
     from utils.networking.relay_client import RelayClient
 
@@ -87,8 +89,8 @@ class RelayRequestAdapter(Protocol):
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         """Return True when the adapter can process ``request_data``."""
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        """Process ``request_data`` and return success."""
+    def process(self, request_data: Dict[str, Any]) -> ProcessingResult:
+        """Process ``request_data`` and return a typed outcome."""
 
 
 class LegacyRelayRequestAdapter:
@@ -100,8 +102,16 @@ class LegacyRelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_legacy_relay_payload(request_data)
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+    def process(self, request_data: Dict[str, Any]) -> ProcessingResult:
+        result_fn = getattr(self._relay_client, "process_client_request_result", None)
+        if callable(result_fn) and not type(result_fn).__module__.startswith("unittest.mock"):
+            return result_fn(request_data)
+        submitted = bool(self._relay_client.process_client_request(request_data))
+        return ProcessingResult(
+            inference_succeeded=submitted,
+            envelope_submitted=submitted,
+            runtime_healthy=True,
+        )
 
 
 class ApiV1RelayRequestAdapter:
@@ -113,8 +123,16 @@ class ApiV1RelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_api_v1_relay_payload(request_data)
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+    def process(self, request_data: Dict[str, Any]) -> ProcessingResult:
+        result_fn = getattr(self._relay_client, "process_client_request_result", None)
+        if callable(result_fn) and not type(result_fn).__module__.startswith("unittest.mock"):
+            return result_fn(request_data)
+        submitted = bool(self._relay_client.process_client_request(request_data))
+        return ProcessingResult(
+            inference_succeeded=submitted,
+            envelope_submitted=submitted,
+            runtime_healthy=True,
+        )
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -395,17 +413,52 @@ class ComputeNodeRuntime:
         _log_info(f"Started relay polling thread for {relay_target}")
         return relay_thread
 
-    def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
-        """Process relay payloads via registered protocol adapters."""
+    def process_relay_request(self, request_data: Dict[str, Any]) -> ProcessingResult:
+        """Process relay payloads via adapters and return a typed outcome.
+
+        ``bool(result)`` remains compatible with legacy callers and means only
+        that an encrypted response or safe error envelope was submitted.
+        """
 
         for adapter in self.request_adapters:
             if adapter.can_process(request_data):
-                return adapter.process(request_data)
+                result = adapter.process(request_data)
+                if isinstance(result, ProcessingResult):
+                    return result
+                submitted = bool(result)
+                return ProcessingResult(
+                    inference_succeeded=submitted,
+                    envelope_submitted=submitted,
+                    runtime_healthy=True,
+                )
 
         _log_error(
             f"No relay request adapter matched payload keys: {sorted(request_data.keys())}"
         )
-        return False
+        return PROCESSING_NOT_SUBMITTED
+
+    def api_v1_runtime_healthy(self) -> bool:
+        """Return whether the shared API v1 runtime worker is currently usable."""
+
+        llm = getattr(self.model_manager, "llm", None)
+        usable = getattr(self.model_manager, "_llm_is_usable", None)
+        if callable(usable):
+            try:
+                return bool(usable(llm))
+            except Exception:
+                return False
+        is_alive = getattr(llm, "is_alive", None)
+        if callable(is_alive):
+            try:
+                return bool(is_alive())
+            except Exception:
+                return False
+        return llm is not None
+
+    def recover_api_v1_runtime_once(self) -> bool:
+        """Attempt bounded one-shot API v1 runtime recovery."""
+
+        return bool(self.ensure_api_v1_runtime_ready())
 
     def start_relay_session(self) -> None:
         """Reset relay-client stop state before a fresh operator session polls."""

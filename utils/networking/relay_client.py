@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
+from utils.processing_result import ProcessingResult
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -2281,40 +2282,69 @@ class RelayClient:
                 },
             )
 
+    def _api_v1_runtime_healthy_for_result(self) -> bool:
+        """Return current runtime-worker health without plaintext diagnostics."""
+
+        llm = getattr(self.model_manager, "llm", None)
+        usable = getattr(self.model_manager, "_llm_is_usable", None)
+        if callable(usable):
+            try:
+                return bool(usable(llm))
+            except Exception:
+                return False
+        is_alive = getattr(llm, "is_alive", None)
+        if callable(is_alive):
+            try:
+                return bool(is_alive())
+            except Exception:
+                return False
+        return llm is not None
+
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
-        """
-        Process a client request from the relay.
+        """Process a relay request and return legacy encrypted-submission success.
 
-        Args:
-            request_data: Data received from the relay containing the encrypted client request
-
-        Returns:
-            bool: True if processing succeeded, False otherwise
+        Boolean compatibility is intentionally submission-scoped: True means an
+        encrypted assistant response or safe error envelope reached the relay.
+        Call ``process_client_request_result`` when model-inference success, safe
+        error code, or runtime health is significant.
         """
+
+        return bool(self.process_client_request_result(request_data))
+
+    def process_client_request_result(self, request_data: Dict[str, Any]) -> ProcessingResult:
+        """Process a relay request and return a typed, privacy-safe outcome."""
+
+        def _result(submitted: bool, *, inference_succeeded: Optional[bool] = None) -> ProcessingResult:
+            return ProcessingResult(
+                inference_succeeded=submitted if inference_succeeded is None else inference_succeeded,
+                envelope_submitted=submitted,
+                runtime_healthy=submitted,
+            )
+
         try:
             try:
                 _validate_with_fallback(request_data, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid request data format: {}", str(e))
-                return False
+                return _result(False)
 
             client_pub_key_b64 = _normalize_client_public_key_b64(request_data['client_public_key'])
             if client_pub_key_b64 is None:
                 log_error("Invalid client_public_key format in relay request metadata")
-                return False
+                return _result(False)
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
             try:
                 client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
             except (AttributeError, binascii.Error, ValueError):
                 log_error("Invalid client_public_key encoding in relay request metadata")
-                return False
+                return _result(False)
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
             if decrypted_chat_history is None:
                 log_info("Decryption failed. Skipping.")
-                return False
+                return _result(False)
 
             log_info("Decrypted client request")
             api_v1_request_payload = _extract_api_v1_request_payload(
@@ -2328,10 +2358,31 @@ class RelayClient:
                     messages=api_v1_request_payload["messages"],
                     options=dict(api_v1_request_payload["options"]),
                 )
-                return self._post_api_v1_response(
+                api_v1_response = response_envelope.get("api_v1_response")
+                error_payload = (
+                    api_v1_response.get("error")
+                    if isinstance(api_v1_response, dict)
+                    else None
+                )
+                safe_error_code = (
+                    error_payload.get("code")
+                    if isinstance(error_payload, dict) and isinstance(error_payload.get("code"), str)
+                    else None
+                )
+                submitted = self._post_api_v1_response(
                     response_envelope,
                     client_pub_key_b64=client_pub_key_b64,
                     client_pub_key=client_pub_key,
+                )
+                return ProcessingResult(
+                    inference_succeeded=safe_error_code is None and submitted,
+                    envelope_submitted=submitted,
+                    safe_error_code=safe_error_code,
+                    runtime_healthy=(
+                        self._api_v1_runtime_healthy_for_result()
+                        if safe_error_code == "compute_node_internal_error"
+                        else True
+                    ),
                 )
 
             chat_history = _extract_chat_history_and_validate_key_binding(
@@ -2339,7 +2390,7 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if chat_history is None:
-                return False
+                return _result(False)
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)
@@ -2370,8 +2421,8 @@ class RelayClient:
                 )
                 if stream_response.status_code != 200:
                     log_error("Error status from /stream/source: {}", stream_response.status_code)
-                    return False
-                return True
+                    return _result(False)
+                return _result(True)
 
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(chat_history)
@@ -2392,7 +2443,7 @@ class RelayClient:
                 _validate_with_fallback(source_payload, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid response payload format: {}", str(e))
-                return False
+                return _result(False)
 
             log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
 
@@ -2419,27 +2470,27 @@ class RelayClient:
 
             if source_response.status_code != 200:
                 log_error("Error status from /source: {}", source_response.status_code)
-                return False
+                return _result(False)
 
             response_content = source_response.text.strip()
             if not response_content:
                 log_error("Empty response from /source")
-                return False
+                return _result(False)
 
-            return True
+            return _result(True)
 
         except requests.ConnectionError as e:
             log_error("Connection error when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return _result(False)
         except requests.Timeout as e:
             log_error("Request timeout when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return _result(False)
         except requests.RequestException as e:
             log_error("Request exception when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return False
+            return _result(False)
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
-            return False
+            return _result(False)
 
     def process_api_v1_chat_request(self, request_data: Dict[str, Any]) -> bool:
         """Relay API v1 plaintext dispatch is disabled pending an E2EE-compatible design."""

@@ -1993,6 +1993,42 @@ class TestRelayClient:
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_result_error_envelope_is_not_inference_success(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Submitting compute_node_internal_error is delivery success, not inference success."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-internal-error",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.runtime.create_chat_completion.side_effect = RuntimeError("boom")
+        source_response = MagicMock(status_code=200)
+        mock_post.return_value = source_response
+
+        result = relay_client.process_client_request_result(request_data)
+
+        assert bool(result) is True
+        assert result.envelope_submitted is True
+        assert result.inference_succeeded is False
+        assert result.safe_error_code == "compute_node_internal_error"
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["request_id"] == "req-internal-error"
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_normalises_multipart_content_blocks(
         self,
         mock_post,

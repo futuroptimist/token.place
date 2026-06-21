@@ -965,8 +965,6 @@ def test_process_relay_request_result_preserves_error_envelope_submission_semant
                 submitted=True,
                 safe_error_code="compute_node_internal_error",
                 runtime_healthy=False,
-                recovery_attempted=True,
-                recovery_succeeded=False,
             )
 
     runtime = ComputeNodeRuntime(

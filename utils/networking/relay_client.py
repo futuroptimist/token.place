@@ -24,6 +24,12 @@ logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
+def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
+    """Return True for request-scoped llama.cpp inference validation failures."""
+
+    return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
+
+
 def _load_jsonschema():
     """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
     try:
@@ -2270,7 +2276,19 @@ class RelayClient:
                 )
 
             return self._api_v1_response_envelope(request_id, message=assistant_message)
-        except Exception:
+        except Exception as exc:
+            if _is_llama_cpp_inference_request_error(exc):
+                log_error(
+                    "Desktop runtime rejected API v1 relay inference request",
+                    exc_info=True,
+                )
+                return self._api_v1_response_envelope(
+                    request_id,
+                    error={
+                        "code": "compute_node_inference_request_error",
+                        "message": "Desktop runtime rejected the inference request",
+                    },
+                )
             log_error(
                 "Desktop runtime inference failed for API v1 relay request",
                 exc_info=True,
@@ -2334,7 +2352,10 @@ class RelayClient:
                     inference_succeeded=safe_error_code is None and submitted,
                     submitted=submitted,
                     safe_error_code=safe_error_code,
-                    runtime_healthy=safe_error_code != "compute_node_internal_error",
+                    runtime_healthy=safe_error_code not in {
+                        "compute_node_internal_error",
+                        "compute_node_process_failed",
+                    },
                 )
 
             chat_history = _extract_chat_history_and_validate_key_binding(

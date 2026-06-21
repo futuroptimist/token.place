@@ -3589,6 +3589,60 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert started['pip_stderr_tail'] == 'Metal headers missing'
 
+def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+
+    class ReRegisterAfterFailureRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            ReRegisterAfterFailureRuntime.last_instance = self
+            self._responses.append({'next_ping_in_x_seconds': 0})
+            self.poll_count = 0
+
+        def register_and_poll_once(self):
+            self.poll_count += 1
+            return super().register_and_poll_once()
+
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=True,
+                safe_error_code="compute_node_internal_error",
+                runtime_healthy=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ReRegisterAfterFailureRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: (
+            ReRegisterAfterFailureRuntime.last_instance is not None
+            and ReRegisterAfterFailureRuntime.last_instance.poll_count >= 2
+        ),
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get('type') == 'status']
+    failed_statuses = [
+        event for event in status_events if event.get('relay_runtime_state') == 'failed'
+    ]
+    assert failed_statuses
+    assert all(event['registered'] is False for event in failed_statuses)
+
 
 def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch):
     from utils.processing_result import RelayProcessingResult

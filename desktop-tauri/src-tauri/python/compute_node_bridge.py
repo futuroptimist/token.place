@@ -1329,6 +1329,8 @@ def run(args: argparse.Namespace) -> int:
                 and (has_heartbeat or api_v1_payload)
                 and _registration_fresh(relay_runtime.relay_client, active_relay_url)
             )
+            if warm_load_state == "failed":
+                registered = False
             if registered:
                 registration_succeeded_by_relay[active_relay_url] = True
             wait_seconds = _safe_poll_wait_seconds(
@@ -1433,8 +1435,6 @@ def run(args: argparse.Namespace) -> int:
                                 "submitted": bool(processed_bool),
                                 "safe_error_code": None,
                                 "runtime_healthy": True,
-                                "recovery_attempted": False,
-                                "recovery_succeeded": False,
                             }
                 except Exception as exc:
                     process_result = {
@@ -1442,8 +1442,6 @@ def run(args: argparse.Namespace) -> int:
                         "submitted": False,
                         "safe_error_code": "compute_node_process_failed",
                         "runtime_healthy": False,
-                        "recovery_attempted": False,
-                        "recovery_succeeded": False,
                     }
                     relay_last_error = "failed to process relay request"
                     last_error = relay_last_error

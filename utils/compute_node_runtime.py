@@ -94,6 +94,22 @@ class RelayRequestAdapter(Protocol):
         """Process ``request_data`` and return a typed outcome."""
 
 
+def _process_relay_client_request(
+    relay_client: "RelayClient", request_data: Dict[str, Any]
+) -> RelayProcessingResult:
+    """Process a request through a relay client with typed-result fallback.
+
+    The class-level probe intentionally avoids MagicMock's auto-created instance
+    attributes while keeping adapter behavior compatible with older clients.
+    """
+
+    process_result = getattr(type(relay_client), "process_client_request_result", None)
+    if callable(process_result):
+        return process_result(relay_client, request_data)
+    submitted = bool(relay_client.process_client_request(request_data))
+    return RelayProcessingResult(inference_succeeded=submitted, submitted=submitted)
+
+
 class LegacyRelayRequestAdapter:
     """Compatibility adapter for the existing deprecated relay request shape."""
 
@@ -104,11 +120,7 @@ class LegacyRelayRequestAdapter:
         return is_legacy_relay_payload(request_data)
 
     def process(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
-        process_result = getattr(type(self._relay_client), "process_client_request_result", None)
-        if callable(process_result):
-            return process_result(self._relay_client, request_data)
-        submitted = bool(self._relay_client.process_client_request(request_data))
-        return RelayProcessingResult(inference_succeeded=submitted, submitted=submitted)
+        return _process_relay_client_request(self._relay_client, request_data)
 
 
 class ApiV1RelayRequestAdapter:
@@ -121,11 +133,7 @@ class ApiV1RelayRequestAdapter:
         return is_api_v1_relay_payload(request_data)
 
     def process(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
-        process_result = getattr(type(self._relay_client), "process_client_request_result", None)
-        if callable(process_result):
-            return process_result(self._relay_client, request_data)
-        submitted = bool(self._relay_client.process_client_request(request_data))
-        return RelayProcessingResult(inference_succeeded=submitted, submitted=submitted)
+        return _process_relay_client_request(self._relay_client, request_data)
 
 
 def first_env(keys: List[str]) -> Optional[str]:

@@ -127,6 +127,14 @@ DESKTOP_RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
 _LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
 
 
+class LlamaCppInferenceRequestError(RuntimeError):
+    """Raised when a live llama_cpp worker reports a request-scoped inference failure."""
+
+    def __init__(self, message: str, *, diagnostics: Optional[Dict[str, Any]] = None) -> None:
+        self.diagnostics = diagnostics or {}
+        super().__init__(message)
+
+
 class LlamaCppRuntimeStageTimeout(TimeoutError):
     """Raised when a llama_cpp discovery/import stage exceeds its bounded timeout."""
 
@@ -766,6 +774,9 @@ def _read_llama_subprocess_message(
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
+        diagnostics = message.get('diagnostics') if isinstance(message.get('diagnostics'), dict) else {}
+        if stage == 'llama_cpp_inference' and message.get('error_type') == 'request_error':
+            raise LlamaCppInferenceRequestError(error, diagnostics=diagnostics)
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
             error = f"{error}; child_traceback_tail={traceback_text[-2000:]}"
@@ -926,6 +937,24 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+def _safe_request_error(reason, request=None, exc=None):
+    diagnostics = {'reason': reason}
+    if isinstance(request, dict):
+        method = request.get('method')
+        if isinstance(method, str):
+            diagnostics['method'] = method
+        kwargs = request.get('kwargs')
+        if isinstance(kwargs, dict):
+            diagnostics['stream'] = bool(kwargs.get('stream'))
+    if exc is not None:
+        diagnostics['exception_type'] = type(exc).__name__
+    return {
+        'status': 'error',
+        'error_type': 'request_error',
+        'error': 'llama_cpp subprocess request failed',
+        'diagnostics': diagnostics,
+    }
+
 try:
     init_line = sys.stdin.readline()
     if not init_line:
@@ -934,21 +963,32 @@ try:
     llama_cpp = importlib.import_module('llama_cpp')
     llama = llama_cpp.Llama(*init_payload.get('args', []), **init_payload.get('kwargs', {}))
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
-    for line in sys.stdin:
-        request = json.loads(line)
-        if request.get('method') == 'create_chat_completion':
-            kwargs = request.get('kwargs', {})
-            result = llama.create_chat_completion(*request.get('args', []), **kwargs)
-            if kwargs.get('stream'):
-                for chunk in result:
-                    _emit({'status': 'ok', 'chunk': chunk, 'done': False})
-                _emit({'status': 'ok', 'done': True})
-            else:
-                _emit({'status': 'ok', 'result': result})
-        else:
-            _emit({'status': 'error', 'error': 'unsupported llama_cpp subprocess method'})
 except Exception as exc:
     _emit({'status': 'error', 'error': str(exc), 'traceback': traceback.format_exc()})
+    raise SystemExit(1)
+
+for line in sys.stdin:
+    request = None
+    try:
+        request = json.loads(line)
+        if not isinstance(request, dict):
+            _emit(_safe_request_error('malformed_request'))
+            continue
+        if request.get('method') != 'create_chat_completion':
+            _emit(_safe_request_error('unsupported_method', request))
+            continue
+        kwargs = request.get('kwargs', {})
+        result = llama.create_chat_completion(*request.get('args', []), **kwargs)
+        if kwargs.get('stream'):
+            for chunk in result:
+                _emit({'status': 'ok', 'chunk': chunk, 'done': False})
+            _emit({'status': 'ok', 'done': True})
+        else:
+            _emit({'status': 'ok', 'result': result})
+    except json.JSONDecodeError as exc:
+        _emit(_safe_request_error('malformed_json', exc=exc))
+    except Exception as exc:
+        _emit(_safe_request_error('inference_exception', request, exc))
 """
 
 

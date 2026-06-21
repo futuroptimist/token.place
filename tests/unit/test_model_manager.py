@@ -2850,3 +2850,171 @@ def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_exception(mo
     assert diagnostics['detected_device'] == 'none'
     assert diagnostics['llama_module_path'] == '/site/llama_cpp/__init__.py'
     assert diagnostics['error'] == 'probe crashed'
+
+
+def _write_fake_llama_cpp(tmp_path, source):
+    fake_site = tmp_path / 'fake_llama_site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(source, encoding='utf-8')
+    return fake_site
+
+
+def test_subprocess_llama_proxy_initialization_failure_is_fatal(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = _write_fake_llama_cpp(
+        tmp_path,
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        raise RuntimeError('fatal init failure')\n",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+
+    assert 'fatal init failure' in str(exc_info.value)
+
+
+def test_subprocess_llama_proxy_non_streaming_request_error_keeps_worker_alive(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = _write_fake_llama_cpp(
+        tmp_path,
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.calls = 0\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        self.calls += 1\n"
+        "        if self.calls == 1:\n"
+        "            raise RuntimeError('secret prompt should not appear')\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}], 'call': self.calls}\n",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion(messages=[{'role': 'user', 'content': 'private prompt'}], stream=False)
+
+        message = str(exc_info.value)
+        assert 'llama_cpp subprocess request failed' in message
+        assert 'RuntimeError' in message
+        assert 'secret prompt should not appear' not in message
+        assert 'private prompt' not in message
+
+        result = proxy.create_chat_completion(messages=[], stream=False)
+        assert result['choices'][0]['message']['content'] == 'ok'
+        assert result['call'] == 2
+    finally:
+        proxy.close()
+
+
+def test_subprocess_llama_proxy_streaming_request_error_keeps_worker_alive(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = _write_fake_llama_cpp(
+        tmp_path,
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.calls = 0\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        self.calls += 1\n"
+        "        if kwargs.get('stream') and self.calls == 1:\n"
+        "            def broken():\n"
+        "                yield {'choices': [{'delta': {'content': 'first'}}]}\n"
+        "                raise RuntimeError('generated secret text')\n"
+        "            return broken()\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}], 'call': self.calls}\n",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    try:
+        stream = proxy.create_chat_completion(messages=[{'role': 'user', 'content': 'private prompt'}], stream=True)
+        assert next(stream)['choices'][0]['delta']['content'] == 'first'
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            next(stream)
+
+        message = str(exc_info.value)
+        assert 'llama_cpp subprocess request failed' in message
+        assert 'generated secret text' not in message
+        assert 'private prompt' not in message
+
+        result = proxy.create_chat_completion(messages=[], stream=False)
+        assert result['choices'][0]['message']['content'] == 'ok'
+        assert result['call'] == 2
+    finally:
+        proxy.close()
+
+
+def test_subprocess_llama_proxy_malformed_request_keeps_worker_alive(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = _write_fake_llama_cpp(
+        tmp_path,
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.calls = 0\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        self.calls += 1\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}], 'call': self.calls}\n",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    try:
+        with proxy._lock:
+            proxy._process.stdin.write('{not valid json with private prompt}\n')
+            proxy._process.stdin.flush()
+            with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+                model_manager_module._read_llama_subprocess_message(
+                    proxy._process,
+                    timeout_seconds=5,
+                    stage='llama_cpp_inference',
+                )
+
+        message = str(exc_info.value)
+        assert 'malformed llama_cpp subprocess request' in message
+        assert 'JSONDecodeError' in message
+        assert 'private prompt' not in message
+
+        result = proxy.create_chat_completion(messages=[], stream=False)
+        assert result['choices'][0]['message']['content'] == 'ok'
+    finally:
+        proxy.close()
+
+
+def test_subprocess_llama_proxy_unsupported_method_keeps_worker_alive(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = _write_fake_llama_cpp(
+        tmp_path,
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.calls = 0\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        self.calls += 1\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}], 'call': self.calls}\n",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+    try:
+        with proxy._lock:
+            proxy._send({'method': 'unsupported_method', 'args': [], 'kwargs': {}})
+            with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+                model_manager_module._read_llama_subprocess_message(
+                    proxy._process,
+                    timeout_seconds=5,
+                    stage='llama_cpp_inference',
+                )
+
+        assert 'unsupported llama_cpp subprocess method' in str(exc_info.value)
+        assert 'UnsupportedMethod' in str(exc_info.value)
+
+        result = proxy.create_chat_completion(messages=[], stream=False)
+        assert result['choices'][0]['message']['content'] == 'ok'
+    finally:
+        proxy.close()

@@ -1594,8 +1594,9 @@ def run(args: argparse.Namespace) -> int:
                 )
                 poll_threads.append(thread)
                 thread.start()
-            while not stop_requested() and any(thread.is_alive() for thread in poll_threads):
-                time.sleep(0.05)
+            while any(thread.is_alive() for thread in poll_threads):
+                for thread in poll_threads:
+                    thread.join(timeout=0.05)
     except KeyboardInterrupt:
         pass
     finally:

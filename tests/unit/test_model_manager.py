@@ -3089,3 +3089,165 @@ def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(request_scoped
     result = proxy.create_chat_completion(messages=[], stream=False)
     assert result['choices'][0]['message']['content'] == 'ok'
     assert result['choices'][0]['pid'] == proxy._process.pid
+
+
+class _RestartTestLlama:
+    created = []
+    fail_next_replacement = False
+
+    def __init__(self, **kwargs):
+        self.closed = False
+        self.dead = False
+        self.calls = 0
+        self.id = len(type(self).created) + 1
+        type(self).created.append(self)
+
+    def is_alive(self):
+        return not self.closed and not self.dead
+
+    def close(self):
+        self.closed = True
+
+    def create_chat_completion(self, *args, **kwargs):
+        self.calls += 1
+        if self.dead:
+            raise __import__('utils.llm.model_manager', fromlist=['LlamaCppWorkerDeadError']).LlamaCppWorkerDeadError(
+                'dead worker'
+            )
+        if type(self).fail_next_replacement and self.id > 1:
+            raise __import__('utils.llm.model_manager', fromlist=['LlamaCppWorkerEOFError']).LlamaCppWorkerEOFError(
+                'replacement eof'
+            )
+        return {'choices': [{'message': {'role': 'assistant', 'content': f'ok-{self.id}'}}]}
+
+
+@pytest.fixture
+def restartable_manager(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    _RestartTestLlama.created = []
+    _RestartTestLlama.fail_next_replacement = False
+    model_path = tmp_path / 'test_model.gguf'
+    model_path.write_bytes(b'model')
+    config = MagicMock()
+    values = {
+        'model.filename': model_path.name,
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.context_size': 128,
+        'model.chat_format': 'llama-3',
+        'model.max_tokens': 8,
+        'model.temperature': 0.1,
+        'model.top_p': 0.9,
+        'model.stop_tokens': [],
+        'model.enforce_gpu_memory_headroom': False,
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.is_production = True
+    manager = ModelManager(config)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **kwargs: SimpleNamespace(Llama=_RestartTestLlama, __file__='fake_llama_cpp.py'),
+    )
+    return manager
+
+
+def test_model_manager_restart_replaces_worker_killed_between_requests(restartable_manager):
+    first = restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+    old_worker = restartable_manager.llm
+    old_worker.dead = True
+
+    second = restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+
+    assert first['choices'][0]['message']['content'] == 'ok-1'
+    assert second['choices'][0]['message']['content'] == 'ok-2'
+    assert old_worker.closed is True
+    assert restartable_manager.llm is _RestartTestLlama.created[1]
+
+
+def test_model_manager_restart_broken_pipe_or_eof_triggers_one_replacement(restartable_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    restartable_manager.get_llm_instance()
+    old_worker = restartable_manager.llm
+    monkeypatch.setattr(
+        old_worker,
+        'create_chat_completion',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppWorkerBrokenPipeError('broken pipe')
+        ),
+    )
+
+    result = restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+
+    assert result['choices'][0]['message']['content'] == 'ok-2'
+    assert len(_RestartTestLlama.created) == 2
+    assert old_worker.closed is True
+
+
+def test_model_manager_request_scoped_inference_error_does_not_restart(restartable_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    worker = restartable_manager.get_llm_instance()
+    monkeypatch.setattr(
+        worker,
+        'create_chat_completion',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppInferenceRequestError('request failed')
+        ),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+
+    assert restartable_manager.llm is worker
+    assert worker.closed is False
+    assert len(_RestartTestLlama.created) == 1
+
+
+def test_model_manager_concurrent_dead_worker_creates_one_restart_replacement(restartable_manager):
+    restartable_manager.get_llm_instance()
+    old_worker = restartable_manager.llm
+    old_worker.dead = True
+    barrier = threading.Barrier(2)
+    results = []
+
+    def call():
+        barrier.wait(timeout=5)
+        results.append(restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False))
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(results) == 2
+    assert {item['choices'][0]['message']['content'] for item in results} == {'ok-2'}
+    assert len(_RestartTestLlama.created) == 2
+    assert old_worker.closed is True
+
+
+def test_model_manager_restart_replacement_failure_attempted_once(restartable_manager):
+    from utils.llm import model_manager as model_manager_module
+
+    restartable_manager.get_llm_instance()
+    restartable_manager.llm.dead = True
+    _RestartTestLlama.fail_next_replacement = True
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError, match='replacement eof'):
+        restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+
+    assert len(_RestartTestLlama.created) == 2
+
+
+def test_model_manager_healthy_requests_do_not_restart_or_liveness_probe(restartable_manager):
+    first = restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+    second = restartable_manager.create_chat_completion_with_recovery(messages=[], stream=False)
+
+    assert first['choices'][0]['message']['content'] == 'ok-1'
+    assert second['choices'][0]['message']['content'] == 'ok-1'
+    assert len(_RestartTestLlama.created) == 1
+    assert restartable_manager.llm.calls == 2

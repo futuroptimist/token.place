@@ -2012,8 +2012,18 @@ class RelayClient:
                 },
             )
 
+        complete_with_recovery = getattr(
+            self.model_manager,
+            "create_chat_completion_with_recovery",
+            None,
+        )
+        if (
+            "create_chat_completion_with_recovery" not in vars(self.model_manager)
+            and getattr(type(self.model_manager), "create_chat_completion_with_recovery", None) is None
+        ):
+            complete_with_recovery = None
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
-        has_direct_runtime_completion = callable(get_llm_instance)
+        has_direct_runtime_completion = callable(complete_with_recovery) or callable(get_llm_instance)
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2055,13 +2065,7 @@ class RelayClient:
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
-            llm_instance = None
-            create_chat_completion = None
-            if has_direct_runtime_completion:
-                llm_instance = get_llm_instance()
-                create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
-
-            if callable(create_chat_completion):
+            if callable(complete_with_recovery):
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "
@@ -2074,13 +2078,36 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
-                completion = create_chat_completion(
+                completion = complete_with_recovery(
                     messages=runtime_messages,
                     **completion_kwargs,
                 )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
                 )
+            else:
+                llm_instance = get_llm_instance()
+                create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+                if callable(create_chat_completion):
+                    log_info(
+                        (
+                            "API v1 runtime generation branch selected: "
+                            "request_id={} model_id={} protocol={} route={} branch={}"
+                        ),
+                        request_id,
+                        model_id,
+                        "tokenplace_api_v1_relay_e2ee",
+                        "/api/v1/relay/responses",
+                        "direct_non_streaming_completion",
+                    )
+                    completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+                    completion = create_chat_completion(
+                        messages=runtime_messages,
+                        **completion_kwargs,
+                    )
+                    assistant_message = self._assistant_message_from_runtime_completion(
+                        completion
+                    )
 
             if assistant_message is None:
                 log_error("Desktop runtime returned invalid API v1 assistant output")

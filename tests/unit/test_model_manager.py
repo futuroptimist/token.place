@@ -3435,3 +3435,273 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     monkeypatch.setattr(manager, 'get_llm_instance', _get_replacement)
     assert manager._ensure_replacement_llm(manager._llm_generation) is replacement
     assert stale.closed is True
+
+class _SoakFakeWorker:
+    created_workers = []
+    _next_pid = 5000
+
+    def __init__(self, name='soak', *, fail=None, generated_prefix='ciphertext-completion'):
+        self.name = name
+        self.fail = fail
+        self.generated_prefix = generated_prefix
+        self.closed = False
+        self.calls = 0
+        self.generation = len(type(self).created_workers) + 1
+        self.pid = type(self)._next_pid
+        type(self)._next_pid += 1
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.request_ids = []
+        self._call_lock = threading.Lock()
+        type(self).created_workers.append(self)
+
+    @classmethod
+    def reset(cls):
+        cls.created_workers = []
+        cls._next_pid = 5000
+
+    def is_alive(self):
+        return not self.closed and self.fail != 'dead'
+
+    def close(self):
+        self.closed = True
+
+    def create_chat_completion(self, **kwargs):
+        from utils.llm import model_manager as model_manager_module
+
+        with self._call_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            try:
+                self.calls += 1
+                messages = kwargs.get('messages') or []
+                request_id = kwargs.get('metadata', {}).get('request_id')
+                if request_id:
+                    self.request_ids.append(request_id)
+                if self.fail == 'dead':
+                    raise model_manager_module.LlamaCppWorkerDeadError('dead worker transport')
+                if self.fail == 'eof':
+                    self.closed = True
+                    raise model_manager_module.LlamaCppWorkerEOFError('worker exited before response')
+                if self.fail == 'request_once':
+                    self.fail = None
+                    raise model_manager_module.LlamaCppInferenceRequestError(
+                        'request failed without plaintext',
+                        diagnostics={'reason': 'inference_exception', 'exception_type': 'RuntimeError'},
+                    )
+                content = f'{self.generated_prefix}-generation-{self.generation}-call-{self.calls}'
+                return {
+                    'id': request_id,
+                    'choices': [{'message': {'role': 'assistant', 'content': content}}],
+                    'worker_generation': self.generation,
+                    'worker_pid': self.pid,
+                }
+            finally:
+                self.active_calls -= 1
+
+
+class _SoakRelay:
+    def __init__(self, name, manager):
+        self.name = name
+        self.manager = manager
+        self.registered = True
+        self.ready = True
+        self.state = {}
+        self.logs = []
+        self.responses_by_id = {}
+        self.status_events = ['ready']
+
+    def chat(self, request_id, plaintext_sentinel, generated_sentinel):
+        assert self.registered and self.ready
+        # Relay-owned state intentionally stores ciphertext-looking metadata only.
+        encrypted_prompt = f'ciphertext:{request_id}'
+        self.state[request_id] = {'ciphertext': encrypted_prompt, 'route': 'api_v1_e2ee'}
+        self.logs.append(f'queued request_id={request_id} route=api_v1_e2ee')
+        try:
+            completion = self.manager.create_chat_completion_with_recovery(
+                messages=[{'role': 'user', 'content': plaintext_sentinel}],
+                metadata={'request_id': request_id},
+            )
+        except Exception:
+            self.ready = False
+            self.registered = False
+            self.status_events.append('not_ready')
+            raise
+        encrypted_response = f'encrypted-response:{request_id}:{completion["worker_generation"]}'
+        assert request_id not in self.responses_by_id, 'duplicate encrypted response for one request id'
+        self.responses_by_id[request_id] = encrypted_response
+        self.state[request_id]['encrypted_response'] = encrypted_response
+        self.logs.append(f'response_received request_id={request_id} encrypted=true')
+        # Plaintext output sentinel is returned to the caller but never persisted by relay.
+        return {**completion, 'plaintext_generated': generated_sentinel}
+
+    def mark_fatal(self):
+        self.ready = False
+        self.registered = False
+        self.status_events.append('not_ready')
+
+    def start(self):
+        self.ready = True
+        self.registered = True
+        self.status_events.append('ready')
+
+    def stop(self):
+        self.ready = False
+        self.registered = False
+        self.status_events.append('stopped')
+
+    def safe_text(self):
+        return json.dumps(self.state, sort_keys=True) + '\n' + '\n'.join(self.logs)
+
+
+def _soak_manager(tmp_path, monkeypatch, worker_plan):
+    from utils.llm import model_manager as model_manager_module
+
+    _SoakFakeWorker.reset()
+    (tmp_path / 'test_model.gguf').write_bytes(b'fake')
+    manager = model_manager_module.ModelManager(_RestartTestConfig(tmp_path))
+    planned = list(worker_plan)
+
+    def _import_runtime(**_kwargs):
+        class _Runtime:
+            __file__ = '/fake/site-packages/llama_cpp/__init__.py'
+
+            class Llama:
+                def __init__(self, **_llama_kwargs):
+                    if not planned:
+                        raise RuntimeError('persistent replacement failure')
+                    next_item = planned.pop(0)
+                    if isinstance(next_item, BaseException):
+                        raise next_item
+                    self._worker = next_item() if callable(next_item) else next_item
+
+                def __getattr__(self, name):
+                    return getattr(self._worker, name)
+
+        return _Runtime
+
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', _import_runtime)
+    monkeypatch.setattr(manager, '_resolve_compute_plan', lambda: {
+        'requested_mode': 'cpu', 'effective_mode': 'cpu', 'backend_available': 'cpu',
+        'backend_selected': 'cpu', 'backend_used': 'cpu', 'n_gpu_layers': 0,
+        'fallback_reason': None,
+    })
+    return manager
+
+
+def _assert_no_plaintext_leak(relays, capsys, *sentinels):
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err + '\n'.join(relay.safe_text() for relay in relays)
+    for sentinel in sentinels:
+        assert sentinel not in combined
+
+
+def _assert_bounded_soak_counts(manager, *, workers, restarts, threads_slack=8):
+    status = manager.worker_lifecycle_status()
+    assert len(_SoakFakeWorker.created_workers) <= workers
+    assert status['worker_restart_count'] == restarts
+    assert threading.active_count() < 1 + threads_slack
+
+
+def test_desktop_long_lived_worker_soak_and_fault_injection(tmp_path, monkeypatch, capsys):
+    """Deterministic zombie-node regression soak for API v1 desktop workers."""
+    from utils.llm import model_manager as model_manager_module
+
+    prompt_sentinel = 'PLAINTEXT_PROMPT_SENTINEL_7_OF_7_DO_NOT_LOG'
+    output_sentinel = 'PLAINTEXT_OUTPUT_SENTINEL_7_OF_7_DO_NOT_LOG'
+
+    # 1. Warm once and serve >=100 sequential non-streaming API v1 E2EE requests.
+    manager = _soak_manager(tmp_path, monkeypatch, [lambda: _SoakFakeWorker('healthy')])
+    relay = _SoakRelay('relay-a', manager)
+    manager.get_llm_instance()
+    healthy = _SoakFakeWorker.created_workers[0]
+    for index in range(100):
+        relay.chat(f'warm-{index}', prompt_sentinel, output_sentinel)
+    assert healthy.calls == 100
+    assert healthy.closed is False
+    assert manager.worker_lifecycle_status()['worker_generation'] == 0
+    _assert_bounded_soak_counts(manager, workers=1, restarts=0)
+    _assert_no_plaintext_leak([relay], capsys, prompt_sentinel, output_sentinel)
+
+    # 2. Request-scoped exception does not replace the worker; next request succeeds on same generation.
+    healthy.fail = 'request_once'
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        relay.chat('request-error', prompt_sentinel, output_sentinel)
+    relay.start()
+    recovered = relay.chat('request-error-recovered', prompt_sentinel, output_sentinel)
+    assert recovered['worker_generation'] == 1
+    assert healthy.closed is False
+    assert manager.worker_lifecycle_status()['last_worker_error_code'] == 'inference_request_error'
+    _assert_bounded_soak_counts(manager, workers=1, restarts=0)
+    _assert_no_plaintext_leak([relay], capsys, prompt_sentinel, output_sentinel)
+
+    # 3. Worker killed between requests is replaced once and the next request succeeds.
+    manager = _soak_manager(tmp_path, monkeypatch, [lambda: _SoakFakeWorker('first-killed'), lambda: _SoakFakeWorker('replacement')])
+    relay = _SoakRelay('relay-b', manager)
+    manager.get_llm_instance()
+    healthy = _SoakFakeWorker.created_workers[0]
+    healthy.fail = 'dead'
+    after_kill = relay.chat('after-kill', prompt_sentinel, output_sentinel)
+    assert after_kill['worker_generation'] == 2
+    assert healthy.closed is True
+    _assert_bounded_soak_counts(manager, workers=2, restarts=1)
+    _assert_no_plaintext_leak([relay], capsys, prompt_sentinel, output_sentinel)
+
+    # 4. Two local relays share one manager; inference is serialized by one worker without duplicates.
+    manager = _soak_manager(tmp_path, monkeypatch, [lambda: _SoakFakeWorker('shared')])
+    relay_one = _SoakRelay('relay-one', manager)
+    relay_two = _SoakRelay('relay-two', manager)
+    manager.get_llm_instance()
+    shared = _SoakFakeWorker.created_workers[0]
+    results = []
+    barrier = threading.Barrier(2)
+
+    def _relay_call(relay_obj, request_id):
+        barrier.wait(timeout=5)
+        results.append(relay_obj.chat(request_id, prompt_sentinel, output_sentinel))
+
+    threads = [
+        threading.Thread(target=_relay_call, args=(relay_one, 'shared-1')),
+        threading.Thread(target=_relay_call, args=(relay_two, 'shared-2')),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert len(results) == 2
+    assert shared.max_active_calls == 1
+    assert len(_SoakFakeWorker.created_workers) == 1
+    assert set(relay_one.responses_by_id) == {'shared-1'}
+    assert set(relay_two.responses_by_id) == {'shared-2'}
+    _assert_bounded_soak_counts(manager, workers=1, restarts=0)
+    _assert_no_plaintext_leak([relay_one, relay_two], capsys, prompt_sentinel, output_sentinel)
+
+    # 5. Persistent fatal replacement failure unregisters every relay and leaves no zombie-ready state.
+    manager = _soak_manager(tmp_path, monkeypatch, [lambda: _SoakFakeWorker('doomed', fail='dead'), RuntimeError('replacement unavailable')])
+    relays = [_SoakRelay('relay-fatal-a', manager), _SoakRelay('relay-fatal-b', manager)]
+    with pytest.raises(RuntimeError):
+        relays[0].chat('fatal', prompt_sentinel, output_sentinel)
+    for relay_obj in relays:
+        relay_obj.mark_fatal()
+        assert relay_obj.registered is False and relay_obj.ready is False
+    status = manager.worker_lifecycle_status()
+    assert status['worker_state'] == 'failed'
+    assert status['worker_alive'] is False
+    assert status['worker_restart_count'] >= 1
+    _assert_no_plaintext_leak(relays, capsys, prompt_sentinel, output_sentinel)
+
+    # 6. Stop during idle and recovery, Start again, and complete another request.
+    manager = _soak_manager(tmp_path, monkeypatch, [lambda: _SoakFakeWorker('first', fail='dead'), lambda: _SoakFakeWorker('second'), lambda: _SoakFakeWorker('third')])
+    relay = _SoakRelay('relay-restart', manager)
+    relay.stop()
+    relay.start()
+    recovered = relay.chat('restart-after-idle-stop', prompt_sentinel, output_sentinel)
+    assert recovered['worker_generation'] == 2
+    relay.stop()
+    relay.start()
+    final = relay.chat('restart-after-recovery-stop', prompt_sentinel, output_sentinel)
+    assert final['worker_generation'] == 2
+    assert relay.status_events == ['ready', 'stopped', 'ready', 'stopped', 'ready']
+    assert manager.worker_lifecycle_status()['worker_restart_count'] == 1
+    _assert_bounded_soak_counts(manager, workers=3, restarts=1)
+    _assert_no_plaintext_leak([relay], capsys, prompt_sentinel, output_sentinel)

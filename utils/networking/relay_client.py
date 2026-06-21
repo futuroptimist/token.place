@@ -30,6 +30,12 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+def _is_llama_cpp_restartable_worker_error(exc: BaseException) -> bool:
+    """Return True for restartable llama.cpp worker failures without importing runtime internals."""
+
+    return exc.__class__.__name__.startswith("LlamaCpp") and "Worker" in exc.__class__.__name__
+
+
 def _load_jsonschema():
     """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
     try:
@@ -2160,6 +2166,12 @@ class RelayClient:
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
+        self._last_api_v1_runtime_health = {
+            "runtime_healthy": True,
+            "recovery_attempted": False,
+            "recovery_succeeded": False,
+        }
+
         if not self._messages_are_valid_api_v1_chat(messages):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2234,6 +2246,11 @@ class RelayClient:
             if not callable(create_chat_completion) and has_direct_runtime_completion:
                 llm_instance = get_llm_instance()
                 if llm_instance is None:
+                    self._last_api_v1_runtime_health = {
+                        "runtime_healthy": False,
+                        "recovery_attempted": False,
+                        "recovery_succeeded": False,
+                    }
                     log_error("Desktop runtime LLM initialization failed for API v1 relay request")
                     return self._api_v1_response_envelope(
                         request_id,
@@ -2278,6 +2295,11 @@ class RelayClient:
             return self._api_v1_response_envelope(request_id, message=assistant_message)
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
+                self._last_api_v1_runtime_health = {
+                    "runtime_healthy": True,
+                    "recovery_attempted": False,
+                    "recovery_succeeded": False,
+                }
                 log_error(
                     "Desktop runtime rejected API v1 relay inference request",
                     exc_info=True,
@@ -2285,10 +2307,24 @@ class RelayClient:
                 return self._api_v1_response_envelope(
                     request_id,
                     error={
-                        "code": "compute_node_inference_request_error",
+                        "code": "compute_node_internal_error",
                         "message": "Desktop runtime rejected the inference request",
                     },
                 )
+            recovery_attempted = (
+                "replacement" in str(exc).lower()
+                or "restart" in str(exc).lower()
+                or (
+                    exc.__cause__ is not None
+                    and _is_llama_cpp_restartable_worker_error(exc.__cause__)
+                )
+            )
+            runtime_healthy = not recovery_attempted
+            self._last_api_v1_runtime_health = {
+                "runtime_healthy": runtime_healthy,
+                "recovery_attempted": recovery_attempted,
+                "recovery_succeeded": False,
+            }
             log_error(
                 "Desktop runtime inference failed for API v1 relay request",
                 exc_info=True,
@@ -2343,6 +2379,15 @@ class RelayClient:
                 api_v1_response = response_envelope.get("api_v1_response", {})
                 error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
                 safe_error_code = error.get("code") if isinstance(error, dict) else None
+                runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+                runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
+                recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
+                recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
+                if safe_error_code not in {
+                    "compute_node_internal_error",
+                    "compute_node_process_failed",
+                }:
+                    runtime_healthy = True
                 submitted = self._post_api_v1_response(
                     response_envelope,
                     client_pub_key_b64=client_pub_key_b64,
@@ -2352,10 +2397,9 @@ class RelayClient:
                     inference_succeeded=safe_error_code is None and submitted,
                     submitted=submitted,
                     safe_error_code=safe_error_code,
-                    runtime_healthy=safe_error_code not in {
-                        "compute_node_internal_error",
-                        "compute_node_process_failed",
-                    },
+                    runtime_healthy=runtime_healthy,
+                    recovery_attempted=recovery_attempted,
+                    recovery_succeeded=recovery_succeeded,
                 )
 
             chat_history = _extract_chat_history_and_validate_key_binding(

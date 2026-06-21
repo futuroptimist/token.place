@@ -1435,6 +1435,8 @@ def run(args: argparse.Namespace) -> int:
                                 "submitted": bool(processed_bool),
                                 "safe_error_code": None,
                                 "runtime_healthy": True,
+                                "recovery_attempted": False,
+                                "recovery_succeeded": False,
                             }
                 except Exception as exc:
                     process_result = {
@@ -1442,6 +1444,8 @@ def run(args: argparse.Namespace) -> int:
                         "submitted": False,
                         "safe_error_code": "compute_node_process_failed",
                         "runtime_healthy": False,
+                        "recovery_attempted": True,
+                        "recovery_succeeded": False,
                     }
                     relay_last_error = "failed to process relay request"
                     last_error = relay_last_error
@@ -1471,6 +1475,16 @@ def run(args: argparse.Namespace) -> int:
                     if not isinstance(process_result, dict)
                     else process_result.get("runtime_healthy", True)
                 )
+                recovery_attempted = bool(
+                    getattr(process_result, "recovery_attempted", False)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("recovery_attempted", False)
+                )
+                recovery_succeeded = bool(
+                    getattr(process_result, "recovery_succeeded", False)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("recovery_succeeded", False)
+                )
                 if not inference_succeeded:
                     relay_last_error = "failed to process relay request"
                     if safe_error_code:
@@ -1480,7 +1494,9 @@ def run(args: argparse.Namespace) -> int:
                         "desktop.compute_node_bridge.process_request.failed "
                         f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
                         f"safe_error_code={safe_error_code or 'none'} submitted={submitted} "
-                        f"runtime_healthy={runtime_healthy}",
+                        f"runtime_healthy={runtime_healthy} "
+                        f"recovery_attempted={recovery_attempted} "
+                        f"recovery_succeeded={recovery_succeeded}",
                         file=sys.stderr,
                     )
                     if submitted:
@@ -1500,9 +1516,29 @@ def run(args: argparse.Namespace) -> int:
                             relay_runtime=relay_runtime,
                         )
                     if not runtime_healthy:
-                        warm_load_state = "failed"
                         registered = False
+                        if recovery_attempted and not recovery_succeeded:
+                            relay_state = "recovering"
+                            warm_load_state = "recovering"
+                            update_relay_status(
+                                active_relay_url,
+                                registered=False,
+                                relay_runtime_state="recovering",
+                                last_error=relay_last_error,
+                                last_request_id=request_id if request_id != "none" else None,
+                            )
+                            emit_operator_event(
+                                build_status_payload(
+                                    event_type="status",
+                                    running=True,
+                                    registered=False,
+                                    active_relay_url=active_relay_url,
+                                    current_last_error=last_error,
+                                    extra={"relay_runtime_state": "recovering"},
+                                )
+                            )
                         relay_state = "failed"
+                        warm_load_state = "failed"
                 else:
                     last_error = None
                     print(

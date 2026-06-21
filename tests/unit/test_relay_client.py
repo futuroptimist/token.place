@@ -2220,12 +2220,58 @@ class TestRelayClient:
 
         assert typed_result.submitted is True
         assert typed_result.inference_succeeded is False
-        assert typed_result.safe_error_code == "compute_node_inference_request_error"
+        assert typed_result.safe_error_code == "compute_node_internal_error"
         assert typed_result.runtime_healthy is True
+        assert typed_result.recovery_attempted is False
+        assert typed_result.recovery_succeeded is False
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_inference_request_error"
+            "compute_node_internal_error"
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_exhausted_replacement_reports_recovery_failed(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Exhausted worker replacement is submitted as an encrypted error with recovery metadata."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-worker-dead",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.create_chat_completion_with_recovery = MagicMock(
+            side_effect=RuntimeError(
+                "LLM runtime replacement failed after one restart attempt"
+            )
+        )
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        typed_result = relay_client.process_client_request_result(request_data)
+
+        assert typed_result.submitted is True
+        assert typed_result.inference_succeeded is False
+        assert typed_result.safe_error_code == "compute_node_internal_error"
+        assert typed_result.runtime_healthy is False
+        assert typed_result.recovery_attempted is True
+        assert typed_result.recovery_succeeded is False
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_runtime_output_posts_encrypted_error(

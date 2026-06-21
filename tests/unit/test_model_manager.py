@@ -3438,7 +3438,7 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     assert stale.closed is True
 
 
-def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog):
+def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog, capsys):
     """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
     from utils.llm import model_manager as model_manager_module
 
@@ -3451,7 +3451,7 @@ def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeyp
     state_path.write_text(json.dumps({'created': 0, 'calls': [], 'actions': []}), encoding='utf-8')
     fake_pkg.joinpath('__init__.py').write_text(
         r'''
-import contextlib, fcntl, json, os, time
+import contextlib, json, os, time
 from pathlib import Path
 STATE = Path(os.environ['TOKEN_PLACE_FAKE_LLAMA_STATE'])
 LOCK = STATE.with_suffix(STATE.suffix + '.lock')
@@ -3469,14 +3469,23 @@ def _save_unlocked(data):
 @contextlib.contextmanager
 def _locked_state():
     LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK.open('a+', encoding='utf-8') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    deadline = time.monotonic() + 10
+    lock_fd = None
+    while lock_fd is None:
         try:
-            data = _load_unlocked()
-            yield data
-            _save_unlocked(data)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            if time.monotonic() > deadline:
+                raise TimeoutError('timed out waiting for fake llama state lock')
+            time.sleep(0.01)
+    try:
+        data = _load_unlocked()
+        yield data
+        _save_unlocked(data)
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(LOCK)
 
 class Llama:
     def __init__(self, **_kwargs):
@@ -3499,12 +3508,15 @@ class Llama:
         if action == 'abrupt_exit':
             os._exit(23)
         time.sleep(float(os.environ.get('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0')))
-        return {'id': request_id, 'choices': [{'message': {'role': 'assistant', 'content': SENTINEL_OUTPUT + ' gen=' + str(self.generation) + ' request=' + str(request_id)}}]}
+        nonce = (kwargs.get('metadata') or {}).get('nonce') or request_id
+        return {'id': request_id, 'nonce': nonce, 'choices': [{'message': {'role': 'assistant', 'content': SENTINEL_OUTPUT + ' gen=' + str(self.generation) + ' request=' + str(request_id) + ' nonce=' + str(nonce)}}]}
 ''',
         encoding='utf-8',
     )
 
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger='utils.llm.model_manager')
+    caplog.set_level(logging.DEBUG, logger='token.place')
 
     monkeypatch.syspath_prepend(str(fake_parent))
     monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_STATE', str(state_path))
@@ -3541,11 +3553,63 @@ class Llama:
         data.pop('fail_init', None)
         save(data)
 
-    def request(request_id):
+    def request(request_id, nonce=None):
+        nonce = nonce or f'nonce-{request_id}'
         return manager.create_chat_completion_with_recovery(
-            messages=[{'role': 'user', 'content': f'{plaintext_prompt} {request_id}'}],
+            messages=[{'role': 'user', 'content': f'{plaintext_prompt} {request_id} {nonce}'}],
             request_id=request_id,
+            metadata={'request_id': request_id, 'nonce': nonce},
         )
+
+    class LocalRelayProbe:
+        def __init__(self, relay_ids):
+            self.registered = {relay_id: True for relay_id in relay_ids}
+            self.ready = {relay_id: True for relay_id in relay_ids}
+            self.encrypted_requests = {}
+            self.encrypted_responses = {}
+            self.response_history = []
+            self.safe_logs = []
+            self.diagnostics = []
+
+        def encrypted_request_for(self, request_id, nonce):
+            payload = f'ciphertext-request:{request_id}:{nonce}'
+            self.encrypted_requests[request_id] = payload
+            self.safe_logs.append(f'queued encrypted request {request_id}')
+            return payload
+
+        def store_response(self, request_id, nonce, result):
+            content = result['choices'][0]['message']['content']
+            assert f'request={request_id}' in content
+            assert f'nonce={nonce}' in content
+            encrypted = f'ciphertext-response:{request_id}:{nonce}:{result["id"]}'
+            self.encrypted_responses.setdefault(request_id, []).append(encrypted)
+            self.response_history.append((request_id, encrypted))
+            self.safe_logs.append(f'stored encrypted response {request_id}')
+            return encrypted
+
+        def mark_failed(self, reason):
+            for relay_id in self.registered:
+                self.registered[relay_id] = False
+                self.ready[relay_id] = False
+            self.diagnostics.append({'event': 'worker_failed', 'reason': reason})
+
+        def ciphertext_blob(self):
+            return json.dumps({
+                'registered': self.registered,
+                'ready': self.ready,
+                'encrypted_requests': self.encrypted_requests,
+                'encrypted_responses': self.encrypted_responses,
+                'safe_logs': self.safe_logs,
+                'diagnostics': self.diagnostics,
+            }, sort_keys=True)
+
+    relay_probe = LocalRelayProbe(['relay-0', 'relay-1'])
+
+    def relay_request(request_id, nonce):
+        relay_probe.encrypted_request_for(request_id, nonce)
+        result = request(request_id, nonce=nonce)
+        relay_probe.store_response(request_id, nonce, result)
+        return result
 
     seen_ids = set()
     for index in range(100):
@@ -3581,11 +3645,12 @@ class Llama:
     def _relay_call(name):
         try:
             barrier.wait(timeout=5)
-            results.append(request(name)['id'])
+            nonce = f'nonce-{name}'
+            results.append(relay_request(name, nonce)['id'])
         except Exception as exc:  # pragma: no cover - surfaced below with thread context
             relay_errors.append((name, repr(exc)))
 
-    threads = [threading.Thread(target=_relay_call, args=(f'relay-{i}',)) for i in range(2)]
+    threads = [threading.Thread(target=_relay_call, args=(f'relay-{i}',), daemon=True) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -3594,6 +3659,8 @@ class Llama:
     assert stuck_threads == []
     assert relay_errors == []
     assert sorted(results) == ['relay-0', 'relay-1']
+    assert all(len(relay_probe.encrypted_responses[request_id]) == 1 for request_id in results)
+    assert len({encrypted for _request_id, encrypted in relay_probe.response_history}) == len(results)
     assert state()['created'] == before
     assert manager.worker_lifecycle_status()['worker_alive'] is True
 
@@ -3601,8 +3668,13 @@ class Llama:
     data = state()
     data['fail_init'] = True
     save(data)
-    with pytest.raises(RuntimeError, match='replacement failed|one restart attempt|fake init failure'):
+    persistent_error = None
+    with pytest.raises(RuntimeError, match='replacement failed|one restart attempt|fake init failure') as exc_info:
         request('persistent-failure')
+    persistent_error = repr(exc_info.value)
+    relay_probe.mark_failed(persistent_error)
+    assert all(is_registered is False for is_registered in relay_probe.registered.values())
+    assert all(is_ready is False for is_ready in relay_probe.ready.values())
     status = manager.worker_lifecycle_status()
     assert status['worker_state'] in {'failed', 'recovering', 'stopped'}
     assert status['worker_alive'] is False
@@ -3626,6 +3698,14 @@ class Llama:
     assert threading.active_count() < 80
 
     diagnostics = json.dumps(manager.worker_lifecycle_status(), sort_keys=True)
-    log_text = caplog.text + diagnostics
-    assert plaintext_prompt not in log_text
-    assert plaintext_output not in log_text
+    captured = capsys.readouterr()
+    leak_checked_text = '\n'.join([
+        caplog.text,
+        diagnostics,
+        relay_probe.ciphertext_blob(),
+        persistent_error or '',
+        captured.out,
+        captured.err,
+    ])
+    assert plaintext_prompt not in leak_checked_text
+    assert plaintext_output not in leak_checked_text

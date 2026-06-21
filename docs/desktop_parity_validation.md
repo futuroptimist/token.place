@@ -81,6 +81,9 @@ python desktop-tauri/scripts/run_desktop_parity_checks.py
 # Or run the underlying local relay parity test directly.
 python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
 
+# Reproduce the deterministic long-lived-worker soak and fault-injection check.
+python desktop-tauri/scripts/test_desktop_worker_soak_fault_e2e.py
+
 # Inspect local relay health and diagnostics while the test or app is running.
 curl -fsS http://127.0.0.1:5010/livez
 curl -fsS http://127.0.0.1:5010/relay/diagnostics | python -m json.tool

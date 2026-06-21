@@ -2100,7 +2100,13 @@ class ModelManager:
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
         try:
-            return create_chat_completion(*args, **kwargs)
+            result = create_chat_completion(*args, **kwargs)
+            with self.llm_lock:
+                if self.llm is llm_instance:
+                    self.worker_state = 'ready'
+                    self.last_worker_error_code = None
+                    self.last_worker_exit_code = None
+            return result
         except LlamaCppInferenceRequestError as exc:
             safe_error_code = _safe_worker_error_code(exc)
             with self.llm_lock:

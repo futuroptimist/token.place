@@ -3640,8 +3640,13 @@ def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monke
     failed_statuses = [
         event for event in status_events if event.get('relay_runtime_state') == 'failed'
     ]
+    assert ReRegisterAfterFailureRuntime.last_instance.poll_count == 1
     assert failed_statuses
     assert all(event['registered'] is False for event in failed_statuses)
+    assert not any(
+        event['registered'] is True and event.get('relay_runtime_state') == 'failed'
+        for event in status_events
+    )
 
 
 def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch):

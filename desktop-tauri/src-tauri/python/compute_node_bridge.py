@@ -1265,6 +1265,19 @@ def run(args: argparse.Namespace) -> int:
         worker = relay_poll_workers[active_relay_url]
         while not stop_requested():
             active_relay_url = relay_runtime.relay_client.relay_url
+            if warm_load_state == "failed":
+                update_relay_status(
+                    active_relay_url,
+                    registered=False,
+                    relay_runtime_state="failed",
+                    last_error=last_error,
+                )
+                emit_status_event(
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                )
+                break
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.register "
                 f"operator_session_id={bridge_session_id} "

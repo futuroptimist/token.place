@@ -1665,12 +1665,6 @@ class RelayClient:
         return None
 
     @classmethod
-    def _api_v1_content_is_valid(cls, content: Any) -> bool:
-        """Mirror API v1 text-only chat content validation before runtime use."""
-
-        return cls._api_v1_content_validation_size(content) is not None
-
-    @classmethod
     def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
         if (
             not isinstance(messages, list)
@@ -1938,11 +1932,12 @@ class RelayClient:
 
     @staticmethod
     def _api_v1_is_finite_number(value: Any) -> bool:
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(value)
-        )
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
 
     @classmethod
     def _api_v1_normalise_numeric_option(
@@ -1968,17 +1963,27 @@ class RelayClient:
     @classmethod
     def _api_v1_normalise_stop_option(cls, value: Any) -> Tuple[bool, Any]:
         if isinstance(value, str):
-            if len(value) > cls._API_V1_MAX_STOP_CHARS:
+            if not value or len(value) > cls._API_V1_MAX_STOP_CHARS:
                 return False, None
             return True, value
         if not isinstance(value, list) or len(value) > cls._API_V1_MAX_STOP_SEQUENCES:
             return False, None
         normalised = []
         for item in value:
-            if not isinstance(item, str) or len(item) > cls._API_V1_MAX_STOP_CHARS:
+            if not isinstance(item, str) or not item or len(item) > cls._API_V1_MAX_STOP_CHARS:
                 return False, None
             normalised.append(item)
         return True, normalised
+
+    @staticmethod
+    def _api_v1_rejected_options_summary(option_names: List[str]) -> str:
+        displayed_option_limit = 5
+        displayed = option_names[:displayed_option_limit]
+        remaining_count = len(option_names) - len(displayed)
+        summary = ", ".join(displayed)
+        if remaining_count > 0:
+            summary = f"{summary}, and {remaining_count} more option(s)"
+        return summary
 
     @classmethod
     def _api_v1_validate_and_normalise_options(
@@ -2020,7 +2025,7 @@ class RelayClient:
             return (
                 False,
                 "compute_node_options_unsupported",
-                ", ".join(unsupported + unknown),
+                cls._api_v1_rejected_options_summary(unsupported + unknown),
                 {},
             )
 
@@ -2174,14 +2179,22 @@ class RelayClient:
             safe_options,
         ) = self._api_v1_validate_and_normalise_options(options)
         if not options_supported:
+            error_code = option_error_code or "compute_node_options_unsupported"
+            if error_code == "compute_node_invalid_request":
+                error_message = (
+                    "Requested option is invalid for the desktop runtime: "
+                    f"{rejected_option}"
+                )
+            else:
+                error_message = (
+                    "Requested option is unsupported by the desktop runtime: "
+                    f"{rejected_option}"
+                )
             return self._api_v1_response_envelope(
                 request_id,
                 error={
-                    "code": option_error_code or "compute_node_options_unsupported",
-                    "message": (
-                        "Requested option is invalid or unsupported by the desktop runtime: "
-                        f"{rejected_option}"
-                    ),
+                    "code": error_code,
+                    "message": error_message,
                 },
             )
 

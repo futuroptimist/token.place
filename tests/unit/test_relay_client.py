@@ -3607,7 +3607,6 @@ class _ApiV1RuntimeManager:
         ({"presence_penalty": 2.0}, {"presence_penalty": 2.0}),
         ({"seed": 0}, {"seed": 0}),
         ({"seed": 2**32 - 1}, {"seed": 2**32 - 1}),
-        ({"stop": ""}, {"stop": ""}),
         ({"stop": ["END", "STOP"]}, {"stop": ["END", "STOP"]}),
         ({"stream": False}, {"stream": False}),
     ],
@@ -3639,6 +3638,7 @@ def test_api_v1_supported_option_boundaries_are_normalized(options, expected):
         ({"temperature": False}, "compute_node_invalid_request"),
         ({"temperature": float("nan")}, "compute_node_invalid_request"),
         ({"temperature": float("inf")}, "compute_node_invalid_request"),
+        ({"temperature": 10**10000}, "compute_node_invalid_request"),
         ({"temperature": 2.01}, "compute_node_invalid_request"),
         ({"top_p": -0.01}, "compute_node_invalid_request"),
         ({"frequency_penalty": -2.01}, "compute_node_invalid_request"),
@@ -3647,6 +3647,9 @@ def test_api_v1_supported_option_boundaries_are_normalized(options, expected):
         ({"seed": 1.5}, "compute_node_invalid_request"),
         ({"stop": ["x"] * 17}, "compute_node_invalid_request"),
         ({"stop": [True]}, "compute_node_invalid_request"),
+        ({"stop": [""]}, "compute_node_invalid_request"),
+        ({"stop": ["END", ""]}, "compute_node_invalid_request"),
+        ({"stop": ""}, "compute_node_invalid_request"),
         ({"stop": "x" * 257}, "compute_node_invalid_request"),
         ({"stream": True}, "compute_node_options_unsupported"),
         ({"tools": []}, "compute_node_options_unsupported"),
@@ -3672,6 +3675,11 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == code
     assert "SENTINEL" not in json.dumps(error)
+    if code == "compute_node_invalid_request":
+        assert "invalid for the desktop runtime" in error["message"]
+        assert "unsupported" not in error["message"]
+    else:
+        assert "unsupported by the desktop runtime" in error["message"]
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
 
@@ -3710,6 +3718,25 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     assert error["code"] == "compute_node_invalid_request"
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
+
+
+def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    options = {f"unknown_option_{index}": "value" for index in range(20)}
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-too-many-options",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options=options,
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert "and 15 more option(s)" in error["message"]
+    assert "unknown_option_19" not in error["message"]
+    manager.runtime.create_chat_completion.assert_not_called()
 
 
 def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():

@@ -165,6 +165,9 @@ def _start_fake_desktop_loop(base_url, done_event):
     )
     desktop_client._request_timeout = 2
 
+    register = desktop_client.register_api_v1_compute_node(base_url)
+    assert register["next_ping_in_x_seconds"] > 0
+
     def worker():
         deadline = time.time() + 5
         while time.time() < deadline and not done_event.is_set():

@@ -41,6 +41,52 @@ def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
     assert compute_node_bridge._api_v1_recovery_attempts(default=3) == 3
 
 
+@pytest.mark.parametrize(
+    ('raw_value', 'expected'),
+    [
+        (None, 4),
+        ('0', 0),
+        ('5', 5),
+        ('not-an-int', 4),
+    ],
+)
+def test_api_v1_recovery_attempts_parses_valid_values_and_defaults(
+    monkeypatch,
+    raw_value,
+    expected,
+):
+    if raw_value is None:
+        monkeypatch.delenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', raising=False)
+    else:
+        monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', raw_value)
+
+    assert compute_node_bridge._api_v1_recovery_attempts(default=4) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw_value', 'expected'),
+    [
+        (None, 1.5),
+        ('0', 0.0),
+        ('2.25', 2.25),
+        ('not-a-float', 1.5),
+        ('nan', 1.5),
+        ('-0.01', 1.5),
+    ],
+)
+def test_api_v1_recovery_backoff_seconds_parses_valid_values_and_defaults(
+    monkeypatch,
+    raw_value,
+    expected,
+):
+    if raw_value is None:
+        monkeypatch.delenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', raising=False)
+    else:
+        monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', raw_value)
+
+    assert compute_node_bridge._api_v1_recovery_backoff_seconds(default=1.5) == expected
+
+
 class FakeModelManager:
     def __init__(self):
         self.model_path = ''
@@ -3962,3 +4008,133 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
         thread.name.startswith('tokenplace-relay-poller') and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exception(
+    capsys,
+    monkeypatch,
+):
+    _reset_cancel_queue()
+    recovery_calls = {'count': 0}
+
+    class RaisingUnregisterClient(FakeRelayClient):
+        def __init__(self, relay_url):
+            self.relay_url = relay_url
+            self._api_v1_registered_relays = {relay_url}
+            self.unregister_calls = 0
+            self.start_calls = 0
+
+        def unregister_from_relay(self):
+            self.unregister_calls += 1
+            raise TimeoutError('unregister timed out')
+
+        def start(self):
+            self.start_calls += 1
+
+    class ExceptionThenSuccessRuntime(ApiV1Runtime):
+        instances = []
+
+        def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+            super().__init__(config)
+            self.model_manager = model_manager or FakeModelManager()
+            self.crypto_manager = crypto_manager or object()
+            self.relay_client = RaisingUnregisterClient(config.relay_url)
+            ExceptionThenSuccessRuntime.instances.append(self)
+
+        def ensure_api_v1_runtime_ready(self):
+            recovery_calls['count'] += 1
+            if recovery_calls['count'] == 1:
+                raise RuntimeError('first warm-load failed')
+            return True
+
+        def process_relay_request_result(self, _payload):
+            return SimpleNamespace(
+                inference_succeeded=False,
+                submitted=False,
+                safe_error_code='compute_node_internal_error',
+                runtime_healthy=False,
+                recovery_attempted=True,
+                recovery_succeeded=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ExceptionThenSuccessRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '0')
+    stop_checks = {'count': 0}
+
+    def stop_after_recovery():
+        stop_checks['count'] += 1
+        return recovery_calls['count'] >= 2 and stop_checks['count'] > 6
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_recovery)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_urls=['https://relay-b.example'],
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    output = capsys.readouterr()
+    assert status == 0
+    assert recovery_calls['count'] == 2
+    assert output.err.count('desktop.compute_node_bridge.recovery.attempt_exception') == 1
+    assert output.err.count('desktop.compute_node_bridge.recovery.unregister.failed') >= 1
+    assert all(instance.relay_client.start_calls >= 1 for instance in ExceptionThenSuccessRuntime.instances)
+
+
+def test_multi_relay_recovery_cancelled_before_first_attempt(capsys, monkeypatch):
+    _reset_cancel_queue()
+    cancel_recovery = {'value': False}
+    recovery_calls = {'count': 0}
+
+    class CancelledRecoveryRuntime(ApiV1Runtime):
+        def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+            super().__init__(config)
+            self.model_manager = model_manager or FakeModelManager()
+            self.crypto_manager = crypto_manager or object()
+            self.relay_client = FakeRelayClientRouting()
+            self.relay_client.relay_url = config.relay_url
+            self.relay_client._api_v1_registered_relays = {config.relay_url}
+            self.relay_client.unregister_from_relay = lambda: True
+
+        def ensure_api_v1_runtime_ready(self):
+            recovery_calls['count'] += 1
+            return True
+
+        def process_relay_request_result(self, _payload):
+            cancel_recovery['value'] = True
+            return SimpleNamespace(
+                inference_succeeded=False,
+                submitted=False,
+                safe_error_code='compute_node_internal_error',
+                runtime_healthy=False,
+                recovery_attempted=True,
+                recovery_succeeded=False,
+            )
+
+    def stop_during_recovery():
+        return cancel_recovery['value']
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=CancelledRecoveryRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '0')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_during_recovery)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_urls=[],
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    output = capsys.readouterr()
+    assert status == 0
+    assert recovery_calls['count'] == 0
+    assert 'desktop.compute_node_bridge.recovery.cancelled' in output.err

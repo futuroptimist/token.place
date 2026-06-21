@@ -584,7 +584,10 @@ def test_api_v1_relay_request_adapter_processes_api_v1_payload():
     }
     relay_client.process_client_request.return_value = True
     assert adapter.can_process(payload) is True
-    assert adapter.process(payload) is True
+    result = adapter.process(payload)
+    assert bool(result) is True
+    assert result.inference_succeeded is True
+    assert result.submitted is True
     relay_client.process_client_request.assert_called_once_with(payload)
 
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
@@ -947,3 +950,37 @@ def test_compute_node_runtime_stop_skips_unregister_for_non_set_registration_sta
 
     relay_client.stop.assert_called_once_with()
     relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_process_relay_request_result_preserves_error_envelope_submission_semantics():
+    from utils.processing_result import RelayProcessingResult
+
+    class Adapter:
+        def can_process(self, _payload):
+            return True
+
+        def process(self, _payload):
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=True,
+                safe_error_code="compute_node_internal_error",
+                runtime_healthy=False,
+                recovery_attempted=True,
+                recovery_succeeded=False,
+            )
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        relay_client=MagicMock(),
+        model_manager=MagicMock(use_mock_llm=True),
+        crypto_manager=MagicMock(),
+        request_adapters=[Adapter()],
+    )
+
+    result = runtime.process_relay_request_result({"request_id": "req-1"})
+    assert bool(result) is True
+    assert runtime.process_relay_request({"request_id": "req-1"}) is True
+    assert result.submitted is True
+    assert result.inference_succeeded is False
+    assert result.safe_error_code == "compute_node_internal_error"
+    assert result.runtime_healthy is False

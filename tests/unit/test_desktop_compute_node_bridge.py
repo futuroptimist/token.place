@@ -3588,3 +3588,38 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     assert started['install_command_summary'].startswith('python -m pip install')
     assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert started['pip_stderr_tail'] == 'Metal headers missing'
+
+
+def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+
+    class ErrorEnvelopeRuntime(ApiV1Runtime):
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=True,
+                safe_error_code="compute_node_internal_error",
+                runtime_healthy=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ErrorEnvelopeRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(ErrorEnvelopeRuntime.last_instance._processed),
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' not in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted' in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get('type') == 'status']
+    assert status_events[-1]['registered'] is False
+    assert status_events[-1]['relay_runtime_state'] == 'failed'
+    assert status_events[-1]['last_error'] == 'relay request failed: compute_node_internal_error'

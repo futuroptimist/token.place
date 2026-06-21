@@ -2172,6 +2172,12 @@ class TestRelayClient:
         source_response.status_code = 200
         mock_post.return_value = source_response
 
+        typed_result = relay_client.process_client_request_result(request_data)
+        assert bool(typed_result) is True
+        assert typed_result.submitted is True
+        assert typed_result.inference_succeeded is False
+        assert typed_result.safe_error_code == "compute_node_internal_error"
+        assert typed_result.runtime_healthy is False
         assert relay_client.process_client_request(request_data) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]

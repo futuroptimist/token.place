@@ -2013,7 +2013,26 @@ class RelayClient:
             )
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
-        has_direct_runtime_completion = callable(get_llm_instance)
+        recovery_completion = (
+            self.model_manager.__dict__.get("create_chat_completion_with_recovery")
+            if hasattr(self.model_manager, "__dict__")
+            else None
+        )
+        if recovery_completion is None:
+            recovery_completion = getattr(
+                type(self.model_manager),
+                "create_chat_completion_with_recovery",
+                None,
+            )
+            if callable(recovery_completion):
+                recovery_completion = getattr(
+                    self.model_manager,
+                    "create_chat_completion_with_recovery",
+                    None,
+                )
+        has_direct_runtime_completion = callable(get_llm_instance) or callable(
+            recovery_completion
+        )
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2056,8 +2075,8 @@ class RelayClient:
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = None
-            create_chat_completion = None
-            if has_direct_runtime_completion:
+            create_chat_completion = recovery_completion
+            if not callable(create_chat_completion) and has_direct_runtime_completion:
                 llm_instance = get_llm_instance()
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 

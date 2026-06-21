@@ -3089,3 +3089,191 @@ def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(request_scoped
     result = proxy.create_chat_completion(messages=[], stream=False)
     assert result['choices'][0]['message']['content'] == 'ok'
     assert result['choices'][0]['pid'] == proxy._process.pid
+
+
+class _RestartTestConfig:
+    is_production = False
+
+    def __init__(self, models_dir):
+        self.models_dir = str(models_dir)
+
+    def get(self, key, default=None):
+        values = {
+            'model.filename': 'test_model.gguf',
+            'model.url': 'https://example.com/model.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': self.models_dir,
+            'model.use_mock': False,
+            'model.context_size': 2048,
+            'model.chat_format': 'llama-3',
+            'model.max_tokens': 1000,
+            'model.temperature': 0.7,
+            'model.top_p': 0.9,
+            'model.stop_tokens': [],
+            'model.n_gpu_layers': 0,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': False,
+        }
+        return values.get(key, default)
+
+
+class _RestartableFakeWorker:
+    def __init__(self, name, *, fail=None):
+        self.name = name
+        self.fail = fail
+        self.closed = False
+        self.calls = 0
+        self.pid = id(self)
+
+    def is_alive(self):
+        return not self.closed and self.fail != 'dead'
+
+    def close(self):
+        self.closed = True
+
+    def create_chat_completion(self, **_kwargs):
+        self.calls += 1
+        from utils.llm import model_manager as model_manager_module
+        if self.fail == 'dead':
+            raise model_manager_module.LlamaCppWorkerDeadError('dead')
+        if self.fail == 'pipe':
+            raise model_manager_module.LlamaCppWorkerBrokenPipeError('pipe')
+        if self.fail == 'eof':
+            raise model_manager_module.LlamaCppWorkerEOFError('eof')
+        if self.fail == 'request':
+            raise model_manager_module.LlamaCppInferenceRequestError('request failed')
+        return {'choices': [{'message': {'role': 'assistant', 'content': self.name}}]}
+
+
+def _restart_manager(tmp_path, monkeypatch, workers):
+    from utils.llm import model_manager as model_manager_module
+
+    (tmp_path / 'test_model.gguf').write_bytes(b'fake')
+    manager = model_manager_module.ModelManager(_RestartTestConfig(tmp_path))
+    created = []
+
+    def _import_runtime(**_kwargs):
+        class _Runtime:
+            __file__ = '/fake/llama_cpp.py'
+
+            class Llama:
+                def __init__(self, **_llama_kwargs):
+                    worker = workers.pop(0)
+                    created.append(worker)
+                    self._worker = worker
+
+                def __getattr__(self, name):
+                    return getattr(self._worker, name)
+
+        return _Runtime
+
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', _import_runtime)
+    monkeypatch.setattr(manager, '_resolve_compute_plan', lambda: {
+        'requested_mode': 'cpu', 'effective_mode': 'cpu', 'backend_available': 'cpu',
+        'backend_selected': 'cpu', 'backend_used': 'cpu', 'n_gpu_layers': 0,
+        'fallback_reason': None,
+    })
+    return manager, created
+
+
+def test_model_manager_recover_replaces_worker_killed_between_requests(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first')
+    second = _RestartableFakeWorker('second')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    first_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert first_result['choices'][0]['message']['content'] == 'first'
+    first.fail = 'dead'
+    second_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert second_result['choices'][0]['message']['content'] == 'second'
+
+    assert first.closed is True
+    assert manager.llm is not None
+    assert manager.llm._worker is second
+    assert created == [first, second]
+
+
+def test_model_manager_restart_broken_pipe_or_eof_once(tmp_path, monkeypatch):
+    pipe = _RestartableFakeWorker('pipe', fail='pipe')
+    second = _RestartableFakeWorker('second')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [pipe, second])
+
+    second_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert second_result['choices'][0]['message']['content'] == 'second'
+    assert pipe.closed is True
+    assert created == [pipe, second]
+
+    eof = _RestartableFakeWorker('eof', fail='eof')
+    fourth = _RestartableFakeWorker('fourth')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [eof, fourth])
+    fourth_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert fourth_result['choices'][0]['message']['content'] == 'fourth'
+    assert eof.closed is True
+    assert created == [eof, fourth]
+
+
+def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first', fail='request')
+    second = _RestartableFakeWorker('second')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, second])
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    assert first.closed is False
+    assert manager.llm._worker is first
+    assert created == [first]
+
+
+def test_model_manager_concurrent_dead_worker_creates_one_replacement(tmp_path, monkeypatch):
+    dead = _RestartableFakeWorker('dead', fail='dead')
+    replacement = _RestartableFakeWorker('replacement')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [dead, replacement])
+    manager.get_llm_instance()
+
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _call():
+        barrier.wait(timeout=5)
+        results.append(manager.create_chat_completion_with_recovery(messages=[]))
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(results) == 2
+    assert [worker.name for worker in created] == ['dead', 'replacement']
+    assert dead.closed is True
+    assert replacement.calls == 2
+
+
+def test_model_manager_replacement_failure_attempted_once_surfaces_stable_error(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first', fail='dead')
+    second = _RestartableFakeWorker('second', fail='eof')
+    third = _RestartableFakeWorker('third')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, second, third])
+
+    with pytest.raises(RuntimeError, match='one restart attempt'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    assert [worker.name for worker in created] == ['first', 'second']
+    assert first.closed is True
+    assert second.closed is True
+
+
+def test_model_manager_healthy_request_has_no_restart(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first')
+    second = _RestartableFakeWorker('second')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    first_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert first_result['choices'][0]['message']['content'] == 'first'
+    first_result = manager.create_chat_completion_with_recovery(messages=[])
+    assert first_result['choices'][0]['message']['content'] == 'first'
+
+    assert created == [first]
+    assert first.closed is False

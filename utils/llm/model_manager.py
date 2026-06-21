@@ -873,11 +873,13 @@ class _SubprocessLlamaProxy:
         if check_health:
             self.assert_healthy()
         if self._process.stdin is None:
+            self._closed = True
             raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess stdin is unavailable')
         try:
             self._process.stdin.write(json.dumps(payload) + '\n')
             self._process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
+            self._closed = True
             raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess transport write failed') from exc
 
     def is_alive(self) -> bool:
@@ -1985,12 +1987,23 @@ class ModelManager:
                 self.llm = None
             if self._llm_generation == observed_generation:
                 self._llm_generation += 1
-            # get_llm_instance performs initialization under this same lock when llm is None;
-            # inline the guarded call by releasing the lock would allow duplicate creators.
+            # Release llm_lock before get_llm_instance() because it initializes under
+            # the same non-reentrant lock and still serializes creation internally.
         return self.get_llm_instance()
 
     def create_chat_completion_with_recovery(self, *args, **kwargs):
-        """Create a completion, replacing a dead subprocess worker at most once."""
+        """Create a completion, replacing a dead subprocess worker at most once.
+
+        Recovery is only supported for non-streaming completions. Passing
+        ``stream=True`` returns a generator before transport IO can raise
+        restartable worker errors, so callers that need recovery must use
+        ``stream=False``.
+        """
+        if kwargs.get('stream', False):
+            raise ValueError(
+                'create_chat_completion_with_recovery does not support stream=True; '
+                'use create_chat_completion directly for streaming.'
+            )
 
         llm_instance = self.get_llm_instance()
         if llm_instance is None:

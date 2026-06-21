@@ -313,6 +313,7 @@ class TestRelayClient:
             ]
         }
         mock.get_llm_instance.return_value = mock.runtime
+        mock.create_chat_completion_with_recovery = None
         mock.use_mock_llm = True
         return mock
 
@@ -2138,6 +2139,48 @@ class TestRelayClient:
         assert result is False
         mock_model_manager.llama_cpp_get_response.assert_not_called()
         mock_post.assert_not_called()
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_missing_runtime_posts_internal_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Missing desktop runtime init becomes a stable encrypted internal error."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-runtime-missing",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.get_llm_instance.return_value = None
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_internal_error"
+        )
+        assert encrypted_envelope["api_v1_response"]["error"]["message"] == (
+            "Desktop runtime inference failed"
+        )
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_runtime_output_posts_encrypted_error(

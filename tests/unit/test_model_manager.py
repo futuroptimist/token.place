@@ -3277,3 +3277,41 @@ def test_model_manager_healthy_request_has_no_restart(tmp_path, monkeypatch):
 
     assert created == [first]
     assert first.closed is False
+
+
+def test_subprocess_llama_proxy_send_marks_closed_on_missing_stdin_or_write_failure():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._process = SimpleNamespace(stdin=None)
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerBrokenPipeError):
+        proxy._send({"method": "noop"}, check_health=False)
+
+    assert proxy.is_alive() is False
+
+    class BrokenStdin:
+        def write(self, _text):
+            raise BrokenPipeError("closed")
+
+        def flush(self):
+            raise AssertionError("flush should not run after write failure")
+
+    proxy._closed = False
+    proxy._process = SimpleNamespace(stdin=BrokenStdin(), poll=lambda: None)
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerBrokenPipeError):
+        proxy._send({"method": "noop"}, check_health=False)
+
+    assert proxy.is_alive() is False
+
+
+def test_model_manager_recovery_rejects_streaming_calls(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first])
+
+    with pytest.raises(ValueError, match='does not support stream=True'):
+        manager.create_chat_completion_with_recovery(messages=[], stream=True)
+
+    assert created == []

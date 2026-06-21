@@ -2013,23 +2013,9 @@ class RelayClient:
             )
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
-        recovery_completion = (
-            self.model_manager.__dict__.get("create_chat_completion_with_recovery")
-            if hasattr(self.model_manager, "__dict__")
-            else None
+        recovery_completion = getattr(
+            self.model_manager, "create_chat_completion_with_recovery", None
         )
-        if recovery_completion is None:
-            recovery_completion = getattr(
-                type(self.model_manager),
-                "create_chat_completion_with_recovery",
-                None,
-            )
-            if callable(recovery_completion):
-                recovery_completion = getattr(
-                    self.model_manager,
-                    "create_chat_completion_with_recovery",
-                    None,
-                )
         has_direct_runtime_completion = callable(get_llm_instance) or callable(
             recovery_completion
         )
@@ -2078,6 +2064,15 @@ class RelayClient:
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and has_direct_runtime_completion:
                 llm_instance = get_llm_instance()
+                if llm_instance is None:
+                    log_error("Desktop runtime LLM initialization failed for API v1 relay request")
+                    return self._api_v1_response_envelope(
+                        request_id,
+                        error={
+                            "code": "compute_node_internal_error",
+                            "message": "Desktop runtime inference failed",
+                        },
+                    )
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 
             if callable(create_chat_completion):

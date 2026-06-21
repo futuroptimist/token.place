@@ -1,5 +1,7 @@
 from unittest.mock import call, MagicMock
 
+from utils.networking.relay_client import RelayProcessingResult
+
 import pytest
 
 from utils.compute_node_runtime import (
@@ -386,6 +388,44 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
 
     assert runtime.process_relay_request(payload) is True
     relay_client.process_client_request.assert_called_once_with(payload)
+
+
+
+def test_compute_node_runtime_typed_result_distinguishes_error_envelope_submission():
+    relay_client = MagicMock()
+    relay_client.process_client_request_result.return_value = RelayProcessingResult(
+        inference_succeeded=False,
+        submission_succeeded=True,
+        safe_error_code="compute_node_internal_error",
+        runtime_healthy=False,
+        runtime_recovery_attempted=True,
+        runtime_recovery_succeeded=False,
+    )
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-error-envelope",
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+
+    result = runtime.process_relay_request_result(payload)
+
+    assert runtime.process_relay_request(payload) is True
+    assert result.submission_succeeded is True
+    assert result.inference_succeeded is False
+    assert result.safe_error_code == "compute_node_internal_error"
+    assert result.runtime_healthy is False
 
 
 def test_compute_node_runtime_submit_api_v1_error_response_delegates_to_relay_client():

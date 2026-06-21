@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol,
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
-    from utils.networking.relay_client import RelayClient
+    from utils.networking.relay_client import RelayClient, RelayProcessingResult
+else:
+    from utils.networking.relay_client import RelayProcessingResult
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,9 @@ class RelayRequestAdapter(Protocol):
     def process(self, request_data: Dict[str, Any]) -> bool:
         """Process ``request_data`` and return success."""
 
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        """Process ``request_data`` and return a typed outcome."""
+
 
 class LegacyRelayRequestAdapter:
     """Compatibility adapter for the existing deprecated relay request shape."""
@@ -103,6 +108,18 @@ class LegacyRelayRequestAdapter:
     def process(self, request_data: Dict[str, Any]) -> bool:
         return self._relay_client.process_client_request(request_data)
 
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        process_result = getattr(self._relay_client, "process_client_request_result", None)
+        if callable(process_result):
+            result = process_result(request_data)
+            if isinstance(result, RelayProcessingResult):
+                return result
+        submitted = bool(self.process(request_data))
+        return RelayProcessingResult(
+            inference_succeeded=submitted,
+            submission_succeeded=submitted,
+        )
+
 
 class ApiV1RelayRequestAdapter:
     """Adapter for API v1 E2EE relay request envelopes."""
@@ -115,6 +132,18 @@ class ApiV1RelayRequestAdapter:
 
     def process(self, request_data: Dict[str, Any]) -> bool:
         return self._relay_client.process_client_request(request_data)
+
+    def process_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        process_result = getattr(self._relay_client, "process_client_request_result", None)
+        if callable(process_result):
+            result = process_result(request_data)
+            if isinstance(result, RelayProcessingResult):
+                return result
+        submitted = bool(self.process(request_data))
+        return RelayProcessingResult(
+            inference_succeeded=submitted,
+            submission_succeeded=submitted,
+        )
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -396,16 +425,21 @@ class ComputeNodeRuntime:
         return relay_thread
 
     def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
-        """Process relay payloads via registered protocol adapters."""
+        """Process relay payloads using legacy submission-success semantics."""
+
+        return self.process_relay_request_result(request_data).as_legacy_bool()
+
+    def process_relay_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        """Process relay payloads via registered adapters and return typed outcome."""
 
         for adapter in self.request_adapters:
             if adapter.can_process(request_data):
-                return adapter.process(request_data)
+                return adapter.process_result(request_data)
 
         _log_error(
             f"No relay request adapter matched payload keys: {sorted(request_data.keys())}"
         )
-        return False
+        return RelayProcessingResult()
 
     def start_relay_session(self) -> None:
         """Reset relay-client stop state before a fresh operator session polls."""

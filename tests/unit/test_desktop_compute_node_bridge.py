@@ -2807,6 +2807,44 @@ def test_run_reports_api_v1_processing_failure(capsys, monkeypatch):
     assert status_events[-1]["last_error"] == "failed to process relay request"
 
 
+
+def test_run_error_envelope_is_not_success_response_and_keeps_failure_status(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class ApiV1ErrorEnvelopeRuntime(ApiV1Runtime):
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            return SimpleNamespace(
+                inference_succeeded=False,
+                submission_succeeded=True,
+                safe_error_code="compute_node_internal_error",
+                runtime_healthy=False,
+                runtime_recovery_attempted=True,
+                runtime_recovery_succeeded=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1ErrorEnvelopeRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(ApiV1ErrorEnvelopeRuntime.last_instance._processed),
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    output = capsys.readouterr()
+    assert "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted" in output.err
+    assert "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" not in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get("type") == "status"]
+    assert status_events[-1]["last_error"] == "inference failed: compute_node_internal_error"
+    assert status_events[-1]["relay_runtime_state"] == "failed"
+    assert status_events[-1]["registered"] is False
+
+
 def test_run_logs_api_v1_processing_exception_type(capsys, monkeypatch):
     _reset_cancel_queue()
 

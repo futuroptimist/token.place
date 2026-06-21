@@ -493,6 +493,18 @@ class RelayClient:
     }
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant", "function"}
+    _API_V1_MAX_MESSAGES = 64
+    _API_V1_MAX_MESSAGE_CHARS = 32_768
+    _API_V1_MAX_TOTAL_CHARS = 131_072
+    _API_V1_MAX_CONTENT_BLOCKS = 32
+    _API_V1_MAX_STOP_SEQUENCES = 8
+    _API_V1_MAX_STOP_CHARS = 256
+    _API_V1_MAX_MODEL_ID_CHARS = 256
+    _API_V1_MAX_MAX_TOKENS = 4096
+    _API_V1_MAX_SEED = 2**31 - 1
+    _API_V1_MIN_PENALTY = -2.0
+    _API_V1_MAX_PENALTY = 2.0
+
 
     def __init__(
         self,
@@ -1930,8 +1942,52 @@ class RelayClient:
         return False
 
     @staticmethod
-    def _api_v1_supported_options(options: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-        passthrough_options = {
+    def _api_v1_number_is_finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    @classmethod
+    def _api_v1_invalid_request(cls, request_id: str, message: str) -> Dict[str, Any]:
+        return cls._api_v1_response_envelope(
+            request_id,
+            error={"code": "compute_node_invalid_request", "message": message},
+        )
+
+    @classmethod
+    def _api_v1_unsupported_options(cls, request_id: str, option: str) -> Dict[str, Any]:
+        return cls._api_v1_response_envelope(
+            request_id,
+            error={
+                "code": "compute_node_options_unsupported",
+                "message": f"Requested option is unsupported by the desktop runtime: {option}",
+            },
+        )
+
+    @classmethod
+    def _validate_api_v1_stop(cls, value: Any) -> Tuple[bool, Optional[Any]]:
+        if isinstance(value, str):
+            if not value or len(value) > cls._API_V1_MAX_STOP_CHARS:
+                return False, None
+            return True, value
+        if not isinstance(value, list) or len(value) > cls._API_V1_MAX_STOP_SEQUENCES:
+            return False, None
+        normalised = []
+        for item in value:
+            if not isinstance(item, str) or not item or len(item) > cls._API_V1_MAX_STOP_CHARS:
+                return False, None
+            normalised.append(item)
+        return True, normalised
+
+    @classmethod
+    def _validate_api_v1_options(
+        cls, options: Dict[str, Any], *, default_max_tokens: Any = None
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Validate and normalize explicitly supported desktop llama.cpp options.
+
+        Returns ``(safe_options, error_code, detail)``. Details are option names or
+        structural labels only and never include rejected user payload values.
+        """
+
+        allowed = {
             "frequency_penalty",
             "max_tokens",
             "presence_penalty",
@@ -1944,12 +2000,109 @@ class RelayClient:
             "tools",
             "top_p",
         }
-        unsupported = sorted(key for key in options if key not in passthrough_options)
-        if unsupported:
-            return False, ", ".join(unsupported)
-        if bool(options.get("stream", False)):
-            return False, "stream"
-        return True, None
+        unknown = sorted(str(key) for key in options if key not in allowed)
+        if unknown:
+            return None, "compute_node_options_unsupported", unknown[0]
+
+        safe: Dict[str, Any] = {}
+        max_tokens_cap = cls._API_V1_MAX_MAX_TOKENS
+        if isinstance(default_max_tokens, int) and not isinstance(default_max_tokens, bool):
+            max_tokens_cap = max(1, min(max_tokens_cap, default_max_tokens))
+
+        for key, value in options.items():
+            if key == "stream":
+                if value is not False:
+                    return None, "compute_node_options_unsupported", "stream"
+                continue
+            if key == "max_tokens":
+                if not isinstance(value, int) or isinstance(value, bool) or not (1 <= value <= max_tokens_cap):
+                    return None, "compute_node_invalid_request", "max_tokens"
+                safe[key] = value
+            elif key in {"temperature", "top_p"}:
+                if not cls._api_v1_number_is_finite(value):
+                    return None, "compute_node_invalid_request", key
+                upper = 2.0 if key == "temperature" else 1.0
+                if not (0.0 <= float(value) <= upper):
+                    return None, "compute_node_invalid_request", key
+                safe[key] = float(value)
+            elif key in {"frequency_penalty", "presence_penalty"}:
+                if not cls._api_v1_number_is_finite(value) or not (
+                    cls._API_V1_MIN_PENALTY <= float(value) <= cls._API_V1_MAX_PENALTY
+                ):
+                    return None, "compute_node_invalid_request", key
+                safe[key] = float(value)
+            elif key == "seed":
+                if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= cls._API_V1_MAX_SEED):
+                    return None, "compute_node_invalid_request", key
+                safe[key] = value
+            elif key == "stop":
+                valid, normalised = cls._validate_api_v1_stop(value)
+                if not valid:
+                    return None, "compute_node_invalid_request", key
+                safe[key] = normalised
+            elif key == "response_format":
+                if value != {"type": "text"}:
+                    return None, "compute_node_options_unsupported", key
+                safe[key] = value
+            elif key == "tools":
+                if value != []:
+                    return None, "compute_node_options_unsupported", key
+                safe[key] = []
+            elif key == "tool_choice":
+                if value != "none":
+                    return None, "compute_node_options_unsupported", key
+                safe[key] = value
+        return safe, None, None
+
+    @classmethod
+    def _validate_and_normalise_api_v1_messages(
+        cls, messages: Any
+    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        if not isinstance(messages, list) or not messages or len(messages) > cls._API_V1_MAX_MESSAGES:
+            return None, "messages"
+        normalised: List[Dict[str, Any]] = []
+        total_chars = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                return None, "messages"
+            allowed_keys = {"role", "content", "name"}
+            if any(key not in allowed_keys for key in message):
+                return None, "messages"
+            role = message.get("role")
+            if not isinstance(role, str) or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES:
+                return None, "messages"
+            if "content" not in message:
+                return None, "messages"
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list) and content and len(content) <= cls._API_V1_MAX_CONTENT_BLOCKS:
+                parts: List[str] = []
+                for block in content:
+                    if not isinstance(block, dict) or set(block.keys()) != {"type", "text"}:
+                        return None, "messages"
+                    if block.get("type") not in {"input_text", "text"}:
+                        return None, "messages"
+                    block_text = block.get("text")
+                    if not isinstance(block_text, str) or not block_text:
+                        return None, "messages"
+                    parts.append(block_text)
+                text = "\n\n".join(parts)
+            else:
+                return None, "messages"
+            if len(text) > cls._API_V1_MAX_MESSAGE_CHARS:
+                return None, "messages"
+            total_chars += len(text)
+            if total_chars > cls._API_V1_MAX_TOTAL_CHARS:
+                return None, "messages"
+            updated = {"role": role, "content": text}
+            name = message.get("name")
+            if name is not None:
+                if not isinstance(name, str) or not name or len(name) > 128:
+                    return None, "messages"
+                updated["name"] = name
+            normalised.append(updated)
+        return normalised, None
 
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
@@ -2003,14 +2156,29 @@ class RelayClient:
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
-        if not self._messages_are_valid_api_v1_chat(messages):
-            return self._api_v1_response_envelope(
+        normalised_messages, message_error = self._validate_and_normalise_api_v1_messages(messages)
+        if normalised_messages is None:
+            return self._api_v1_invalid_request(
                 request_id,
-                error={
-                    "code": "compute_node_invalid_request",
-                    "message": "Invalid chat message format",
-                },
+                "Invalid chat message format",
             )
+
+        config = getattr(self.model_manager, "config", None)
+        config_get = getattr(config, "get", None)
+        configured_max_tokens = None
+        if callable(config_get):
+            configured_max_tokens = config_get("model.max_tokens", None)
+        safe_options, option_error_code, option_detail = self._validate_api_v1_options(
+            options,
+            default_max_tokens=configured_max_tokens,
+        )
+        if option_error_code == "compute_node_invalid_request":
+            return self._api_v1_invalid_request(
+                request_id,
+                "Invalid API v1 option value",
+            )
+        if option_error_code == "compute_node_options_unsupported":
+            return self._api_v1_unsupported_options(request_id, option_detail or "options")
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
         has_direct_runtime_completion = callable(get_llm_instance)
@@ -2023,20 +2191,12 @@ class RelayClient:
                 },
             )
 
-        options_supported, unsupported_option = self._api_v1_supported_options(options)
-        if not options_supported:
-            return self._api_v1_response_envelope(
+        if safe_options is None:
+            return self._api_v1_invalid_request(
                 request_id,
-                error={
-                    "code": "compute_node_options_unsupported",
-                    "message": (
-                        "Requested option is unsupported by the desktop runtime: "
-                        f"{unsupported_option}"
-                    ),
-                },
+                "Invalid API v1 option value",
             )
 
-        safe_options = {key: value for key, value in options.items() if key != "stream"}
         if not has_direct_runtime_completion:
             # API v1 desktop relay generation must fail closed rather than
             # falling back to legacy chat-history runtimes. This is intentional
@@ -2052,7 +2212,7 @@ class RelayClient:
                 },
             )
 
-        runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
+        runtime_messages = self._prepare_api_v1_runtime_messages(model_id, normalised_messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = None

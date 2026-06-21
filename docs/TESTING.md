@@ -458,6 +458,21 @@ This targets tooling-backed security coverage including
 `tests/unit/test_dependency_audit.py` and `tests/test_security_bandit.py`. They enforce
 dependency baselines and static-analysis gates.
 
+### Desktop long-lived worker soak and fault injection
+
+Run the deterministic local-only worker soak from the desktop parity harness with:
+
+```sh
+python -m pytest -q tests/unit/test_model_manager.py::test_long_lived_subprocess_worker_soak_and_fault_injection
+```
+
+The shared desktop parity entry point also runs this focused soak after packaged
+operator parity:
+
+```sh
+python desktop-tauri/scripts/run_desktop_parity_checks.py
+```
+
 ### Running all tests
 
 To execute the complete test suite that CI runs, use:

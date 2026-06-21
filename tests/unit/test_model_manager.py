@@ -3435,3 +3435,175 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     monkeypatch.setattr(manager, 'get_llm_instance', _get_replacement)
     assert manager._ensure_replacement_llm(manager._llm_generation) is replacement
     assert stale.closed is True
+
+
+def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog):
+    """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
+    from utils.llm import model_manager as model_manager_module
+
+    plaintext_prompt = 'PLAINTEXT_PROMPT_SENTINEL_DO_NOT_LOG_7'
+    plaintext_output = 'PLAINTEXT_OUTPUT_SENTINEL_DO_NOT_LOG_7'
+    fake_parent = tmp_path / 'fake_site'
+    fake_pkg = fake_parent / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    state_path = tmp_path / 'fake_llama_state.json'
+    state_path.write_text(json.dumps({'created': 0, 'calls': [], 'actions': []}), encoding='utf-8')
+    fake_pkg.joinpath('__init__.py').write_text(
+        r'''
+import json, os, time
+from pathlib import Path
+STATE = Path(os.environ['TOKEN_PLACE_FAKE_LLAMA_STATE'])
+SENTINEL_OUTPUT = os.environ['TOKEN_PLACE_FAKE_LLAMA_OUTPUT']
+
+def _load():
+    try:
+        return json.loads(STATE.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {'created': 0, 'calls': [], 'actions': []}
+
+def _save(data):
+    STATE.write_text(json.dumps(data, sort_keys=True), encoding='utf-8')
+
+class Llama:
+    def __init__(self, **_kwargs):
+        data = _load()
+        if data.get('fail_init'):
+            raise RuntimeError('fake init failure without plaintext')
+        data['created'] = int(data.get('created', 0)) + 1
+        self.generation = data['created']
+        data.setdefault('generations', []).append(self.generation)
+        _save(data)
+
+    def create_chat_completion(self, **kwargs):
+        data = _load()
+        actions = data.get('actions') or []
+        action = actions.pop(0) if actions else None
+        data['actions'] = actions
+        request_id = kwargs.get('request_id') or (kwargs.get('metadata') or {}).get('request_id')
+        data.setdefault('calls', []).append({'generation': self.generation, 'request_id': request_id})
+        _save(data)
+        if action == 'request_error':
+            raise RuntimeError('fake request scoped exception without plaintext')
+        if action == 'abrupt_exit':
+            os._exit(23)
+        time.sleep(float(os.environ.get('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0')))
+        return {'id': request_id, 'choices': [{'message': {'role': 'assistant', 'content': SENTINEL_OUTPUT + ' gen=' + str(self.generation) + ' request=' + str(request_id)}}]}
+''',
+        encoding='utf-8',
+    )
+
+    monkeypatch.syspath_prepend(str(fake_parent))
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_STATE', str(state_path))
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_OUTPUT', plaintext_output)
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '5')
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: False)
+    monkeypatch.setattr(model_manager_module, '_find_llama_cpp_spec_in_subprocess', lambda **_kwargs: {'module_path': str(fake_pkg / '__init__.py')})
+    monkeypatch.setattr(model_manager_module, '_run_llama_cpp_import_watchdog', lambda **_kwargs: {'module_path': str(fake_pkg / '__init__.py')})
+
+    (tmp_path / 'test_model.gguf').write_bytes(b'fake')
+    manager = model_manager_module.ModelManager(_RestartTestConfig(tmp_path))
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: model_manager_module._import_llama_cpp_subprocess_module(
+            module_path_hint=str(fake_pkg / '__init__.py'), timeout_seconds=5
+        ),
+    )
+    monkeypatch.setattr(manager, '_resolve_compute_plan', lambda: {
+        'requested_mode': 'cpu', 'effective_mode': 'cpu', 'backend_available': 'cpu',
+        'backend_selected': 'cpu', 'backend_used': 'cpu', 'n_gpu_layers': 0,
+        'fallback_reason': None,
+    })
+
+    def state():
+        return json.loads(state_path.read_text(encoding='utf-8'))
+
+    def save(data):
+        state_path.write_text(json.dumps(data), encoding='utf-8')
+
+    def set_actions(*actions):
+        data = state()
+        data['actions'] = list(actions)
+        data.pop('fail_init', None)
+        save(data)
+
+    def request(request_id):
+        return manager.create_chat_completion_with_recovery(
+            messages=[{'role': 'user', 'content': f'{plaintext_prompt} {request_id}'}],
+            request_id=request_id,
+        )
+
+    seen_ids = set()
+    for index in range(100):
+        req_id = f'soak-{index}'
+        result = request(req_id)
+        assert result['id'] == req_id
+        assert req_id not in seen_ids
+        seen_ids.add(req_id)
+    assert state()['created'] == 1
+    assert manager.worker_lifecycle_status()['worker_restart_count'] == 0
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    set_actions('request_error')
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        request('request-error-once')
+    assert state()['created'] == 1
+    assert request('after-request-error')['choices'][0]['message']['content'].startswith(plaintext_output)
+    assert state()['created'] == 1
+
+    set_actions('abrupt_exit')
+    assert request('after-abrupt-exit')['id'] == 'after-abrupt-exit'
+    status = manager.worker_lifecycle_status()
+    assert state()['created'] == 2
+    assert status['worker_restart_count'] == 1
+    assert status['worker_state'] == 'ready'
+
+    before = state()['created']
+    monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0.01')
+    results = []
+    barrier = threading.Barrier(2)
+
+    def _relay_call(name):
+        barrier.wait(timeout=5)
+        results.append(request(name)['id'])
+
+    threads = [threading.Thread(target=_relay_call, args=(f'relay-{i}',)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert sorted(results) == ['relay-0', 'relay-1']
+    assert state()['created'] == before
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    set_actions('abrupt_exit')
+    data = state()
+    data['fail_init'] = True
+    save(data)
+    with pytest.raises(RuntimeError, match='replacement failed|one restart attempt|fake init failure'):
+        request('persistent-failure')
+    status = manager.worker_lifecycle_status()
+    assert status['worker_state'] in {'failed', 'recovering', 'stopped'}
+    assert status['worker_alive'] is False
+    assert manager.llm is None
+
+    data = state()
+    data.pop('fail_init', None)
+    data['actions'] = []
+    save(data)
+    manager.llm = None
+    manager.worker_state = 'stopped'
+    recovered = request('after-stop-start')
+    assert recovered['id'] == 'after-stop-start'
+    assert manager.worker_lifecycle_status()['worker_alive'] is True
+
+    calls = state()['calls']
+    assert sum(1 for call in calls if call.get('request_id') == 'after-abrupt-exit') == 2
+    assert len(seen_ids) == 100
+    assert state()['created'] <= 4
+    assert threading.active_count() < 80
+
+    diagnostics = json.dumps(manager.worker_lifecycle_status(), sort_keys=True)
+    log_text = caplog.text + diagnostics
+    assert plaintext_prompt not in log_text
+    assert plaintext_output not in log_text

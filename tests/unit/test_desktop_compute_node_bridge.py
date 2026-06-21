@@ -2281,9 +2281,12 @@ def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeyp
 
     try:
         assert status == 0
-        assert elapsed < 0.5
         assert "stop" in events
         assert "warm-done" not in events[: events.index("stop") + 1]
+        # Coarse guard: the behavioral assertions above prove shutdown did not
+        # wait for warmup completion. This only catches regressions that block
+        # on the full 1s warmup, without making the test depend on CI host speed.
+        assert elapsed < 0.9
     finally:
         release_warmup.set()
     _ = capsys.readouterr()

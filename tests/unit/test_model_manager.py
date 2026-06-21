@@ -1,6 +1,7 @@
 """
 Unit tests for the model manager module.
 """
+import logging
 import os
 import queue
 import threading
@@ -3450,38 +3451,49 @@ def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeyp
     state_path.write_text(json.dumps({'created': 0, 'calls': [], 'actions': []}), encoding='utf-8')
     fake_pkg.joinpath('__init__.py').write_text(
         r'''
-import json, os, time
+import contextlib, fcntl, json, os, time
 from pathlib import Path
 STATE = Path(os.environ['TOKEN_PLACE_FAKE_LLAMA_STATE'])
+LOCK = STATE.with_suffix(STATE.suffix + '.lock')
 SENTINEL_OUTPUT = os.environ['TOKEN_PLACE_FAKE_LLAMA_OUTPUT']
 
-def _load():
+def _load_unlocked():
     try:
         return json.loads(STATE.read_text(encoding='utf-8'))
     except FileNotFoundError:
         return {'created': 0, 'calls': [], 'actions': []}
 
-def _save(data):
+def _save_unlocked(data):
     STATE.write_text(json.dumps(data, sort_keys=True), encoding='utf-8')
+
+@contextlib.contextmanager
+def _locked_state():
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open('a+', encoding='utf-8') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            data = _load_unlocked()
+            yield data
+            _save_unlocked(data)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 class Llama:
     def __init__(self, **_kwargs):
-        data = _load()
-        if data.get('fail_init'):
-            raise RuntimeError('fake init failure without plaintext')
-        data['created'] = int(data.get('created', 0)) + 1
-        self.generation = data['created']
-        data.setdefault('generations', []).append(self.generation)
-        _save(data)
+        with _locked_state() as data:
+            if data.get('fail_init'):
+                raise RuntimeError('fake init failure without plaintext')
+            data['created'] = int(data.get('created', 0)) + 1
+            self.generation = data['created']
+            data.setdefault('generations', []).append(self.generation)
 
     def create_chat_completion(self, **kwargs):
-        data = _load()
-        actions = data.get('actions') or []
-        action = actions.pop(0) if actions else None
-        data['actions'] = actions
-        request_id = kwargs.get('request_id') or (kwargs.get('metadata') or {}).get('request_id')
-        data.setdefault('calls', []).append({'generation': self.generation, 'request_id': request_id})
-        _save(data)
+        with _locked_state() as data:
+            actions = data.get('actions') or []
+            action = actions.pop(0) if actions else None
+            data['actions'] = actions
+            request_id = kwargs.get('request_id') or (kwargs.get('metadata') or {}).get('request_id')
+            data.setdefault('calls', []).append({'generation': self.generation, 'request_id': request_id})
         if action == 'request_error':
             raise RuntimeError('fake request scoped exception without plaintext')
         if action == 'abrupt_exit':
@@ -3491,6 +3503,8 @@ class Llama:
 ''',
         encoding='utf-8',
     )
+
+    caplog.set_level(logging.INFO)
 
     monkeypatch.syspath_prepend(str(fake_parent))
     monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_STATE', str(state_path))
@@ -3561,17 +3575,24 @@ class Llama:
     before = state()['created']
     monkeypatch.setenv('TOKEN_PLACE_FAKE_LLAMA_DELAY', '0.01')
     results = []
+    relay_errors = []
     barrier = threading.Barrier(2)
 
     def _relay_call(name):
-        barrier.wait(timeout=5)
-        results.append(request(name)['id'])
+        try:
+            barrier.wait(timeout=5)
+            results.append(request(name)['id'])
+        except Exception as exc:  # pragma: no cover - surfaced below with thread context
+            relay_errors.append((name, repr(exc)))
 
     threads = [threading.Thread(target=_relay_call, args=(f'relay-{i}',)) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
+    stuck_threads = [thread.name for thread in threads if thread.is_alive()]
+    assert stuck_threads == []
+    assert relay_errors == []
     assert sorted(results) == ['relay-0', 'relay-1']
     assert state()['created'] == before
     assert manager.worker_lifecycle_status()['worker_alive'] is True
@@ -3591,8 +3612,9 @@ class Llama:
     data.pop('fail_init', None)
     data['actions'] = []
     save(data)
-    manager.llm = None
-    manager.worker_state = 'stopped'
+    with manager.llm_lock:
+        manager.llm = None
+        manager.worker_state = 'stopped'
     recovered = request('after-stop-start')
     assert recovered['id'] == 'after-stop-start'
     assert manager.worker_lifecycle_status()['worker_alive'] is True

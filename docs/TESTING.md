@@ -460,7 +460,7 @@ dependency baselines and static-analysis gates.
 
 ### Desktop long-lived worker soak and fault injection
 
-Run the deterministic local-only worker soak from the desktop parity harness with:
+Run the deterministic local-only worker soak directly with:
 
 ```sh
 python -m pytest -q tests/unit/test_model_manager.py::test_long_lived_subprocess_worker_soak_and_fault_injection

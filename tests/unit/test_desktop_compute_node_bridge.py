@@ -94,6 +94,17 @@ class FakeModelManager:
         self.requested_compute_mode = 'auto'
         self.last_compute_diagnostics = None
 
+    def worker_lifecycle_status(self):
+        return {
+            "worker_state": "ready",
+            "worker_generation": 2,
+            "worker_restart_count": 1,
+            "worker_alive": True,
+            "last_worker_error_code": None,
+            "last_worker_exit_code": None,
+            "last_worker_restart_at_ms": None,
+        }
+
 
 class FakeRelayClient:
     relay_url = 'https://token.place'
@@ -653,6 +664,13 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
         'operator_session_id',
         'sequence',
         'updated_at_ms',
+        'worker_state',
+        'worker_generation',
+        'worker_restart_count',
+        'worker_alive',
+        'last_worker_error_code',
+        'last_worker_exit_code',
+        'last_worker_restart_at_ms',
     }
     for event in events:
         if event['type'] in {'started', 'status', 'stopped'}:
@@ -666,6 +684,8 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     assert stopped['running'] is False
     assert stopped['registered'] is False
     assert stopped['relay_runtime_state'] == 'stopped'
+    assert stopped['last_worker_error_code'] is None
+    assert stopped['last_worker_exit_code'] is None
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):

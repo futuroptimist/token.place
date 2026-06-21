@@ -928,7 +928,7 @@ def run(args: argparse.Namespace) -> int:
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
         }
-        payload.update({key: value for key, value in worker_lifecycle_status().items() if value is not None})
+        payload.update(worker_lifecycle_status())
         if extra:
             payload.update(extra)
         return payload

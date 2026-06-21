@@ -64,6 +64,13 @@ pub struct ComputeNodeStatus {
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub worker_state: Option<String>,
+    pub worker_generation: Option<u64>,
+    pub worker_restart_count: Option<u64>,
+    pub worker_alive: Option<bool>,
+    pub last_worker_error_code: Option<String>,
+    pub last_worker_exit_code: Option<i64>,
+    pub last_worker_restart_at_ms: Option<u64>,
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
@@ -259,6 +266,13 @@ fn startup_failure_status(
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        worker_state: Some("failed".into()),
+        worker_generation: None,
+        worker_restart_count: None,
+        worker_alive: Some(false),
+        last_worker_error_code: None,
+        last_worker_exit_code: None,
+        last_worker_restart_at_ms: None,
         operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
@@ -283,6 +297,14 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let (Some(current_sequence), Some(payload_sequence)) = (status.sequence, payload_sequence) {
         if payload_sequence <= current_sequence && !is_fresh_start_event {
+            return false;
+        }
+    }
+    if let (Some(current_generation), Some(payload_generation)) = (
+        status.worker_generation,
+        payload.get("worker_generation").and_then(Value::as_u64),
+    ) {
+        if payload_generation < current_generation && !is_fresh_start_event {
             return false;
         }
     }
@@ -393,6 +415,36 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(relay_runtime_state) = payload.get("relay_runtime_state").and_then(Value::as_str) {
         status.relay_runtime_state = Some(relay_runtime_state.into());
+    }
+
+    if payload.get("worker_state").is_some() {
+        status.worker_state = payload
+            .get("worker_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("worker_generation").is_some() {
+        status.worker_generation = payload.get("worker_generation").and_then(Value::as_u64);
+    }
+    if payload.get("worker_restart_count").is_some() {
+        status.worker_restart_count = payload.get("worker_restart_count").and_then(Value::as_u64);
+    }
+    if payload.get("worker_alive").is_some() {
+        status.worker_alive = payload.get("worker_alive").and_then(Value::as_bool);
+    }
+    if payload.get("last_worker_error_code").is_some() {
+        status.last_worker_error_code = payload
+            .get("last_worker_error_code")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("last_worker_exit_code").is_some() {
+        status.last_worker_exit_code = payload.get("last_worker_exit_code").and_then(Value::as_i64);
+    }
+    if payload.get("last_worker_restart_at_ms").is_some() {
+        status.last_worker_restart_at_ms = payload
+            .get("last_worker_restart_at_ms")
+            .and_then(Value::as_u64);
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
@@ -924,6 +976,13 @@ pub async fn start_compute_node(
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                worker_state: Some("starting".into()),
+                worker_generation: None,
+                worker_restart_count: None,
+                worker_alive: Some(false),
+                last_worker_error_code: None,
+                last_worker_exit_code: None,
+                last_worker_restart_at_ms: None,
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),

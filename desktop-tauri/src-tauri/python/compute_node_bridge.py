@@ -843,6 +843,25 @@ def run(args: argparse.Namespace) -> int:
             )
         return statuses, registered_count, error_summary or None
 
+    def worker_lifecycle_status() -> Dict[str, Any]:
+        status_fn = getattr(runtime.model_manager, "worker_lifecycle_status", None)
+        if callable(status_fn):
+            try:
+                status = status_fn()
+                if isinstance(status, dict):
+                    return dict(status)
+            except Exception:
+                pass
+        return {
+            "worker_state": "ready" if warm_load_state == "ready" else ("recovering" if warm_load_state == "recovering" else ("failed" if warm_load_state == "failed" else "starting")),
+            "worker_generation": None,
+            "worker_restart_count": None,
+            "worker_alive": warm_load_state == "ready",
+            "last_worker_error_code": None,
+            "last_worker_exit_code": None,
+            "last_worker_restart_at_ms": None,
+        }
+
     def build_status_payload(
         *,
         event_type: str,
@@ -909,6 +928,7 @@ def run(args: argparse.Namespace) -> int:
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
         }
+        payload.update({key: value for key, value in worker_lifecycle_status().items() if value is not None})
         if extra:
             payload.update(extra)
         return payload
@@ -1417,9 +1437,13 @@ def run(args: argparse.Namespace) -> int:
                     extra={"relay_runtime_state": "recovering"},
                 )
             )
+            worker_status = worker_lifecycle_status()
             print(
                 "desktop.compute_node_bridge.recovery.start "
                 f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"safe_error_code={worker_status.get('last_worker_error_code') or 'runtime_recovery'} "
+                f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
+                f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')} "
                 f"attempts={attempts} backoff_seconds={backoff_seconds:g}",
                 file=sys.stderr,
             )
@@ -1463,9 +1487,13 @@ def run(args: argparse.Namespace) -> int:
                                 extra={"relay_runtime_state": "ready"},
                             )
                         )
+                        worker_status = worker_lifecycle_status()
                         print(
                             "desktop.compute_node_bridge.recovery.succeeded "
-                            f"attempt={attempt} request_id={request_id}",
+                            f"attempt={attempt} request_id={request_id} "
+                            f"safe_error_code={worker_status.get('last_worker_error_code') or 'none'} "
+                            f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
+                            f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')}",
                             file=sys.stderr,
                         )
                         return True
@@ -1503,9 +1531,14 @@ def run(args: argparse.Namespace) -> int:
                     extra={"relay_runtime_state": "failed", "message": last_error},
                 )
             )
+            worker_status = worker_lifecycle_status()
             print(
                 "desktop.compute_node_bridge.recovery.exhausted "
-                f"request_id={request_id} action=restart_desktop_compute_node",
+                f"request_id={request_id} action=restart_desktop_compute_node "
+                f"safe_error_code={worker_status.get('last_worker_error_code') or 'recovery_exhausted'} "
+                f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
+                f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')} "
+                f"exit_code={worker_status.get('last_worker_exit_code')}",
                 file=sys.stderr,
             )
             return False

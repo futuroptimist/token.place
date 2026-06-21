@@ -1610,4 +1610,89 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('renders worker lifecycle fields and ignores stale worker generations', async () => {
+    render(<App />);
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/Worker state:/).textContent).toContain('stopped'));
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        active_relay_url: 'https://token.place',
+        relay_runtime_state: 'ready',
+        worker_state: 'ready',
+        worker_generation: 4,
+        worker_restart_count: 1,
+        worker_alive: true,
+        last_worker_error_code: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Worker state:/).textContent).toContain('ready'));
+    expect(screen.getByText(/Worker alive:/).textContent).toContain('yes');
+    expect(screen.getByText(/Worker generation:/).textContent).toContain('4');
+    expect(screen.getByText(/Worker restart count:/).textContent).toContain('1');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'failed',
+        worker_state: 'failed',
+        worker_generation: 3,
+        worker_restart_count: 9,
+        worker_alive: false,
+        last_worker_error_code: 'stale_failure',
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+    expect(screen.getByText(/Worker state:/).textContent).toContain('ready');
+    expect(screen.queryByText('stale_failure')).toBeNull();
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'recovering',
+        worker_state: 'recovering',
+        worker_generation: 5,
+        worker_restart_count: 2,
+        worker_alive: false,
+        last_worker_error_code: 'worker_dead',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Worker state:/).textContent).toContain('recovering'));
+    expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker restart count:/).textContent).toContain('2');
+    expect(screen.getByText(/Last worker error code:/).textContent).toContain('worker_dead');
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        worker_state: 'failed',
+        worker_generation: 5,
+        worker_restart_count: 3,
+        worker_alive: false,
+        last_worker_error_code: 'fatal_worker_exit',
+        operator_session_id: 'session-1',
+        sequence: 4,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Worker state:/).textContent).toContain('failed'));
+    expect(screen.getByText(/Worker restart count:/).textContent).toContain('3');
+    expect(screen.getByText(/Last worker error code:/).textContent).toContain('fatal_worker_exit');
+  });
+
 });

@@ -136,6 +136,15 @@ class LlamaCppRuntimeStageTimeout(TimeoutError):
         super().__init__(f"{stage} after {timeout_seconds:g}s")
 
 
+class LlamaCppRequestError(RuntimeError):
+    """Raised when a live llama_cpp worker reports a request-scoped failure."""
+
+    def __init__(self, message: str, *, code: str = "request_failed", method: str = "unknown") -> None:
+        self.code = code
+        self.method = method
+        super().__init__(message)
+
+
 def _format_runtime_stage_timeout(exc: LlamaCppRuntimeStageTimeout) -> str:
     return f"{exc.stage}_timeout after {exc.timeout_seconds:g}s"
 
@@ -766,6 +775,10 @@ def _read_llama_subprocess_message(
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
+        code = str(message.get('code') or 'request_failed')
+        method = str(message.get('method') or 'unknown')
+        if stage == 'llama_cpp_inference':
+            raise LlamaCppRequestError(error, code=code, method=method)
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
             error = f"{error}; child_traceback_tail={traceback_text[-2000:]}"
@@ -926,6 +939,14 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+def _safe_request_error(code, method='unknown'):
+    _emit({
+        'status': 'error',
+        'code': code,
+        'method': method if isinstance(method, str) else 'unknown',
+        'error': 'llama_cpp subprocess request failed',
+    })
+
 try:
     init_line = sys.stdin.readline()
     if not init_line:
@@ -934,21 +955,35 @@ try:
     llama_cpp = importlib.import_module('llama_cpp')
     llama = llama_cpp.Llama(*init_payload.get('args', []), **init_payload.get('kwargs', {}))
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
-    for line in sys.stdin:
-        request = json.loads(line)
-        if request.get('method') == 'create_chat_completion':
-            kwargs = request.get('kwargs', {})
-            result = llama.create_chat_completion(*request.get('args', []), **kwargs)
-            if kwargs.get('stream'):
-                for chunk in result:
-                    _emit({'status': 'ok', 'chunk': chunk, 'done': False})
-                _emit({'status': 'ok', 'done': True})
-            else:
-                _emit({'status': 'ok', 'result': result})
-        else:
-            _emit({'status': 'error', 'error': 'unsupported llama_cpp subprocess method'})
 except Exception as exc:
     _emit({'status': 'error', 'error': str(exc), 'traceback': traceback.format_exc()})
+    raise SystemExit(1)
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+        if not isinstance(request, dict):
+            _safe_request_error('malformed_request')
+            continue
+        method = request.get('method')
+        if method != 'create_chat_completion':
+            _safe_request_error('unsupported_method', method)
+            continue
+        kwargs = request.get('kwargs', {})
+        if not isinstance(kwargs, dict):
+            _safe_request_error('malformed_request', method)
+            continue
+        result = llama.create_chat_completion(*request.get('args', []), **kwargs)
+        if kwargs.get('stream'):
+            for chunk in result:
+                _emit({'status': 'ok', 'chunk': chunk, 'done': False})
+            _emit({'status': 'ok', 'done': True})
+        else:
+            _emit({'status': 'ok', 'result': result})
+    except json.JSONDecodeError:
+        _safe_request_error('malformed_request')
+    except Exception:
+        _safe_request_error('inference_failed', locals().get('method', 'unknown'))
 """
 
 

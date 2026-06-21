@@ -3315,3 +3315,112 @@ def test_model_manager_recovery_rejects_streaming_calls(tmp_path, monkeypatch):
         manager.create_chat_completion_with_recovery(messages=[], stream=True)
 
     assert created == []
+
+
+def test_llama_subprocess_transport_error_payload_raises_restartable_eof():
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        stdout=iter(()),
+        stderr=None,
+        wait=MagicMock(return_value=7),
+        poll=lambda: 7,
+        returncode=7,
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError, match='JSON handshake'):
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=0.2,
+            stage='llama_cpp_inference',
+        )
+
+
+def test_subprocess_llama_proxy_liveness_and_close_edge_cases():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._process = SimpleNamespace(
+        stdin=SimpleNamespace(close=MagicMock(side_effect=RuntimeError('close failed'))),
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=TimeoutError('still running')),
+        kill=MagicMock(),
+        returncode=None,
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerDeadError):
+        dead_proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+        dead_proxy._closed = False
+        dead_proxy._process = SimpleNamespace(poll=lambda: 1, returncode=1, stderr=None)
+        dead_proxy.assert_healthy()
+
+    proxy.close()
+    proxy.close()
+
+    assert proxy._closed is True
+    proxy._process.terminate.assert_called_once_with()
+    proxy._process.wait.assert_called_once_with(timeout=1)
+    proxy._process.kill.assert_called_once_with()
+
+
+def test_model_manager_recovery_reports_unavailable_or_invalid_runtime(tmp_path, monkeypatch):
+    first = SimpleNamespace(create_chat_completion='not-callable')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first])
+
+    with pytest.raises(RuntimeError, match='missing create_chat_completion'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    monkeypatch.setattr(manager, 'get_llm_instance', lambda: None)
+    with pytest.raises(RuntimeError, match='unavailable'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+
+def test_model_manager_recovery_reports_invalid_or_missing_replacement(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker('first', fail='dead')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first])
+    monkeypatch.setattr(manager, '_ensure_replacement_llm', lambda _observed_generation: None)
+
+    with pytest.raises(RuntimeError, match='replacement failed'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    first = _RestartableFakeWorker('first', fail='dead')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first])
+    monkeypatch.setattr(
+        manager,
+        '_ensure_replacement_llm',
+        lambda _observed_generation: SimpleNamespace(create_chat_completion='not-callable'),
+    )
+
+    with pytest.raises(RuntimeError, match='replacement runtime missing'):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+
+def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    assert manager._llm_is_usable(object()) is True
+    assert manager._llm_is_usable(SimpleNamespace(is_alive=lambda: (_ for _ in ()).throw(RuntimeError('boom')))) is False
+
+    close = MagicMock(side_effect=RuntimeError('close failed'))
+    manager._close_llm_proxy(SimpleNamespace(close=close))
+    close.assert_called_once_with()
+
+    usable = _RestartableFakeWorker('usable')
+    manager.llm = usable
+    observed_generation = manager._llm_generation
+    assert manager._ensure_replacement_llm(observed_generation) is usable
+
+    stale = _RestartableFakeWorker('stale', fail='dead')
+    replacement = _RestartableFakeWorker('replacement')
+    manager.llm = stale
+    workers = [replacement]
+
+    def _get_replacement():
+        manager.llm = workers.pop(0)
+        return manager.llm
+
+    monkeypatch.setattr(manager, 'get_llm_instance', _get_replacement)
+    assert manager._ensure_replacement_llm(manager._llm_generation) is replacement
+    assert stale.closed is True

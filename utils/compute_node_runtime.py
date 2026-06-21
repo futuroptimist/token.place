@@ -6,7 +6,10 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+
 from urllib.parse import urlparse
+
+from utils.processing_result import RelayProcessingResult
 
 if TYPE_CHECKING:
     from utils.networking.relay_client import RelayClient
@@ -87,8 +90,24 @@ class RelayRequestAdapter(Protocol):
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         """Return True when the adapter can process ``request_data``."""
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        """Process ``request_data`` and return success."""
+    def process(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        """Process ``request_data`` and return a typed outcome."""
+
+
+def _process_relay_client_request(
+    relay_client: "RelayClient", request_data: Dict[str, Any]
+) -> RelayProcessingResult:
+    """Process a request through a relay client with typed-result fallback.
+
+    The class-level probe intentionally avoids MagicMock's auto-created instance
+    attributes while keeping adapter behavior compatible with older clients.
+    """
+
+    process_result = getattr(type(relay_client), "process_client_request_result", None)
+    if callable(process_result):
+        return process_result(relay_client, request_data)
+    submitted = bool(relay_client.process_client_request(request_data))
+    return RelayProcessingResult(inference_succeeded=submitted, submitted=submitted)
 
 
 class LegacyRelayRequestAdapter:
@@ -100,8 +119,8 @@ class LegacyRelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_legacy_relay_payload(request_data)
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+    def process(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        return _process_relay_client_request(self._relay_client, request_data)
 
 
 class ApiV1RelayRequestAdapter:
@@ -113,8 +132,8 @@ class ApiV1RelayRequestAdapter:
     def can_process(self, request_data: Dict[str, Any]) -> bool:
         return is_api_v1_relay_payload(request_data)
 
-    def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_client_request(request_data)
+    def process(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+        return _process_relay_client_request(self._relay_client, request_data)
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -395,7 +414,7 @@ class ComputeNodeRuntime:
         _log_info(f"Started relay polling thread for {relay_target}")
         return relay_thread
 
-    def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
+    def process_relay_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
         """Process relay payloads via registered protocol adapters."""
 
         for adapter in self.request_adapters:
@@ -405,7 +424,12 @@ class ComputeNodeRuntime:
         _log_error(
             f"No relay request adapter matched payload keys: {sorted(request_data.keys())}"
         )
-        return False
+        return RelayProcessingResult.submission_failed(safe_error_code="unsupported_relay_payload")
+
+    def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
+        """Compatibility wrapper; True means encrypted response/error submission succeeded."""
+
+        return bool(self.process_relay_request_result(request_data))
 
     def start_relay_session(self) -> None:
         """Reset relay-client stop state before a fresh operator session polls."""

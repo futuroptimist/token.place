@@ -998,7 +998,6 @@ class TestRelayClient:
         assert result['error'] == "Unexpected error"
         assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
 
-
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_non_200_returns_error(self, mock_post, relay_client):
         response = MagicMock(status_code=503)
@@ -1139,7 +1138,6 @@ class TestRelayClient:
         assert 'relay_control_plane_rate_limited' in caplog.text
         assert 'retry_after=37' in caplog.text
 
-
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
         self, mock_post, relay_client, caplog
@@ -1178,7 +1176,6 @@ class TestRelayClient:
         for forbidden in ('super-secret-token', 'server-public-key-secret'):
             assert forbidden not in logs
             assert forbidden not in json.dumps(result, sort_keys=True)
-
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_nested_json_error_and_hyphen_keys(
@@ -1364,7 +1361,6 @@ class TestRelayClient:
         }
         assert 'http://localhost:5000' in relay_client._api_v1_registered_relays
 
-
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_zero_poll_wait_timeout_is_failure(
         self, mock_post, relay_client, monkeypatch
@@ -1389,7 +1385,6 @@ class TestRelayClient:
         assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
         assert relay_client._api_v1_last_heartbeat_at == {}
         assert relay_client.api_v1_registration_fresh() is False
-
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_no_work_hint_is_preserved(self, mock_post, relay_client):
@@ -1543,7 +1538,6 @@ class TestRelayClient:
             'http://localhost:5000/api/v1/relay/servers/register',
             'http://localhost:5000/api/v1/relay/servers/poll',
         ]
-
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_reregisters_before_cached_lease_expires(
@@ -2140,7 +2134,6 @@ class TestRelayClient:
         mock_model_manager.llama_cpp_get_response.assert_not_called()
         mock_post.assert_not_called()
 
-
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_missing_runtime_posts_internal_error(
         self,
@@ -2172,6 +2165,12 @@ class TestRelayClient:
         source_response.status_code = 200
         mock_post.return_value = source_response
 
+        typed_result = relay_client.process_client_request_result(request_data)
+        assert bool(typed_result) is True
+        assert typed_result.submitted is True
+        assert typed_result.inference_succeeded is False
+        assert typed_result.safe_error_code == "compute_node_internal_error"
+        assert typed_result.runtime_healthy is False
         assert relay_client.process_client_request(request_data) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
@@ -2181,6 +2180,98 @@ class TestRelayClient:
         assert encrypted_envelope["api_v1_response"]["error"]["message"] == (
             "Desktop runtime inference failed"
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_request_scoped_inference_error_keeps_runtime_healthy(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Request-scoped llama.cpp failures submit errors without marking runtime unhealthy."""
+        from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-bad-prompt",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.create_chat_completion_with_recovery = MagicMock(
+            side_effect=LlamaCppInferenceRequestError("bad request")
+        )
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        typed_result = relay_client.process_client_request_result(request_data)
+
+        assert typed_result.submitted is True
+        assert typed_result.inference_succeeded is False
+        assert typed_result.safe_error_code == "compute_node_internal_error"
+        assert typed_result.runtime_healthy is True
+        assert typed_result.recovery_attempted is False
+        assert typed_result.recovery_succeeded is False
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_internal_error"
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_exhausted_replacement_reports_recovery_failed(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Exhausted worker replacement is submitted as an encrypted error with recovery metadata."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-worker-dead",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.create_chat_completion_with_recovery = MagicMock(
+            side_effect=RuntimeError(
+                "LLM runtime replacement failed after one restart attempt"
+            )
+        )
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        typed_result = relay_client.process_client_request_result(request_data)
+
+        assert typed_result.submitted is True
+        assert typed_result.inference_succeeded is False
+        assert typed_result.safe_error_code == "compute_node_internal_error"
+        assert typed_result.runtime_healthy is False
+        assert typed_result.recovery_attempted is True
+        assert typed_result.recovery_succeeded is False
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_runtime_output_posts_encrypted_error(
@@ -2950,7 +3041,6 @@ class TestRelayClient:
 
         assert result is False
         mock_post.assert_not_called()
-
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_streaming_posts_to_stream_source(

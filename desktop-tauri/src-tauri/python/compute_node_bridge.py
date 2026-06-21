@@ -1260,11 +1260,24 @@ def run(args: argparse.Namespace) -> int:
             )
 
     def poll_relay_loop(relay_runtime: Any) -> None:
-        nonlocal last_error, poll_failure_fatal
+        nonlocal last_error, poll_failure_fatal, warm_load_state
         active_relay_url = relay_runtime.relay_client.relay_url
         worker = relay_poll_workers[active_relay_url]
         while not stop_requested():
             active_relay_url = relay_runtime.relay_client.relay_url
+            if warm_load_state == "failed":
+                update_relay_status(
+                    active_relay_url,
+                    registered=False,
+                    relay_runtime_state="failed",
+                    last_error=last_error,
+                )
+                emit_status_event(
+                    registered=False,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
+                )
+                break
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.register "
                 f"operator_session_id={bridge_session_id} "
@@ -1329,6 +1342,8 @@ def run(args: argparse.Namespace) -> int:
                 and (has_heartbeat or api_v1_payload)
                 and _registration_fresh(relay_runtime.relay_client, active_relay_url)
             )
+            if warm_load_state == "failed":
+                registered = False
             if registered:
                 registration_succeeded_by_relay[active_relay_url] = True
             wait_seconds = _safe_poll_wait_seconds(
@@ -1416,11 +1431,35 @@ def run(args: argparse.Namespace) -> int:
                         extra={"relay_runtime_state": "processing"},
                     )
                 )
+                process_result = None
                 try:
                     with inference_lock:
-                        processed = relay_runtime.process_relay_request(relay_response)
+                        process_relay_request_result = getattr(
+                            relay_runtime,
+                            "process_relay_request_result",
+                            None,
+                        )
+                        if callable(process_relay_request_result):
+                            process_result = process_relay_request_result(relay_response)
+                        else:
+                            processed_bool = relay_runtime.process_relay_request(relay_response)
+                            process_result = {
+                                "inference_succeeded": bool(processed_bool),
+                                "submitted": bool(processed_bool),
+                                "safe_error_code": None,
+                                "runtime_healthy": True,
+                                "recovery_attempted": False,
+                                "recovery_succeeded": False,
+                            }
                 except Exception as exc:
-                    processed = False
+                    process_result = {
+                        "inference_succeeded": False,
+                        "submitted": False,
+                        "safe_error_code": "compute_node_process_failed",
+                        "runtime_healthy": False,
+                        "recovery_attempted": True,
+                        "recovery_succeeded": False,
+                    }
                     relay_last_error = "failed to process relay request"
                     last_error = relay_last_error
                     print(
@@ -1429,22 +1468,90 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
-                if not processed:
+                inference_succeeded = bool(
+                    getattr(process_result, "inference_succeeded", False)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("inference_succeeded")
+                )
+                submitted = bool(
+                    getattr(process_result, "submitted", bool(process_result))
+                    if not isinstance(process_result, dict)
+                    else process_result.get("submitted")
+                )
+                safe_error_code = (
+                    getattr(process_result, "safe_error_code", None)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("safe_error_code")
+                )
+                runtime_healthy = bool(
+                    getattr(process_result, "runtime_healthy", True)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("runtime_healthy", True)
+                )
+                recovery_attempted = bool(
+                    getattr(process_result, "recovery_attempted", False)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("recovery_attempted", False)
+                )
+                recovery_succeeded = bool(
+                    getattr(process_result, "recovery_succeeded", False)
+                    if not isinstance(process_result, dict)
+                    else process_result.get("recovery_succeeded", False)
+                )
+                if not inference_succeeded:
                     relay_last_error = "failed to process relay request"
+                    if safe_error_code:
+                        relay_last_error = f"relay request failed: {safe_error_code}"
                     last_error = relay_last_error
                     print(
                         "desktop.compute_node_bridge.process_request.failed "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"safe_error_code={safe_error_code or 'none'} submitted={submitted} "
+                        f"runtime_healthy={runtime_healthy} "
+                        f"recovery_attempted={recovery_attempted} "
+                        f"recovery_succeeded={recovery_succeeded}",
                         file=sys.stderr,
                     )
-                    submit_api_v1_error_response(
-                        relay_response,
-                        code="compute_node_process_failed",
-                        message=last_error,
-                        active_relay_url=active_relay_url,
-                        request_id=request_id,
-                        relay_runtime=relay_runtime,
-                    )
+                    if submitted:
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted "
+                            f"relay={_sanitize_relay_target(active_relay_url)} "
+                            f"request_id={request_id} safe_error_code={safe_error_code or 'unknown'}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        submit_api_v1_error_response(
+                            relay_response,
+                            code="compute_node_process_failed",
+                            message=last_error,
+                            active_relay_url=active_relay_url,
+                            request_id=request_id,
+                            relay_runtime=relay_runtime,
+                        )
+                    if not runtime_healthy:
+                        registered = False
+                        if recovery_attempted and not recovery_succeeded:
+                            relay_state = "recovering"
+                            warm_load_state = "recovering"
+                            update_relay_status(
+                                active_relay_url,
+                                registered=False,
+                                relay_runtime_state="recovering",
+                                last_error=relay_last_error,
+                                last_request_id=request_id if request_id != "none" else None,
+                            )
+                            emit_operator_event(
+                                build_status_payload(
+                                    event_type="status",
+                                    running=True,
+                                    registered=False,
+                                    active_relay_url=active_relay_url,
+                                    current_last_error=last_error,
+                                    extra={"relay_runtime_state": "recovering"},
+                                )
+                            )
+                        relay_state = "failed"
+                        warm_load_state = "failed"
                 else:
                     last_error = None
                     print(
@@ -1500,8 +1607,9 @@ def run(args: argparse.Namespace) -> int:
                 )
                 poll_threads.append(thread)
                 thread.start()
-            while not stop_requested() and any(thread.is_alive() for thread in poll_threads):
-                time.sleep(0.05)
+            while any(thread.is_alive() for thread in poll_threads):
+                for thread in poll_threads:
+                    thread.join(timeout=0.05)
     except KeyboardInterrupt:
         pass
     finally:

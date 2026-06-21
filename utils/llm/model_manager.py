@@ -811,6 +811,29 @@ def _read_llama_subprocess_message(
     return message
 
 
+
+
+def _safe_worker_error_code(value: Any) -> str:
+    text = str(value or '').strip().lower()
+    if isinstance(value, LlamaCppWorkerDeadError):
+        return 'worker_dead'
+    if isinstance(value, LlamaCppWorkerEOFError):
+        return 'worker_eof'
+    if isinstance(value, LlamaCppWorkerBrokenPipeError):
+        return 'worker_broken_pipe'
+    if isinstance(value, LlamaCppInferenceRequestError):
+        code = value.diagnostics.get('code') if isinstance(value.diagnostics, dict) else None
+        return str(code) if isinstance(code, str) and code else 'inference_request_error'
+    if 'broken pipe' in text:
+        return 'worker_broken_pipe'
+    if 'exited' in text or 'dead' in text or 'liveness' in text:
+        return 'worker_dead'
+    if 'timeout' in text:
+        return 'worker_timeout'
+    if text and all(ch.isalnum() or ch in {'_', '-'} for ch in text) and len(text) <= 80:
+        return text.replace('-', '_')
+    return type(value).__name__ if isinstance(value, BaseException) else 'worker_error'
+
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
@@ -1470,6 +1493,11 @@ class ModelManager:
         self.llm = None
         self.llm_lock = Lock()
         self._llm_generation = 0
+        self.worker_restart_count = 0
+        self.last_worker_error_code: Optional[str] = None
+        self.last_worker_exit_code: Optional[int] = None
+        self.last_worker_restart_at_ms: Optional[int] = None
+        self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
 
         # Check if mock mode is enabled
@@ -1939,12 +1967,18 @@ class ModelManager:
                                 f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
+                            self.worker_state = 'ready'
+                            self.last_worker_error_code = None
+                            self.last_worker_exit_code = None
+                            self.log_info("desktop.llama_cpp_worker.initialized event=worker_initialization worker_state=ready worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count))
                             self.log_info("Llama init completed successfully.")
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.last_runtime_init_error = str(e)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)
+                            self.worker_state = 'failed'
+                            self.last_worker_error_code = _safe_worker_error_code(e)
                             self.log_error(
                                 f"Failed to initialize Llama model: {self.last_runtime_init_error}",
                                 exc_info=True,
@@ -1970,15 +2004,63 @@ class ModelManager:
                 return False
         return llm is not None
 
-    def _invalidate_llm_if_current(self, failed_llm: Any) -> int:
+    def _worker_exit_code(self, llm: Any) -> Optional[int]:
+        process = getattr(llm, '_process', None)
+        poll = getattr(process, 'poll', None)
+        if callable(poll):
+            try:
+                code = poll()
+                return int(code) if code is not None else None
+            except Exception:
+                return None
+        return None
+
+    def worker_lifecycle_status(self) -> Dict[str, Any]:
+        with self.llm_lock:
+            llm = self.llm
+            state = self.worker_state
+            generation = self._llm_generation
+            restart_count = self.worker_restart_count
+            last_error_code = self.last_worker_error_code
+            last_exit_code = self.last_worker_exit_code
+            last_restart_at_ms = self.last_worker_restart_at_ms
+        alive = self._llm_is_usable(llm) if llm is not None else False
+        if llm is None and state not in {'failed', 'recovering', 'starting'}:
+            state = 'stopped'
+        return {
+            'worker_state': state,
+            'worker_generation': generation,
+            'worker_restart_count': restart_count,
+            'worker_alive': alive,
+            'last_worker_error_code': last_error_code,
+            'last_worker_exit_code': last_exit_code,
+            'last_worker_restart_at_ms': last_restart_at_ms,
+        }
+
+    def _invalidate_llm_if_current(self, failed_llm: Any, error: Any = None) -> int:
+        dead_worker_log_message: Optional[str] = None
         with self.llm_lock:
             if self.llm is failed_llm:
+                self.last_worker_exit_code = self._worker_exit_code(failed_llm)
+                self.last_worker_error_code = _safe_worker_error_code(error) if error is not None else 'worker_dead'
+                self.worker_state = 'recovering'
+                self.worker_restart_count += 1
+                self.last_worker_restart_at_ms = int(time.time() * 1000)
+                dead_worker_log_message = (
+                    "desktop.llama_cpp_worker.dead_detected event=dead_worker_detection "
+                    f"safe_error_code={self.last_worker_error_code} worker_generation={self._llm_generation} "
+                    f"worker_restart_count={self.worker_restart_count} exit_code={self.last_worker_exit_code}"
+                )
                 self._close_llm_proxy(self.llm)
                 self.llm = None
                 self._llm_generation += 1
-            return self._llm_generation
+            generation = self._llm_generation
+        if dead_worker_log_message is not None:
+            self.log_warning(dead_worker_log_message)
+        return generation
 
     def _ensure_replacement_llm(self, observed_generation: int) -> Any:
+        replacement_attempt_log_message: Optional[str] = None
         with self.llm_lock:
             if self.llm is not None and self._llm_is_usable(self.llm):
                 return self.llm
@@ -1987,8 +2069,12 @@ class ModelManager:
                 self.llm = None
             if self._llm_generation == observed_generation:
                 self._llm_generation += 1
+            self.worker_state = 'recovering'
+            replacement_attempt_log_message = "desktop.llama_cpp_worker.replacement_attempt event=replacement_attempt worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count)
             # Release llm_lock before get_llm_instance() because it initializes under
             # the same non-reentrant lock and still serializes creation internally.
+        if replacement_attempt_log_message is not None:
+            self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()
 
     def create_chat_completion_with_recovery(self, *args, **kwargs):
@@ -2015,8 +2101,16 @@ class ModelManager:
             raise RuntimeError('LLM runtime missing create_chat_completion')
         try:
             return create_chat_completion(*args, **kwargs)
-        except LlamaCppRestartableWorkerError:
-            self._invalidate_llm_if_current(llm_instance)
+        except LlamaCppInferenceRequestError as exc:
+            safe_error_code = _safe_worker_error_code(exc)
+            with self.llm_lock:
+                self.last_worker_error_code = safe_error_code
+                generation = self._llm_generation
+                restart_count = self.worker_restart_count
+            self.log_warning("desktop.llama_cpp_worker.request_failure event=request_scoped_inference_failure safe_error_code=%s worker_generation=%s worker_restart_count=%s" % (safe_error_code, generation, restart_count))
+            raise
+        except LlamaCppRestartableWorkerError as exc:
+            self._invalidate_llm_if_current(llm_instance, exc)
 
         replacement = self._ensure_replacement_llm(observed_generation)
         if replacement is None:
@@ -2025,9 +2119,24 @@ class ModelManager:
         if not callable(replacement_create):
             raise RuntimeError('LLM replacement runtime missing create_chat_completion')
         try:
-            return replacement_create(*args, **kwargs)
+            result = replacement_create(*args, **kwargs)
+            with self.llm_lock:
+                self.worker_state = 'ready'
+                self.last_worker_error_code = None
+                self.last_worker_exit_code = None
+                generation = self._llm_generation
+                restart_count = self.worker_restart_count
+            self.log_info("desktop.llama_cpp_worker.replacement_result event=replacement_result result=succeeded worker_generation=%s worker_restart_count=%s" % (generation, restart_count))
+            return result
         except LlamaCppRestartableWorkerError as exc:
-            self._invalidate_llm_if_current(replacement)
+            self._invalidate_llm_if_current(replacement, exc)
+            with self.llm_lock:
+                self.worker_state = 'failed'
+                safe_error_code = self.last_worker_error_code
+                generation = self._llm_generation
+                restart_count = self.worker_restart_count
+                exit_code = self.last_worker_exit_code
+            self.log_error("desktop.llama_cpp_worker.terminal_failure event=terminal_failure safe_error_code=%s worker_generation=%s worker_restart_count=%s exit_code=%s" % (safe_error_code, generation, restart_count, exit_code))
             raise RuntimeError('LLM runtime replacement failed after one restart attempt') from exc
 
     def llama_cpp_get_response(self, chat_history: List[Dict[str, str]]) -> List[Dict[str, str]]:

@@ -3223,6 +3223,7 @@ def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monk
 
     assert first.closed is False
     assert manager.llm._worker is first
+    assert manager.last_worker_error_code == 'inference_request_error'
     assert created == [first]
 
 
@@ -3249,6 +3250,11 @@ def test_model_manager_concurrent_dead_worker_creates_one_replacement(tmp_path, 
     assert [worker.name for worker in created] == ['dead', 'replacement']
     assert dead.closed is True
     assert replacement.calls == 2
+    status = manager.worker_lifecycle_status()
+    assert status['worker_state'] == 'ready'
+    assert status['worker_restart_count'] == 1
+    assert status['last_worker_error_code'] is None
+    assert status['last_worker_exit_code'] is None
 
 
 def test_model_manager_replacement_failure_attempted_once_surfaces_stable_error(tmp_path, monkeypatch):
@@ -3263,6 +3269,10 @@ def test_model_manager_replacement_failure_attempted_once_surfaces_stable_error(
     assert [worker.name for worker in created] == ['first', 'second']
     assert first.closed is True
     assert second.closed is True
+    status = manager.worker_lifecycle_status()
+    assert status['worker_state'] == 'failed'
+    assert status['worker_restart_count'] == 2
+    assert status['last_worker_error_code'] == 'worker_eof'
 
 
 def test_model_manager_healthy_request_has_no_restart(tmp_path, monkeypatch):
@@ -3277,6 +3287,7 @@ def test_model_manager_healthy_request_has_no_restart(tmp_path, monkeypatch):
 
     assert created == [first]
     assert first.closed is False
+    assert manager.worker_lifecycle_status()['worker_restart_count'] == 0
 
 
 def test_subprocess_llama_proxy_send_marks_closed_on_missing_stdin_or_write_failure():

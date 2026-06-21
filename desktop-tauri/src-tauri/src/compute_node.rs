@@ -64,6 +64,13 @@ pub struct ComputeNodeStatus {
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub worker_state: Option<String>,
+    pub worker_generation: Option<u64>,
+    pub worker_restart_count: Option<u64>,
+    pub worker_alive: Option<bool>,
+    pub last_worker_error_code: Option<String>,
+    pub last_worker_exit_code: Option<i64>,
+    pub last_worker_restart_at_ms: Option<u64>,
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
@@ -259,6 +266,13 @@ fn startup_failure_status(
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        worker_state: Some("failed".into()),
+        worker_generation: None,
+        worker_restart_count: None,
+        worker_alive: Some(false),
+        last_worker_error_code: None,
+        last_worker_exit_code: None,
+        last_worker_restart_at_ms: None,
         operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
@@ -283,6 +297,14 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let (Some(current_sequence), Some(payload_sequence)) = (status.sequence, payload_sequence) {
         if payload_sequence <= current_sequence && !is_fresh_start_event {
+            return false;
+        }
+    }
+    if let (Some(current_generation), Some(payload_generation)) = (
+        status.worker_generation,
+        payload.get("worker_generation").and_then(Value::as_u64),
+    ) {
+        if payload_generation < current_generation && !is_fresh_start_event {
             return false;
         }
     }
@@ -393,6 +415,36 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(relay_runtime_state) = payload.get("relay_runtime_state").and_then(Value::as_str) {
         status.relay_runtime_state = Some(relay_runtime_state.into());
+    }
+
+    if payload.get("worker_state").is_some() {
+        status.worker_state = payload
+            .get("worker_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if let Some(worker_generation) = payload.get("worker_generation").and_then(Value::as_u64) {
+        status.worker_generation = Some(worker_generation);
+    }
+    if payload.get("worker_restart_count").is_some() {
+        status.worker_restart_count = payload.get("worker_restart_count").and_then(Value::as_u64);
+    }
+    if payload.get("worker_alive").is_some() {
+        status.worker_alive = payload.get("worker_alive").and_then(Value::as_bool);
+    }
+    if payload.get("last_worker_error_code").is_some() {
+        status.last_worker_error_code = payload
+            .get("last_worker_error_code")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("last_worker_exit_code").is_some() {
+        status.last_worker_exit_code = payload.get("last_worker_exit_code").and_then(Value::as_i64);
+    }
+    if payload.get("last_worker_restart_at_ms").is_some() {
+        status.last_worker_restart_at_ms = payload
+            .get("last_worker_restart_at_ms")
+            .and_then(Value::as_u64);
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
@@ -924,6 +976,13 @@ pub async fn start_compute_node(
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                worker_state: Some("starting".into()),
+                worker_generation: None,
+                worker_restart_count: None,
+                worker_alive: Some(false),
+                last_worker_error_code: None,
+                last_worker_exit_code: None,
+                last_worker_restart_at_ms: None,
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
@@ -1739,6 +1798,150 @@ mod tests {
             stopped_status.operator_session_id.as_deref(),
             Some("new-session")
         );
+    }
+
+    #[test]
+    fn update_status_from_event_rejects_stale_worker_generation_without_overwriting_status() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            worker_state: Some("ready".into()),
+            worker_generation: Some(5),
+            worker_restart_count: Some(2),
+            worker_alive: Some(true),
+            last_worker_error_code: None,
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(10),
+            ..ComputeNodeStatus::default()
+        };
+
+        let stale_worker_event = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "failed",
+            "last_error": "stale event should not overwrite non-worker status",
+            "worker_state": "failed",
+            "worker_generation": 4,
+            "worker_restart_count": 99,
+            "worker_alive": false,
+            "last_worker_error_code": "stale_worker_failure",
+            "operator_session_id": "session-1",
+            "sequence": 11
+        });
+
+        assert!(!update_status_from_event(&mut status, &stale_worker_event));
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("ready"));
+        assert!(status.last_error.is_none());
+        assert_eq!(status.worker_state.as_deref(), Some("ready"));
+        assert_eq!(status.worker_generation, Some(5));
+        assert_eq!(status.worker_restart_count, Some(2));
+        assert_eq!(status.worker_alive, Some(true));
+        assert!(status.last_worker_error_code.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_preserves_generation_on_null_payload_for_stale_guard() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            worker_state: Some("ready".into()),
+            worker_generation: Some(5),
+            worker_restart_count: Some(2),
+            worker_alive: Some(true),
+            last_worker_error_code: Some("previous_worker_failure".into()),
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(10),
+            ..ComputeNodeStatus::default()
+        };
+
+        let fallback_status_event = serde_json::json!({
+            "type": "status",
+            "running": true,
+            "registered": true,
+            "relay_runtime_state": "ready",
+            "worker_generation": null,
+            "last_worker_error_code": null,
+            "operator_session_id": "session-1",
+            "sequence": 11
+        });
+
+        assert!(update_status_from_event(
+            &mut status,
+            &fallback_status_event
+        ));
+        assert_eq!(status.worker_generation, Some(5));
+        assert!(status.last_worker_error_code.is_none());
+
+        let stale_worker_event = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "failed",
+            "worker_state": "failed",
+            "worker_generation": 4,
+            "worker_restart_count": 99,
+            "worker_alive": false,
+            "last_worker_error_code": "stale_worker_failure",
+            "operator_session_id": "session-1",
+            "sequence": 12
+        });
+
+        assert!(!update_status_from_event(&mut status, &stale_worker_event));
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("ready"));
+        assert_eq!(status.worker_state.as_deref(), Some("ready"));
+        assert_eq!(status.worker_generation, Some(5));
+        assert_eq!(status.worker_restart_count, Some(2));
+        assert_eq!(status.worker_alive, Some(true));
+        assert!(status.last_worker_error_code.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_allows_fresh_new_session_to_reset_worker_generation() {
+        let mut status = ComputeNodeStatus {
+            running: false,
+            registered: false,
+            relay_runtime_state: Some("stopped".into()),
+            worker_state: Some("failed".into()),
+            worker_generation: Some(9),
+            worker_restart_count: Some(4),
+            worker_alive: Some(false),
+            last_worker_error_code: Some("old_failure".into()),
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(20),
+            ..ComputeNodeStatus::default()
+        };
+
+        let fresh_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "starting",
+            "worker_state": "starting",
+            "worker_generation": 1,
+            "worker_restart_count": 0,
+            "worker_alive": false,
+            "last_worker_error_code": null,
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+
+        assert!(update_status_from_event(&mut status, &fresh_started_event));
+        assert!(status.running);
+        assert_eq!(status.operator_session_id.as_deref(), Some("new-session"));
+        assert_eq!(status.sequence, Some(1));
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("starting"));
+        assert_eq!(status.worker_state.as_deref(), Some("starting"));
+        assert_eq!(status.worker_generation, Some(1));
+        assert_eq!(status.worker_restart_count, Some(0));
+        assert_eq!(status.worker_alive, Some(false));
+        assert!(status.last_worker_error_code.is_none());
     }
 
     #[test]

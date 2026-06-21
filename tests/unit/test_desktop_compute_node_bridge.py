@@ -35,6 +35,12 @@ def _default_desktop_runtime_arch(monkeypatch):
         monkeypatch.setattr(runtime_setup.platform_module, 'machine', lambda: 'AMD64')
 
 
+def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '-1')
+
+    assert compute_node_bridge._api_v1_recovery_attempts(default=3) == 3
+
+
 class FakeModelManager:
     def __init__(self):
         self.model_path = ''

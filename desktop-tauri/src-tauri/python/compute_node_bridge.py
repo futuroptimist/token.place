@@ -262,7 +262,9 @@ def _api_v1_recovery_attempts(default: int = RECOVERY_ATTEMPTS_DEFAULT) -> int:
         value = int(raw_value)
     except (TypeError, ValueError):
         return default
-    return max(value, 0)
+    if value < 0:
+        return default
+    return value
 
 
 def _api_v1_recovery_backoff_seconds(
@@ -1320,7 +1322,11 @@ def run(args: argparse.Namespace) -> int:
             )
             relay_client = getattr(relay_runtime, "relay_client", None)
             unregister = getattr(relay_client, "unregister_from_relay", None)
-            if callable(unregister):
+            registered_relays = getattr(relay_client, "_api_v1_registered_relays", None)
+            was_registered = registration_succeeded_by_relay.get(relay_url_value, False) or (
+                isinstance(registered_relays, set) and bool(registered_relays)
+            )
+            if callable(unregister) and was_registered:
                 print(
                     "desktop.compute_node_bridge.recovery.unregister.attempted "
                     f"relay={_sanitize_relay_target(relay_url_value)} "
@@ -1345,6 +1351,14 @@ def run(args: argparse.Namespace) -> int:
                         f"success={unregistered}",
                         file=sys.stderr,
                     )
+            elif callable(unregister):
+                print(
+                    "desktop.compute_node_bridge.recovery.unregister.skipped "
+                    f"relay={_sanitize_relay_target(relay_url_value)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    "reason=not_registered",
+                    file=sys.stderr,
+                )
             else:
                 relay_stop = getattr(relay_client, "stop", None)
                 if callable(relay_stop):
@@ -1375,7 +1389,10 @@ def run(args: argparse.Namespace) -> int:
                 f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                 file=sys.stderr,
             )
-            while not recovery_done.wait(timeout=0.05):
+            while True:
+                recovery_done.wait(timeout=0.05)
+                if recovery_done.is_set() and not recovery_lock.locked():
+                    break
                 if stop_requested():
                     return False
             return warm_load_state == "ready"

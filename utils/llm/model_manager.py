@@ -942,8 +942,10 @@ def _safe_request_error(reason, *, request=None, exc=None):
     diagnostics = {'reason': reason}
     if isinstance(request, dict):
         method = request.get('method')
-        if isinstance(method, str):
-            diagnostics['method'] = method[:80]
+        if method == 'create_chat_completion':
+            diagnostics['method'] = method
+        elif method is not None:
+            diagnostics['method'] = 'unsupported'
         kwargs = request.get('kwargs')
         if isinstance(kwargs, dict):
             diagnostics['stream'] = bool(kwargs.get('stream'))

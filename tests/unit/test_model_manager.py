@@ -2994,3 +2994,31 @@ def test_subprocess_llama_proxy_unsupported_method_does_not_terminate_worker(tmp
 
     result = proxy.create_chat_completion(messages=[], stream=False)
     assert result['choices'][0]['message']['content'] == 'ok'
+    assert result['choices'][0]['pid'] == proxy._process.pid
+
+
+def test_subprocess_llama_proxy_secret_method_value_is_not_echoed(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    _install_request_scoped_fake_llama(tmp_path, monkeypatch)
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+
+    with proxy._lock:
+        proxy._send({'method': 'unsupported TOP_SECRET_METHOD', 'args': [], 'kwargs': {}})
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            model_manager_module._read_llama_subprocess_message(
+                proxy._process,
+                timeout_seconds=5,
+                stage='llama_cpp_inference',
+            )
+
+    assert exc_info.value.diagnostics == {
+        'reason': 'unsupported_method',
+        'method': 'unsupported',
+        'stream': False,
+    }
+    assert 'TOP_SECRET_METHOD' not in str(exc_info.value)
+
+    result = proxy.create_chat_completion(messages=[], stream=False)
+    assert result['choices'][0]['message']['content'] == 'ok'
+    assert result['choices'][0]['pid'] == proxy._process.pid

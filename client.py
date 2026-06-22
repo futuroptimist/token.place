@@ -332,7 +332,8 @@ class ChatClient:
                                     logger.warning("Invalid assistant message format in API v1 response.")
                                     return None
                                 return list(chat_history or self.chat_history) + [assistant_message]
-                            return decrypted_payload
+                            logger.warning("Unexpected API v1 response envelope type: %s", type(decrypted_payload).__name__)
+                            return None
                         else:
                             logger.debug("Decryption failed. Skipping this response.")
                     else:

@@ -57,7 +57,10 @@ def test_retrieve_chat_success(monkeypatch):
         "utils.crypto_helpers.requests.post",
         lambda *a, **k: _FakeResponse(status_code=200, payload=enc),
     )
-    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role':'assistant','content':'ok'}]))
+    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value={
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'api_v1_response': {'message': {'role': 'assistant', 'content': 'ok'}},
+    }))
     monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda x: None)
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert result[0]['content'] == 'ok'
@@ -74,7 +77,10 @@ def test_retrieve_chat_invalid_message_structure(monkeypatch):
         "utils.crypto_helpers.requests.post",
         lambda *a, **k: _FakeResponse(status_code=200, payload=enc),
     )
-    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role': 'assistant'}]))
+    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value={
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'api_v1_response': {'message': {'role': 'assistant'}},
+    }))
     res = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert res is None
 

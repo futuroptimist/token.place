@@ -145,21 +145,26 @@ def test_error_handling():
 
 @patch('utils.crypto_helpers.requests')
 @patch('utils.crypto_helpers.time')  # Mock time.sleep
-def test_send_chat_message(_mock_time, mock_requests):
+@patch('utils.crypto_helpers.uuid.uuid4')
+def test_send_chat_message(mock_uuid4, _mock_time, mock_requests):
     """Test sending a chat message"""
     # Mock responses
+    mock_uuid4.return_value.hex = 'abc123'
     mock_faucet_response = MagicMock()
     mock_faucet_response.status_code = 200
     mock_faucet_response.json.return_value = {'success': True}
 
     mock_retrieve_response = MagicMock()
     mock_retrieve_response.status_code = 200
-    chat_history = json.dumps([
-        {"role": "user", "content": "Test message"},
-        {"role": "assistant", "content": "Mock Response: Test reply"}
-    ])
+    api_v1_response = json.dumps({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "request_id": "crypto-client-abc123",
+        "api_v1_response": {
+            "message": {"role": "assistant", "content": "Mock Response: Test reply"}
+        },
+    })
     mock_retrieve_response.json.return_value = {
-        'chat_history': base64.b64encode(chat_history.encode()).decode(),
+        'chat_history': base64.b64encode(api_v1_response.encode()).decode(),
         'cipherkey': base64.b64encode(b'mock_key').decode(),
         'iv': base64.b64encode(b'mock_iv').decode()
     }
@@ -178,8 +183,8 @@ def test_send_chat_message(_mock_time, mock_requests):
             b'mock_iv'
         )
 
-        # Mock decrypt to return the chat history
-        mock_decrypt.return_value = chat_history.encode()
+        # Mock decrypt to return an API v1 response envelope
+        mock_decrypt.return_value = api_v1_response.encode()
 
         # Create client and set server key
         client = CryptoClient('https://test-server.com')
@@ -859,6 +864,7 @@ def test_retrieve_chat_response_api_v1_invalid_envelopes(monkeypatch):
         {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {'error': {'message': 'boom'}}},
         {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {}},
         {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {'message': {'role': 'assistant'}}},
+        [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'legacy ok'}],
     ]
 
     for envelope in invalid_envelopes:

@@ -493,16 +493,8 @@ class CryptoClient:
                             return [assistant_message]
                         return list(chat_history) + [assistant_message]
 
-                    # Validate the response structure for legacy-compatible test fixtures.
-                    if isinstance(decrypted_data, list) and len(decrypted_data) > 0:
-                        for msg in decrypted_data:
-                            if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-                                logger.warning("Invalid message format in response")
-                                return None
-                        return decrypted_data
-                    else:
-                        logger.warning("Unexpected response format type: %s", type(decrypted_data).__name__)
-                        return None
+                    logger.warning("Unexpected response format type: %s", type(decrypted_data).__name__)
+                    return None
                 except Exception as e:
                     logger.error(
                         "Failed to decrypt response: %s",

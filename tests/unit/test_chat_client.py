@@ -62,6 +62,26 @@ def test_send_message_flow():
         )
 
 
+
+def test_retrieve_response_rejects_raw_array_payload():
+    client = ChatClient('http://test', relay_port=5000)
+    encrypted_response = {
+        'chat_history': base64.b64encode(b'ciphertext').decode('utf-8'),
+        'cipherkey': base64.b64encode(b'cipherkey').decode('utf-8'),
+        'iv': base64.b64encode(b'iv').decode('utf-8'),
+    }
+    with patch('client.requests.post') as m_post, patch('client.decrypt') as m_dec:
+        m_post.return_value = MagicMock(status_code=200)
+        m_post.return_value.json.return_value = encrypted_response
+        m_dec.return_value = json.dumps([
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'assistant', 'content': 'legacy ok'},
+        ]).encode('utf-8')
+
+        response = client.retrieve_response(timeout=0.1, request_id='req-1')
+
+    assert response is None
+
 def test_send_message_returns_none_when_no_server_public_key():
     client = ChatClient('http://test', relay_port=5000)
     with patch.object(client, 'get_server_public_key', return_value=None), \

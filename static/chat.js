@@ -1054,7 +1054,7 @@ new Vue({
                             content: normalizedError.userMessage
                         });
                     }
-                    // For API response, extract last message
+                    // For API v1 response envelopes, extract the assistant message.
                     else if (response.message && typeof response.message === 'object') {
                         const assistantMessage = response.message;
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
@@ -1068,18 +1068,6 @@ new Vue({
                             throw new Error('invalid_assistant_response_content');
                         }
                         this.appendAssistantMessage(assistantMessage);
-                    }
-                    // For legacy response format (full chat history)
-                    else if (Array.isArray(response)) {
-                        const history = response.slice();
-                        const candidate = history.length > 0 ? history[history.length - 1] : null;
-                        if (candidate && candidate.role === 'assistant' && typeof candidate.content === 'string') {
-                            history.pop();
-                            this.chatHistory = history;
-                            this.appendAssistantMessage(candidate);
-                        } else {
-                            this.chatHistory = response;
-                        }
                     }
                     else {
                         throw new Error('Unexpected response format');

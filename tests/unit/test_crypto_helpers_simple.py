@@ -34,12 +34,17 @@ def test_encrypt_decrypt_message():
 def test_send_chat_message():
     with patch('utils.crypto_helpers.encrypt') as mock_enc, \
          patch('utils.crypto_helpers.decrypt') as mock_dec, \
-         patch('utils.crypto_helpers.requests') as mock_requests:
+         patch('utils.crypto_helpers.requests') as mock_requests, \
+         patch('utils.crypto_helpers.uuid.uuid4') as mock_uuid4:
+        mock_uuid4.return_value.hex = 'abc123'
         mock_enc.return_value = ({'ciphertext': b'd', 'iv': b'i'}, b'k', b'i')
-        mock_dec.return_value = json.dumps([
-            {'role': 'user', 'content': 'hi'},
-            {'role': 'assistant', 'content': 'hey'}
-        ]).encode()
+        mock_dec.return_value = json.dumps({
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'request_id': 'crypto-client-abc123',
+            'api_v1_response': {
+                'message': {'role': 'assistant', 'content': 'hey'},
+            },
+        }).encode()
         get_resp = MagicMock(status_code=200)
         get_resp.json.return_value = {'server_public_key': base64.b64encode(b'k').decode()}
         post_resp = MagicMock(status_code=200)

@@ -70,7 +70,10 @@ def test_retrieve_chat_response_retry(monkeypatch):
         _FakeResponse(200, {'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'}),
     ])
     monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **k: next(seq))
-    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role': 'assistant', 'content': 'ok'}]))
+    monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value={
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'api_v1_response': {'message': {'role': 'assistant', 'content': 'ok'}},
+    }))
     result = client.retrieve_chat_response(max_retries=2, retry_delay=0)
     assert result[0]['content'] == 'ok'
 

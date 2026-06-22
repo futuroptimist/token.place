@@ -81,6 +81,17 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     assert "this.chatHistory" in chat_js
     assert "messages: this.createApiV1Messages(messageContent)" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js
+    assert "response.choices && response.choices.length > 0" in chat_js
+    assert "response.choices[0].message" in chat_js
+
+
+def test_landing_chat_js_rejects_raw_array_chat_responses():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "legacy" + " response format" not in chat_js
+    assert "full chat" + " history" not in chat_js
+    assert "response" + ".slice(" not in chat_js
+    assert "Array.isArray" + "(response)" not in chat_js
+    assert "Unexpected response format" in chat_js
 
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():

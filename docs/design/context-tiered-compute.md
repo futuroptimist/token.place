@@ -158,22 +158,17 @@ defaults. The schema still needs room for later tuning.
 
 ```json
 {
-  "id": "64k-full",
+  "profile_id": "64k-full",
   "display_name": "64K full context",
   "model_ids": ["llama-3.1-8b-instruct"],
   "total_context_tokens": 65536,
   "default_output_token_reservation": 1024,
   "maximum_output_tokens": 4096,
   "max_concurrency": 1,
-  "kv_cache": {
-    "type": "runtime_default",
-    "validated": true
-  },
-  "offload": {
-    "kqv_policy": "runtime_default",
-    "gpu_layers": "runtime_default"
-  },
-  "batch": {
+  "kv_cache_type": "runtime_default",
+  "kqv_offload_policy": "runtime_default",
+  "gpu_layers": "runtime_default",
+  "batch_defaults": {
     "n_batch": "runtime_default",
     "n_ubatch": "runtime_default",
     "flash_attention": "runtime_default"
@@ -189,7 +184,7 @@ defaults. The schema still needs room for later tuning.
 
 Required fields:
 
-- stable profile ID;
+- stable `profile_id`;
 - display name;
 - supported model IDs;
 - total context tokens;
@@ -235,9 +230,27 @@ After warm-load validation, a compute node registers these API v1 capabilities:
   "api_version": "v1",
   "supported_model_ids": ["llama-3.1-8b-instruct"],
   "active_context_profile": {
-    "id": "64k-full",
+    "profile_id": "64k-full",
     "display_name": "64K full context",
-    "total_context_tokens": 65536
+    "model_ids": ["llama-3.1-8b-instruct"],
+    "total_context_tokens": 65536,
+    "default_output_token_reservation": 1024,
+    "maximum_output_tokens": 4096,
+    "max_concurrency": 1,
+    "kv_cache_type": "runtime_default",
+    "kqv_offload_policy": "runtime_default",
+    "gpu_layers": "runtime_default",
+    "batch_defaults": {
+      "n_batch": "runtime_default",
+      "n_ubatch": "runtime_default",
+      "flash_attention": "runtime_default"
+    },
+    "enabled": true,
+    "safe_diagnostics": {
+      "backend_class": "cuda",
+      "throughput_band": "long_context_baseline",
+      "last_warm_load_status": "ok"
+    }
   },
   "maximum_total_context_tokens": 65536,
   "maximum_output_tokens": 4096,
@@ -285,11 +298,26 @@ Response:
 {
   "server_public_key": "base64-public-key",
   "selected_context_profile": {
-    "id": "64k-full",
+    "profile_id": "64k-full",
     "display_name": "64K full context",
+    "model_ids": ["llama-3.1-8b-instruct"],
     "total_context_tokens": 65536,
+    "default_output_token_reservation": 1024,
     "maximum_output_tokens": 4096,
-    "max_concurrency": 1
+    "max_concurrency": 1,
+    "kv_cache_type": "runtime_default",
+    "kqv_offload_policy": "runtime_default",
+    "gpu_layers": "runtime_default",
+    "batch_defaults": {
+      "n_batch": "runtime_default",
+      "n_ubatch": "runtime_default",
+      "flash_attention": "runtime_default"
+    },
+    "enabled": true,
+    "safe_diagnostics": {
+      "backend_class": "cuda",
+      "throughput_band": "long_context_baseline"
+    }
   }
 }
 ```
@@ -374,7 +402,7 @@ Decision flow:
    tier capability, max concurrency availability, and lease freshness. During the
    migration window, a request that omits `context_tier` must remain eligible
    for exact `8k-fast` profiles only unless the client copies the returned
-   `selected_context_profile.id` into the encrypted request before dispatch.
+   `selected_context_profile.profile_id` into the encrypted request before dispatch.
    This prevents an omitted-tier encrypted request from being selected onto a
    larger node and then failing closed when that node normalizes the missing
    encrypted tier back to `8k-fast`.
@@ -390,7 +418,7 @@ Decision flow:
 | --- | --- | --- | --- | --- |
 | Current | Live API v1 nodes | Registration-order round robin | public key, API v1 marker | Existing behavior. |
 | Step 1 | Nodes matching model + tier | Preserve round robin among equivalent nodes | registration capabilities | Minimal capability correctness. |
-| Step 2 | Nodes matching model + at least requested tier, only after clients echo `selected_context_profile.id` into encrypted requests | Smallest capable tier | profile token limit, tier order | Avoid burning scarce 64K capacity on explicit or echoed-tier work without breaking omitted-tier compatibility. |
+| Step 2 | Nodes matching model + at least requested tier, only after clients echo `selected_context_profile.profile_id` into encrypted requests | Smallest capable tier | profile token limit, tier order | Avoid burning scarce 64K capacity on explicit or echoed-tier work without breaking omitted-tier compatibility. |
 | Step 3 | Smallest capable tier set | Lowest queued + in-flight work | queue depth, in-flight count, max concurrency | Reduce avoidable latency with safe metadata. |
 | Step 4 | Load-aware candidate set | Expected completion time | coarse throughput band, queue/in-flight, tier | Account for heterogeneous hardware without raw device inventory. |
 | Step 5 | Policy overlay | Fairness, long-tier reservation, optional selection reservation | safe tenant-neutral counters, reservation expiry | Prevent starvation and racey over-selection. |
@@ -467,7 +495,7 @@ Encrypted overflow error body:
 }
 ```
 
-`recommended_next_tier` is the next larger registered profile ID when one exists.
+`recommended_next_tier` is the next larger registered profile identifier when one exists.
 When the active profile is already the largest defined tier, the field must be
 present with `null` and `retryable` must be `false`; clients must not auto-retry
 without an explicit user or policy change.
@@ -644,7 +672,7 @@ and recovery requires warm-load validation before re-registration.
 - The encrypted request may omit `context_tier` during migration; compute nodes
   normalize missing to `8k-fast`. Relay selection must therefore keep omitted-tier
   requests on exact `8k-fast` profiles until clients are upgraded to echo the
-  returned `selected_context_profile.id` into the encrypted request.
+  returned `selected_context_profile.profile_id` into the encrypted request.
 - Once the migration completes, documentation and diagnostics should encourage
   explicit tier selection, but the default remains for compatibility.
 

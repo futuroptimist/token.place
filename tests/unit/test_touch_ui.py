@@ -85,16 +85,26 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
 
 
 def test_landing_chat_js_rejects_raw_array_chat_responses():
+    # Landing chat invariants currently use static string guards here rather
+    # than an executable static/chat.js harness. Keep these assertions focused
+    # on the API v1 response contract so unexpected raw arrays stay on the
+    # invalid response path instead of being appended as assistant replies.
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     forbidden_array_branch = "Array.isArray" + "(response)"
     forbidden_slice_branch = "response" + ".slice"
     forbidden_history_comment = "full chat" + " history"
     forbidden_compat_comment = "legacy" + " response" + " format"
+
     assert forbidden_array_branch not in chat_js
     assert forbidden_slice_branch not in chat_js
     assert forbidden_history_comment not in chat_js
     assert forbidden_compat_comment not in chat_js.lower()
-    assert "Unexpected response format" in chat_js
+    assert "else if (response.message && typeof response.message === 'object')" in chat_js
+    assert "const assistantMessage = response.message;" in chat_js
+    assert "else if (response.choices && response.choices.length > 0)" in chat_js
+    assert "const assistantMessage = response.choices[0].message;" in chat_js
+    assert "this.appendAssistantMessage(assistantMessage);" in chat_js
+    assert "throw new Error('Unexpected response format');" in chat_js
 
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():

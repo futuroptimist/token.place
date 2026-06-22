@@ -539,7 +539,6 @@ After (explicit relay-only semantics):
   "activeUpstreamServers": [],
   "requiredUpstreamServers": [],
   "configuredUpstreamServers": ["https://token.place"],
-  "legacyConfiguredUpstreamServers": ["https://token.place"],
   "upstream": "http://gpu-server:3000",
   "details": {"knownServers": "empty"}
 }
@@ -558,8 +557,6 @@ Interpretation:
   compatibility/configured upstream pool.
 - `configuredUpstreamServers` is retained as a stable compatibility key and can
   differ from the explicit runtime upstream.
-- `legacyConfiguredUpstreamServers` represents compatibility/default config, not
-  active runtime state or a required staging dependency.
 - Operators should rely on `relayOnly`, `upstreamHealthRequired`, `activeUpstreamServers`, `requiredUpstreamServers`, and registered compute-node counts when judging relay-only readiness.
 
 ## Guardrails

@@ -333,22 +333,6 @@ def _active_upstream_reporting_servers(
     return configured_servers
 
 
-def _legacy_configured_upstream_reporting_servers(
-    configured_servers: List[str],
-    *,
-    explicit_upstream_config: bool,
-) -> List[str]:
-    """Return compatibility/default upstream config without relabeling custom pools."""
-
-    if (
-        explicit_upstream_config
-        and _normalise_upstream_server_pool(configured_servers)
-        != _normalise_upstream_server_pool(["https://token.place"])
-    ):
-        return []
-    return configured_servers
-
-
 def _load_upstream_config() -> Dict[str, Any]:
     upstream_override = os.environ.get(UPSTREAM_URL_ENV)
     parsed_host = None
@@ -867,12 +851,6 @@ def healthz():
         "registeredServers": _live_server_diagnostics(),
     }
     status["configuredUpstreamServers"] = configured_servers
-    status["legacyConfiguredUpstreamServers"] = (
-        _legacy_configured_upstream_reporting_servers(
-            configured_servers,
-            explicit_upstream_config=explicit_upstream_config,
-        )
-    )
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -1140,12 +1118,6 @@ def relay_diagnostics():
         "api_v1_registered_compute_nodes": api_v1_live_nodes,
         "total_api_v1_registered_compute_nodes": len(api_v1_live_nodes),
         "configured_upstream_servers": configured_servers,
-        "legacy_configured_upstream_servers": (
-            _legacy_configured_upstream_reporting_servers(
-                configured_servers,
-                explicit_upstream_config=explicit_upstream_config,
-            )
-        ),
     }
     response = jsonify(diagnostics)
     response.headers["Cache-Control"] = "no-store"

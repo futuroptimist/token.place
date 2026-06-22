@@ -100,7 +100,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  D[DSPACE / client] -->|coarse model + context_tier| S[/api/v1/relay/servers/next/]
+  D[DSPACE / client] -->|coarse model + context_tier| S[/api/v1/relay/servers/next]
   S -->|capability filter + scheduler metadata| R[relay.py]
   R -->|public key + safe selected profile metadata| D
   D -->|encrypted API v1 request repeats context_tier| Q[(relay ciphertext queue)]
@@ -163,7 +163,7 @@ defaults. The schema still needs room for later tuning.
   "model_ids": ["llama-3.1-8b-instruct"],
   "total_context_tokens": 65536,
   "default_output_token_reservation": 1024,
-  "max_output_tokens": 4096,
+  "maximum_output_tokens": 4096,
   "max_concurrency": 1,
   "kv_cache": {
     "type": "runtime_default",
@@ -193,7 +193,7 @@ Required fields:
 - display name;
 - supported model IDs;
 - total context tokens;
-- default and maximum output-token reservation;
+- default output-token reservation and maximum output tokens;
 - max concurrency;
 - KV cache type;
 - K/Q/V offload policy;
@@ -330,6 +330,37 @@ Registration must occur only after warm-load and profile memory validation.
 Heartbeat renewals may repeat the same capability payload or send a stable
 capability revision ID plus the public key.
 
+### Unregister extension
+
+`POST /api/v1/relay/servers/unregister` explicitly removes a compute node from
+the live API v1 candidate set. The request body contains only safe metadata:
+
+```json
+{
+  "server_public_key": "base64-public-key",
+  "api_version": "v1",
+  "reason": "operator_stop"
+}
+```
+
+Response:
+
+```json
+{
+  "removed": true,
+  "cancelled_queued_request_count": 0,
+  "in_flight_request_state": "held_until_ttl_or_terminal_response"
+}
+```
+
+On unregister, the relay must stop selecting the node immediately and cancel any
+queued encrypted envelopes that have not been claimed when cancellation can be
+represented without plaintext. Claimed in-flight encrypted work must either reach
+a terminal encrypted response from the compute node or expire via the existing
+in-flight TTL; the relay must not decrypt, inspect, or synthesize plaintext
+model errors. Re-registration after unregister requires fresh warm-load and
+profile validation.
+
 ## Tier-aware selection
 
 Selection happens before encryption because the client needs a public key. The
@@ -340,7 +371,13 @@ Decision flow:
 
 1. Normalize missing `context_tier` to `8k-fast`.
 2. Filter live API v1 nodes by API version, enabled profile, model ID, requested
-   tier capability, max concurrency availability, and lease freshness.
+   tier capability, max concurrency availability, and lease freshness. During the
+   migration window, a request that omits `context_tier` must remain eligible
+   for exact `8k-fast` profiles only unless the client copies the returned
+   `selected_context_profile.id` into the encrypted request before dispatch.
+   This prevents an omitted-tier encrypted request from being selected onto a
+   larger node and then failing closed when that node normalizes the missing
+   encrypted tier back to `8k-fast`.
 3. Return `503 no_registered_compute_nodes` if no live API v1 nodes exist.
 4. Return a capability-specific `503 no_capable_compute_nodes` if nodes exist but
    none support the requested safe metadata.
@@ -353,7 +390,7 @@ Decision flow:
 | --- | --- | --- | --- | --- |
 | Current | Live API v1 nodes | Registration-order round robin | public key, API v1 marker | Existing behavior. |
 | Step 1 | Nodes matching model + tier | Preserve round robin among equivalent nodes | registration capabilities | Minimal capability correctness. |
-| Step 2 | Nodes matching model + at least requested tier | Smallest capable tier | profile token limit, tier order | Avoid burning scarce 64K capacity on 8K work. |
+| Step 2 | Nodes matching model + at least requested tier, only after clients echo `selected_context_profile.id` into encrypted requests | Smallest capable tier | profile token limit, tier order | Avoid burning scarce 64K capacity on explicit or echoed-tier work without breaking omitted-tier compatibility. |
 | Step 3 | Smallest capable tier set | Lowest queued + in-flight work | queue depth, in-flight count, max concurrency | Reduce avoidable latency with safe metadata. |
 | Step 4 | Load-aware candidate set | Expected completion time | coarse throughput band, queue/in-flight, tier | Account for heterogeneous hardware without raw device inventory. |
 | Step 5 | Policy overlay | Fairness, long-tier reservation, optional selection reservation | safe tenant-neutral counters, reservation expiry | Prevent starvation and racey over-selection. |
@@ -430,8 +467,16 @@ Encrypted overflow error body:
 }
 ```
 
+`recommended_next_tier` is the next larger registered profile ID when one exists.
+When the active profile is already the largest defined tier, the field must be
+present with `null` and `retryable` must be `false`; clients must not auto-retry
+without an explicit user or policy change.
+
 This error is encrypted to the client. The relay stores and forwards only the
-ciphertext envelope and safe request metadata.
+ciphertext envelope and safe request metadata. Because overflow errors include
+exact encrypted token counts that success responses do not normally expose, the
+error retrieval path needs the same E2EE hardening, ciphertext-only relay
+handling, and log redaction as the success path.
 
 ## Registration, heartbeat, overflow, retry, and unregister sequences
 
@@ -466,7 +511,7 @@ sequenceDiagram
   par long non-streaming inference
     Worker->>Worker: decrypt, admit, generate
   and independent lease renewal
-    loop every heartbeat interval
+    loop every heartbeat interval (must be <= half the relay lease TTL)
       HB->>Relay: POST /api/v1/relay/servers/register heartbeat/capability revision
       Relay-->>HB: renewed lease
     end
@@ -511,7 +556,11 @@ sequenceDiagram
 ## Liveness design
 
 Long-running inference must not make the relay consider a healthy compute node
-stale. A 64K non-streaming request can exceed the normal poll/lease interval.
+stale. A 64K non-streaming request can exceed the normal poll/lease interval. The
+heartbeat interval is a testable contract: it must be less than or equal to half
+of the relay lease TTL and must renew before the relay stale-node eviction
+window. If the relay advertises a shorter TTL in registration hints, the compute
+node must lower its heartbeat interval accordingly before accepting work.
 
 | Option | Benefits | Costs/failure modes | Decision |
 | --- | --- | --- | --- |
@@ -593,7 +642,9 @@ and recovery requires warm-load validation before re-registration.
   `8k-fast` candidates only after they have warm-loaded the current 8,192-token
   default runtime.
 - The encrypted request may omit `context_tier` during migration; compute nodes
-  normalize missing to `8k-fast`.
+  normalize missing to `8k-fast`. Relay selection must therefore keep omitted-tier
+  requests on exact `8k-fast` profiles until clients are upgraded to echo the
+  returned `selected_context_profile.id` into the encrypted request.
 - Once the migration completes, documentation and diagnostics should encourage
   explicit tier selection, but the default remains for compatibility.
 

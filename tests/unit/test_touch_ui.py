@@ -75,12 +75,21 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "distributed provider request failed" not in chat_js
 
 
-def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes():
+def test_landing_chat_js_preserves_context_and_handles_api_v1_success_envelopes():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "createApiV1Messages" in chat_js
     assert "this.chatHistory" in chat_js
     assert "messages: this.createApiV1Messages(messageContent)" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js
+    assert "response.choices[0].message" in chat_js
+
+
+def test_landing_chat_js_rejects_raw_array_chat_responses():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "Array.isArray(response)" not in chat_js
+    assert "response.slice()" not in chat_js
+    assert "legacy response format" not in chat_js.lower()
+    assert "full chat history" not in chat_js.lower()
 
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():

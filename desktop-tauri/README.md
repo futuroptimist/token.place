@@ -214,6 +214,18 @@ It prints:
   CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
   startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.
 
+
+## Operator context tiers
+
+Before **Start operator**, choose one static context tier in the desktop operator controls:
+
+- **8K Fast** (`8k-fast`) warms a single llama.cpp runtime with `n_ctx=8192`.
+- **64K Full** (`64k-full`) warms a single llama.cpp runtime with `n_ctx=65536`.
+
+The selected tier is persisted in the desktop config and is locked while the operator is starting,
+warming, running, stopping, or recovering. To switch tiers, stop the operator, select the new tier,
+and start again. Registration still happens only after the selected runtime warm-load succeeds.
+
 ## Packaged operator debug logs
 
 The packaged desktop app writes compute-node operator diagnostics to a per-session

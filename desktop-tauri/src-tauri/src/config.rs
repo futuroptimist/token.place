@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::context_profiles::{normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,8 @@ pub struct DesktopConfig {
     pub relay_base_urls: Vec<String>,
     #[serde(default = "default_compute_mode")]
     pub preferred_mode: ComputeMode,
+    #[serde(default = "default_context_tier")]
+    pub selected_context_tier: String,
 }
 
 fn default_relay_base_url() -> String {
@@ -23,6 +26,10 @@ fn default_relay_base_url() -> String {
 
 fn default_compute_mode() -> ComputeMode {
     ComputeMode::Auto
+}
+
+fn default_context_tier() -> String {
+    DEFAULT_CONTEXT_TIER.into()
 }
 
 pub fn normalize_relay_base_urls(
@@ -63,6 +70,7 @@ impl DesktopConfig {
             .first()
             .cloned()
             .unwrap_or_else(default_relay_base_url);
+        self.selected_context_tier = normalize_context_tier(&self.selected_context_tier);
         self
     }
 }
@@ -74,6 +82,7 @@ impl Default for DesktopConfig {
             relay_base_url: DEFAULT_RELAY_BASE_URL.into(),
             relay_base_urls: vec![DEFAULT_RELAY_BASE_URL.into()],
             preferred_mode: ComputeMode::Auto,
+            selected_context_tier: DEFAULT_CONTEXT_TIER.into(),
         }
     }
 }
@@ -81,7 +90,8 @@ impl Default for DesktopConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_relay_base_urls, DesktopConfig, DEFAULT_RELAY_BASE_URL, MAX_RELAY_BASE_URLS,
+        normalize_relay_base_urls, DesktopConfig, DEFAULT_CONTEXT_TIER, DEFAULT_RELAY_BASE_URL,
+        MAX_RELAY_BASE_URLS,
     };
 
     #[test]
@@ -89,6 +99,7 @@ mod tests {
         let config = DesktopConfig::default();
         assert_eq!(config.relay_base_url, DEFAULT_RELAY_BASE_URL);
         assert_eq!(config.relay_base_urls, vec![DEFAULT_RELAY_BASE_URL]);
+        assert_eq!(config.selected_context_tier, DEFAULT_CONTEXT_TIER);
     }
 
     #[test]
@@ -106,6 +117,23 @@ mod tests {
         assert_eq!(config.relay_base_url, "https://staging.token.place");
         assert_eq!(config.relay_base_urls, vec!["https://staging.token.place"]);
         assert_eq!(config.model_path, "/tmp/model.gguf");
+        assert_eq!(config.selected_context_tier, DEFAULT_CONTEXT_TIER);
+    }
+
+    #[test]
+    fn unknown_context_tier_normalizes_to_default() {
+        let config: DesktopConfig = serde_json::from_str::<DesktopConfig>(
+            r#"{
+                "model_path": "/tmp/model.gguf",
+                "relay_base_url": "https://token.place",
+                "preferred_mode": "auto",
+                "selected_context_tier": "unknown"
+            }"#,
+        )
+        .expect("config should deserialize")
+        .normalized();
+
+        assert_eq!(config.selected_context_tier, DEFAULT_CONTEXT_TIER);
     }
 
     #[test]

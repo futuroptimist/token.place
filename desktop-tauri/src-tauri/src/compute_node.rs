@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
+use crate::context_profiles::{normalize_context_tier, resolve_context_profile};
 use crate::operator_logs::{
     append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
     OperatorLogSink,
@@ -31,6 +32,8 @@ pub struct ComputeNodeRequest {
     #[serde(default)]
     pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
+    #[serde(default)]
+    pub context_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,6 +78,8 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    pub context_tier: Option<String>,
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -218,6 +223,17 @@ fn sanitize_relay_target(relay_url: &str) -> String {
     "unknown".into()
 }
 
+fn normalized_request_context_tier(request: &ComputeNodeRequest) -> String {
+    normalize_context_tier(&request.context_tier)
+}
+
+fn request_context_window_tokens(request: &ComputeNodeRequest) -> u32 {
+    let tier = normalized_request_context_tier(request);
+    resolve_context_profile(&tier)
+        .map(|profile| profile.total_context_tokens)
+        .unwrap_or_default()
+}
+
 fn normalized_request_relay_urls(request: &ComputeNodeRequest) -> Vec<String> {
     normalize_relay_base_urls(&request.relay_base_urls, &request.relay_base_url)
 }
@@ -277,6 +293,8 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        context_tier: Some(normalized_request_context_tier(request)),
+        context_window_tokens: Some(request_context_window_tokens(request)),
     }
 }
 
@@ -463,6 +481,14 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if let Some(context_tier) = payload.get("context_tier").and_then(Value::as_str) {
+        status.context_tier = Some(context_tier.into());
+    }
+    if let Some(context_window_tokens) =
+        payload.get("context_window_tokens").and_then(Value::as_u64)
+    {
+        status.context_window_tokens = Some(context_window_tokens as u32);
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -553,6 +579,8 @@ fn finalize_bridge_exit(
             "last_error": last_error,
             "message": last_error,
             "operator_session_id": expected_session_id,
+            "context_tier": status.context_tier,
+            "context_window_tokens": status.context_window_tokens,
             "sequence": sequence,
             "updated_at_ms": updated_at_ms,
         })
@@ -890,6 +918,8 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--context-tier")
+        .arg(normalized_request_context_tier(&request))
         .args(
             relay_base_urls
                 .iter()
@@ -987,6 +1017,8 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                context_tier: Some(normalized_request_context_tier(&request)),
+                context_window_tokens: Some(request_context_window_tokens(&request)),
             };
             true
         }
@@ -1978,6 +2010,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
+            context_tier: "64k-full".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -2157,6 +2190,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
+            context_tier: "unknown".into(),
         };
 
         let status = startup_failure_status(

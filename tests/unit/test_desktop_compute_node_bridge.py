@@ -2019,6 +2019,10 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
         path_bootstrap_path.read_text(encoding='utf-8'),
         encoding='utf-8',
     )
+    (python_dir / 'context_profiles.py').write_text(
+        (MODULE_PATH.parent / 'context_profiles.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
     (python_dir / 'desktop_runtime_setup.py').write_text(
         """
 def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):
@@ -4375,3 +4379,8 @@ def test_api_v1_unhealthy_result_without_recovery_attempt_sets_terminal_state(
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get('type') == 'status']
     assert status_events[-1]['relay_runtime_state'] == expected_state
+
+
+def test_context_profile_registry_validates_known_profiles():
+    assert compute_node_bridge.normalize_context_tier("unknown") == "8k-fast"
+    assert compute_node_bridge.require_context_profile("64k-full").total_context_tokens == 65536

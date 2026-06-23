@@ -3711,3 +3711,45 @@ class Llama:
     ])
     assert plaintext_prompt not in leak_checked_text
     assert plaintext_output not in leak_checked_text
+
+
+def test_model_manager_context_profile_sets_llama_n_ctx(monkeypatch, tmp_path):
+    import types
+    import utils.llm.model_manager as model_manager_module
+
+    captured = {}
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_module = types.SimpleNamespace(Llama=FakeLlama, __file__="/tmp/llama_cpp.py")
+    monkeypatch.setattr(model_manager_module, "_import_llama_cpp_runtime", lambda **_: fake_module)
+
+    class Config:
+        is_production = True
+        def __init__(self):
+            self.config = {"paths": {"models_dir": str(tmp_path)}, "model": {"context_size": 8192}}
+        def get(self, key, default=None):
+            value = self.config
+            try:
+                for part in key.split('.'):
+                    value = value[part]
+                return value
+            except Exception:
+                return default
+        def set(self, key, value):
+            target = self.config
+            parts = key.split('.')
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            target[parts[-1]] = value
+
+    model_path = tmp_path / "model.gguf"
+    model_path.write_text("fake")
+    manager = model_manager_module.ModelManager(Config())
+    manager.model_path = str(model_path)
+    manager.set_context_profile("64k-full", 65536)
+
+    assert manager.get_llm_instance() is not None
+    assert captured["n_ctx"] == 65536

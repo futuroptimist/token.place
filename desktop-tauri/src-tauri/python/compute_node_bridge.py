@@ -76,6 +76,9 @@ _stdin_reader_lock = threading.Lock()
 _stop_requested_latched = threading.Event()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
+
+from context_profiles import normalize_context_tier, require_context_profile
+
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
@@ -551,6 +554,8 @@ def _structured_startup_error_payload(
         "warm_load_duration_ms": None,
         "runtime_path": _runtime_path_from_env(),
         "relay_runtime_path": "bridge",
+        "context_tier": normalize_context_tier(getattr(args, "context_tier", "")),
+        "context_window_tokens": require_context_profile(normalize_context_tier(getattr(args, "context_tier", ""))).total_context_tokens,
     }
     if operator_session_id is not None:
         payload["operator_session_id"] = operator_session_id
@@ -695,6 +700,8 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
+    context_profile = require_context_profile(normalize_context_tier(getattr(args, "context_tier", "")))
+    args.context_tier = context_profile.profile_id
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
         getattr(args, "relay_urls", None),
@@ -705,7 +712,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} "
+        f"model={args.model} mode={args.mode} context_tier={context_profile.profile_id} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -761,6 +768,12 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
+    set_context_profile = getattr(runtime.model_manager, "set_context_profile", None)
+    if callable(set_context_profile):
+        set_context_profile(context_profile.profile_id, context_profile.total_context_tokens)
+    else:
+        setattr(runtime.model_manager, "context_tier", context_profile.profile_id)
+        setattr(runtime.model_manager, "context_window_tokens", context_profile.total_context_tokens)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
@@ -927,6 +940,8 @@ def run(args: argparse.Namespace) -> int:
             "warm_load_duration_ms": warm_load_duration_ms,
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
+            "context_tier": context_profile.profile_id,
+            "context_window_tokens": context_profile.total_context_tokens,
         }
         payload.update(worker_lifecycle_status())
         if extra:
@@ -1974,10 +1989,12 @@ def main() -> int:
         help="JSON array or comma-separated relay URL list (can be repeated)",
     )
     parser.add_argument("--relay-port", type=int, default=None)
+    parser.add_argument("--context-tier", default="8k-fast")
     args = parser.parse_args()
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)
+        args.context_tier = require_context_profile(args.context_tier).profile_id
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         message = f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"

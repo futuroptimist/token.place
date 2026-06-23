@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
+type ContextTier = '8k-fast' | '64k-full';
 
 interface BackendInfo {
   platform_label: string;
@@ -18,16 +19,23 @@ interface DesktopConfig {
   relay_base_url: string;
   relay_base_urls: string[];
   preferred_mode: BackendMode;
+  selected_context_tier: ContextTier;
 }
 
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
+const DEFAULT_CONTEXT_TIER: ContextTier = '8k-fast';
+const CONTEXT_PROFILES: Array<{ id: ContextTier; label: string; contextWindowTokens: number }> = [
+  { id: '8k-fast', label: '8K Fast', contextWindowTokens: 8192 },
+  { id: '64k-full', label: '64K Full', contextWindowTokens: 65536 },
+];
 export const MAX_RELAY_BASE_URLS = 10;
 
-type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_base_url' | 'relay_base_urls' | 'preferred_mode'> & {
+type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_base_url' | 'relay_base_urls' | 'preferred_mode' | 'selected_context_tier'> & {
   model_path?: unknown;
   relay_base_url?: unknown;
   relay_base_urls?: unknown;
   preferred_mode?: unknown;
+  selected_context_tier?: unknown;
 };
 
 interface RelayStatus {
@@ -74,6 +82,8 @@ interface ComputeNodeStatus {
   sequence: number | null;
   updated_at_ms: number | null;
   log_file_path: string | null;
+  context_tier: string | null;
+  context_window_tokens: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -129,10 +139,16 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
+  context_tier: DEFAULT_CONTEXT_TIER,
+  context_window_tokens: 8192,
 };
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeContextTier(value: unknown): ContextTier {
+  return CONTEXT_PROFILES.some((profile) => profile.id === value) ? (value as ContextTier) : DEFAULT_CONTEXT_TIER;
 }
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
@@ -220,6 +236,7 @@ export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopCon
     relay_base_url: relayBaseUrls[0] || DEFAULT_RELAY_BASE_URL,
     relay_base_urls: relayBaseUrls,
     preferred_mode: normalizeBackendMode(config.preferred_mode),
+    selected_context_tier: normalizeContextTier(config.selected_context_tier),
   };
 }
 
@@ -453,6 +470,12 @@ function mergeComputeStatusEvent(
           : typeof payload.message === 'string'
             ? payload.message
             : prev.last_error,
+    context_tier:
+      typeof payload.context_tier === 'string' ? payload.context_tier : prev.context_tier,
+    context_window_tokens:
+      typeof payload.context_window_tokens === 'number'
+        ? payload.context_window_tokens
+        : prev.context_window_tokens,
   };
 }
 
@@ -473,6 +496,7 @@ export function App() {
     relay_base_url: DEFAULT_RELAY_BASE_URL,
     relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
+    selected_context_tier: DEFAULT_CONTEXT_TIER,
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
@@ -718,6 +742,8 @@ export function App() {
         worker_state: 'starting',
         worker_alive: false,
         log_file_path: null,
+        context_tier: config.selected_context_tier,
+        context_window_tokens: CONTEXT_PROFILES.find((profile) => profile.id === config.selected_context_tier)?.contextWindowTokens ?? 8192,
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -727,6 +753,7 @@ export function App() {
           relay_base_url: primaryRelayUrl(config),
           relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
+          context_tier: config.selected_context_tier,
         },
       });
     } catch (e) {
@@ -868,6 +895,21 @@ export function App() {
         partial offload. Unsupported platforms fall back to CPU with diagnostics.
       </p>
 
+      <label htmlFor="context-tier-select" style={{ display: 'block', marginTop: 12 }}>Context tier</label>
+      <select
+        id="context-tier-select"
+        value={config.selected_context_tier}
+        disabled={computeStatus.running || isStartingComputeNode}
+        onChange={(e) => updateConfig({ ...config, selected_context_tier: normalizeContextTier(e.target.value) })}
+      >
+        {CONTEXT_PROFILES.map((profile) => (
+          <option key={profile.id} value={profile.id}>{profile.label}</option>
+        ))}
+      </select>
+      <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
+        Changing tiers requires Stop Operator followed by Start Operator. The active operator warms one selected tier per process.
+      </p>
+
       <section aria-labelledby="relay-urls-heading" style={{ marginTop: 12 }}>
         <h2 id="relay-urls-heading" style={{ fontSize: 16, marginBottom: 8 }}>Relay URLs</h2>
         {(computeStatus.running || isStartingComputeNode) && (
@@ -953,6 +995,8 @@ export function App() {
             </ul>
           </div>
         )}
+        <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.selected_context_tier)}</code></p>
+        <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.selected_context_tier)?.contextWindowTokens ?? 8192)} tokens</code></p>
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{displayStatusValue(computeStatus.requested_mode, config.preferred_mode)}</code></p>
         <p style={{ marginBottom: 0 }}>Effective mode: <code>{displayStatusValue(computeStatus.effective_mode, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend available: <code>{displayStatusValue(computeStatus.backend_available, 'pending')}</code></p>

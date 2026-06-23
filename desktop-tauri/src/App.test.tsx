@@ -91,6 +91,7 @@ describe('desktop app start failure handling', () => {
       relay_base_url: 'https://token.place',
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
+      selected_context_tier: '8k-fast',
     });
   });
 
@@ -1695,4 +1696,36 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last worker error code:/).textContent).toContain('fatal_worker_exit');
   });
 
+});
+
+it('normalizes unknown context tiers to 8k fast', () => {
+  expect(normalizeDesktopConfig({ selected_context_tier: 'bogus' }).selected_context_tier).toBe('8k-fast');
+  expect(normalizeDesktopConfig({ selected_context_tier: '64k-full' }).selected_context_tier).toBe('64k-full');
+});
+
+it('persists context tier changes and disables selector while starting operator', async () => {
+  render(<App />);
+
+  const selector = await screen.findByLabelText('Context tier');
+  fireEvent.change(selector, { target: { value: '64k-full' } });
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      'save_config',
+      expect.objectContaining({
+        config: expect.objectContaining({ selected_context_tier: '64k-full' }),
+      })
+    )
+  );
+
+  fireEvent.click(screen.getByText('Start operator'));
+  expect((selector as HTMLSelectElement).disabled).toBe(true);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      'start_compute_node',
+      expect.objectContaining({
+        request: expect.objectContaining({ context_tier: '64k-full' }),
+      })
+    )
+  );
 });

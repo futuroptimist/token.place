@@ -1488,6 +1488,8 @@ class ModelManager:
         self.download_timeout = config.get('model.download_timeout', 30)
         self.models_dir = config.get('paths.models_dir')
         self.model_path = os.path.join(self.models_dir, self.file_name)
+        self.context_tier = None
+        self.context_window_tokens = int(config.get('model.context_size', 8192) or 8192)
 
         # LLM instance and lock for thread safety
         self.llm = None
@@ -1930,7 +1932,7 @@ class ModelManager:
                             self.llm = Llama(
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
+                                n_ctx=self.active_context_window_tokens(),
                                 chat_format=self.config.get('model.chat_format', 'llama-3'),
                                 verbose=llama_cpp_verbose_logging_enabled(),
                             )
@@ -1965,7 +1967,8 @@ class ModelManager:
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
                                 f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
-                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
+                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'} "
+                                f"context_window_tokens={self.active_context_window_tokens()}"
                             )
                             self.worker_state = 'ready'
                             self.last_worker_error_code = None
@@ -1986,6 +1989,21 @@ class ModelManager:
                             return None
 
         return self.llm
+
+    def set_context_profile(self, profile_id: str, context_window_tokens: int) -> None:
+        """Set the single static context profile before Llama construction."""
+        if self.llm is not None:
+            raise RuntimeError("context profile cannot change after Llama initialization")
+        self.context_tier = profile_id
+        self.context_window_tokens = int(context_window_tokens)
+        set_config = getattr(self.config, 'set', None)
+        if callable(set_config):
+            set_config('model.context_size', self.context_window_tokens)
+        elif hasattr(self.config, 'config') and isinstance(self.config.config, dict):
+            self.config.config.setdefault('model', {})['context_size'] = self.context_window_tokens
+
+    def active_context_window_tokens(self) -> int:
+        return int(self.config.get('model.context_size', self.context_window_tokens) or self.context_window_tokens)
 
     def _close_llm_proxy(self, llm: Any) -> None:
         close = getattr(llm, 'close', None)

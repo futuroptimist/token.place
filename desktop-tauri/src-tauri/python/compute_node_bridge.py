@@ -420,7 +420,9 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
         f"backend_available={diagnostics.get('backend_available')} "
         f"fallback_reason={diagnostics.get('fallback_reason') or 'none'} "
         f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
-        f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
+        f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'} "
+        f"context_tier={diagnostics.get('context_tier') or 'unknown'} "
+        f"context_window_tokens={diagnostics.get('context_window_tokens') or 'unknown'}"
     )
 
 
@@ -705,7 +707,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} "
+        f"model={args.model} mode={args.mode} context_tier={getattr(args, 'context_tier', '8k-fast')} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -725,6 +727,7 @@ def run(args: argparse.Namespace) -> int:
             relay_port=target_relay_port,
             use_configured_relay_fallbacks=False,
             relay_urls=(target_relay_url,),
+            context_tier=getattr(args, "context_tier", "8k-fast"),
         )
         if shared_runtime is None:
             return ComputeNodeRuntime(config)
@@ -921,6 +924,8 @@ def run(args: argparse.Namespace) -> int:
             "pip_stdout_tail": runtime_setup.get("pip_stdout_tail"),
             "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
             "model_path": args.model,
+            "context_tier": getattr(runtime.model_manager, "context_tier", getattr(args, "context_tier", "8k-fast")),
+            "context_window_tokens": getattr(runtime.model_manager, "context_window_tokens", None),
             "last_error": relay_errors or current_last_error,
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
@@ -1974,10 +1979,19 @@ def main() -> int:
         help="JSON array or comma-separated relay URL list (can be repeated)",
     )
     parser.add_argument("--relay-port", type=int, default=None)
+    parser.add_argument("--context-tier", default="8k-fast")
     args = parser.parse_args()
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)
+        try:
+            from utils.context_profiles import require_context_profile
+        except ModuleNotFoundError:
+            if args.context_tier not in {"8k-fast", "64k-full"}:
+                raise ValueError(f"unknown or disabled context profile: {args.context_tier!r}")
+        else:
+            args.context_profile = require_context_profile(args.context_tier)
+            args.context_tier = args.context_profile.profile_id
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         message = f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"

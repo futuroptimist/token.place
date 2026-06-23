@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
+use crate::context_profiles::{context_profile, normalize_context_tier};
 use crate::operator_logs::{
     append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
     OperatorLogSink,
@@ -31,6 +32,8 @@ pub struct ComputeNodeRequest {
     #[serde(default)]
     pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
+    #[serde(default = "crate::context_profiles::default_context_tier")]
+    pub context_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,6 +78,8 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    pub context_tier: Option<String>,
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -277,6 +282,9 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        context_tier: Some(normalize_context_tier(&request.context_tier)),
+        context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
+            .map(|profile| profile.total_context_tokens),
     }
 }
 
@@ -448,6 +456,14 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
+    }
+    if let Some(context_tier) = payload.get("context_tier").and_then(Value::as_str) {
+        status.context_tier = Some(normalize_context_tier(context_tier));
+    }
+    if let Some(context_window_tokens) =
+        payload.get("context_window_tokens").and_then(Value::as_u64)
+    {
+        status.context_window_tokens = u32::try_from(context_window_tokens).ok();
     }
     if let Some(sequence) = payload.get("sequence").and_then(Value::as_u64) {
         status.sequence = Some(sequence);
@@ -710,6 +726,9 @@ pub async fn start_compute_node(
         .first()
         .cloned()
         .unwrap_or_else(|| request.relay_base_url.clone());
+    let selected_context_tier = normalize_context_tier(&request.context_tier);
+    let selected_context_profile =
+        context_profile(&selected_context_tier).expect("default context profile should exist");
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -753,9 +772,11 @@ pub async fn start_compute_node(
         &log_sink,
         "desktop.compute_node.session.start",
         &format!(
-            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={} context_tier={} context_window_tokens={}",
             session_id,
-            format!("{:?}", request.mode).to_lowercase()
+            format!("{:?}", request.mode).to_lowercase(),
+            selected_context_profile.id,
+            selected_context_profile.total_context_tokens
         ),
     );
     if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
@@ -890,6 +911,8 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--context-tier")
+        .arg(selected_context_profile.id)
         .args(
             relay_base_urls
                 .iter()
@@ -987,6 +1010,8 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                context_tier: Some(selected_context_profile.id.into()),
+                context_window_tokens: Some(selected_context_profile.total_context_tokens),
             };
             true
         }
@@ -1978,6 +2003,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
+            context_tier: "8k-fast".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -2157,6 +2183,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
+            context_tier: "8k-fast".into(),
         };
 
         let status = startup_failure_status(

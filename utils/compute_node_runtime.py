@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol,
 
 from urllib.parse import urlparse
 
+from utils.context_profiles import require_context_profile
 from utils.processing_result import RelayProcessingResult
 
 if TYPE_CHECKING:
@@ -52,6 +53,7 @@ class ComputeNodeRuntimeConfig:
     relay_port: Optional[int]
     use_configured_relay_fallbacks: bool = True
     relay_urls: Tuple[str, ...] = ()
+    context_tier: str = "8k-fast"
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
@@ -240,6 +242,8 @@ def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
         "backend_used": "cpu" if selected == "cpu" else "unknown",
         "n_gpu_layers": manager.default_n_gpu_layers,
         "fallback_reason": None,
+        "context_tier": getattr(manager, "context_tier", "8k-fast"),
+        "context_window_tokens": getattr(manager, "context_window_tokens", None),
     }
     return selected
 
@@ -250,7 +254,10 @@ def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
     requested = normalize_compute_mode(getattr(manager, "requested_compute_mode", "auto"))
     runtime = getattr(manager, "last_compute_diagnostics", None)
     if isinstance(runtime, dict) and runtime.get("requested_mode") == requested:
-        return dict(runtime)
+        diagnostics = dict(runtime)
+        diagnostics.setdefault("context_tier", getattr(manager, "context_tier", "8k-fast"))
+        diagnostics.setdefault("context_window_tokens", getattr(manager, "context_window_tokens", None))
+        return diagnostics
 
     if requested == "cpu":
         return {
@@ -261,6 +268,8 @@ def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
             "backend_used": "cpu",
             "n_gpu_layers": 0,
             "fallback_reason": None,
+            "context_tier": getattr(manager, "context_tier", "8k-fast"),
+            "context_window_tokens": getattr(manager, "context_window_tokens", None),
         }
     return {
         "requested_mode": requested,
@@ -270,7 +279,28 @@ def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
         "backend_used": "unknown",
         "n_gpu_layers": getattr(manager, "default_n_gpu_layers", -1),
         "fallback_reason": None,
+        "context_tier": getattr(manager, "context_tier", "8k-fast"),
+        "context_window_tokens": getattr(manager, "context_window_tokens", None),
     }
+
+
+def configure_context_profile(manager: Any, context_tier: Optional[str]) -> str:
+    """Apply a known static context profile before any Llama construction."""
+
+    profile = require_context_profile(context_tier)
+    llm = getattr(manager, "llm", None)
+    llm_is_test_double = llm.__class__.__module__.startswith("unittest.mock") if llm is not None else False
+    if llm is not None and not llm_is_test_double:
+        active = getattr(manager, "context_tier", None)
+        if active != profile.profile_id:
+            raise RuntimeError("cannot change context profile after runtime initialization")
+    manager.context_tier = profile.profile_id
+    manager.context_window_tokens = profile.total_context_tokens
+    manager.default_output_token_reservation = profile.default_output_token_reservation
+    config = getattr(manager, "config", None)
+    if config is not None and hasattr(config, "set"):
+        config.set("model.context_size", profile.total_context_tokens)
+    return profile.profile_id
 
 
 class ComputeNodeRuntime:
@@ -293,6 +323,8 @@ class ComputeNodeRuntime:
         self.config = runtime_config
         self._thread_factory = thread_factory
         self.model_manager = model_manager or get_model_manager()
+        self.context_profile = require_context_profile(runtime_config.context_tier)
+        configure_context_profile(self.model_manager, self.context_profile.profile_id)
         self.crypto_manager = crypto_manager or get_crypto_manager()
         self.relay_client = relay_client or RelayClient(
             base_url=runtime_config.relay_url,

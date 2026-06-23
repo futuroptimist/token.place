@@ -91,7 +91,55 @@ describe('desktop app start failure handling', () => {
       relay_base_url: 'https://token.place',
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
+      context_tier: '8k-fast',
     });
+  });
+
+
+  it('persists context tier selection and disables the selector while starting', async () => {
+    let resolveStart: (() => void) | undefined;
+    invokeMock.mockImplementation((command: string, payload?: unknown) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: ['https://token.place'],
+          preferred_mode: 'auto',
+          context_tier: '8k-fast',
+        });
+      }
+      if (command === 'save_config') {
+        return Promise.resolve(payload);
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({ running: false, registered: false });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const selector = (await screen.findByLabelText('Operator context tier')) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: '64k-full' } });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('save_config', {
+        config: expect.objectContaining({ context_tier: '64k-full' }),
+      })
+    );
+
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+    await waitFor(() => expect(selector.disabled).toBe(true));
+    expect(invokeMock).toHaveBeenCalledWith('start_compute_node', {
+      request: expect.objectContaining({ context_tier: '64k-full' }),
+    });
+    resolveStart?.();
   });
 
   const mockInitialCommand = (command: string) => {

@@ -65,9 +65,13 @@ After a successful repair, the sidecar automatically re-execs once so the active
 
 - Prompt/response plaintext stays in-memory by default.
 - The app only persists non-plaintext settings (model path, relay URLs,
-  preferred mode) in app-local config.
+  preferred mode, selected context profile) in app-local config.
 - Relay URLs default to `https://token.place`, remain user-editable while the operator is stopped,
   and migrate automatically from the legacy single Relay URL config field.
+- The operator context profile defaults to `8k-fast` (8,192 tokens). Select `64k-full`
+  (65,536 tokens) before **Start operator** when the local runtime can warm that profile;
+  changing profiles requires **Stop operator** followed by **Start operator** so only one
+  profile is warm per operator process.
 - Log lines are redacted to metadata (byte counts, request ids).
 
 

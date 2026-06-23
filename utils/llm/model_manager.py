@@ -1499,6 +1499,12 @@ class ModelManager:
         self.last_worker_restart_at_ms: Optional[int] = None
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
+        self.context_tier = '8k-fast'
+        try:
+            self.context_window_tokens = int(config.get('model.context_size', 8192))
+        except (TypeError, ValueError):
+            self.context_window_tokens = 8192
+        self.default_output_token_reservation = 512
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -1930,11 +1936,13 @@ class ModelManager:
                             self.llm = Llama(
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
+                                n_ctx=int(getattr(self, 'context_window_tokens', self.config.get('model.context_size', 8192))),
                                 chat_format=self.config.get('model.chat_format', 'llama-3'),
                                 verbose=llama_cpp_verbose_logging_enabled(),
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
+                            compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
+                            compute_plan['context_window_tokens'] = int(getattr(self, 'context_window_tokens', self.config.get('model.context_size', 8192)))
                             compute_plan['kv_cache_device'] = (
                                 compute_plan['backend_used']
                                 if n_gpu_layers < 0

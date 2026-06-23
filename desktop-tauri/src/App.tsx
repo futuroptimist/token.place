@@ -141,7 +141,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   updated_at_ms: null,
   log_file_path: null,
   context_tier: DEFAULT_CONTEXT_TIER,
-  context_window_tokens: 8192,
+  context_window_tokens: null,
 };
 
 function formatErrorMessage(error: unknown): string {

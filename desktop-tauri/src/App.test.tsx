@@ -1630,6 +1630,9 @@ describe('desktop app start failure handling', () => {
 
     fireEvent.change(contextSelect, { target: { value: '64k-full' } });
     await waitFor(() =>
+      expect(screen.getByText(/Context window:/).textContent).toContain('65536')
+    );
+    await waitFor(() =>
       expect(
         invokeMock.mock.calls.some(
           ([command, args]) =>

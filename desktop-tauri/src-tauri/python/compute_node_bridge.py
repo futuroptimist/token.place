@@ -707,7 +707,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} context_tier={get_context_profile(args.context_tier).profile_id} "
+        f"model={args.model} mode={args.mode} context_tier={args.context_tier} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -1984,7 +1984,6 @@ def main() -> int:
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)
-        args.context_tier = get_context_profile(args.context_tier).profile_id
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         message = f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"

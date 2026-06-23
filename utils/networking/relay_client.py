@@ -511,6 +511,8 @@ class RelayClient:
     _API_V1_MAX_MESSAGE_CONTENT_CHARS = 32768
     _API_V1_MAX_TEXT_BLOCKS = 32
     _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
+    _API_V1_MESSAGE_CHARS_PER_CONTEXT_TOKEN = 4
+    _API_V1_TOTAL_CHARS_PER_CONTEXT_TOKEN = 16
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
@@ -1678,15 +1680,28 @@ class RelayClient:
             return dict(message)
         return None
 
-    @classmethod
-    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
+    def _api_v1_message_content_char_limit(self) -> int:
+        context_window_tokens = getattr(self.model_manager, "context_window_tokens", None)
+        if not isinstance(context_window_tokens, int) or context_window_tokens <= 8192:
+            return self._API_V1_MAX_MESSAGE_CONTENT_CHARS
+        return context_window_tokens * self._API_V1_MESSAGE_CHARS_PER_CONTEXT_TOKEN
+
+    def _api_v1_total_request_char_limit(self) -> int:
+        context_window_tokens = getattr(self.model_manager, "context_window_tokens", None)
+        if not isinstance(context_window_tokens, int) or context_window_tokens <= 8192:
+            return self._API_V1_MAX_TOTAL_REQUEST_CHARS
+        return context_window_tokens * self._API_V1_TOTAL_CHARS_PER_CONTEXT_TOKEN
+
+    def _messages_are_valid_api_v1_chat(self, messages: Any) -> bool:
         if (
             not isinstance(messages, list)
             or not messages
-            or len(messages) > cls._API_V1_MAX_MESSAGES
+            or len(messages) > self._API_V1_MAX_MESSAGES
         ):
             return False
         total_content_chars = 0
+        message_content_char_limit = self._api_v1_message_content_char_limit()
+        total_request_char_limit = self._api_v1_total_request_char_limit()
         for message in messages:
             if not isinstance(message, dict):
                 return False
@@ -1696,7 +1711,7 @@ class RelayClient:
             role = message.get("role")
             if (
                 not isinstance(role, str)
-                or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES
+                or role not in self._API_V1_ALLOWED_MESSAGE_ROLES
             ):
                 return False
             name = message.get("name")
@@ -1704,11 +1719,14 @@ class RelayClient:
                 return False
             if "content" not in message:
                 return False
-            content_size = cls._api_v1_content_validation_size(message.get("content"))
+            content_size = self._api_v1_content_validation_size(
+                message.get("content"),
+                message_content_char_limit=message_content_char_limit,
+            )
             if content_size is None:
                 return False
             total_content_chars += content_size
-            if total_content_chars > cls._API_V1_MAX_TOTAL_REQUEST_CHARS:
+            if total_content_chars > total_request_char_limit:
                 return False
         return True
 
@@ -2085,9 +2103,12 @@ class RelayClient:
         return True, None, None, normalised
 
     @classmethod
-    def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
+    def _api_v1_content_validation_size(
+        cls, content: Any, *, message_content_char_limit: Optional[int] = None
+    ) -> Optional[int]:
+        message_limit = message_content_char_limit or cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
         if isinstance(content, str):
-            if len(content) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS:
+            if len(content) > message_limit:
                 return None
             return len(content)
         if (
@@ -2108,8 +2129,8 @@ class RelayClient:
                 return None
             total += len(text)
             if (
-                len(text) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-                or total > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
+                len(text) > message_limit
+                or total > message_limit
             ):
                 return None
         return total

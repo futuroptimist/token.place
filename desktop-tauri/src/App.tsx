@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
+type ContextTier = '8k-fast' | '64k-full';
 
 interface BackendInfo {
   platform_label: string;
@@ -18,16 +19,22 @@ interface DesktopConfig {
   relay_base_url: string;
   relay_base_urls: string[];
   preferred_mode: BackendMode;
+  context_tier: ContextTier;
 }
 
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
+const CONTEXT_TIER_WINDOWS: Record<ContextTier, number> = {
+  '8k-fast': 8192,
+  '64k-full': 65536,
+};
 export const MAX_RELAY_BASE_URLS = 10;
 
-type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_base_url' | 'relay_base_urls' | 'preferred_mode'> & {
+type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_base_url' | 'relay_base_urls' | 'preferred_mode' | 'context_tier'> & {
   model_path?: unknown;
   relay_base_url?: unknown;
   relay_base_urls?: unknown;
   preferred_mode?: unknown;
+  context_tier?: unknown;
 };
 
 interface RelayStatus {
@@ -74,6 +81,8 @@ interface ComputeNodeStatus {
   sequence: number | null;
   updated_at_ms: number | null;
   log_file_path: string | null;
+  context_tier: string | null;
+  context_window_tokens: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -129,6 +138,8 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
+  context_tier: null,
+  context_window_tokens: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -203,6 +214,10 @@ export function normalizeRelayUrls(
   return normalized;
 }
 
+function normalizeContextTier(contextTier: unknown): ContextTier {
+  return contextTier === '64k-full' || contextTier === '8k-fast' ? contextTier : '8k-fast';
+}
+
 function normalizeBackendMode(preferredMode: unknown): BackendMode {
   return preferredMode === 'cpu' ||
     preferredMode === 'gpu' ||
@@ -220,6 +235,7 @@ export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopCon
     relay_base_url: relayBaseUrls[0] || DEFAULT_RELAY_BASE_URL,
     relay_base_urls: relayBaseUrls,
     preferred_mode: normalizeBackendMode(config.preferred_mode),
+    context_tier: normalizeContextTier(config.context_tier),
   };
 }
 
@@ -473,6 +489,7 @@ export function App() {
     relay_base_url: DEFAULT_RELAY_BASE_URL,
     relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
+    context_tier: '8k-fast',
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
@@ -607,6 +624,7 @@ export function App() {
   );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
+  const contextTierControlsDisabled = computeStatus.running || isStartingComputeNode;
 
   const scheduleConfigSave = (next: DesktopConfig) => {
     if (saveTimerRef.current !== null) {
@@ -671,6 +689,7 @@ export function App() {
           model_path: config.model_path,
           prompt,
           mode: config.preferred_mode,
+          context_tier: config.context_tier,
         },
       });
     } catch (e) {
@@ -718,6 +737,8 @@ export function App() {
         worker_state: 'starting',
         worker_alive: false,
         log_file_path: null,
+        context_tier: config.context_tier,
+        context_window_tokens: CONTEXT_TIER_WINDOWS[config.context_tier],
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -727,6 +748,7 @@ export function App() {
           relay_base_url: primaryRelayUrl(config),
           relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
+          context_tier: config.context_tier,
         },
       });
     } catch (e) {
@@ -868,6 +890,21 @@ export function App() {
         partial offload. Unsupported platforms fall back to CPU with diagnostics.
       </p>
 
+
+      <label htmlFor="context-tier-select" style={{ display: 'block', marginTop: 12 }}>Context tier</label>
+      <select
+        id="context-tier-select"
+        value={config.context_tier}
+        disabled={contextTierControlsDisabled}
+        onChange={(e) => updateConfig({ ...config, context_tier: e.target.value as ContextTier })}
+      >
+        <option value="8k-fast">8K Fast</option>
+        <option value="64k-full">64K Full</option>
+      </select>
+      <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
+        Changing context tiers requires Stop Operator followed by Start Operator. One selected tier is warm per operator process.
+      </p>
+
       <section aria-labelledby="relay-urls-heading" style={{ marginTop: 12 }}>
         <h2 id="relay-urls-heading" style={{ fontSize: 16, marginBottom: 8 }}>Relay URLs</h2>
         {(computeStatus.running || isStartingComputeNode) && (
@@ -927,6 +964,8 @@ export function App() {
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{formatRegisteredLabel(computeStatus, normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length)}</strong></p>
+        <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
+        <p style={{ marginBottom: 0 }}>Context window tokens: <code>{(computeStatus.context_window_tokens ?? CONTEXT_TIER_WINDOWS[config.context_tier]).toLocaleString()}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>

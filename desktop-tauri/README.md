@@ -65,11 +65,26 @@ After a successful repair, the sidecar automatically re-execs once so the active
 
 - Prompt/response plaintext stays in-memory by default.
 - The app only persists non-plaintext settings (model path, relay URLs,
-  preferred mode) in app-local config.
+  preferred mode, and selected context tier) in app-local config.
 - Relay URLs default to `https://token.place`, remain user-editable while the operator is stopped,
   and migrate automatically from the legacy single Relay URL config field.
 - Log lines are redacted to metadata (byte counts, request ids).
 
+
+
+## Context-tier selection
+
+The Compute node operator panel offers one stopped-only context tier selector before
+**Start operator**:
+
+- **8K Fast** (`8k-fast`) warms an 8,192-token llama.cpp context.
+- **64K Full** (`64k-full`) warms a 65,536-token llama.cpp context.
+
+The selected tier is persisted with the desktop config and is passed as a stable
+profile ID through Rust into the Python bridge. The bridge resolves that profile
+before warm-load and sets `model.context_size` before constructing the single
+`Llama` runtime. Changing tiers requires **Stop operator**, choosing the new tier,
+and then **Start operator** again; only one profile is warm per operator process.
 
 ## Multi-relay compute-node operation
 

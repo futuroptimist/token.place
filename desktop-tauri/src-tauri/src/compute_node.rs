@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
+use crate::context_profiles::{context_profile, normalize_context_tier};
 use crate::operator_logs::{
     append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
     OperatorLogSink,
@@ -31,6 +32,8 @@ pub struct ComputeNodeRequest {
     #[serde(default)]
     pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
+    #[serde(default = "crate::context_profiles::default_context_tier")]
+    pub context_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,6 +78,8 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    pub context_tier: Option<String>,
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -277,6 +282,9 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        context_tier: Some(normalize_context_tier(&request.context_tier)),
+        context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
+            .map(|profile| profile.total_context_tokens),
     }
 }
 
@@ -451,6 +459,14 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(sequence) = payload.get("sequence").and_then(Value::as_u64) {
         status.sequence = Some(sequence);
+    }
+    if let Some(context_tier) = payload.get("context_tier").and_then(Value::as_str) {
+        status.context_tier = Some(context_tier.into());
+    }
+    if let Some(context_window_tokens) =
+        payload.get("context_window_tokens").and_then(Value::as_u64)
+    {
+        status.context_window_tokens = Some(context_window_tokens as u32);
     }
     if let Some(updated_at_ms) = payload.get("updated_at_ms").and_then(Value::as_u64) {
         status.updated_at_ms = Some(updated_at_ms);
@@ -632,6 +648,8 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "last_error",
         "configured_relay_count",
         "registered_relay_count",
+        "context_tier",
+        "context_window_tokens",
     ] {
         if let Some(value) = map.get(key) {
             summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
@@ -706,6 +724,10 @@ pub async fn start_compute_node(
 ) -> anyhow::Result<()> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let relay_base_urls = normalized_request_relay_urls(&request);
+    let context_tier = normalize_context_tier(&request.context_tier);
+    let context_window_tokens = context_profile(&context_tier)
+        .map(|profile| profile.total_context_tokens)
+        .ok_or_else(|| anyhow::anyhow!("unknown context profile after normalization"))?;
     let primary_relay_url = relay_base_urls
         .first()
         .cloned()
@@ -890,6 +912,8 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--context-tier")
+        .arg(&context_tier)
         .args(
             relay_base_urls
                 .iter()
@@ -987,6 +1011,8 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                context_tier: Some(context_tier.clone()),
+                context_window_tokens: Some(context_window_tokens),
             };
             true
         }
@@ -1978,6 +2004,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
+            context_tier: "64k-full".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -2157,6 +2184,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
+            context_tier: "missing".into(),
         };
 
         let status = startup_failure_status(

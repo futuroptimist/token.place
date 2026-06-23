@@ -93,6 +93,8 @@ class FakeModelManager:
         self.default_n_gpu_layers = -1
         self.requested_compute_mode = 'auto'
         self.last_compute_diagnostics = None
+        self.config_values = {}
+        self.config = SimpleNamespace(set=lambda key, value: self.config_values.__setitem__(key, value))
 
     def worker_lifecycle_status(self):
         return {
@@ -2040,6 +2042,29 @@ def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
         encoding='utf-8',
     )
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_dir / 'context_profiles.py').write_text(
+        """
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ContextProfile:
+    profile_id: str
+    display_label: str
+    total_context_tokens: int
+    default_output_reservation: int
+
+
+def resolve_context_profile(profile_id):
+    if profile_id == '64k-full':
+        return ContextProfile('64k-full', '64K Full', 65536, 1024)
+    if profile_id == '8k-fast':
+        return ContextProfile('8k-fast', '8K Fast', 8192, 512)
+    raise ValueError(f'unknown or disabled context profile: {profile_id}')
+""".strip()
+        + "\n",
+        encoding='utf-8',
+    )
+
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
 SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
@@ -2091,8 +2116,14 @@ class _RelayClient:
         self.relay_url = relay_url
 
 
+class _Config:
+    def set(self, _key, _value):
+        return None
+
+
 class _ModelManager:
     model_path = ""
+    config = _Config()
 
 
 class ComputeNodeRuntime:
@@ -4375,3 +4406,16 @@ def test_api_v1_unhealthy_result_without_recovery_attempt_sets_terminal_state(
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get('type') == 'status']
     assert status_events[-1]['relay_runtime_state'] == expected_state
+
+
+
+def test_context_profile_registry_validates_known_profiles():
+    from utils.context_profiles import normalize_context_tier, resolve_context_profile
+
+    full = resolve_context_profile('64k-full')
+
+    assert full.display_label == '64K Full'
+    assert full.total_context_tokens == 65536
+    assert normalize_context_tier('missing') == '8k-fast'
+    with pytest.raises(ValueError):
+        resolve_context_profile('missing')

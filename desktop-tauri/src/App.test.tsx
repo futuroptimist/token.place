@@ -91,6 +91,7 @@ describe('desktop app start failure handling', () => {
       relay_base_url: 'https://token.place',
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
+      context_tier: '8k-fast',
     });
   });
 
@@ -108,6 +109,7 @@ describe('desktop app start failure handling', () => {
         model_path: '/tmp/model.gguf',
         relay_base_url: 'https://token.place',
         preferred_mode: 'auto',
+        context_tier: '8k-fast',
       });
     }
     if (command === 'get_compute_node_status') {
@@ -187,6 +189,13 @@ describe('desktop app start failure handling', () => {
       return Promise.resolve(undefined);
     });
   };
+
+
+
+  it('normalizes context tier values', () => {
+    expect(normalizeDesktopConfig({ context_tier: '64k-full' }).context_tier).toBe('64k-full');
+    expect(normalizeDesktopConfig({ context_tier: 'unknown' }).context_tier).toBe('8k-fast');
+  });
 
   it('moves local inference from starting to failed when invoke rejects', async () => {
     invokeMock.mockImplementation((command: string) => {

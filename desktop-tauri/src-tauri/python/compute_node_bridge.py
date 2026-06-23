@@ -682,6 +682,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        from utils.context_profiles import resolve_context_profile
         from utils.compute_node_runtime import (
             apply_compute_mode,
             compute_mode_diagnostics,
@@ -693,6 +694,12 @@ def run(args: argparse.Namespace) -> int:
         )
     except ModuleNotFoundError as exc:
         emit_startup_error(f"runtime unavailable: {exc}")
+        return 1
+
+    try:
+        context_profile = resolve_context_profile(getattr(args, "context_tier", "8k-fast"))
+    except ValueError as exc:
+        emit_startup_error(str(exc))
         return 1
 
     relay_urls = _normalize_relay_urls(
@@ -708,7 +715,9 @@ def run(args: argparse.Namespace) -> int:
         f"model={args.model} mode={args.mode} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
-        f"relay_port={relay_port if relay_port is not None else 'none'}",
+        f"relay_port={relay_port if relay_port is not None else 'none'} "
+        f"context_tier={context_profile.profile_id} "
+        f"context_window_tokens={context_profile.total_context_tokens}",
         file=sys.stderr,
     )
     for configured_relay_url in relay_urls:
@@ -761,6 +770,9 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
+    runtime.model_manager.config.set("model.context_size", context_profile.total_context_tokens)
+    runtime.model_manager.context_tier = context_profile.profile_id
+    runtime.model_manager.context_window_tokens = context_profile.total_context_tokens
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
@@ -927,6 +939,8 @@ def run(args: argparse.Namespace) -> int:
             "warm_load_duration_ms": warm_load_duration_ms,
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
+            "context_tier": context_profile.profile_id,
+            "context_window_tokens": context_profile.total_context_tokens,
         }
         payload.update(worker_lifecycle_status())
         if extra:
@@ -1974,6 +1988,7 @@ def main() -> int:
         help="JSON array or comma-separated relay URL list (can be repeated)",
     )
     parser.add_argument("--relay-port", type=int, default=None)
+    parser.add_argument("--context-tier", default="8k-fast", choices=["8k-fast", "64k-full"])
     args = parser.parse_args()
 
     try:

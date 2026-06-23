@@ -290,6 +290,7 @@ class TestModelManager:
         mock_llama.assert_called_once()
         kwargs = mock_llama.call_args.kwargs
         assert kwargs['n_gpu_layers'] == 0
+        assert kwargs['n_ctx'] == 2048
         mock_can_allocate.assert_called_once()
 
     @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)

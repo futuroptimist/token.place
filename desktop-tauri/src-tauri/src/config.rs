@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::context_profiles::{default_context_tier, normalize_context_tier};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,8 @@ pub struct DesktopConfig {
     pub relay_base_urls: Vec<String>,
     #[serde(default = "default_compute_mode")]
     pub preferred_mode: ComputeMode,
+    #[serde(default = "default_context_tier")]
+    pub context_tier: String,
 }
 
 fn default_relay_base_url() -> String {
@@ -63,6 +66,7 @@ impl DesktopConfig {
             .first()
             .cloned()
             .unwrap_or_else(default_relay_base_url);
+        self.context_tier = normalize_context_tier(&self.context_tier);
         self
     }
 }
@@ -74,6 +78,7 @@ impl Default for DesktopConfig {
             relay_base_url: DEFAULT_RELAY_BASE_URL.into(),
             relay_base_urls: vec![DEFAULT_RELAY_BASE_URL.into()],
             preferred_mode: ComputeMode::Auto,
+            context_tier: default_context_tier(),
         }
     }
 }
@@ -89,6 +94,7 @@ mod tests {
         let config = DesktopConfig::default();
         assert_eq!(config.relay_base_url, DEFAULT_RELAY_BASE_URL);
         assert_eq!(config.relay_base_urls, vec![DEFAULT_RELAY_BASE_URL]);
+        assert_eq!(config.context_tier, "8k-fast");
     }
 
     #[test]
@@ -106,6 +112,7 @@ mod tests {
         assert_eq!(config.relay_base_url, "https://staging.token.place");
         assert_eq!(config.relay_base_urls, vec!["https://staging.token.place"]);
         assert_eq!(config.model_path, "/tmp/model.gguf");
+        assert_eq!(config.context_tier, "8k-fast");
     }
 
     #[test]
@@ -161,6 +168,16 @@ mod tests {
                 "https://relay-10.example",
             ]
         );
+    }
+
+    #[test]
+    fn unknown_context_tier_normalizes_to_default() {
+        let config = DesktopConfig {
+            context_tier: "bogus".into(),
+            ..DesktopConfig::default()
+        }
+        .normalized();
+        assert_eq!(config.context_tier, "8k-fast");
     }
 
     #[test]

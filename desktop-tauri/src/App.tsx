@@ -160,9 +160,9 @@ function isStoppedOrIdleOperatorStatus(status: ComputeNodeStatus, isStarting: bo
   const relayRuntimeState = status.relay_runtime_state?.trim().toLowerCase() || 'idle';
   const warmLoadState = status.warm_load_state?.trim().toLowerCase() || 'idle';
   return (
-    (workerState === 'stopped' || workerState === 'idle') &&
-    (relayRuntimeState === 'stopped' || relayRuntimeState === 'idle') &&
-    (warmLoadState === 'stopped' || warmLoadState === 'idle')
+    (workerState === 'stopped' || workerState === 'idle' || workerState === 'failed') &&
+    (relayRuntimeState === 'stopped' || relayRuntimeState === 'idle' || relayRuntimeState === 'failed') &&
+    (warmLoadState === 'stopped' || warmLoadState === 'idle' || warmLoadState === 'failed')
   );
 }
 

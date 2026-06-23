@@ -1660,18 +1660,19 @@ describe('desktop app start failure handling', () => {
   });
 
   it.each([
-    ['starting', { running: false, worker_state: 'starting', relay_runtime_state: 'starting' }],
-    ['warming', { running: false, worker_state: 'warming', warm_load_state: 'warming' }],
-    ['running', { running: true, worker_state: 'ready', relay_runtime_state: 'ready' }],
-    ['stopping', { running: false, worker_state: 'stopping', relay_runtime_state: 'stopping' }],
-    ['recovering', { running: false, worker_state: 'recovering', relay_runtime_state: 'recovering' }],
-  ])('disables context tier selection while operator is %s', async (_label, statusOverrides) => {
+    ['starting', { running: false, worker_state: 'starting', relay_runtime_state: 'starting' }, true],
+    ['warming', { running: false, worker_state: 'warming', warm_load_state: 'warming' }, true],
+    ['running', { running: true, worker_state: 'ready', relay_runtime_state: 'ready' }, true],
+    ['stopping', { running: false, worker_state: 'stopping', relay_runtime_state: 'stopping' }, true],
+    ['recovering', { running: false, worker_state: 'recovering', relay_runtime_state: 'recovering' }, true],
+    ['failed', { running: false, worker_state: 'failed', relay_runtime_state: 'failed', warm_load_state: 'failed' }, false],
+  ])('sets context tier disabled=%s while operator is %s', async (_label, statusOverrides, expectedDisabled) => {
     mockInitialComputeStatus(statusOverrides);
 
     render(<App />);
     const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
 
-    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+    await waitFor(() => expect(contextSelect.disabled).toBe(expectedDisabled));
   });
 
   it('renders worker lifecycle fields and ignores stale worker generations', async () => {

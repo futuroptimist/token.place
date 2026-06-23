@@ -1517,6 +1517,8 @@ class ModelManager:
             'backend_used': 'unknown',
             'n_gpu_layers': self.default_n_gpu_layers,
             'fallback_reason': None,
+            'context_tier': getattr(self, 'context_tier', '8k-fast'),
+            'context_window_tokens': config.get('model.context_size', 8192),
         }
 
     def _runtime_capabilities(self=None) -> Dict[str, Any]:
@@ -1935,6 +1937,8 @@ class ModelManager:
                                 verbose=llama_cpp_verbose_logging_enabled(),
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
+                            compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
+                            compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)
                             compute_plan['kv_cache_device'] = (
                                 compute_plan['backend_used']
                                 if n_gpu_layers < 0

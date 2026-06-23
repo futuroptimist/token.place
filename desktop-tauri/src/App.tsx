@@ -5,6 +5,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
+type ContextTier = '8k-fast' | '64k-full';
+
+const CONTEXT_PROFILES: Array<{ id: ContextTier; displayLabel: string; totalContextTokens: number; enabled: boolean }> = [
+  { id: '8k-fast', displayLabel: '8K Fast', totalContextTokens: 8192, enabled: true },
+  { id: '64k-full', displayLabel: '64K Full', totalContextTokens: 65536, enabled: true },
+];
+const DEFAULT_CONTEXT_TIER: ContextTier = '8k-fast';
 
 interface BackendInfo {
   platform_label: string;
@@ -18,6 +25,7 @@ interface DesktopConfig {
   relay_base_url: string;
   relay_base_urls: string[];
   preferred_mode: BackendMode;
+  context_tier: ContextTier;
 }
 
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
@@ -28,6 +36,7 @@ type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_b
   relay_base_url?: unknown;
   relay_base_urls?: unknown;
   preferred_mode?: unknown;
+  context_tier?: unknown;
 };
 
 interface RelayStatus {
@@ -74,6 +83,8 @@ interface ComputeNodeStatus {
   sequence: number | null;
   updated_at_ms: number | null;
   log_file_path: string | null;
+  context_tier: string | null;
+  context_window_tokens: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -129,6 +140,8 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
+  context_tier: DEFAULT_CONTEXT_TIER,
+  context_window_tokens: 8192,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -203,6 +216,10 @@ export function normalizeRelayUrls(
   return normalized;
 }
 
+function normalizeContextTier(contextTier: unknown): ContextTier {
+  return contextTier === '64k-full' || contextTier === '8k-fast' ? contextTier : DEFAULT_CONTEXT_TIER;
+}
+
 function normalizeBackendMode(preferredMode: unknown): BackendMode {
   return preferredMode === 'cpu' ||
     preferredMode === 'gpu' ||
@@ -220,6 +237,7 @@ export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopCon
     relay_base_url: relayBaseUrls[0] || DEFAULT_RELAY_BASE_URL,
     relay_base_urls: relayBaseUrls,
     preferred_mode: normalizeBackendMode(config.preferred_mode),
+    context_tier: normalizeContextTier(config.context_tier),
   };
 }
 
@@ -439,6 +457,10 @@ function mergeComputeStatusEvent(
     sequence: payloadSequence ?? prev.sequence,
     updated_at_ms:
       typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
+    context_tier:
+      typeof payload.context_tier === 'string' ? normalizeContextTier(payload.context_tier) : prev.context_tier,
+    context_window_tokens:
+      typeof payload.context_window_tokens === 'number' ? payload.context_window_tokens : prev.context_window_tokens,
     log_file_path:
       payload.log_file_path === null
         ? null
@@ -473,6 +495,7 @@ export function App() {
     relay_base_url: DEFAULT_RELAY_BASE_URL,
     relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
+    context_tier: DEFAULT_CONTEXT_TIER,
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
@@ -727,6 +750,7 @@ export function App() {
           relay_base_url: primaryRelayUrl(config),
           relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
+          context_tier: config.context_tier,
         },
       });
     } catch (e) {
@@ -916,6 +940,21 @@ export function App() {
 
       <section style={{ marginTop: 14, border: '1px solid #ddd', padding: 12 }}>
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
+        <label style={{ display: 'block', marginBottom: 8 }}>
+          Context tier
+          <select
+            aria-label="Context tier"
+            value={config.context_tier}
+            disabled={computeStatus.running || isStartingComputeNode}
+            onChange={(event) => updateConfig({ ...config, context_tier: normalizeContextTier(event.target.value) })}
+            style={{ display: 'block', marginTop: 4 }}
+          >
+            {CONTEXT_PROFILES.filter((profile) => profile.enabled).map((profile) => (
+              <option key={profile.id} value={profile.id}>{profile.displayLabel}</option>
+            ))}
+          </select>
+        </label>
+        <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>Changing tiers requires Stop Operator followed by Start Operator.</p>
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
@@ -928,6 +967,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{formatRegisteredLabel(computeStatus, normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length)}</strong></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
+        <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
+        <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Worker state: <strong>{displayStatusValue(computeStatus.worker_state, computeStatus.running ? 'starting' : 'stopped')}</strong></p>

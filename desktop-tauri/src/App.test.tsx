@@ -91,6 +91,7 @@ describe('desktop app start failure handling', () => {
       relay_base_url: 'https://token.place',
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
+      context_tier: '8k-fast',
     });
   });
 
@@ -1603,11 +1604,54 @@ describe('desktop app start failure handling', () => {
           ([command, args]) =>
             command === 'start_compute_node' &&
             args?.request?.relay_base_url === 'https://token.place' &&
+            args?.request?.context_tier === '8k-fast' &&
             JSON.stringify(args?.request?.relay_base_urls) ===
               JSON.stringify(['https://token.place', 'https://staging.token.place'])
         )
       ).toBe(true)
     );
+  });
+
+
+  it('persists context tier selection and disables it while operator is starting', async () => {
+    let startResolve: (() => void) | null = null;
+    invokeMock.mockImplementation((command: string, args?: unknown) => {
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          startResolve = resolve;
+        });
+      }
+      return mockInitialCommand(command, args);
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+
+    fireEvent.change(contextSelect, { target: { value: '64k-full' } });
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'save_config' &&
+            args?.config?.context_tier === '64k-full'
+        )
+      ).toBe(true)
+    );
+
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    expect(contextSelect.disabled).toBe(true);
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'start_compute_node' &&
+            args?.request?.context_tier === '64k-full'
+        )
+      ).toBe(true)
+    );
+
+    startResolve?.();
   });
 
   it('renders worker lifecycle fields and ignores stale worker generations', async () => {

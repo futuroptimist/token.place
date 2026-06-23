@@ -325,6 +325,41 @@ class TestModelManager:
         assert kwargs['n_gpu_layers'] == -1
         mock_can_allocate.assert_called_once_with(4_000_000_000, headroom_percent=0.1)
 
+
+    def test_selected_context_profile_reaches_llama_n_ctx(self, model_manager):
+        """Selected desktop context profile controls Llama n_ctx construction."""
+        from utils.context_profiles import apply_context_profile
+
+        instance = MagicMock()
+        mock_llama = MagicMock(return_value=instance)
+        model_manager.config.get.side_effect = None
+        model_manager.config.get.return_value = None
+        model_manager.config.get.side_effect = lambda key, default=None: {
+            'model.context_size': 2048,
+            'model.chat_format': 'llama-3',
+        }.get(key, self._mock_config_get(key, default))
+        apply_context_profile(model_manager, '64k-full')
+        model_manager.config.get.side_effect = lambda key, default=None: {
+            'model.context_size': 65536,
+            'model.chat_format': 'llama-3',
+        }.get(key, self._mock_config_get(key, default))
+
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)), \
+             patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=True), \
+             patch('utils.llm.model_manager.os.path.exists', return_value=True), \
+             patch.object(model_manager, '_runtime_capabilities', return_value={
+                 'backend': 'cuda',
+                 'gpu_offload_supported': True,
+                 'detected_device': 'cuda',
+                 'llama_module_path': 'unknown',
+                 'error': None,
+             }):
+            result = model_manager.get_llm_instance()
+
+        assert result is instance
+        assert mock_llama.call_args.kwargs['n_ctx'] == 65536
+        assert model_manager.last_compute_diagnostics['context_window_tokens'] == 65536
+
     def test_get_llm_instance_skips_headroom_when_size_unknown(self, model_manager):
         """If the model size cannot be determined we skip the headroom check."""
 

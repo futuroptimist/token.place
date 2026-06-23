@@ -2118,6 +2118,10 @@ class ComputeNodeRuntime:
         + "\n",
         encoding='utf-8',
     )
+    (utils_dir / 'context_profiles.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / 'context_profiles.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
 
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)

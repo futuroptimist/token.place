@@ -27,6 +27,7 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
+from utils.context_profiles import apply_context_profile, get_context_profile
 
 try:
     from desktop_runtime_setup import (
@@ -61,7 +62,6 @@ except ModuleNotFoundError:
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
     ) -> None:
         return
-
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     try:
@@ -695,6 +695,8 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
+    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
+
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
         getattr(args, "relay_urls", None),
@@ -705,7 +707,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} "
+        f"model={args.model} mode={args.mode} context_tier={get_context_profile(args.context_tier).profile_id} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -761,6 +763,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
+    context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
@@ -921,6 +924,8 @@ def run(args: argparse.Namespace) -> int:
             "pip_stdout_tail": runtime_setup.get("pip_stdout_tail"),
             "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
             "model_path": args.model,
+            "context_tier": context_profile.profile_id,
+            "context_window_tokens": context_profile.total_context_tokens,
             "last_error": relay_errors or current_last_error,
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
@@ -1974,10 +1979,12 @@ def main() -> int:
         help="JSON array or comma-separated relay URL list (can be repeated)",
     )
     parser.add_argument("--relay-port", type=int, default=None)
+    parser.add_argument("--context-tier", default="8k-fast")
     args = parser.parse_args()
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)
+        args.context_tier = get_context_profile(args.context_tier).profile_id
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         message = f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"

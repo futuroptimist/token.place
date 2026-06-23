@@ -240,6 +240,8 @@ def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
         "backend_used": "cpu" if selected == "cpu" else "unknown",
         "n_gpu_layers": manager.default_n_gpu_layers,
         "fallback_reason": None,
+        "context_tier": getattr(manager, "context_tier", "8k-fast"),
+        "context_window_tokens": getattr(manager, "context_window_tokens", None),
     }
     return selected
 
@@ -270,6 +272,8 @@ def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
         "backend_used": "unknown",
         "n_gpu_layers": getattr(manager, "default_n_gpu_layers", -1),
         "fallback_reason": None,
+        "context_tier": getattr(manager, "context_tier", "8k-fast"),
+        "context_window_tokens": getattr(manager, "context_window_tokens", None),
     }
 
 

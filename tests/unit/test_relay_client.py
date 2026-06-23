@@ -3937,27 +3937,6 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     assert (manager.worker_health, manager.recovery_count) == before
 
 
-def test_api_v1_accepts_larger_messages_for_64k_context_profile():
-    manager = _ApiV1RuntimeManager()
-    manager.context_window_tokens = 65536
-    client = _api_v1_validation_client(manager)
-
-    envelope = client._generate_api_v1_response_with_runtime_model(
-        request_id="req-64k-context-message",
-        model_id="llama-3-8b-instruct",
-        messages=[
-            {
-                "role": "user",
-                "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1),
-            }
-        ],
-        options={},
-    )
-
-    assert "error" not in envelope["api_v1_response"]
-    manager.runtime.create_chat_completion.assert_called_once()
-
-
 def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)

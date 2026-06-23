@@ -140,7 +140,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   sequence: null,
   updated_at_ms: null,
   log_file_path: null,
-  context_tier: DEFAULT_CONTEXT_TIER,
+  context_tier: null,
   context_window_tokens: null,
 };
 
@@ -150,6 +150,20 @@ function formatErrorMessage(error: unknown): string {
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
+}
+
+function isStoppedOrIdleOperatorStatus(status: ComputeNodeStatus, isStarting: boolean): boolean {
+  if (isStarting || status.running) {
+    return false;
+  }
+  const workerState = status.worker_state?.trim().toLowerCase() || 'stopped';
+  const relayRuntimeState = status.relay_runtime_state?.trim().toLowerCase() || 'idle';
+  const warmLoadState = status.warm_load_state?.trim().toLowerCase() || 'idle';
+  return (
+    (workerState === 'stopped' || workerState === 'idle') &&
+    (relayRuntimeState === 'stopped' || relayRuntimeState === 'idle') &&
+    (warmLoadState === 'stopped' || warmLoadState === 'idle')
+  );
 }
 
 function stringArrayPayload(value: unknown): string[] {
@@ -628,6 +642,10 @@ export function App() {
     () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
     [config.model_path, computeStatus.running, isStartingComputeNode]
   );
+  const canChangeContextTier = useMemo(
+    () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode),
+    [computeStatus, isStartingComputeNode]
+  );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
 
@@ -945,7 +963,7 @@ export function App() {
           <select
             aria-label="Context tier"
             value={config.context_tier}
-            disabled={computeStatus.running || isStartingComputeNode}
+            disabled={!canChangeContextTier}
             onChange={(event) => updateConfig({ ...config, context_tier: normalizeContextTier(event.target.value) })}
             style={{ display: 'block', marginTop: 4 }}
           >

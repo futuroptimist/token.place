@@ -1613,7 +1613,7 @@ describe('desktop app start failure handling', () => {
   });
 
 
-  it('persists context tier selection and disables it while operator is starting', async () => {
+  it('persists 64k context tier while stopped, displays selected window, and starts by stable profile ID only', async () => {
     let startResolve: (() => void) | null = null;
     invokeMock.mockImplementation((command: string, args?: unknown) => {
       if (command === 'start_compute_node') {
@@ -1649,12 +1649,29 @@ describe('desktop app start failure handling', () => {
         invokeMock.mock.calls.some(
           ([command, args]) =>
             command === 'start_compute_node' &&
-            args?.request?.context_tier === '64k-full'
+            args?.request?.context_tier === '64k-full' &&
+            args?.request?.n_ctx === undefined &&
+            args?.request?.context_window_tokens === undefined
         )
       ).toBe(true)
     );
 
     startResolve?.();
+  });
+
+  it.each([
+    ['starting', { running: false, worker_state: 'starting', relay_runtime_state: 'starting' }],
+    ['warming', { running: false, worker_state: 'warming', warm_load_state: 'warming' }],
+    ['running', { running: true, worker_state: 'ready', relay_runtime_state: 'ready' }],
+    ['stopping', { running: false, worker_state: 'stopping', relay_runtime_state: 'stopping' }],
+    ['recovering', { running: false, worker_state: 'recovering', relay_runtime_state: 'recovering' }],
+  ])('disables context tier selection while operator is %s', async (_label, statusOverrides) => {
+    mockInitialComputeStatus(statusOverrides);
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
   });
 
   it('renders worker lifecycle fields and ignores stale worker generations', async () => {

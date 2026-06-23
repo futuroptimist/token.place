@@ -200,7 +200,10 @@ Safe diagnostics must stay coarse. They may include backend class, readiness,
 coarse throughput bands, configured token limits, and queue/in-flight counts.
 They must not include hostname, device serial number, raw VRAM inventory,
 prompt/message content, user identifiers, or exact token counts for decrypted
-requests.
+requests. Relay-visible tuning fields such as `gpu_layers` are allowed only as
+coarse non-identifying policy labels such as `runtime_default`, `auto`, or
+`profile_default`; they must never expose raw layer counts, device-derived
+tuning detail, or per-device calibration values.
 
 ## Manual desktop tier selection
 
@@ -279,7 +282,13 @@ Forbidden fields:
 - raw VRAM/system RAM inventory;
 - prompt data or message content;
 - user data;
-- exact token counts derived from decrypted requests.
+- exact token counts derived from decrypted requests;
+- raw `gpu_layers` counts, device-derived GPU tuning values, or any other
+  relay-visible hardware fingerprinting detail.
+
+Relay-visible `gpu_layers` values in profile examples are policy labels only.
+Allowed labels include `runtime_default`, `auto`, and `profile_default`; they do
+not disclose actual layer counts or operator-specific hardware tuning.
 
 ## API v1 extension proposal
 
@@ -358,10 +367,12 @@ unambiguous:
 `context_tier` and `routing.requested_context_tier` mean the requested minimum
 tier. `routing.selected_context_profile_id` is the relay-selected active profile
 that the client copied from `selected_context_profile.profile_id` after node
-selection. The selected-profile echo capability/version records that the client
-understands this migration contract. Missing requested tier defaults to
-`8k-fast` for compatibility. A selected-profile mismatch fails closed with an
-encrypted structured error.
+selection. `routing.selected_profile_echo` records the selected-profile echo contract
+version and must be `selected_profile_echo_v1` whenever
+`routing.selected_context_profile_id` is used. Missing requested tier defaults
+to `8k-fast` for compatibility. A selected-profile mismatch or missing/unknown
+echo version fails closed with an encrypted structured error. Legacy exact-tier
+behavior is allowed only when no selected profile echo is used.
 
 ### Client capability negotiation
 
@@ -503,12 +514,16 @@ Algorithm:
    `context_tier` or `routing.requested_context_tier`, and optional
    `routing.selected_context_profile_id`.
 3. Default missing requested tier to `8k-fast`.
-4. If `routing.selected_context_profile_id` is present, require it to match the
-   node's active `profile_id`; otherwise require the requested tier to match the
-   active profile for legacy exact-tier clients.
+4. If `routing.selected_context_profile_id` is present, require
+   `routing.selected_profile_echo == "selected_profile_echo_v1"` and require the
+   selected profile ID to match the node's active `profile_id`. Missing or
+   unknown echo versions fail closed through the same tier/profile mismatch
+   path. If no selected profile echo is used, fall back only to legacy exact-tier
+   behavior and require the requested tier to match the active profile.
 5. Verify that the active profile can satisfy the requested tier. A `64k-full`
    active profile may satisfy an `8k-fast` requested tier only when the encrypted
-   request echoed `routing.selected_context_profile_id` for this active profile.
+   request echoed both `routing.selected_context_profile_id` for this active
+   profile and `routing.selected_profile_echo == "selected_profile_echo_v1"`.
 6. Render the prompt with the same chat template that will be used for
    `create_chat_completion`.
 7. Count exact input tokens with the active `Llama` runtime tokenizer.
@@ -769,6 +784,10 @@ and recovery requires warm-load validation before re-registration.
   are not tied to plaintext content or user identity.
 - Throughput bands must be coarse enough to avoid revealing unique hardware
   fingerprints. Avoid raw model speed traces per user request.
+- Relay-visible hardware tuning fields must remain coarse policy labels. In
+  particular, `gpu_layers` may be `runtime_default`, `auto`, or
+  `profile_default`, but must never be a raw layer count, device-derived setting,
+  benchmark-selected value, or other fingerprinting signal.
 - Registration must not include hostname, serial numbers, raw VRAM/RAM inventory,
   local usernames, paths that identify the operator, prompt content, response
   content, or decrypted tool arguments.

@@ -7,6 +7,7 @@ import json
 import math
 import pytest
 import sys
+import time
 import requests
 import jsonschema
 from unittest.mock import MagicMock, patch
@@ -2493,9 +2494,10 @@ class TestRelayClient:
         assert relay_client.process_client_request(request_data) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_context_tier_unsupported"
-        )
+        error = encrypted_envelope["api_v1_response"]["error"]
+        assert error["code"] == "compute_node_context_window_exceeded"
+        assert error["active_context_tier"] == "8k-fast"
+        assert error["recommended_context_tier"] == "64k-full"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_strips_routing_context_tier(
@@ -4146,3 +4148,174 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
     assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+
+class _AdmissionConfig:
+    def __init__(self, max_tokens=16):
+        self.max_tokens = max_tokens
+
+    def get(self, key, default):
+        return {
+            "model.max_tokens": self.max_tokens,
+            "model.temperature": 0.7,
+            "model.top_p": 0.9,
+            "model.stop_tokens": [],
+        }.get(key, default)
+
+
+class _AdmissionRuntime:
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        assert tokenize is False
+        rendered = "<s>"
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, list):
+                content = "".join(block["text"] for block in content)
+            rendered += f"<{message['role']}>" + content
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return rendered
+
+    def tokenize(self, payload, _add_bos=False):
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        token_count = len(payload)
+        if "雪" in payload:
+            token_count = 20 + ((len(payload) - 20) * 2)
+        return list(range(token_count))
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class _AdmissionManager:
+    api_model_id = "llama-3-8b-instruct"
+    use_mock_llm = False
+
+    def __init__(self, tier="8k-fast", window=8192, default_max_tokens=16):
+        self.context_tier = tier
+        self.context_window_tokens = window
+        self.config = _AdmissionConfig(default_max_tokens)
+        self.runtime = _AdmissionRuntime()
+        self.worker_restart_count = 0
+
+    def get_llm_instance(self):
+        return self.runtime
+
+
+def _admission_envelope(client, manager, content, *, options=None, requested_tier=None):
+    client.model_manager = manager
+    return client._generate_api_v1_response_with_runtime_model(
+        request_id="req-admission",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": content}],
+        options=options or {},
+        requested_context_tier=requested_tier or manager.context_tier,
+    )
+
+
+def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():
+    manager = _AdmissionManager(window=32)
+    client = _api_v1_validation_client(manager)
+    # Rendered prompt is len("<s><user>" + content + "<assistant>") = 20 + content.
+    accepted = _admission_envelope(client, manager, "x" * 7, options={"max_tokens": 5})
+    rejected = _admission_envelope(client, manager, "x" * 8, options={"max_tokens": 5})
+
+    assert "error" not in accepted["api_v1_response"]
+    assert manager.runtime.calls[-1]["max_tokens"] == 5
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 28
+    assert error["requested_output_tokens"] == 5
+    assert error["required_total_tokens"] == 33
+
+
+def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tokens():
+    manager = _AdmissionManager(window=32, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    accepted = _admission_envelope(client, manager, "x" * 8)
+    rejected = _admission_envelope(client, manager, "x" * 9)
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["requested_output_tokens"] == 4
+    assert error["prompt_tokens"] == 29
+
+
+def test_api_v1_context_admission_exact_64k_boundaries_and_unicode_structured_text():
+    manager = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=1)
+    client = _api_v1_validation_client(manager)
+    content = [{"type": "text", "text": "雪" * 32757}]
+    accepted = _admission_envelope(client, manager, content, requested_tier="8k-fast")
+    rejected = _admission_envelope(client, manager, [{"type": "input_text", "text": "雪" * 32758}])
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["active_context_tier"] == "64k-full"
+    assert error["configured_context_tokens"] == 65536
+    assert error["prompt_tokens"] == 65536
+    assert error["requested_output_tokens"] == 1
+    assert error["retryable"] is False
+
+
+def test_api_v1_context_overflow_is_request_scoped_and_does_not_restart_worker():
+    manager = _AdmissionManager(window=24, default_max_tokens=5)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x" * 10)
+
+    assert envelope["api_v1_response"]["error"]["code"] == "compute_node_context_window_exceeded"
+    assert manager.worker_restart_count == 0
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_recommends_64k_for_8k_overflow():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=1)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x" * 8172)
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+
+
+def test_api_v1_heartbeat_worker_refreshes_during_blocked_inference():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
+    relay_client._api_v1_relay_wait_hints = {
+        relay_client.relay_url: {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+    }
+    calls = []
+
+    def register(url):
+        calls.append(url)
+        relay_client.stop()
+        return {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+
+    relay_client.register_api_v1_compute_node = register
+    relay_client._api_v1_start_heartbeat_worker()
+    time.sleep(0.4)
+
+    assert calls == [relay_client.relay_url]
+    assert relay_client._api_v1_heartbeat_thread is None
+
+
+def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = time.monotonic()
+    relay_client._api_v1_start_heartbeat_worker()
+    assert relay_client._api_v1_heartbeat_thread is not None
+
+    relay_client.stop()
+
+    assert relay_client._api_v1_heartbeat_thread is None

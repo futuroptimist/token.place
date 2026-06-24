@@ -3706,8 +3706,16 @@ class Llama:
     data['fail_init'] = True
     save(data)
     persistent_error = None
-    with pytest.raises(RuntimeError, match='replacement failed|one restart attempt|fake init failure') as exc_info:
-        request('persistent-failure')
+    # This branch intentionally forces a replacement initialization failure.
+    # Suppress the expected ERROR-level model-manager traceback from live pytest
+    # logs so CI summaries do not misclassify the exercised failure path as the
+    # cause of a red run while the exception is still asserted below.
+    with caplog.at_level(logging.CRITICAL, logger='model_manager'):
+        with pytest.raises(
+            RuntimeError,
+            match='replacement failed|one restart attempt|fake init failure',
+        ) as exc_info:
+            request('persistent-failure')
     persistent_error = repr(exc_info.value)
     relay_probe.mark_failed(persistent_error)
     assert all(is_registered is False for is_registered in relay_probe.registered.values())

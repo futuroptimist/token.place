@@ -917,12 +917,9 @@ class _SubprocessLlamaProxy:
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_liveness')
             )
 
-    def create_chat_completion(self, *args, **kwargs):
-        stream = bool(kwargs.get('stream', False))
-        if stream:
-            return self._stream_chat_completion(*args, **kwargs)
+    def _call(self, method: str, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
+            self._send({'method': method, 'args': args, 'kwargs': kwargs})
             try:
                 message = _read_llama_subprocess_message(
                     self._process,
@@ -933,6 +930,15 @@ class _SubprocessLlamaProxy:
                 self._closed = True
                 raise
         return message.get('result')
+
+    def create_chat_completion(self, *args, **kwargs):
+        stream = bool(kwargs.get('stream', False))
+        if stream:
+            return self._stream_chat_completion(*args, **kwargs)
+        return self._call('create_chat_completion', *args, **kwargs)
+
+    def token_place_count_chat_prompt_tokens(self, *args, **kwargs):
+        return self._call('token_place_count_chat_prompt_tokens', *args, **kwargs)
 
     def _stream_chat_completion(self, *args, **kwargs):
         with self._lock:
@@ -1069,12 +1075,33 @@ for line in sys.stdin:
         if not isinstance(request, dict):
             _emit(_safe_request_error('malformed_request'))
             continue
-        if request.get('method') != 'create_chat_completion':
-            _emit(_safe_request_error('unsupported_method', request=request))
-            continue
+        method = request.get('method')
         kwargs = request.get('kwargs', {})
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
+            continue
+        if method == 'token_place_count_chat_prompt_tokens':
+            messages = kwargs.get('messages')
+            rendered = None
+            apply_chat_template = getattr(llama, 'apply_chat_template', None)
+            if callable(apply_chat_template):
+                rendered = apply_chat_template(messages=messages, tokenize=False)
+            else:
+                tokenizer = getattr(llama, 'tokenizer', None)
+                tokenizer = tokenizer() if callable(tokenizer) else tokenizer
+                tokenizer_template = getattr(tokenizer, 'apply_chat_template', None)
+                if callable(tokenizer_template):
+                    rendered = tokenizer_template(messages, tokenize=False)
+            if not isinstance(rendered, str):
+                raise RuntimeError('llama.cpp runtime does not expose chat-template rendering preflight')
+            tokenize = getattr(llama, 'tokenize', None)
+            if not callable(tokenize):
+                raise RuntimeError('llama.cpp runtime does not expose tokenizer preflight')
+            tokens = tokenize(rendered.encode('utf-8'), add_bos=False, special=True)
+            _emit({'status': 'ok', 'result': {'prompt_tokens': len(tokens)}})
+            continue
+        if method != 'create_chat_completion':
+            _emit(_safe_request_error('unsupported_method', request=request))
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):
@@ -2080,6 +2107,41 @@ class ModelManager:
         if replacement_attempt_log_message is not None:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()
+
+
+    def count_chat_prompt_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Render and tokenize chat messages with the active llama.cpp runtime.
+
+        This intentionally delegates chat-template rendering and tokenization to
+        the warmed runtime so admission cannot drift from inference.
+        """
+        llm_instance = self.get_llm_instance()
+        if llm_instance is None:
+            raise RuntimeError('LLM runtime is unavailable')
+        preflight = getattr(llm_instance, 'token_place_count_chat_prompt_tokens', None)
+        if callable(preflight):
+            result = preflight(messages=messages)
+            if isinstance(result, dict) and isinstance(result.get('prompt_tokens'), int):
+                return int(result['prompt_tokens'])
+            if isinstance(result, int):
+                return int(result)
+        rendered = None
+        apply_chat_template = getattr(llm_instance, 'apply_chat_template', None)
+        if callable(apply_chat_template):
+            rendered = apply_chat_template(messages=messages, tokenize=False)
+        else:
+            tokenizer = getattr(llm_instance, 'tokenizer', None)
+            tokenizer = tokenizer() if callable(tokenizer) else tokenizer
+            tokenizer_template = getattr(tokenizer, 'apply_chat_template', None)
+            if callable(tokenizer_template):
+                rendered = tokenizer_template(messages, tokenize=False)
+        if not isinstance(rendered, str):
+            raise RuntimeError('LLM runtime missing chat-template preflight support')
+        tokenize = getattr(llm_instance, 'tokenize', None)
+        if not callable(tokenize):
+            raise RuntimeError('LLM runtime missing tokenizer preflight support')
+        tokens = tokenize(rendered.encode('utf-8'), add_bos=False, special=True)
+        return len(tokens)
 
     def create_chat_completion_with_recovery(self, *args, **kwargs):
         """Create a completion, replacing a dead subprocess worker at most once.

@@ -1239,6 +1239,37 @@ class RelayClient:
             )
         return response.json()
 
+
+    def heartbeat_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
+        """Renew API v1 compute-node registration without polling for work."""
+
+        if getattr(self, "_polling_stopped_by_request", False):
+            return {"error": "Relay polling stopped", "next_ping_in_x_seconds": 0}
+        target_url = relay_url or self.relay_url
+        response = self.register_api_v1_compute_node(target_url)
+        if isinstance(response, dict) and not response.get("error"):
+            wait = self._normalise_positive_seconds(
+                response.get("next_ping_in_x_seconds"), self._request_timeout
+            )
+            poll_wait = self._normalise_poll_wait_seconds(response.get("poll_wait_seconds", wait))
+            relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+            self._api_v1_relay_wait_hints = relay_wait_hints
+            relay_wait_hints[target_url] = {
+                "next_ping_in_x_seconds": wait,
+                "poll_wait_seconds": poll_wait,
+                "server_public_key": self.crypto_manager.public_key_b64,
+            }
+            self._api_v1_registered_relays.add(target_url)
+            self._api_v1_last_heartbeat_at[target_url] = time.monotonic()
+            self._unregister_complete = False
+            log_info(
+                "server.heartbeat_renewed relay={} lease_seconds={} key_fingerprint={}",
+                target_url,
+                wait,
+                self._api_v1_public_key_fingerprint(self.crypto_manager.public_key_b64),
+            )
+        return response if isinstance(response, dict) else {"error": "Invalid heartbeat response"}
+
     @staticmethod
     def _api_v1_model_path_basename(model_path: Any) -> Optional[str]:
         """Return a safe basename only for concrete path-like model paths."""
@@ -1634,7 +1665,7 @@ class RelayClient:
         request_id: str,
         *,
         message: Optional[Dict[str, Any]] = None,
-        error: Optional[Dict[str, str]] = None,
+        error: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build an encrypted API v1 relay response envelope body."""
 
@@ -2216,6 +2247,106 @@ class RelayClient:
                 return None
         return total
 
+    def _api_v1_context_window_error(
+        self,
+        *,
+        request_id: str,
+        active_profile: Any,
+        prompt_tokens: int,
+        requested_output_tokens: int,
+        requested_context_tier: str,
+        retryable: bool,
+    ) -> Dict[str, Any]:
+        required_total_tokens = prompt_tokens + requested_output_tokens
+        recommended_context_tier = None
+        try:
+            full_profile = get_context_profile("64k-full")
+            requested_profile = get_context_profile(requested_context_tier)
+            if (
+                active_profile.total_context_tokens < full_profile.total_context_tokens
+                and requested_profile.total_context_tokens <= full_profile.total_context_tokens
+                and required_total_tokens <= full_profile.total_context_tokens
+            ):
+                recommended_context_tier = "64k-full"
+        except Exception:
+            recommended_context_tier = None
+        error: Dict[str, Any] = {
+            "code": "compute_node_context_window_exceeded",
+            "type": "validation_error",
+            "message": "Requested prompt and output reservation exceed the active compute context window",
+            "active_context_tier": active_profile.profile_id,
+            "configured_context_tokens": active_profile.total_context_tokens,
+            "prompt_tokens": prompt_tokens,
+            "requested_output_tokens": requested_output_tokens,
+            "required_total_tokens": required_total_tokens,
+            "retryable": bool(retryable),
+        }
+        if recommended_context_tier is not None:
+            error["recommended_context_tier"] = recommended_context_tier
+        return self._api_v1_response_envelope(request_id, error=error)
+
+    def _api_v1_admit_context(
+        self,
+        *,
+        request_id: str,
+        runtime_messages: List[Dict[str, Any]],
+        safe_options: Dict[str, Any],
+        requested_context_tier: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, Any]]:
+        active_context_tier = normalize_context_tier(
+            getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+        )
+        active_profile = get_context_profile(active_context_tier)
+        requested_profile = get_context_profile(requested_context_tier)
+        completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+        requested_output_tokens = int(completion_kwargs["max_tokens"])
+        prompt_counter = getattr(self.model_manager, "count_chat_prompt_tokens", None)
+        if callable(prompt_counter):
+            prompt_tokens = int(prompt_counter(runtime_messages))
+        elif (
+            getattr(self.model_manager, "use_mock_llm", False) is True
+            or not hasattr(self.model_manager, "context_tier")
+        ):
+            # Unit-test/mock runtimes and legacy test doubles do not carry a real
+            # llama.cpp tokenizer. Production desktop ModelManager has an active
+            # context_tier from apply_context_profile and exposes
+            # count_chat_prompt_tokens above.
+            prompt_tokens = 0
+        else:
+            raise RuntimeError("LLM runtime missing authoritative prompt-token preflight")
+        required_total_tokens = prompt_tokens + requested_output_tokens
+        tier_fits = active_profile.total_context_tokens >= requested_profile.total_context_tokens
+        budget_fits = required_total_tokens <= active_profile.total_context_tokens
+        admitted = tier_fits and budget_fits
+        metrics = {
+            "active_context_tier": active_profile.profile_id,
+            "configured_context_tokens": active_profile.total_context_tokens,
+            "prompt_tokens": prompt_tokens,
+            "requested_output_tokens": requested_output_tokens,
+            "required_total_tokens": required_total_tokens,
+            "admission_result": "accepted" if admitted else "rejected",
+        }
+        log_info(
+            "api_v1.context_admission request_id={} active_tier={} prompt_tokens={} output_reservation={} result={} safe_error_code={}",
+            request_id,
+            active_profile.profile_id,
+            prompt_tokens,
+            requested_output_tokens,
+            metrics["admission_result"],
+            "none" if admitted else "compute_node_context_window_exceeded",
+        )
+        if admitted:
+            return True, None, {**metrics, "completion_kwargs": completion_kwargs}
+        retryable = active_profile.total_context_tokens < requested_profile.total_context_tokens
+        return False, self._api_v1_context_window_error(
+            request_id=request_id,
+            active_profile=active_profile,
+            prompt_tokens=prompt_tokens,
+            requested_output_tokens=requested_output_tokens,
+            requested_context_tier=requested_context_tier,
+            retryable=retryable,
+        ), {**metrics, "completion_kwargs": completion_kwargs}
+
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -2291,15 +2422,6 @@ class RelayClient:
         has_direct_runtime_completion = callable(get_llm_instance) or callable(
             recovery_completion
         )
-        if not self._active_context_tier_can_satisfy(requested_context_tier):
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_context_tier_unsupported",
-                    "message": "Requested context tier is not available in the desktop runtime",
-                },
-            )
-
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2352,6 +2474,28 @@ class RelayClient:
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         try:
+            admitted, admission_error, admission = self._api_v1_admit_context(
+                request_id=request_id,
+                runtime_messages=runtime_messages,
+                safe_options=safe_options,
+                requested_context_tier=requested_context_tier,
+            )
+            completion_kwargs = admission["completion_kwargs"]
+            if not admitted:
+                self._last_api_v1_runtime_health = {
+                    "runtime_healthy": True,
+                    "recovery_attempted": False,
+                    "recovery_succeeded": False,
+                }
+                return admission_error or self._api_v1_response_envelope(
+                    request_id,
+                    error={
+                        "code": "compute_node_context_window_exceeded",
+                        "type": "validation_error",
+                        "message": "Requested prompt and output reservation exceed the active compute context window",
+                        "retryable": False,
+                    },
+                )
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = None
             create_chat_completion = recovery_completion
@@ -2385,13 +2529,19 @@ class RelayClient:
                     "/api/v1/relay/responses",
                     "direct_non_streaming_completion",
                 )
-                completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+                inference_started = time.monotonic()
                 completion = create_chat_completion(
                     messages=runtime_messages,
                     **completion_kwargs,
                 )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
+                )
+                log_info(
+                    "api_v1.inference_complete request_id={} active_tier={} duration_seconds={} admission_result=accepted safe_error_code=none",
+                    request_id,
+                    admission.get("active_context_tier"),
+                    round(time.monotonic() - inference_started, 3),
                 )
 
             if assistant_message is None:

@@ -209,6 +209,62 @@ class _CancelablePollWorker:
             pass
 
 
+
+class _HeartbeatWorker:
+    """Small dedicated API v1 lease-renewal worker for long inference."""
+
+    def __init__(self, relay_client: Any, relay_url: str, *, operator_session_id: str) -> None:
+        self._relay_client = relay_client
+        self._relay_url = relay_url
+        self._operator_session_id = operator_session_id
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"tokenplace-heartbeat-{_sanitize_relay_target(self._relay_url)}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                hints = getattr(self._relay_client, "_api_v1_relay_wait_hints", {}).get(self._relay_url, {})
+                lease = hints.get("next_ping_in_x_seconds", getattr(self._relay_client, "_request_timeout", 10))
+                refresh_after = max(1.0, float(lease) * 0.5)
+            except Exception:
+                refresh_after = 5.0
+            if self._stop.wait(refresh_after):
+                break
+            if getattr(self._relay_client, "_polling_stopped_by_request", False):
+                break
+            heartbeat = getattr(self._relay_client, "heartbeat_api_v1_compute_node", None)
+            if callable(heartbeat):
+                try:
+                    heartbeat(self._relay_url)
+                    print(
+                        "desktop.compute_node_bridge.heartbeat.renewed "
+                        f"operator_session_id={self._operator_session_id} relay={_sanitize_relay_target(self._relay_url)}",
+                        file=sys.stderr,
+                    )
+                except Exception as exc:
+                    print(
+                        "desktop.compute_node_bridge.heartbeat.failed "
+                        f"operator_session_id={self._operator_session_id} relay={_sanitize_relay_target(self._relay_url)} "
+                        f"exc_type={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
 def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
     """Return whether bridge UI should report the relay registration as current."""
 
@@ -1734,6 +1790,12 @@ def run(args: argparse.Namespace) -> int:
                     )
                 )
                 process_result = None
+                heartbeat_worker = _HeartbeatWorker(
+                    relay_runtime.relay_client,
+                    active_relay_url,
+                    operator_session_id=bridge_session_id,
+                )
+                heartbeat_worker.start()
                 try:
                     with inference_lock:
                         process_relay_request_result = getattr(
@@ -1754,6 +1816,7 @@ def run(args: argparse.Namespace) -> int:
                                 "recovery_succeeded": False,
                             }
                 except Exception as exc:
+                    heartbeat_worker.stop()
                     process_result = {
                         "inference_succeeded": False,
                         "submitted": False,
@@ -1770,6 +1833,7 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
+                heartbeat_worker.stop()
                 inference_succeeded = bool(
                     getattr(process_result, "inference_succeeded", False)
                     if not isinstance(process_result, dict)

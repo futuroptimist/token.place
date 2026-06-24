@@ -2493,9 +2493,12 @@ class TestRelayClient:
         assert relay_client.process_client_request(request_data) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_context_tier_unsupported"
-        )
+        error = encrypted_envelope["api_v1_response"]["error"]
+        assert error["code"] == "compute_node_context_window_exceeded"
+        assert error["active_context_tier"] == "8k-fast"
+        assert error["configured_context_tokens"] == 8192
+        assert error["recommended_context_tier"] == "64k-full"
+        assert error["retryable"] is True
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_strips_routing_context_tier(
@@ -4146,3 +4149,128 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
     assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+class _CountingModelManager:
+    def __init__(self, *, tier="8k-fast", prompt_tokens=10, default_max_tokens=1024):
+        self.context_tier = tier
+        self.context_window_tokens = 8192 if tier == "8k-fast" else 65536
+        self.default_output_reservation_tokens = 1024
+        self.use_mock_llm = True
+        self.prompt_tokens = prompt_tokens
+        self.calls = []
+        self.config = MagicMock()
+        self.config.get.side_effect = lambda key, default=None: {
+            "model.max_tokens": default_max_tokens,
+            "model.temperature": 0.7,
+            "model.top_p": 0.9,
+            "model.stop_tokens": [],
+        }.get(key, default)
+
+    def count_chat_prompt_tokens(self, messages):
+        self.calls.append(("count", messages))
+        return self.prompt_tokens
+
+    def create_chat_completion_with_recovery(self, **kwargs):
+        self.calls.append(("complete", kwargs))
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+def _relay_for_admission(manager):
+    crypto = MagicMock()
+    crypto.public_key_b64 = "server-key"
+    return RelayClient("http://relay.test", None, crypto, manager, include_configured_servers=False)
+
+
+def _admission_response(manager, *, tier="8k-fast", max_tokens=None):
+    client = _relay_for_admission(manager)
+    options = {} if max_tokens is None else {"max_tokens": max_tokens}
+    return client._generate_api_v1_response_with_runtime_model(
+        request_id="req-admit",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello 🌍\n```json\n{\"a\":1}\n```"}],
+        options=options,
+        requested_context_tier=tier,
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens,max_tokens,accepted",
+    [(8191, 1, True), (8192, 1, False), (65535, 1, True), (65536, 1, False)],
+)
+def test_api_v1_exact_context_admission_boundaries(prompt_tokens, max_tokens, accepted):
+    tier = "64k-full" if prompt_tokens > 8192 else "8k-fast"
+    manager = _CountingModelManager(tier=tier, prompt_tokens=prompt_tokens)
+    response = _admission_response(manager, tier=tier, max_tokens=max_tokens)
+
+    error = response["api_v1_response"].get("error")
+    assert (error is None) is accepted
+    if error:
+        assert error["code"] == "compute_node_context_window_exceeded"
+        assert error["prompt_tokens"] == prompt_tokens
+        assert error["requested_output_tokens"] == max_tokens
+
+
+def test_api_v1_default_output_budget_is_reserved_without_truncation():
+    manager = _CountingModelManager(tier="8k-fast", prompt_tokens=7600, default_max_tokens=700)
+    response = _admission_response(manager, tier="8k-fast")
+
+    error = response["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["requested_output_tokens"] == 700
+    assert not any(call[0] == "complete" for call in manager.calls)
+
+
+def test_api_v1_8k_request_runs_on_64k_runtime():
+    manager = _CountingModelManager(tier="64k-full", prompt_tokens=8000)
+    response = _admission_response(manager, tier="8k-fast", max_tokens=100)
+
+    assert response["api_v1_response"].get("message", {}).get("content") == "ok"
+
+
+def test_api_v1_64k_request_on_8k_runtime_returns_encrypted_structured_overflow_payload():
+    manager = _CountingModelManager(tier="8k-fast", prompt_tokens=8000)
+    response = _admission_response(manager, tier="64k-full", max_tokens=100)
+
+    error = response["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["type"] == "validation_error"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert error["prompt_tokens"] == 8000
+    assert error["requested_output_tokens"] == 100
+    assert error["required_total_tokens"] == 8100
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+
+
+def test_api_v1_overflow_does_not_mark_worker_unhealthy_or_restart():
+    manager = _CountingModelManager(tier="8k-fast", prompt_tokens=8192)
+    client = _relay_for_admission(manager)
+
+    response = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-overflow",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "x"}],
+        options={"max_tokens": 1},
+        requested_context_tier="8k-fast",
+    )
+
+    assert response["api_v1_response"]["error"]["code"] == "compute_node_context_window_exceeded"
+    assert client._last_api_v1_runtime_health["runtime_healthy"] is True
+    assert not any(call[0] == "complete" for call in manager.calls)
+
+
+def test_api_v1_heartbeat_renews_registration_without_polling(monkeypatch):
+    manager = _CountingModelManager()
+    client = _relay_for_admission(manager)
+
+    monkeypatch.setattr(
+        client,
+        "register_api_v1_compute_node",
+        lambda relay_url=None: {"next_ping_in_x_seconds": 30, "poll_wait_seconds": 20},
+    )
+    result = client.heartbeat_api_v1_compute_node("http://relay.test")
+
+    assert result["next_ping_in_x_seconds"] == 30
+    assert "http://relay.test" in client._api_v1_registered_relays
+    assert client.api_v1_registration_fresh("http://relay.test") is True

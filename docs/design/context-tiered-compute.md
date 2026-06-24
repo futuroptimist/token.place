@@ -225,55 +225,39 @@ The initial desktop UX is intentionally static and operator-controlled:
 
 ## Privacy-safe capability registration
 
-After warm-load validation, a compute node registers these API v1 capabilities:
+P9 compute nodes register only a coarse API v1 capability contract. The relay
+stores the normalized fields below and discards unsafe extras. Older API v1 nodes
+that omit `capabilities` remain accepted as bounded `8k-fast` compatibility
+nodes with the default supported API v1 model IDs; they are not wildcards for
+arbitrary requested models.
 
 ```json
 {
   "server_public_key": "base64-public-key",
-  "api_version": "v1",
-  "supported_model_ids": ["llama-3.1-8b-instruct"],
-  "active_context_profile": {
-    "profile_id": "64k-full",
-    "display_name": "64K full context",
-    "model_ids": ["llama-3.1-8b-instruct"],
-    "total_context_tokens": 65536,
+  "capabilities": {
+    "api_version": "v1",
+    "supported_model_ids": ["llama-3.1-8b-instruct"],
+    "active_context_tier": "64k-full",
+    "maximum_total_context_tokens": 65536,
     "default_output_token_reservation": 1024,
-    "maximum_output_tokens": 4096,
+    "maximum_output_tokens": 8192,
     "max_concurrency": 1,
-    "kv_cache_type": "runtime_default",
-    "kqv_offload_policy": "runtime_default",
-    "gpu_layers": "runtime_default",
-    "batch_defaults": {
-      "n_batch": "runtime_default",
-      "n_ubatch": "runtime_default",
-      "flash_attention": "runtime_default"
-    },
-    "enabled": true,
-    "safe_diagnostics": {
-      "backend_class": "cuda",
-      "throughput_band": "long_context_baseline",
-      "last_warm_load_status": "ok"
-    }
-  },
-  "maximum_total_context_tokens": 65536,
-  "maximum_output_tokens": 4096,
-  "max_concurrency": 1,
-  "backend_class": "cuda",
-  "throughput_band": "long_context_baseline"
+    "backend_class": "cuda"
+  }
 }
 ```
 
-Allowed fields:
+Allowed normalized capability fields:
 
-- server public key;
-- API version;
-- supported model IDs;
-- active context profile;
-- maximum total context tokens;
-- maximum output tokens;
-- max concurrency;
-- backend class such as `cpu`, `cuda`, or `metal`;
-- optional coarse throughput bands.
+- `api_version`;
+- `supported_model_ids`;
+- `active_context_tier`;
+- `maximum_total_context_tokens`;
+- `default_output_token_reservation`;
+- `maximum_output_tokens`;
+- `max_concurrency`;
+- optional coarse `backend_class` such as `cpu`, `cuda`, `metal`, `hybrid`, or
+  `unknown`.
 
 Forbidden fields:
 
@@ -286,9 +270,9 @@ Forbidden fields:
 - raw `gpu_layers` counts, device-derived GPU tuning values, or any other
   relay-visible hardware fingerprinting detail.
 
-Relay-visible `gpu_layers` values in profile examples are policy labels only.
-Allowed labels include `runtime_default`, `auto`, and `profile_default`; they do
-not disclose actual layer counts or operator-specific hardware tuning.
+Relay-visible `backend_class` is a coarse class only. It must not disclose
+operator-specific hardware inventory, raw memory, hostnames, serials, private
+keys, or plaintext request content.
 
 ## API v1 extension proposal
 
@@ -306,42 +290,25 @@ Response:
 ```json
 {
   "server_public_key": "base64-public-key",
-  "selected_context_profile": {
-    "profile_id": "64k-full",
-    "display_name": "64K full context",
-    "model_ids": ["llama-3.1-8b-instruct"],
-    "total_context_tokens": 65536,
-    "default_output_token_reservation": 1024,
-    "maximum_output_tokens": 4096,
-    "max_concurrency": 1,
-    "kv_cache_type": "runtime_default",
-    "kqv_offload_policy": "runtime_default",
-    "gpu_layers": "runtime_default",
-    "batch_defaults": {
-      "n_batch": "runtime_default",
-      "n_ubatch": "runtime_default",
-      "flash_attention": "runtime_default"
-    },
-    "enabled": true,
-    "safe_diagnostics": {
-      "backend_class": "cuda",
-      "throughput_band": "long_context_baseline"
-    }
-  }
+  "selected_context_tier": "64k-full",
+  "selected_context_window_tokens": 65536,
+  "selected_model_support": ["llama-3.1-8b-instruct"],
+  "selection_policy": "registration_order_round_robin_with_capability_filter"
 }
 ```
 
-The selection response contains only the public key plus safe selected-profile
-metadata. It must not include private hardware details or anything derived from
-plaintext prompt inspection.
+The selection response keeps existing compatibility for clients that only read
+`server_public_key`. Additional fields are safe coarse metadata derived from the
+normalized capability contract. It must not include private hardware details,
+plaintext prompts/messages, exact decrypted token counts, raw VRAM/RAM,
+hostnames, serials, or keys beyond the selected public key.
 
 ### Encrypted API v1 request addition
 
-The plaintext that is encrypted to the compute node distinguishes the requested
-minimum tier from the relay-selected active profile. Clients may keep the legacy
-top-level `context_tier` for the requested tier, but new implementations should
-prefer the explicit `routing` object so the selected-profile echo is
-unambiguous:
+The plaintext that is encrypted to the compute node may include coarse routing
+metadata under `api_v1_request.routing`. In P9 the implemented routing field is
+`routing.context_tier`; when omitted, the compute node normalizes it to
+`8k-fast` after decryption.
 
 ```json
 {
@@ -350,11 +317,8 @@ unambiguous:
   "client_public_key": "...",
   "api_v1_request": {
     "model": "llama-3.1-8b-instruct",
-    "context_tier": "8k-fast",
     "routing": {
-      "requested_context_tier": "8k-fast",
-      "selected_context_profile_id": "64k-full",
-      "selected_profile_echo": "selected_profile_echo_v1"
+      "context_tier": "64k-full"
     },
     "messages": [],
     "options": {
@@ -364,44 +328,18 @@ unambiguous:
 }
 ```
 
-`context_tier` and `routing.requested_context_tier` mean the requested minimum
-tier. `routing.selected_context_profile_id` is the relay-selected active profile
-that the client copied from `selected_context_profile.profile_id` after node
-selection. `routing.selected_profile_echo` records the selected-profile echo contract
-version and must be `selected_profile_echo_v1` whenever
-`routing.selected_context_profile_id` is used. Missing requested tier defaults
-to `8k-fast` for compatibility. A selected-profile mismatch or missing/unknown
-echo version fails closed with an encrypted structured error. Legacy exact-tier
-behavior is allowed only when no selected profile echo is used.
-
-### Client capability negotiation
-
-`GET /api/v1/relay/servers/next` also accepts a relay-visible capability flag:
-
-| Query parameter | Required | Meaning |
-| --- | --- | --- |
-| `client_capabilities` | optional | Comma-separated client feature flags. `selected_profile_echo_v1` means the client will copy `selected_context_profile.profile_id` into encrypted `routing.selected_context_profile_id`. |
-
-Clients without `selected_profile_echo_v1` support get exact-tier selection only:
-missing `context_tier` still defaults to `8k-fast`, and the relay must not assign
-such requests to `64k-full` even if the larger profile could satisfy the token
-limit. This preserves backward compatibility for encrypted payloads that omit
-the selected active profile.
-
-Clients that advertise `client_capabilities=selected_profile_echo_v1` may receive
-the smallest capable selected profile instead of an exact profile. They must copy
-the returned `selected_context_profile.profile_id` into
-`routing.selected_context_profile_id` inside the encrypted API v1 request before
-dispatch. The relay must keep smallest-capable/spillover selection disabled for
-clients that do not advertise this capability.
+Malformed `routing` or unsupported `routing.context_tier` values are rejected
+only after decryption by the compute node, and the relay continues to handle only
+ciphertext plus safe routing metadata. P9 does not require clients to echo a
+selected profile ID for 64K fallback.
 
 ### Registration extension
 
-`POST /api/v1/relay/servers/register` adds the capability body described above.
-The relay stores the safe metadata and uses it for filtering/scheduling.
-Registration must occur only after warm-load and profile memory validation.
-Heartbeat renewals may repeat the same capability payload or send a stable
-capability revision ID plus the public key.
+`POST /api/v1/relay/servers/register` adds the `capabilities` body described
+above. The relay stores only the normalized safe fields and uses them for
+filtering. Heartbeat renewals may repeat the same capability payload. If a
+heartbeat omits capabilities, the previously stored normalized capabilities are
+preserved.
 
 ### Unregister extension
 
@@ -438,69 +376,28 @@ profile validation.
 
 Selection happens before encryption because the client needs a public key. The
 client provides coarse `model` and `context_tier`; exact token count remains
-inside the encrypted request.
+inside the encrypted request and is not a P9 relay input.
 
 Decision flow:
 
 1. Normalize missing `context_tier` to `8k-fast`.
-2. Read `client_capabilities` from the relay-visible selection request. Treat
-   `selected_profile_echo_v1` as the only activation signal for selected-profile
-   echo support.
-3. Filter live API v1 nodes by API version, enabled profile, model ID, requested
-   tier capability, max concurrency availability, and lease freshness. Without
-   `selected_profile_echo_v1`, selection is exact-tier only: omitted-tier and
-   explicit `8k-fast` requests remain eligible for exact `8k-fast` profiles only,
-   and the relay must not spill them to `64k-full`. With
-   `selected_profile_echo_v1`, the relay may select the smallest capable active
-   profile, and the client must echo that profile ID into the encrypted request.
-   This prevents an omitted-tier encrypted request from being selected onto a
-   larger node without a compute-visible selected-profile signal.
-4. Return `503 no_registered_compute_nodes` if no live API v1 nodes exist.
-5. Return a capability-specific `503 no_capable_compute_nodes` if nodes exist but
-   none support the requested safe metadata and capability contract.
-6. Schedule among equivalent nodes without exposing prompt size.
-7. Return the public key plus safe selected-profile metadata.
+2. Filter live API v1 nodes by normalized `api_version`, requested model ID, and
+   requested tier capability. A `64k-full` node may satisfy an `8k-fast` request;
+   an `8k-fast` node must never satisfy a `64k-full` request.
+3. Return `503 no_registered_compute_nodes` if no live API v1 nodes exist.
+4. Return `503 no_matching_compute_node` if nodes exist but none match the
+   requested safe metadata and capability contract.
+5. Preserve deterministic registration-order round robin among the equivalent
+   eligible nodes. Broader load balancing, weighted scheduling, concurrency-aware
+   placement, and exact token admission remain deferred.
+6. Return `server_public_key` plus safe selected capability metadata.
 
 ### Scheduler decision table
 
 | Stage | Eligible nodes | Selection rule | Relay-visible inputs | Reason |
 | --- | --- | --- | --- | --- |
-| Current | Live API v1 nodes | Registration-order round robin | public key, API v1 marker | Existing behavior. |
-| Step 1 | Nodes matching model + tier | Preserve round robin among equivalent nodes | registration capabilities | Minimal capability correctness. |
-| Step 2 | Nodes matching model + at least requested tier, only when `client_capabilities=selected_profile_echo_v1` is present | Smallest capable tier | profile token limit, tier order, client capability flag | Avoid burning scarce 64K capacity while preserving exact-tier compatibility for clients that cannot echo `selected_context_profile.profile_id`. |
-| Step 3 | Smallest capable tier set | Lowest queued + in-flight work | queue depth, in-flight count, max concurrency | Reduce avoidable latency with safe metadata. |
-| Step 4 | Load-aware candidate set | Expected completion time | coarse throughput band, queue/in-flight, tier | Account for heterogeneous hardware without raw device inventory. |
-| Step 5 | Policy overlay | Fairness, long-tier reservation, optional selection reservation | safe tenant-neutral counters, reservation expiry | Prevent starvation and racey over-selection. |
-
-Relay-visible scheduling inputs remain metadata-only. The relay must never learn
-exact prompt tokens, decrypted messages, or model output text.
-
-## Dispatch and admission sequence
-
-```mermaid
-sequenceDiagram
-  participant Client
-  participant Relay
-  participant Compute
-  participant Runtime as Llama runtime
-
-  Client->>Relay: GET /api/v1/relay/servers/next?model=M&context_tier=8k-fast&client_capabilities=selected_profile_echo_v1
-  Relay-->>Client: server_public_key + safe selected profile
-  Client->>Relay: POST /api/v1/relay/requests encrypted to selected key
-  Compute->>Relay: POST /api/v1/relay/servers/poll heartbeat/poll
-  Relay-->>Compute: encrypted envelope
-  Compute->>Compute: decrypt and verify selected profile == active profile
-  Compute->>Runtime: render chat template and tokenize exact prompt
-  Compute->>Compute: prompt tokens + output reservation <= profile limit?
-  alt fits
-    Compute->>Runtime: non-streaming create_chat_completion
-    Compute->>Relay: encrypted success response
-    Relay-->>Client: encrypted response retrieval
-  else overflow
-    Compute->>Relay: encrypted structured overflow error
-    Relay-->>Client: encrypted error retrieval
-  end
-```
+| Current | Live API v1 nodes matching requested `model` and a sufficient `active_context_tier` | Registration-order round robin among equivalent eligible nodes | public key, API v1 marker, normalized capabilities | Minimal P9 capability correctness without P12 load balancing. |
+| Deferred | Nodes matching exact decrypted token admission, current queue depth, and richer load signals | Broader load balancing / smallest capable placement | exact admission and scheduler metadata | Out of scope for P9. |
 
 ## Compute-side exact admission control
 
@@ -510,49 +407,40 @@ use the same tokenizer/template as inference.
 Algorithm:
 
 1. Decrypt the API v1 envelope.
-2. Validate protocol, client key binding, model, messages, options, requested
-   `context_tier` or `routing.requested_context_tier`, and optional
-   `routing.selected_context_profile_id`.
-3. Default missing requested tier to `8k-fast`.
-4. If `routing.selected_context_profile_id` is present, require
-   `routing.selected_profile_echo == "selected_profile_echo_v1"` and require the
-   selected profile ID to match the node's active `profile_id`. Missing or
-   unknown echo versions fail closed through the same tier/profile mismatch
-   path. If no selected profile echo is used, fall back only to legacy exact-tier
-   behavior and require the requested tier to match the active profile.
-5. Verify that the active profile can satisfy the requested tier. A `64k-full`
-   active profile may satisfy an `8k-fast` requested tier only when the encrypted
-   request echoed both `routing.selected_context_profile_id` for this active
-   profile and `routing.selected_profile_echo == "selected_profile_echo_v1"`.
-6. Render the prompt with the same chat template that will be used for
+2. Validate protocol, client key binding, model, messages, options, and optional
+   `api_v1_request.routing.context_tier`.
+3. Default missing `routing.context_tier` to `8k-fast`.
+4. Verify that the active profile can satisfy the requested tier. A `64k-full`
+   active profile may satisfy an `8k-fast` requested tier; an `8k-fast` active
+   profile must fail closed for a `64k-full` requested tier.
+5. Render the prompt with the same chat template that will be used for
    `create_chat_completion`.
-7. Count exact input tokens with the active `Llama` runtime tokenizer.
-8. Determine requested output tokens from API v1 options, or use the profile's
+6. Count exact input tokens with the active `Llama` runtime tokenizer.
+7. Determine requested output tokens from API v1 options, or use the profile's
    default output reservation.
-9. Reject requests above the profile's max output tokens.
-10. Compute `required_total_tokens = prompt_tokens + output_reservation`.
-11. Admit only if the required total fits `total_context_tokens`.
-12. Do not silently shrink output below the requested budget.
-13. Return success or encrypted structured error. Do not expose exact counts to
+8. Reject requests above the profile's max output tokens.
+9. Compute `required_total_tokens = prompt_tokens + output_reservation`.
+10. Admit only if the required total fits `total_context_tokens`.
+11. Do not silently shrink output below the requested budget.
+12. Return success or encrypted structured error. Do not expose exact counts to
     the relay.
 
-Encrypted tier/profile mismatch error body:
+Encrypted tier mismatch error body:
 
 ```json
 {
   "error": {
     "code": "compute_node_context_tier_mismatch",
-    "message": "The request was encrypted for a different context profile than this compute node is serving.",
-    "active_context_tier": "64k-full",
-    "requested_context_tier": "8k-fast",
-    "selected_context_profile_id": "8k-fast",
+    "message": "The request requires a context tier this compute node is not currently serving.",
+    "active_context_tier": "8k-fast",
+    "requested_context_tier": "64k-full",
     "retryable": false
   }
 }
 ```
 
 This mismatch error is encrypted to the client and is separate from
-`compute_node_context_window_exceeded`: it reports a routing/profile contract
+`compute_node_context_window_exceeded`: it reports a coarse routing/tier contract
 failure before exact token admission. The relay must forward only ciphertext and
 must not inspect or synthesize plaintext mismatch details.
 
@@ -684,7 +572,7 @@ and recovery requires warm-load validation before re-registration.
 | Failure | Detection | Recovery | Privacy note |
 | --- | --- | --- | --- |
 | Profile warm-load OOM | Local warm-load validation fails before registration | Do not register; surface local operator error; allow tier change after Stop | Relay never sees failed profile details beyond absence of registration. |
-| Encrypted tier/profile mismatch | Compute decrypts request and compares `routing.selected_context_profile_id` to the active profile, then checks the active profile can satisfy the requested tier | Encrypted `compute_node_context_tier_mismatch`; client reselects/re-encrypts only after fixing capability echo or exact-tier routing | Relay sees only ciphertext error. |
+| Encrypted tier mismatch | Compute decrypts request and checks whether its active context tier can satisfy `routing.context_tier` | Encrypted `compute_node_context_tier_mismatch`; client reselects/re-encrypts after selecting a capable node | Relay sees only ciphertext error. |
 | Context overflow | Exact tokenizer admission fails | Encrypted `compute_node_context_window_exceeded`; recommend next tier when known | Exact counts remain encrypted. |
 | 64K inference exceeds lease | Heartbeat thread renews lease | Continue processing; unregister only on missed independent heartbeats | Relay sees heartbeat metadata only. |
 | Node crash during inference | Heartbeats stop; in-flight TTL expires | Relay evicts/cancels; client retries selection | Relay must not log plaintext. |
@@ -712,12 +600,11 @@ and recovery requires warm-load validation before re-registration.
 ### Phase 2: capability-aware/load-aware routing
 
 - Filter by model and context tier.
-- Preserve round robin among equivalent nodes first.
-- Add smallest-capable-tier selection only for clients that advertise
-  `client_capabilities=selected_profile_echo_v1` and echo the selected profile in
-  the encrypted request.
-- Add queue/in-flight load awareness.
-- Add optional coarse throughput-aware expected completion time.
+- Preserve round robin among equivalent eligible nodes first.
+- Allow `64k-full` nodes to satisfy `8k-fast` requests while preventing
+  `8k-fast` nodes from satisfying `64k-full`.
+- Defer queue/in-flight load awareness.
+- Defer optional coarse throughput-aware expected completion time.
 
 ### Phase 3: long-context runtime tuning
 
@@ -746,20 +633,14 @@ and recovery requires warm-load validation before re-registration.
 
 ## Compatibility plan
 
-- Clients that omit `context_tier` are treated as requesting `8k-fast`. Without
-  `client_capabilities=selected_profile_echo_v1`, they remain exact-tier only and
-  must not be assigned to `64k-full`.
+- Clients that omit `context_tier` are treated as requesting `8k-fast`; a
+  `64k-full` node may satisfy that default request, while `8k-fast` must never
+  satisfy `64k-full`.
 - Compute nodes that do not advertise a profile are treated as legacy API v1
   `8k-fast` candidates only after they have warm-loaded the current 8,192-token
   default runtime.
-- The encrypted request may omit `context_tier` during migration; compute nodes
-  normalize missing to `8k-fast`. Relay selection must therefore keep omitted-tier
-  requests on exact `8k-fast` profiles until clients are upgraded to echo the
-  returned `selected_context_profile.profile_id` into
-  `routing.selected_context_profile_id` in the encrypted request.
-- Clients that advertise `client_capabilities=selected_profile_echo_v1` may use
-  smallest-capable selection, but only if they include the same capability
-  version in the encrypted routing object.
+- The encrypted request may omit `routing.context_tier` during migration; compute
+  nodes normalize missing routing to `8k-fast` after decryption.
 - Once the migration completes, documentation and diagnostics should encourage
   explicit tier selection, but the default remains for compatibility.
 

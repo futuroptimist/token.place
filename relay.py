@@ -489,6 +489,7 @@ def _validate_server_registration():
 known_servers = {}
 server_round_robin_lock = threading.RLock()
 server_round_robin_next_index = 0
+api_v1_filtered_round_robin_next_positions: dict[tuple[str, ...], int] = {}
 API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
 client_responses = {}
@@ -514,6 +515,11 @@ DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
 API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
+DEFAULT_CONTEXT_TIER = "8k-fast"
+MAX_API_V1_MODEL_IDS_PER_NODE = 64
+CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
+DEFAULT_MODEL_IDS = ["llama-3.1-8b-instruct", "llama-3-8b-instruct"]
+ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -565,6 +571,104 @@ def _api_v1_in_flight_ttl_seconds() -> float:
     except ValueError:
         return max(float(_api_v1_lease_seconds()), 1.0)
     return max(value, 1.0)
+
+
+def _api_v1_default_capabilities() -> dict[str, Any]:
+    return {
+        "api_version": "v1",
+        "supported_model_ids": list(DEFAULT_MODEL_IDS),
+        "active_context_tier": DEFAULT_CONTEXT_TIER,
+        "maximum_total_context_tokens": CONTEXT_TIER_ORDER[DEFAULT_CONTEXT_TIER],
+        "default_output_token_reservation": 1024,
+        "maximum_output_tokens": 1024,
+        "max_concurrency": 1,
+        "backend_class": "unknown",
+    }
+
+
+def _normalise_model_ids(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    if len(value) > MAX_API_V1_MODEL_IDS_PER_NODE:
+        return None
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        model_id = item.strip().lower()
+        if not model_id or len(model_id) > 128:
+            return None
+        if model_id not in normalized:
+            normalized.append(model_id)
+    return normalized
+
+
+def _normalise_positive_int(value: Any, *, min_value: int = 1, max_value: int = 1_000_000) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if min_value <= value <= max_value:
+        return value
+    return None
+
+
+def _normalise_api_v1_capabilities(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if value is None:
+        return _api_v1_default_capabilities(), None
+    if not isinstance(value, dict):
+        return None, "capabilities must be an object"
+
+    api_version = value.get("api_version", "v1")
+    if api_version not in {"v1", 1}:
+        return None, "capabilities.api_version must be v1"
+
+    active_context_tier = value.get("active_context_tier") or value.get("context_tier")
+    if not isinstance(active_context_tier, str):
+        return None, "capabilities.active_context_tier must be a string"
+    active_context_tier = active_context_tier.strip()
+    if active_context_tier not in CONTEXT_TIER_ORDER:
+        return None, "capabilities.active_context_tier is unsupported"
+
+    supported_model_ids = _normalise_model_ids(value.get("supported_model_ids") or value.get("model_ids"))
+    if supported_model_ids is None:
+        return None, "capabilities.supported_model_ids must be a non-empty string list"
+
+    max_context = _normalise_positive_int(value.get("maximum_total_context_tokens"))
+    if max_context is None:
+        return None, "capabilities.maximum_total_context_tokens must be a positive integer"
+    if max_context < CONTEXT_TIER_ORDER[active_context_tier]:
+        return None, "capabilities.maximum_total_context_tokens is below the active tier"
+
+    default_reservation = _normalise_positive_int(value.get("default_output_token_reservation"))
+    maximum_output = _normalise_positive_int(value.get("maximum_output_tokens"))
+    max_concurrency = _normalise_positive_int(value.get("max_concurrency"), max_value=128)
+    if default_reservation is None or maximum_output is None or max_concurrency is None:
+        return None, "capability token reservations and concurrency must be positive integers"
+    if default_reservation > maximum_output:
+        return None, "default output reservation cannot exceed maximum output tokens"
+
+    backend_class = value.get("backend_class", "unknown")
+    if not isinstance(backend_class, str):
+        return None, "capabilities.backend_class must be a string"
+    backend_class = backend_class.strip().lower() or "unknown"
+    if backend_class not in ALLOWED_BACKEND_CLASSES:
+        backend_class = "unknown"
+
+    return {
+        "api_version": "v1",
+        "supported_model_ids": supported_model_ids,
+        "active_context_tier": active_context_tier,
+        "maximum_total_context_tokens": max_context,
+        "default_output_token_reservation": default_reservation,
+        "maximum_output_tokens": maximum_output,
+        "max_concurrency": max_concurrency,
+        "backend_class": backend_class,
+    }, None
+
+
+def _context_tier_can_satisfy(active_tier: Any, requested_tier: str) -> bool:
+    if not isinstance(active_tier, str):
+        return False
+    return CONTEXT_TIER_ORDER.get(active_tier, 0) >= CONTEXT_TIER_ORDER[requested_tier]
 
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
@@ -657,6 +761,7 @@ def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
             "next_ping_in_x_seconds": payload.get("last_ping_duration"),
             "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+            "capabilities": payload.get("capabilities"),
         })
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
@@ -1002,29 +1107,57 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
-def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
+def _select_round_robin_server_key(*, model: str | None = None, context_tier: str = DEFAULT_CONTEXT_TIER) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
     """Select and snapshot the next API v1 compute node in registration-order round-robin order."""
 
     global server_round_robin_next_index
     with server_round_robin_lock:
-        ordered_keys = _api_v1_round_robin_keys()
+        all_api_v1_keys = _api_v1_round_robin_keys()
+        ordered_keys = []
+        requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
+        for server_public_key in all_api_v1_keys:
+            payload = known_servers.get(server_public_key, {})
+            capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+            if not isinstance(capabilities, dict):
+                continue
+            if requested_model and requested_model not in capabilities.get("supported_model_ids", []):
+                continue
+            if not _context_tier_can_satisfy(capabilities.get("active_context_tier"), context_tier):
+                continue
+            ordered_keys.append(server_public_key)
+        registered_count = len(all_api_v1_keys)
+        current_index = server_round_robin_next_index % registered_count if registered_count else 0
         if not ordered_keys:
-            server_round_robin_next_index = 0
             return None, {
                 "eligible_count": 0,
-                "round_robin_index": 0,
+                "registered_api_v1_count": registered_count,
+                "round_robin_index": current_index,
                 "round_robin_position": None,
             }, None
 
         eligible_count = len(ordered_keys)
-        round_robin_index = server_round_robin_next_index % eligible_count
-        server_public_key = ordered_keys[round_robin_index]
+        eligible_key = tuple(ordered_keys)
+        if eligible_key in api_v1_filtered_round_robin_next_positions:
+            selected_eligible_index = (
+                api_v1_filtered_round_robin_next_positions[eligible_key] % eligible_count
+            )
+        else:
+            selected_eligible_index = next(
+                ordered_keys.index(all_api_v1_keys[(current_index + index) % registered_count])
+                for index in range(registered_count)
+                if all_api_v1_keys[(current_index + index) % registered_count] in ordered_keys
+            )
+        server_public_key = ordered_keys[selected_eligible_index]
+        selected_global_index = all_api_v1_keys.index(server_public_key)
         server_payload = dict(known_servers[server_public_key])
-        server_round_robin_next_index = (round_robin_index + 1) % eligible_count
+        api_v1_filtered_round_robin_next_positions[eligible_key] = (
+            selected_eligible_index + 1
+        ) % eligible_count
+        server_round_robin_next_index = (selected_global_index + 1) % registered_count
         return server_public_key, {
             "eligible_count": eligible_count,
             "round_robin_index": server_round_robin_next_index,
-            "round_robin_position": round_robin_index,
+            "round_robin_position": selected_eligible_index,
         }, server_payload
 
 
@@ -1047,8 +1180,27 @@ def _select_next_server_payload(*, api_v1: bool = False):
             server_payload = dict(known_servers[server_public_key])
             return jsonify({'server_public_key': server_payload['public_key']})
 
-    server_public_key, selection, server_payload = _select_round_robin_server_key()
+    model = request.args.get("model") if api_v1 else None
+    context_tier = request.args.get("context_tier") if api_v1 else None
+    context_tier = context_tier.strip() if isinstance(context_tier, str) and context_tier.strip() else DEFAULT_CONTEXT_TIER
+    if api_v1 and context_tier not in CONTEXT_TIER_ORDER:
+        return jsonify({'error': {'message': 'Unsupported context_tier', 'code': 'invalid_context_tier'}}), 400
+
+    server_public_key, selection, server_payload = _select_round_robin_server_key(
+        model=model,
+        context_tier=context_tier,
+    )
     if not server_public_key or server_payload is None:
+        if selection.get("registered_api_v1_count", 0):
+            return jsonify({
+                'error': {
+                    'message': 'Registered compute nodes are available, but none match the requested model/context tier.',
+                    'code': 'no_matching_compute_node',
+                    'selection_policy': 'registration_order_round_robin_with_capability_filter',
+                    'requested_context_tier': context_tier,
+                    'requested_model': model,
+                }
+            }), 503
         return jsonify({
             'error': {
                 'message': 'No registered compute nodes are available on this relay.',
@@ -1060,7 +1212,7 @@ def _select_next_server_payload(*, api_v1: bool = False):
         "relay.server_selected",
         extra={
             "server_fingerprint": _safe_key_fingerprint(server_public_key),
-            "selection_policy": "registration_order_round_robin",
+            "selection_policy": "registration_order_round_robin_with_capability_filter",
             "round_robin_index": selection.get("round_robin_index"),
             "round_robin_position": selection.get("round_robin_position"),
             "eligible_count": selection.get("eligible_count"),
@@ -1068,7 +1220,14 @@ def _select_next_server_payload(*, api_v1: bool = False):
             "api_v1": api_v1,
         },
     )
-    return jsonify({'server_public_key': server_payload['public_key']})
+    capabilities = server_payload.get("capabilities") if isinstance(server_payload, dict) else {}
+    return jsonify({
+        'server_public_key': server_payload['public_key'],
+        'selected_context_tier': capabilities.get("active_context_tier"),
+        'selected_context_window_tokens': capabilities.get("maximum_total_context_tokens"),
+        'selected_model_support': capabilities.get("supported_model_ids", []),
+        'selection_policy': 'registration_order_round_robin_with_capability_filter',
+    })
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
@@ -1653,6 +1812,9 @@ def api_v1_relay_servers_register():
     public_key = data.get('server_public_key')
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+    capabilities, capability_error = _normalise_api_v1_capabilities(data.get('capabilities'))
+    if capability_error:
+        return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
 
     lease_seconds = _api_v1_lease_seconds()
     with server_round_robin_lock:
@@ -1678,6 +1840,7 @@ def api_v1_relay_servers_register():
             log_event = "server.registered"
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
+        known_servers[public_key]['capabilities'] = capabilities
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({
@@ -1731,6 +1894,13 @@ def api_v1_relay_servers_poll():
     public_key = data.get('server_public_key')
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+    capabilities = None
+    if 'capabilities' in data:
+        raw_capabilities = data.get('capabilities')
+        if raw_capabilities is not None:
+            capabilities, capability_error = _normalise_api_v1_capabilities(raw_capabilities)
+            if capability_error:
+                return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     lease_seconds = _api_v1_lease_seconds()
@@ -1740,6 +1910,8 @@ def api_v1_relay_servers_poll():
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
         server_payload['last_ping'] = datetime.now()
         server_payload['last_ping_duration'] = lease_seconds
+        if capabilities is not None:
+            server_payload['capabilities'] = capabilities
         server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 

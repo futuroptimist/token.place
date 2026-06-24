@@ -59,6 +59,52 @@ def _load_compute_node_bridge_module():
     return module
 
 
+def _api_v1_decrypted_payload(*, request_id="req-routing", client_public_key=TEST_VALID_RESPONSE["client_public_key"], routing_marker=...):
+    api_v1_request = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "options": {},
+    }
+    if routing_marker is not ...:
+        api_v1_request["routing"] = routing_marker
+    return {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": client_public_key,
+        "api_v1_request": api_v1_request,
+    }
+
+
+def test_extract_api_v1_request_payload_defaults_missing_routing_to_8k_fast():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker=...),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is not None
+    assert payload["routing"] == {"context_tier": "8k-fast"}
+
+
+def test_extract_api_v1_request_payload_accepts_valid_64k_routing():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker={"context_tier": "64k-full"}),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is not None
+    assert payload["routing"] == {"context_tier": "64k-full"}
+
+
+def test_extract_api_v1_request_payload_rejects_malformed_decrypted_routing():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker="64k-full"),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is None
+
+
 def test_sanitize_relay_target_handles_malformed_ports_and_ipv6():
     assert relay_client_module._sanitize_relay_target('https://relay.example:bad') == 'unknown'
     assert relay_client_module._sanitize_relay_target('http://[::1') == 'unknown'
@@ -1015,6 +1061,26 @@ class TestRelayClient:
         assert result['relay_http_diagnostic']['path'] == '/api/v1/relay/servers/register'
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_sends_context_capabilities(self, mock_post, relay_client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0}
+        mock_post.return_value = response
+        relay_client.model_manager.context_tier = "64k-full"
+        relay_client.model_manager.context_window_tokens = 65536
+        relay_client.model_manager.last_compute_diagnostics = {"backend_used": "cuda"}
+
+        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+
+        assert result['next_ping_in_x_seconds'] == 30
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["server_public_key"] == "mock_public_key_b64"
+        assert payload["capabilities"]["active_context_tier"] == "64k-full"
+        assert payload["capabilities"]["maximum_total_context_tokens"] == 65536
+        assert payload["capabilities"]["max_concurrency"] == 1
+        assert payload["capabilities"]["backend_class"] == "cuda"
+        assert "llama-3.1-8b-instruct" in payload["capabilities"]["supported_model_ids"]
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
         self, mock_post, relay_client, caplog
     ):
@@ -1770,6 +1836,7 @@ class TestRelayClient:
                 "model": "llama-3-8b-instruct",
                 "messages": [{"role": "user", "content": "Hello"}],
                 "options": {},
+                "routing": {"context_tier": "8k-fast"},
             },
         }
         mock_crypto_manager.decrypt_message.return_value = decrypted_payload
@@ -1818,6 +1885,20 @@ class TestRelayClient:
             },
             timeout=relay_client._request_timeout,
         )
+        posted_payload = mock_post.call_args.kwargs["json"]
+        posted_json = json.dumps(posted_payload)
+        for forbidden in (
+            "api_v1_response",
+            "messages",
+            "prompt",
+            "model",
+            "routing",
+            "context_tier",
+            "llama-3-8b-instruct",
+            "8k-fast",
+            "Hello",
+        ):
+            assert forbidden not in posted_json
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_no_options_does_not_depend_on_api_imports(
@@ -2358,6 +2439,95 @@ class TestRelayClient:
         assert mock_post.call_args.kwargs["json"]["request_id"] == (
             "req-unsupported-model"
         )
+
+    def test_api_v1_supported_model_ids_ignores_none_model_path(self, relay_client, mock_model_manager):
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = None
+        mock_model_manager.model_path = None
+
+        supported_model_ids = relay_client._api_v1_supported_model_ids()
+
+        assert "none" not in supported_model_ids
+
+    def test_api_v1_supported_model_ids_respects_manager_support_hook(self, relay_client):
+        class _Manager:
+            api_model_id = "custom-local-api-v1-model"
+            model_id = None
+            file_name = None
+            model_path = None
+
+            def supports_api_v1_model(self, model_id):
+                return model_id == "custom-local-api-v1-model"
+
+        relay_client.model_manager = _Manager()
+
+        assert relay_client._api_v1_supported_model_ids() == ["custom-local-api-v1-model"]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_unsatisfied_context_tier(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        mock_model_manager.context_tier = "8k-fast"
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-context-tier",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+                "routing": {"context_tier": "64k-full"},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_context_tier_unsupported"
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_strips_routing_context_tier(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        mock_model_manager.context_tier = "64k-full"
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-context-tier-space",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+                "routing": {"context_tier": "64k-full "},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert "error" not in encrypted_envelope["api_v1_response"]
+        assert encrypted_envelope["api_v1_response"]["message"]["role"] == "assistant"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_rejects_wrong_llama_family_model(

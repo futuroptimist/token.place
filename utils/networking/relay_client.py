@@ -18,6 +18,7 @@ from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
+from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -447,6 +448,7 @@ def _extract_api_v1_request_payload(
     model = api_v1_request.get("model")
     messages = api_v1_request.get("messages")
     options = api_v1_request.get("options", {})
+    routing = api_v1_request.get("routing", {})
     if not isinstance(model, str) or not model.strip():
         log_error("Rejected API v1 relay payload: model must be a non-empty string")
         return None
@@ -456,12 +458,24 @@ def _extract_api_v1_request_payload(
     if not isinstance(options, dict):
         log_error("Rejected API v1 relay payload: options must be an object")
         return None
+    if routing is None:
+        routing = {}
+    if not isinstance(routing, dict):
+        log_error("Rejected API v1 relay payload: routing must be an object")
+        return None
+    raw_context_tier = routing.get("context_tier")
+    normalized_raw_context_tier = raw_context_tier.strip() if isinstance(raw_context_tier, str) else raw_context_tier
+    context_tier = normalize_context_tier(normalized_raw_context_tier)
+    if normalized_raw_context_tier is not None and context_tier != normalized_raw_context_tier:
+        log_error("Rejected API v1 relay payload: routing.context_tier is unsupported")
+        return None
 
     return {
         "request_id": request_id,
         "model": model,
         "messages": messages,
         "options": options,
+        "routing": {"context_tier": context_tier},
     }
 
 
@@ -1200,7 +1214,10 @@ class RelayClient:
 
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
-        payload = {'server_public_key': self.crypto_manager.public_key_b64}
+        payload = {
+            'server_public_key': self.crypto_manager.public_key_b64,
+            'capabilities': self._api_v1_compute_node_capabilities(),
+        }
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
         headers = self._auth_headers()
         if headers:
@@ -1221,6 +1238,88 @@ class RelayClient:
                 next_ping_in_x_seconds=self._request_timeout,
             )
         return response.json()
+
+    @staticmethod
+    def _api_v1_model_path_basename(model_path: Any) -> Optional[str]:
+        """Return a safe basename only for concrete path-like model paths."""
+
+        if isinstance(model_path, (str, bytes, os.PathLike)):
+            basename = os.path.basename(os.fspath(model_path))
+            return basename if basename else None
+        return None
+
+    def _active_context_tier_can_satisfy(self, requested_context_tier: str) -> bool:
+        """Return whether the active runtime profile can satisfy a requested tier."""
+
+        active_context_tier = normalize_context_tier(
+            getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+        )
+        try:
+            active_profile = get_context_profile(active_context_tier)
+            requested_profile = get_context_profile(requested_context_tier)
+        except Exception:
+            return False
+        return active_profile.total_context_tokens >= requested_profile.total_context_tokens
+
+    def _api_v1_supported_model_ids(self) -> List[str]:
+        configured = [
+            getattr(self.model_manager, "api_model_id", None),
+            getattr(self.model_manager, "model_id", None),
+            getattr(self.model_manager, "file_name", None),
+            self._api_v1_model_path_basename(getattr(self.model_manager, "model_path", None)),
+        ]
+        model_ids = {
+            str(value).strip().lower()
+            for value in configured
+            if isinstance(value, str) and value.strip()
+        }
+        supports_api_v1_model = getattr(self.model_manager, "supports_api_v1_model", None)
+        manager_defines_supports_model = callable(
+            getattr(type(self.model_manager), "supports_api_v1_model", None)
+        )
+        if callable(supports_api_v1_model) and manager_defines_supports_model:
+            candidate_ids = set(model_ids)
+            candidate_ids.update(self._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
+            candidate_ids.update(self._API_V1_LOCAL_MODEL_ALIASES)
+            candidate_ids.update(self._API_V1_LOCAL_MODEL_ALIASES.values())
+            model_ids = {
+                model_id
+                for model_id in candidate_ids
+                if supports_api_v1_model(model_id)
+            }
+        else:
+            model_ids.update(self._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
+            model_ids.update(self._API_V1_LOCAL_MODEL_ALIASES)
+            model_ids.update(self._API_V1_LOCAL_MODEL_ALIASES.values())
+        return sorted(model_ids)
+
+    def _api_v1_compute_node_capabilities(self) -> Dict[str, Any]:
+        context_tier = normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
+        profile = get_context_profile(context_tier)
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        backend_class = "unknown"
+        if isinstance(diagnostics, dict):
+            backend_class = str(
+                diagnostics.get("backend_used")
+                or diagnostics.get("backend_selected")
+                or diagnostics.get("backend_available")
+                or "unknown"
+            ).strip().lower()
+        if backend_class not in {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}:
+            backend_class = "unknown"
+        return {
+            "api_version": "v1",
+            "supported_model_ids": self._api_v1_supported_model_ids(),
+            "active_context_tier": profile.profile_id,
+            "maximum_total_context_tokens": profile.total_context_tokens,
+            "default_output_token_reservation": profile.default_output_reservation_tokens,
+            "maximum_output_tokens": max(
+                profile.default_output_reservation_tokens,
+                self._API_V1_MAX_TOKENS_LIMIT,
+            ),
+            "max_concurrency": 1,
+            "backend_class": backend_class,
+        }
 
     @staticmethod
     def _build_api_v1_url(relay_url: str, route: str) -> str:
@@ -1378,7 +1477,10 @@ class RelayClient:
                     )
 
                 request_kwargs: Dict[str, Any] = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'json': {
+                        'server_public_key': self.crypto_manager.public_key_b64,
+                        'capabilities': self._api_v1_compute_node_capabilities(),
+                    },
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 log_info(
@@ -1926,7 +2028,7 @@ class RelayClient:
                 getattr(self.model_manager, "api_model_id", None),
                 getattr(self.model_manager, "model_id", None),
                 getattr(self.model_manager, "file_name", None),
-                os.path.basename(str(getattr(self.model_manager, "model_path", ""))),
+                self._api_v1_model_path_basename(getattr(self.model_manager, "model_path", None)),
             )
             if value
         }
@@ -2163,6 +2265,7 @@ class RelayClient:
         model_id: str,
         messages: List[Dict[str, Any]],
         options: Dict[str, Any],
+        requested_context_tier: str = DEFAULT_CONTEXT_TIER,
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
@@ -2188,6 +2291,15 @@ class RelayClient:
         has_direct_runtime_completion = callable(get_llm_instance) or callable(
             recovery_completion
         )
+        if not self._active_context_tier_can_satisfy(requested_context_tier):
+            return self._api_v1_response_envelope(
+                request_id,
+                error={
+                    "code": "compute_node_context_tier_unsupported",
+                    "message": "Requested context tier is not available in the desktop runtime",
+                },
+            )
+
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2375,6 +2487,7 @@ class RelayClient:
                     model_id=api_v1_request_payload["model"],
                     messages=api_v1_request_payload["messages"],
                     options=dict(api_v1_request_payload["options"]),
+                    requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
                 )
                 api_v1_response = response_envelope.get("api_v1_response", {})
                 error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None

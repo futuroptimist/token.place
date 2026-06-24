@@ -1,5 +1,6 @@
 """Unit tests for the desktop compute-node bridge."""
 
+import argparse
 import importlib.util
 import json
 import os
@@ -615,7 +616,6 @@ def test_run_restart_falls_back_to_relay_client_start(capsys, monkeypatch):
     assert start_calls == ['start']
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.relay_client.reset' in output.err
-
 
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()
@@ -1972,7 +1972,10 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert payload["backend_available"] == "pending"
     assert payload["backend_selected"] == "pending"
     assert payload["backend_used"] == "pending"
-    assert payload["model_path"] == "/tmp/model.gguf"
+    assert "model_path" not in payload
+    assert payload["context_tier"] == "8k-fast"
+    assert payload["interpreter"] == sys.executable
+    assert payload["import_root"]
     assert payload["last_error"] == payload["message"]
     assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
     assert payload["warm_load_state"] == "failed"
@@ -2002,6 +2005,83 @@ def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch
 
     assert compute_node_bridge.main() == 0
 
+
+def test_run_emits_structured_error_when_context_profiles_missing(capsys, monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.context_profiles':
+            raise ModuleNotFoundError("No module named 'utils.context_profiles'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    args = argparse.Namespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url=['https://relay.example'],
+        relay_urls=None,
+        relay_port=None,
+        context_tier='8k-fast',
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get('type') == 'error')
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert payload['context_tier'] == '8k-fast'
+    assert payload['interpreter'] == sys.executable
+    assert payload['import_root']
+    assert 'utils.context_profiles' in payload['message']
+    assert 'model_path' not in payload
+
+
+def test_packaged_bridge_prefers_bundled_context_profiles_over_site_utils(tmp_path):
+    resources_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    import_root = resources_root / '_up_' / '_up_'
+    bundled_utils = import_root / 'utils'
+    site_packages = tmp_path / 'site-packages'
+    third_party_utils = site_packages / 'utils'
+    python_dir.mkdir(parents=True)
+    bundled_utils.mkdir(parents=True)
+    third_party_utils.mkdir(parents=True)
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (bundled_utils / '__init__.py').write_text('', encoding='utf-8')
+    (bundled_utils / 'context_profiles.py').write_text('SOURCE = "bundled"\n', encoding='utf-8')
+    (third_party_utils / '__init__.py').write_text('', encoding='utf-8')
+    (third_party_utils / 'context_profiles.py').write_text('SOURCE = "site"\n', encoding='utf-8')
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(site_packages)
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            (
+                'import json, sys; '
+                f'sys.path.insert(0, {str(python_dir)!r}); '
+                'from path_bootstrap import ensure_runtime_import_paths; '
+                'ensure_runtime_import_paths('
+                f'{str(python_dir / "compute_node_bridge.py")!r}, '
+                'avoid_llama_cpp_shadowing=True); '
+                'import utils.context_profiles as cp; '
+                'print(json.dumps({"source": cp.SOURCE, "file": cp.__file__}))'
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload['source'] == 'bundled'
+    assert str(bundled_utils.resolve()) in str(Path(payload['file']).resolve())
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
     python_dir = tmp_path / 'bin' / 'resources' / 'python'

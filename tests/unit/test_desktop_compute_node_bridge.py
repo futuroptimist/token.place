@@ -1972,7 +1972,7 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert payload["backend_available"] == "pending"
     assert payload["backend_selected"] == "pending"
     assert payload["backend_used"] == "pending"
-    assert payload["model_path"] == "/tmp/model.gguf"
+    assert "model_path" not in payload
     assert payload["last_error"] == payload["message"]
     assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
     assert payload["warm_load_state"] == "failed"
@@ -2001,6 +2001,74 @@ def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch
     )
 
     assert compute_node_bridge.main() == 0
+
+
+def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    utils_dir = import_root / 'utils'
+    python_dir.mkdir(parents=True)
+    utils_dir.mkdir(parents=True)
+
+    (python_dir / 'compute_node_bridge.py').write_text(
+        MODULE_PATH.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'desktop_runtime_setup.py').write_text(
+        """
+def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):
+    return None
+
+def ensure_desktop_llama_runtime(_mode):
+    return {"selected_backend": "cpu", "detected_device": "cpu", "runtime_action": "skipped"}
+
+def ensure_desktop_python_dependencies(*, repo_root=None):
+    return {"ok": "true", "action": "already_satisfied", "missing": ""}
+
+def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
+    return None
+""".strip() + "\n",
+        encoding='utf-8',
+    )
+    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_dir / 'compute_node_runtime.py').write_text('', encoding='utf-8')
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(python_dir / 'compute_node_bridge.py'),
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+            '--relay-url',
+            'https://token.place',
+        ],
+        text=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        cwd=tmp_path,
+    )
+
+    assert proc.returncode == 1
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get('type') == 'error')
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert 'desktop context profile startup import failed' in payload['message']
+    assert "No module named 'utils.context_profiles'" in payload['message']
+    assert 'interpreter=' in payload['message']
+    assert 'import_root=' in payload['message']
+    assert 'model_path' not in payload
 
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):

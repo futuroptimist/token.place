@@ -1,6 +1,7 @@
 mod backend;
 mod compute_node;
 mod config;
+mod context_profiles;
 pub mod forward;
 pub mod keygen;
 mod logging;

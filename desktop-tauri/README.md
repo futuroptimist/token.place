@@ -76,6 +76,16 @@ After a successful repair, the sidecar automatically re-execs once so the active
 The Compute node operator panel supports multiple relay URLs for v0.1.x desktop nodes. Use this when
 one machine should serve both production and staging during release validation.
 
+The operator also has a stopped-only **Context tier** selector. Choose **8K Fast** for
+`n_ctx=8192` or **64K Full** for `n_ctx=65536` before clicking **Start operator**.
+The selected tier is saved in the desktop config and is applied during warm-load before relay
+registration; changing it requires **Stop operator** followed by **Start operator** so only one
+context profile is warm in each operator process.
+This context tier selector only chooses and warm-loads the operator runtime context window. It intentionally
+does not change API v1 request admission, relay request-size policy, relay scheduling, or registration
+capabilities; long-context admission and tier-aware selection remain follow-up work so the API v1
+E2EE relay contract stays unchanged in this patch.
+
 1. Stop the operator before editing relay URLs. Relay URL fields are stopped-only, and changes apply
    on the next Start operator action.
 2. Add one URL per field with **Add new relay URL**. Blank entries are ignored when saved or started.

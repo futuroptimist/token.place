@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
+use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
     append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
     OperatorLogSink,
@@ -31,6 +32,8 @@ pub struct ComputeNodeRequest {
     #[serde(default)]
     pub relay_base_urls: Vec<String>,
     pub mode: ComputeMode,
+    #[serde(default = "default_request_context_tier")]
+    pub context_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -62,6 +65,8 @@ pub struct ComputeNodeStatus {
     pub warm_load_state: Option<String>,
     pub warm_load_enabled: Option<bool>,
     pub warm_load_duration_ms: Option<u64>,
+    pub context_tier: Option<String>,
+    pub context_window_tokens: Option<u32>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
     pub worker_state: Option<String>,
@@ -75,6 +80,10 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+}
+
+fn default_request_context_tier() -> String {
+    DEFAULT_CONTEXT_TIER.to_string()
 }
 
 #[derive(Clone, Default)]
@@ -264,6 +273,9 @@ fn startup_failure_status(
         warm_load_state: Some("failed".into()),
         warm_load_enabled: Some(true),
         warm_load_duration_ms: None,
+        context_tier: Some(normalize_context_tier(&request.context_tier)),
+        context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
+            .map(|profile| profile.total_context_tokens),
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
         worker_state: Some("failed".into()),
@@ -400,6 +412,18 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if payload.get("warm_load_duration_ms").is_some() {
         status.warm_load_duration_ms = payload.get("warm_load_duration_ms").and_then(Value::as_u64);
+    }
+    if payload.get("context_tier").is_some() {
+        status.context_tier = payload
+            .get("context_tier")
+            .and_then(Value::as_str)
+            .map(normalize_context_tier);
+    }
+    if payload.get("context_window_tokens").is_some() {
+        status.context_window_tokens = payload
+            .get("context_window_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
     }
     if payload.get("runtime_path").is_some() {
         status.runtime_path = payload
@@ -615,6 +639,8 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "warm_load_state",
         "warm_load_enabled",
         "warm_load_duration_ms",
+        "context_tier",
+        "context_window_tokens",
         "requested_mode",
         "effective_mode",
         "backend_available",
@@ -890,6 +916,8 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&request.context_tier))
         .args(
             relay_base_urls
                 .iter()
@@ -974,6 +1002,11 @@ pub async fn start_compute_node(
                 warm_load_state: Some("not_started".into()),
                 warm_load_enabled: Some(true),
                 warm_load_duration_ms: None,
+                context_tier: Some(normalize_context_tier(&request.context_tier)),
+                context_window_tokens: context_profile(&normalize_context_tier(
+                    &request.context_tier,
+                ))
+                .map(|profile| profile.total_context_tokens),
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
                 worker_state: Some("starting".into()),
@@ -1263,12 +1296,32 @@ mod tests {
         )
         .expect("request should deserialize");
 
+        assert_eq!(request.context_tier, "8k-fast");
+
         assert_eq!(
             normalized_request_relay_urls(&request),
             vec![
                 "https://token.place".to_string(),
                 "https://staging.token.place".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn compute_node_request_serializes_context_tier() {
+        let request = ComputeNodeRequest {
+            model_path: "/tmp/model.gguf".into(),
+            relay_base_url: "https://token.place".into(),
+            relay_base_urls: vec!["https://token.place".into()],
+            mode: ComputeMode::Cpu,
+            context_tier: "64k-full".into(),
+        };
+
+        let payload = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(
+            payload.get("context_tier").and_then(Value::as_str),
+            Some("64k-full")
         );
     }
 
@@ -1978,6 +2031,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
+            context_tier: "64k-full".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -2157,6 +2211,7 @@ mod tests {
             relay_base_url: "https://relay.example".into(),
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
+            context_tier: "unknown".into(),
         };
 
         let status = startup_failure_status(

@@ -3855,3 +3855,24 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
         proxy.tokenize(b'hello', add_bos=False)
     assert proxy._closed is True
+
+
+def test_get_llm_instance_with_recovery_returns_existing_runtime(standalone_model_manager):
+    runtime = object()
+    standalone_model_manager.get_llm_instance = MagicMock(return_value=runtime)
+    standalone_model_manager._ensure_replacement_llm = MagicMock()
+
+    assert standalone_model_manager.get_llm_instance_with_recovery() is runtime
+    standalone_model_manager.get_llm_instance.assert_called_once_with()
+    standalone_model_manager._ensure_replacement_llm.assert_not_called()
+
+
+def test_get_llm_instance_with_recovery_attempts_replacement_when_unavailable(standalone_model_manager):
+    replacement = object()
+    standalone_model_manager.get_llm_instance = MagicMock(return_value=None)
+    standalone_model_manager._ensure_replacement_llm = MagicMock(return_value=replacement)
+    standalone_model_manager._llm_generation = 7
+
+    assert standalone_model_manager.get_llm_instance_with_recovery() is replacement
+    standalone_model_manager.get_llm_instance.assert_called_once_with()
+    standalone_model_manager._ensure_replacement_llm.assert_called_once_with(7)

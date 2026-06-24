@@ -490,6 +490,12 @@ known_servers = {}
 server_round_robin_lock = threading.RLock()
 server_round_robin_next_index = 0
 API_V1_SERVER_MARKER = "api_v1_registered"
+API_V1_DEFAULT_CONTEXT_TIER = "8k-fast"
+API_V1_CONTEXT_TIER_TOKENS = {
+    "8k-fast": 8192,
+    "64k-full": 65536,
+}
+API_V1_SELECTION_POLICY = "registration_order_round_robin_with_capability_filter"
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
@@ -565,6 +571,97 @@ def _api_v1_in_flight_ttl_seconds() -> float:
     except ValueError:
         return max(float(_api_v1_lease_seconds()), 1.0)
     return max(value, 1.0)
+
+
+def _api_v1_compat_capabilities() -> dict[str, Any]:
+    return {
+        "api_version": "v1",
+        "supported_model_ids": ["llama-3.1-8b-instruct"],
+        "active_context_tier": API_V1_DEFAULT_CONTEXT_TIER,
+        "max_total_context_tokens": API_V1_CONTEXT_TIER_TOKENS[API_V1_DEFAULT_CONTEXT_TIER],
+        "default_output_token_reservation": 1024,
+        "maximum_output_tokens": 4096,
+        "max_concurrency": 1,
+    }
+
+
+def _normalise_api_v1_capabilities(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Return relay-safe, normalized API v1 capabilities or an error message."""
+
+    if raw is None:
+        return _api_v1_compat_capabilities(), None
+    if not isinstance(raw, dict):
+        return None, "capabilities must be an object"
+
+    allowed_keys = {
+        "api_version",
+        "supported_model_ids",
+        "active_context_tier",
+        "max_total_context_tokens",
+        "default_output_token_reservation",
+        "maximum_output_tokens",
+        "max_concurrency",
+        "backend_class",
+    }
+    capabilities: dict[str, Any] = {}
+    for key in raw:
+        if key not in allowed_keys:
+            return None, f"unsupported capability field: {key}"
+
+    api_version = raw.get("api_version", "v1")
+    if api_version != "v1":
+        return None, "api_version must be v1"
+    capabilities["api_version"] = "v1"
+
+    models = raw.get("supported_model_ids", _api_v1_compat_capabilities()["supported_model_ids"])
+    if (
+        not isinstance(models, list)
+        or not models
+        or len(models) > 32
+        or any(not isinstance(model, str) or not model.strip() or len(model) > 128 for model in models)
+    ):
+        return None, "supported_model_ids must be a non-empty string list"
+    capabilities["supported_model_ids"] = sorted({model.strip() for model in models})
+
+    tier = raw.get("active_context_tier", API_V1_DEFAULT_CONTEXT_TIER)
+    if tier not in API_V1_CONTEXT_TIER_TOKENS:
+        return None, "active_context_tier is unsupported"
+    capabilities["active_context_tier"] = tier
+
+    expected_tokens = API_V1_CONTEXT_TIER_TOKENS[tier]
+    max_total_context_tokens = raw.get("max_total_context_tokens", expected_tokens)
+    if (
+        isinstance(max_total_context_tokens, bool)
+        or not isinstance(max_total_context_tokens, int)
+        or max_total_context_tokens < expected_tokens
+    ):
+        return None, "max_total_context_tokens is invalid for active_context_tier"
+    capabilities["max_total_context_tokens"] = max_total_context_tokens
+
+    for field, default in (
+        ("default_output_token_reservation", 1024),
+        ("maximum_output_tokens", 4096),
+        ("max_concurrency", 1),
+    ):
+        value = raw.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return None, f"{field} must be a positive integer"
+        capabilities[field] = value
+    if capabilities["default_output_token_reservation"] > capabilities["maximum_output_tokens"]:
+        return None, "default_output_token_reservation cannot exceed maximum_output_tokens"
+    if capabilities["max_concurrency"] != 1:
+        return None, "max_concurrency must be 1"
+
+    backend_class = raw.get("backend_class")
+    if backend_class is not None:
+        if backend_class not in {"cpu", "cuda", "metal", "gpu", "hybrid", "unknown"}:
+            return None, "backend_class is unsupported"
+        capabilities["backend_class"] = backend_class
+    return capabilities, None
+
+
+def _api_v1_context_tier_satisfies(active_tier: str, requested_tier: str) -> bool:
+    return API_V1_CONTEXT_TIER_TOKENS.get(active_tier, 0) >= API_V1_CONTEXT_TIER_TOKENS.get(requested_tier, 0)
 
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
@@ -657,6 +754,7 @@ def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
             "next_ping_in_x_seconds": payload.get("last_ping_duration"),
             "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+            "capabilities": payload.get("capabilities", _api_v1_compat_capabilities()),
         })
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
@@ -670,6 +768,23 @@ def _api_v1_round_robin_keys() -> list[str]:
         for server_public_key, payload in known_servers.items()
         if bool(payload.get(API_V1_SERVER_MARKER))
     ]
+
+
+def _api_v1_eligible_round_robin_keys(*, model: str | None, context_tier: str) -> list[str]:
+    ordered: list[str] = []
+    for server_public_key, payload in known_servers.items():
+        if not bool(payload.get(API_V1_SERVER_MARKER)):
+            continue
+        capabilities = payload.get("capabilities", _api_v1_compat_capabilities())
+        if not isinstance(capabilities, dict):
+            continue
+        if model and model not in capabilities.get("supported_model_ids", []):
+            continue
+        active_tier = capabilities.get("active_context_tier")
+        if not isinstance(active_tier, str) or not _api_v1_context_tier_satisfies(active_tier, context_tier):
+            continue
+        ordered.append(server_public_key)
+    return ordered
 
 
 def _remove_known_server(server_public_key: str) -> bool:
@@ -1002,18 +1117,30 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
-def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
+def _select_round_robin_server_key(
+    *, model: str | None = None, context_tier: str = API_V1_DEFAULT_CONTEXT_TIER
+) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
     """Select and snapshot the next API v1 compute node in registration-order round-robin order."""
 
     global server_round_robin_next_index
     with server_round_robin_lock:
-        ordered_keys = _api_v1_round_robin_keys()
-        if not ordered_keys:
+        all_api_v1_keys = _api_v1_round_robin_keys()
+        if not all_api_v1_keys:
             server_round_robin_next_index = 0
             return None, {
                 "eligible_count": 0,
                 "round_robin_index": 0,
                 "round_robin_position": None,
+                "registered_api_v1_count": 0,
+            }, None
+
+        ordered_keys = _api_v1_eligible_round_robin_keys(model=model, context_tier=context_tier)
+        if not ordered_keys:
+            return None, {
+                "eligible_count": 0,
+                "round_robin_index": server_round_robin_next_index,
+                "round_robin_position": None,
+                "registered_api_v1_count": len(all_api_v1_keys),
             }, None
 
         eligible_count = len(ordered_keys)
@@ -1025,6 +1152,7 @@ def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any], dict[s
             "eligible_count": eligible_count,
             "round_robin_index": server_round_robin_next_index,
             "round_robin_position": round_robin_index,
+            "registered_api_v1_count": len(all_api_v1_keys),
         }, server_payload
 
 
@@ -1047,8 +1175,32 @@ def _select_next_server_payload(*, api_v1: bool = False):
             server_payload = dict(known_servers[server_public_key])
             return jsonify({'server_public_key': server_payload['public_key']})
 
-    server_public_key, selection, server_payload = _select_round_robin_server_key()
+    requested_model = request.args.get("model")
+    if isinstance(requested_model, str):
+        requested_model = requested_model.strip() or None
+    requested_context_tier = request.args.get("context_tier", API_V1_DEFAULT_CONTEXT_TIER)
+    if requested_context_tier not in API_V1_CONTEXT_TIER_TOKENS:
+        return jsonify({
+            'error': {
+                'message': 'Requested context tier is not supported.',
+                'code': 'invalid_context_tier',
+            }
+        }), 400
+
+    server_public_key, selection, server_payload = _select_round_robin_server_key(
+        model=requested_model,
+        context_tier=requested_context_tier,
+    )
     if not server_public_key or server_payload is None:
+        if selection.get("registered_api_v1_count", 0):
+            return jsonify({
+                'error': {
+                    'message': 'No registered compute nodes match the requested model and context tier.',
+                    'code': 'no_matching_compute_node',
+                    'requested_model': requested_model,
+                    'requested_context_tier': requested_context_tier,
+                }
+            }), 503
         return jsonify({
             'error': {
                 'message': 'No registered compute nodes are available on this relay.',
@@ -1060,7 +1212,7 @@ def _select_next_server_payload(*, api_v1: bool = False):
         "relay.server_selected",
         extra={
             "server_fingerprint": _safe_key_fingerprint(server_public_key),
-            "selection_policy": "registration_order_round_robin",
+            "selection_policy": API_V1_SELECTION_POLICY,
             "round_robin_index": selection.get("round_robin_index"),
             "round_robin_position": selection.get("round_robin_position"),
             "eligible_count": selection.get("eligible_count"),
@@ -1068,7 +1220,17 @@ def _select_next_server_payload(*, api_v1: bool = False):
             "api_v1": api_v1,
         },
     )
-    return jsonify({'server_public_key': server_payload['public_key']})
+    capabilities = server_payload.get("capabilities", _api_v1_compat_capabilities())
+    return jsonify({
+        'server_public_key': server_payload['public_key'],
+        'selected_context_tier': capabilities.get("active_context_tier", API_V1_DEFAULT_CONTEXT_TIER),
+        'selected_context_window_tokens': capabilities.get(
+            "max_total_context_tokens",
+            API_V1_CONTEXT_TIER_TOKENS[API_V1_DEFAULT_CONTEXT_TIER],
+        ),
+        'selected_model_support': capabilities.get("supported_model_ids", []),
+        'selection_policy': API_V1_SELECTION_POLICY,
+    })
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
@@ -1653,6 +1815,14 @@ def api_v1_relay_servers_register():
     public_key = data.get('server_public_key')
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+    capabilities, capabilities_error = _normalise_api_v1_capabilities(data.get("capabilities"))
+    if capabilities_error:
+        return jsonify({
+            'error': {
+                'message': f'Invalid capabilities: {capabilities_error}',
+                'code': 'invalid_capabilities',
+            }
+        }), 400
 
     lease_seconds = _api_v1_lease_seconds()
     with server_round_robin_lock:
@@ -1678,6 +1848,7 @@ def api_v1_relay_servers_register():
             log_event = "server.registered"
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
+        known_servers[public_key]['capabilities'] = capabilities
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({

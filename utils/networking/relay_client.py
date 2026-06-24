@@ -18,6 +18,7 @@ from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
+from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -447,6 +448,7 @@ def _extract_api_v1_request_payload(
     model = api_v1_request.get("model")
     messages = api_v1_request.get("messages")
     options = api_v1_request.get("options", {})
+    routing = api_v1_request.get("routing", {})
     if not isinstance(model, str) or not model.strip():
         log_error("Rejected API v1 relay payload: model must be a non-empty string")
         return None
@@ -456,12 +458,22 @@ def _extract_api_v1_request_payload(
     if not isinstance(options, dict):
         log_error("Rejected API v1 relay payload: options must be an object")
         return None
+    if routing is None:
+        routing = {}
+    if not isinstance(routing, dict):
+        log_error("Rejected API v1 relay payload: routing must be an object")
+        return None
+    context_tier = routing.get("context_tier", DEFAULT_CONTEXT_TIER)
+    if context_tier not in {"8k-fast", "64k-full"}:
+        log_error("Rejected API v1 relay payload: routing.context_tier is unsupported")
+        return None
 
     return {
         "request_id": request_id,
         "model": model,
         "messages": messages,
         "options": options,
+        "routing": {"context_tier": context_tier},
     }
 
 
@@ -1200,7 +1212,10 @@ class RelayClient:
 
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
-        payload = {'server_public_key': self.crypto_manager.public_key_b64}
+        payload = {
+            'server_public_key': self.crypto_manager.public_key_b64,
+            'capabilities': self._api_v1_compute_capabilities(),
+        }
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
         headers = self._auth_headers()
         if headers:
@@ -1221,6 +1236,26 @@ class RelayClient:
                 next_ping_in_x_seconds=self._request_timeout,
             )
         return response.json()
+
+    def _api_v1_compute_capabilities(self) -> Dict[str, Any]:
+        context_tier = getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+        profile = get_context_profile(context_tier if isinstance(context_tier, str) else DEFAULT_CONTEXT_TIER)
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", {})
+        backend_class = None
+        if isinstance(diagnostics, dict):
+            backend_class = diagnostics.get("backend_used") or diagnostics.get("backend_selected")
+        capabilities: Dict[str, Any] = {
+            "api_version": "v1",
+            "supported_model_ids": sorted(self._API_V1_LOCAL_LLAMA_RUNTIME_IDS),
+            "active_context_tier": profile.profile_id,
+            "max_total_context_tokens": profile.total_context_tokens,
+            "default_output_token_reservation": profile.default_output_reservation_tokens,
+            "maximum_output_tokens": profile.maximum_output_tokens,
+            "max_concurrency": 1,
+        }
+        if backend_class in {"cpu", "cuda", "metal", "gpu", "hybrid", "unknown"}:
+            capabilities["backend_class"] = backend_class
+        return capabilities
 
     @staticmethod
     def _build_api_v1_url(relay_url: str, route: str) -> str:

@@ -17,7 +17,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
+from utils.networking.relay_client import (
+    RelayClient,
+    MESSAGE_SCHEMA,
+    RELAY_RESPONSE_SCHEMA,
+    _extract_api_v1_request_payload,
+)
 
 # Common test data
 TEST_VALID_RESPONSE = {
@@ -155,6 +160,40 @@ def test_validate_with_fallback_rejects_missing_required_field_without_jsonschem
     ):
         with pytest.raises(ValueError, match="Missing required field: iv"):
             relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
+
+
+def test_api_v1_encrypted_request_routing_defaults_to_8k_after_decryption():
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "request_id": "req-1",
+        "client_public_key": "client-key",
+        "api_v1_request": {
+            "model": "llama-3.1-8b-instruct",
+            "messages": [],
+            "options": {},
+        },
+    }
+
+    extracted = _extract_api_v1_request_payload(payload, "client-key")
+
+    assert extracted is not None
+    assert extracted["routing"] == {"context_tier": "8k-fast"}
+
+
+def test_api_v1_encrypted_request_rejects_malformed_routing_after_decryption():
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "request_id": "req-1",
+        "client_public_key": "client-key",
+        "api_v1_request": {
+            "model": "llama-3.1-8b-instruct",
+            "messages": [],
+            "options": {},
+            "routing": {"context_tier": "128k-raw"},
+        },
+    }
+
+    assert _extract_api_v1_request_payload(payload, "client-key") is None
 
 # Create a better time mock with a context manager
 class TimeMock:
@@ -1013,6 +1052,27 @@ class TestRelayClient:
         assert result['http_status'] == 503
         assert result['relay_error_kind'] == 'http_status_no_json_body'
         assert result['relay_http_diagnostic']['path'] == '/api/v1/relay/servers/register'
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_sends_active_context_capabilities(self, mock_post, relay_client):
+        relay_client.model_manager.context_tier = "64k-full"
+        relay_client.model_manager.last_compute_diagnostics = {"backend_used": "cuda"}
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"next_ping_in_x_seconds": 30, "poll_wait_seconds": 10}
+        mock_post.return_value = response
+
+        result = relay_client.register_api_v1_compute_node("http://relay-a.example")
+
+        assert result["next_ping_in_x_seconds"] == 30
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["server_public_key"] == relay_client.crypto_manager.public_key_b64
+        assert payload["capabilities"]["api_version"] == "v1"
+        assert payload["capabilities"]["active_context_tier"] == "64k-full"
+        assert payload["capabilities"]["max_total_context_tokens"] == 65536
+        assert payload["capabilities"]["max_concurrency"] == 1
+        assert payload["capabilities"]["backend_class"] == "cuda"
+        assert "hostname" not in payload["capabilities"]
+        assert "vram" not in payload["capabilities"]
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(

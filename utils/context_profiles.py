@@ -15,6 +15,7 @@ class ContextProfile:
     display_label: str
     total_context_tokens: int
     default_output_reservation_tokens: int
+    maximum_output_tokens: int = 4096
     enabled: bool = True
 
 
@@ -22,8 +23,8 @@ class ContextProfile:
 # codegen/manifest loading. Keep these IDs and token counts synchronized with
 # desktop-tauri/src-tauri/src/context_profiles.rs and desktop-tauri/src/App.tsx.
 _CONTEXT_PROFILES = (
-    ContextProfile("8k-fast", "8K Fast", 8192, 1024, True),
-    ContextProfile("64k-full", "64K Full", 65536, 1024, True),
+    ContextProfile("8k-fast", "8K Fast", 8192, 1024, 4096, True),
+    ContextProfile("64k-full", "64K Full", 65536, 1024, 4096, True),
 )
 
 CONTEXT_PROFILES: Dict[str, ContextProfile] = {

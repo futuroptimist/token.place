@@ -223,6 +223,46 @@ The initial desktop UX is intentionally static and operator-controlled:
 9. No in-place resize and no per-request model reconstruction are part of the
    initial design.
 
+## API v1 capability registration and tier-aware selection (P9)
+
+Compute nodes may now include an optional `capabilities` object on
+`POST /api/v1/relay/servers/register` heartbeats. The relay stores only
+normalized, privacy-safe fields:
+
+- API version (`v1`);
+- supported model IDs;
+- active context tier (`8k-fast` or `64k-full`);
+- maximum total context tokens for the active tier;
+- default and maximum output-token reservation;
+- maximum concurrency, initially `1`;
+- coarse backend class when the desktop runtime can safely report one.
+
+Older API v1 nodes that omit capabilities are treated as `8k-fast`
+compatibility nodes. Malformed capability payloads are rejected before updating
+relay registration state. The initial contract intentionally does not advertise
+raw VRAM/RAM values, hostnames, hardware serials, keys beyond the existing
+public-key routing field, prompt text, or exact prompt token counts.
+
+`GET /api/v1/relay/servers/next` accepts optional `model` and `context_tier`
+query parameters. Missing `context_tier` defaults to `8k-fast`. Selection
+filters to live API v1 nodes that support the requested model, when supplied,
+and whose active context tier can satisfy the requested tier. A `64k-full` node
+may satisfy an `8k-fast` request, but an `8k-fast` node must not satisfy a
+`64k-full` request. Among equivalent eligible nodes, registration-order
+round-robin remains the scheduling policy; broader load balancing is still a
+later task.
+
+Successful selection returns the existing `server_public_key` plus safe metadata:
+selected context tier, selected context-window tokens, selected model support,
+and the selection policy. If no compute nodes are registered the relay preserves
+`no_registered_compute_nodes`; if nodes exist but none match the requested
+model/tier, it returns `no_matching_compute_node`.
+
+Encrypted API v1 request payloads may include `api_v1_request.routing` with
+`routing.context_tier`. This routing field is validated only after the compute
+node decrypts the E2EE envelope; plaintext relay dispatch still carries no
+prompt text, message content, exact token count, or client-derived message size.
+
 ## Privacy-safe capability registration
 
 After warm-load validation, a compute node registers these API v1 capabilities:

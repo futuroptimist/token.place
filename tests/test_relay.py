@@ -259,19 +259,114 @@ def _server_key(label):
     return base64.b64encode(f"server_public_key_{label}".encode()).decode("utf-8")
 
 
-def _register_api_v1_server(client, server_public_key):
+def _capabilities(tier="8k-fast", models=None):
+    return {
+        "api_version": "v1",
+        "supported_model_ids": models or ["llama-3.1-8b-instruct"],
+        "active_context_tier": tier,
+        "max_total_context_tokens": 65536 if tier == "64k-full" else 8192,
+        "default_output_token_reservation": 1024,
+        "maximum_output_tokens": 4096,
+        "max_concurrency": 1,
+        "backend_class": "metal" if tier == "8k-fast" else "cuda",
+    }
+
+
+def _register_api_v1_server(client, server_public_key, capabilities=None):
+    payload = {'server_public_key': server_public_key}
+    if capabilities is not None:
+        payload["capabilities"] = capabilities
     response = client.post(
         '/api/v1/relay/servers/register',
-        json={'server_public_key': server_public_key},
+        json=payload,
     )
     assert response.status_code == 200
     return response
 
 
-def _next_api_v1_server_key(client):
-    response = client.get('/api/v1/relay/servers/next')
+def _next_api_v1_server_key(client, **query):
+    response = client.get('/api/v1/relay/servers/next', query_string=query)
     assert response.status_code == 200
     return response.get_json()['server_public_key']
+
+
+def test_api_v1_registers_normalized_8k_and_64k_capabilities(client):
+    server_a = _server_key("cap-8k")
+    server_b = _server_key("cap-64k")
+    _register_api_v1_server(client, server_a, _capabilities("8k-fast"))
+    _register_api_v1_server(client, server_b, _capabilities("64k-full"))
+
+    nodes = client.get("/relay/diagnostics").get_json()["api_v1_registered_compute_nodes"]
+    capabilities = {node["server_public_key"]: node["capabilities"] for node in nodes}
+    assert capabilities[server_a]["active_context_tier"] == "8k-fast"
+    assert capabilities[server_a]["max_total_context_tokens"] == 8192
+    assert capabilities[server_b]["active_context_tier"] == "64k-full"
+    assert capabilities[server_b]["max_total_context_tokens"] == 65536
+    assert "hostname" not in capabilities[server_b]
+    assert "vram" not in capabilities[server_b]
+
+
+def test_api_v1_rejects_malformed_capabilities_without_registering(client):
+    response = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": _server_key("bad-cap"), "capabilities": {"active_context_tier": "raw-host"}},
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_capabilities"
+    assert known_servers == {}
+
+
+def test_api_v1_old_node_defaults_to_8k_compatibility(client):
+    server = _server_key("old-node")
+    _register_api_v1_server(client, server)
+    payload = client.get("/api/v1/relay/servers/next").get_json()
+    assert payload["server_public_key"] == server
+    assert payload["selected_context_tier"] == "8k-fast"
+    assert payload["selected_context_window_tokens"] == 8192
+
+
+def test_api_v1_tier_and_model_selection(client):
+    node_8k = _server_key("tier-8k")
+    node_64k = _server_key("tier-64k")
+    _register_api_v1_server(client, node_8k, _capabilities("8k-fast", ["small-model"]))
+    _register_api_v1_server(client, node_64k, _capabilities("64k-full", ["small-model", "long-model"]))
+
+    assert _next_api_v1_server_key(client, context_tier="8k-fast", model="small-model") == node_8k
+    assert _next_api_v1_server_key(client, context_tier="64k-full") == node_64k
+    assert _next_api_v1_server_key(client, context_tier="8k-fast", model="long-model") == node_64k
+
+
+def test_api_v1_8k_request_may_select_64k_when_no_8k_node(client):
+    node_64k = _server_key("only-64k")
+    _register_api_v1_server(client, node_64k, _capabilities("64k-full"))
+    assert _next_api_v1_server_key(client, context_tier="8k-fast") == node_64k
+
+
+def test_api_v1_deterministic_round_robin_within_eligible_tier(client):
+    node_a = _server_key("rr-64k-a")
+    node_b = _server_key("rr-64k-b")
+    _register_api_v1_server(client, _server_key("rr-8k"), _capabilities("8k-fast"))
+    _register_api_v1_server(client, node_a, _capabilities("64k-full"))
+    _register_api_v1_server(client, node_b, _capabilities("64k-full"))
+
+    assert [_next_api_v1_server_key(client, context_tier="64k-full") for _ in range(4)] == [
+        node_a,
+        node_b,
+        node_a,
+        node_b,
+    ]
+
+
+def test_api_v1_no_matching_node_error_when_registered_nodes_are_ineligible(client):
+    _register_api_v1_server(client, _server_key("only-8k"), _capabilities("8k-fast", ["small-model"]))
+
+    response = client.get("/api/v1/relay/servers/next", query_string={"context_tier": "64k-full"})
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "no_matching_compute_node"
+
+    response = client.get("/api/v1/relay/servers/next", query_string={"model": "other-model"})
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "no_matching_compute_node"
 
 
 def _queue_api_v1_request(client, *, server_public_key, request_id, client_public_key=None):

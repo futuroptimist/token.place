@@ -1972,7 +1972,11 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert payload["backend_available"] == "pending"
     assert payload["backend_selected"] == "pending"
     assert payload["backend_used"] == "pending"
-    assert payload["model_path"] == "/tmp/model.gguf"
+    assert "model_path" not in payload
+    assert payload["context_tier"] == "8k-fast"
+    assert payload["interpreter"] == sys.executable
+    assert "import_root" in payload
+    assert "log_path" in payload
     assert payload["last_error"] == payload["message"]
     assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
     assert payload["warm_load_state"] == "failed"
@@ -2157,6 +2161,38 @@ class ComputeNodeRuntime:
     assert any(event.get('type') == 'started' for event in events)
     assert any(event.get('type') == 'stopped' for event in events)
     assert "No module named 'utils'" not in stdout
+
+
+def test_context_profiles_import_failure_emits_structured_startup_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_CONTEXT_PROFILES_IMPORT_ERROR",
+        ModuleNotFoundError("No module named 'utils.context_profiles'"),
+    )
+    monkeypatch.setenv("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "/app/Resources/_up/_up")
+    monkeypatch.setenv("TOKENPLACE_COMPUTE_NODE_LOG_PATH", "/tmp/operator.log")
+    args = SimpleNamespace(
+        model="/tmp/secret-model.gguf",
+        mode="auto",
+        relay_url="https://token.place",
+        relay_port=None,
+        context_tier="does-not-exist",
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = events[0]
+    assert payload["type"] == "error"
+    assert payload["registered"] is False
+    assert payload["context_tier"] == "8k-fast"
+    assert payload["interpreter"] == sys.executable
+    assert payload["import_root"] == "/app/Resources/_up/_up"
+    assert payload["log_path"] == "/tmp/operator.log"
+    assert "utils.context_profiles" in payload["message"]
+    assert "model_path" not in payload
+    assert "/tmp/secret-model.gguf" not in json.dumps(payload)
 
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):

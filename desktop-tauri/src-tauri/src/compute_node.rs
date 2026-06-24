@@ -910,6 +910,9 @@ pub async fn start_compute_node(
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
+    if let Some(path) = &log_file_path {
+        bridge_command.env("TOKENPLACE_COMPUTE_NODE_LOG_PATH", path);
+    }
 
     let spawn_result = bridge_command
         .arg("--model")

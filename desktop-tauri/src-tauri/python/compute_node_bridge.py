@@ -27,7 +27,21 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
-from utils.context_profiles import apply_context_profile, get_context_profile
+
+_CONTEXT_PROFILES_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from utils.context_profiles import (
+        apply_context_profile,
+        get_context_profile,
+        normalize_context_tier,
+    )
+except Exception as exc:  # resolved into a structured startup error from run()/main()
+    _CONTEXT_PROFILES_IMPORT_ERROR = exc
+    apply_context_profile = None  # type: ignore[assignment]
+    get_context_profile = None  # type: ignore[assignment]
+
+    def normalize_context_tier(profile_id: Optional[str]) -> str:
+        return profile_id if profile_id in {"8k-fast", "64k-full"} else "8k-fast"
 
 try:
     from desktop_runtime_setup import (
@@ -543,7 +557,10 @@ def _structured_startup_error_payload(
         "backend_selected": "pending",
         "backend_used": "pending",
         "fallback_reason": None,
-        "model_path": getattr(args, "model", ""),
+        "context_tier": normalize_context_tier(getattr(args, "context_tier", "8k-fast")),
+        "interpreter": sys.executable,
+        "import_root": os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "unknown") or "unknown",
+        "log_path": os.environ.get("TOKENPLACE_COMPUTE_NODE_LOG_PATH", "unknown") or "unknown",
         "last_error": message,
         "message": message,
         "warm_load_state": "failed",
@@ -633,6 +650,10 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
+    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+        emit_startup_error(f"runtime unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+        return 1
+
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -695,7 +716,12 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
-    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
+    try:
+        args.context_tier = get_context_profile(
+            getattr(args, "context_tier", "8k-fast")
+        ).profile_id
+    except ValueError:
+        args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),

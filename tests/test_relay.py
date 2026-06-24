@@ -46,6 +46,7 @@ def client():
     # Reset state before each test
     known_servers.clear()
     relay_module.server_round_robin_next_index = 0
+    relay_module.api_v1_filtered_round_robin_next_positions.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -64,6 +65,7 @@ def client():
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     relay_module.server_round_robin_next_index = 0
+    relay_module.api_v1_filtered_round_robin_next_positions.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -364,6 +366,24 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     no_match = client.get("/api/v1/relay/servers/next?model=model-a&context_tier=64k-full")
     assert no_match.status_code == 503
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
+
+
+def test_api_v1_filtered_round_robin_is_stable_across_alternating_filters(client):
+    fast = _server_key("mixed-fast")
+    full_a = _server_key("mixed-full-a")
+    full_b = _server_key("mixed-full-b")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast", ["fast-model"]))
+    _register_api_v1_server_with_capabilities(client, full_a, _capabilities("64k-full", ["full-model"]))
+    _register_api_v1_server_with_capabilities(client, full_b, _capabilities("64k-full", ["full-model"]))
+
+    selections = [
+        client.get("/api/v1/relay/servers/next?model=full-model&context_tier=64k-full").get_json()["server_public_key"],
+        client.get("/api/v1/relay/servers/next?model=fast-model").get_json()["server_public_key"],
+        client.get("/api/v1/relay/servers/next?model=full-model&context_tier=64k-full").get_json()["server_public_key"],
+        client.get("/api/v1/relay/servers/next?model=fast-model").get_json()["server_public_key"],
+    ]
+
+    assert selections == [full_a, fast, full_b, fast]
 
 
 def test_api_v1_no_match_does_not_reset_round_robin_cursor(client):

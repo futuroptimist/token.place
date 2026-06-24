@@ -59,6 +59,52 @@ def _load_compute_node_bridge_module():
     return module
 
 
+def _api_v1_decrypted_payload(*, request_id="req-routing", client_public_key=TEST_VALID_RESPONSE["client_public_key"], routing_marker=...):
+    api_v1_request = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "options": {},
+    }
+    if routing_marker is not ...:
+        api_v1_request["routing"] = routing_marker
+    return {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": client_public_key,
+        "api_v1_request": api_v1_request,
+    }
+
+
+def test_extract_api_v1_request_payload_defaults_missing_routing_to_8k_fast():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker=...),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is not None
+    assert payload["routing"] == {"context_tier": "8k-fast"}
+
+
+def test_extract_api_v1_request_payload_accepts_valid_64k_routing():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker={"context_tier": "64k-full"}),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is not None
+    assert payload["routing"] == {"context_tier": "64k-full"}
+
+
+def test_extract_api_v1_request_payload_rejects_malformed_decrypted_routing():
+    payload = relay_client_module._extract_api_v1_request_payload(
+        _api_v1_decrypted_payload(routing_marker="64k-full"),
+        TEST_VALID_RESPONSE["client_public_key"],
+    )
+
+    assert payload is None
+
+
 def test_sanitize_relay_target_handles_malformed_ports_and_ipv6():
     assert relay_client_module._sanitize_relay_target('https://relay.example:bad') == 'unknown'
     assert relay_client_module._sanitize_relay_target('http://[::1') == 'unknown'
@@ -1790,6 +1836,7 @@ class TestRelayClient:
                 "model": "llama-3-8b-instruct",
                 "messages": [{"role": "user", "content": "Hello"}],
                 "options": {},
+                "routing": {"context_tier": "8k-fast"},
             },
         }
         mock_crypto_manager.decrypt_message.return_value = decrypted_payload
@@ -1838,6 +1885,20 @@ class TestRelayClient:
             },
             timeout=relay_client._request_timeout,
         )
+        posted_payload = mock_post.call_args.kwargs["json"]
+        posted_json = json.dumps(posted_payload)
+        for forbidden in (
+            "api_v1_response",
+            "messages",
+            "prompt",
+            "model",
+            "routing",
+            "context_tier",
+            "llama-3-8b-instruct",
+            "8k-fast",
+            "Hello",
+        ):
+            assert forbidden not in posted_json
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_no_options_does_not_depend_on_api_imports(

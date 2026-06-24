@@ -489,6 +489,7 @@ def _validate_server_registration():
 known_servers = {}
 server_round_robin_lock = threading.RLock()
 server_round_robin_next_index = 0
+api_v1_filtered_round_robin_next_positions: dict[tuple[str, ...], int] = {}
 API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
 client_responses = {}
@@ -1135,20 +1136,28 @@ def _select_round_robin_server_key(*, model: str | None = None, context_tier: st
             }, None
 
         eligible_count = len(ordered_keys)
-        selected_position = next(
-            index
-            for index in range(registered_count)
-            if all_api_v1_keys[(current_index + index) % registered_count] in ordered_keys
-        )
-        selected_global_index = (current_index + selected_position) % registered_count
-        server_public_key = all_api_v1_keys[selected_global_index]
-        round_robin_index = ordered_keys.index(server_public_key)
+        eligible_key = tuple(ordered_keys)
+        if eligible_key in api_v1_filtered_round_robin_next_positions:
+            selected_eligible_index = (
+                api_v1_filtered_round_robin_next_positions[eligible_key] % eligible_count
+            )
+        else:
+            selected_eligible_index = next(
+                ordered_keys.index(all_api_v1_keys[(current_index + index) % registered_count])
+                for index in range(registered_count)
+                if all_api_v1_keys[(current_index + index) % registered_count] in ordered_keys
+            )
+        server_public_key = ordered_keys[selected_eligible_index]
+        selected_global_index = all_api_v1_keys.index(server_public_key)
         server_payload = dict(known_servers[server_public_key])
+        api_v1_filtered_round_robin_next_positions[eligible_key] = (
+            selected_eligible_index + 1
+        ) % eligible_count
         server_round_robin_next_index = (selected_global_index + 1) % registered_count
         return server_public_key, {
             "eligible_count": eligible_count,
             "round_robin_index": server_round_robin_next_index,
-            "round_robin_position": round_robin_index,
+            "round_robin_position": selected_eligible_index,
         }, server_payload
 
 

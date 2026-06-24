@@ -11,6 +11,7 @@ import math
 import os
 import hashlib
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -661,6 +662,9 @@ class RelayClient:
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
         self._unregister_attempted = False
         self._unregister_complete = False
+        self._api_v1_heartbeat_stop = threading.Event()
+        self._api_v1_heartbeat_lock = threading.Lock()
+        self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
 
 
     @staticmethod
@@ -857,11 +861,90 @@ class RelayClient:
             clear_registration,
         )
 
+    def _api_v1_heartbeat_loop(self) -> None:
+        """Renew API v1 relay leases independently of the polling/inference thread."""
+
+        while not self._api_v1_heartbeat_stop.is_set():
+            registered = list(getattr(self, "_api_v1_registered_relays", set()))
+            if not registered:
+                self._api_v1_heartbeat_stop.wait(0.25)
+                continue
+            for relay_url in registered:
+                if self._api_v1_heartbeat_stop.is_set():
+                    return
+                hints = getattr(self, "_api_v1_relay_wait_hints", {}).get(relay_url, {})
+                lease_seconds = hints.get("next_ping_in_x_seconds", DEFAULT_API_V1_LEASE_SECONDS)
+                threshold = self._api_v1_refresh_threshold_seconds(lease_seconds)
+                last = self._api_v1_last_heartbeat_at.get(relay_url, 0.0)
+                if threshold <= 0 or time.monotonic() - float(last or 0.0) < threshold:
+                    continue
+                try:
+                    response = self.register_api_v1_compute_node(relay_url)
+                    if isinstance(response, dict) and not response.get("error"):
+                        wait = self._normalise_positive_seconds(
+                            response.get("next_ping_in_x_seconds"),
+                            DEFAULT_API_V1_LEASE_SECONDS,
+                        )
+                        poll_wait = self._normalise_poll_wait_seconds(
+                            response.get("poll_wait_seconds", hints.get("poll_wait_seconds", 0))
+                        )
+                        self._api_v1_registered_relays.add(relay_url)
+                        self._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
+                        self._api_v1_relay_wait_hints[relay_url] = {
+                            "next_ping_in_x_seconds": wait,
+                            "poll_wait_seconds": poll_wait,
+                            "server_public_key": getattr(self.crypto_manager, "public_key_b64", None),
+                        }
+                        log_info(
+                            "server.heartbeat.background relay={} lease_seconds={} key_fingerprint={}",
+                            relay_url,
+                            wait,
+                            self._api_v1_public_key_fingerprint(getattr(self.crypto_manager, "public_key_b64", None)),
+                        )
+                    else:
+                        log_error(
+                            "API v1 heartbeat renewal failed for {}: {}",
+                            relay_url,
+                            response.get("error") if isinstance(response, dict) else "invalid_response",
+                        )
+                except Exception as exc:
+                    log_error(
+                        "API v1 heartbeat renewal exception for {}: {}",
+                        relay_url,
+                        str(exc),
+                        exc_info=True,
+                    )
+            self._api_v1_heartbeat_stop.wait(0.25)
+
+    def start_api_v1_heartbeat_worker(self) -> None:
+        with self._api_v1_heartbeat_lock:
+            thread = self._api_v1_heartbeat_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._api_v1_heartbeat_stop.clear()
+            self._api_v1_heartbeat_thread = threading.Thread(
+                target=self._api_v1_heartbeat_loop,
+                name="tokenplace-api-v1-heartbeat",
+                daemon=True,
+            )
+            self._api_v1_heartbeat_thread.start()
+
+    def stop_api_v1_heartbeat_worker(self, *, join_timeout: float = 2.0) -> None:
+        with self._api_v1_heartbeat_lock:
+            self._api_v1_heartbeat_stop.set()
+            thread = self._api_v1_heartbeat_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=join_timeout)
+        with self._api_v1_heartbeat_lock:
+            if self._api_v1_heartbeat_thread is thread:
+                self._api_v1_heartbeat_thread = None
+
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""
         log_info("Stopping relay polling")
         self.stop_polling = True
         self._polling_stopped_by_request = True
+        self.stop_api_v1_heartbeat_worker()
 
     def unregister_from_relay(self) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
@@ -880,6 +963,7 @@ class RelayClient:
             return True
 
         self._unregister_attempted = True
+        self.stop_api_v1_heartbeat_worker()
 
         last_error: Optional[str] = None
         failed_relays: Set[str] = set()
@@ -2239,6 +2323,113 @@ class RelayClient:
         completion_kwargs.update(safe_options)
         return completion_kwargs
 
+
+    @staticmethod
+    def _api_v1_render_chat_for_admission(llm_instance: Any, messages: List[Dict[str, Any]]) -> str:
+        """Render chat with the active runtime/template surface used by llama-cpp-python."""
+
+        for owner in (llm_instance, getattr(llm_instance, "tokenizer_", None), getattr(llm_instance, "_tokenizer", None)):
+            apply_template = getattr(owner, "apply_chat_template", None) if owner is not None else None
+            if callable(apply_template):
+                rendered = apply_template(messages, tokenize=False, add_generation_prompt=True)
+                if isinstance(rendered, bytes):
+                    return rendered.decode("utf-8", errors="replace")
+                if isinstance(rendered, str):
+                    return rendered
+        return "".join(
+            f"<|start_header_id|>{message.get('role')}<|end_header_id|>\n\n"
+            f"{message.get('content', '')}<|eot_id|>"
+            for message in messages
+        ) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    @staticmethod
+    def _api_v1_tokenize_rendered_chat(llm_instance: Any, rendered_prompt: str) -> int:
+        """Tokenize a rendered prompt with the active llama runtime tokenizer."""
+
+        for owner in (llm_instance, getattr(llm_instance, "tokenizer_", None), getattr(llm_instance, "_tokenizer", None)):
+            tokenize = getattr(owner, "tokenize", None) if owner is not None else None
+            if callable(tokenize):
+                try:
+                    tokens = tokenize(rendered_prompt.encode("utf-8"), add_bos=False, special=True)
+                except TypeError:
+                    try:
+                        tokens = tokenize(rendered_prompt.encode("utf-8"), add_bos=False)
+                    except TypeError:
+                        tokens = tokenize(rendered_prompt)
+                return len(tokens)
+            encode = getattr(owner, "encode", None) if owner is not None else None
+            if callable(encode):
+                return len(encode(rendered_prompt))
+        return len(rendered_prompt.encode("utf-8"))
+
+    @staticmethod
+    def _api_v1_context_overflow_error(
+        *,
+        active_context_tier: str,
+        configured_context_tokens: int,
+        prompt_tokens: int,
+        requested_output_tokens: int,
+        requested_context_tier: str,
+    ) -> Dict[str, Any]:
+        required_total = prompt_tokens + requested_output_tokens
+        recommended = None
+        retryable = False
+        try:
+            full = get_context_profile("64k-full")
+            if required_total <= full.total_context_tokens and configured_context_tokens < full.total_context_tokens:
+                recommended = full.profile_id
+                retryable = True
+        except Exception:
+            recommended = None
+        error: Dict[str, Any] = {
+            "code": "compute_node_context_window_exceeded",
+            "type": "validation_error",
+            "message": "Request exceeds the active compute node context window",
+            "active_context_tier": active_context_tier,
+            "configured_context_tokens": configured_context_tokens,
+            "prompt_tokens": prompt_tokens,
+            "requested_output_tokens": requested_output_tokens,
+            "required_total_tokens": required_total,
+            "requested_context_tier": requested_context_tier,
+            "retryable": retryable,
+        }
+        if recommended is not None:
+            error["recommended_context_tier"] = recommended
+        return error
+
+    def _api_v1_admit_context_window(
+        self,
+        *,
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        completion_kwargs: Dict[str, Any],
+        requested_context_tier: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        active_tier = normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
+        active_profile = get_context_profile(active_tier)
+        requested_output_tokens = int(completion_kwargs.get("max_tokens", active_profile.default_output_reservation_tokens))
+        rendered = self._api_v1_render_chat_for_admission(llm_instance, messages)
+        prompt_tokens = self._api_v1_tokenize_rendered_chat(llm_instance, rendered)
+        configured_context_tokens = int(getattr(self.model_manager, "context_window_tokens", active_profile.total_context_tokens))
+        admitted = prompt_tokens + requested_output_tokens <= configured_context_tokens
+        log_info(
+            "api_v1.context_admission active_tier={} prompt_tokens={} output_reservation={} result={} safe_error_code={}",
+            active_tier,
+            prompt_tokens,
+            requested_output_tokens,
+            "admitted" if admitted else "rejected",
+            "none" if admitted else "compute_node_context_window_exceeded",
+        )
+        if admitted:
+            return True, None
+        return False, self._api_v1_context_overflow_error(
+            active_context_tier=active_tier,
+            configured_context_tokens=configured_context_tokens,
+            prompt_tokens=prompt_tokens,
+            requested_output_tokens=requested_output_tokens,
+            requested_context_tier=requested_context_tier,
+        )
+
     def _assistant_message_from_runtime_completion(
         self, completion: Any
     ) -> Optional[Dict[str, Any]]:
@@ -2292,12 +2483,18 @@ class RelayClient:
             recovery_completion
         )
         if not self._active_context_tier_can_satisfy(requested_context_tier):
+            active_tier = normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
+            active_profile = get_context_profile(active_tier)
+            requested_profile = get_context_profile(requested_context_tier)
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": "compute_node_context_tier_unsupported",
-                    "message": "Requested context tier is not available in the desktop runtime",
-                },
+                error=self._api_v1_context_overflow_error(
+                    active_context_tier=active_tier,
+                    configured_context_tokens=active_profile.total_context_tokens,
+                    prompt_tokens=0,
+                    requested_output_tokens=requested_profile.default_output_reservation_tokens,
+                    requested_context_tier=requested_context_tier,
+                ),
             )
 
         if not self._runtime_model_can_satisfy(model_id):
@@ -2386,9 +2583,26 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+                admission_llm = llm_instance or getattr(self.model_manager, "llm", None)
+                if admission_llm is None and callable(get_llm_instance):
+                    admission_llm = get_llm_instance()
+                admitted, admission_error = self._api_v1_admit_context_window(
+                    llm_instance=admission_llm,
+                    messages=runtime_messages,
+                    completion_kwargs=completion_kwargs,
+                    requested_context_tier=requested_context_tier,
+                )
+                if not admitted:
+                    return self._api_v1_response_envelope(request_id, error=admission_error)
+                inference_started_at = time.monotonic()
                 completion = create_chat_completion(
                     messages=runtime_messages,
                     **completion_kwargs,
+                )
+                log_info(
+                    "api_v1.inference_duration active_tier={} duration_seconds={}",
+                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+                    round(time.monotonic() - inference_started_at, 6),
                 )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
@@ -2650,6 +2864,7 @@ class RelayClient:
         """Continuously poll API v1 E2EE relay routes and process encrypted work."""
 
         self.start()
+        self.start_api_v1_heartbeat_worker()
         consecutive_failures = 0
         max_failures = _max_poll_failures_before_stop()
         log_info("Starting API v1 E2EE relay polling loop")

@@ -7,6 +7,7 @@ import json
 import math
 import pytest
 import sys
+import threading
 import requests
 import jsonschema
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
+from utils.context_profiles import get_context_profile
 
 # Common test data
 TEST_VALID_RESPONSE = {
@@ -2494,7 +2496,7 @@ class TestRelayClient:
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_context_tier_unsupported"
+            "compute_node_context_window_exceeded"
         )
 
     @patch('utils.networking.relay_client.requests.post')
@@ -4146,3 +4148,183 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
     assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+
+class _CountingRuntime:
+    def __init__(self):
+        self.created = []
+        self.rendered = []
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        rendered = "".join(
+            f"<{message['role']}>:{message.get('content', '')}\n" for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<assistant>:"
+        self.rendered.append(rendered)
+        return rendered
+
+    def tokenize(self, rendered, *args, **kwargs):
+        override = getattr(self, 'next_prompt_tokens', None)
+        if override is not None:
+            self.next_prompt_tokens = None
+            return list(range(override))
+        if isinstance(rendered, bytes):
+            rendered = rendered.decode('utf-8')
+        return list(rendered)
+
+    def create_chat_completion(self, **kwargs):
+        self.created.append(kwargs)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class _CountingRuntimeManager:
+    def __init__(self, tier='8k-fast', default_max_tokens=4):
+        self.runtime = _CountingRuntime()
+        self.use_mock_llm = True
+        self.context_tier = tier
+        profile = get_context_profile(tier)
+        self.context_window_tokens = profile.total_context_tokens
+        self.config = MagicMock()
+        self.config.get.side_effect = lambda key, default=None: {
+            'model.max_tokens': default_max_tokens,
+            'model.temperature': 0.7,
+            'model.top_p': 0.9,
+            'model.stop_tokens': [],
+        }.get(key, default)
+
+    def get_llm_instance(self):
+        return self.runtime
+
+
+def _message_for_rendered_prompt_tokens(runtime, desired_prompt_tokens):
+    runtime.next_prompt_tokens = desired_prompt_tokens
+    return {'role': 'user', 'content': f'synthetic prompt token budget {desired_prompt_tokens}'}
+
+
+@pytest.mark.parametrize('tier', ['8k-fast', '64k-full'])
+def test_api_v1_exact_context_admission_boundaries(tier):
+    manager = _CountingRuntimeManager(tier=tier, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+    window = manager.context_window_tokens
+
+    below = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-below',
+        model_id='llama-3-8b-instruct',
+        messages=[_message_for_rendered_prompt_tokens(manager.runtime, window - 4)],
+        options={'max_tokens': 4},
+        requested_context_tier=tier,
+    )
+    above = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-above',
+        model_id='llama-3-8b-instruct',
+        messages=[_message_for_rendered_prompt_tokens(manager.runtime, window - 3)],
+        options={'max_tokens': 4},
+        requested_context_tier=tier,
+    )
+
+    assert below['api_v1_response']['message']['content'] == 'ok'
+    error = above['api_v1_response']['error']
+    assert error['code'] == 'compute_node_context_window_exceeded'
+    assert error['prompt_tokens'] == window - 3
+    assert error['requested_output_tokens'] == 4
+    assert error['required_total_tokens'] == window + 1
+    assert len(manager.runtime.created) == 1
+
+
+def test_api_v1_context_admission_uses_default_output_budget_and_template_overhead():
+    manager = _CountingRuntimeManager(tier='8k-fast', default_max_tokens=7)
+    client = _api_v1_validation_client(manager)
+    window = manager.context_window_tokens
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-default-budget',
+        model_id='llama-3-8b-instruct',
+        messages=[_message_for_rendered_prompt_tokens(manager.runtime, window - 6)],
+        options={},
+    )
+
+    error = envelope['api_v1_response']['error']
+    assert error['code'] == 'compute_node_context_window_exceeded'
+    assert error['requested_output_tokens'] == 7
+    assert error['prompt_tokens'] == window - 6
+    assert manager.runtime.created == []
+
+
+def test_api_v1_context_admission_unicode_and_structured_content_blocks():
+    manager = _CountingRuntimeManager(tier='8k-fast', default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-unicode-structured',
+        model_id='llama-3-8b-instruct',
+        messages=[{'role': 'user', 'content': [{'type': 'text', 'text': 'hello 🌍'}, {'type': 'input_text', 'text': '{"k":"v"}'}]}],
+        options={'max_tokens': 4},
+    )
+
+    assert envelope['api_v1_response']['message']['content'] == 'ok'
+    rendered = manager.runtime.rendered[-1]
+    assert 'hello 🌍\n\n{"k":"v"}' in rendered
+
+
+def test_api_v1_8k_request_is_accepted_on_64k_runtime_and_64k_rejected_on_8k_runtime():
+    full_manager = _CountingRuntimeManager(tier='64k-full', default_max_tokens=4)
+    full_client = _api_v1_validation_client(full_manager)
+    accepted = full_client._generate_api_v1_response_with_runtime_model(
+        request_id='req-8k-on-64k',
+        model_id='llama-3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 4},
+        requested_context_tier='8k-fast',
+    )
+    fast_manager = _CountingRuntimeManager(tier='8k-fast', default_max_tokens=4)
+    fast_client = _api_v1_validation_client(fast_manager)
+    rejected = fast_client._generate_api_v1_response_with_runtime_model(
+        request_id='req-64k-on-8k',
+        model_id='llama-3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 4},
+        requested_context_tier='64k-full',
+    )
+
+    assert accepted['api_v1_response']['message']['content'] == 'ok'
+    error = rejected['api_v1_response']['error']
+    assert error['code'] == 'compute_node_context_window_exceeded'
+    assert error['active_context_tier'] == '8k-fast'
+    assert error['recommended_context_tier'] == '64k-full'
+    assert error['retryable'] is True
+    assert fast_manager.runtime.created == []
+
+
+def test_api_v1_heartbeat_worker_renews_stale_registration_and_stops_cleanly(monkeypatch):
+    client = _standalone_relay_client()
+    relay_url = 'http://localhost:5000'
+    renewed = []
+    observed = threading.Event()
+    client._api_v1_registered_relays.add(relay_url)
+    client._api_v1_last_heartbeat_at[relay_url] = 1.0
+    client._api_v1_relay_wait_hints = {}
+    client._api_v1_relay_wait_hints[relay_url] = {
+        'next_ping_in_x_seconds': 2,
+        'poll_wait_seconds': 0,
+        'server_public_key': client.crypto_manager.public_key_b64,
+    }
+
+    def fake_register(target_url):
+        renewed.append(target_url)
+        observed.set()
+        return {'next_ping_in_x_seconds': 2, 'poll_wait_seconds': 0}
+
+    monkeypatch.setattr(client, 'register_api_v1_compute_node', fake_register)
+
+    client.start_api_v1_heartbeat_worker()
+    first_thread = client._api_v1_heartbeat_thread
+    client.start_api_v1_heartbeat_worker()
+
+    assert client._api_v1_heartbeat_thread is first_thread
+    assert observed.wait(2.0)
+    client.stop_api_v1_heartbeat_worker()
+
+    assert renewed == [relay_url]
+    assert client._api_v1_heartbeat_thread is None
+    assert not first_thread.is_alive()

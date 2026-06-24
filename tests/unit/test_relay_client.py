@@ -2379,6 +2379,95 @@ class TestRelayClient:
             "req-unsupported-model"
         )
 
+    def test_api_v1_supported_model_ids_ignores_none_model_path(self, relay_client, mock_model_manager):
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = None
+        mock_model_manager.model_path = None
+
+        supported_model_ids = relay_client._api_v1_supported_model_ids()
+
+        assert "none" not in supported_model_ids
+
+    def test_api_v1_supported_model_ids_respects_manager_support_hook(self, relay_client):
+        class _Manager:
+            api_model_id = "custom-local-api-v1-model"
+            model_id = None
+            file_name = None
+            model_path = None
+
+            def supports_api_v1_model(self, model_id):
+                return model_id == "custom-local-api-v1-model"
+
+        relay_client.model_manager = _Manager()
+
+        assert relay_client._api_v1_supported_model_ids() == ["custom-local-api-v1-model"]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_unsatisfied_context_tier(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        mock_model_manager.context_tier = "8k-fast"
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-context-tier",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+                "routing": {"context_tier": "64k-full"},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_context_tier_unsupported"
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_strips_routing_context_tier(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        mock_model_manager.context_tier = "64k-full"
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-context-tier-space",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+                "routing": {"context_tier": "64k-full "},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert "error" not in encrypted_envelope["api_v1_response"]
+        assert encrypted_envelope["api_v1_response"]["message"]["role"] == "assistant"
+
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_rejects_wrong_llama_family_model(
         self,

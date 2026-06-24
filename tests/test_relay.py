@@ -366,6 +366,50 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
 
 
+def test_api_v1_no_match_does_not_reset_round_robin_cursor(client):
+    a = _server_key("fair-a")
+    b = _server_key("fair-b")
+    c = _server_key("fair-c")
+    for key in (a, b, c):
+        _register_api_v1_server_with_capabilities(client, key, _capabilities("8k-fast"))
+
+    assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == a
+    no_match = client.get("/api/v1/relay/servers/next?context_tier=64k-full")
+    assert no_match.status_code == 503
+
+    assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == b
+
+
+def test_api_v1_rejects_excessive_capability_model_ids(client):
+    server = _server_key("too-many-models")
+    capabilities = _capabilities(
+        "8k-fast",
+        [f"model-{index}" for index in range(relay_module.MAX_API_V1_MODEL_IDS_PER_NODE + 1)],
+    )
+
+    response = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": server, "capabilities": capabilities},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_capabilities"
+    assert server not in known_servers
+
+
+def test_api_v1_poll_capabilities_null_preserves_registered_tier(client):
+    server = _server_key("null-heartbeat")
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("64k-full"))
+
+    response = client.post(
+        "/api/v1/relay/servers/poll",
+        json={"server_public_key": server, "capabilities": None},
+    )
+
+    assert response.status_code == 200
+    assert known_servers[server]["capabilities"]["active_context_tier"] == "64k-full"
+
+
 def test_api_v1_diagnostics_expose_only_normalized_capabilities(client):
     server = _server_key("diagnostic-cap")
     _register_api_v1_server_with_capabilities(

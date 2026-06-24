@@ -515,6 +515,7 @@ API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
 API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
 DEFAULT_CONTEXT_TIER = "8k-fast"
+MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
 DEFAULT_MODEL_IDS = ["llama-3.1-8b-instruct", "llama-3-8b-instruct"]
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
@@ -586,6 +587,8 @@ def _api_v1_default_capabilities() -> dict[str, Any]:
 
 def _normalise_model_ids(value: Any) -> list[str] | None:
     if not isinstance(value, list) or not value:
+        return None
+    if len(value) > MAX_API_V1_MODEL_IDS_PER_NODE:
         return None
     normalized: list[str] = []
     for item in value:
@@ -1121,20 +1124,27 @@ def _select_round_robin_server_key(*, model: str | None = None, context_tier: st
             if not _context_tier_can_satisfy(capabilities.get("active_context_tier"), context_tier):
                 continue
             ordered_keys.append(server_public_key)
+        registered_count = len(all_api_v1_keys)
+        current_index = server_round_robin_next_index % registered_count if registered_count else 0
         if not ordered_keys:
-            server_round_robin_next_index = 0
             return None, {
                 "eligible_count": 0,
-                "registered_api_v1_count": len(all_api_v1_keys),
-                "round_robin_index": 0,
+                "registered_api_v1_count": registered_count,
+                "round_robin_index": current_index,
                 "round_robin_position": None,
             }, None
 
         eligible_count = len(ordered_keys)
-        round_robin_index = server_round_robin_next_index % eligible_count
-        server_public_key = ordered_keys[round_robin_index]
+        selected_position = next(
+            index
+            for index in range(registered_count)
+            if all_api_v1_keys[(current_index + index) % registered_count] in ordered_keys
+        )
+        selected_global_index = (current_index + selected_position) % registered_count
+        server_public_key = all_api_v1_keys[selected_global_index]
+        round_robin_index = ordered_keys.index(server_public_key)
         server_payload = dict(known_servers[server_public_key])
-        server_round_robin_next_index = (round_robin_index + 1) % eligible_count
+        server_round_robin_next_index = (selected_global_index + 1) % registered_count
         return server_public_key, {
             "eligible_count": eligible_count,
             "round_robin_index": server_round_robin_next_index,
@@ -1877,9 +1887,11 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
     capabilities = None
     if 'capabilities' in data:
-        capabilities, capability_error = _normalise_api_v1_capabilities(data.get('capabilities'))
-        if capability_error:
-            return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
+        raw_capabilities = data.get('capabilities')
+        if raw_capabilities is not None:
+            capabilities, capability_error = _normalise_api_v1_capabilities(raw_capabilities)
+            if capability_error:
+                return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     lease_seconds = _api_v1_lease_seconds()

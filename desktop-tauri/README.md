@@ -81,7 +81,7 @@ The operator also has a stopped-only **Context tier** selector. Choose **8K Fast
 The selected tier is saved in the desktop config and is applied during warm-load before relay
 registration; changing it requires **Stop operator** followed by **Start operator** so only one
 context profile is warm in each operator process.
-This P8 selector only chooses and warm-loads the operator runtime context window. It intentionally
+This context tier selector only chooses and warm-loads the operator runtime context window. It intentionally
 does not change API v1 request admission, relay request-size policy, relay scheduling, or registration
 capabilities; long-context admission and tier-aware selection remain follow-up work so the API v1
 E2EE relay contract stays unchanged in this patch.

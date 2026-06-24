@@ -11,7 +11,7 @@ pub struct ContextProfile {
     pub enabled: bool,
 }
 
-// P8 intentionally uses static, duplicated profile constants instead of
+// Context tiers intentionally use static, duplicated profile constants instead of
 // runtime codegen/manifest loading. Keep these IDs and token counts
 // synchronized with utils/context_profiles.py and desktop-tauri/src/App.tsx.
 pub const CONTEXT_PROFILES: &[ContextProfile] = &[

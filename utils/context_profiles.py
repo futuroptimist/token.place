@@ -18,7 +18,7 @@ class ContextProfile:
     enabled: bool = True
 
 
-# P8 intentionally uses static, duplicated profile constants instead of runtime
+# Context tiers intentionally use static, duplicated profile constants instead of runtime
 # codegen/manifest loading. Keep these IDs and token counts synchronized with
 # desktop-tauri/src-tauri/src/context_profiles.rs and desktop-tauri/src/App.tsx.
 _CONTEXT_PROFILES = (
@@ -49,7 +49,7 @@ def apply_context_profile(manager: object, profile_id: Optional[str]) -> Context
     """Select the operator runtime n_ctx without changing API v1 admission policy."""
     profile = get_context_profile(profile_id)
     # Deliberately leave relay_client.py admission/request-size limits untouched:
-    # P8 warms one operator runtime profile, while exact long-context admission
+    # Context tier selection warms one operator runtime profile, while exact long-context admission
     # and tier-aware relay selection are later API v1 policy work.
     config = getattr(manager, "config", None)
     if config is not None and hasattr(config, "set"):

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import plistlib
 import subprocess
 import tempfile
@@ -24,6 +25,13 @@ DMG_PREVIEW_REQUIRED_PHRASES = (
 DMG_PREVIEW_SIGNING_PHRASE_OPTIONS = (
     "ad-hoc signed",
     "signed with the configured Apple signing identity",
+)
+DMG_ATTACH_TRANSIENT_MESSAGES = (
+    "Resource temporarily unavailable",
+    "Resource busy",
+    "busy",
+    "already attached",
+    "already mounted",
 )
 
 
@@ -74,6 +82,140 @@ def _run_with_retries(
     _fail(_format_command_failure(cmd, last_result))
 
 
+def _is_transient_attach_error(output: str) -> bool:
+    lower_output = output.lower()
+    return any(message.lower() in lower_output for message in DMG_ATTACH_TRANSIENT_MESSAGES)
+
+
+def _hdiutil_info_snapshot() -> str:
+    result = subprocess.run(["hdiutil", "info"], check=False, capture_output=True, text=True)
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    if result.returncode != 0:
+        return f"hdiutil info failed with exit {result.returncode}:\n{output}"
+    return output
+
+
+def _redact_hdiutil_info(info: str) -> str:
+    # Keep diagnostics useful while avoiding runner-local usernames or temp directory details.
+    redacted = re.sub(r"/Users/[^/\s]+", "/Users/<redacted>", info)
+    redacted = re.sub(r"/private/var/folders/[^\s]+", "/private/var/folders/<redacted>", redacted)
+    return redacted
+
+
+def _matching_hdiutil_devices(info: str, dmg_path: Path) -> list[str]:
+    devices: list[str] = []
+    current_device: str | None = None
+    dmg_names = {str(dmg_path), str(dmg_path.resolve()), dmg_path.name}
+    for line in info.splitlines():
+        device_match = re.match(r"^(/dev/disk\S+)", line.strip())
+        if device_match:
+            current_device = device_match.group(1)
+        if current_device and any(name in line for name in dmg_names):
+            devices.append(current_device)
+    return sorted(set(devices))
+
+
+def _cleanup_dmg_attach_state(dmg_path: Path, mountpoint: Path) -> str:
+    diagnostics: list[str] = []
+    if mountpoint.exists():
+        result = subprocess.run(
+            ["hdiutil", "detach", str(mountpoint)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            diagnostics.append(_format_command_failure(["hdiutil", "detach", str(mountpoint)], result))
+
+    info = _hdiutil_info_snapshot()
+    for device in _matching_hdiutil_devices(info, dmg_path):
+        result = subprocess.run(["hdiutil", "detach", device], check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            diagnostics.append(_format_command_failure(["hdiutil", "detach", device], result))
+
+    return "\n".join(diagnostics)
+
+
+def _inspect_mounted_dmg(root: Path, *, expect_signing: bool) -> None:
+    apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")
+    if len(apps) != 1:
+        _fail(f"DMG must contain exactly one .app at root; found {len(apps)}")
+    readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
+    if readme_path is None:
+        _fail(f"DMG must include one preview README at root: {DMG_PREVIEW_README_NAMES}")
+    readme_text = readme_path.read_text(encoding="utf-8")
+    missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
+    if missing:
+        _fail(f"DMG preview README missing required phrases: {missing}")
+    if expect_signing:
+        if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
+            _fail(
+                "DMG preview README must describe configured Apple signing identity when --expect-signing is set"
+            )
+    elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
+        _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
+
+
+def _attach_and_validate_dmg_with_retries(
+    dmg_path: Path,
+    *,
+    expect_signing: bool,
+    attempts: int = 8,
+    delay_seconds: float = 2.0,
+    max_delay_seconds: float = 15.0,
+) -> None:
+    last_result: subprocess.CompletedProcess[str] | None = None
+    mountpoints: list[str] = []
+    cleanup_messages: list[str] = []
+    for attempt in range(1, attempts + 1):
+        with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:
+            mountpoint = Path(mount_dir)
+            mountpoints.append(str(mountpoint))
+            cleanup_output = _cleanup_dmg_attach_state(dmg_path, mountpoint)
+            if cleanup_output:
+                cleanup_messages.append(cleanup_output)
+
+            cmd = ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", str(mountpoint), str(dmg_path)]
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            last_result = result
+            if result.returncode == 0:
+                try:
+                    _inspect_mounted_dmg(mountpoint, expect_signing=expect_signing)
+                    return
+                finally:
+                    _run(["hdiutil", "detach", str(mountpoint)])
+
+            combined_output = f"{result.stdout}\n{result.stderr}"
+            if attempt >= attempts or not _is_transient_attach_error(combined_output):
+                break
+
+            retry_delay = min(delay_seconds * (2 ** (attempt - 1)), max_delay_seconds)
+            print(
+                f"::warning::hdiutil attach failed for {dmg_path} at {mountpoint} with a transient "
+                f"disk image error; retrying attempt {attempt + 1}/{attempts} after {retry_delay:g}s.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+            cleanup_output = _cleanup_dmg_attach_state(dmg_path, mountpoint)
+            if cleanup_output:
+                cleanup_messages.append(cleanup_output)
+            time.sleep(retry_delay)
+
+    if last_result is None:
+        _fail(f"hdiutil attach failed for {dmg_path}: no attempts were run")
+
+    info = _redact_hdiutil_info(_hdiutil_info_snapshot())
+    _fail(
+        "DMG attach failed during macOS artifact validation.\n"
+        f"DMG path: {dmg_path}\n"
+        f"Mountpoints attempted: {mountpoints}\n"
+        f"Attach attempts: {attempts}\n"
+        f"Last stdout:\n{last_result.stdout}\n"
+        f"Last stderr:\n{last_result.stderr}\n"
+        f"Cleanup diagnostics:\n{chr(10).join(cleanup_messages) if cleanup_messages else '<none>'}\n"
+        f"Redacted hdiutil info:\n{info}"
+    )
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -93,33 +235,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
-    with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:
-        _run_with_retries(
-            ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount_dir, str(dmg_path)],
-            attempts=8,
-            retry_messages=("Resource temporarily unavailable", "Resource busy"),
-        )
-        try:
-            root = Path(mount_dir)
-            apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")
-            if len(apps) != 1:
-                _fail(f"DMG must contain exactly one .app at root; found {len(apps)}")
-            readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
-            if readme_path is None:
-                _fail(f"DMG must include one preview README at root: {DMG_PREVIEW_README_NAMES}")
-            readme_text = readme_path.read_text(encoding="utf-8")
-            missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
-            if missing:
-                _fail(f"DMG preview README missing required phrases: {missing}")
-            if expect_signing:
-                if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
-                    _fail(
-                        "DMG preview README must describe configured Apple signing identity when --expect-signing is set"
-                    )
-            elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
-                _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
-        finally:
-            _run(["hdiutil", "detach", mount_dir])
+    _attach_and_validate_dmg_with_retries(dmg_path, expect_signing=expect_signing)
 
 
 def main() -> None:

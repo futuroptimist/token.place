@@ -2519,14 +2519,15 @@ class TestRelayClient:
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         error = encrypted_envelope["api_v1_response"]["error"]
-        assert error["code"] == "compute_node_context_window_exceeded"
+        assert error["code"] == "compute_node_context_tier_unsupported"
         assert error["active_context_tier"] == "8k-fast"
+        assert error["requested_context_tier"] == "64k-full"
         assert error["configured_context_tokens"] == 8192
         assert error["prompt_tokens"] == len(b"<s><user>Hello<assistant>")
         assert error["requested_output_tokens"] == 512
         assert error["required_total_tokens"] == error["prompt_tokens"] + 512
-        assert error["recommended_context_tier"] == "64k-full"
-        assert error["retryable"] is True
+        assert error["retryable"] is False
+        assert "recommended_context_tier" not in error
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_strips_routing_context_tier(
@@ -4342,7 +4343,7 @@ def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():
     envelope = _admission_envelope(
         client,
         manager,
-        "x" * 8169,
+        "x" * 8170,
         options={"max_tokens": 3},
         requested_tier="64k-full",
     )
@@ -4351,11 +4352,37 @@ def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():
     assert error["code"] == "compute_node_context_window_exceeded"
     assert error["active_context_tier"] == "8k-fast"
     assert error["configured_context_tokens"] == 8192
-    assert error["prompt_tokens"] == 8189
+    assert error["prompt_tokens"] == 8190
     assert error["requested_output_tokens"] == 3
-    assert error["required_total_tokens"] == 8192
+    assert error["required_total_tokens"] == 8193
     assert error["recommended_context_tier"] == "64k-full"
     assert error["retryable"] is True
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_64k_request_on_8k_runtime_reports_tier_unsupported_when_it_fits():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "small",
+        options={"max_tokens": 10},
+        requested_tier="64k-full",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_tier_unsupported"
+    assert error["message"] == "Requested context tier is not active on this compute node"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "64k-full"
+    assert error["configured_context_tokens"] == 8192
+    assert error["prompt_tokens"] == 25
+    assert error["requested_output_tokens"] == 10
+    assert error["required_total_tokens"] == 35
+    assert error["retryable"] is False
+    assert "recommended_context_tier" not in error
     assert manager.runtime.calls == []
 
 

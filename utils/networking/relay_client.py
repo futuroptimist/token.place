@@ -2369,6 +2369,8 @@ class RelayClient:
         active_context_tier: str,
         configured_context_tokens: int,
         requested_context_tier: str,
+        prompt_tokens: int,
+        requested_output_tokens: int,
     ) -> Dict[str, Any]:
         return {
             "code": "compute_node_context_tier_unsupported",
@@ -2377,6 +2379,9 @@ class RelayClient:
             "active_context_tier": active_context_tier,
             "requested_context_tier": requested_context_tier,
             "configured_context_tokens": configured_context_tokens,
+            "prompt_tokens": prompt_tokens,
+            "requested_output_tokens": requested_output_tokens,
+            "required_total_tokens": prompt_tokens + requested_output_tokens,
             "retryable": False,
         }
 
@@ -2482,31 +2487,40 @@ class RelayClient:
                 None,
             )
         required_total = prompt_tokens + requested_output_tokens
-        admitted = (
-            self._active_context_tier_can_satisfy(requested_context_tier)
-            and required_total <= configured_context_tokens
-        )
+        tier_supported = self._active_context_tier_can_satisfy(requested_context_tier)
+        admitted = tier_supported and required_total <= configured_context_tokens
+        if admitted:
+            safe_error_code = "none"
+            admission_error = None
+        elif not tier_supported and required_total <= configured_context_tokens:
+            safe_error_code = "compute_node_context_tier_unsupported"
+            admission_error = self._api_v1_context_tier_unsupported_error(
+                active_context_tier=active_context_tier,
+                configured_context_tokens=configured_context_tokens,
+                requested_context_tier=requested_context_tier,
+                prompt_tokens=prompt_tokens,
+                requested_output_tokens=requested_output_tokens,
+            )
+        else:
+            safe_error_code = "compute_node_context_window_exceeded"
+            admission_error = self._api_v1_context_admission_error(
+                active_context_tier=active_context_tier,
+                configured_context_tokens=configured_context_tokens,
+                prompt_tokens=prompt_tokens,
+                requested_output_tokens=requested_output_tokens,
+                requested_context_tier=requested_context_tier,
+            )
         log_info(
             "api_v1.context_admission active_tier={} prompt_tokens={} output_reservation={} result={} duration_ms=0 safe_error_code={}",
             active_context_tier,
             prompt_tokens,
             requested_output_tokens,
             "admitted" if admitted else "rejected",
-            "none" if admitted else "compute_node_context_window_exceeded",
+            safe_error_code,
         )
         if admitted:
             return True, None, prompt_tokens
-        return (
-            False,
-            self._api_v1_context_admission_error(
-                active_context_tier=active_context_tier,
-                configured_context_tokens=configured_context_tokens,
-                prompt_tokens=prompt_tokens,
-                requested_output_tokens=requested_output_tokens,
-                requested_context_tier=requested_context_tier,
-            ),
-            prompt_tokens,
-        )
+        return False, admission_error, prompt_tokens
 
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]

@@ -221,6 +221,87 @@ def test_api_v1_next_server_no_registered_compute_nodes_message(client):
     )
 
 
+def test_api_v1_capability_registration_and_diagnostics_are_normalized(client):
+    server_8k = _server_key("capability-8k")
+    server_64k = _server_key("capability-64k")
+    _register_api_v1_server(client, server_8k, _capabilities("8k-fast", ["model-a"]))
+    _register_api_v1_server(client, server_64k, _capabilities("64k-full", ["model-b"]))
+
+    diagnostics = client.get("/relay/diagnostics")
+    assert diagnostics.status_code == 200
+    payload = diagnostics.get_json()
+    nodes = {node["server_public_key"]: node for node in payload["api_v1_registered_compute_nodes"]}
+    assert nodes[server_8k]["capabilities"]["active_context_tier"] == "8k-fast"
+    assert nodes[server_8k]["capabilities"]["max_total_context_tokens"] == 8192
+    assert nodes[server_64k]["capabilities"]["active_context_tier"] == "64k-full"
+    assert nodes[server_64k]["capabilities"]["max_total_context_tokens"] == 65536
+    assert "hostname" not in json.dumps(payload).lower()
+    assert "vram" not in json.dumps(payload).lower()
+
+
+def test_api_v1_malformed_capability_registration_is_rejected(client):
+    server_key = _server_key("bad-capabilities")
+    response = client.post(
+        "/api/v1/relay/servers/register",
+        json={
+            "server_public_key": server_key,
+            "capabilities": {"active_context_tier": "64k-full", "max_total_context_tokens": 8192},
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_capabilities"
+    assert server_key not in known_servers
+
+
+def test_api_v1_old_node_defaults_to_8k_compatibility_capabilities(client):
+    server_key = _server_key("old-node")
+    _register_api_v1_server(client, server_key)
+
+    payload = _next_api_v1_server_payload(client)
+    assert payload["server_public_key"] == server_key
+    assert payload["selected_context_tier"] == "8k-fast"
+    assert payload["selected_context_window_tokens"] == 8192
+
+
+def test_api_v1_tier_and_model_aware_selection(client):
+    server_8k = _server_key("tier-8k")
+    server_64k = _server_key("tier-64k")
+    _register_api_v1_server(client, server_8k, _capabilities("8k-fast", ["model-a"]))
+    _register_api_v1_server(client, server_64k, _capabilities("64k-full", ["model-b"]))
+
+    assert _next_api_v1_server_payload(client, context_tier="8k-fast")["server_public_key"] == server_8k
+    assert _next_api_v1_server_payload(client, context_tier="64k-full")["server_public_key"] == server_64k
+    assert _next_api_v1_server_payload(client, model="model-b")["server_public_key"] == server_64k
+
+    no_match = client.get("/api/v1/relay/servers/next", query_string={"model": "missing-model"})
+    assert no_match.status_code == 503
+    assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
+
+
+def test_api_v1_8k_request_can_select_64k_when_no_8k_node(client):
+    server_64k = _server_key("only-64k")
+    _register_api_v1_server(client, server_64k, _capabilities("64k-full", ["model-a"]))
+
+    payload = _next_api_v1_server_payload(client, context_tier="8k-fast")
+    assert payload["server_public_key"] == server_64k
+    assert payload["selected_context_tier"] == "64k-full"
+
+
+def test_api_v1_round_robin_is_deterministic_within_eligible_tier(client):
+    server_a = _server_key("eligible-64k-a")
+    server_b = _server_key("eligible-64k-b")
+    server_8k = _server_key("ineligible-8k")
+    _register_api_v1_server(client, server_a, _capabilities("64k-full", ["model-a"]))
+    _register_api_v1_server(client, server_8k, _capabilities("8k-fast", ["model-a"]))
+    _register_api_v1_server(client, server_b, _capabilities("64k-full", ["model-a"]))
+
+    selections = [
+        _next_api_v1_server_payload(client, context_tier="64k-full")["server_public_key"]
+        for _ in range(4)
+    ]
+    assert selections == [server_a, server_b, server_a, server_b]
+
+
 def test_next_server_one_server(client):
     """Test /next_server when one server is registered."""
     # Simulate server registration (directly modifying state for setup)
@@ -259,10 +340,27 @@ def _server_key(label):
     return base64.b64encode(f"server_public_key_{label}".encode()).decode("utf-8")
 
 
-def _register_api_v1_server(client, server_public_key):
+def _capabilities(tier="8k-fast", models=None):
+    tokens = 65536 if tier == "64k-full" else 8192
+    return {
+        "api_version": "v1",
+        "supported_model_ids": models or ["llama-3.1-8b-instruct"],
+        "active_context_tier": tier,
+        "max_total_context_tokens": tokens,
+        "default_output_token_reservation": 1024,
+        "max_output_token_reservation": 2048,
+        "max_concurrency": 1,
+        "backend_class": "metal",
+    }
+
+
+def _register_api_v1_server(client, server_public_key, capabilities=None):
+    payload = {'server_public_key': server_public_key}
+    if capabilities is not None:
+        payload["capabilities"] = capabilities
     response = client.post(
         '/api/v1/relay/servers/register',
-        json={'server_public_key': server_public_key},
+        json=payload,
     )
     assert response.status_code == 200
     return response
@@ -272,6 +370,12 @@ def _next_api_v1_server_key(client):
     response = client.get('/api/v1/relay/servers/next')
     assert response.status_code == 200
     return response.get_json()['server_public_key']
+
+
+def _next_api_v1_server_payload(client, **query):
+    response = client.get('/api/v1/relay/servers/next', query_string=query)
+    assert response.status_code == 200
+    return response.get_json()
 
 
 def _queue_api_v1_request(client, *, server_public_key, request_id, client_public_key=None):
@@ -526,6 +630,7 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
             "model": "llama-3-8b-instruct:alignment",
             "messages": [{"role": "user", "content": "hello"}],
             "options": {"temperature": 0.2, "max_tokens": 42},
+            "routing": {"context_tier": "64k-full"},
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
@@ -585,6 +690,35 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
     assert encrypted_payload["request_id"] == "req-1"
     assert encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
     assert captured["model"] == "llama-3-8b-instruct:alignment"
+
+
+def test_relay_client_rejects_invalid_encrypted_routing_without_plaintext_dispatch(monkeypatch):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-invalid-routing",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+            "routing": {"context_tier": "128k-private"},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+    monkeypatch.setattr(
+        "utils.networking.relay_client.requests.post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not post")),
+    )
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is False
 
 
 def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):

@@ -443,21 +443,14 @@ inside the encrypted request.
 Decision flow:
 
 1. Normalize missing `context_tier` to `8k-fast`.
-2. Read `client_capabilities` from the relay-visible selection request. Treat
-   `selected_profile_echo_v1` as the only activation signal for selected-profile
-   echo support.
-3. Filter live API v1 nodes by API version, enabled profile, model ID, requested
-   tier capability, max concurrency availability, and lease freshness. Without
-   `selected_profile_echo_v1`, selection is exact-tier only: omitted-tier and
-   explicit `8k-fast` requests remain eligible for exact `8k-fast` profiles only,
-   and the relay must not spill them to `64k-full`. With
-   `selected_profile_echo_v1`, the relay may select the smallest capable active
-   profile, and the client must echo that profile ID into the encrypted request.
-   This prevents an omitted-tier encrypted request from being selected onto a
-   larger node without a compute-visible selected-profile signal.
+2. Filter live API v1 nodes by API version, active context tier capability,
+   model ID when supplied, max concurrency availability, and lease freshness.
+3. Treat larger active tiers as capable of serving smaller requests: a
+   `64k-full` node may satisfy an `8k-fast` request, but an `8k-fast` node must
+   never satisfy a `64k-full` request.
 4. Return `503 no_registered_compute_nodes` if no live API v1 nodes exist.
-5. Return a capability-specific `503 no_capable_compute_nodes` if nodes exist but
-   none support the requested safe metadata and capability contract.
+5. Return a capability-specific `503 no_matching_compute_node` if nodes exist
+   but none support the requested safe metadata and capability contract.
 6. Schedule among equivalent nodes without exposing prompt size.
 7. Return the public key plus safe selected-profile metadata.
 
@@ -778,6 +771,16 @@ and recovery requires warm-load validation before re-registration.
 ## Security and privacy analysis
 
 - Capability registration is intentionally coarse and non-identifying.
+- API v1 compute nodes may register and heartbeat with a normalized capability
+  object containing only the API version, supported model IDs, active context
+  tier, maximum context-window tokens, output-token reservation bounds, max
+  concurrency, and a coarse backend class. Older nodes that omit capabilities
+  are treated as `8k-fast` compatibility nodes.
+- `/api/v1/relay/servers/next` accepts optional `model` and `context_tier`
+  query parameters, defaults missing tiers to `8k-fast`, and filters eligible
+  live API v1 nodes before preserving registration-order round robin among
+  matches. A `64k-full` node may satisfy an `8k-fast` request, but an `8k-fast`
+  node must not satisfy a `64k-full` request.
 - Exact token counts are generated only after compute-side decryption and are
   returned only in encrypted client-visible errors.
 - Relay queue depth and in-flight counts are safe scheduling metadata when they

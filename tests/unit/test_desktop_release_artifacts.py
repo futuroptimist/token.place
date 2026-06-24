@@ -243,59 +243,116 @@ def test_validator_rejects_zero_retry_attempts(monkeypatch) -> None:
 
 def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
-    mount_dir = tmp_path / 'mounted-dmg'
-    mount_dir.mkdir()
-    (mount_dir / 'token.place desktop.app').mkdir()
-    readme = mount_dir / 'README BEFORE OPENING.txt'
-    readme.write_text(
-        '\n'.join(
-            [
-                'This preview build is ad-hoc signed and not notarized.',
-                'Apple could not verify token.place desktop is free of malware.',
-                'Open System Settings -> Privacy & Security.',
-                'Developer ID signing + notarization is required for public trust.',
-            ]
-        ),
-        encoding='utf-8',
-    )
     dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg_path.write_bytes(b'dmg')
+    attach_calls = []
+
+    def fake_attach_and_validate(path, *, expect_signing):
+        attach_calls.append((path, expect_signing))
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_and_validate_dmg_with_retries', fake_attach_and_validate)
+
+    validator._validate_dmg_contents(dmg_path, expect_signing=False)
+
+    assert attach_calls == [(dmg_path, False)]
+
+
+def test_validator_attach_retry_uses_fresh_mountpoints_and_cleans_up(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_dirs = []
+    cleanup_calls = []
     attach_calls = []
     detach_calls = []
 
     class FakeTemporaryDirectory:
         def __init__(self, *, prefix):
             assert prefix == 'token-place-dmg-mount-'
+            self.path = tmp_path / f'mount-{len(mount_dirs)}'
 
         def __enter__(self):
-            return str(mount_dir)
+            self.path.mkdir()
+            mount_dirs.append(self.path)
+            return str(self.path)
 
         def __exit__(self, *args):
             return False
 
-    def fake_run_with_retries(cmd, *, attempts, retry_messages):
-        attach_calls.append((cmd, attempts, retry_messages))
-        return '/dev/disk4'
-
-    def fake_run(cmd):
-        detach_calls.append(cmd)
+    def fake_cleanup(path, mountpoint):
+        cleanup_calls.append((path, mountpoint))
         return ''
 
-    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    def fake_run(cmd, *, check=False, capture_output=True, text=True):
+        if cmd[:2] == ['hdiutil', 'attach']:
+            attach_calls.append(cmd)
+            if len(attach_calls) < 3:
+                return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - Resource temporarily unavailable')
+            (mount_dirs[-1] / 'token.place desktop.app').mkdir()
+            (mount_dirs[-1] / 'README BEFORE OPENING.txt').write_text(
+                '\n'.join(
+                    [
+                        'This preview build is ad-hoc signed and not notarized.',
+                        'Apple could not verify token.place desktop is free of malware.',
+                        'Open System Settings -> Privacy & Security.',
+                        'Developer ID signing + notarization is required for public trust.',
+                    ]
+                ),
+                encoding='utf-8',
+            )
+            return subprocess.CompletedProcess(cmd, 0, '/dev/disk4', '')
+        if cmd[:2] == ['hdiutil', 'detach']:
+            detach_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        raise AssertionError(f'unexpected command: {cmd}')
+
     monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
-    monkeypatch.setattr(validator, '_run_with_retries', fake_run_with_retries)
-    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator.time, 'sleep', lambda _delay: None)
 
-    validator._validate_dmg_contents(dmg_path, expect_signing=False)
+    validator._attach_and_validate_dmg_with_retries(dmg_path, expect_signing=False, delay_seconds=0.01)
 
-    assert attach_calls == [
-        (
-            ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            8,
-            ('Resource temporarily unavailable', 'Resource busy'),
-        )
+    assert [cmd[5] for cmd in attach_calls] == [str(path) for path in mount_dirs]
+    assert len(set(cmd[5] for cmd in attach_calls)) == 3
+    assert cleanup_calls == [
+        (dmg_path, mount_dirs[0]),
+        (dmg_path, mount_dirs[0]),
+        (dmg_path, mount_dirs[1]),
+        (dmg_path, mount_dirs[1]),
+        (dmg_path, mount_dirs[2]),
     ]
-    assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert detach_calls == [['hdiutil', 'detach', str(mount_dirs[2])]]
+
+
+def test_validator_attach_retry_stops_on_non_transient_attach_error(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    attach_calls = []
+
+    def fake_run(cmd, *, check=False, capture_output=True, text=True):
+        attach_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, 'mount failed', 'permission denied')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda _path, _mountpoint: '')
+    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda: 'no images')
+
+    try:
+        validator._attach_and_validate_dmg_with_retries(dmg_path, expect_signing=False, delay_seconds=0.01)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected non-transient attach failure to exit')
+
+    assert len(attach_calls) == 1
+    assert 'permission denied' in message
 
 
 def test_validator_run_formats_command_failures(monkeypatch) -> None:

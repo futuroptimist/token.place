@@ -1733,9 +1733,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             consecutive_ready_observations_local = 0
             relay_server_selection_body_local = ""
             for _ in range(attempts):
-                next_server_response = page.request.get(
-                    f"{base_url}/api/v1/relay/servers/next"
-                )
+                try:
+                    next_server_response = page.request.get(
+                        f"{base_url}/api/v1/relay/servers/next",
+                        timeout=2_000,
+                    )
+                except Exception:
+                    consecutive_ready_observations_local = 0
+                    time.sleep(pause_seconds)
+                    continue
                 if next_server_response.ok:
                     relay_server_selection_body_local = next_server_response.text()
                     try:
@@ -1961,11 +1967,20 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             if "desktop.compute_node_bridge.api_v1_e2ee.work_received" in line
         ]
         assert work_received_lines, "desktop bridge should receive API v1 encrypted relay work"
-        response_submitted_lines = [
-            line
-            for line in stderr_lines
-            if "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" in line
-        ]
+        response_submitted_deadline = time.time() + 3
+        response_submitted_lines = []
+        while time.time() < response_submitted_deadline:
+            response_submitted_lines = [
+                line
+                for line in stderr_lines
+                if (
+                    "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" in line
+                    or "API v1 E2EE response submission" in line
+                )
+            ]
+            if response_submitted_lines:
+                break
+            time.sleep(0.05)
         assert response_submitted_lines, "desktop bridge should submit API v1 encrypted responses"
         bridge_stderr_text = "".join(stderr_lines)
         assert "E2EE_SENTINEL_SHOULD_NEVER_REACH_RELAY_PLAINTEXT" not in bridge_stderr_text

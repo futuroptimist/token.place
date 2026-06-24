@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 import signal
+import threading
 import requests
 from pathlib import Path
 from typing import Dict, Any, Generator, List, Optional, Tuple
@@ -23,6 +24,14 @@ from playwright.sync_api import (
     BrowserContext,
     Error as PlaywrightError,
 )
+
+
+def _drain_process_stream(stream) -> None:
+    """Continuously drain a subprocess pipe so verbose test servers cannot block."""
+    if stream is None:
+        return
+    for _line in iter(stream.readline, ""):
+        pass
 
 # Add the project root to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -315,6 +324,19 @@ def setup_servers(
         text=True,
         env=test_env
     )
+    relay_stdout_thread = threading.Thread(
+        target=_drain_process_stream,
+        args=(relay_process.stdout,),
+        daemon=True,
+    )
+    relay_stderr_thread = threading.Thread(
+        target=_drain_process_stream,
+        args=(relay_process.stderr,),
+        daemon=True,
+    )
+    relay_stdout_thread.start()
+    relay_stderr_thread.start()
+
     if run_real_bridge_e2e:
         print(f"Started relay server on port {E2E_RELAY_PORT} with real-provider guardrails")
     else:
@@ -351,7 +373,11 @@ def setup_servers(
             print("Focused relay e2e mode enabled: skipping server registration bootstrap")
         yield relay_process, None
         relay_process.terminate()
-        relay_process.wait(timeout=5)
+        try:
+            relay_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            relay_process.kill()
+            relay_process.wait(timeout=5)
         return
 
     # Start the server with mock LLM enabled via environment variable

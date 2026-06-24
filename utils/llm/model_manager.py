@@ -934,6 +934,35 @@ class _SubprocessLlamaProxy:
                 raise
         return message.get('result')
 
+
+    def apply_chat_template(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=self._timeout_seconds,
+                    stage='llama_cpp_prompt_render',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+    def tokenize(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'tokenize', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=self._timeout_seconds,
+                    stage='llama_cpp_prompt_tokenize',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
     def _stream_chat_completion(self, *args, **kwargs):
         with self._lock:
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
@@ -1069,12 +1098,30 @@ for line in sys.stdin:
         if not isinstance(request, dict):
             _emit(_safe_request_error('malformed_request'))
             continue
-        if request.get('method') != 'create_chat_completion':
+        method = request.get('method')
+        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
+            continue
+        if method == 'apply_chat_template':
+            render = getattr(llama, 'apply_chat_template', None)
+            if not callable(render):
+                tokenizer = getattr(llama, 'tokenizer', None)
+                render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+            if not callable(render):
+                _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                continue
+            _emit({'status': 'ok', 'result': render(*request.get('args', []), **kwargs)})
+            continue
+        if method == 'tokenize':
+            tokenize = getattr(llama, 'tokenize', None)
+            if not callable(tokenize):
+                _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                continue
+            _emit({'status': 'ok', 'result': tokenize(*request.get('args', []), **kwargs)})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

@@ -2164,6 +2164,15 @@ class ModelManager:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()
 
+    def get_llm_instance_with_recovery(self):
+        """Return a live LLM runtime, attempting one replacement if unavailable."""
+        llm_instance = self.get_llm_instance()
+        if llm_instance is not None:
+            return llm_instance
+        with self.llm_lock:
+            observed_generation = self._llm_generation
+        return self._ensure_replacement_llm(observed_generation)
+
     def create_chat_completion_with_recovery(self, *args, **kwargs):
         """Create a completion, replacing a dead subprocess worker at most once.
 

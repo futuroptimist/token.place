@@ -7,6 +7,7 @@ import json
 import math
 import pytest
 import sys
+import threading
 import time
 import requests
 import jsonschema
@@ -4323,6 +4324,22 @@ def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tok
     assert error["prompt_tokens"] == 29
 
 
+def test_api_v1_context_admission_uses_recovered_runtime_before_rejecting():
+    manager = _AdmissionManager(window=64, default_max_tokens=4)
+    manager.get_llm_instance = MagicMock(side_effect=[None])
+    manager.get_llm_instance_with_recovery = MagicMock(return_value=manager.runtime)
+    manager.create_chat_completion_with_recovery = MagicMock(
+        return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "hello", options={"max_tokens": 4})
+
+    assert "error" not in envelope["api_v1_response"]
+    manager.get_llm_instance_with_recovery.assert_called_once()
+    manager.create_chat_completion_with_recovery.assert_called_once()
+    assert manager.runtime.calls == []
+
 def test_api_v1_context_admission_rejects_when_runtime_count_unavailable():
     manager = _AdmissionManager(window=32)
     manager.runtime.apply_chat_template = lambda *args, **kwargs: None
@@ -4425,6 +4442,35 @@ def test_api_v1_context_admission_recommends_64k_for_8k_overflow():
     assert error["recommended_context_tier"] == "64k-full"
     assert error["retryable"] is True
 
+
+def test_api_v1_stop_prevents_racing_start_from_leaving_live_heartbeat():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = time.monotonic()
+    relay_client._api_v1_start_heartbeat_worker()
+    original = relay_client._api_v1_heartbeat_thread
+    assert original is not None
+
+    entered_join = threading.Event()
+    release_join = threading.Event()
+    original_join = original.join
+
+    def blocking_join(timeout=None):
+        entered_join.set()
+        release_join.wait(timeout=1.0)
+        return original_join(timeout=timeout)
+
+    original.join = blocking_join
+    stopper = threading.Thread(target=relay_client._api_v1_stop_heartbeat_worker)
+    stopper.start()
+    assert entered_join.wait(timeout=1.0)
+
+    relay_client._api_v1_start_heartbeat_worker()
+    release_join.set()
+    stopper.join(timeout=2.0)
+
+    assert not stopper.is_alive()
+    assert relay_client._api_v1_heartbeat_thread is None
 
 def test_api_v1_heartbeat_worker_refreshes_during_blocked_inference():
     relay_client = _api_v1_validation_client()

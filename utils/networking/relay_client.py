@@ -665,7 +665,7 @@ class RelayClient:
         self._api_v1_heartbeat_lock = threading.Lock()
         self._api_v1_heartbeat_stop = threading.Event()
         self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
-
+        self._api_v1_heartbeat_stopping = False
 
 
     def _api_v1_start_heartbeat_worker(self) -> None:
@@ -675,6 +675,8 @@ class RelayClient:
         if lock is None:
             return
         with lock:
+            if getattr(self, "_api_v1_heartbeat_stopping", False):
+                return
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
             if thread is not None and thread.is_alive():
                 return
@@ -693,11 +695,13 @@ class RelayClient:
         stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
         if stop_event is None:
             return
-        stop_event.set()
         lock = getattr(self, "_api_v1_heartbeat_lock", None)
         if lock is None:
+            stop_event.set()
             return
         with lock:
+            self._api_v1_heartbeat_stopping = True
+            stop_event.set()
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             join_timeout = max(float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0)
@@ -707,6 +711,7 @@ class RelayClient:
                 thread is None or not thread.is_alive()
             ):
                 self._api_v1_heartbeat_thread = None
+            self._api_v1_heartbeat_stopping = False
 
     def _api_v1_heartbeat_worker(self) -> None:
         """Refresh relay leases independently from polling/inference work."""
@@ -2651,6 +2656,16 @@ class RelayClient:
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = get_llm_instance() if callable(get_llm_instance) else None
+            if llm_instance is None and callable(recovery_completion):
+                recover_runtime = getattr(
+                    self.model_manager, "get_llm_instance_with_recovery", None
+                )
+                if callable(recover_runtime):
+                    self._last_api_v1_runtime_health["recovery_attempted"] = True
+                    llm_instance = recover_runtime()
+                    self._last_api_v1_runtime_health["recovery_succeeded"] = (
+                        llm_instance is not None
+                    )
             if llm_instance is None and not callable(recovery_completion):
                 self._last_api_v1_runtime_health = {
                     "runtime_healthy": False,

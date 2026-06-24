@@ -1015,6 +1015,26 @@ class TestRelayClient:
         assert result['relay_http_diagnostic']['path'] == '/api/v1/relay/servers/register'
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_sends_context_capabilities(self, mock_post, relay_client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0}
+        mock_post.return_value = response
+        relay_client.model_manager.context_tier = "64k-full"
+        relay_client.model_manager.context_window_tokens = 65536
+        relay_client.model_manager.last_compute_diagnostics = {"backend_used": "cuda"}
+
+        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+
+        assert result['next_ping_in_x_seconds'] == 30
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["server_public_key"] == "mock_public_key_b64"
+        assert payload["capabilities"]["active_context_tier"] == "64k-full"
+        assert payload["capabilities"]["maximum_total_context_tokens"] == 65536
+        assert payload["capabilities"]["max_concurrency"] == 1
+        assert payload["capabilities"]["backend_class"] == "cuda"
+        assert "llama-3.1-8b-instruct" in payload["capabilities"]["supported_model_ids"]
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
         self, mock_post, relay_client, caplog
     ):

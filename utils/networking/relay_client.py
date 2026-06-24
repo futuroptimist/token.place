@@ -2330,23 +2330,22 @@ class RelayClient:
         tokenize = getattr(llm_instance, "tokenize", None)
         if not callable(tokenize) or not isinstance(rendered_prompt, str):
             return None
-        try:
-            tokens = tokenize(rendered_prompt.encode("utf-8"), add_bos=False)
-        except TypeError:
+        attempts = (
+            lambda: tokenize(rendered_prompt.encode("utf-8"), add_bos=False),
+            lambda: tokenize(rendered_prompt.encode("utf-8"), False),
+            lambda: tokenize(rendered_prompt.encode("utf-8")),
+            lambda: tokenize(rendered_prompt),
+        )
+        for tokenize_attempt in attempts:
             try:
-                tokens = tokenize(rendered_prompt.encode("utf-8"), False)
+                tokens = tokenize_attempt()
             except TypeError:
-                try:
-                    tokens = tokenize(rendered_prompt.encode("utf-8"))
-                except TypeError:
-                    try:
-                        tokens = tokenize(rendered_prompt)
-                    except Exception:
-                        return None
-        except Exception:
+                continue
+            except Exception:
+                return None
+            if isinstance(tokens, (list, tuple)):
+                return len(tokens)
             return None
-        if isinstance(tokens, (list, tuple)):
-            return len(tokens)
         return None
 
     @staticmethod

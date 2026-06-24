@@ -4391,6 +4391,26 @@ def test_api_v1_context_admission_rejects_when_chat_template_fallback_raises():
     assert manager.runtime.calls == []
 
 
+def test_api_v1_context_admission_rejects_when_tokenizer_template_branch_raises():
+    manager = _AdmissionManager(window=32)
+    manager.runtime.apply_chat_template = None
+
+    class RejectingTokenizerTemplate:
+        def apply_chat_template(self, *args, **kwargs):
+            raise RuntimeError("template render failed")
+
+    manager.runtime.tokenizer = lambda: RejectingTokenizerTemplate()
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
 def test_api_v1_context_admission_uses_llama_cpp_chat_format_fallback(monkeypatch):
     manager = _AdmissionManager(window=64)
     manager.runtime.apply_chat_template = None

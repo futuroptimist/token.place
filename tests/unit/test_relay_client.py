@@ -1,10 +1,12 @@
 """
 Unit tests for the relay client module.
 """
+
 import base64
 import builtins
 import json
 import math
+import time
 import pytest
 import sys
 import requests
@@ -17,25 +19,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
+from utils.networking.relay_client import (
+    RelayClient,
+    MESSAGE_SCHEMA,
+    RELAY_RESPONSE_SCHEMA,
+)
 
 # Common test data
 TEST_VALID_RESPONSE = {
-    'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',  # Base64 encoded "client_key_b64"
-    'chat_history': 'encrypted_data',
-    'cipherkey': 'key',
-    'iv': 'iv',
-    'next_ping_in_x_seconds': 5
+    "client_public_key": "Y2xpZW50X2tleV9iNjQ=",  # Base64 encoded "client_key_b64"
+    "chat_history": "encrypted_data",
+    "cipherkey": "key",
+    "iv": "iv",
+    "next_ping_in_x_seconds": 5,
 }
 
-TEST_ERROR_RESPONSE = {
-    'error': 'Connection refused',
-    'next_ping_in_x_seconds': 10
-}
+TEST_ERROR_RESPONSE = {"error": "Connection refused", "next_ping_in_x_seconds": 10}
 
-TEST_NO_REQUEST_RESPONSE = {
-    'next_ping_in_x_seconds': 5
-}
+TEST_NO_REQUEST_RESPONSE = {"next_ping_in_x_seconds": 5}
 
 
 def _load_compute_node_bridge_module():
@@ -51,7 +52,9 @@ def _load_compute_node_bridge_module():
     module_dir = str(module_path.parent)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
-    spec = importlib.util.spec_from_file_location("compute_node_bridge_for_unit_test", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "compute_node_bridge_for_unit_test", module_path
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -59,7 +62,12 @@ def _load_compute_node_bridge_module():
     return module
 
 
-def _api_v1_decrypted_payload(*, request_id="req-routing", client_public_key=TEST_VALID_RESPONSE["client_public_key"], routing_marker=...):
+def _api_v1_decrypted_payload(
+    *,
+    request_id="req-routing",
+    client_public_key=TEST_VALID_RESPONSE["client_public_key"],
+    routing_marker=...,
+):
     api_v1_request = {
         "model": "llama-3-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
@@ -106,17 +114,22 @@ def test_extract_api_v1_request_payload_rejects_malformed_decrypted_routing():
 
 
 def test_sanitize_relay_target_handles_malformed_ports_and_ipv6():
-    assert relay_client_module._sanitize_relay_target('https://relay.example:bad') == 'unknown'
-    assert relay_client_module._sanitize_relay_target('http://[::1') == 'unknown'
     assert (
-        relay_client_module._sanitize_relay_target('http://[::1]:8000/path?token=abc#debug')
-        == 'http://[::1]:8000'
+        relay_client_module._sanitize_relay_target("https://relay.example:bad")
+        == "unknown"
+    )
+    assert relay_client_module._sanitize_relay_target("http://[::1") == "unknown"
+    assert (
+        relay_client_module._sanitize_relay_target(
+            "http://[::1]:8000/path?token=abc#debug"
+        )
+        == "http://[::1]:8000"
     )
     assert (
         relay_client_module._sanitize_relay_target(
-            'https://user:pass@[2001:db8::1]:9443/source?token=abc'
+            "https://user:pass@[2001:db8::1]:9443/source?token=abc"
         )
-        == 'https://[2001:db8::1]:9443'
+        == "https://[2001:db8::1]:9443"
     )
 
 
@@ -141,13 +154,17 @@ def test_max_poll_failures_honours_override(monkeypatch):
     assert relay_client_module._max_poll_failures_before_stop() == 3
 
 
-def test_desktop_bridge_registration_fresh_helper_rejects_stale_client_state(monkeypatch):
+def test_desktop_bridge_registration_fresh_helper_rejects_stale_client_state(
+    monkeypatch,
+):
     bridge = _load_compute_node_bridge_module()
     client = MagicMock()
     client.api_v1_registration_fresh.return_value = False
 
     assert bridge._registration_fresh(client, "https://staging.token.place") is False
-    client.api_v1_registration_fresh.assert_called_once_with("https://staging.token.place")
+    client.api_v1_registration_fresh.assert_called_once_with(
+        "https://staging.token.place"
+    )
 
 
 def test_desktop_bridge_registration_fresh_helper_accepts_recent_heartbeat(monkeypatch):
@@ -182,7 +199,9 @@ def test_validate_with_fallback_accepts_message_schema_without_jsonschema():
     with patch.object(
         relay_client_module,
         "_load_jsonschema",
-        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+        side_effect=RuntimeError(
+            "jsonschema is required for relay schema validation at runtime"
+        ),
     ):
         relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
 
@@ -197,14 +216,18 @@ def test_validate_with_fallback_rejects_missing_required_field_without_jsonschem
     with patch.object(
         relay_client_module,
         "_load_jsonschema",
-        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+        side_effect=RuntimeError(
+            "jsonschema is required for relay schema validation at runtime"
+        ),
     ):
         with pytest.raises(ValueError, match="Missing required field: iv"):
             relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
 
+
 # Create a better time mock with a context manager
 class TimeMock:
     """A context manager for mocking time.sleep"""
+
     def __init__(self, mock_sleep):
         self.mock_sleep = mock_sleep
         self.sleep_calls = []
@@ -226,99 +249,107 @@ class TimeMock:
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         # Restore original side_effect (if needed)
-        if hasattr(self, 'original_side_effect'):
+        if hasattr(self, "original_side_effect"):
             self.mock_sleep.side_effect = self.original_side_effect
 
     def assert_slept_for(self, seconds):
         """Assert that sleep was called with the given duration"""
-        assert seconds in self.sleep_calls, f"Expected sleep({seconds}), got {self.sleep_calls}"
+        assert (
+            seconds in self.sleep_calls
+        ), f"Expected sleep({seconds}), got {self.sleep_calls}"
 
 
 def test_init_propagates_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(
-        'utils.networking.relay_client.get_config_lazy',
-        MagicMock(side_effect=KeyboardInterrupt())
+        "utils.networking.relay_client.get_config_lazy",
+        MagicMock(side_effect=KeyboardInterrupt()),
     )
     with pytest.raises(KeyboardInterrupt):
-        RelayClient('http://localhost', 8080, object(), object())
+        RelayClient("http://localhost", 8080, object(), object())
 
 
 def test_compose_relay_url_preserves_ipv6_brackets():
     """IPv6 relay targets must keep brackets when injecting the port."""
 
-    result = RelayClient._compose_relay_url('http://[2001:db8::1]', 8080)
-    assert result == 'http://[2001:db8::1]:8080'
+    result = RelayClient._compose_relay_url("http://[2001:db8::1]", 8080)
+    assert result == "http://[2001:db8::1]:8080"
 
 
 def test_compose_relay_url_keeps_https_without_injected_port():
-    result = RelayClient._compose_relay_url('https://token.place', None)
-    assert result == 'https://token.place'
+    result = RelayClient._compose_relay_url("https://token.place", None)
+    assert result == "https://token.place"
 
 
 def test_compose_relay_url_honors_explicit_https_port_override():
-    result = RelayClient._compose_relay_url('https://token.place', 7443)
-    assert result == 'https://token.place:7443'
+    result = RelayClient._compose_relay_url("https://token.place", 7443)
+    assert result == "https://token.place:7443"
 
 
 def test_compose_relay_url_keeps_explicit_localhost_port():
-    result = RelayClient._compose_relay_url('http://localhost:5000', 1234)
-    assert result == 'http://localhost:5000'
+    result = RelayClient._compose_relay_url("http://localhost:5000", 1234)
+    assert result == "http://localhost:5000"
 
 
 def test_init_can_disable_configured_server_fallbacks():
     mock_config = MagicMock()
     mock_config.is_production = False
     mock_config.get.side_effect = lambda key, default: {
-        'relay.request_timeout': 10,
-        'relay.cluster_only': True,
-        'relay.server_url': 'https://token.place',
-        'relay.additional_servers': ['https://relay-backup.example'],
+        "relay.request_timeout": 10,
+        "relay.cluster_only": True,
+        "relay.server_url": "https://token.place",
+        "relay.additional_servers": ["https://relay-backup.example"],
     }.get(key, default)
 
-    with patch('utils.networking.relay_client.get_config_lazy', return_value=mock_config):
+    with patch(
+        "utils.networking.relay_client.get_config_lazy", return_value=mock_config
+    ):
         client = RelayClient(
-            base_url='http://127.0.0.1:5010',
+            base_url="http://127.0.0.1:5010",
             port=None,
             crypto_manager=object(),
             model_manager=object(),
             include_configured_servers=False,
         )
 
-    assert client.relay_urls == ('http://127.0.0.1:5010',)
+    assert client.relay_urls == ("http://127.0.0.1:5010",)
 
 
-def test_init_excludes_config_and_env_fallback_relays_when_configured_servers_disabled(monkeypatch):
+def test_init_excludes_config_and_env_fallback_relays_when_configured_servers_disabled(
+    monkeypatch,
+):
     mock_config = MagicMock()
     mock_config.is_production = False
     mock_config.get.side_effect = lambda key, default: {
-        'relay.request_timeout': 10,
-        'relay.cluster_only': True,
-        'relay.server_url': 'https://token.place',
-        'relay.additional_servers': ['https://relay-backup.example'],
-        'relay.cloudflare_fallback_urls': ['https://cloudflare-a.example'],
+        "relay.request_timeout": 10,
+        "relay.cluster_only": True,
+        "relay.server_url": "https://token.place",
+        "relay.additional_servers": ["https://relay-backup.example"],
+        "relay.cloudflare_fallback_urls": ["https://cloudflare-a.example"],
     }.get(key, default)
 
     monkeypatch.setenv(
-        'TOKEN_PLACE_RELAY_UPSTREAMS',
-        'https://token.place,https://env-upstream.example',
+        "TOKEN_PLACE_RELAY_UPSTREAMS",
+        "https://token.place,https://env-upstream.example",
     )
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', 'https://token.place')
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_CLOUDFLARE_URL", "https://token.place")
     monkeypatch.setenv(
-        'TOKEN_PLACE_RELAY_CLOUDFLARE_URLS',
+        "TOKEN_PLACE_RELAY_CLOUDFLARE_URLS",
         '["https://token.place","https://env-cloudflare.example"]',
     )
 
-    with patch('utils.networking.relay_client.get_config_lazy', return_value=mock_config):
+    with patch(
+        "utils.networking.relay_client.get_config_lazy", return_value=mock_config
+    ):
         client = RelayClient(
-            base_url='http://127.0.0.1:5010',
+            base_url="http://127.0.0.1:5010",
             port=None,
             crypto_manager=object(),
             model_manager=object(),
             include_configured_servers=False,
         )
 
-    assert client.relay_urls == ('http://127.0.0.1:5010',)
-    assert 'https://token.place' not in client.relay_urls
+    assert client.relay_urls == ("http://127.0.0.1:5010",)
+    assert "https://token.place" not in client.relay_urls
 
 
 class TestRelayClient:
@@ -328,11 +359,11 @@ class TestRelayClient:
     def mock_crypto_manager(self):
         """Fixture for a mock crypto manager."""
         mock = MagicMock()
-        mock.public_key_b64 = 'mock_public_key_b64'
+        mock.public_key_b64 = "mock_public_key_b64"
         mock.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv'
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         mock.decrypt_message.return_value = [
             {"role": "user", "content": "What is the capital of France?"}
@@ -345,7 +376,7 @@ class TestRelayClient:
         mock = MagicMock()
         mock.llama_cpp_get_response.return_value = [
             {"role": "user", "content": "What is the capital of France?"},
-            {"role": "assistant", "content": "The capital of France is Paris."}
+            {"role": "assistant", "content": "The capital of France is Paris."},
         ]
         mock.runtime = MagicMock()
         mock.runtime.create_chat_completion.return_value = {
@@ -366,25 +397,25 @@ class TestRelayClient:
     @pytest.fixture
     def config_values(self):
         """Fixture for mock config values."""
-        return {
-            'relay.request_timeout': 15
-        }
+        return {"relay.request_timeout": 15}
 
     @pytest.fixture
     def relay_client(self, mock_crypto_manager, mock_model_manager, config_values):
         """Fixture that returns a relay client instance with mocked dependencies."""
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             # Create a MagicMock that also implements get method
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
                 base_url="http://localhost",
                 port=5000,
                 crypto_manager=mock_crypto_manager,
-                model_manager=mock_model_manager
+                model_manager=mock_model_manager,
             )
             return client
 
@@ -396,7 +427,9 @@ class TestRelayClient:
         mock_response.text = "Success"
         return mock_response
 
-    def test_initialization(self, relay_client, mock_crypto_manager, mock_model_manager, config_values):
+    def test_initialization(
+        self, relay_client, mock_crypto_manager, mock_model_manager, config_values
+    ):
         """Test RelayClient initialization."""
         assert relay_client.base_url == "http://localhost"
         assert relay_client.port == 5000
@@ -419,7 +452,7 @@ class TestRelayClient:
         relay_client.stop()
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_unregister_from_relay_success(self, mock_post, relay_client):
         """Unregister should post to /api/v1/relay/servers/unregister and return True on success after registration."""
 
@@ -433,13 +466,15 @@ class TestRelayClient:
 
         assert result is True
         mock_post.assert_called_once_with(
-            'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            "http://localhost:5000/api/v1/relay/servers/unregister",
+            json={"server_public_key": "mock_public_key_b64"},
             timeout=relay_client._request_timeout,
         )
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_unregister_from_relay_skips_when_never_registered(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_unregister_from_relay_skips_when_never_registered(
+        self, mock_post, relay_client
+    ):
         """Unregister should be a local no-op before API v1 registration succeeds."""
 
         assert relay_client.unregister_from_relay() is True
@@ -454,14 +489,16 @@ class TestRelayClient:
         """Unregister should attempt all relay targets before returning."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['http://backup-relay:6000'],
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["http://backup-relay:6000"],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -480,18 +517,20 @@ class TestRelayClient:
         failure_response.status_code = 503
         failure_response.text = "Service unavailable"
 
-        with patch('utils.networking.relay_client.requests.post') as mock_post:
+        with patch("utils.networking.relay_client.requests.post") as mock_post:
             mock_post.side_effect = [success_response, failure_response]
             assert client.unregister_from_relay() is False
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/api/v1/relay/servers/unregister',
-            'http://backup-relay:6000/api/v1/relay/servers/unregister',
+            "http://primary-relay:5000/api/v1/relay/servers/unregister",
+            "http://backup-relay:6000/api/v1/relay/servers/unregister",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_unregister_from_relay_retries_after_transient_failure(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_unregister_from_relay_retries_after_transient_failure(
+        self, mock_post, relay_client
+    ):
         """A failed unregister attempt should not make later attempts no-ops."""
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
@@ -507,11 +546,11 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://localhost:5000/api/v1/relay/servers/unregister',
-            'http://localhost:5000/api/v1/relay/servers/unregister',
+            "http://localhost:5000/api/v1/relay/servers/unregister",
+            "http://localhost:5000/api/v1/relay/servers/unregister",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_unregister_from_relay_keeps_failed_registered_relay_for_retry(
         self,
         mock_post,
@@ -521,14 +560,16 @@ class TestRelayClient:
         """Partial multi-relay unregisters should retain only failed local state."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['http://backup-relay:6000'],
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["http://backup-relay:6000"],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -538,18 +579,22 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
-        primary = 'http://primary-relay:5000'
-        backup = 'http://backup-relay:6000'
+        primary = "http://primary-relay:5000"
+        backup = "http://backup-relay:6000"
         client._api_v1_registered_relays.update({primary, backup})
         client._api_v1_last_heartbeat_at.update({primary: 1.0, backup: 2.0})
         client._api_v1_relay_wait_hints = {
-            primary: {'next_ping_in_x_seconds': 30},
-            backup: {'next_ping_in_x_seconds': 30},
+            primary: {"next_ping_in_x_seconds": 30},
+            backup: {"next_ping_in_x_seconds": 30},
         }
         success_response = MagicMock(status_code=200)
         failure_response = MagicMock(status_code=503)
         retry_success_response = MagicMock(status_code=200)
-        mock_post.side_effect = [success_response, failure_response, retry_success_response]
+        mock_post.side_effect = [
+            success_response,
+            failure_response,
+            retry_success_response,
+        ]
 
         assert client.unregister_from_relay() is False
         assert client._api_v1_registered_relays == {backup}
@@ -562,15 +607,15 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            f'{primary}/api/v1/relay/servers/unregister',
-            f'{backup}/api/v1/relay/servers/unregister',
-            f'{backup}/api/v1/relay/servers/unregister',
+            f"{primary}/api/v1/relay/servers/unregister",
+            f"{backup}/api/v1/relay/servers/unregister",
+            f"{backup}/api/v1/relay/servers/unregister",
         ]
         assert client._api_v1_registered_relays == set()
         assert client._api_v1_last_heartbeat_at == {}
         assert client._api_v1_relay_wait_hints == {}
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_unregister_from_relay_uses_registration_token(
         self,
         mock_post,
@@ -580,14 +625,16 @@ class TestRelayClient:
         """Registration token headers should be forwarded to unregister calls."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            "relay.request_timeout": 15,
+            "relay.server_registration_token": "alpha-token",
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -606,9 +653,9 @@ class TestRelayClient:
         assert client.unregister_from_relay() is True
         mock_post.assert_called_once()
         call = mock_post.call_args
-        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+        assert call.kwargs["headers"] == {"X-Relay-Server-Token": "alpha-token"}
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
         """Test successful ping to relay."""
         # Setup mock response
@@ -625,12 +672,12 @@ class TestRelayClient:
 
         # Verify mock calls
         mock_post.assert_called_once_with(
-            'http://localhost:5000/sink',
-            json={'server_public_key': 'mock_public_key_b64'},
-            timeout=relay_client._request_timeout
+            "http://localhost:5000/sink",
+            json={"server_public_key": "mock_public_key_b64"},
+            timeout=relay_client._request_timeout,
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_uses_registration_token(
         self,
         mock_post,
@@ -640,14 +687,16 @@ class TestRelayClient:
         """Registration tokens should be sent with sink requests when configured."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            "relay.request_timeout": 15,
+            "relay.server_registration_token": "alpha-token",
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -667,9 +716,9 @@ class TestRelayClient:
         assert result == TEST_NO_REQUEST_RESPONSE
         mock_post.assert_called_once()
         call = mock_post.call_args
-        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+        assert call.kwargs["headers"] == {"X-Relay-Server-Token": "alpha-token"}
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_http_error(self, mock_post, relay_client):
         """Test ping to relay with HTTP error."""
         # Setup mock response
@@ -682,10 +731,10 @@ class TestRelayClient:
         result = relay_client.ping_relay()
 
         # Check the result
-        assert 'error' in result
-        assert 'next_ping_in_x_seconds' in result
-        assert result['error'] == "HTTP 500"
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "error" in result
+        assert "next_ping_in_x_seconds" in result
+        assert result["error"] == "HTTP 500"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
 
     def test_ping_relay_failover_to_additional_servers(
         self,
@@ -695,14 +744,16 @@ class TestRelayClient:
         """RelayClient should fail over to additional servers when the primary fails."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['http://backup-relay:6000'],
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["http://backup-relay:6000"],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -723,7 +774,7 @@ class TestRelayClient:
         failure_response.status_code = 503
         failure_response.text = "Service unavailable"
 
-        with patch('utils.networking.relay_client.requests.post') as mock_post:
+        with patch("utils.networking.relay_client.requests.post") as mock_post:
             mock_post.side_effect = [failure_response, success_response]
 
             result = client.ping_relay()
@@ -732,10 +783,10 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            "http://primary-relay:5000/sink",
+            "http://backup-relay:6000/sink",
         ]
-        assert client.relay_url == 'http://backup-relay:6000'
+        assert client.relay_url == "http://backup-relay:6000"
 
     def test_ping_relay_cloudflare_fallback(
         self,
@@ -745,16 +796,18 @@ class TestRelayClient:
         """RelayClient should fall back to Cloudflare relays when configured."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.cloudflare_fallback_urls': [
-                'https://relay.cloudflare.workers.dev/api/v1'
+            "relay.request_timeout": 15,
+            "relay.cloudflare_fallback_urls": [
+                "https://relay.cloudflare.workers.dev/api/v1"
             ],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -772,7 +825,7 @@ class TestRelayClient:
         success_response.status_code = 200
         success_response.json.return_value = TEST_NO_REQUEST_RESPONSE
 
-        with patch('utils.networking.relay_client.requests.post') as mock_post:
+        with patch("utils.networking.relay_client.requests.post") as mock_post:
             mock_post.side_effect = [failure_response, success_response]
 
             result = client.ping_relay()
@@ -781,11 +834,11 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'https://relay.cloudflare.workers.dev/api/v1/sink',
+            "http://primary-relay:5000/sink",
+            "https://relay.cloudflare.workers.dev/api/v1/sink",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_sticky_failover_after_failure(
         self,
         mock_post,
@@ -795,14 +848,16 @@ class TestRelayClient:
         """Once failover occurs, subsequent calls should start with the healthy relay."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['http://backup-relay:6000'],
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["http://backup-relay:6000"],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -838,13 +893,13 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
-            'http://backup-relay:6000/sink',
+            "http://primary-relay:5000/sink",
+            "http://backup-relay:6000/sink",
+            "http://backup-relay:6000/sink",
         ]
-        assert client.relay_url == 'http://backup-relay:6000'
+        assert client.relay_url == "http://backup-relay:6000"
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_rotates_between_successful_servers(
         self,
         mock_post,
@@ -854,14 +909,16 @@ class TestRelayClient:
         """Successful sink calls should round-robin across configured relay targets."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['http://backup-relay:6000'],
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["http://backup-relay:6000"],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -889,10 +946,10 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            "http://primary-relay:5000/sink",
+            "http://backup-relay:6000/sink",
         ]
-        assert client.relay_url == 'http://backup-relay:6000'
+        assert client.relay_url == "http://backup-relay:6000"
 
     def test_cluster_only_uses_remote_targets_first(
         self,
@@ -902,15 +959,17 @@ class TestRelayClient:
         """Cluster-only mode should skip the local relay host."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.additional_servers': ['https://cluster-relay:7443'],
-            'relay.cluster_only': True,
+            "relay.request_timeout": 15,
+            "relay.additional_servers": ["https://cluster-relay:7443"],
+            "relay.cluster_only": True,
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -920,8 +979,8 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
-        assert client.relay_urls == ('https://cluster-relay:7443',)
-        assert client.relay_url == 'https://cluster-relay:7443'
+        assert client.relay_urls == ("https://cluster-relay:7443",)
+        assert client.relay_url == "https://cluster-relay:7443"
 
     def test_cluster_only_without_targets_raises(
         self,
@@ -931,14 +990,16 @@ class TestRelayClient:
         """Cluster-only mode should fail fast when no remote targets are configured."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.cluster_only': True,
+            "relay.request_timeout": 15,
+            "relay.cluster_only": True,
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             with pytest.raises(ValueError):
@@ -957,20 +1018,24 @@ class TestRelayClient:
         """Cluster-only mode should not silently accept localhost from config defaults."""
 
         config_values = {
-            'relay.request_timeout': 20,
-            'relay.cluster_only': True,
-            'relay.server_url': 'http://localhost:5000',
-            'relay.additional_servers': [],
-            'relay.server_pool_secondary': [],
+            "relay.request_timeout": 20,
+            "relay.cluster_only": True,
+            "relay.server_url": "http://localhost:5000",
+            "relay.additional_servers": [],
+            "relay.server_pool_secondary": [],
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
-            with pytest.raises(ValueError, match='At least one relay target must be provided'):
+            with pytest.raises(
+                ValueError, match="At least one relay target must be provided"
+            ):
                 RelayClient(
                     base_url="http://localhost",
                     port=5000,
@@ -978,7 +1043,7 @@ class TestRelayClient:
                     model_manager=mock_model_manager,
                 )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_request_exception(self, mock_post, relay_client):
         """Test ping to relay with request exception."""
         # Setup mock to raise an exception
@@ -988,12 +1053,12 @@ class TestRelayClient:
         result = relay_client.ping_relay()
 
         # Check the result
-        assert 'error' in result
-        assert 'next_ping_in_x_seconds' in result
-        assert result['error'] == "Test connection error"
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "error" in result
+        assert "next_ping_in_x_seconds" in result
+        assert result["error"] == "Test connection error"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_json_decode_error(self, mock_post, relay_client):
         """Test ping to relay with JSON decode error."""
         # Setup mock to return invalid JSON
@@ -1006,30 +1071,32 @@ class TestRelayClient:
         result = relay_client.ping_relay()
 
         # Check the result
-        assert 'error' in result
-        assert 'next_ping_in_x_seconds' in result
-        assert "Invalid JSON" in result['error']
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "error" in result
+        assert "next_ping_in_x_seconds" in result
+        assert "Invalid JSON" in result["error"]
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_schema_validation_error(self, mock_post, relay_client):
         """Test ping to relay with schema validation error."""
         # Setup mock to return response that fails schema validation
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {'invalid': 'response'}  # Missing required fields
+        mock_response.json.return_value = {
+            "invalid": "response"
+        }  # Missing required fields
         mock_post.return_value = mock_response
 
         # Call the method
         result = relay_client.ping_relay()
 
         # Check the result
-        assert 'error' in result
-        assert 'next_ping_in_x_seconds' in result
-        assert "Invalid response format" in result['error']
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "error" in result
+        assert "next_ping_in_x_seconds" in result
+        assert "Invalid response format" in result["error"]
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_ping_relay_generic_exception(self, mock_post, relay_client):
         """Test ping to relay with generic exception."""
         # Setup mock to raise an exception
@@ -1039,39 +1106,48 @@ class TestRelayClient:
         result = relay_client.ping_relay()
 
         # Check the result
-        assert 'error' in result
-        assert 'next_ping_in_x_seconds' in result
-        assert result['error'] == "Unexpected error"
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "error" in result
+        assert "next_ping_in_x_seconds" in result
+        assert result["error"] == "Unexpected error"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_register_api_v1_compute_node_non_200_returns_error(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_register_api_v1_compute_node_non_200_returns_error(
+        self, mock_post, relay_client
+    ):
         response = MagicMock(status_code=503)
-        response.headers = {'content-type': 'text/plain'}
-        response.text = 'Service unavailable'
-        response.json.side_effect = ValueError('not json')
+        response.headers = {"content-type": "text/plain"}
+        response.text = "Service unavailable"
+        response.json.side_effect = ValueError("not json")
         mock_post.return_value = response
 
-        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+        result = relay_client.register_api_v1_compute_node("http://relay-a.example")
 
-        assert result['error'] == 'HTTP 503'
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
-        assert result['http_status'] == 503
-        assert result['relay_error_kind'] == 'http_status_no_json_body'
-        assert result['relay_http_diagnostic']['path'] == '/api/v1/relay/servers/register'
+        assert result["error"] == "HTTP 503"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
+        assert result["http_status"] == 503
+        assert result["relay_error_kind"] == "http_status_no_json_body"
+        assert (
+            result["relay_http_diagnostic"]["path"] == "/api/v1/relay/servers/register"
+        )
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_register_api_v1_compute_node_sends_context_capabilities(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_register_api_v1_compute_node_sends_context_capabilities(
+        self, mock_post, relay_client
+    ):
         response = MagicMock(status_code=200)
-        response.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0}
+        response.json.return_value = {
+            "next_ping_in_x_seconds": 30,
+            "poll_wait_seconds": 0,
+        }
         mock_post.return_value = response
         relay_client.model_manager.context_tier = "64k-full"
         relay_client.model_manager.context_window_tokens = 65536
         relay_client.model_manager.last_compute_diagnostics = {"backend_used": "cuda"}
 
-        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+        result = relay_client.register_api_v1_compute_node("http://relay-a.example")
 
-        assert result['next_ping_in_x_seconds'] == 30
+        assert result["next_ping_in_x_seconds"] == 30
         payload = mock_post.call_args.kwargs["json"]
         assert payload["server_public_key"] == "mock_public_key_b64"
         assert payload["capabilities"]["active_context_tier"] == "64k-full"
@@ -1080,270 +1156,293 @@ class TestRelayClient:
         assert payload["capabilities"]["backend_class"] == "cuda"
         assert "llama-3.1-8b-instruct" in payload["capabilities"]["supported_model_ids"]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        relay_client._registration_token = "super-secret-token"
+        relay_client.crypto_manager.public_key_b64 = "server-public-key-secret"
         response = MagicMock(status_code=403)
         response.headers = {
-            'server': 'cloudflare',
-            'cf-ray': '84abcd-SJC',
-            'cf-cache-status': 'DYNAMIC',
-            'content-type': 'text/html; charset=UTF-8',
+            "server": "cloudflare",
+            "cf-ray": "84abcd-SJC",
+            "cf-cache-status": "DYNAMIC",
+            "content-type": "text/html; charset=UTF-8",
         }
         response.text = (
-            '<html>\n403 forbidden\r\nX-Relay-Server-Token: super-secret-token\x00 '
-            'server_public_key=server-public-key-secret private_key=do-not-log</html>'
+            "<html>\n403 forbidden\r\nX-Relay-Server-Token: super-secret-token\x00 "
+            "server_public_key=server-public-key-secret private_key=do-not-log</html>"
         )
-        response.json.side_effect = ValueError('not json')
+        response.json.side_effect = ValueError("not json")
         mock_post.return_value = response
 
-        with caplog.at_level('ERROR', logger='relay_client'):
-            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+        with caplog.at_level("ERROR", logger="relay_client"):
+            result = relay_client.register_api_v1_compute_node(
+                "https://staging.token.place"
+            )
 
-        diagnostic = result['relay_http_diagnostic']
-        assert result['error'] == 'HTTP 403'
-        assert result['relay_error_kind'] == 'cloudflare_pre_app_rejection'
-        assert diagnostic['method'] == 'POST'
-        assert diagnostic['path'] == '/api/v1/relay/servers/register'
-        assert diagnostic['status_code'] == 403
-        assert diagnostic['headers'] == {
-            'server': 'cloudflare',
-            'cf-ray': '84abcd-SJC',
-            'cf-cache-status': 'DYNAMIC',
-            'content-type': 'text/html; charset=UTF-8',
+        diagnostic = result["relay_http_diagnostic"]
+        assert result["error"] == "HTTP 403"
+        assert result["relay_error_kind"] == "cloudflare_pre_app_rejection"
+        assert diagnostic["method"] == "POST"
+        assert diagnostic["path"] == "/api/v1/relay/servers/register"
+        assert diagnostic["status_code"] == 403
+        assert diagnostic["headers"] == {
+            "server": "cloudflare",
+            "cf-ray": "84abcd-SJC",
+            "cf-cache-status": "DYNAMIC",
+            "content-type": "text/html; charset=UTF-8",
         }
-        assert diagnostic['token_sent'] is True
-        assert diagnostic['probable_pre_app_rejection'] is True
-        assert '403 forbidden' in diagnostic['body_snippet']
-        assert len(diagnostic['body_snippet']) <= relay_client_module._API_V1_BODY_SNIPPET_LIMIT + 3
-        assert '\n' not in diagnostic['body_snippet']
-        assert '\r' not in diagnostic['body_snippet']
-        assert '\x00' not in diagnostic['body_snippet']
+        assert diagnostic["token_sent"] is True
+        assert diagnostic["probable_pre_app_rejection"] is True
+        assert "403 forbidden" in diagnostic["body_snippet"]
+        assert (
+            len(diagnostic["body_snippet"])
+            <= relay_client_module._API_V1_BODY_SNIPPET_LIMIT + 3
+        )
+        assert "\n" not in diagnostic["body_snippet"]
+        assert "\r" not in diagnostic["body_snippet"]
+        assert "\x00" not in diagnostic["body_snippet"]
         http_log = next(
             record.getMessage()
             for record in caplog.records
-            if 'api_v1.relay_http_error' in record.getMessage()
+            if "api_v1.relay_http_error" in record.getMessage()
         )
-        assert '\n' not in http_log
-        assert '\r' not in http_log
-        assert '\x00' not in http_log
+        assert "\n" not in http_log
+        assert "\r" not in http_log
+        assert "\x00" not in http_log
         logs = caplog.text
-        assert 'api_v1.relay_http_error' in logs
-        assert 'api_v1.relay_pre_app_rejection' in logs
-        assert 'cf-ray' in logs
-        assert '84abcd-SJC' in logs
+        assert "api_v1.relay_http_error" in logs
+        assert "api_v1.relay_pre_app_rejection" in logs
+        assert "cf-ray" in logs
+        assert "84abcd-SJC" in logs
         for forbidden in (
-            'super-secret-token',
-            'server-public-key-secret',
-            'do-not-log',
+            "super-secret-token",
+            "server-public-key-secret",
+            "do-not-log",
         ):
             assert forbidden not in logs
             assert forbidden not in json.dumps(result, sort_keys=True)
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_propagates_register_http_diagnostic(
         self, mock_post, relay_client
     ):
-        relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        relay_client._registration_token = "super-secret-token"
+        relay_client.crypto_manager.public_key_b64 = "server-public-key-secret"
         response = MagicMock(status_code=403)
         response.headers = {
-            'server': 'cloudflare',
-            'cf-ray': '84abcd-SJC',
-            'content-type': 'text/html; charset=UTF-8',
+            "server": "cloudflare",
+            "cf-ray": "84abcd-SJC",
+            "content-type": "text/html; charset=UTF-8",
         }
         response.text = (
-            '<html>403 forbidden X-Relay-Server-Token: super-secret-token '
-            'server_public_key=server-public-key-secret</html>'
+            "<html>403 forbidden X-Relay-Server-Token: super-secret-token "
+            "server_public_key=server-public-key-secret</html>"
         )
-        response.json.side_effect = ValueError('not json')
+        response.json.side_effect = ValueError("not json")
         mock_post.return_value = response
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['error'] == 'HTTP 403'
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
-        assert result['http_status'] == 403
-        assert result['relay_error_kind'] == 'cloudflare_pre_app_rejection'
-        diagnostic = result['relay_http_diagnostic']
-        assert diagnostic['path'] == '/api/v1/relay/servers/register'
-        assert diagnostic['headers']['cf-ray'] == '84abcd-SJC'
-        assert diagnostic['token_sent'] is True
-        for forbidden in ('super-secret-token', 'server-public-key-secret'):
+        assert result["error"] == "HTTP 403"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
+        assert result["http_status"] == 403
+        assert result["relay_error_kind"] == "cloudflare_pre_app_rejection"
+        diagnostic = result["relay_http_diagnostic"]
+        assert diagnostic["path"] == "/api/v1/relay/servers/register"
+        assert diagnostic["headers"]["cf-ray"] == "84abcd-SJC"
+        assert diagnostic["token_sent"] is True
+        for forbidden in ("super-secret-token", "server-public-key-secret"):
             assert forbidden not in json.dumps(result, sort_keys=True)
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_register_api_v1_compute_node_logs_control_plane_429(self, mock_post, relay_client, caplog):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_register_api_v1_compute_node_logs_control_plane_429(
+        self, mock_post, relay_client, caplog
+    ):
         response = MagicMock(status_code=429)
         response.headers = {
-            'content-type': 'application/json',
-            'retry-after': '37',
+            "content-type": "application/json",
+            "retry-after": "37",
         }
         response.json.return_value = {
-            'error': {
-                'code': 'rate_limit_exceeded',
-                'message': 'Rate limit exceeded: 2 per 1 hour. Try again in 37 seconds.',
-                'type': 'rate_limit_error',
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit exceeded: 2 per 1 hour. Try again in 37 seconds.",
+                "type": "rate_limit_error",
             }
         }
         mock_post.return_value = response
 
-        with caplog.at_level('ERROR', logger='relay_client'):
-            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+        with caplog.at_level("ERROR", logger="relay_client"):
+            result = relay_client.register_api_v1_compute_node(
+                "https://staging.token.place"
+            )
 
-        diagnostic = result['relay_http_diagnostic']
-        assert result['error'] == 'HTTP 429'
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
-        assert diagnostic['path'] == '/api/v1/relay/servers/register'
-        assert diagnostic['route_class'] == 'compute_node_control_plane'
-        assert diagnostic['retry_after'] == '37'
-        assert diagnostic['headers']['retry-after'] == '37'
-        assert 'relay_control_plane_rate_limited' in caplog.text
-        assert 'retry_after=37' in caplog.text
+        diagnostic = result["relay_http_diagnostic"]
+        assert result["error"] == "HTTP 429"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
+        assert diagnostic["path"] == "/api/v1/relay/servers/register"
+        assert diagnostic["route_class"] == "compute_node_control_plane"
+        assert diagnostic["retry_after"] == "37"
+        assert diagnostic["headers"]["retry-after"] == "37"
+        assert "relay_control_plane_rate_limited" in caplog.text
+        assert "retry_after=37" in caplog.text
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        relay_client._registration_token = "super-secret-token"
+        relay_client.crypto_manager.public_key_b64 = "server-public-key-secret"
         response = MagicMock(status_code=401)
         response.headers = {
-            'server': 'gunicorn',
-            'content-type': 'application/json',
-            'x-request-id': 'relay-request-123',
+            "server": "gunicorn",
+            "content-type": "application/json",
+            "x-request-id": "relay-request-123",
         }
         response.text = '{"error":"invalid relay registration token"}'
         response.json.return_value = {
-            'error': 'invalid relay registration token',
-            'token': 'super-secret-token',
-            'server_public_key': 'server-public-key-secret',
+            "error": "invalid relay registration token",
+            "token": "super-secret-token",
+            "server_public_key": "server-public-key-secret",
         }
         mock_post.return_value = response
 
-        with caplog.at_level('ERROR', logger='relay_client'):
-            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+        with caplog.at_level("ERROR", logger="relay_client"):
+            result = relay_client.register_api_v1_compute_node(
+                "https://staging.token.place"
+            )
 
-        assert result['error'] == 'HTTP 401'
-        assert result['relay_error_kind'] == 'relay_json_error'
-        assert result['relay_error'] == 'invalid relay registration token'
-        diagnostic = result['relay_http_diagnostic']
-        assert diagnostic['headers']['x-request-id'] == 'relay-request-123'
-        assert diagnostic['token_sent'] is True
-        assert diagnostic['probable_pre_app_rejection'] is False
-        assert 'invalid relay registration token' in diagnostic['body_snippet']
-        assert '"token":"[redacted]"' in diagnostic['body_snippet']
+        assert result["error"] == "HTTP 401"
+        assert result["relay_error_kind"] == "relay_json_error"
+        assert result["relay_error"] == "invalid relay registration token"
+        diagnostic = result["relay_http_diagnostic"]
+        assert diagnostic["headers"]["x-request-id"] == "relay-request-123"
+        assert diagnostic["token_sent"] is True
+        assert diagnostic["probable_pre_app_rejection"] is False
+        assert "invalid relay registration token" in diagnostic["body_snippet"]
+        assert '"token":"[redacted]"' in diagnostic["body_snippet"]
         logs = caplog.text
-        assert 'api_v1.relay_http_error' in logs
-        assert 'api_v1.relay_pre_app_rejection' not in logs
-        for forbidden in ('super-secret-token', 'server-public-key-secret'):
+        assert "api_v1.relay_http_error" in logs
+        assert "api_v1.relay_pre_app_rejection" not in logs
+        for forbidden in ("super-secret-token", "server-public-key-secret"):
             assert forbidden not in logs
             assert forbidden not in json.dumps(result, sort_keys=True)
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_register_api_v1_compute_node_redacts_nested_json_error_and_hyphen_keys(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'configured-public-key-secret'
+        relay_client._registration_token = "super-secret-token"
+        relay_client.crypto_manager.public_key_b64 = "configured-public-key-secret"
         response = MagicMock(status_code=401)
-        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
-        response.text = 'ignored because response.json returns a JSON object'
+        response.headers = {"server": "gunicorn", "content-type": "application/json"}
+        response.text = "ignored because response.json returns a JSON object"
         response.json.return_value = {
-            'error': {
-                'message': 'bad super-secret-token configured-public-key-secret',
-                'X-Relay-Server-Token': 'echoed-other-token',
-                'private-key': 'private-key-secret',
-                'server-public-key': 'server-public-key-secret',
+            "error": {
+                "message": "bad super-secret-token configured-public-key-secret",
+                "X-Relay-Server-Token": "echoed-other-token",
+                "private-key": "private-key-secret",
+                "server-public-key": "server-public-key-secret",
             },
-            'detail': {
-                'token': 'super-secret-token',
-                'message': 'bad super-secret-token configured-public-key-secret',
+            "detail": {
+                "token": "super-secret-token",
+                "message": "bad super-secret-token configured-public-key-secret",
             },
         }
         mock_post.return_value = response
 
-        with caplog.at_level('ERROR', logger='relay_client'):
-            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+        with caplog.at_level("ERROR", logger="relay_client"):
+            result = relay_client.register_api_v1_compute_node(
+                "https://staging.token.place"
+            )
 
         bridge = _load_compute_node_bridge_module()
         summary = bridge._relay_response_summary(result)
 
-        assert result['relay_error_kind'] == 'relay_json_error'
-        assert result['relay_error'] == (
+        assert result["relay_error_kind"] == "relay_json_error"
+        assert result["relay_error"] == (
             '{"X-Relay-Server-Token":"[redacted]","message":"bad [redacted] [redacted]",'
             '"private-key":"[redacted]","server-public-key":"[redacted]"}'
         )
-        body_snippet = result['relay_http_diagnostic']['body_snippet']
+        body_snippet = result["relay_http_diagnostic"]["body_snippet"]
         assert '"X-Relay-Server-Token":"[redacted]"' in body_snippet
         assert '"private-key":"[redacted]"' in body_snippet
         assert '"server-public-key":"[redacted]"' in body_snippet
         assert '"token":"[redacted]"' in body_snippet
         rendered_result = json.dumps(result, sort_keys=True)
         for forbidden in (
-            'super-secret-token',
-            'configured-public-key-secret',
-            'echoed-other-token',
-            'server-public-key-secret',
-            'private-key-secret',
+            "super-secret-token",
+            "configured-public-key-secret",
+            "echoed-other-token",
+            "server-public-key-secret",
+            "private-key-secret",
         ):
             assert forbidden not in caplog.text
             assert forbidden not in rendered_result
             assert forbidden not in body_snippet
-            assert forbidden not in result['relay_error']
+            assert forbidden not in result["relay_error"]
             assert forbidden not in summary
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        relay_client._registration_token = "super-secret-token"
+        relay_client.crypto_manager.public_key_b64 = "server-public-key-secret"
         response = MagicMock(status_code=401)
-        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.headers = {"server": "gunicorn", "content-type": "application/json"}
         response.text = (
             '{"error":"bad super-secret-token server-public-key-secret",'
             '"detail":{"message":"bad super-secret-token server-public-key-secret"}}'
         )
         response.json.return_value = {
-            'error': 'bad super-secret-token server-public-key-secret',
-            'detail': {
-                'message': 'bad super-secret-token server-public-key-secret',
+            "error": "bad super-secret-token server-public-key-secret",
+            "detail": {
+                "message": "bad super-secret-token server-public-key-secret",
             },
         }
         mock_post.return_value = response
 
-        with caplog.at_level('ERROR', logger='relay_client'):
-            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+        with caplog.at_level("ERROR", logger="relay_client"):
+            result = relay_client.register_api_v1_compute_node(
+                "https://staging.token.place"
+            )
 
         bridge = _load_compute_node_bridge_module()
         summary = bridge._relay_response_summary(result)
 
-        assert result['relay_error_kind'] == 'relay_json_error'
-        assert result['relay_error'] == 'bad [redacted] [redacted]'
+        assert result["relay_error_kind"] == "relay_json_error"
+        assert result["relay_error"] == "bad [redacted] [redacted]"
         assert (
-            result['relay_http_diagnostic']['body_snippet']
+            result["relay_http_diagnostic"]["body_snippet"]
             == '{"detail":{"message":"bad [redacted] [redacted]"},"error":"bad [redacted] [redacted]"}'
         )
         for rendered in (caplog.text, json.dumps(result, sort_keys=True), summary):
-            assert 'super-secret-token' not in rendered
-            assert 'server-public-key-secret' not in rendered
+            assert "super-secret-token" not in rendered
+            assert "server-public-key-secret" not in rendered
 
     def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
-        assert RelayClient._build_api_v1_url(
-            "http://localhost:5000", "/relay/servers/register"
-        ) == "http://localhost:5000/api/v1/relay/servers/register"
-        assert RelayClient._build_api_v1_url(
-            "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
-        ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
+        assert (
+            RelayClient._build_api_v1_url(
+                "http://localhost:5000", "/relay/servers/register"
+            )
+            == "http://localhost:5000/api/v1/relay/servers/register"
+        )
+        assert (
+            RelayClient._build_api_v1_url(
+                "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
+            )
+            == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
+        )
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_unregister_from_relay_uses_api_v1_url_builder_for_prefixed_relay(self, mock_post):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_unregister_from_relay_uses_api_v1_url_builder_for_prefixed_relay(
+        self, mock_post
+    ):
         client = _standalone_relay_client()
-        prefixed_url = 'http://localhost:5000/api/v1'
+        prefixed_url = "http://localhost:5000/api/v1"
         client._relay_urls = [prefixed_url]
         client._api_v1_registered_relays.add(prefixed_url)
         client._api_v1_last_heartbeat_at[prefixed_url] = 1.0
@@ -1352,8 +1451,8 @@ class TestRelayClient:
         assert client.unregister_from_relay() is True
 
         mock_post.assert_called_once_with(
-            'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            "http://localhost:5000/api/v1/relay/servers/unregister",
+            json={"server_public_key": "mock_public_key_b64"},
             timeout=15,
         )
 
@@ -1372,47 +1471,61 @@ class TestRelayClient:
             (float("inf"), 15.0),
         ],
     )
-    def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout):
-        assert relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
+    def test_api_v1_poll_timeout_seconds_defensive(
+        self, relay_client, expected_wait, expected_timeout
+    ):
+        assert (
+            relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
+        )
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_uses_derived_poll_timeout(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_uses_derived_poll_timeout(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 30}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 12,
+            "poll_wait_seconds": 30,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 12
-        assert mock_post.call_args_list[1].kwargs['timeout'] == 37.5
+        assert result["next_ping_in_x_seconds"] == 12
+        assert mock_post.call_args_list[1].kwargs["timeout"] == 37.5
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_falls_back_to_register_wait_without_poll_wait(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_falls_back_to_register_wait_without_poll_wait(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 12}
+        register_ok.json.return_value = {"next_ping_in_x_seconds": 12}
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 12
-        assert mock_post.call_args_list[1].kwargs['timeout'] == 17.0
+        assert result["next_ping_in_x_seconds"] == 12
+        assert mock_post.call_args_list[1].kwargs["timeout"] == 17.0
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_expected_poll_timeout_returns_no_work_without_reregister(
         self, mock_post, relay_client, monkeypatch
     ):
         clock_values = iter([1000.0, 1000.0, 1010.0, 1010.0])
         monkeypatch.setattr(
             relay_client_module.time,
-            'monotonic',
+            "monotonic",
             lambda: next(clock_values),
         )
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 12,
+            "poll_wait_seconds": 10,
+        }
         mock_post.side_effect = [
             register_ok,
             requests.Timeout("Read timed out. (read timeout=15)"),
@@ -1421,24 +1534,27 @@ class TestRelayClient:
         result = relay_client.poll_api_v1_encrypted_work()
 
         assert result == {
-            'message': 'No requests available',
-            'next_ping_in_x_seconds': 0,
-            'poll_wait_seconds': 10,
+            "message": "No requests available",
+            "next_ping_in_x_seconds": 0,
+            "poll_wait_seconds": 10,
         }
-        assert 'http://localhost:5000' in relay_client._api_v1_registered_relays
+        assert "http://localhost:5000" in relay_client._api_v1_registered_relays
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_zero_poll_wait_timeout_is_failure(
         self, mock_post, relay_client, monkeypatch
     ):
         clock_values = iter([1000.0, 1000.0, 1000.1])
         monkeypatch.setattr(
             relay_client_module.time,
-            'monotonic',
+            "monotonic",
             lambda: next(clock_values),
         )
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 12,
+            "poll_wait_seconds": 0,
+        }
         mock_post.side_effect = [
             register_ok,
             requests.Timeout("Read timed out. (read timeout=5)"),
@@ -1446,96 +1562,120 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert 'Read timed out' in result['error']
-        assert result.get('message') != 'No requests available'
-        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert "Read timed out" in result["error"]
+        assert result.get("message") != "No requests available"
+        assert result["next_ping_in_x_seconds"] == relay_client._request_timeout
         assert relay_client._api_v1_last_heartbeat_at == {}
         assert relay_client.api_v1_registration_fresh() is False
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_no_work_hint_is_preserved(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_no_work_hint_is_preserved(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 12,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 10}
+        poll_ok.json.return_value = {
+            "message": "No requests available",
+            "next_ping_in_x_seconds": 0,
+            "poll_wait_seconds": 10,
+        }
         mock_post.side_effect = [register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
-        assert result['poll_wait_seconds'] == 10
+        assert result["next_ping_in_x_seconds"] == 0
+        assert result["poll_wait_seconds"] == 10
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_error_path_uses_register_backoff(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_error_path_uses_register_backoff(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 14}
+        register_ok.json.return_value = {"next_ping_in_x_seconds": 14}
         poll_err = MagicMock(status_code=503)
         mock_post.side_effect = [register_ok, poll_err]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['error'] == 'HTTP 503'
-        assert result['next_ping_in_x_seconds'] == 14
+        assert result["error"] == "HTTP 503"
+        assert result["next_ping_in_x_seconds"] == 14
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(self, mock_post, relay_client):
-        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(
+        self, mock_post, relay_client
+    ):
+        relay_client._relay_urls = ("http://relay-a.example", "http://relay-b.example")
         relay_client._active_relay_index = 0
 
         register_fail = MagicMock(status_code=500)
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9}
+        register_ok.json.return_value = {"next_ping_in_x_seconds": 9}
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_fail, register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 9
+        assert result["next_ping_in_x_seconds"] == 9
         assert relay_client._active_relay_index == 1
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://relay-a.example/api/v1/relay/servers/register',
-            'http://relay-b.example/api/v1/relay/servers/register',
-            'http://relay-b.example/api/v1/relay/servers/poll',
+            "http://relay-a.example/api/v1/relay/servers/register",
+            "http://relay-b.example/api/v1/relay/servers/register",
+            "http://relay-b.example/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_register_timeout_does_not_return_no_work(self, mock_post, relay_client):
-        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_register_timeout_does_not_return_no_work(
+        self, mock_post, relay_client
+    ):
+        relay_client._relay_urls = ("http://relay-a.example", "http://relay-b.example")
         relay_client._active_relay_index = 0
 
         register_timeout = requests.Timeout("Read timed out. (read timeout=15)")
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_timeout, register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['message'] == 'No requests available'
-        assert result['next_ping_in_x_seconds'] == 9
+        assert result["message"] == "No requests available"
+        assert result["next_ping_in_x_seconds"] == 9
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://relay-a.example/api/v1/relay/servers/register',
-            'http://relay-b.example/api/v1/relay/servers/register',
-            'http://relay-b.example/api/v1/relay/servers/poll',
+            "http://relay-a.example/api/v1/relay/servers/register",
+            "http://relay-b.example/api/v1/relay/servers/register",
+            "http://relay-b.example/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_poll_timeout_fails_over_to_backup(
         self, mock_post, relay_client
     ):
-        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+        relay_client._relay_urls = ("http://relay-a.example", "http://relay-b.example")
         relay_client._active_relay_index = 0
 
         register_a = MagicMock(status_code=200)
-        register_a.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_a.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         register_b = MagicMock(status_code=200)
-        register_b.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 10}
+        register_b.json.return_value = {
+            "next_ping_in_x_seconds": 12,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [
             register_a,
             requests.Timeout("Read timed out. (read timeout=15)"),
@@ -1545,24 +1685,29 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['message'] == 'No requests available'
-        assert result['next_ping_in_x_seconds'] == 12
-        assert 'http://relay-a.example' not in relay_client._api_v1_registered_relays
+        assert result["message"] == "No requests available"
+        assert result["next_ping_in_x_seconds"] == 12
+        assert "http://relay-a.example" not in relay_client._api_v1_registered_relays
         assert relay_client._active_relay_index == 1
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://relay-a.example/api/v1/relay/servers/register',
-            'http://relay-a.example/api/v1/relay/servers/poll',
-            'http://relay-b.example/api/v1/relay/servers/register',
-            'http://relay-b.example/api/v1/relay/servers/poll',
+            "http://relay-a.example/api/v1/relay/servers/register",
+            "http://relay-a.example/api/v1/relay/servers/poll",
+            "http://relay-b.example/api/v1/relay/servers/register",
+            "http://relay-b.example/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_does_not_register_every_poll(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_does_not_register_every_poll(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_ok, poll_ok, poll_ok]
 
         relay_client.poll_api_v1_encrypted_work()
@@ -1570,181 +1715,225 @@ class TestRelayClient:
 
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
-            'http://localhost:5000/api/v1/relay/servers/poll',
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
+            "http://localhost:5000/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_reregisters_after_unknown_node(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_reregisters_after_unknown_node(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         poll_404 = MagicMock(status_code=404)
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_ok, poll_404, register_ok, poll_ok]
 
         first = relay_client.poll_api_v1_encrypted_work()
 
-        assert first['error'] == 'HTTP 404'
-        assert first['next_ping_in_x_seconds'] == 0
-        assert first['relay_error_kind'] == 'http_status_no_json_body'
-        assert relay_client.api_v1_registration_fresh('http://localhost:5000') is False
-        assert 'http://localhost:5000' not in relay_client._api_v1_registered_relays
-        assert 'http://localhost:5000' not in relay_client._api_v1_last_heartbeat_at
-        assert 'http://localhost:5000' not in relay_client._api_v1_relay_wait_hints
+        assert first["error"] == "HTTP 404"
+        assert first["next_ping_in_x_seconds"] == 0
+        assert first["relay_error_kind"] == "http_status_no_json_body"
+        assert relay_client.api_v1_registration_fresh("http://localhost:5000") is False
+        assert "http://localhost:5000" not in relay_client._api_v1_registered_relays
+        assert "http://localhost:5000" not in relay_client._api_v1_last_heartbeat_at
+        assert "http://localhost:5000" not in relay_client._api_v1_relay_wait_hints
 
         second = relay_client.poll_api_v1_encrypted_work()
 
-        assert second['message'] == 'No requests available'
+        assert second["message"] == "No requests available"
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_reregisters_before_cached_lease_expires(
         self, mock_post, relay_client, monkeypatch
     ):
         clock = {"now": 1000.0}
         monkeypatch.setattr(relay_client_module.time, "monotonic", lambda: clock["now"])
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 30,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 10}
+        poll_ok.json.return_value = {
+            "message": "No requests available",
+            "next_ping_in_x_seconds": 0,
+            "poll_wait_seconds": 10,
+        }
         mock_post.side_effect = [register_ok, poll_ok, register_ok, poll_ok]
 
         first = relay_client.poll_api_v1_encrypted_work()
-        assert first['message'] == 'No requests available'
-        assert relay_client.api_v1_registration_fresh('http://localhost:5000') is True
+        assert first["message"] == "No requests available"
+        assert relay_client.api_v1_registration_fresh("http://localhost:5000") is True
 
         clock["now"] += 25.0
         second = relay_client.poll_api_v1_encrypted_work()
 
-        assert second['message'] == 'No requests available'
+        assert second["message"] == "No requests available"
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_api_v1_registration_fresh_expires_after_lease_window(
         self, mock_post, relay_client, monkeypatch
     ):
         clock = {"now": 2000.0}
         monkeypatch.setattr(relay_client_module.time, "monotonic", lambda: clock["now"])
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 30,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 10}
+        poll_ok.json.return_value = {
+            "message": "No requests available",
+            "next_ping_in_x_seconds": 0,
+            "poll_wait_seconds": 10,
+        }
         mock_post.side_effect = [register_ok, poll_ok]
 
         relay_client.poll_api_v1_encrypted_work()
-        assert relay_client.api_v1_registration_fresh('http://localhost:5000') is True
+        assert relay_client.api_v1_registration_fresh("http://localhost:5000") is True
 
         clock["now"] += 31.0
-        assert relay_client.api_v1_registration_fresh('http://localhost:5000') is False
+        assert relay_client.api_v1_registration_fresh("http://localhost:5000") is False
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_poll_api_v1_encrypted_work_normalises_string_lease_hint(
         self, mock_post, relay_client
     ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
         poll_ok.json.return_value = {
-            'message': 'No requests available',
-            'next_ping_in_x_seconds': '30',
-            'poll_wait_seconds': '10',
+            "message": "No requests available",
+            "next_ping_in_x_seconds": "30",
+            "poll_wait_seconds": "10",
         }
         mock_post.side_effect = [register_ok, poll_ok]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 30.0
-        hints = relay_client._api_v1_relay_wait_hints['http://localhost:5000']
-        assert hints['next_ping_in_x_seconds'] == 30.0
-        assert hints['poll_wait_seconds'] == 10.0
+        assert result["next_ping_in_x_seconds"] == 30.0
+        hints = relay_client._api_v1_relay_wait_hints["http://localhost:5000"]
+        assert hints["next_ping_in_x_seconds"] == 30.0
+        assert hints["poll_wait_seconds"] == 10.0
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_cached_poll_wait_reused(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_cached_poll_wait_reused(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 60}
+        register_ok.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 60,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_ok, poll_ok, poll_ok]
 
         relay_client.poll_api_v1_encrypted_work()
         relay_client.poll_api_v1_encrypted_work()
 
         second_poll_call = mock_post.call_args_list[2]
-        assert second_poll_call.args[0] == 'http://localhost:5000/api/v1/relay/servers/poll'
-        assert second_poll_call.kwargs['timeout'] == relay_client._api_v1_poll_timeout_seconds(60)
+        assert (
+            second_poll_call.args[0]
+            == "http://localhost:5000/api/v1/relay/servers/poll"
+        )
+        assert second_poll_call.kwargs[
+            "timeout"
+        ] == relay_client._api_v1_poll_timeout_seconds(60)
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_reregisters_when_public_key_changes(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_reregisters_when_public_key_changes(
+        self, mock_post, relay_client
+    ):
         register_first = MagicMock(status_code=200)
-        register_first.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_first.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         register_second = MagicMock(status_code=200)
-        register_second.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        register_second.json.return_value = {
+            "next_ping_in_x_seconds": 9,
+            "poll_wait_seconds": 10,
+        }
         poll_ok = MagicMock(status_code=200)
-        poll_ok.json.return_value = {'message': 'No requests available'}
+        poll_ok.json.return_value = {"message": "No requests available"}
         mock_post.side_effect = [register_first, poll_ok, register_second, poll_ok]
 
         relay_client.poll_api_v1_encrypted_work()
-        relay_client.crypto_manager.public_key_b64 = 'new-server-public-key'
+        relay_client.crypto_manager.public_key_b64 = "new-server-public-key"
         relay_client.poll_api_v1_encrypted_work()
 
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
-            'http://localhost:5000/api/v1/relay/servers/register',
-            'http://localhost:5000/api/v1/relay/servers/poll',
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
+            "http://localhost:5000/api/v1/relay/servers/register",
+            "http://localhost:5000/api/v1/relay/servers/poll",
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_non_dict_payload_returns_bounded_error(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_non_dict_payload_returns_bounded_error(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 7}
+        register_ok.json.return_value = {"next_ping_in_x_seconds": 7}
         poll_ok_non_dict = MagicMock(status_code=200)
-        poll_ok_non_dict.json.return_value = ['unexpected']
+        poll_ok_non_dict.json.return_value = ["unexpected"]
         mock_post.side_effect = [register_ok, poll_ok_non_dict]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
         assert result == {
-            'error': 'Invalid response format: expected object payload',
-            'next_ping_in_x_seconds': 7,
+            "error": "Invalid response format: expected object payload",
+            "next_ping_in_x_seconds": 7,
         }
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(self, mock_post, relay_client):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(
+        self, mock_post, relay_client
+    ):
         register_ok = MagicMock(status_code=200)
-        register_ok.json.return_value = {'next_ping_in_x_seconds': 11}
+        register_ok.json.return_value = {"next_ping_in_x_seconds": 11}
         poll_fail = MagicMock(status_code=429)
         mock_post.side_effect = [register_ok, poll_fail]
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['error'] == 'HTTP 429'
-        assert result['next_ping_in_x_seconds'] == 11
-        assert result['relay_error_kind'] == 'http_status_no_json_body'
+        assert result["error"] == "HTTP 429"
+        assert result["next_ping_in_x_seconds"] == 11
+        assert result["relay_error_kind"] == "http_status_no_json_body"
 
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""
         # Setup request data with missing fields
         request_data = {
-            'client_public_key': 'client_key',
+            "client_public_key": "client_key",
             # Missing 'chat_history'
-            'cipherkey': 'key',
-            'iv': 'iv'
+            "cipherkey": "key",
+            "iv": "iv",
         }
 
         # Call the method
@@ -1753,7 +1942,9 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
-    def test_process_client_request_decryption_failure(self, relay_client, mock_crypto_manager):
+    def test_process_client_request_decryption_failure(
+        self, relay_client, mock_crypto_manager
+    ):
         """Test processing a client request with decryption failure."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -1767,8 +1958,15 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_success(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager, mock_http_response):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_success(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        mock_http_response,
+    ):
         """Test successful processing of a client request."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -1792,22 +1990,22 @@ class TestRelayClient:
         # Check the encryption and post to /source
         mock_crypto_manager.encrypt_message.assert_called_once_with(
             mock_model_manager.llama_cpp_get_response.return_value,
-            base64.b64decode('Y2xpZW50X2tleV9iNjQ=')
+            base64.b64decode("Y2xpZW50X2tleV9iNjQ="),
         )
 
         expected_payload = {
-            'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv'
+            "client_public_key": "Y2xpZW50X2tleV9iNjQ=",
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            "http://localhost:5000/source",
             json=expected_payload,
-            timeout=relay_client._request_timeout
+            timeout=relay_client._request_timeout,
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_e2ee_success(
         self,
         mock_post,
@@ -1821,11 +2019,11 @@ class TestRelayClient:
         original_import = builtins.__import__
 
         def fail_api_v1_models_import(name, *args, **kwargs):
-            if name == 'api.v1.models':
+            if name == "api.v1.models":
                 raise ModuleNotFoundError("No module named 'api'")
             return original_import(name, *args, **kwargs)
 
-        monkeypatch.setattr(builtins, '__import__', fail_api_v1_models_import)
+        monkeypatch.setattr(builtins, "__import__", fail_api_v1_models_import)
         request_data = TEST_VALID_RESPONSE.copy()
         decrypted_payload = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -1841,9 +2039,9 @@ class TestRelayClient:
         }
         mock_crypto_manager.decrypt_message.return_value = decrypted_payload
         mock_crypto_manager.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv'
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         source_response = MagicMock()
         source_response.status_code = 200
@@ -1873,15 +2071,15 @@ class TestRelayClient:
             base64.b64decode(request_data["client_public_key"], validate=True),
         )
         mock_post.assert_called_once_with(
-            'http://localhost:5000/api/v1/relay/responses',
+            "http://localhost:5000/api/v1/relay/responses",
             json={
-                'client_public_key': request_data["client_public_key"],
-                'request_id': 'req-123',
-                'protocol': 'tokenplace_api_v1_relay_e2ee',
-                'version': 1,
-                'chat_history': 'encrypted_chat_history',
-                'cipherkey': 'encrypted_key',
-                'iv': 'encrypted_iv',
+                "client_public_key": request_data["client_public_key"],
+                "request_id": "req-123",
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "chat_history": "encrypted_chat_history",
+                "cipherkey": "encrypted_key",
+                "iv": "encrypted_iv",
             },
             timeout=relay_client._request_timeout,
         )
@@ -1900,7 +2098,7 @@ class TestRelayClient:
         ):
             assert forbidden not in posted_json
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_no_options_does_not_depend_on_api_imports(
         self,
         mock_post,
@@ -1958,7 +2156,7 @@ class TestRelayClient:
         )
 
     @pytest.mark.parametrize("model_id", ["gpt-3.5-turbo", "gpt-5-chat-latest"])
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_local_aliases_use_packaged_llama_runtime(
         self,
         mock_post,
@@ -2029,7 +2227,7 @@ class TestRelayClient:
 
         assert RelayClient._valid_api_v1_assistant_message(message) == message
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_alignment_adapter_is_rejected(
         self,
         mock_post,
@@ -2065,9 +2263,12 @@ class TestRelayClient:
         mock_model_manager.llama_cpp_get_response.assert_not_called()
         mock_model_manager.runtime.create_chat_completion.assert_not_called()
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+        assert (
+            encrypted_envelope["api_v1_response"]["error"]["code"]
+            == "compute_node_model_unsupported"
+        )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_normalises_multipart_content_blocks(
         self,
         mock_post,
@@ -2113,7 +2314,7 @@ class TestRelayClient:
             }
         ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejects_image_content_blocks(
         self,
         mock_post,
@@ -2155,7 +2356,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(
         self,
         mock_post,
@@ -2165,7 +2366,7 @@ class TestRelayClient:
         """API v1 responses should be submitted to the relay that supplied the work."""
 
         request_data = TEST_VALID_RESPONSE.copy()
-        relay_client._last_api_v1_work_relay_url = 'https://relay-that-polled.example'
+        relay_client._last_api_v1_work_relay_url = "https://relay-that-polled.example"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2184,10 +2385,10 @@ class TestRelayClient:
         assert relay_client.process_client_request(request_data) is True
 
         assert mock_post.call_args.args[0] == (
-            'https://relay-that-polled.example/api/v1/relay/responses'
+            "https://relay-that-polled.example/api/v1/relay/responses"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
         self,
         mock_post,
@@ -2215,7 +2416,7 @@ class TestRelayClient:
         mock_model_manager.llama_cpp_get_response.assert_not_called()
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_missing_runtime_posts_internal_error(
         self,
         mock_post,
@@ -2238,9 +2439,9 @@ class TestRelayClient:
         }
         mock_model_manager.get_llm_instance.return_value = None
         mock_crypto_manager.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv',
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         source_response = MagicMock()
         source_response.status_code = 200
@@ -2262,7 +2463,7 @@ class TestRelayClient:
             "Desktop runtime inference failed"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_request_scoped_inference_error_keeps_runtime_healthy(
         self,
         mock_post,
@@ -2289,9 +2490,9 @@ class TestRelayClient:
             side_effect=LlamaCppInferenceRequestError("bad request")
         )
         mock_crypto_manager.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv',
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         source_response = MagicMock()
         source_response.status_code = 200
@@ -2310,7 +2511,7 @@ class TestRelayClient:
             "compute_node_internal_error"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_exhausted_replacement_reports_recovery_failed(
         self,
         mock_post,
@@ -2337,9 +2538,9 @@ class TestRelayClient:
             )
         )
         mock_crypto_manager.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv',
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         source_response = MagicMock()
         source_response.status_code = 200
@@ -2354,7 +2555,7 @@ class TestRelayClient:
         assert typed_result.recovery_attempted is True
         assert typed_result.recovery_succeeded is False
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_invalid_runtime_output_posts_encrypted_error(
         self,
         mock_post,
@@ -2379,9 +2580,9 @@ class TestRelayClient:
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         }
         mock_crypto_manager.encrypt_message.return_value = {
-            'chat_history': 'encrypted_chat_history',
-            'cipherkey': 'encrypted_key',
-            'iv': 'encrypted_iv',
+            "chat_history": "encrypted_chat_history",
+            "cipherkey": "encrypted_key",
+            "iv": "encrypted_iv",
         }
         source_response = MagicMock()
         source_response.status_code = 200
@@ -2399,7 +2600,7 @@ class TestRelayClient:
         assert relay_visible_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
         assert relay_visible_payload["version"] == 1
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_unsupported_model_posts_encrypted_error(
         self,
         mock_post,
@@ -2440,7 +2641,9 @@ class TestRelayClient:
             "req-unsupported-model"
         )
 
-    def test_api_v1_supported_model_ids_ignores_none_model_path(self, relay_client, mock_model_manager):
+    def test_api_v1_supported_model_ids_ignores_none_model_path(
+        self, relay_client, mock_model_manager
+    ):
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
         mock_model_manager.file_name = None
@@ -2450,7 +2653,9 @@ class TestRelayClient:
 
         assert "none" not in supported_model_ids
 
-    def test_api_v1_supported_model_ids_respects_manager_support_hook(self, relay_client):
+    def test_api_v1_supported_model_ids_respects_manager_support_hook(
+        self, relay_client
+    ):
         class _Manager:
             api_model_id = "custom-local-api-v1-model"
             model_id = None
@@ -2462,9 +2667,11 @@ class TestRelayClient:
 
         relay_client.model_manager = _Manager()
 
-        assert relay_client._api_v1_supported_model_ids() == ["custom-local-api-v1-model"]
+        assert relay_client._api_v1_supported_model_ids() == [
+            "custom-local-api-v1-model"
+        ]
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejects_unsatisfied_context_tier(
         self,
         mock_post,
@@ -2494,10 +2701,10 @@ class TestRelayClient:
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_context_tier_unsupported"
+            "compute_node_context_window_exceeded"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_strips_routing_context_tier(
         self,
         mock_post,
@@ -2529,7 +2736,7 @@ class TestRelayClient:
         assert "error" not in encrypted_envelope["api_v1_response"]
         assert encrypted_envelope["api_v1_response"]["message"]["role"] == "assistant"
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejects_wrong_llama_family_model(
         self,
         mock_post,
@@ -2568,7 +2775,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_uses_manager_model_support_hook(
         self,
         mock_post,
@@ -2623,9 +2830,11 @@ class TestRelayClient:
 
         assert manager.checked_model_ids == ["custom-local-api-v1-model"]
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
+        assert (
+            encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
+        )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_invalid_role_posts_invalid_request(
         self,
         mock_post,
@@ -2659,7 +2868,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_invalid_content_posts_invalid_request(
         self,
         mock_post,
@@ -2693,7 +2902,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejects_options_without_direct_runtime(
         self,
         mock_post,
@@ -2728,7 +2937,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_stream_false_without_direct_runtime_fails_closed(
         self,
         mock_post,
@@ -2752,9 +2961,9 @@ class TestRelayClient:
             mock_crypto_manager.reset_mock()
             mock_model_manager.llama_cpp_get_response.reset_mock()
             mock_crypto_manager.encrypt_message.return_value = {
-                'chat_history': 'encrypted_chat_history',
-                'cipherkey': 'encrypted_key',
-                'iv': 'encrypted_iv'
+                "chat_history": "encrypted_chat_history",
+                "cipherkey": "encrypted_key",
+                "iv": "encrypted_iv",
             }
             mock_crypto_manager.decrypt_message.return_value = {
                 "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -2782,7 +2991,7 @@ class TestRelayClient:
         ]
         assert "compute_node_options_unsupported" not in observed_error_codes
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejects_streaming_option(
         self,
         mock_post,
@@ -2816,7 +3025,7 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_rejection_skips_runtime_then_valid_succeeds(
         self,
         mock_post,
@@ -2895,7 +3104,7 @@ class TestRelayClient:
         manager.runtime.create_chat_completion.assert_called_once()
         manager.llama_cpp_get_response.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_forwards_supported_generation_options(
         self,
         mock_post,
@@ -2972,7 +3181,7 @@ class TestRelayClient:
             "Options forwarded"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_forwards_supported_options_with_defaults(
         self,
         mock_post,
@@ -3068,7 +3277,7 @@ class TestRelayClient:
             "Tool-aware response"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_api_v1_explicit_false_stream_stays_non_streaming(
         self,
         mock_post,
@@ -3133,7 +3342,7 @@ class TestRelayClient:
             "Non-streaming response"
         )
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_rejects_mismatched_bound_client_key(
         self,
         mock_post,
@@ -3152,7 +3361,7 @@ class TestRelayClient:
         assert result is False
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_accepts_matching_bound_client_key(
         self,
         mock_post,
@@ -3176,7 +3385,7 @@ class TestRelayClient:
         assert result is True
         mock_model_manager.llama_cpp_get_response.assert_called_once_with(chat_history)
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_rejects_bound_payload_missing_chat_history(
         self,
         mock_post,
@@ -3194,7 +3403,7 @@ class TestRelayClient:
         assert result is False
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_rejects_invalid_chat_history_shape(
         self,
         mock_post,
@@ -3212,7 +3421,7 @@ class TestRelayClient:
         assert result is False
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_streaming_posts_to_stream_source(
         self,
         mock_post,
@@ -3223,11 +3432,11 @@ class TestRelayClient:
     ):
         """Streaming relay requests should publish chunks to /stream/source."""
         request_data = TEST_VALID_RESPONSE.copy()
-        request_data['stream'] = True
-        request_data['stream_session_id'] = 'session-123'
+        request_data["stream"] = True
+        request_data["stream_session_id"] = "session-123"
 
         mock_http_response.status_code = 200
-        mock_http_response.text = 'ok'
+        mock_http_response.text = "ok"
         mock_post.return_value = mock_http_response
 
         result = relay_client.process_client_request(request_data)
@@ -3235,11 +3444,11 @@ class TestRelayClient:
         assert result is True
         mock_post.assert_called_once()
         call = mock_post.call_args
-        assert call.args[0] == 'http://localhost:5000/stream/source'
-        assert call.kwargs['json']['session_id'] == 'session-123'
-        assert call.kwargs['json']['final'] is True
+        assert call.args[0] == "http://localhost:5000/stream/source"
+        assert call.kwargs["json"]["session_id"] == "session-123"
+        assert call.kwargs["json"]["final"] is True
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_streaming_uses_registration_token_header(
         self,
         mock_post,
@@ -3249,18 +3458,20 @@ class TestRelayClient:
         """Streaming posts should include the relay registration token when configured."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            "relay.request_timeout": 15,
+            "relay.server_registration_token": "alpha-token",
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
-                base_url='http://localhost',
+                base_url="http://localhost",
                 port=5000,
                 crypto_manager=mock_crypto_manager,
                 model_manager=mock_model_manager,
@@ -3268,19 +3479,21 @@ class TestRelayClient:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.text = 'OK'
+        mock_response.text = "OK"
         mock_post.return_value = mock_response
 
         payload = TEST_VALID_RESPONSE.copy()
-        payload['stream'] = True
-        payload['stream_session_id'] = 'session-123'
+        payload["stream"] = True
+        payload["stream_session_id"] = "session-123"
         result = client.process_client_request(payload)
 
         assert result is True
         mock_post.assert_called_once()
-        assert mock_post.call_args.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+        assert mock_post.call_args.kwargs["headers"] == {
+            "X-Relay-Server-Token": "alpha-token"
+        }
 
-    @patch('utils.networking.relay_client.requests.post')
+    @patch("utils.networking.relay_client.requests.post")
     def test_process_client_request_uses_registration_token(
         self,
         mock_post,
@@ -3290,14 +3503,16 @@ class TestRelayClient:
         """Registration tokens should be propagated to the source endpoint."""
 
         config_values = {
-            'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            "relay.request_timeout": 15,
+            "relay.server_registration_token": "alpha-token",
         }
 
-        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
-            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(
+                key, default
+            )
             mock_get_config.return_value = mock_config
 
             client = RelayClient(
@@ -3317,11 +3532,16 @@ class TestRelayClient:
         assert result is True
         mock_post.assert_called_once()
         call = mock_post.call_args
-        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+        assert call.kwargs["headers"] == {"X-Relay-Server-Token": "alpha-token"}
 
-    @patch('utils.networking.relay_client._validate_with_fallback', side_effect=ValueError("bad"))
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_invalid_payload(self, mock_post, mock_validate, relay_client):
+    @patch(
+        "utils.networking.relay_client._validate_with_fallback",
+        side_effect=ValueError("bad"),
+    )
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_invalid_payload(
+        self, mock_post, mock_validate, relay_client
+    ):
         """Handle schema validation error for outgoing payload."""
         request_data = TEST_VALID_RESPONSE.copy()
         result = relay_client.process_client_request(request_data)
@@ -3329,8 +3549,15 @@ class TestRelayClient:
         mock_validate.assert_called()
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_source_error(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager, mock_http_response):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_source_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        mock_http_response,
+    ):
         """Test processing a client request with error from /source endpoint."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -3346,8 +3573,15 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_empty_response(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager, mock_http_response):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_empty_response(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        mock_http_response,
+    ):
         """Test processing a client request with empty response from /source."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -3363,8 +3597,10 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_connection_error(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_connection_error(
+        self, mock_post, relay_client, mock_crypto_manager, mock_model_manager
+    ):
         """Test processing a client request with connection error."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -3378,8 +3614,10 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
-    @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_exception(self, mock_post, relay_client, mock_crypto_manager):
+    @patch("utils.networking.relay_client.requests.post")
+    def test_process_client_request_exception(
+        self, mock_post, relay_client, mock_crypto_manager
+    ):
         """Test processing a client request with an exception."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
@@ -3397,12 +3635,12 @@ class TestRelayClient:
         mock_post.assert_not_called()
 
     @pytest.mark.parametrize(
-        'bad_wait_seconds',
-        ['missing', None, 'soon', True, -1, math.nan, math.inf],
+        "bad_wait_seconds",
+        ["missing", None, "soon", True, -1, math.nan, math.inf],
     )
-    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
-    @patch('utils.networking.relay_client.RelayClient.process_client_request')
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch("utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work")
+    @patch("utils.networking.relay_client.RelayClient.process_client_request")
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_api_v1_encrypted_work_continuously_coerces_invalid_wait_and_keeps_polling(
         self,
         mock_sleep,
@@ -3412,13 +3650,14 @@ class TestRelayClient:
         bad_wait_seconds,
     ):
         """Malformed API v1 relay wait values should not stop future polling."""
-        invalid_response = {'protocol': 'tokenplace_api_v1_relay_e2ee'}
-        if bad_wait_seconds != 'missing':
-            invalid_response['next_ping_in_x_seconds'] = bad_wait_seconds
+        invalid_response = {"protocol": "tokenplace_api_v1_relay_e2ee"}
+        if bad_wait_seconds != "missing":
+            invalid_response["next_ping_in_x_seconds"] = bad_wait_seconds
         next_response = {
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'next_ping_in_x_seconds': 0.25,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "next_ping_in_x_seconds": 0.25,
         }
+
         def poll_then_stop():
             if mock_poll.call_count == 1:
                 return invalid_response
@@ -3440,9 +3679,9 @@ class TestRelayClient:
         ]
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
-    @patch('utils.networking.relay_client.RelayClient.process_client_request')
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch("utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work")
+    @patch("utils.networking.relay_client.RelayClient.process_client_request")
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_api_v1_encrypted_work_continuously_survives_poll_exception(
         self,
         mock_sleep,
@@ -3452,10 +3691,10 @@ class TestRelayClient:
     ):
         """Unexpected API v1 poll errors should sleep and keep the daemon alive."""
         next_response = {
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'next_ping_in_x_seconds': 0.5,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "next_ping_in_x_seconds": 0.5,
         }
-        mock_poll.side_effect = [RuntimeError('temporary relay failure'), next_response]
+        mock_poll.side_effect = [RuntimeError("temporary relay failure"), next_response]
 
         def stop_after_second_sleep(seconds):
             if mock_sleep.call_count >= 2:
@@ -3475,9 +3714,14 @@ class TestRelayClient:
         ]
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
-    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work', return_value=False)
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch(
+        "utils.networking.relay_client._max_poll_failures_before_stop", return_value=2
+    )
+    @patch(
+        "utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work",
+        return_value=False,
+    )
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_api_v1_encrypted_work_continuously_stops_after_invalid_responses(
         self,
         mock_sleep,
@@ -3493,10 +3737,12 @@ class TestRelayClient:
         mock_sleep.assert_called_with(relay_client._request_timeout)
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
-    @patch('utils.networking.relay_client.RelayClient.process_client_request')
-    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch(
+        "utils.networking.relay_client._max_poll_failures_before_stop", return_value=2
+    )
+    @patch("utils.networking.relay_client.RelayClient.process_client_request")
+    @patch("utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work")
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_api_v1_encrypted_work_continuously_stops_after_repeated_error_responses(
         self,
         mock_sleep,
@@ -3519,10 +3765,12 @@ class TestRelayClient:
         mock_sleep.assert_called_with(0.0)
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.RelayClient.process_client_request')
-    @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.RelayClient.process_client_request")
+    @patch("utils.networking.relay_client.time.sleep")
+    def test_poll_relay_continuously_with_client_request(
+        self, mock_sleep, mock_process, mock_ping, relay_client
+    ):
         """Test the continuous polling with a client request."""
         # Setup to return a client request on first call
         mock_ping.side_effect = [TEST_VALID_RESPONSE]
@@ -3548,10 +3796,12 @@ class TestRelayClient:
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.RelayClient.process_client_request')
-    @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.RelayClient.process_client_request")
+    @patch("utils.networking.relay_client.time.sleep")
+    def test_poll_relay_continuously_no_client_request(
+        self, mock_sleep, mock_process, mock_ping, relay_client
+    ):
         """Test the continuous polling without a client request."""
         # Setup mock ping to return response without client request
         mock_ping.side_effect = [TEST_NO_REQUEST_RESPONSE]
@@ -3577,9 +3827,11 @@ class TestRelayClient:
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_error(self, mock_sleep, mock_ping, relay_client):
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.time.sleep")
+    def test_poll_relay_continuously_with_error(
+        self, mock_sleep, mock_ping, relay_client
+    ):
         """Test the continuous polling with an error in the response."""
         # Setup mock ping to return an error response
         mock_ping.side_effect = [TEST_ERROR_RESPONSE]
@@ -3604,12 +3856,16 @@ class TestRelayClient:
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_invalid_response(self, mock_sleep, mock_ping, relay_client):
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.time.sleep")
+    def test_poll_relay_continuously_with_invalid_response(
+        self, mock_sleep, mock_ping, relay_client
+    ):
         """Test polling with an invalid response (missing required fields)."""
         # Setup mock ping to return an invalid response
-        mock_ping.side_effect = [{'invalid': 'response'}]  # Missing next_ping_in_x_seconds
+        mock_ping.side_effect = [
+            {"invalid": "response"}
+        ]  # Missing next_ping_in_x_seconds
 
         # Start polling
         relay_client.start()
@@ -3626,13 +3882,15 @@ class TestRelayClient:
 
         # Verify mock calls
         assert mock_ping.call_count == 1
-        mock_sleep.assert_called_once_with(relay_client._request_timeout)  # Direct check of sleep call
+        mock_sleep.assert_called_once_with(
+            relay_client._request_timeout
+        )  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_relay_continuously_stops_after_repeated_error_response(
         self,
         mock_sleep,
@@ -3652,8 +3910,8 @@ class TestRelayClient:
         mock_sleep.assert_called_with(10)
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
-    @patch('utils.networking.relay_client.time.sleep')
+    @patch("utils.networking.relay_client.RelayClient.ping_relay")
+    @patch("utils.networking.relay_client.time.sleep")
     def test_poll_relay_continuously_stops_after_repeated_invalid_response(
         self,
         mock_sleep,
@@ -3663,7 +3921,7 @@ class TestRelayClient:
     ):
         """Invalid sink payloads should respect the consecutive failure cap."""
         monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "2")
-        mock_ping.side_effect = [{'invalid': 'response'}, {'invalid': 'response'}]
+        mock_ping.side_effect = [{"invalid": "response"}, {"invalid": "response"}]
 
         relay_client.start()
         relay_client.poll_relay_continuously()
@@ -3675,20 +3933,28 @@ class TestRelayClient:
 
 
 def test_poll_api_v1_encrypted_work_continuously_sleeps_no_work_hint(monkeypatch):
-    client = RelayClient('http://localhost', 5000, MagicMock(public_key_b64='k'), MagicMock())
+    client = RelayClient(
+        "http://localhost", 5000, MagicMock(public_key_b64="k"), MagicMock()
+    )
     client.stop_polling = False
-    calls = {'n': 0}
+    calls = {"n": 0}
 
     def fake_poll():
-        calls['n'] += 1
-        if calls['n'] == 1:
-            return {'message': 'No requests available', 'next_ping_in_x_seconds': 0.25, 'poll_wait_seconds': 10}
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "message": "No requests available",
+                "next_ping_in_x_seconds": 0.25,
+                "poll_wait_seconds": 10,
+            }
         client.stop_polling = True
-        return {'error': 'stop', 'next_ping_in_x_seconds': 0}
+        return {"error": "stop", "next_ping_in_x_seconds": 0}
 
     sleeps = []
-    monkeypatch.setattr(client, 'poll_api_v1_encrypted_work', fake_poll)
-    monkeypatch.setattr(relay_client_module.time, 'sleep', lambda secs: sleeps.append(secs))
+    monkeypatch.setattr(client, "poll_api_v1_encrypted_work", fake_poll)
+    monkeypatch.setattr(
+        relay_client_module.time, "sleep", lambda secs: sleeps.append(secs)
+    )
 
     client.poll_api_v1_encrypted_work_continuously()
     assert 0.25 in sleeps
@@ -3696,20 +3962,22 @@ def test_poll_api_v1_encrypted_work_continuously_sleeps_no_work_hint(monkeypatch
 
 def _standalone_relay_client():
     crypto = MagicMock()
-    crypto.public_key_b64 = 'mock_public_key_b64'
+    crypto.public_key_b64 = "mock_public_key_b64"
     model = MagicMock()
     config = MagicMock()
     config.is_production = False
-    config.get.side_effect = lambda key, default=None: {'relay.request_timeout': 15}.get(key, default)
-    with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
-        return RelayClient('http://localhost', 5000, crypto, model)
+    config.get.side_effect = lambda key, default=None: {
+        "relay.request_timeout": 15
+    }.get(key, default)
+    with patch("utils.networking.relay_client.get_config_lazy", return_value=config):
+        return RelayClient("http://localhost", 5000, crypto, model)
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_unregister_from_relay_falls_back_to_legacy_unregister_on_404(mock_post):
     client = _standalone_relay_client()
-    client._api_v1_registered_relays.add('http://localhost:5000')
-    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
     api_v1_missing = MagicMock(status_code=404)
     legacy_success = MagicMock(status_code=200)
     mock_post.side_effect = [api_v1_missing, legacy_success]
@@ -3718,16 +3986,18 @@ def test_unregister_from_relay_falls_back_to_legacy_unregister_on_404(mock_post)
 
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
-        'http://localhost:5000/api/v1/relay/servers/unregister',
-        'http://localhost:5000/unregister',
+        "http://localhost:5000/api/v1/relay/servers/unregister",
+        "http://localhost:5000/unregister",
     ]
     assert client._api_v1_registered_relays == set()
 
 
-@patch('utils.networking.relay_client.requests.post')
-def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregister(mock_post):
+@patch("utils.networking.relay_client.requests.post")
+def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregister(
+    mock_post,
+):
     client = _standalone_relay_client()
-    prefixed_url = 'http://localhost:5000/api/v1'
+    prefixed_url = "http://localhost:5000/api/v1"
     client._relay_urls = [prefixed_url]
     client._api_v1_registered_relays.add(prefixed_url)
     client._api_v1_last_heartbeat_at[prefixed_url] = 123.0
@@ -3739,25 +4009,27 @@ def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregist
 
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
-        'http://localhost:5000/api/v1/relay/servers/unregister',
-        'http://localhost:5000/unregister',
+        "http://localhost:5000/api/v1/relay/servers/unregister",
+        "http://localhost:5000/unregister",
     ]
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock_post):
     client = _standalone_relay_client()
-    client._api_v1_registered_relays.add('http://localhost:5000')
-    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
-    client._api_v1_relay_wait_hints = {'http://localhost:5000': {'next_ping_in_x_seconds': 30}}
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
+    client._api_v1_relay_wait_hints = {
+        "http://localhost:5000": {"next_ping_in_x_seconds": 30}
+    }
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        "http://localhost:5000/api/v1/relay/servers/unregister",
+        json={"server_public_key": "mock_public_key_b64"},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
@@ -3765,76 +4037,81 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     assert client._api_v1_relay_wait_hints == {}
 
 
-@patch('utils.networking.relay_client.requests.post')
-def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(mock_post):
+@patch("utils.networking.relay_client.requests.post")
+def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(
+    mock_post,
+):
     client = _standalone_relay_client()
     client._unregister_attempted = True
     client._unregister_complete = True
-    client._api_v1_registered_relays.add('http://localhost:5000')
-    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        "http://localhost:5000/api/v1/relay/servers/unregister",
+        json={"server_public_key": "mock_public_key_b64"},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_unregister_from_relay_logs_control_plane_429_diagnostic(mock_post, caplog):
     client = _standalone_relay_client()
-    client._registration_token = 'super-secret-token'
-    client._api_v1_registered_relays.add('http://localhost:5000')
-    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._registration_token = "super-secret-token"
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
 
     response = MagicMock(status_code=429)
     response.headers = {
-        'content-type': 'application/json',
-        'retry-after': '41',
+        "content-type": "application/json",
+        "retry-after": "41",
     }
     response.json.return_value = {
-        'error': {
-            'code': 'rate_limit_exceeded',
-            'message': 'Rate limit exceeded. Try again in 41 seconds.',
-            'type': 'rate_limit_error',
+        "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit exceeded. Try again in 41 seconds.",
+            "type": "rate_limit_error",
         }
     }
     mock_post.return_value = response
 
-    with caplog.at_level('ERROR', logger='relay_client'):
+    with caplog.at_level("ERROR", logger="relay_client"):
         result = client.unregister_from_relay()
 
     assert result is False
     assert client._unregister_complete is False
-    assert 'relay_control_plane_rate_limited' in caplog.text
-    assert 'path=/api/v1/relay/servers/unregister' in caplog.text
-    assert 'retry_after=41' in caplog.text
-    assert 'super-secret-token' not in caplog.text
+    assert "relay_control_plane_rate_limited" in caplog.text
+    assert "path=/api/v1/relay/servers/unregister" in caplog.text
+    assert "retry_after=41" in caplog.text
+    assert "super-secret-token" not in caplog.text
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_start_after_unregister_clears_stale_registration_and_polls_cleanly(mock_post):
     client = _standalone_relay_client()
-    client._api_v1_registered_relays.add('http://localhost:5000')
-    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
     client._api_v1_relay_wait_hints = {
-        'http://localhost:5000': {
-            'next_ping_in_x_seconds': 30,
-            'poll_wait_seconds': 10,
-            'server_public_key': 'mock_public_key_b64',
+        "http://localhost:5000": {
+            "next_ping_in_x_seconds": 30,
+            "poll_wait_seconds": 10,
+            "server_public_key": "mock_public_key_b64",
         }
     }
     client.stop()
     client._unregister_complete = True
 
     register_ok = MagicMock(status_code=200)
-    register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    register_ok.json.return_value = {
+        "next_ping_in_x_seconds": 12,
+        "poll_wait_seconds": 0,
+    }
     poll_ok = MagicMock(status_code=200)
-    poll_ok.json.return_value = {'message': 'No requests available'}
+    poll_ok.json.return_value = {"message": "No requests available"}
     mock_post.side_effect = [register_ok, poll_ok]
 
     client.start()
@@ -3842,14 +4119,14 @@ def test_start_after_unregister_clears_stale_registration_and_polls_cleanly(mock
 
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
-        'http://localhost:5000/api/v1/relay/servers/register',
-        'http://localhost:5000/api/v1/relay/servers/poll',
+        "http://localhost:5000/api/v1/relay/servers/register",
+        "http://localhost:5000/api/v1/relay/servers/poll",
     ]
-    assert result['next_ping_in_x_seconds'] == 12
-    assert client.api_v1_registration_fresh('http://localhost:5000') is True
+    assert result["next_ping_in_x_seconds"] == 12
+    assert client.api_v1_registration_fresh("http://localhost:5000") is True
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_poll_api_v1_encrypted_work_stop_prevents_register_and_poll(mock_post):
     client = _standalone_relay_client()
     client.stop()
@@ -3857,14 +4134,14 @@ def test_poll_api_v1_encrypted_work_stop_prevents_register_and_poll(mock_post):
     result = client.poll_api_v1_encrypted_work()
 
     assert result == {
-        'error': 'Relay polling stopped',
-        'next_ping_in_x_seconds': 0,
-        'poll_wait_seconds': 0,
+        "error": "Relay polling stopped",
+        "next_ping_in_x_seconds": 0,
+        "poll_wait_seconds": 0,
     }
     mock_post.assert_not_called()
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_post):
     client = _standalone_relay_client()
     client.start()
@@ -3872,37 +4149,42 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     client._unregister_complete = True
 
     register_response = MagicMock(status_code=200)
-    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    register_response.json.return_value = {
+        "next_ping_in_x_seconds": 12,
+        "poll_wait_seconds": 0,
+    }
     unregister_response = MagicMock(status_code=200)
 
     def fake_post(url, *args, **kwargs):
-        if url.endswith('/relay/servers/register'):
+        if url.endswith("/relay/servers/register"):
             client.stop()
             return register_response
-        if url.endswith('/api/v1/relay/servers/unregister'):
+        if url.endswith("/api/v1/relay/servers/unregister"):
             return unregister_response
-        raise AssertionError(f'Unexpected relay request: {url}')
+        raise AssertionError(f"Unexpected relay request: {url}")
 
     mock_post.side_effect = fake_post
 
     result = client.poll_api_v1_encrypted_work()
 
     assert result == {
-        'error': 'Relay polling stopped',
-        'next_ping_in_x_seconds': 0,
-        'poll_wait_seconds': 0,
+        "error": "Relay polling stopped",
+        "next_ping_in_x_seconds": 0,
+        "poll_wait_seconds": 0,
     }
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
-        'http://localhost:5000/api/v1/relay/servers/register',
-        'http://localhost:5000/api/v1/relay/servers/unregister',
+        "http://localhost:5000/api/v1/relay/servers/register",
+        "http://localhost:5000/api/v1/relay/servers/unregister",
     ]
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}
     assert client._unregister_complete is True
 
 
-def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(monkeypatch):
+def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(
+    monkeypatch,
+):
     client = _standalone_relay_client()
     client.stop()
     client._unregister_attempted = True
@@ -3911,10 +4193,10 @@ def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(mo
     def fake_poll():
         observed_stop_flags.append(client._polling_stopped_by_request)
         client.stop()
-        return {'message': 'No requests available', 'next_ping_in_x_seconds': 0}
+        return {"message": "No requests available", "next_ping_in_x_seconds": 0}
 
-    monkeypatch.setattr(client, 'poll_api_v1_encrypted_work', fake_poll)
-    monkeypatch.setattr(relay_client_module.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(client, "poll_api_v1_encrypted_work", fake_poll)
+    monkeypatch.setattr(relay_client_module.time, "sleep", lambda _seconds: None)
 
     client.poll_api_v1_encrypted_work_continuously()
 
@@ -3924,36 +4206,39 @@ def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(mo
     assert client._unregister_attempted is False
 
 
-@patch('utils.networking.relay_client.requests.post')
+@patch("utils.networking.relay_client.requests.post")
 def test_start_after_stop_allows_api_v1_registration_again(mock_post):
     client = _standalone_relay_client()
     client.stop()
     client.start()
     register_ok = MagicMock(status_code=200)
-    register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    register_ok.json.return_value = {
+        "next_ping_in_x_seconds": 12,
+        "poll_wait_seconds": 0,
+    }
     poll_ok = MagicMock(status_code=200)
-    poll_ok.json.return_value = {'message': 'No requests available'}
+    poll_ok.json.return_value = {"message": "No requests available"}
     mock_post.side_effect = [register_ok, poll_ok]
 
     result = client.poll_api_v1_encrypted_work()
 
-    assert result['next_ping_in_x_seconds'] == 12
+    assert result["next_ping_in_x_seconds"] == 12
     assert mock_post.call_count == 2
 
 
 def _api_v1_validation_client(model_manager=None):
     crypto = MagicMock()
     crypto.public_key_b64 = TEST_VALID_RESPONSE["client_public_key"]
-    with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+    with patch("utils.networking.relay_client.get_config_lazy") as mock_get_config:
         mock_config = MagicMock()
         mock_config.is_production = False
         mock_config.get.side_effect = lambda key, default: {
-            'relay.request_timeout': 15,
-            'relay.cluster_only': True,
+            "relay.request_timeout": 15,
+            "relay.cluster_only": True,
         }.get(key, default)
         mock_get_config.return_value = mock_config
         return RelayClient(
-            base_url='http://localhost',
+            base_url="http://localhost",
             port=5000,
             crypto_manager=crypto,
             model_manager=model_manager or MagicMock(),
@@ -4040,7 +4325,10 @@ def test_api_v1_supported_option_boundaries_are_normalized(options, expected):
         ({"tools": []}, "compute_node_options_unsupported"),
         ({"tool_choice": "none"}, "compute_node_options_unsupported"),
         ({"tool_choice": "auto"}, "compute_node_options_unsupported"),
-        ({"response_format": {"type": "json_object"}}, "compute_node_options_unsupported"),
+        (
+            {"response_format": {"type": "json_object"}},
+            "compute_node_options_unsupported",
+        ),
         ({"logprobs": True}, "compute_node_options_unsupported"),
         ({"unknown_option": "value"}, "compute_node_options_unsupported"),
         ({1: "value"}, "compute_node_invalid_request"),
@@ -4078,13 +4366,21 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],
-        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
+        [
+            {
+                "role": "user",
+                "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1),
+            }
+        ],
         [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
         [{"role": "user", "content": [{"type": "text", "text": ""}]}],
         [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
         [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
         [
-            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
+            {
+                "role": "user",
+                "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS,
+            }
         ]
         * 5,
     ],
@@ -4143,6 +4439,212 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
         options={},
     )
 
-    assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
+    assert (
+        rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
+    )
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+
+class _TokenCountingRuntime:
+    def __init__(self):
+        self.calls = []
+        self.rendered = []
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        assert tokenize is False
+        rendered = "".join(
+            f"<|start_header_id|>{message['role']}<|end_header_id|>\n\n{message['content']}<|eot_id|>"
+            for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        self.rendered.append(rendered)
+        return rendered
+
+    def tokenize(self, prompt_bytes, add_bos=False, special=True):
+        assert add_bos is False
+        assert special is True
+        assert isinstance(prompt_bytes, bytes)
+        return list(prompt_bytes)
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class _TokenCountingManager(_ApiV1RuntimeManager):
+    def __init__(self, tier="8k-fast", context_tokens=8192, default_output=512):
+        self.runtime = _TokenCountingRuntime()
+        self.use_mock_llm = True
+        self.context_tier = tier
+        self.context_window_tokens = context_tokens
+        self.default_output_reservation_tokens = default_output
+        self.worker_restart_count = 0
+
+
+def _admission_envelope(manager, content_len, *, max_tokens=None, tier="8k-fast"):
+    client = _api_v1_validation_client(manager)
+    options = {} if max_tokens is None else {"max_tokens": max_tokens}
+    return client._generate_api_v1_response_with_runtime_model(
+        request_id="req-admission",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "x" * content_len}],
+        options=options,
+        requested_context_tier=tier,
+    )
+
+
+def test_api_v1_context_admission_exact_8k_below_and_above_with_template_overhead():
+    manager = _TokenCountingManager(context_tokens=8192)
+    overhead = len(
+        manager.runtime.apply_chat_template(
+            [{"role": "user", "content": ""}],
+            tokenize=False,
+            add_generation_prompt=True,
+        ).encode()
+    )
+
+    accepted = _admission_envelope(manager, 8192 - overhead - 512, max_tokens=512)
+    rejected = _admission_envelope(manager, 8192 - overhead - 511, max_tokens=512)
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 7681
+    assert error["requested_output_tokens"] == 512
+    assert error["required_total_tokens"] == 8193
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+    assert len(manager.runtime.calls) == 1
+
+
+def test_api_v1_context_admission_exact_64k_below_and_above_default_budget_unicode_structured_text(
+    monkeypatch,
+):
+    monkeypatch.setattr(RelayClient, "_API_V1_MAX_MESSAGE_CONTENT_CHARS", 70000)
+    monkeypatch.setattr(RelayClient, "_API_V1_MAX_TOTAL_REQUEST_CHARS", 70000)
+    manager = _TokenCountingManager(
+        tier="64k-full", context_tokens=65536, default_output=1024
+    )
+    client = _api_v1_validation_client(manager)
+    messages = [{"role": "user", "content": ""}]
+    overhead = len(
+        manager.runtime.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        ).encode()
+    )
+    unicode_prefix = 'こんにちは {"nested": [1, 2, 3]}\n'
+    prefix_tokens = len(unicode_prefix.encode())
+    accepted_len = 65536 - overhead - prefix_tokens - 1024
+
+    accepted = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-64k-ok",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": unicode_prefix + ("x" * accepted_len)}],
+        options={},
+        requested_context_tier="64k-full",
+    )
+    rejected = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-64k-bad",
+        model_id="llama-3-8b-instruct",
+        messages=[
+            {"role": "user", "content": unicode_prefix + ("x" * (accepted_len + 1))}
+        ],
+        options={},
+        requested_context_tier="64k-full",
+    )
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["configured_context_tokens"] == 65536
+    assert error["requested_output_tokens"] == 1024
+    assert error["required_total_tokens"] == 65537
+    assert error["retryable"] is False
+
+
+def test_api_v1_8k_request_is_accepted_on_64k_runtime():
+    manager = _TokenCountingManager(tier="64k-full", context_tokens=65536)
+    envelope = _admission_envelope(manager, 100, max_tokens=128, tier="8k-fast")
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert len(manager.runtime.calls) == 1
+
+
+def test_api_v1_64k_request_on_8k_runtime_returns_window_error_without_restart():
+    manager = _TokenCountingManager(tier="8k-fast", context_tokens=8192)
+    before_restart_count = manager.worker_restart_count
+    envelope = _admission_envelope(manager, 100, max_tokens=128, tier="64k-full")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+    assert manager.worker_restart_count == before_restart_count
+    assert len(manager.runtime.calls) == 0
+
+
+def test_api_v1_heartbeat_worker_renews_registered_lease_during_blocked_inference(
+    monkeypatch,
+):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    renewals = []
+
+    def fake_register(relay_url=None):
+        renewals.append(relay_url)
+        return {"next_ping_in_x_seconds": 0.2, "poll_wait_seconds": 0}
+
+    monkeypatch.setattr(client, "register_api_v1_compute_node", fake_register)
+
+    client.start()
+    client._api_v1_registered_relays.add(client.relay_url)
+    client._api_v1_relay_wait_hints = {
+        client.relay_url: {
+            "next_ping_in_x_seconds": 0.2,
+            "poll_wait_seconds": 0,
+            "server_public_key": client.crypto_manager.public_key_b64,
+        }
+    }
+    client._api_v1_last_heartbeat_at[client.relay_url] = time.monotonic() - 1.0
+    try:
+        deadline = time.monotonic() + 2.0
+        while not renewals and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        client.stop()
+
+    assert renewals
+    assert client._api_v1_last_heartbeat_at[client.relay_url] > time.monotonic() - 1.0
+
+
+def test_api_v1_stop_terminates_heartbeat_cleanly_and_prevents_late_renewal(
+    monkeypatch,
+):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    client._api_v1_registered_relays.add(client.relay_url)
+    client._api_v1_relay_wait_hints = {
+        client.relay_url: {
+            "next_ping_in_x_seconds": 0.2,
+            "poll_wait_seconds": 0,
+            "server_public_key": client.crypto_manager.public_key_b64,
+        }
+    }
+    client._api_v1_last_heartbeat_at[client.relay_url] = time.monotonic() - 1.0
+    renewals = []
+
+    def fake_register(relay_url=None):
+        renewals.append(relay_url)
+        return {"next_ping_in_x_seconds": 0.2, "poll_wait_seconds": 0}
+
+    monkeypatch.setattr(client, "register_api_v1_compute_node", fake_register)
+    client.start()
+    client.stop()
+    count_after_stop = len(renewals)
+    time.sleep(0.35)
+
+    thread = client._api_v1_heartbeat_thread
+    assert thread is None or not thread.is_alive()
+    assert len(renewals) == count_after_stop

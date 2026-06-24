@@ -694,11 +694,18 @@ class RelayClient:
         if stop_event is None:
             return
         stop_event.set()
-        thread = getattr(self, "_api_v1_heartbeat_thread", None)
+        lock = getattr(self, "_api_v1_heartbeat_lock", None)
+        if lock is None:
+            return
+        with lock:
+            thread = getattr(self, "_api_v1_heartbeat_thread", None)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
-        if thread is not None and not thread.is_alive():
-            self._api_v1_heartbeat_thread = None
+        with lock:
+            if getattr(self, "_api_v1_heartbeat_thread", None) is thread and (
+                thread is None or not thread.is_alive()
+            ):
+                self._api_v1_heartbeat_thread = None
 
     def _api_v1_heartbeat_worker(self) -> None:
         """Refresh relay leases independently from polling/inference work."""
@@ -706,7 +713,10 @@ class RelayClient:
         while not self._api_v1_heartbeat_stop.wait(0.25):
             if getattr(self, "_polling_stopped_by_request", False):
                 break
-            relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+            relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", None)
+            if not isinstance(relay_wait_hints, dict):
+                relay_wait_hints = {}
+                self._api_v1_relay_wait_hints = relay_wait_hints
             for candidate_url in list(getattr(self, "_api_v1_registered_relays", set())):
                 if self._api_v1_heartbeat_stop.is_set():
                     break
@@ -2313,9 +2323,12 @@ class RelayClient:
             tokens = tokenize(rendered_prompt.encode("utf-8"), add_bos=False)
         except TypeError:
             try:
-                tokens = tokenize(rendered_prompt.encode("utf-8"))
+                tokens = tokenize(rendered_prompt.encode("utf-8"), False)
             except TypeError:
-                tokens = tokenize(rendered_prompt)
+                try:
+                    tokens = tokenize(rendered_prompt.encode("utf-8"))
+                except TypeError:
+                    tokens = tokenize(rendered_prompt)
         if isinstance(tokens, (list, tuple)):
             return len(tokens)
         return None
@@ -2344,6 +2357,23 @@ class RelayClient:
                 if isinstance(rendered, str):
                     return rendered
         return None
+
+    def _api_v1_context_tier_unsupported_error(
+        self,
+        *,
+        active_context_tier: str,
+        configured_context_tokens: int,
+        requested_context_tier: str,
+    ) -> Dict[str, Any]:
+        return {
+            "code": "compute_node_context_tier_unsupported",
+            "type": "validation_error",
+            "message": "Requested context tier is not active on this compute node",
+            "active_context_tier": active_context_tier,
+            "requested_context_tier": requested_context_tier,
+            "configured_context_tokens": configured_context_tokens,
+            "retryable": False,
+        }
 
     def _api_v1_context_admission_error(
         self,
@@ -2411,6 +2441,11 @@ class RelayClient:
             else None
         )
         if prompt_tokens is None:
+            log_info(
+                "api_v1.context_admission_skipped active_tier={} reason={} safe_error_code=none",
+                active_context_tier,
+                "runtime_tokenizer_unavailable",
+            )
             return True, None, None
         required_total = prompt_tokens + requested_output_tokens
         admitted = required_total <= configured_context_tokens
@@ -2518,7 +2553,7 @@ class RelayClient:
             active_profile = get_context_profile(active_context_tier)
             return self._api_v1_response_envelope(
                 request_id,
-                error=self._api_v1_context_admission_error(
+                error=self._api_v1_context_tier_unsupported_error(
                     active_context_tier=active_context_tier,
                     configured_context_tokens=int(
                         getattr(
@@ -2528,8 +2563,6 @@ class RelayClient:
                         )
                         or active_profile.total_context_tokens
                     ),
-                    prompt_tokens=0,
-                    requested_output_tokens=0,
                     requested_context_tier=requested_context_tier,
                 ),
             )

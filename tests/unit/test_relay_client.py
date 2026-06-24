@@ -2495,9 +2495,11 @@ class TestRelayClient:
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         error = encrypted_envelope["api_v1_response"]["error"]
-        assert error["code"] == "compute_node_context_window_exceeded"
+        assert error["code"] == "compute_node_context_tier_unsupported"
         assert error["active_context_tier"] == "8k-fast"
-        assert error["recommended_context_tier"] == "64k-full"
+        assert error["requested_context_tier"] == "64k-full"
+        assert "prompt_tokens" not in error
+        assert "recommended_context_tier" not in error
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_strips_routing_context_tier(
@@ -4303,7 +4305,10 @@ def test_api_v1_heartbeat_worker_refreshes_during_blocked_inference():
 
     relay_client.register_api_v1_compute_node = register
     relay_client._api_v1_start_heartbeat_worker()
-    time.sleep(0.4)
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    relay_client.stop()
 
     assert calls == [relay_client.relay_url]
     assert relay_client._api_v1_heartbeat_thread is None

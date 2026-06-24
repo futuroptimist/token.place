@@ -2,8 +2,8 @@ use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
-    append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
-    OperatorLogSink,
+    append_line_to_path, read_log_tail, sanitize_operator_diagnostic_line,
+    sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
@@ -511,12 +511,17 @@ fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
 fn bridge_exit_error(
     exit_status: std::process::ExitStatus,
     saw_startup_event: bool,
+    diagnostic_tail: Option<&str>,
 ) -> Option<String> {
     let status_label = bridge_exit_status_label(exit_status);
+    let diagnostic_suffix = diagnostic_tail
+        .and_then(last_compute_node_stderr_diagnostic)
+        .map(|line| format!("; recent diagnostic: {line}"))
+        .unwrap_or_default();
     if !saw_startup_event {
         return Some(format!(
             "compute-node bridge exited with status {status_label} before emitting a startup \
-             event; see desktop.compute_node.stderr logs"
+             event; see desktop.compute_node.stderr logs{diagnostic_suffix}"
         ));
     }
     if exit_status.success() {
@@ -524,8 +529,22 @@ fn bridge_exit_error(
     }
     Some(format!(
         "compute-node bridge exited with status {status_label}; \
-         see desktop.compute_node.stderr logs"
+         see desktop.compute_node.stderr logs{diagnostic_suffix}"
     ))
+}
+
+fn last_compute_node_stderr_diagnostic(tail: &str) -> Option<String> {
+    tail.lines()
+        .rev()
+        .find(|line| line.contains("desktop.compute_node.stderr"))
+        .map(|line| sanitize_operator_diagnostic_line(line).trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+fn recent_operator_log_tail(log_file_path: Option<&str>) -> Option<String> {
+    log_file_path
+        .and_then(|path| read_log_tail(Path::new(path), 4096).ok())
+        .filter(|tail| !tail.trim().is_empty())
 }
 
 fn finalize_bridge_exit(
@@ -552,7 +571,8 @@ fn finalize_bridge_exit(
         status.relay_runtime_state = Some("stopped".into());
     }
 
-    let exit_error = bridge_exit_error(exit_status, saw_startup_event);
+    let recent_tail = recent_operator_log_tail(status.log_file_path.as_deref());
+    let exit_error = bridge_exit_error(exit_status, saw_startup_event, recent_tail.as_deref());
     if status.last_error.is_none() {
         status.last_error = exit_error.clone();
     }
@@ -2055,7 +2075,7 @@ mod tests {
         let exit_status = success_exit_status();
         assert!(exit_status.success());
 
-        let last_error = bridge_exit_error(exit_status, false);
+        let last_error = bridge_exit_error(exit_status, false, None);
         assert!(last_error.is_some());
         assert!(last_error
             .as_deref()
@@ -2067,7 +2087,21 @@ mod tests {
         let exit_status = success_exit_status();
         assert!(exit_status.success());
 
-        assert!(bridge_exit_error(exit_status, true).is_none());
+        assert!(bridge_exit_error(exit_status, true, None).is_none());
+    }
+
+    #[test]
+    fn bridge_exit_error_includes_recent_stderr_diagnostic_tail() {
+        let exit_status = success_exit_status();
+        let tail = "desktop.compute_node.stderr first line\nother source ignored\ndesktop.compute_node.stderr ModuleNotFoundError: No module named 'utils.context_profiles'\n";
+
+        let last_error = bridge_exit_error(exit_status, false, Some(tail))
+            .expect("missing startup event should be an error");
+
+        assert!(last_error.contains("before emitting a startup event"));
+        assert!(last_error.contains("recent diagnostic:"));
+        assert!(last_error.contains("desktop.compute_node.stderr ModuleNotFoundError"));
+        assert!(last_error.contains("utils.context_profiles"));
     }
 
     #[test]

@@ -27,7 +27,33 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
-from utils.context_profiles import apply_context_profile, get_context_profile
+
+_CONTEXT_PROFILES_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from utils.context_profiles import (
+        apply_context_profile,
+        get_context_profile,
+        normalize_context_tier,
+    )
+except Exception as exc:  # pragma: no cover - exercised via subprocess startup tests
+    _CONTEXT_PROFILES_IMPORT_ERROR = exc
+
+    class _MissingContextProfile:
+        profile_id = "8k-fast"
+        total_context_tokens = 8192
+
+    def normalize_context_tier(_profile_id: Optional[str]) -> str:
+        return "8k-fast"
+
+    def get_context_profile(_profile_id: Optional[str]) -> _MissingContextProfile:
+        if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+            raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+        return _MissingContextProfile()
+
+    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> _MissingContextProfile:
+        if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+            raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+        return _MissingContextProfile()
 
 try:
     from desktop_runtime_setup import (
@@ -520,6 +546,13 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
+def _startup_context_tier(args: argparse.Namespace) -> str:
+    raw_context_tier = getattr(args, "context_tier", "8k-fast")
+    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+        return raw_context_tier if isinstance(raw_context_tier, str) and raw_context_tier else "8k-fast"
+    return normalize_context_tier(raw_context_tier)
+
+
 def _structured_startup_error_payload(
     args: argparse.Namespace,
     message: str,
@@ -543,7 +576,11 @@ def _structured_startup_error_payload(
         "backend_selected": "pending",
         "backend_used": "pending",
         "fallback_reason": None,
-        "model_path": getattr(args, "model", ""),
+        "error_code": getattr(args, "startup_error_code", "desktop_compute_node_startup_failed"),
+        "context_tier": _startup_context_tier(args),
+        "interpreter": sys.executable,
+        "import_root": os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "unknown") or "unknown",
+        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
         "last_error": message,
         "message": message,
         "warm_load_state": "failed",
@@ -656,6 +693,11 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+        setattr(args, "startup_error_code", "context_profiles_unavailable")
+        emit_startup_error(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+        return 1
+
     dependency_setup = ensure_desktop_python_dependencies()
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
@@ -695,7 +737,7 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
-    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
+    args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),

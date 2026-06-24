@@ -1972,7 +1972,12 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert payload["backend_available"] == "pending"
     assert payload["backend_selected"] == "pending"
     assert payload["backend_used"] == "pending"
-    assert payload["model_path"] == "/tmp/model.gguf"
+    assert "model_path" not in payload
+    assert payload["error_code"] == "desktop_compute_node_startup_failed"
+    assert payload["context_tier"] == "8k-fast"
+    assert payload["interpreter"] == sys.executable
+    assert payload["import_root"] == "unknown"
+    assert payload["log_file_path"] == "unknown"
     assert payload["last_error"] == payload["message"]
     assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
     assert payload["warm_load_state"] == "failed"
@@ -2158,6 +2163,94 @@ class ComputeNodeRuntime:
     assert any(event.get('type') == 'stopped' for event in events)
     assert "No module named 'utils'" not in stdout
 
+
+def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    utils_dir = import_root / 'utils'
+    python_dir.mkdir(parents=True)
+    utils_dir.mkdir(parents=True)
+
+    (python_dir / 'compute_node_bridge.py').write_text(
+        MODULE_PATH.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'desktop_runtime_setup.py').write_text(
+        'def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):\n    return None\n'
+        'def ensure_desktop_llama_runtime(_mode):\n    return {"selected_backend": "cpu"}\n'
+        'def ensure_desktop_python_dependencies(*, repo_root=None):\n    return {"ok": "true"}\n'
+        'def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):\n    return None\n',
+        encoding='utf-8',
+    )
+    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] = str(import_root)
+    env['TOKENPLACE_OPERATOR_LOG_FILE'] = str(tmp_path / 'operator.log')
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(python_dir / 'compute_node_bridge.py'),
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+            '--context-tier',
+            '64k-full',
+            '--relay-url',
+            'https://token.place',
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 1
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get('type') == 'error')
+    assert payload['error_code'] == 'context_profiles_unavailable'
+    assert payload['registered'] is False
+    assert payload['context_tier'] == '64k-full'
+    assert payload['interpreter'] == sys.executable
+    assert payload['import_root'] == str(import_root)
+    assert payload['log_file_path'] == str(tmp_path / 'operator.log')
+    assert 'context profiles unavailable' in payload['message']
+    assert 'model_path' not in payload
+
+
+def test_main_normalizes_unknown_context_tier_before_run(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured['context_tier'] = args.context_tier
+        return 0
+
+    monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'compute_node_bridge.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+            '--context-tier',
+            'unknown',
+        ],
+    )
+
+    assert compute_node_bridge.main() == 0
+    assert captured['context_tier'] == 'unknown'
+    # run() performs the final normalization after expected startup preflights.
+    args = SimpleNamespace(context_tier='unknown')
+    assert compute_node_bridge.normalize_context_tier(args.context_tier) == '8k-fast'
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

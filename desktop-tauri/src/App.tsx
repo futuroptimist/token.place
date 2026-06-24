@@ -7,6 +7,9 @@ type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'f
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 type ContextTier = '8k-fast' | '64k-full';
 
+// P8 intentionally uses static, duplicated profile constants instead of
+// runtime codegen/manifest loading. Keep these IDs and token counts
+// synchronized with utils/context_profiles.py and src-tauri/src/context_profiles.rs.
 const CONTEXT_PROFILES: Array<{ id: ContextTier; displayLabel: string; totalContextTokens: number; enabled: boolean }> = [
   { id: '8k-fast', displayLabel: '8K Fast', totalContextTokens: 8192, enabled: true },
   { id: '64k-full', displayLabel: '64K Full', totalContextTokens: 65536, enabled: true },

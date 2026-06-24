@@ -950,8 +950,14 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
     def tokenize(self, *args, **kwargs):
+        serializable_args = tuple(
+            {'__token_place_bytes_utf8__': arg.decode('utf-8')}
+            if isinstance(arg, (bytes, bytearray))
+            else arg
+            for arg in args
+        )
         with self._lock:
-            self._send({'method': 'tokenize', 'args': args, 'kwargs': kwargs})
+            self._send({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs})
             try:
                 message = _read_llama_subprocess_message(
                     self._process,
@@ -1110,9 +1116,37 @@ for line in sys.stdin:
             render = getattr(llama, 'apply_chat_template', None)
             if not callable(render):
                 tokenizer = getattr(llama, 'tokenizer', None)
+                if callable(tokenizer):
+                    try:
+                        tokenizer = tokenizer()
+                    except Exception:
+                        tokenizer = None
                 render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
             if not callable(render):
-                _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                try:
+                    chat_format = getattr(llama, 'chat_format', None) or 'llama-2'
+                    chat_format_module = importlib.import_module('llama_cpp.llama_chat_format')
+                    formatter_key = str(chat_format).replace("-", "_")
+                    formatter_name = (
+                        "format_llama2"
+                        if formatter_key == "llama_2"
+                        else "format_" + formatter_key
+                    )
+                    formatter = getattr(chat_format_module, formatter_name, None)
+                    if not callable(formatter):
+                        _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                        continue
+                    rendered = formatter(*request.get('args', []), **kwargs)
+                    prompt = getattr(rendered, 'prompt', rendered)
+                    if kwargs.get('tokenize'):
+                        tokenize = getattr(llama, 'tokenize', None)
+                        if not callable(tokenize):
+                            _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                            continue
+                        prompt = tokenize(str(prompt).encode('utf-8'), add_bos=False)
+                    _emit({'status': 'ok', 'result': prompt})
+                except Exception as exc:
+                    _emit(_safe_request_error('prompt_render_unavailable', request=request, exc=exc))
                 continue
             _emit({'status': 'ok', 'result': render(*request.get('args', []), **kwargs)})
             continue
@@ -1121,7 +1155,13 @@ for line in sys.stdin:
             if not callable(tokenize):
                 _emit(_safe_request_error('tokenizer_unavailable', request=request))
                 continue
-            _emit({'status': 'ok', 'result': tokenize(*request.get('args', []), **kwargs)})
+            tokenize_args = []
+            for arg in request.get('args', []):
+                if isinstance(arg, dict) and set(arg) == {'__token_place_bytes_utf8__'}:
+                    tokenize_args.append(arg['__token_place_bytes_utf8__'].encode('utf-8'))
+                else:
+                    tokenize_args.append(arg)
+            _emit({'status': 'ok', 'result': tokenize(*tokenize_args, **kwargs)})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

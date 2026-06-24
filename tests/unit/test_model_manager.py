@@ -3822,7 +3822,7 @@ def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeyp
         }),
         call({
             'method': 'tokenize',
-            'args': (b'<|user|>\nhello',),
+            'args': ({'__token_place_bytes_utf8__': '<|user|>\nhello'},),
             'kwargs': {'add_bos': False},
         }),
     ]

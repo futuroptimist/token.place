@@ -11,6 +11,7 @@ import threading
 import time
 import requests
 import jsonschema
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
@@ -4388,6 +4389,41 @@ def test_api_v1_context_admission_rejects_when_chat_template_fallback_raises():
     assert error["code"] != "compute_node_internal_error"
     assert error["retryable"] is False
     assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_uses_llama_cpp_chat_format_fallback(monkeypatch):
+    manager = _AdmissionManager(window=64)
+    manager.runtime.apply_chat_template = None
+    manager.runtime.chat_format = "llama-2"
+
+    class FakeRendered:
+        prompt = "<s>[INST]x[/INST]"
+
+    fake_chat_format_module = SimpleNamespace(
+        format_llama2=MagicMock(return_value=FakeRendered())
+    )
+    original_import_module = relay_client_module.importlib.import_module
+
+    def fake_import_module(name, *args, **kwargs):
+        if name == "llama_cpp.llama_chat_format":
+            return fake_chat_format_module
+        return original_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "utils.networking.relay_client.importlib.import_module",
+        fake_import_module,
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x", options={"max_tokens": 1})
+
+    assert "error" not in envelope["api_v1_response"]
+    fake_chat_format_module.format_llama2.assert_called_once_with(
+        [{"role": "user", "content": "x"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert manager.runtime.calls
 
 
 def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():

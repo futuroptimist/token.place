@@ -2368,6 +2368,11 @@ class RelayClient:
             if isinstance(rendered, str):
                 return rendered
         tokenizer = getattr(llm_instance, "tokenizer", None)
+        if callable(tokenizer):
+            try:
+                tokenizer = tokenizer()
+            except Exception:
+                tokenizer = None
         if tokenizer is not None:
             tokenizer_template = getattr(tokenizer, "apply_chat_template", None)
             if callable(tokenizer_template):
@@ -2379,6 +2384,25 @@ class RelayClient:
                     rendered = None
                 if isinstance(rendered, str):
                     return rendered
+        try:
+            if not hasattr(llm_instance, "chat_format"):
+                return None
+            chat_format = getattr(llm_instance, "chat_format", None) or "llama-2"
+            chat_format_module = importlib.import_module("llama_cpp.llama_chat_format")
+            formatter_key = str(chat_format).replace("-", "_")
+            formatter_name = (
+                "format_llama2" if formatter_key == "llama_2" else "format_" + formatter_key
+            )
+            formatter = getattr(chat_format_module, formatter_name, None)
+            if callable(formatter):
+                rendered = formatter(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                prompt = getattr(rendered, "prompt", rendered)
+                if isinstance(prompt, str):
+                    return prompt
+        except Exception:
+            return None
         return None
 
     def _api_v1_context_tier_unsupported_error(

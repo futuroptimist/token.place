@@ -263,39 +263,21 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     attach_calls = []
     detach_calls = []
 
-    class FakeTemporaryDirectory:
-        def __init__(self, *, prefix):
-            assert prefix == 'token-place-dmg-mount-'
+    def fake_attach_dmg_with_retries(path):
+        attach_calls.append(path)
+        return mount_dir
 
-        def __enter__(self):
-            return str(mount_dir)
-
-        def __exit__(self, *args):
-            return False
-
-    def fake_run_with_retries(cmd, *, attempts, retry_messages):
-        attach_calls.append((cmd, attempts, retry_messages))
-        return '/dev/disk4'
-
-    def fake_run(cmd):
-        detach_calls.append(cmd)
-        return ''
+    def fake_detach_hdiutil_target(target):
+        detach_calls.append(target)
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
-    monkeypatch.setattr(validator, '_run_with_retries', fake_run_with_retries)
-    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach_dmg_with_retries)
+    monkeypatch.setattr(validator, '_detach_hdiutil_target', fake_detach_hdiutil_target)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
-    assert attach_calls == [
-        (
-            ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            8,
-            ('Resource temporarily unavailable', 'Resource busy'),
-        )
-    ]
-    assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert attach_calls == [dmg_path]
+    assert detach_calls == [str(mount_dir)]
 
 
 def test_validator_run_formats_command_failures(monkeypatch) -> None:

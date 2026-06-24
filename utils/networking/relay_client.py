@@ -2338,7 +2338,12 @@ class RelayClient:
                 try:
                     tokens = tokenize(rendered_prompt.encode("utf-8"))
                 except TypeError:
-                    tokens = tokenize(rendered_prompt)
+                    try:
+                        tokens = tokenize(rendered_prompt)
+                    except Exception:
+                        return None
+        except Exception:
+            return None
         if isinstance(tokens, (list, tuple)):
             return len(tokens)
         return None
@@ -2354,16 +2359,24 @@ class RelayClient:
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except TypeError:
-                rendered = apply_chat_template(messages)
+                try:
+                    rendered = apply_chat_template(messages)
+                except Exception:
+                    rendered = None
+            except Exception:
+                rendered = None
             if isinstance(rendered, str):
                 return rendered
         tokenizer = getattr(llm_instance, "tokenizer", None)
         if tokenizer is not None:
             tokenizer_template = getattr(tokenizer, "apply_chat_template", None)
             if callable(tokenizer_template):
-                rendered = tokenizer_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                try:
+                    rendered = tokenizer_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    rendered = None
                 if isinstance(rendered, str):
                     return rendered
         return None

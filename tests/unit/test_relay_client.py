@@ -4340,6 +4340,7 @@ def test_api_v1_context_admission_uses_recovered_runtime_before_rejecting():
     manager.create_chat_completion_with_recovery.assert_called_once()
     assert manager.runtime.calls == []
 
+
 def test_api_v1_context_admission_rejects_when_runtime_count_unavailable():
     manager = _AdmissionManager(window=32)
     manager.runtime.apply_chat_template = lambda *args, **kwargs: None
@@ -4349,6 +4350,42 @@ def test_api_v1_context_admission_rejects_when_runtime_count_unavailable():
 
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_tokenizer_fallbacks_raise():
+    manager = _AdmissionManager(window=32)
+
+    def reject_all_tokenize_signatures(*args, **kwargs):
+        raise TypeError("unsupported tokenizer signature")
+
+    manager.runtime.tokenize = reject_all_tokenize_signatures
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_chat_template_fallback_raises():
+    manager = _AdmissionManager(window=32)
+
+    def reject_all_template_signatures(*args, **kwargs):
+        raise TypeError("unsupported chat template signature")
+
+    manager.runtime.apply_chat_template = reject_all_template_signatures
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
     assert error["retryable"] is False
     assert manager.runtime.calls == []
 

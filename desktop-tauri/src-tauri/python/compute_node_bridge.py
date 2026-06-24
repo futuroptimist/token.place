@@ -27,7 +27,14 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
-from utils.context_profiles import apply_context_profile, get_context_profile
+
+_CONTEXT_PROFILES_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from utils.context_profiles import apply_context_profile, normalize_context_tier
+except Exception as exc:  # pragma: no cover - exercised by subprocess startup tests
+    apply_context_profile = None  # type: ignore[assignment]
+    normalize_context_tier = None  # type: ignore[assignment]
+    _CONTEXT_PROFILES_IMPORT_ERROR = exc
 
 try:
     from desktop_runtime_setup import (
@@ -486,6 +493,32 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def _context_profiles_unavailable_message(exc: BaseException) -> str:
+    return (
+        "desktop context profile startup import failed "
+        f"(interpreter={sys.executable} import_root={_safe_import_root_for_diagnostics()}): {exc}"
+    )
+
+
+def _safe_import_root_for_diagnostics() -> str:
+    explicit = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if explicit:
+        return explicit
+    for entry in sys.path:
+        if entry and os.path.isdir(os.path.join(entry, "utils")):
+            return entry
+    return "unknown"
+
+
+def _normalize_context_tier_for_bridge(profile_id: Optional[str]) -> str:
+    if _CONTEXT_PROFILES_IMPORT_ERROR is not None or normalize_context_tier is None:
+        fallback_error = RuntimeError("utils.context_profiles unavailable")
+        raise RuntimeError(
+            _context_profiles_unavailable_message(_CONTEXT_PROFILES_IMPORT_ERROR or fallback_error)
+        )
+    return normalize_context_tier(profile_id)
+
+
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
 ) -> str:
@@ -543,7 +576,6 @@ def _structured_startup_error_payload(
         "backend_selected": "pending",
         "backend_used": "pending",
         "fallback_reason": None,
-        "model_path": getattr(args, "model", ""),
         "last_error": message,
         "message": message,
         "warm_load_state": "failed",
@@ -682,6 +714,14 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        args.context_tier = _normalize_context_tier_for_bridge(
+            getattr(args, "context_tier", "8k-fast")
+        )
+    except RuntimeError as exc:
+        emit_startup_error(str(exc))
+        return 1
+
+    try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
             compute_mode_diagnostics,
@@ -691,11 +731,9 @@ def run(args: argparse.Namespace) -> int:
             resolve_relay_port,
             resolve_relay_url,
         )
-    except ModuleNotFoundError as exc:
+    except (ImportError, ModuleNotFoundError) as exc:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
-
-    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -763,6 +801,12 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
+    if apply_context_profile is None:
+        fallback_error = RuntimeError("utils.context_profiles unavailable")
+        emit_startup_error(
+            _context_profiles_unavailable_message(_CONTEXT_PROFILES_IMPORT_ERROR or fallback_error)
+        )
+        return 1
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:

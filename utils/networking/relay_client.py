@@ -700,7 +700,8 @@ class RelayClient:
         with lock:
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            join_timeout = max(float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0)
+            thread.join(timeout=join_timeout)
         with lock:
             if getattr(self, "_api_v1_heartbeat_thread", None) is thread and (
                 thread is None or not thread.is_alive()
@@ -731,7 +732,11 @@ class RelayClient:
                 try:
                     response = self.register_api_v1_compute_node(candidate_url)
                 except Exception as exc:
-                    log_error("server.heartbeat.background_failed relay={} error={}", candidate_url, str(exc))
+                    log_error(
+                        "server.heartbeat.background_failed relay={} error={}",
+                        _sanitize_relay_target(candidate_url),
+                        str(exc),
+                    )
                     continue
                 if isinstance(response, dict) and not response.get("error"):
                     refreshed_lease = self._normalise_positive_seconds(
@@ -748,7 +753,7 @@ class RelayClient:
                     self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                     log_info(
                         "server.heartbeat.background relay={} lease_seconds={} key_fingerprint={}",
-                        candidate_url,
+                        _sanitize_relay_target(candidate_url),
                         refreshed_lease,
                         self._api_v1_public_key_fingerprint(self.crypto_manager.public_key_b64),
                     )
@@ -2375,6 +2380,26 @@ class RelayClient:
             "retryable": False,
         }
 
+    def _api_v1_context_admission_unavailable_error(
+        self,
+        *,
+        active_context_tier: str,
+        configured_context_tokens: int,
+        requested_context_tier: str,
+    ) -> Dict[str, Any]:
+        return {
+            "code": "compute_node_context_admission_unavailable",
+            "type": "validation_error",
+            "message": (
+                "Compute node cannot authoritatively render and tokenize the "
+                "API v1 prompt for context admission"
+            ),
+            "active_context_tier": active_context_tier,
+            "requested_context_tier": requested_context_tier,
+            "configured_context_tokens": configured_context_tokens,
+            "retryable": False,
+        }
+
     def _api_v1_context_admission_error(
         self,
         *,
@@ -2441,14 +2466,26 @@ class RelayClient:
             else None
         )
         if prompt_tokens is None:
-            log_info(
-                "api_v1.context_admission_skipped active_tier={} reason={} safe_error_code=none",
+            log_error(
+                "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={}",
                 active_context_tier,
                 "runtime_tokenizer_unavailable",
+                "compute_node_context_admission_unavailable",
             )
-            return True, None, None
+            return (
+                False,
+                self._api_v1_context_admission_unavailable_error(
+                    active_context_tier=active_context_tier,
+                    configured_context_tokens=configured_context_tokens,
+                    requested_context_tier=requested_context_tier,
+                ),
+                None,
+            )
         required_total = prompt_tokens + requested_output_tokens
-        admitted = required_total <= configured_context_tokens
+        admitted = (
+            self._active_context_tier_can_satisfy(requested_context_tier)
+            and required_total <= configured_context_tokens
+        )
         log_info(
             "api_v1.context_admission active_tier={} prompt_tokens={} output_reservation={} result={} duration_ms=0 safe_error_code={}",
             active_context_tier,
@@ -2546,27 +2583,6 @@ class RelayClient:
         has_direct_runtime_completion = callable(get_llm_instance) or callable(
             recovery_completion
         )
-        if not self._active_context_tier_can_satisfy(requested_context_tier):
-            active_context_tier = normalize_context_tier(
-                getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
-            )
-            active_profile = get_context_profile(active_context_tier)
-            return self._api_v1_response_envelope(
-                request_id,
-                error=self._api_v1_context_tier_unsupported_error(
-                    active_context_tier=active_context_tier,
-                    configured_context_tokens=int(
-                        getattr(
-                            self.model_manager,
-                            "context_window_tokens",
-                            active_profile.total_context_tokens,
-                        )
-                        or active_profile.total_context_tokens
-                    ),
-                    requested_context_tier=requested_context_tier,
-                ),
-            )
-
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -2767,41 +2783,43 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
-                if getattr(self, "_api_v1_registered_relays", set()):
-                    self._api_v1_start_heartbeat_worker()
-                response_envelope = self._generate_api_v1_response_with_runtime_model(
-                    request_id=api_v1_request_payload["request_id"],
-                    model_id=api_v1_request_payload["model"],
-                    messages=api_v1_request_payload["messages"],
-                    options=dict(api_v1_request_payload["options"]),
-                    requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
-                )
-                api_v1_response = response_envelope.get("api_v1_response", {})
-                error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
-                safe_error_code = error.get("code") if isinstance(error, dict) else None
-                runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
-                runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
-                recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
-                recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
-                if safe_error_code not in {
-                    "compute_node_internal_error",
-                    "compute_node_process_failed",
-                }:
-                    runtime_healthy = True
-                submitted = self._post_api_v1_response(
-                    response_envelope,
-                    client_pub_key_b64=client_pub_key_b64,
-                    client_pub_key=client_pub_key,
-                )
-                self._api_v1_stop_heartbeat_worker()
-                return RelayProcessingResult(
-                    inference_succeeded=safe_error_code is None and submitted,
-                    submitted=submitted,
-                    safe_error_code=safe_error_code,
-                    runtime_healthy=runtime_healthy,
-                    recovery_attempted=recovery_attempted,
-                    recovery_succeeded=recovery_succeeded,
-                )
+                try:
+                    if getattr(self, "_api_v1_registered_relays", set()):
+                        self._api_v1_start_heartbeat_worker()
+                    response_envelope = self._generate_api_v1_response_with_runtime_model(
+                        request_id=api_v1_request_payload["request_id"],
+                        model_id=api_v1_request_payload["model"],
+                        messages=api_v1_request_payload["messages"],
+                        options=dict(api_v1_request_payload["options"]),
+                        requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
+                    )
+                    api_v1_response = response_envelope.get("api_v1_response", {})
+                    error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
+                    safe_error_code = error.get("code") if isinstance(error, dict) else None
+                    runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+                    runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
+                    recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
+                    recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
+                    if safe_error_code not in {
+                        "compute_node_internal_error",
+                        "compute_node_process_failed",
+                    }:
+                        runtime_healthy = True
+                    submitted = self._post_api_v1_response(
+                        response_envelope,
+                        client_pub_key_b64=client_pub_key_b64,
+                        client_pub_key=client_pub_key,
+                    )
+                    return RelayProcessingResult(
+                        inference_succeeded=safe_error_code is None and submitted,
+                        submitted=submitted,
+                        safe_error_code=safe_error_code,
+                        runtime_healthy=runtime_healthy,
+                        recovery_attempted=recovery_attempted,
+                        recovery_succeeded=recovery_succeeded,
+                    )
+                finally:
+                    self._api_v1_stop_heartbeat_worker()
 
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,

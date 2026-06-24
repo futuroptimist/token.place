@@ -45,6 +45,15 @@ class FakeDesktopRuntime:
     def __init__(self):
         self.calls = []
 
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        assert tokenize is False
+        return "".join(
+            f"<{message['role']}>{message['content']}" for message in messages
+        ) + ("<assistant>" if add_generation_prompt else "")
+
+    def tokenize(self, payload, _add_bos=False):
+        return list(range(len(payload)))
+
     def create_chat_completion(self, **kwargs):
         self.calls.append(kwargs)
         assert kwargs.get("stream") is False

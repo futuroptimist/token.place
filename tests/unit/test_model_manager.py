@@ -108,6 +108,24 @@ class TestModelManager:
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
 
+    def test_mock_llm_exposes_chat_template_and_tokenizer(self, model_manager):
+        """USE_MOCK_LLM runtime supports API v1 authoritative admission helpers."""
+        model_manager.use_mock_llm = True
+
+        llm = model_manager.get_llm_instance()
+        rendered = llm.apply_chat_template(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        tokens = llm.tokenize(rendered.encode('utf-8'), add_bos=False)
+
+        assert isinstance(rendered, str)
+        assert '<|user|>' in rendered
+        assert '<|assistant|>' in rendered
+        assert isinstance(tokens, list)
+        assert len(tokens) > 0
+
     def test_get_model_artifact_metadata(self, model_manager):
         """Test runtime model metadata includes expected keys and file state."""
         metadata = model_manager.get_model_artifact_metadata()

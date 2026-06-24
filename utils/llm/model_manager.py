@@ -1858,6 +1858,42 @@ class ModelManager:
             self.log_info("Using Mock LLM instance based on USE_MOCK_LLM configuration.")
             self.last_compute_diagnostics = self._mock_compute_plan()
             mock_llama_instance = MagicMock()
+
+            def _mock_apply_chat_template(messages, tokenize=False, add_generation_prompt=True):
+                rendered_parts = []
+                for message in messages:
+                    role = message.get('role', 'user') if isinstance(message, dict) else 'user'
+                    content = message.get('content', '') if isinstance(message, dict) else str(message)
+                    if isinstance(content, list):
+                        content = ''.join(
+                            str(item.get('text', ''))
+                            for item in content
+                            if isinstance(item, dict)
+                        )
+                    rendered_parts.append(f"<|{role}|>\n{content}")
+                if add_generation_prompt:
+                    rendered_parts.append("<|assistant|>\n")
+                rendered = "\n".join(rendered_parts)
+                if tokenize:
+                    return _mock_tokenize(rendered.encode('utf-8'), add_bos=False)
+                return rendered
+
+            def _mock_tokenize(content, add_bos=True):
+                if isinstance(content, bytes):
+                    text = content.decode('utf-8', errors='ignore')
+                else:
+                    text = str(content)
+                # Deterministic approximation for USE_MOCK_LLM test/runtime paths.
+                # Production context admission still uses the warmed llama.cpp
+                # runtime tokenizer; this mock only keeps local packaged parity
+                # e2e on the same render/tokenize surface.
+                tokens = text.split()
+                if add_bos:
+                    return [1] + list(range(2, len(tokens) + 2))
+                return list(range(1, len(tokens) + 1))
+
+            mock_llama_instance.apply_chat_template.side_effect = _mock_apply_chat_template
+            mock_llama_instance.tokenize.side_effect = _mock_tokenize
             mock_response = {
                 'choices': [
                     {

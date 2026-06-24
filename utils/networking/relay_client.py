@@ -11,6 +11,7 @@ import math
 import os
 import hashlib
 import re
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -2388,11 +2389,13 @@ class RelayClient:
             if not hasattr(llm_instance, "chat_format"):
                 return None
             chat_format = getattr(llm_instance, "chat_format", None) or "llama-2"
-            chat_format_module = importlib.import_module("llama_cpp.llama_chat_format")
+            chat_format_module = RelayClient._api_v1_llama_chat_format_module()
             formatter_key = str(chat_format).replace("-", "_")
             formatter_name = (
                 "format_llama2" if formatter_key == "llama_2" else "format_" + formatter_key
             )
+            if formatter_name == "format_llama_3":
+                formatter_name = "format_llama3"
             formatter = getattr(chat_format_module, formatter_name, None)
             if callable(formatter):
                 rendered = formatter(
@@ -2404,6 +2407,32 @@ class RelayClient:
         except Exception:
             return None
         return None
+
+    @staticmethod
+    def _api_v1_llama_chat_format_module() -> Any:
+        """Import llama.cpp chat formatting without the repo-local llama_cpp stub."""
+
+        repo_root = os.path.abspath(os.getcwd())
+        original_path = list(sys.path)
+        original_parent_module = sys.modules.get("llama_cpp")
+        parent_module_path = os.path.abspath(
+            str(getattr(original_parent_module, "__file__", ""))
+        )
+        try:
+            if (
+                original_parent_module is not None
+                and parent_module_path == os.path.join(repo_root, "llama_cpp.py")
+            ):
+                sys.modules.pop("llama_cpp", None)
+            sys.path = [
+                entry for entry in sys.path
+                if entry and os.path.abspath(entry) != repo_root
+            ]
+            return importlib.import_module("llama_cpp.llama_chat_format")
+        finally:
+            sys.path = original_path
+            if original_parent_module is not None:
+                sys.modules["llama_cpp"] = original_parent_module
 
     def _api_v1_context_tier_unsupported_error(
         self,

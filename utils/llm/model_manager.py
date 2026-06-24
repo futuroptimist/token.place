@@ -1132,6 +1132,8 @@ for line in sys.stdin:
                         if formatter_key == "llama_2"
                         else "format_" + formatter_key
                     )
+                    if formatter_name == "format_llama_3":
+                        formatter_name = "format_llama3"
                     formatter = getattr(chat_format_module, formatter_name, None)
                     if not callable(formatter):
                         _emit(_safe_request_error('prompt_render_unavailable', request=request))

@@ -4394,13 +4394,13 @@ def test_api_v1_context_admission_rejects_when_chat_template_fallback_raises():
 def test_api_v1_context_admission_uses_llama_cpp_chat_format_fallback(monkeypatch):
     manager = _AdmissionManager(window=64)
     manager.runtime.apply_chat_template = None
-    manager.runtime.chat_format = "llama-2"
+    manager.runtime.chat_format = "llama-3"
 
     class FakeRendered:
-        prompt = "<s>[INST]x[/INST]"
+        prompt = "<|start_header_id|>user<|end_header_id|>\n\nx<|eot_id|>"
 
     fake_chat_format_module = SimpleNamespace(
-        format_llama2=MagicMock(return_value=FakeRendered())
+        format_llama3=MagicMock(return_value=FakeRendered())
     )
     original_import_module = relay_client_module.importlib.import_module
 
@@ -4418,12 +4418,31 @@ def test_api_v1_context_admission_uses_llama_cpp_chat_format_fallback(monkeypatc
     envelope = _admission_envelope(client, manager, "x", options={"max_tokens": 1})
 
     assert "error" not in envelope["api_v1_response"]
-    fake_chat_format_module.format_llama2.assert_called_once_with(
+    fake_chat_format_module.format_llama3.assert_called_once_with(
         [{"role": "user", "content": "x"}],
         tokenize=False,
         add_generation_prompt=True,
     )
     assert manager.runtime.calls
+
+
+def test_api_v1_chat_format_import_ignores_repo_local_llama_stub(monkeypatch):
+    repo_llama_stub = SimpleNamespace(__file__=str(Path.cwd() / "llama_cpp.py"))
+    fake_chat_format_module = SimpleNamespace(format_llama3=object())
+    monkeypatch.setitem(sys.modules, "llama_cpp", repo_llama_stub)
+
+    def fake_import_module(name, *args, **kwargs):
+        assert name == "llama_cpp.llama_chat_format"
+        assert sys.modules.get("llama_cpp") is not repo_llama_stub
+        return fake_chat_format_module
+
+    monkeypatch.setattr(
+        "utils.networking.relay_client.importlib.import_module",
+        fake_import_module,
+    )
+
+    assert RelayClient._api_v1_llama_chat_format_module() is fake_chat_format_module
+    assert sys.modules["llama_cpp"] is repo_llama_stub
 
 
 def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():

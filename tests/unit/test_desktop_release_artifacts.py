@@ -243,8 +243,9 @@ def test_validator_rejects_zero_retry_attempts(monkeypatch) -> None:
 
 def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
-    mount_dir = tmp_path / 'mounted-dmg'
-    mount_dir.mkdir()
+    mount_root = tmp_path / 'mount-root'
+    mount_dir = mount_root / 'attempt-1'
+    mount_dir.mkdir(parents=True)
     (mount_dir / 'token.place desktop.app').mkdir()
     readme = mount_dir / 'README BEFORE OPENING.txt'
     readme.write_text(
@@ -264,38 +265,27 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     detach_calls = []
 
     class FakeTemporaryDirectory:
-        def __init__(self, *, prefix):
-            assert prefix == 'token-place-dmg-mount-'
+        name = str(mount_root)
 
-        def __enter__(self):
-            return str(mount_dir)
+        def cleanup(self):
+            pass
 
-        def __exit__(self, *args):
-            return False
+    def fake_attach(path):
+        attach_calls.append(path)
+        return FakeTemporaryDirectory()
 
-    def fake_run_with_retries(cmd, *, attempts, retry_messages):
-        attach_calls.append((cmd, attempts, retry_messages))
-        return '/dev/disk4'
-
-    def fake_run(cmd):
-        detach_calls.append(cmd)
-        return ''
+    def fake_detach(path, mountpoint=None):
+        detach_calls.append((path, mountpoint))
+        return []
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
-    monkeypatch.setattr(validator, '_run_with_retries', fake_run_with_retries)
-    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
+    monkeypatch.setattr(validator, '_detach_dmg_mounts', fake_detach)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
-    assert attach_calls == [
-        (
-            ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            8,
-            ('Resource temporarily unavailable', 'Resource busy'),
-        )
-    ]
-    assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert attach_calls == [dmg_path]
+    assert detach_calls == [(dmg_path, mount_dir)]
 
 
 def test_validator_run_formats_command_failures(monkeypatch) -> None:
@@ -318,3 +308,77 @@ def test_validator_run_formats_command_failures(monkeypatch) -> None:
     assert 'Command failed (codesign --verify example.app)' in message
     assert 'stdout detail' in message
     assert 'stderr detail' in message
+
+
+def test_validator_dmg_attach_retries_with_fresh_mountpoints_and_cleanup(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    validator = _load_release_artifact_validator()
+    dmg = tmp_path / 'token.place-desktop-0.1.2-apple-silicon.dmg'
+    dmg.write_text('fake', encoding='utf-8')
+    calls = []
+    sleeps = []
+
+    def fake_run(cmd, *, check, capture_output, text):
+        calls.append(cmd)
+        if cmd[:2] == ['hdiutil', 'attach']:
+            attempt = sum(1 for c in calls if c[:2] == ['hdiutil', 'attach'])
+            if attempt < 3:
+                return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - Resource temporarily unavailable')
+            return subprocess.CompletedProcess(cmd, 0, '/dev/disk4', '')
+        if cmd[:3] == ['hdiutil', 'info', '-plist']:
+            return subprocess.CompletedProcess(cmd, 0, '<plist><dict><key>images</key><array/></dict></plist>', '')
+        if cmd[:2] == ['hdiutil', 'detach']:
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        raise AssertionError(f'unexpected command: {cmd}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator.time, 'sleep', sleeps.append)
+
+    mount_root = validator._attach_dmg_with_retries(dmg, attempts=4, delay_seconds=0.01)
+    try:
+        attach_calls = [cmd for cmd in calls if cmd[:2] == ['hdiutil', 'attach']]
+        detach_calls = [cmd for cmd in calls if cmd[:2] == ['hdiutil', 'detach']]
+        mountpoints = [cmd[cmd.index('-mountpoint') + 1] for cmd in attach_calls]
+
+        assert len(attach_calls) == 3
+        assert len(set(mountpoints)) == 3
+        assert mountpoints[0].endswith('attempt-1')
+        assert mountpoints[1].endswith('attempt-2')
+        assert mountpoints[2].endswith('attempt-3')
+        assert [cmd[-1] for cmd in detach_calls] == mountpoints[:2]
+        assert sleeps == [0.01, 0.02]
+    finally:
+        mount_root.cleanup()
+
+
+def test_validator_dmg_attach_does_not_retry_structural_errors(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    validator = _load_release_artifact_validator()
+    dmg = tmp_path / 'token.place-desktop-0.1.2-apple-silicon.dmg'
+    dmg.write_text('fake', encoding='utf-8')
+    calls = []
+
+    def fake_run(cmd, *, check, capture_output, text):
+        calls.append(cmd)
+        if cmd[:2] == ['hdiutil', 'attach']:
+            return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - image not recognized')
+        if cmd[:2] == ['hdiutil', 'info']:
+            return subprocess.CompletedProcess(cmd, 0, 'redacted-safe-info', '')
+        raise AssertionError(f'unexpected command: {cmd}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    try:
+        validator._attach_dmg_with_retries(dmg, attempts=4, delay_seconds=0.01)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected structural hdiutil failure to exit')
+
+    attach_calls = [cmd for cmd in calls if cmd[:2] == ['hdiutil', 'attach']]
+    assert len(attach_calls) == 1
+    assert str(dmg) in message
+    assert 'image not recognized' in message
+    assert 'hdiutil info snapshot' in message

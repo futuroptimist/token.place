@@ -27,7 +27,6 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
-from utils.context_profiles import apply_context_profile, get_context_profile
 
 try:
     from desktop_runtime_setup import (
@@ -520,6 +519,17 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
+def _startup_import_root() -> str:
+    explicit = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if explicit:
+        return explicit
+    for entry in sys.path:
+        candidate = Path(entry or os.getcwd())
+        if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
+            return str(candidate)
+    return "unknown"
+
+
 def _structured_startup_error_payload(
     args: argparse.Namespace,
     message: str,
@@ -543,7 +553,9 @@ def _structured_startup_error_payload(
         "backend_selected": "pending",
         "backend_used": "pending",
         "fallback_reason": None,
-        "model_path": getattr(args, "model", ""),
+        "context_tier": getattr(args, "context_tier", "8k-fast"),
+        "interpreter": sys.executable,
+        "import_root": _startup_import_root(),
         "last_error": message,
         "message": message,
         "warm_load_state": "failed",
@@ -614,6 +626,13 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 
     return normalized or ["https://token.place"]
 
+
+def _load_context_profile_helpers() -> Tuple[Any, Any]:
+    from utils.context_profiles import apply_context_profile, get_context_profile
+
+    return apply_context_profile, get_context_profile
+
+
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
@@ -632,6 +651,14 @@ def run(args: argparse.Namespace) -> int:
 
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
+
+    try:
+        apply_context_profile, get_context_profile = _load_context_profile_helpers()
+    except ModuleNotFoundError as exc:
+        emit_startup_error(f"runtime unavailable: {exc}")
+        return 1
+
+    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
@@ -694,8 +721,6 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
-
-    args.context_tier = get_context_profile(getattr(args, "context_tier", "8k-fast")).profile_id
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),

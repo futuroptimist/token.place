@@ -7,8 +7,11 @@ import json
 import math
 import pytest
 import sys
+import threading
+import time
 import requests
 import jsonschema
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
@@ -358,9 +361,19 @@ class TestRelayClient:
                 }
             ]
         }
+        mock.runtime.apply_chat_template.side_effect = (
+            lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                f"<{message['role']}>{message['content']}" for message in messages
+            ) + ("<assistant>" if add_generation_prompt else "")
+        )
+        mock.runtime.tokenize.side_effect = (
+            lambda payload, _add_bos=False: list(range(len(payload)))
+        )
         mock.get_llm_instance.return_value = mock.runtime
         mock.create_chat_completion_with_recovery = None
         mock.use_mock_llm = True
+        mock.context_tier = "8k-fast"
+        mock.context_window_tokens = 8192
         return mock
 
     @pytest.fixture
@@ -2473,6 +2486,13 @@ class TestRelayClient:
         mock_model_manager,
     ):
         mock_model_manager.context_tier = "8k-fast"
+        mock_model_manager.context_window_tokens = 8192
+        mock_model_manager.config.get.side_effect = lambda key, default: {
+            "model.max_tokens": 512,
+            "model.temperature": 0.7,
+            "model.top_p": 0.9,
+            "model.stop_tokens": [],
+        }.get(key, default)
         request_data = TEST_VALID_RESPONSE.copy()
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -2490,12 +2510,26 @@ class TestRelayClient:
         source_response.status_code = 200
         mock_post.return_value = source_response
 
+        mock_model_manager.runtime.apply_chat_template.side_effect = (
+            lambda messages, tokenize=False, add_generation_prompt=True: "<s><user>Hello<assistant>"
+        )
+        mock_model_manager.runtime.tokenize.side_effect = (
+            lambda payload, _add_bos=False: list(range(len(payload)))
+        )
+
         assert relay_client.process_client_request(request_data) is True
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_context_tier_unsupported"
-        )
+        error = encrypted_envelope["api_v1_response"]["error"]
+        assert error["code"] == "compute_node_context_tier_unsupported"
+        assert error["active_context_tier"] == "8k-fast"
+        assert error["requested_context_tier"] == "64k-full"
+        assert error["configured_context_tokens"] == 8192
+        assert error["prompt_tokens"] == len(b"<s><user>Hello<assistant>")
+        assert error["requested_output_tokens"] == 512
+        assert error["required_total_tokens"] == error["prompt_tokens"] + 512
+        assert error["retryable"] is False
+        assert "recommended_context_tier" not in error
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_strips_routing_context_tier(
@@ -2597,6 +2631,14 @@ class TestRelayClient:
                         }
                     ]
                 }
+                self.runtime.apply_chat_template.side_effect = (
+                    lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                        f"<{message['role']}>{message['content']}" for message in messages
+                    ) + ("<assistant>" if add_generation_prompt else "")
+                )
+                self.runtime.tokenize.side_effect = (
+                    lambda payload, _add_bos=False: list(range(len(payload)))
+                )
 
             def get_llm_instance(self):
                 return self.runtime
@@ -2834,6 +2876,12 @@ class TestRelayClient:
                         ]
                     }
                 )
+                self.apply_chat_template = (
+                    lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                        f"<{message['role']}>{message['content']}" for message in messages
+                    ) + ("<assistant>" if add_generation_prompt else "")
+                )
+                self.tokenize = lambda payload, _add_bos=False: list(range(len(payload)))
 
         class _Manager:
             use_mock_llm = False
@@ -2907,6 +2955,14 @@ class TestRelayClient:
         class _Runtime:
             def __init__(self):
                 self.calls = []
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "".join(
+                    f"<{message['role']}>{message['content']}" for message in messages
+                ) + ("<assistant>" if add_generation_prompt else "")
+
+            def tokenize(self, payload, _add_bos=False):
+                return list(range(len(payload)))
 
             def create_chat_completion(self, **kwargs):
                 self.calls.append(kwargs)
@@ -2994,6 +3050,14 @@ class TestRelayClient:
             def __init__(self):
                 self.calls = []
 
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "".join(
+                    f"<{message['role']}>{message['content']}" for message in messages
+                ) + ("<assistant>" if add_generation_prompt else "")
+
+            def tokenize(self, payload, _add_bos=False):
+                return list(range(len(payload)))
+
             def create_chat_completion(self, **kwargs):
                 self.calls.append(kwargs)
                 return {
@@ -3080,6 +3144,14 @@ class TestRelayClient:
         class _Runtime:
             def __init__(self):
                 self.calls = []
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "".join(
+                    f"<{message['role']}>{message['content']}" for message in messages
+                ) + ("<assistant>" if add_generation_prompt else "")
+
+            def tokenize(self, payload, _add_bos=False):
+                return list(range(len(payload)))
 
             def create_chat_completion(self, **kwargs):
                 self.calls.append(kwargs)
@@ -3967,6 +4039,14 @@ class _ApiV1RuntimeManager:
         self.runtime.create_chat_completion.return_value = {
             "choices": [{"message": {"role": "assistant", "content": "ok"}}]
         }
+        self.runtime.apply_chat_template.side_effect = (
+            lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                f"<{message['role']}>{message['content']}" for message in messages
+            ) + ("<assistant>" if add_generation_prompt else "")
+        )
+        self.runtime.tokenize.side_effect = (
+            lambda payload, _add_bos=False: list(range(len(payload)))
+        )
         self.use_mock_llm = True
         self.worker_health = "healthy"
         self.recovery_count = 0
@@ -3980,7 +4060,7 @@ class _ApiV1RuntimeManager:
     [
         ({}, {"stream": False}),
         ({"max_tokens": 1}, {"max_tokens": 1}),
-        ({"max_tokens": 8192}, {"max_tokens": 8192}),
+        ({"max_tokens": 8000}, {"max_tokens": 8000}),
         ({"temperature": 0}, {"temperature": 0.0}),
         ({"temperature": 2.0}, {"temperature": 2.0}),
         ({"top_p": 0}, {"top_p": 0.0}),
@@ -4146,3 +4226,448 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
     assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+
+class _AdmissionConfig:
+    def __init__(self, max_tokens=16):
+        self.max_tokens = max_tokens
+
+    def get(self, key, default):
+        return {
+            "model.max_tokens": self.max_tokens,
+            "model.temperature": 0.7,
+            "model.top_p": 0.9,
+            "model.stop_tokens": [],
+        }.get(key, default)
+
+
+class _AdmissionRuntime:
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        assert tokenize is False
+        rendered = "<s>"
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, list):
+                content = "".join(block["text"] for block in content)
+            rendered += f"<{message['role']}>" + content
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return rendered
+
+    def tokenize(self, payload, *args):
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        token_count = len(payload)
+        if "雪" in payload:
+            token_count = 20 + ((len(payload) - 20) * 2)
+        return list(range(token_count))
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class _AdmissionManager:
+    api_model_id = "llama-3-8b-instruct"
+    use_mock_llm = False
+
+    def __init__(self, tier="8k-fast", window=8192, default_max_tokens=16):
+        self.context_tier = tier
+        self.context_window_tokens = window
+        self.config = _AdmissionConfig(default_max_tokens)
+        self.runtime = _AdmissionRuntime()
+        self.worker_restart_count = 0
+
+    def get_llm_instance(self):
+        return self.runtime
+
+
+def _admission_envelope(client, manager, content, *, options=None, requested_tier=None):
+    client.model_manager = manager
+    return client._generate_api_v1_response_with_runtime_model(
+        request_id="req-admission",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": content}],
+        options=options or {},
+        requested_context_tier=requested_tier or manager.context_tier,
+    )
+
+
+def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():
+    manager = _AdmissionManager(window=32)
+    client = _api_v1_validation_client(manager)
+    # Rendered prompt is len("<s><user>" + content + "<assistant>") = 20 + content.
+    accepted = _admission_envelope(client, manager, "x" * 7, options={"max_tokens": 5})
+    rejected = _admission_envelope(client, manager, "x" * 8, options={"max_tokens": 5})
+
+    assert "error" not in accepted["api_v1_response"]
+    assert manager.runtime.calls[-1]["max_tokens"] == 5
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 28
+    assert error["requested_output_tokens"] == 5
+    assert error["required_total_tokens"] == 33
+
+
+def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tokens():
+    manager = _AdmissionManager(window=32, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    accepted = _admission_envelope(client, manager, "x" * 8)
+    rejected = _admission_envelope(client, manager, "x" * 9)
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["requested_output_tokens"] == 4
+    assert error["prompt_tokens"] == 29
+
+
+def test_api_v1_context_admission_uses_recovered_runtime_before_rejecting():
+    manager = _AdmissionManager(window=64, default_max_tokens=4)
+    manager.get_llm_instance = MagicMock(side_effect=[None])
+    manager.get_llm_instance_with_recovery = MagicMock(return_value=manager.runtime)
+    manager.create_chat_completion_with_recovery = MagicMock(
+        return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "hello", options={"max_tokens": 4})
+
+    assert "error" not in envelope["api_v1_response"]
+    manager.get_llm_instance_with_recovery.assert_called_once()
+    manager.create_chat_completion_with_recovery.assert_called_once()
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_runtime_count_unavailable():
+    manager = _AdmissionManager(window=32)
+    manager.runtime.apply_chat_template = lambda *args, **kwargs: None
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_tokenizer_fallbacks_raise():
+    manager = _AdmissionManager(window=32)
+
+    def reject_all_tokenize_signatures(*args, **kwargs):
+        raise TypeError("unsupported tokenizer signature")
+
+    manager.runtime.tokenize = reject_all_tokenize_signatures
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_chat_template_fallback_raises():
+    manager = _AdmissionManager(window=32)
+
+    def reject_all_template_signatures(*args, **kwargs):
+        raise TypeError("unsupported chat template signature")
+
+    manager.runtime.apply_chat_template = reject_all_template_signatures
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_rejects_when_tokenizer_template_branch_raises():
+    manager = _AdmissionManager(window=32)
+    manager.runtime.apply_chat_template = None
+
+    class RejectingTokenizerTemplate:
+        def apply_chat_template(self, *args, **kwargs):
+            raise RuntimeError("template render failed")
+
+    manager.runtime.tokenizer = lambda: RejectingTokenizerTemplate()
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x")
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["code"] != "compute_node_internal_error"
+    assert error["retryable"] is False
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_uses_llama_cpp_chat_format_fallback(monkeypatch):
+    manager = _AdmissionManager(window=64)
+    manager.runtime.apply_chat_template = None
+    manager.runtime.chat_format = "llama-3"
+
+    class FakeRendered:
+        prompt = "<|start_header_id|>user<|end_header_id|>\n\nx<|eot_id|>"
+
+    fake_chat_format_module = SimpleNamespace(
+        format_llama3=MagicMock(return_value=FakeRendered())
+    )
+    original_import_module = relay_client_module.importlib.import_module
+
+    def fake_import_module(name, *args, **kwargs):
+        if name == "llama_cpp.llama_chat_format":
+            return fake_chat_format_module
+        return original_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "utils.networking.relay_client.importlib.import_module",
+        fake_import_module,
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x", options={"max_tokens": 1})
+
+    assert "error" not in envelope["api_v1_response"]
+    fake_chat_format_module.format_llama3.assert_called_once_with(
+        [{"role": "user", "content": "x"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert manager.runtime.calls
+
+
+def test_api_v1_chat_format_import_ignores_repo_local_llama_stub(monkeypatch):
+    repo_llama_stub = SimpleNamespace(__file__=str(Path.cwd() / "llama_cpp.py"))
+    fake_chat_format_module = SimpleNamespace(format_llama3=object())
+    monkeypatch.setitem(sys.modules, "llama_cpp", repo_llama_stub)
+
+    def fake_import_module(name, *args, **kwargs):
+        assert name == "llama_cpp.llama_chat_format"
+        assert sys.modules.get("llama_cpp") is not repo_llama_stub
+        return fake_chat_format_module
+
+    monkeypatch.setattr(
+        "utils.networking.relay_client.importlib.import_module",
+        fake_import_module,
+    )
+
+    assert RelayClient._api_v1_llama_chat_format_module() is fake_chat_format_module
+    assert sys.modules["llama_cpp"] is repo_llama_stub
+
+
+def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "x" * 8170,
+        options={"max_tokens": 3},
+        requested_tier="64k-full",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert error["prompt_tokens"] == 8190
+    assert error["requested_output_tokens"] == 3
+    assert error["required_total_tokens"] == 8193
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_64k_request_on_8k_runtime_reports_tier_unsupported_when_it_fits():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=4)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "small",
+        options={"max_tokens": 10},
+        requested_tier="64k-full",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_tier_unsupported"
+    assert error["message"] == "Requested context tier is not active on this compute node"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "64k-full"
+    assert error["configured_context_tokens"] == 8192
+    assert error["prompt_tokens"] == 25
+    assert error["requested_output_tokens"] == 10
+    assert error["required_total_tokens"] == 35
+    assert error["retryable"] is False
+    assert "recommended_context_tier" not in error
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_exact_64k_boundaries_and_unicode_structured_text():
+    manager = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=1)
+    client = _api_v1_validation_client(manager)
+    content = [{"type": "text", "text": "雪" * 32757}]
+    accepted = _admission_envelope(client, manager, content, requested_tier="8k-fast")
+    rejected = _admission_envelope(client, manager, [{"type": "input_text", "text": "雪" * 32758}])
+
+    assert "error" not in accepted["api_v1_response"]
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["active_context_tier"] == "64k-full"
+    assert error["configured_context_tokens"] == 65536
+    assert error["prompt_tokens"] == 65536
+    assert error["requested_output_tokens"] == 1
+    assert error["retryable"] is False
+
+
+def test_api_v1_context_overflow_is_request_scoped_and_does_not_restart_worker():
+    manager = _AdmissionManager(window=24, default_max_tokens=5)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x" * 10)
+
+    assert envelope["api_v1_response"]["error"]["code"] == "compute_node_context_window_exceeded"
+    assert manager.worker_restart_count == 0
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_admission_recommends_64k_for_8k_overflow():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=1)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x" * 8172)
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["recommended_context_tier"] == "64k-full"
+    assert error["retryable"] is True
+
+
+def test_api_v1_stop_prevents_racing_start_from_leaving_live_heartbeat():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = time.monotonic()
+    relay_client._api_v1_start_heartbeat_worker()
+    original = relay_client._api_v1_heartbeat_thread
+    assert original is not None
+
+    entered_join = threading.Event()
+    release_join = threading.Event()
+    original_join = original.join
+
+    def blocking_join(timeout=None):
+        entered_join.set()
+        release_join.wait(timeout=1.0)
+        return original_join(timeout=timeout)
+
+    original.join = blocking_join
+    stopper = threading.Thread(target=relay_client._api_v1_stop_heartbeat_worker)
+    stopper.start()
+    assert entered_join.wait(timeout=1.0)
+
+    relay_client._api_v1_start_heartbeat_worker()
+    release_join.set()
+    stopper.join(timeout=2.0)
+
+    assert not stopper.is_alive()
+    assert relay_client._api_v1_heartbeat_thread is None
+
+def test_api_v1_heartbeat_worker_refreshes_during_blocked_inference():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
+    relay_client._api_v1_relay_wait_hints = {
+        relay_client.relay_url: {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+    }
+    calls = []
+
+    def register(url):
+        calls.append(url)
+        relay_client.stop()
+        return {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+
+    relay_client.register_api_v1_compute_node = register
+    relay_client._api_v1_start_heartbeat_worker()
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    relay_client.stop()
+
+    assert calls == [relay_client.relay_url]
+    assert relay_client._api_v1_heartbeat_thread is None
+
+
+def test_api_v1_heartbeat_stops_when_response_posting_raises():
+    manager = _AdmissionManager()
+    client = _api_v1_validation_client(manager)
+    client._api_v1_registered_relays.add(client.relay_url)
+    client.crypto_manager.decrypt_message.return_value = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-post-raises",
+        "client_public_key": TEST_VALID_RESPONSE["client_public_key"],
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "options": {},
+            "routing": {"context_tier": "8k-fast"},
+        },
+    }
+    client._post_api_v1_response = MagicMock(side_effect=RuntimeError("post failed"))
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.submitted is False
+    assert client._api_v1_heartbeat_thread is None
+
+
+def test_api_v1_heartbeat_logs_sanitized_relay_targets():
+    relay_client = _api_v1_validation_client()
+    relay_url = "https://user:secret@example.test:443/path?token=abc#frag"
+    relay_client._api_v1_registered_relays.add(relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_url] = 0.0
+    relay_client._api_v1_relay_wait_hints = {
+        relay_url: {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+    }
+    logged = []
+
+    def register(url):
+        relay_client.stop()
+        return {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+
+    relay_client.register_api_v1_compute_node = register
+    with patch("utils.networking.relay_client.log_info") as mock_log_info:
+        mock_log_info.side_effect = lambda message, *args: logged.append(message.format(*args))
+        relay_client._api_v1_start_heartbeat_worker()
+        deadline = time.monotonic() + 2.0
+        while relay_client._api_v1_heartbeat_thread is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    joined = "\n".join(logged)
+    assert "https://example.test" in joined
+    assert "secret" not in joined
+    assert "token=abc" not in joined
+
+
+def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = time.monotonic()
+    relay_client._api_v1_start_heartbeat_worker()
+    assert relay_client._api_v1_heartbeat_thread is not None
+
+    relay_client.stop()
+
+    assert relay_client._api_v1_heartbeat_thread is None

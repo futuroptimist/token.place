@@ -934,6 +934,41 @@ class _SubprocessLlamaProxy:
                 raise
         return message.get('result')
 
+
+    def apply_chat_template(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=self._timeout_seconds,
+                    stage='llama_cpp_prompt_render',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+    def tokenize(self, *args, **kwargs):
+        serializable_args = tuple(
+            {'__token_place_bytes_utf8__': arg.decode('utf-8')}
+            if isinstance(arg, (bytes, bytearray))
+            else arg
+            for arg in args
+        )
+        with self._lock:
+            self._send({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=self._timeout_seconds,
+                    stage='llama_cpp_prompt_tokenize',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
     def _stream_chat_completion(self, *args, **kwargs):
         with self._lock:
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
@@ -1069,12 +1104,66 @@ for line in sys.stdin:
         if not isinstance(request, dict):
             _emit(_safe_request_error('malformed_request'))
             continue
-        if request.get('method') != 'create_chat_completion':
+        method = request.get('method')
+        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
+            continue
+        if method == 'apply_chat_template':
+            render = getattr(llama, 'apply_chat_template', None)
+            if not callable(render):
+                tokenizer = getattr(llama, 'tokenizer', None)
+                if callable(tokenizer):
+                    try:
+                        tokenizer = tokenizer()
+                    except Exception:
+                        tokenizer = None
+                render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+            if not callable(render):
+                try:
+                    chat_format = getattr(llama, 'chat_format', None) or 'llama-2'
+                    chat_format_module = importlib.import_module('llama_cpp.llama_chat_format')
+                    formatter_key = str(chat_format).replace("-", "_")
+                    formatter_name = (
+                        "format_llama2"
+                        if formatter_key == "llama_2"
+                        else "format_" + formatter_key
+                    )
+                    if formatter_name == "format_llama_3":
+                        formatter_name = "format_llama3"
+                    formatter = getattr(chat_format_module, formatter_name, None)
+                    if not callable(formatter):
+                        _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                        continue
+                    rendered = formatter(*request.get('args', []), **kwargs)
+                    prompt = getattr(rendered, 'prompt', rendered)
+                    if kwargs.get('tokenize'):
+                        tokenize = getattr(llama, 'tokenize', None)
+                        if not callable(tokenize):
+                            _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                            continue
+                        prompt = tokenize(str(prompt).encode('utf-8'), add_bos=False)
+                    _emit({'status': 'ok', 'result': prompt})
+                except Exception as exc:
+                    _emit(_safe_request_error('prompt_render_unavailable', request=request, exc=exc))
+                continue
+            _emit({'status': 'ok', 'result': render(*request.get('args', []), **kwargs)})
+            continue
+        if method == 'tokenize':
+            tokenize = getattr(llama, 'tokenize', None)
+            if not callable(tokenize):
+                _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                continue
+            tokenize_args = []
+            for arg in request.get('args', []):
+                if isinstance(arg, dict) and set(arg) == {'__token_place_bytes_utf8__'}:
+                    tokenize_args.append(arg['__token_place_bytes_utf8__'].encode('utf-8'))
+                else:
+                    tokenize_args.append(arg)
+            _emit({'status': 'ok', 'result': tokenize(*tokenize_args, **kwargs)})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):
@@ -1858,6 +1947,42 @@ class ModelManager:
             self.log_info("Using Mock LLM instance based on USE_MOCK_LLM configuration.")
             self.last_compute_diagnostics = self._mock_compute_plan()
             mock_llama_instance = MagicMock()
+
+            def _mock_apply_chat_template(messages, tokenize=False, add_generation_prompt=True):
+                rendered_parts = []
+                for message in messages:
+                    role = message.get('role', 'user') if isinstance(message, dict) else 'user'
+                    content = message.get('content', '') if isinstance(message, dict) else str(message)
+                    if isinstance(content, list):
+                        content = ''.join(
+                            str(item.get('text', ''))
+                            for item in content
+                            if isinstance(item, dict)
+                        )
+                    rendered_parts.append(f"<|{role}|>\n{content}")
+                if add_generation_prompt:
+                    rendered_parts.append("<|assistant|>\n")
+                rendered = "\n".join(rendered_parts)
+                if tokenize:
+                    return _mock_tokenize(rendered.encode('utf-8'), add_bos=False)
+                return rendered
+
+            def _mock_tokenize(content, add_bos=True):
+                if isinstance(content, bytes):
+                    text = content.decode('utf-8', errors='ignore')
+                else:
+                    text = str(content)
+                # Deterministic approximation for USE_MOCK_LLM test/runtime paths.
+                # Production context admission still uses the warmed llama.cpp
+                # runtime tokenizer; this mock only keeps local packaged parity
+                # e2e on the same render/tokenize surface.
+                tokens = text.split()
+                if add_bos:
+                    return [1] + list(range(2, len(tokens) + 2))
+                return list(range(1, len(tokens) + 1))
+
+            mock_llama_instance.apply_chat_template.side_effect = _mock_apply_chat_template
+            mock_llama_instance.tokenize.side_effect = _mock_tokenize
             mock_response = {
                 'choices': [
                     {
@@ -2080,6 +2205,15 @@ class ModelManager:
         if replacement_attempt_log_message is not None:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()
+
+    def get_llm_instance_with_recovery(self):
+        """Return a live LLM runtime, attempting one replacement if unavailable."""
+        llm_instance = self.get_llm_instance()
+        if llm_instance is not None:
+            return llm_instance
+        with self.llm_lock:
+            observed_generation = self._llm_generation
+        return self._ensure_replacement_llm(observed_generation)
 
     def create_chat_completion_with_recovery(self, *args, **kwargs):
         """Create a completion, replacing a dead subprocess worker at most once.

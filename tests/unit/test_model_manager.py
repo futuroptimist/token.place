@@ -8,7 +8,7 @@ import threading
 import pytest
 import shutil
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import json
 import sys
 import tempfile
@@ -107,6 +107,40 @@ class TestModelManager:
         assert model_manager.model_path == os.path.join(self._temp_dir, 'test_model.gguf')
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
+
+    def test_mock_llm_exposes_chat_template_and_tokenizer(self, model_manager):
+        """USE_MOCK_LLM runtime supports API v1 authoritative admission helpers."""
+        model_manager.use_mock_llm = True
+
+        llm = model_manager.get_llm_instance()
+        rendered = llm.apply_chat_template(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        structured_rendered = llm.apply_chat_template(
+            [{'role': 'user', 'content': [{'type': 'text', 'text': 'structured'}, {'ignored': 'metadata'}]}],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        template_tokens = llm.apply_chat_template(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        tokens = llm.tokenize(rendered.encode('utf-8'), add_bos=False)
+        bos_tokens = llm.tokenize(rendered, add_bos=True)
+
+        assert isinstance(rendered, str)
+        assert '<|user|>' in rendered
+        assert '<|assistant|>' in rendered
+        assert structured_rendered == '<|user|>\nstructured'
+        assert isinstance(template_tokens, list)
+        assert template_tokens == tokens
+        assert isinstance(tokens, list)
+        assert len(tokens) > 0
+        assert bos_tokens[0] == 1
+        assert len(bos_tokens) == len(tokens) + 1
 
     def test_get_model_artifact_metadata(self, model_manager):
         """Test runtime model metadata includes expected keys and file state."""
@@ -3754,3 +3788,91 @@ class Llama:
     ])
     assert plaintext_prompt not in leak_checked_text
     assert plaintext_output not in leak_checked_text
+
+
+def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = SimpleNamespace(stdin=MagicMock())
+    proxy._timeout_seconds = 3.25
+    proxy._closed = False
+    proxy._send = MagicMock()
+    captured_reads = []
+
+    def _fake_read(_process, *, timeout_seconds, stage):
+        captured_reads.append((stage, timeout_seconds))
+        if stage == 'llama_cpp_prompt_render':
+            return {'status': 'ok', 'result': '<|user|>\nhello'}
+        return {'status': 'ok', 'result': [10, 11]}
+
+    monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _fake_read)
+
+    rendered = proxy.apply_chat_template([{'role': 'user', 'content': 'hello'}], tokenize=False)
+    tokens = proxy.tokenize(rendered.encode('utf-8'), add_bos=False)
+
+    assert rendered == '<|user|>\nhello'
+    assert tokens == [10, 11]
+    assert proxy._send.call_args_list == [
+        call({
+            'method': 'apply_chat_template',
+            'args': ([{'role': 'user', 'content': 'hello'}],),
+            'kwargs': {'tokenize': False},
+        }),
+        call({
+            'method': 'tokenize',
+            'args': ({'__token_place_bytes_utf8__': '<|user|>\nhello'},),
+            'kwargs': {'add_bos': False},
+        }),
+    ]
+    assert captured_reads == [
+        ('llama_cpp_prompt_render', 3.25),
+        ('llama_cpp_prompt_tokenize', 3.25),
+    ]
+
+
+def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = SimpleNamespace(stdin=MagicMock())
+    proxy._timeout_seconds = 0.01
+    proxy._closed = False
+    proxy._send = MagicMock()
+
+    def _raise_eof(*_args, **_kwargs):
+        raise model_manager_module.LlamaCppWorkerEOFError('worker closed')
+
+    monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _raise_eof)
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.apply_chat_template([], tokenize=False)
+    assert proxy._closed is True
+
+    proxy._closed = False
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.tokenize(b'hello', add_bos=False)
+    assert proxy._closed is True
+
+
+def test_get_llm_instance_with_recovery_returns_existing_runtime(standalone_model_manager):
+    runtime = object()
+    standalone_model_manager.get_llm_instance = MagicMock(return_value=runtime)
+    standalone_model_manager._ensure_replacement_llm = MagicMock()
+
+    assert standalone_model_manager.get_llm_instance_with_recovery() is runtime
+    standalone_model_manager.get_llm_instance.assert_called_once_with()
+    standalone_model_manager._ensure_replacement_llm.assert_not_called()
+
+
+def test_get_llm_instance_with_recovery_attempts_replacement_when_unavailable(standalone_model_manager):
+    replacement = object()
+    standalone_model_manager.get_llm_instance = MagicMock(return_value=None)
+    standalone_model_manager._ensure_replacement_llm = MagicMock(return_value=replacement)
+    standalone_model_manager._llm_generation = 7
+
+    assert standalone_model_manager.get_llm_instance_with_recovery() is replacement
+    standalone_model_manager.get_llm_instance.assert_called_once_with()
+    standalone_model_manager._ensure_replacement_llm.assert_called_once_with(7)

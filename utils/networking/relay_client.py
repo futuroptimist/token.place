@@ -447,6 +447,9 @@ def _extract_api_v1_request_payload(
     model = api_v1_request.get("model")
     messages = api_v1_request.get("messages")
     options = api_v1_request.get("options", {})
+    routing = api_v1_request.get("routing", {})
+    if routing is None:
+        routing = {}
     if not isinstance(model, str) or not model.strip():
         log_error("Rejected API v1 relay payload: model must be a non-empty string")
         return None
@@ -456,12 +459,20 @@ def _extract_api_v1_request_payload(
     if not isinstance(options, dict):
         log_error("Rejected API v1 relay payload: options must be an object")
         return None
+    if not isinstance(routing, dict):
+        log_error("Rejected API v1 relay payload: routing must be an object")
+        return None
+    context_tier = routing.get("context_tier", "8k-fast")
+    if context_tier not in {"8k-fast", "64k-full"}:
+        log_error("Rejected API v1 relay payload: unsupported routing.context_tier")
+        return None
 
     return {
         "request_id": request_id,
         "model": model,
         "messages": messages,
         "options": options,
+        "routing": {"context_tier": context_tier},
     }
 
 
@@ -1198,9 +1209,38 @@ class RelayClient:
             'relay_http_diagnostic': diagnostic,
         }
 
+    def _api_v1_capabilities_payload(self) -> Dict[str, Any]:
+        manager = getattr(self, "model_manager", None)
+        context_tier = getattr(manager, "context_tier", "8k-fast")
+        if context_tier not in {"8k-fast", "64k-full"}:
+            context_tier = "8k-fast"
+        context_tokens = getattr(manager, "context_window_tokens", None)
+        if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or context_tokens <= 0:
+            context_tokens = 65536 if context_tier == "64k-full" else 8192
+        default_reservation = getattr(manager, "default_output_reservation_tokens", None)
+        if not isinstance(default_reservation, int) or isinstance(default_reservation, bool) or default_reservation < 0:
+            default_reservation = 1024
+        model_id = getattr(manager, "model_id", None) or getattr(manager, "model_name", None)
+        if not isinstance(model_id, str) or not model_id.strip():
+            model_id = "llama-3-8b-instruct"
+        diagnostics = getattr(manager, "last_compute_diagnostics", {})
+        backend = diagnostics.get("backend_used") if isinstance(diagnostics, dict) else None
+        payload: Dict[str, Any] = {
+            "api_version": "v1",
+            "supported_model_ids": [model_id.strip()],
+            "active_context_tier": context_tier,
+            "max_total_context_tokens": context_tokens,
+            "default_output_token_reservation": default_reservation,
+            "max_output_token_reservation": default_reservation,
+            "max_concurrency": 1,
+        }
+        if isinstance(backend, str) and backend:
+            payload["backend_class"] = backend
+        return payload
+
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
-        payload = {'server_public_key': self.crypto_manager.public_key_b64}
+        payload = {'server_public_key': self.crypto_manager.public_key_b64, 'capabilities': self._api_v1_capabilities_payload()}
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
         headers = self._auth_headers()
         if headers:
@@ -1378,7 +1418,10 @@ class RelayClient:
                     )
 
                 request_kwargs: Dict[str, Any] = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'json': {
+                        'server_public_key': self.crypto_manager.public_key_b64,
+                        'capabilities': self._api_v1_capabilities_payload(),
+                    },
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 log_info(

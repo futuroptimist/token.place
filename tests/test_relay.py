@@ -3334,3 +3334,98 @@ def test_api_v1_terminal_records_are_pruned_without_retrieve(client, monkeypatch
 
     assert diagnostics.status_code == 200
     assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def _capabilities(tier, *, models=None, backend="metal"):
+    tokens = 65536 if tier == "64k-full" else 8192
+    return {
+        "api_version": "v1",
+        "supported_model_ids": models or ["llama-3-8b-instruct"],
+        "active_context_tier": tier,
+        "max_total_context_tokens": tokens,
+        "default_output_token_reservation": 1024,
+        "max_output_token_reservation": 1024,
+        "max_concurrency": 1,
+        "backend_class": backend,
+        "hostname": "must-not-store",
+        "raw_vram_gb": 24,
+    }
+
+
+def _register_api_v1_capable_server(client, key, tier="8k-fast", *, models=None):
+    response = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": key, "capabilities": _capabilities(tier, models=models)},
+    )
+    assert response.status_code == 200
+    return response
+
+
+def test_api_v1_register_accepts_8k_and_64k_capabilities(client):
+    _register_api_v1_capable_server(client, "node-8k", "8k-fast")
+    _register_api_v1_capable_server(client, "node-64k", "64k-full")
+
+    assert known_servers["node-8k"]["capabilities"]["active_context_tier"] == "8k-fast"
+    assert known_servers["node-64k"]["capabilities"]["max_total_context_tokens"] == 65536
+
+
+def test_api_v1_register_rejects_malformed_capabilities_without_storing(client):
+    response = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": "bad-node", "capabilities": {"active_context_tier": "64k-full"}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_capabilities"
+    assert "bad-node" not in known_servers
+
+
+def test_api_v1_old_node_defaults_to_8k_fast_compatibility(client):
+    _register_api_v1_server(client, "old-node")
+
+    payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert payload["server_public_key"] == "old-node"
+    assert payload["selected_context_tier"] == "8k-fast"
+    assert payload["selected_context_window_tokens"] == 8192
+
+
+def test_api_v1_tier_selection_and_64k_fallback(client):
+    _register_api_v1_capable_server(client, "node-8k", "8k-fast")
+    _register_api_v1_capable_server(client, "node-64k", "64k-full")
+
+    assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == "node-8k"
+    assert client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()["server_public_key"] == "node-64k"
+
+    known_servers.pop("node-8k")
+    relay_module.server_round_robin_next_index = 0
+    fallback = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert fallback["server_public_key"] == "node-64k"
+
+
+def test_api_v1_64k_request_never_selects_8k_and_reports_no_match(client):
+    _register_api_v1_capable_server(client, "node-8k", "8k-fast")
+
+    response = client.get("/api/v1/relay/servers/next?context_tier=64k-full")
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "no_matching_compute_node"
+
+
+def test_api_v1_next_filters_by_model_and_round_robins_eligible_nodes(client):
+    _register_api_v1_capable_server(client, "node-a", "8k-fast", models=["model-a"])
+    _register_api_v1_capable_server(client, "node-b", "8k-fast", models=["model-b"])
+    _register_api_v1_capable_server(client, "node-c", "8k-fast", models=["model-b"])
+
+    assert client.get("/api/v1/relay/servers/next?model=model-b").get_json()["server_public_key"] == "node-b"
+    assert client.get("/api/v1/relay/servers/next?model=model-b").get_json()["server_public_key"] == "node-c"
+    assert client.get("/api/v1/relay/servers/next?model=model-b").get_json()["server_public_key"] == "node-b"
+
+
+def test_api_v1_diagnostics_include_normalized_redacted_capabilities(client):
+    _register_api_v1_capable_server(client, "node-8k", "8k-fast")
+
+    response = client.get("/relay/diagnostics")
+    assert response.headers["Cache-Control"] == "no-store"
+    capabilities = response.get_json()["api_v1_registered_compute_nodes"][0]["capabilities"]
+    assert capabilities == known_servers["node-8k"]["capabilities"]
+    assert "hostname" not in capabilities
+    assert "raw_vram_gb" not in capabilities

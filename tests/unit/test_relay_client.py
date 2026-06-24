@@ -3976,3 +3976,24 @@ def test_api_v1_valid_request_succeeds_immediately_after_rejected_request():
     assert rejected["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
     assert accepted["api_v1_response"]["message"]["content"] == "ok"
     manager.runtime.create_chat_completion.assert_called_once()
+
+
+def test_extract_api_v1_request_payload_defaults_and_validates_encrypted_routing_context_tier():
+    from utils.networking.relay_client import _extract_api_v1_request_payload
+
+    base = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "request_id": "req-routing",
+        "client_public_key": "client-key",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [],
+            "options": {},
+        },
+    }
+
+    assert _extract_api_v1_request_payload(base, "client-key")["routing"] == {"context_tier": "8k-fast"}
+    base["api_v1_request"]["routing"] = {"context_tier": "64k-full"}
+    assert _extract_api_v1_request_payload(base, "client-key")["routing"] == {"context_tier": "64k-full"}
+    base["api_v1_request"]["routing"] = {"context_tier": "128k-private"}
+    assert _extract_api_v1_request_payload(base, "client-key") is None

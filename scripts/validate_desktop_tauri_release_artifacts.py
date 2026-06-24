@@ -7,6 +7,8 @@ import json
 import os
 import platform
 import plistlib
+import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -74,6 +76,125 @@ def _run_with_retries(
     _fail(_format_command_failure(cmd, last_result))
 
 
+def _run_best_effort(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(
+            f"::warning::Best-effort command failed ({' '.join(cmd)}):\n"
+            f"{result.stdout}\n{result.stderr}".strip()
+        )
+    return result
+
+
+def _redact_hdiutil_info(info: str) -> str:
+    home = str(Path.home())
+    if home and home != "/":
+        info = info.replace(home, "~")
+    return re.sub(r"/private/var/folders/[^\s]+", "/private/var/folders/<redacted>", info)
+
+
+def _hdiutil_info_snapshot() -> str:
+    result = subprocess.run(["hdiutil", "info"], check=False, capture_output=True, text=True)
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    if result.returncode != 0:
+        return f"hdiutil info failed with exit code {result.returncode}:\n{_redact_hdiutil_info(output)}"
+    return _redact_hdiutil_info(output)
+
+
+def _matching_hdiutil_devices(dmg_path: Path, info: str) -> list[str]:
+    devices: list[str] = []
+    resolved = str(dmg_path.resolve())
+    raw = str(dmg_path)
+    for block in re.split(r"\n\s*\n", info):
+        if resolved not in block and raw not in block and dmg_path.name not in block:
+            continue
+        devices.extend(re.findall(r"/dev/disk\S+", block))
+    return list(dict.fromkeys(devices))
+
+
+def _cleanup_dmg_attach_state(dmg_path: Path, mount_dir: Path) -> str:
+    if mount_dir.exists():
+        _run_best_effort(["hdiutil", "detach", str(mount_dir)])
+    info = _hdiutil_info_snapshot()
+    for device in _matching_hdiutil_devices(dmg_path, info):
+        _run_best_effort(["hdiutil", "detach", device])
+    shutil.rmtree(mount_dir, ignore_errors=True)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    return info
+
+
+def _is_transient_hdiutil_attach_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    transient_markers = (
+        "resource temporarily unavailable",
+        "resource busy",
+        "device busy",
+        "is busy",
+        "already attached",
+        "already mounted",
+        "couldn't open helper",
+        "diskimages-helper",
+    )
+    return any(marker in output for marker in transient_markers)
+
+
+def _attach_dmg_with_retries(
+    dmg_path: Path,
+    *,
+    attempts: int = 8,
+    delay_seconds: float = 2.0,
+    max_delay_seconds: float = 15.0,
+) -> tempfile.TemporaryDirectory[str]:
+    last_result: subprocess.CompletedProcess[str] | None = None
+    mount_dirs: list[str] = []
+    last_info = ""
+    temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
+
+    for attempt in range(1, attempts + 1):
+        temp_dir = tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-")
+        temp_dirs.append(temp_dir)
+        mount_dir = Path(temp_dir.name)
+        mount_dirs.append(str(mount_dir))
+        last_info = _cleanup_dmg_attach_state(dmg_path, mount_dir)
+        cmd = ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", str(mount_dir), str(dmg_path)]
+        print(f"Attaching DMG {dmg_path} at {mount_dir} (attempt {attempt}/{attempts}).")
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            for old_temp_dir in temp_dirs[:-1]:
+                old_temp_dir.cleanup()
+            return temp_dir
+
+        last_result = result
+        if attempt >= attempts or not _is_transient_hdiutil_attach_failure(result):
+            last_info = _cleanup_dmg_attach_state(dmg_path, mount_dir)
+            break
+
+        last_info = _cleanup_dmg_attach_state(dmg_path, mount_dir)
+        retry_delay = min(delay_seconds * (2 ** (attempt - 1)), max_delay_seconds)
+        print(
+            f"::warning::hdiutil attach failed with a transient disk image error for {dmg_path} "
+            f"at {mount_dir}; retrying attempt {attempt + 1}/{attempts} after {retry_delay:g}s.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip()
+        )
+        temp_dir.cleanup()
+        temp_dirs.pop()
+        time.sleep(retry_delay)
+
+    for temp_dir in temp_dirs:
+        temp_dir.cleanup()
+    if last_result is None:
+        _fail(f"hdiutil attach failed for {dmg_path}: no attempts were run")
+    details = [
+        f"hdiutil attach failed for DMG: {dmg_path}",
+        f"mountpoints attempted: {mount_dirs}",
+        f"attach attempts: {len(mount_dirs)}/{attempts}",
+        f"last stdout:\n{last_result.stdout}",
+        f"last stderr:\n{last_result.stderr}",
+        f"redacted hdiutil info snapshot:\n{last_info}",
+    ]
+    _fail("\n".join(details))
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -93,12 +214,9 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
-    with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:
-        _run_with_retries(
-            ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount_dir, str(dmg_path)],
-            attempts=8,
-            retry_messages=("Resource temporarily unavailable", "Resource busy"),
-        )
+    mount_temp_dir = _attach_dmg_with_retries(dmg_path)
+    mount_dir = mount_temp_dir.name
+    try:
         try:
             root = Path(mount_dir)
             apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")
@@ -119,7 +237,9 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
             elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
                 _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
         finally:
-            _run(["hdiutil", "detach", mount_dir])
+            _run_best_effort(["hdiutil", "detach", mount_dir])
+    finally:
+        mount_temp_dir.cleanup()
 
 
 def main() -> None:

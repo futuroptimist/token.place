@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 WORKFLOW = Path('.github/workflows/desktop-release.yml')
@@ -260,42 +261,31 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     )
     dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg_path.write_bytes(b'dmg')
-    attach_calls = []
     detach_calls = []
+    cleaned = []
 
-    class FakeTemporaryDirectory:
-        def __init__(self, *, prefix):
-            assert prefix == 'token-place-dmg-mount-'
+    class FakeMountTemporaryDirectory:
+        name = str(mount_dir)
 
-        def __enter__(self):
-            return str(mount_dir)
+        def cleanup(self):
+            cleaned.append(self.name)
 
-        def __exit__(self, *args):
-            return False
+    def fake_attach(dmg):
+        assert dmg == dmg_path
+        return FakeMountTemporaryDirectory()
 
-    def fake_run_with_retries(cmd, *, attempts, retry_messages):
-        attach_calls.append((cmd, attempts, retry_messages))
-        return '/dev/disk4'
-
-    def fake_run(cmd):
+    def fake_run_best_effort(cmd):
         detach_calls.append(cmd)
-        return ''
+        return subprocess.CompletedProcess(cmd, 0, '', '')
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
-    monkeypatch.setattr(validator, '_run_with_retries', fake_run_with_retries)
-    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
+    monkeypatch.setattr(validator, '_run_best_effort', fake_run_best_effort)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
-    assert attach_calls == [
-        (
-            ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            8,
-            ('Resource temporarily unavailable', 'Resource busy'),
-        )
-    ]
     assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert cleaned == [str(mount_dir)]
 
 
 def test_validator_run_formats_command_failures(monkeypatch) -> None:
@@ -318,3 +308,88 @@ def test_validator_run_formats_command_failures(monkeypatch) -> None:
     assert 'Command failed (codesign --verify example.app)' in message
     assert 'stdout detail' in message
     assert 'stderr detail' in message
+
+
+def test_validator_attach_retries_with_fresh_mountpoints_and_cleanup(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_roots = [tmp_path / 'mount-1', tmp_path / 'mount-2']
+    cleanup_calls = []
+    run_calls = []
+    sleeps = []
+
+    class FakeTemporaryDirectory:
+        counter = 0
+
+        def __init__(self, *, prefix):
+            assert prefix == 'token-place-dmg-mount-'
+            self.name = str(mount_roots[FakeTemporaryDirectory.counter])
+            FakeTemporaryDirectory.counter += 1
+            Path(self.name).mkdir()
+
+        def cleanup(self):
+            cleanup_calls.append(self.name)
+
+    def fake_cleanup(path, mount_dir):
+        cleanup_calls.append(f'cleanup-state:{mount_dir}')
+        return f'image-path: {path}\n/dev/disk9s1 Apple_HFS'
+
+    def fake_run(cmd, *, check, capture_output, text):
+        run_calls.append(cmd)
+        if len(run_calls) == 1:
+            return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - Resource temporarily unavailable')
+        return subprocess.CompletedProcess(cmd, 0, '/dev/disk4', '')
+
+    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator.time, 'sleep', sleeps.append)
+
+    temp_dir = validator._attach_dmg_with_retries(dmg_path, attempts=3, delay_seconds=0.01)
+
+    assert temp_dir.name == str(mount_roots[1])
+    assert [call[5] for call in run_calls] == [str(mount_roots[0]), str(mount_roots[1])]
+    assert f'cleanup-state:{mount_roots[0]}' in cleanup_calls
+    assert str(mount_roots[0]) in cleanup_calls
+    assert sleeps == [0.01]
+    temp_dir.cleanup()
+
+
+def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount-1'
+    run_calls = []
+
+    class FakeTemporaryDirectory:
+        def __init__(self, *, prefix):
+            self.name = str(mount_dir)
+            mount_dir.mkdir()
+
+        def cleanup(self):
+            pass
+
+    def fake_cleanup(path, _mount_dir):
+        return 'hdiutil info snapshot'
+
+    def fake_run(cmd, *, check, capture_output, text):
+        run_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, 'attach stdout', 'permission denied')
+
+    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    try:
+        validator._attach_dmg_with_retries(dmg_path, attempts=3, delay_seconds=0.01)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected non-transient attach failure to exit')
+
+    assert len(run_calls) == 1
+    assert 'attach attempts: 1/3' in message
+    assert 'permission denied' in message
+    assert 'redacted hdiutil info snapshot' in message

@@ -490,6 +490,7 @@ known_servers = {}
 server_round_robin_lock = threading.RLock()
 server_round_robin_next_index = 0
 api_v1_filtered_round_robin_next_positions: dict[tuple[str, ...], int] = {}
+API_V1_SELECTION_POLICY = "best_fit_smallest_capable_least_loaded_v1"
 API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
 client_responses = {}
@@ -670,6 +671,118 @@ def _context_tier_can_satisfy(active_tier: Any, requested_tier: str) -> bool:
         return False
     return CONTEXT_TIER_ORDER.get(active_tier, 0) >= CONTEXT_TIER_ORDER[requested_tier]
 
+
+def _api_v1_queue_depth(server_public_key: str) -> int:
+    queued = client_inference_requests.get(server_public_key, [])
+    return len(queued) if isinstance(queued, list) else 0
+
+
+def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: float | None = None) -> int:
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    in_flight = payload.get("api_v1_in_flight_requests")
+    if not isinstance(in_flight, dict):
+        legacy_until = payload.get("api_v1_in_flight_until_monotonic")
+        return int(isinstance(legacy_until, (int, float)) and legacy_until > now)
+    active = 0
+    for entry in in_flight.values():
+        expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+        if isinstance(expires_at, (int, float)) and expires_at > now:
+            active += 1
+    return active
+
+
+def _api_v1_load_score(*, queue_depth: int, in_flight_count: int, max_concurrency: int = 1) -> float:
+    concurrency = max_concurrency if isinstance(max_concurrency, int) and not isinstance(max_concurrency, bool) else 1
+    concurrency = max(concurrency, 1)
+    return round((queue_depth + in_flight_count) / concurrency, 6)
+
+
+def _api_v1_scheduler_candidate(
+    server_public_key: str,
+    payload: dict[str, Any],
+    *,
+    requested_model: str | None,
+    requested_context_tier: str,
+    registration_index: int,
+    now_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    if not bool(payload.get(API_V1_SERVER_MARKER)):
+        return None
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    active_tier = capabilities.get("active_context_tier")
+    if not _context_tier_can_satisfy(active_tier, requested_context_tier):
+        return None
+    supported_models = capabilities.get("supported_model_ids")
+    if not isinstance(supported_models, list) or not supported_models:
+        return None
+    if requested_model and requested_model not in supported_models:
+        return None
+    max_concurrency = capabilities.get("max_concurrency", 1)
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
+        return None
+    queue_depth = _api_v1_queue_depth(server_public_key)
+    in_flight_count = _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic)
+    if in_flight_count >= max_concurrency:
+        return None
+    tier_tokens = CONTEXT_TIER_ORDER.get(active_tier)
+    if tier_tokens is None:
+        return None
+    return {
+        "server_public_key": server_public_key,
+        "payload": payload,
+        "capabilities": capabilities,
+        "active_context_tier": active_tier,
+        "tier_tokens": tier_tokens,
+        "queue_depth": queue_depth,
+        "in_flight_count": in_flight_count,
+        "max_concurrency": max_concurrency,
+        "load_score": _api_v1_load_score(
+            queue_depth=queue_depth,
+            in_flight_count=in_flight_count,
+            max_concurrency=max_concurrency,
+        ),
+        "registration_index": registration_index,
+    }
+
+
+def _api_v1_select_best_fit_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    requested_context_tier: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    eligible_tier_counts: dict[str, int] = {}
+    for candidate in candidates:
+        tier = candidate["active_context_tier"]
+        eligible_tier_counts[tier] = eligible_tier_counts.get(tier, 0) + 1
+    if not candidates:
+        return None, {
+            "eligible_count": 0,
+            "eligible_tier_counts": eligible_tier_counts,
+            "selection_policy": API_V1_SELECTION_POLICY,
+        }
+    selected_tier_tokens = min(candidate["tier_tokens"] for candidate in candidates)
+    tier_group = [candidate for candidate in candidates if candidate["tier_tokens"] == selected_tier_tokens]
+    min_load = min(candidate["load_score"] for candidate in tier_group)
+    tied = [candidate for candidate in tier_group if candidate["load_score"] == min_load]
+    tie_key = tuple(candidate["server_public_key"] for candidate in tied)
+    next_position = api_v1_filtered_round_robin_next_positions.get(tie_key, 0) % len(tied)
+    selected = sorted(tied, key=lambda candidate: candidate["registration_index"])[next_position]
+    api_v1_filtered_round_robin_next_positions[tie_key] = (next_position + 1) % len(tied)
+    requested_tokens = CONTEXT_TIER_ORDER[requested_context_tier]
+    spillover = selected["tier_tokens"] > requested_tokens
+    reason = None
+    if spillover:
+        reason = "no_smaller_healthy_unsaturated_eligible_node"
+    return selected, {
+        "eligible_count": len(candidates),
+        "eligible_tier_counts": eligible_tier_counts,
+        "selection_policy": API_V1_SELECTION_POLICY,
+        "spillover": spillover,
+        "spillover_reason": reason,
+    }
+
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
     if not queued_requests:
@@ -761,6 +874,14 @@ def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
             "next_ping_in_x_seconds": payload.get("last_ping_duration"),
             "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+            "in_flight_count": _api_v1_active_in_flight_count(payload) if bool(payload.get(API_V1_SERVER_MARKER)) else 0,
+            "load_score": _api_v1_load_score(
+                queue_depth=_api_v1_queue_depth(server_public_key),
+                in_flight_count=_api_v1_active_in_flight_count(payload) if bool(payload.get(API_V1_SERVER_MARKER)) else 0,
+                max_concurrency=(payload.get("capabilities") or {}).get("max_concurrency", 1)
+                if isinstance(payload.get("capabilities"), dict)
+                else 1,
+            ) if bool(payload.get(API_V1_SERVER_MARKER)) else len(client_inference_requests.get(server_public_key, [])),
             "capabilities": payload.get("capabilities"),
         })
     diagnostics.sort(key=lambda node: node["server_public_key"])
@@ -1108,58 +1229,43 @@ def _legacy_route_deprecated_response(route_name: str):
 
 
 def _select_round_robin_server_key(*, model: str | None = None, context_tier: str = DEFAULT_CONTEXT_TIER) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
-    """Select and snapshot the next API v1 compute node in registration-order round-robin order."""
+    """Select and snapshot the best-fit API v1 compute node without inspecting payload content."""
 
-    global server_round_robin_next_index
     with server_round_robin_lock:
         all_api_v1_keys = _api_v1_round_robin_keys()
-        ordered_keys = []
         requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
-        for server_public_key in all_api_v1_keys:
+        now_monotonic = time.monotonic()
+        candidates = []
+        for registration_index, server_public_key in enumerate(all_api_v1_keys):
             payload = known_servers.get(server_public_key, {})
-            capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
-            if not isinstance(capabilities, dict):
+            if not isinstance(payload, dict):
                 continue
-            if requested_model and requested_model not in capabilities.get("supported_model_ids", []):
-                continue
-            if not _context_tier_can_satisfy(capabilities.get("active_context_tier"), context_tier):
-                continue
-            ordered_keys.append(server_public_key)
-        registered_count = len(all_api_v1_keys)
-        current_index = server_round_robin_next_index % registered_count if registered_count else 0
-        if not ordered_keys:
-            return None, {
-                "eligible_count": 0,
-                "registered_api_v1_count": registered_count,
-                "round_robin_index": current_index,
-                "round_robin_position": None,
-            }, None
+            candidate = _api_v1_scheduler_candidate(
+                server_public_key,
+                payload,
+                requested_model=requested_model,
+                requested_context_tier=context_tier,
+                registration_index=registration_index,
+                now_monotonic=now_monotonic,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
 
-        eligible_count = len(ordered_keys)
-        eligible_key = tuple(ordered_keys)
-        if eligible_key in api_v1_filtered_round_robin_next_positions:
-            selected_eligible_index = (
-                api_v1_filtered_round_robin_next_positions[eligible_key] % eligible_count
-            )
-        else:
-            selected_eligible_index = next(
-                ordered_keys.index(all_api_v1_keys[(current_index + index) % registered_count])
-                for index in range(registered_count)
-                if all_api_v1_keys[(current_index + index) % registered_count] in ordered_keys
-            )
-        server_public_key = ordered_keys[selected_eligible_index]
-        selected_global_index = all_api_v1_keys.index(server_public_key)
+        selected, selection = _api_v1_select_best_fit_candidate(
+            candidates,
+            requested_context_tier=context_tier,
+        )
+        selection["registered_api_v1_count"] = len(all_api_v1_keys)
+        if selected is None:
+            return None, selection, None
+        server_public_key = selected["server_public_key"]
         server_payload = dict(known_servers[server_public_key])
-        api_v1_filtered_round_robin_next_positions[eligible_key] = (
-            selected_eligible_index + 1
-        ) % eligible_count
-        server_round_robin_next_index = (selected_global_index + 1) % registered_count
-        return server_public_key, {
-            "eligible_count": eligible_count,
-            "round_robin_index": server_round_robin_next_index,
-            "round_robin_position": selected_eligible_index,
-        }, server_payload
-
+        selection.update({
+            "selected_queue_depth": selected["queue_depth"],
+            "selected_in_flight_count": selected["in_flight_count"],
+            "selected_load_score": selected["load_score"],
+        })
+        return server_public_key, selection, server_payload
 
 def _select_next_server_payload(*, api_v1: bool = False):
     global server_round_robin_next_index
@@ -1196,9 +1302,11 @@ def _select_next_server_payload(*, api_v1: bool = False):
                 'error': {
                     'message': 'Registered compute nodes are available, but none match the requested model/context tier.',
                     'code': 'no_matching_compute_node',
-                    'selection_policy': 'registration_order_round_robin_with_capability_filter',
+                    'selection_policy': API_V1_SELECTION_POLICY,
                     'requested_context_tier': context_tier,
                     'requested_model': model,
+                    'eligible_node_count': selection.get('eligible_count', 0),
+                    'eligible_tier_counts': selection.get('eligible_tier_counts', {}),
                 }
             }), 503
         return jsonify({
@@ -1212,10 +1320,13 @@ def _select_next_server_payload(*, api_v1: bool = False):
         "relay.server_selected",
         extra={
             "server_fingerprint": _safe_key_fingerprint(server_public_key),
-            "selection_policy": "registration_order_round_robin_with_capability_filter",
-            "round_robin_index": selection.get("round_robin_index"),
-            "round_robin_position": selection.get("round_robin_position"),
+            "selection_policy": API_V1_SELECTION_POLICY,
+            "requested_context_tier": context_tier,
+            "requested_model": model,
             "eligible_count": selection.get("eligible_count"),
+            "selected_context_tier": (server_payload.get("capabilities") or {}).get("active_context_tier"),
+            "selected_load_score": selection.get("selected_load_score"),
+            "spillover": bool(selection.get("spillover")),
             "evicted_stale_count": len(evicted),
             "api_v1": api_v1,
         },
@@ -1223,10 +1334,18 @@ def _select_next_server_payload(*, api_v1: bool = False):
     capabilities = server_payload.get("capabilities") if isinstance(server_payload, dict) else {}
     return jsonify({
         'server_public_key': server_payload['public_key'],
+        'requested_context_tier': context_tier,
         'selected_context_tier': capabilities.get("active_context_tier"),
         'selected_context_window_tokens': capabilities.get("maximum_total_context_tokens"),
         'selected_model_support': capabilities.get("supported_model_ids", []),
-        'selection_policy': 'registration_order_round_robin_with_capability_filter',
+        'selection_policy': API_V1_SELECTION_POLICY,
+        'eligible_node_count': selection.get("eligible_count", 0),
+        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
+        'selected_queue_depth': selection.get("selected_queue_depth", 0),
+        'selected_in_flight_count': selection.get("selected_in_flight_count", 0),
+        'selected_load_score': selection.get("selected_load_score", 0),
+        'spillover': bool(selection.get("spillover")),
+        **({"spillover_reason": selection.get("spillover_reason")} if selection.get("spillover_reason") else {}),
     })
 
 @app.route('/next_server', methods=['GET'])

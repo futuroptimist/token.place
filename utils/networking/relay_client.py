@@ -524,8 +524,9 @@ class RelayClient:
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant"}
     _API_V1_MAX_MESSAGES = 64
-    _API_V1_MAX_MESSAGE_CONTENT_CHARS = 32768
     _API_V1_MAX_TEXT_BLOCKS = 32
+    # Aggregate plaintext content ceiling for abuse/transport safety only.
+    # Exact llama.cpp tokenization below remains authoritative for context fit.
     _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
@@ -1888,38 +1889,69 @@ class RelayClient:
         return None
 
     @classmethod
-    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
-        if (
-            not isinstance(messages, list)
-            or not messages
-            or len(messages) > cls._API_V1_MAX_MESSAGES
-        ):
-            return False
+    def _api_v1_chat_validation_result(cls, messages: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "valid": False,
+            "code": "compute_node_invalid_request",
+            "reason": "invalid_messages",
+            "message_count": len(messages) if isinstance(messages, list) else 0,
+            "message_index": None,
+            "message_content_chars": None,
+            "total_content_chars": 0,
+            "maximum_total_content_chars": cls._API_V1_MAX_TOTAL_REQUEST_CHARS,
+        }
+        if not isinstance(messages, list) or not messages:
+            return result
+        if len(messages) > cls._API_V1_MAX_MESSAGES:
+            result["reason"] = "too_many_messages"
+            return result
+
         total_content_chars = 0
-        for message in messages:
+        for index, message in enumerate(messages):
+            result["message_index"] = index
             if not isinstance(message, dict):
-                return False
+                result["reason"] = "message_not_object"
+                return result
             allowed_keys = {"role", "content", "name"}
             if set(message) - allowed_keys:
-                return False
+                result["reason"] = "unknown_message_keys"
+                return result
             role = message.get("role")
             if (
                 not isinstance(role, str)
                 or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES
             ):
-                return False
+                result["reason"] = "invalid_role"
+                return result
             name = message.get("name")
             if name is not None and (not isinstance(name, str) or len(name) > 128):
-                return False
+                result["reason"] = "invalid_name"
+                return result
             if "content" not in message:
-                return False
+                result["reason"] = "missing_content"
+                return result
             content_size = cls._api_v1_content_validation_size(message.get("content"))
             if content_size is None:
-                return False
+                result["reason"] = "invalid_content"
+                return result
+            result["message_content_chars"] = content_size
             total_content_chars += content_size
+            result["total_content_chars"] = total_content_chars
             if total_content_chars > cls._API_V1_MAX_TOTAL_REQUEST_CHARS:
-                return False
-        return True
+                result["code"] = "compute_node_request_too_large"
+                result["reason"] = "total_content_chars_exceeded"
+                return result
+
+        result["valid"] = True
+        result["code"] = None
+        result["reason"] = None
+        result["message_index"] = None
+        result["message_content_chars"] = None
+        return result
+
+    @classmethod
+    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
+        return bool(cls._api_v1_chat_validation_result(messages)["valid"])
 
     @staticmethod
     def _api_v1_stringify_content_blocks(content: Any) -> Any:
@@ -2296,8 +2328,6 @@ class RelayClient:
     @classmethod
     def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
         if isinstance(content, str):
-            if len(content) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS:
-                return None
             return len(content)
         if (
             not isinstance(content, list)
@@ -2316,11 +2346,6 @@ class RelayClient:
             if not isinstance(text, str) or not text:
                 return None
             total += len(text)
-            if (
-                len(text) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-                or total > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-            ):
-                return None
         return total
 
     @staticmethod
@@ -2651,14 +2676,41 @@ class RelayClient:
             "recovery_succeeded": False,
         }
 
-        if not self._messages_are_valid_api_v1_chat(messages):
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
+        validation = self._api_v1_chat_validation_result(messages)
+        if not validation["valid"]:
+            safe_error_code = validation["code"] or "compute_node_invalid_request"
+            log_info(
+                (
+                    "api_v1.chat_validation result=rejected safe_error_code={} "
+                    "reason={} message_count={} message_index={} "
+                    "message_content_chars={} total_content_chars={} "
+                    "maximum_total_content_chars={}"
+                ),
+                safe_error_code,
+                validation["reason"],
+                validation["message_count"],
+                validation["message_index"],
+                validation["message_content_chars"],
+                validation["total_content_chars"],
+                validation["maximum_total_content_chars"],
+            )
+            error: Dict[str, Any]
+            if safe_error_code == "compute_node_request_too_large":
+                error = {
+                    "code": "compute_node_request_too_large",
+                    "type": "request_too_large",
+                    "message": "Request message content exceeds the API v1 safety limit",
+                    "message_count": validation["message_count"],
+                    "total_content_chars": validation["total_content_chars"],
+                    "maximum_total_content_chars": validation["maximum_total_content_chars"],
+                    "retryable": False,
+                }
+            else:
+                error = {
                     "code": "compute_node_invalid_request",
                     "message": "Invalid chat message format",
-                },
-            )
+                }
+            return self._api_v1_response_envelope(request_id, error=error)
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
         recovery_completion = getattr(

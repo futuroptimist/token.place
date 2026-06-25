@@ -2138,6 +2138,8 @@ class ComputeNodeRuntime:
             '/tmp/model.gguf',
             '--mode',
             'auto',
+            '--context-tier',
+            'unknown',
             '--relay-url',
             'https://token.place',
         ],
@@ -2159,7 +2161,8 @@ class ComputeNodeRuntime:
 
     assert proc.returncode == 0, stderr
     events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
-    assert any(event.get('type') == 'started' for event in events)
+    started = next(event for event in events if event.get('type') == 'started')
+    assert started.get('context_tier') == '8k-fast'
     assert any(event.get('type') == 'stopped' for event in events)
     assert "No module named 'utils'" not in stdout
 
@@ -2227,33 +2230,54 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     assert 'model_path' not in payload
 
 
-def test_main_normalizes_unknown_context_tier_before_run(monkeypatch):
-    captured = {}
+def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_packages(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    bundled_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    bundled_utils = bundled_root / 'utils'
+    site_packages = tmp_path / 'venv' / 'lib' / 'python3.11' / 'site-packages'
+    site_utils = site_packages / 'utils'
+    python_dir.mkdir(parents=True)
+    bundled_utils.mkdir(parents=True)
+    site_utils.mkdir(parents=True)
 
-    def fake_run(args):
-        captured['context_tier'] = args.context_tier
-        return 0
-
-    monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
-    monkeypatch.setattr(
-        sys,
-        'argv',
-        [
-            'compute_node_bridge.py',
-            '--model',
-            '/tmp/model.gguf',
-            '--mode',
-            'auto',
-            '--context-tier',
-            'unknown',
-        ],
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (bundled_utils / '__init__.py').write_text('', encoding='utf-8')
+    (bundled_utils / 'context_profiles.py').write_text(
+        'SOURCE = "bundled"\n',
+        encoding='utf-8',
+    )
+    (site_utils / '__init__.py').write_text('', encoding='utf-8')
+    (site_utils / 'context_profiles.py').write_text(
+        'SOURCE = "site-packages"\n',
+        encoding='utf-8',
+    )
+    probe = python_dir / 'probe_import.py'
+    probe.write_text(
+        'import json, sys\n'
+        'from path_bootstrap import ensure_runtime_import_paths\n'
+        'ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)\n'
+        'import utils.context_profiles as profiles\n'
+        'print(json.dumps({"source": profiles.SOURCE, "origin": profiles.__file__}))\n',
+        encoding='utf-8',
     )
 
-    assert compute_node_bridge.main() == 0
-    assert captured['context_tier'] == 'unknown'
-    # run() performs the final normalization after expected startup preflights.
-    args = SimpleNamespace(context_tier='unknown')
-    assert compute_node_bridge.normalize_context_tier(args.context_tier) == '8k-fast'
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(site_packages)
+    proc = subprocess.run(
+        [sys.executable, str(probe)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload['source'] == 'bundled'
+    assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

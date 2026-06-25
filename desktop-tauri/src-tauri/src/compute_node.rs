@@ -635,6 +635,17 @@ fn append_operator_log_line(log_sink: &Option<OperatorLogSink>, source: &str, li
     }
 }
 
+fn bridge_session_env_vars(
+    session_id: &str,
+    log_file_path: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut env_vars = vec![("TOKENPLACE_COMPUTE_NODE_SESSION_ID", session_id.to_string())];
+    if let Some(path) = log_file_path {
+        env_vars.push(("TOKENPLACE_OPERATOR_LOG_FILE", path.to_string()));
+    }
+    env_vars
+}
+
 fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line: &str) {
     if let Some(log_file_path) = log_file_path {
         let _ = append_line_to_path(Path::new(log_file_path), source, line);
@@ -935,7 +946,9 @@ pub async fn start_compute_node(
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
-    bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
+    for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
+        bridge_command.env(key, value);
+    }
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -2055,6 +2068,34 @@ mod tests {
         );
         assert_eq!(status.runtime_path, cached_status.runtime_path);
         assert_eq!(status.relay_runtime_path, cached_status.relay_runtime_path);
+    }
+
+    #[test]
+    fn bridge_session_env_vars_include_operator_log_path_when_available() {
+        let env_vars = bridge_session_env_vars("session-1", Some("/tmp/operator.log"));
+
+        assert!(env_vars.contains(&(
+            "TOKENPLACE_COMPUTE_NODE_SESSION_ID",
+            "session-1".to_string()
+        )));
+        assert!(env_vars.contains(&(
+            "TOKENPLACE_OPERATOR_LOG_FILE",
+            "/tmp/operator.log".to_string()
+        )));
+    }
+
+    #[test]
+    fn bridge_session_env_vars_omit_operator_log_path_when_unavailable() {
+        let env_vars = bridge_session_env_vars("session-1", None);
+
+        assert_eq!(env_vars.len(), 1);
+        assert_eq!(
+            env_vars[0],
+            (
+                "TOKENPLACE_COMPUTE_NODE_SESSION_ID",
+                "session-1".to_string()
+            )
+        );
     }
 
     #[test]

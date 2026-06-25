@@ -2,8 +2,8 @@ use crate::backend::ComputeMode;
 use crate::config::normalize_relay_base_urls;
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
-    append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
-    OperatorLogSink,
+    append_line_to_path, read_log_tail, sanitize_operator_diagnostic_line,
+    sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
@@ -511,12 +511,17 @@ fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
 fn bridge_exit_error(
     exit_status: std::process::ExitStatus,
     saw_startup_event: bool,
+    diagnostic_tail: Option<&str>,
 ) -> Option<String> {
     let status_label = bridge_exit_status_label(exit_status);
+    let diagnostic_suffix = diagnostic_tail
+        .and_then(last_compute_node_stderr_diagnostic)
+        .map(|line| format!("; recent diagnostic: {line}"))
+        .unwrap_or_default();
     if !saw_startup_event {
         return Some(format!(
             "compute-node bridge exited with status {status_label} before emitting a startup \
-             event; see desktop.compute_node.stderr logs"
+             event; see desktop.compute_node.stderr logs{diagnostic_suffix}"
         ));
     }
     if exit_status.success() {
@@ -524,8 +529,22 @@ fn bridge_exit_error(
     }
     Some(format!(
         "compute-node bridge exited with status {status_label}; \
-         see desktop.compute_node.stderr logs"
+         see desktop.compute_node.stderr logs{diagnostic_suffix}"
     ))
+}
+
+fn last_compute_node_stderr_diagnostic(tail: &str) -> Option<String> {
+    tail.lines()
+        .rev()
+        .find(|line| line.split_whitespace().nth(1) == Some("desktop.compute_node.stderr"))
+        .map(|line| sanitize_operator_diagnostic_line(line).trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+fn recent_operator_log_tail(log_file_path: Option<&str>) -> Option<String> {
+    log_file_path
+        .and_then(|path| read_log_tail(Path::new(path), 4096).ok())
+        .filter(|tail| !tail.trim().is_empty())
 }
 
 fn finalize_bridge_exit(
@@ -534,6 +553,7 @@ fn finalize_bridge_exit(
     saw_startup_event: bool,
     saw_error_event: bool,
     expected_session_id: &str,
+    fallback_log_file_path: Option<&str>,
 ) -> Option<Value> {
     if status.operator_session_id.as_deref() != Some(expected_session_id) {
         return None;
@@ -552,7 +572,13 @@ fn finalize_bridge_exit(
         status.relay_runtime_state = Some("stopped".into());
     }
 
-    let exit_error = bridge_exit_error(exit_status, saw_startup_event);
+    let should_read_recent_tail = !exit_status.success() || !saw_startup_event;
+    let recent_tail = should_read_recent_tail
+        .then(|| {
+            recent_operator_log_tail(status.log_file_path.as_deref().or(fallback_log_file_path))
+        })
+        .flatten();
+    let exit_error = bridge_exit_error(exit_status, saw_startup_event, recent_tail.as_deref());
     if status.last_error.is_none() {
         status.last_error = exit_error.clone();
     }
@@ -607,6 +633,17 @@ fn append_operator_log_line(log_sink: &Option<OperatorLogSink>, source: &str, li
     if let Some(log_sink) = log_sink {
         log_sink.append_line(source, line);
     }
+}
+
+fn bridge_session_env_vars(
+    session_id: &str,
+    log_file_path: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut env_vars = vec![("TOKENPLACE_COMPUTE_NODE_SESSION_ID", session_id.to_string())];
+    if let Some(path) = log_file_path {
+        env_vars.push(("TOKENPLACE_OPERATOR_LOG_FILE", path.to_string()));
+    }
+    env_vars
 }
 
 fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line: &str) {
@@ -909,7 +946,9 @@ pub async fn start_compute_node(
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
-    bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
+    for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
+        bridge_command.env(key, value);
+    }
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -1107,6 +1146,7 @@ pub async fn start_compute_node(
                 saw_startup_event,
                 saw_error_event,
                 &session_id,
+                log_file_path.as_deref(),
             )
         };
 
@@ -1529,8 +1569,14 @@ mod tests {
             ..ComputeNodeStatus::default()
         };
 
-        let payload =
-            finalize_bridge_exit(&mut status, success_exit_status(), true, true, "session-1");
+        let payload = finalize_bridge_exit(
+            &mut status,
+            success_exit_status(),
+            true,
+            true,
+            "session-1",
+            None,
+        );
 
         assert!(payload.is_none());
         assert!(!status.running);
@@ -2025,6 +2071,34 @@ mod tests {
     }
 
     #[test]
+    fn bridge_session_env_vars_include_operator_log_path_when_available() {
+        let env_vars = bridge_session_env_vars("session-1", Some("/tmp/operator.log"));
+
+        assert!(env_vars.contains(&(
+            "TOKENPLACE_COMPUTE_NODE_SESSION_ID",
+            "session-1".to_string()
+        )));
+        assert!(env_vars.contains(&(
+            "TOKENPLACE_OPERATOR_LOG_FILE",
+            "/tmp/operator.log".to_string()
+        )));
+    }
+
+    #[test]
+    fn bridge_session_env_vars_omit_operator_log_path_when_unavailable() {
+        let env_vars = bridge_session_env_vars("session-1", None);
+
+        assert_eq!(env_vars.len(), 1);
+        assert_eq!(
+            env_vars[0],
+            (
+                "TOKENPLACE_COMPUTE_NODE_SESSION_ID",
+                "session-1".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn startup_failure_status_records_resolver_error_and_not_running() {
         let request = ComputeNodeRequest {
             model_path: "model.gguf".into(),
@@ -2055,7 +2129,7 @@ mod tests {
         let exit_status = success_exit_status();
         assert!(exit_status.success());
 
-        let last_error = bridge_exit_error(exit_status, false);
+        let last_error = bridge_exit_error(exit_status, false, None);
         assert!(last_error.is_some());
         assert!(last_error
             .as_deref()
@@ -2067,7 +2141,56 @@ mod tests {
         let exit_status = success_exit_status();
         assert!(exit_status.success());
 
-        assert!(bridge_exit_error(exit_status, true).is_none());
+        assert!(bridge_exit_error(exit_status, true, None).is_none());
+    }
+
+    #[test]
+    fn bridge_exit_error_includes_recent_stderr_diagnostic_tail() {
+        let exit_status = success_exit_status();
+        let tail = "123 desktop.compute_node.stderr first line\n124 desktop.compute_node.stdout mentions desktop.compute_node.stderr but is ignored\n125 desktop.compute_node.stderr ModuleNotFoundError: No module named 'utils.context_profiles'\n";
+
+        let last_error = bridge_exit_error(exit_status, false, Some(tail))
+            .expect("missing startup event should be an error");
+
+        assert!(last_error.contains("before emitting a startup event"));
+        assert!(last_error.contains("recent diagnostic:"));
+        assert!(last_error.contains("desktop.compute_node.stderr ModuleNotFoundError"));
+        assert!(last_error.contains("utils.context_profiles"));
+        assert!(!last_error.contains("but is ignored"));
+    }
+
+    #[test]
+    fn finalize_bridge_exit_uses_fallback_log_path_before_startup_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("operator.log");
+        std::fs::write(
+            &log_path,
+            "123 desktop.compute_node.stderr ModuleNotFoundError: No module named 'utils.context_profiles'\n",
+        )
+        .expect("write operator log");
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            operator_session_id: Some("current-session".into()),
+            sequence: Some(7),
+            log_file_path: None,
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+
+        finalize_bridge_exit(
+            &mut status,
+            exit_status,
+            false,
+            false,
+            "current-session",
+            Some(log_path.to_string_lossy().as_ref()),
+        )
+        .expect("error payload should be emitted");
+
+        let last_error = status.last_error.as_deref().expect("last error");
+        assert!(last_error.contains("recent diagnostic:"));
+        assert!(last_error.contains("utils.context_profiles"));
     }
 
     #[test]
@@ -2081,9 +2204,15 @@ mod tests {
         };
         let exit_status = success_exit_status();
 
-        let payload =
-            finalize_bridge_exit(&mut status, exit_status, false, false, "current-session")
-                .expect("error payload should be emitted");
+        let payload = finalize_bridge_exit(
+            &mut status,
+            exit_status,
+            false,
+            false,
+            "current-session",
+            None,
+        )
+        .expect("error payload should be emitted");
 
         assert!(!status.running);
         assert!(!status.registered);
@@ -2126,7 +2255,8 @@ mod tests {
         };
         let exit_status = success_exit_status();
 
-        let payload = finalize_bridge_exit(&mut status, exit_status, false, false, "old-session");
+        let payload =
+            finalize_bridge_exit(&mut status, exit_status, false, false, "old-session", None);
 
         assert!(payload.is_none());
         assert!(status.running);
@@ -2151,6 +2281,7 @@ mod tests {
             false,
             false,
             "old-session",
+            None,
         )
         .expect("old session should emit a versioned synthetic error");
         assert_eq!(

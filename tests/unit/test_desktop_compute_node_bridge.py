@@ -1972,7 +1972,12 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert payload["backend_available"] == "pending"
     assert payload["backend_selected"] == "pending"
     assert payload["backend_used"] == "pending"
-    assert payload["model_path"] == "/tmp/model.gguf"
+    assert "model_path" not in payload
+    assert payload["error_code"] == "desktop_compute_node_startup_failed"
+    assert payload["context_tier"] == "8k-fast"
+    assert payload["interpreter"] == sys.executable
+    assert payload["import_root"] == "unknown"
+    assert payload["log_file_path"] == "unknown"
     assert payload["last_error"] == payload["message"]
     assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
     assert payload["warm_load_state"] == "failed"
@@ -2133,6 +2138,8 @@ class ComputeNodeRuntime:
             '/tmp/model.gguf',
             '--mode',
             'auto',
+            '--context-tier',
+            'unknown',
             '--relay-url',
             'https://token.place',
         ],
@@ -2154,10 +2161,170 @@ class ComputeNodeRuntime:
 
     assert proc.returncode == 0, stderr
     events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
-    assert any(event.get('type') == 'started' for event in events)
+    started = next(event for event in events if event.get('type') == 'started')
+    assert started.get('context_tier') == '8k-fast'
     assert any(event.get('type') == 'stopped' for event in events)
     assert "No module named 'utils'" not in stdout
 
+
+def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    utils_dir = import_root / 'utils'
+    python_dir.mkdir(parents=True)
+    utils_dir.mkdir(parents=True)
+
+    (python_dir / 'compute_node_bridge.py').write_text(
+        MODULE_PATH.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'desktop_runtime_setup.py').write_text(
+        'def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):\n    return None\n'
+        'def ensure_desktop_llama_runtime(_mode):\n'
+        '    print("unexpected runtime setup", file=__import__("sys").stderr)\n'
+        '    return {"selected_backend": "cpu"}\n'
+        'def ensure_desktop_python_dependencies(*, repo_root=None):\n    return {"ok": "true"}\n'
+        'def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):\n    return None\n',
+        encoding='utf-8',
+    )
+    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] = str(import_root)
+    env['TOKENPLACE_OPERATOR_LOG_FILE'] = str(tmp_path / 'operator.log')
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(python_dir / 'compute_node_bridge.py'),
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+            '--context-tier',
+            '64k-full',
+            '--relay-url',
+            'https://token.place',
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 1
+    assert "unexpected runtime setup" not in proc.stderr
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get('type') == 'error')
+    assert payload['error_code'] == 'context_profiles_unavailable'
+    assert payload['registered'] is False
+    assert payload['context_tier'] == '64k-full'
+    assert payload['interpreter'] == sys.executable
+    assert payload['import_root'] == str(import_root)
+    assert payload['log_file_path'] == str(tmp_path / 'operator.log')
+    assert 'context profiles unavailable' in payload['message']
+    assert 'model_path' not in payload
+
+
+def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_packages(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    bundled_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    bundled_utils = bundled_root / 'utils'
+    site_packages = tmp_path / 'venv' / 'lib' / 'python3.11' / 'site-packages'
+    site_utils = site_packages / 'utils'
+    python_dir.mkdir(parents=True)
+    bundled_utils.mkdir(parents=True)
+    site_utils.mkdir(parents=True)
+
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (bundled_utils / '__init__.py').write_text('', encoding='utf-8')
+    (bundled_utils / 'context_profiles.py').write_text(
+        'SOURCE = "bundled"\n',
+        encoding='utf-8',
+    )
+    (site_utils / '__init__.py').write_text('', encoding='utf-8')
+    (site_utils / 'context_profiles.py').write_text(
+        'SOURCE = "site-packages"\n',
+        encoding='utf-8',
+    )
+    probe = python_dir / 'probe_import.py'
+    probe.write_text(
+        'import json, sys\n'
+        'from path_bootstrap import ensure_runtime_import_paths\n'
+        'ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)\n'
+        'import utils.context_profiles as profiles\n'
+        'print(json.dumps({"source": profiles.SOURCE, "origin": profiles.__file__}))\n',
+        encoding='utf-8',
+    )
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(site_packages)
+    proc = subprocess.run(
+        [sys.executable, str(probe)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload['source'] == 'bundled'
+    assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
+
+
+def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, capsys):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.context_profiles':
+            raise ModuleNotFoundError("No module named 'utils.context_profiles'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+
+    module = ModuleType('compute_node_bridge_no_context_profiles')
+    module.__file__ = str(MODULE_PATH)
+    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
+    exec(code, module.__dict__)
+
+    args = SimpleNamespace(
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        context_tier='64k-full',
+    )
+    payload = module._structured_startup_error_payload(args, 'context profiles unavailable')
+
+    assert module._CONTEXT_PROFILES_IMPORT_ERROR is not None
+    assert module.normalize_context_tier('unknown') == '8k-fast'
+    assert payload['context_tier'] == '64k-full'
+    assert payload['error_code'] == 'desktop_compute_node_startup_failed'
+    assert 'model_path' not in payload
+    with pytest.raises(RuntimeError, match='context profiles unavailable'):
+        module.get_context_profile('8k-fast')
+    with pytest.raises(RuntimeError, match='context profiles unavailable'):
+        module.apply_context_profile(object(), '8k-fast')
+
+    run_args = SimpleNamespace(
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        context_tier='64k-full',
+    )
+    assert module.run(run_args) == 1
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert emitted['error_code'] == 'context_profiles_unavailable'
+    assert emitted['context_tier'] == '64k-full'
+    assert emitted['registered'] is False
+    assert 'model_path' not in emitted
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

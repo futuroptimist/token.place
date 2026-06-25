@@ -67,10 +67,14 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "compute_node_bridge_timeout" in chat_js
     assert "compute_node_unreachable" in chat_js
     assert "compute_node_invalid_payload" in chat_js
+    assert "compute_node_request_too_large" in chat_js
+    assert "compute_node_context_window_exceeded" in chat_js
     assert "No LLM servers are available right now." in chat_js
     assert "The LLM server took too long to respond. Please try again." in chat_js
     assert "The LLM server is unavailable right now. Please try again." in chat_js
     assert "The LLM server returned an invalid response. Please try again." in chat_js
+    assert "This request exceeds the current API size limit. Please shorten it and try again." in chat_js
+    assert "This prompt exceeds the selected LLM server\\'s context window." in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
 

@@ -14,7 +14,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
@@ -25,6 +25,16 @@ from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, no
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+
+
+class _ApiV1ChatValidationResult(NamedTuple):
+    valid: bool
+    error_code: Optional[str] = None
+    reason: Optional[str] = None
+    message_count: int = 0
+    total_content_chars: int = 0
+    message_index: Optional[int] = None
+    message_content_chars: Optional[int] = None
 
 
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
@@ -524,8 +534,8 @@ class RelayClient:
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant"}
     _API_V1_MAX_MESSAGES = 64
-    _API_V1_MAX_MESSAGE_CONTENT_CHARS = 32768
     _API_V1_MAX_TEXT_BLOCKS = 32
+    # Aggregate plaintext abuse/transport ceiling; exact token admission decides tier fit.
     _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
@@ -1888,38 +1898,68 @@ class RelayClient:
         return None
 
     @classmethod
-    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
-        if (
-            not isinstance(messages, list)
-            or not messages
-            or len(messages) > cls._API_V1_MAX_MESSAGES
-        ):
-            return False
+    def _validate_api_v1_chat_messages(cls, messages: Any) -> _ApiV1ChatValidationResult:
+        if not isinstance(messages, list) or not messages:
+            return _ApiV1ChatValidationResult(
+                False, "compute_node_invalid_request", "messages must be a non-empty list"
+            )
+        message_count = len(messages)
+        if message_count > cls._API_V1_MAX_MESSAGES:
+            return _ApiV1ChatValidationResult(
+                False, "compute_node_invalid_request", "too many messages", message_count
+            )
         total_content_chars = 0
-        for message in messages:
+        for index, message in enumerate(messages):
             if not isinstance(message, dict):
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "message must be an object",
+                    message_count, total_content_chars, index
+                )
             allowed_keys = {"role", "content", "name"}
             if set(message) - allowed_keys:
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "unknown message key",
+                    message_count, total_content_chars, index
+                )
             role = message.get("role")
             if (
                 not isinstance(role, str)
                 or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES
             ):
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "invalid role",
+                    message_count, total_content_chars, index
+                )
             name = message.get("name")
             if name is not None and (not isinstance(name, str) or len(name) > 128):
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "invalid name",
+                    message_count, total_content_chars, index
+                )
             if "content" not in message:
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "missing content",
+                    message_count, total_content_chars, index
+                )
             content_size = cls._api_v1_content_validation_size(message.get("content"))
             if content_size is None:
-                return False
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_invalid_request", "invalid content",
+                    message_count, total_content_chars, index
+                )
             total_content_chars += content_size
             if total_content_chars > cls._API_V1_MAX_TOTAL_REQUEST_CHARS:
-                return False
-        return True
+                return _ApiV1ChatValidationResult(
+                    False, "compute_node_request_too_large", "aggregate content too large",
+                    message_count, total_content_chars, index, content_size
+                )
+        return _ApiV1ChatValidationResult(
+            True, None, None, message_count, total_content_chars
+        )
+
+    @classmethod
+    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
+        return cls._validate_api_v1_chat_messages(messages).valid
 
     @staticmethod
     def _api_v1_stringify_content_blocks(content: Any) -> Any:
@@ -2296,8 +2336,6 @@ class RelayClient:
     @classmethod
     def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
         if isinstance(content, str):
-            if len(content) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS:
-                return None
             return len(content)
         if (
             not isinstance(content, list)
@@ -2316,11 +2354,6 @@ class RelayClient:
             if not isinstance(text, str) or not text:
                 return None
             total += len(text)
-            if (
-                len(text) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-                or total > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-            ):
-                return None
         return total
 
     @staticmethod
@@ -2651,14 +2684,40 @@ class RelayClient:
             "recovery_succeeded": False,
         }
 
-        if not self._messages_are_valid_api_v1_chat(messages):
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
+        message_validation = self._validate_api_v1_chat_messages(messages)
+        if not message_validation.valid:
+            safe_error_code = message_validation.error_code or "compute_node_invalid_request"
+            log_error(
+                (
+                    "API v1 chat validation rejected request: safe_error_code={} "
+                    "reason={} message_count={} message_index={} "
+                    "message_content_chars={} total_content_chars={} "
+                    "maximum_total_content_chars={}"
+                ),
+                safe_error_code,
+                message_validation.reason,
+                message_validation.message_count,
+                message_validation.message_index,
+                message_validation.message_content_chars,
+                message_validation.total_content_chars,
+                self._API_V1_MAX_TOTAL_REQUEST_CHARS,
+            )
+            if safe_error_code == "compute_node_request_too_large":
+                error = {
+                    "code": "compute_node_request_too_large",
+                    "type": "request_too_large",
+                    "message": "API v1 message content exceeds the configured request size limit",
+                    "message_count": message_validation.message_count,
+                    "total_content_chars": message_validation.total_content_chars,
+                    "maximum_total_content_chars": self._API_V1_MAX_TOTAL_REQUEST_CHARS,
+                    "retryable": False,
+                }
+            else:
+                error = {
                     "code": "compute_node_invalid_request",
                     "message": "Invalid chat message format",
-                },
-            )
+                }
+            return self._api_v1_response_envelope(request_id, error=error)
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
         recovery_completion = getattr(

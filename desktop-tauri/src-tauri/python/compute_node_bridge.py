@@ -9,6 +9,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -534,6 +535,20 @@ def _load_context_profile_helpers() -> Tuple[Any, Any]:
     return apply_context_profile, normalize_context_tier
 
 
+
+def _sanitize_context_profile_import_error(exc: BaseException) -> str:
+    """Return bounded, non-sensitive context-profile import failure details."""
+
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    detail = re.sub(
+        r"(?i)\b(model_path|prompt|ciphertext|decrypted|key)\s*=\s*\S+",
+        "<redacted>",
+        detail,
+    )
+    if len(detail) > 240:
+        detail = f"{detail[:237]}..."
+    return detail
+
 def _structured_startup_error_payload(
     args: argparse.Namespace,
     message: str,
@@ -703,7 +718,10 @@ def run(args: argparse.Namespace) -> int:
         apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
     except Exception as exc:
         setattr(args, "startup_error_code", "context_profiles_unavailable")
-        emit_startup_error(f"context profiles unavailable: {exc}")
+        emit_startup_error(
+            "context profiles unavailable: "
+            f"{_sanitize_context_profile_import_error(exc)}"
+        )
         return 1
 
     try:

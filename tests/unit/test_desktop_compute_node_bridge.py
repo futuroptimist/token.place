@@ -2044,7 +2044,15 @@ def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
         + "\n",
         encoding='utf-8',
     )
-    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    repo_utils = Path(__file__).resolve().parents[2] / 'utils'
+    (utils_dir / '__init__.py').write_text(
+        (repo_utils / '__init__.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (utils_dir / 'path_handling.py').write_text(
+        (repo_utils / 'path_handling.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
 SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
@@ -2321,6 +2329,142 @@ def test_context_profile_error_after_dependency_preflight_fails_closed(monkeypat
     assert emitted['registered'] is False
     assert 'model_path' not in emitted
     assert "No module named 'utils.context_profiles'" in emitted['last_error']
+
+
+def test_context_profile_import_error_details_are_sanitized(monkeypatch, capsys):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+
+    sensitive_detail = (
+        "context load failed\n"
+        "model_path=/secret/model.gguf prompt=plaintext decrypted=ciphertext key=abc "
+        + "x" * 400
+    )
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {'ok': 'true', 'import_root': '/runtime'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        lambda: (_ for _ in ()).throw(RuntimeError(sensitive_detail)),
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        relay_port=None,
+        context_tier='64k-full',
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert emitted['error_code'] == 'context_profiles_unavailable'
+    assert emitted['registered'] is False
+    assert '\n' not in emitted['last_error']
+    assert len(emitted['last_error']) <= len('context profiles unavailable: ') + 240
+    assert 'model_path' not in emitted['last_error']
+    assert 'model.gguf' not in emitted['last_error']
+    assert 'prompt' not in emitted['last_error']
+    assert 'plaintext' not in emitted['last_error']
+    assert 'decrypted' not in emitted['last_error']
+    assert 'ciphertext' not in emitted['last_error']
+    assert 'key=abc' not in emitted['last_error']
+
+
+def test_dependency_preflight_failure_does_not_import_context_profiles(monkeypatch, capsys):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    calls = []
+
+    def fake_dependency_preflight():
+        calls.append('dependency_preflight')
+        return {
+            'ok': 'false',
+            'action': 'requirements_missing',
+            'missing': 'cryptography',
+            'interpreter': sys.executable,
+            'import_root': '/runtime',
+            'detail': 'cryptography unavailable',
+        }
+
+    def fail_context_profiles():
+        calls.append('context_profiles')
+        raise AssertionError('context profiles unavailable')
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        fake_dependency_preflight,
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        fail_context_profiles,
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        relay_port=None,
+        context_tier='64k-full',
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert calls == ['dependency_preflight']
+    assert 'desktop runtime dependency preflight failed' in emitted['last_error']
+    assert 'missing=cryptography' in emitted['last_error']
+    assert 'context profiles unavailable' not in emitted['last_error']
+    assert emitted['registered'] is False
+
+
+def test_clean_first_launch_imports_context_profiles_after_dependency_preflight(monkeypatch):
+    _reset_cancel_queue()
+    observed = []
+    real_import = __import__
+    cryptography_available = {'value': False}
+
+    def fake_dependency_preflight():
+        observed.append('dependency_preflight')
+        cryptography_available['value'] = True
+        return {'ok': 'true', 'missing': '', 'action': 'already_satisfied'}
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'cryptography' and not cryptography_available['value']:
+            raise ModuleNotFoundError("No module named 'cryptography'")
+        if name == 'utils.context_profiles':
+            observed.append('context_profiles_import')
+            assert cryptography_available['value'] is True
+        return real_import(name, *args, **kwargs)
+
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        fake_dependency_preflight,
+    )
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        relay_port=None,
+        context_tier='unknown',
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    assert observed[:2] == ['dependency_preflight', 'context_profiles_import']
+    assert args.context_tier == '8k-fast'
 
 
 def test_module_import_does_not_load_context_profiles_before_preflight(monkeypatch):

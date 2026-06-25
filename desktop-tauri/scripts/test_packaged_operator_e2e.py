@@ -643,6 +643,7 @@ def run_compute_bridge_startup_probe(
 
         forbidden_output = (
             "No module named 'cryptography'",
+            "context_profiles_unavailable",
             "ModuleNotFoundError",
             "ImportError",
             "compute-node bridge exited before emitting a startup event",
@@ -1020,7 +1021,6 @@ def main() -> int:
         spaced_tmp_path = tmp_path / "Packaged Layout With Spaces"
         spaced_tmp_path.mkdir(parents=True, exist_ok=True)
         bridge_script = create_packaged_layout(tmp_path)
-        run_desktop_dependency_preflight(tmp_path)
         run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
@@ -1031,7 +1031,6 @@ def main() -> int:
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
-        run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
         run_unified_root_import_policy_probe(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
@@ -1087,6 +1086,10 @@ def main() -> int:
                     relay_port=relay_port,
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
+                )
+                run_desktop_dependency_preflight(
+                    tmp_path,
+                    resources_root=probe_resources_root,
                 )
                 run_operator_log_persistence_probe(
                     tmp_path,

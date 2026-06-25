@@ -4,6 +4,7 @@ Unit tests for the relay client module.
 import base64
 import builtins
 import json
+import logging
 import math
 import pytest
 import sys
@@ -4158,15 +4159,10 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],
-        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
         [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
         [{"role": "user", "content": [{"type": "text", "text": ""}]}],
         [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
         [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
-        [
-            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
-        ]
-        * 5,
     ],
 )
 def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
@@ -4185,6 +4181,83 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     assert error["code"] == "compute_node_invalid_request"
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
+
+
+def test_api_v1_large_string_messages_reach_structural_validation_and_size_cap():
+    assert RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": "x" * 32769}]
+    )
+    assert RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": "x" * 65536}]
+    )
+    assert RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": "x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS}]
+    )
+
+    result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1)}]
+    )
+
+    assert not result.valid
+    assert result.error_code == "compute_node_request_too_large"
+    assert result.total_content_chars == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1
+
+
+def test_api_v1_text_blocks_allow_aggregate_cap_but_preserve_shape_limits():
+    valid_blocks = [
+        {"type": "text", "text": "x" * 20000},
+        {"type": "input_text", "text": "y" * 20000},
+    ]
+    assert RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": valid_blocks}]
+    )
+
+    too_many_blocks = [{"type": "text", "text": "x"}] * (RelayClient._API_V1_MAX_TEXT_BLOCKS + 1)
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": too_many_blocks}]
+    )
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]
+    )
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": [{"type": "unknown", "text": "x"}]}]
+    )
+
+    oversized_blocks = [
+        {"type": "text", "text": "x" * 65536},
+        {"type": "input_text", "text": "y" * 65537},
+    ]
+    result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": oversized_blocks}]
+    )
+    assert not result.valid
+    assert result.error_code == "compute_node_request_too_large"
+
+
+def test_api_v1_oversized_request_returns_specific_safe_error_and_logs(caplog):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    distinctive = "DISTINCTIVE_SECRET_PROMPT"
+    content = distinctive + ("x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS)
+
+    with caplog.at_level(logging.ERROR, logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-too-large",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": content}],
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_request_too_large"
+    assert error["type"] == "request_too_large"
+    assert error["message_count"] == 1
+    assert error["total_content_chars"] == len(content)
+    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["retryable"] is False
+    assert distinctive not in json.dumps(error)
+    assert distinctive not in caplog.text
+    manager.runtime.create_chat_completion.assert_not_called()
 
 
 def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
@@ -4530,6 +4603,41 @@ def test_api_v1_context_admission_exact_64k_boundaries_and_unicode_structured_te
     assert error["prompt_tokens"] == 65536
     assert error["requested_output_tokens"] == 1
     assert error["retryable"] is False
+
+
+def test_api_v1_large_valid_message_reaches_exact_admission_on_8k_and_64k():
+    content = "x" * 9000
+    eight_k_manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=10)
+    eight_k_client = _api_v1_validation_client(eight_k_manager)
+
+    rejected = _admission_envelope(
+        eight_k_client,
+        eight_k_manager,
+        content,
+        options={"max_tokens": 10},
+        requested_tier="8k-fast",
+    )
+
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 9020
+    assert error["requested_output_tokens"] == 10
+    assert error["required_total_tokens"] == 9030
+    assert eight_k_manager.runtime.calls == []
+
+    full_manager = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=10)
+    full_client = _api_v1_validation_client(full_manager)
+
+    accepted = _admission_envelope(
+        full_client,
+        full_manager,
+        content,
+        options={"max_tokens": 10},
+        requested_tier="64k-full",
+    )
+
+    assert accepted["api_v1_response"]["message"]["content"] == "ok"
+    assert full_manager.runtime.calls[-1]["max_tokens"] == 10
 
 
 def test_api_v1_context_overflow_is_request_scoped_and_does_not_restart_worker():

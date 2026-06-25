@@ -328,6 +328,111 @@ def test_api_v1_old_node_compatibility_and_64k_can_satisfy_8k(client):
     assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == full
 
 
+
+def test_api_v1_best_fit_prefers_8k_for_repeated_8k_requests(client):
+    fast = _server_key("best-fit-fast")
+    full = _server_key("best-fit-full")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    payloads = [client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json() for _ in range(4)]
+
+    assert [payload["server_public_key"] for payload in payloads] == [fast] * 4
+    assert {payload["selection_policy"] for payload in payloads} == {relay_module.API_V1_SELECTION_POLICY}
+    assert {payload["spillover"] for payload in payloads} == {False}
+    assert payloads[-1]["eligible_tier_counts"] == {"8k-fast": 1, "64k-full": 1}
+
+
+def test_api_v1_best_fit_64k_requests_never_route_to_8k(client):
+    fast = _server_key("best-fit-64-fast")
+    full = _server_key("best-fit-64-full")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    payloads = [client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json() for _ in range(4)]
+
+    assert [payload["server_public_key"] for payload in payloads] == [full] * 4
+    assert {payload["selected_context_tier"] for payload in payloads} == {"64k-full"}
+
+
+def test_api_v1_best_fit_spillover_when_smaller_tier_unavailable_or_saturated(client, monkeypatch):
+    monkeypatch.setenv(relay_module.API_V1_MAX_QUEUE_DEPTH_ENV, "1")
+    fast = _server_key("spillover-fast")
+    full = _server_key("spillover-full")
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    no_fast_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert no_fast_payload["server_public_key"] == full
+    assert no_fast_payload["spillover"] is True
+    assert no_fast_payload["spillover_reason"] == "no_smaller_eligible_node_available"
+
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    healthy_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert healthy_payload["server_public_key"] == fast
+    assert healthy_payload["spillover"] is False
+
+    _queue_api_v1_request(client, server_public_key=fast, request_id="req-saturate-fast")
+    saturated_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert saturated_payload["server_public_key"] == full
+    assert saturated_payload["spillover"] is True
+
+
+def test_api_v1_best_fit_least_loaded_within_same_tier(client):
+    busy = _server_key("least-loaded-busy")
+    idle = _server_key("least-loaded-idle")
+    for server in (busy, idle):
+        _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
+    _queue_api_v1_request(client, server_public_key=busy, request_id="req-busy-queue")
+
+    payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+
+    assert payload["server_public_key"] == idle
+    assert payload["selected_queue_depth"] == 0
+    assert payload["selected_load_score"] == 0
+
+
+def test_api_v1_best_fit_least_in_flight_within_64k_tier(client):
+    busy = _server_key("least-inflight-busy")
+    idle = _server_key("least-inflight-idle")
+    for server in (busy, idle):
+        _register_api_v1_server_with_capabilities(client, server, _capabilities("64k-full"))
+    known_servers[busy]["capabilities"]["max_concurrency"] = 2
+    known_servers[busy]["api_v1_in_flight_requests"] = {
+        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
+    }
+
+    payload = client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()
+
+    assert payload["server_public_key"] == idle
+    assert payload["selected_in_flight_count"] == 0
+
+
+def test_api_v1_scheduler_helper_uses_only_safe_metadata():
+    payload = {
+        relay_module.API_V1_SERVER_MARKER: True,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 30,
+        "capabilities": _capabilities("8k-fast", ["safe-model"]),
+        "chat_history": "ciphertext-only-not-read",
+        "messages": [{"content": "plaintext-looking-field-must-not-matter"}],
+        "prompt": "must-not-matter",
+    }
+
+    candidate = relay_module._api_v1_scheduler_candidate(
+        "safe-metadata-node",
+        payload,
+        requested_model="safe-model",
+        requested_context_tier="8k-fast",
+        registration_index=0,
+        now_monotonic=time.monotonic(),
+    )
+
+    assert candidate is not None
+    assert candidate["tier"] == "8k-fast"
+    assert "chat_history" not in candidate
+    assert "messages" not in candidate
+    assert "prompt" not in candidate
+
 def test_api_v1_malformed_capabilities_are_rejected_without_registration(client):
     server = _server_key("malformed-cap")
     response = client.post(
@@ -660,6 +765,14 @@ def test_relay_api_v1_source_fails_closed(client):
     assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
 
 
+class _ApiV1TestLlmMixin:
+    @staticmethod
+    def tokenize(prompt, *args, **kwargs):
+        if isinstance(prompt, bytes):
+            prompt = prompt.decode("utf-8")
+        return str(prompt).split()
+
+
 class _RelayClientApiV1CryptoStub:
     def __init__(self, decrypted_payload):
         self.decrypted_payload = decrypted_payload
@@ -678,13 +791,15 @@ class _RelayClientApiV1CryptoStub:
 
 
 def _build_relay_client_for_api_v1_tests(crypto_stub, model_manager=None):
-    return RelayClient(
+    relay_client = RelayClient(
         base_url="https://relay.example",
         port=None,
         crypto_manager=crypto_stub,
         model_manager=model_manager or object(),
         include_configured_servers=False,
     )
+    relay_client._api_v1_authoritative_context_admission = lambda **_kwargs: (True, None, 1)
+    return relay_client
 
 
 def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monkeypatch):
@@ -701,7 +816,7 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
-    class _FakeLlmInstance:
+    class _FakeLlmInstance(_ApiV1TestLlmMixin):
         @staticmethod
         def create_chat_completion(messages, **options):
             captured["messages"] = messages
@@ -895,7 +1010,7 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
 
-    class _FakeLlmInstance:
+    class _FakeLlmInstance(_ApiV1TestLlmMixin):
         @staticmethod
         def create_chat_completion(messages, **_options):
             return {"choices": [{"message": {"role": "assistant", "content": "Paris"}}]}
@@ -1042,7 +1157,7 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
-    class _FakeLlmInstance:
+    class _FakeLlmInstance(_ApiV1TestLlmMixin):
         @staticmethod
         def create_chat_completion(*, messages, **_options):
             return generated_response
@@ -3060,8 +3175,8 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert next_response.get_json()['error']['code'] == 'no_matching_compute_node'
 
     time.sleep(2.1)
     expired = client.get('/api/v1/relay/servers/next')
@@ -3104,6 +3219,8 @@ def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_r
 
     next_response = client.get('/api/v1/relay/servers/next')
     assert next_response.status_code == 503
+
+
 def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
@@ -3141,8 +3258,8 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert next_response.get_json()['error']['code'] == 'no_matching_compute_node'
 
 
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):

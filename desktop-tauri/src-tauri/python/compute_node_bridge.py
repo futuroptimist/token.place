@@ -28,24 +28,9 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
 
-_CONTEXT_PROFILES_IMPORT_ERROR: Optional[BaseException] = None
-try:
-    from utils.context_profiles import (
-        apply_context_profile,
-        get_context_profile,
-        normalize_context_tier,
-    )
-except Exception as exc:  # pragma: no cover - defensive packaged-startup fallback
-    _CONTEXT_PROFILES_IMPORT_ERROR = exc
-
-    def normalize_context_tier(_profile_id: Optional[str]) -> str:  # pragma: no cover
-        return "8k-fast"  # pragma: no cover
-
-    def get_context_profile(_profile_id: Optional[str]) -> object:  # pragma: no cover
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
-
-    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> object:  # pragma: no cover
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
+apply_context_profile: Optional[Any] = None
+get_context_profile: Optional[Any] = None
+normalize_context_tier: Optional[Any] = None
 
 try:
     from desktop_runtime_setup import (
@@ -540,9 +525,34 @@ def _bridge_session_id_from_env() -> str:
 
 def _startup_context_tier(args: argparse.Namespace) -> str:
     raw_context_tier = getattr(args, "context_tier", "8k-fast")
-    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-        return raw_context_tier if isinstance(raw_context_tier, str) and raw_context_tier else "8k-fast"
-    return normalize_context_tier(raw_context_tier)
+    if callable(normalize_context_tier):
+        return normalize_context_tier(raw_context_tier)
+    if isinstance(raw_context_tier, str) and raw_context_tier in {"8k-fast", "64k-full"}:
+        return raw_context_tier
+    return "8k-fast"
+
+
+def _load_context_profile_helpers() -> Tuple[Any, Any, Any]:
+    """Import context profile helpers after dependency preflight has completed."""
+
+    global apply_context_profile, get_context_profile, normalize_context_tier
+    if (
+        callable(apply_context_profile)
+        and callable(get_context_profile)
+        and callable(normalize_context_tier)
+    ):
+        return apply_context_profile, get_context_profile, normalize_context_tier
+
+    from utils.context_profiles import (
+        apply_context_profile as imported_apply_context_profile,
+        get_context_profile as imported_get_context_profile,
+        normalize_context_tier as imported_normalize_context_tier,
+    )
+
+    apply_context_profile = imported_apply_context_profile
+    get_context_profile = imported_get_context_profile
+    normalize_context_tier = imported_normalize_context_tier
+    return apply_context_profile, get_context_profile, normalize_context_tier
 
 
 def _structured_startup_error_payload(
@@ -662,11 +672,6 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
-    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-        setattr(args, "startup_error_code", "context_profiles_unavailable")
-        emit_startup_error(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
-        return 1
-
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -701,6 +706,18 @@ def run(args: argparse.Namespace) -> int:
             f"missing={missing}): {detail}"
         )
         return 1
+
+    try:
+        (
+            apply_context_profile_helper,
+            _get_context_profile_helper,
+            normalize_context_tier_helper,
+        ) = _load_context_profile_helpers()
+    except Exception as exc:
+        setattr(args, "startup_error_code", "context_profiles_unavailable")
+        emit_startup_error(f"context profiles unavailable: {exc}")
+        return 1
+
     repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
         runtime_setup.get("llama_module_path", "")
     )
@@ -729,7 +746,7 @@ def run(args: argparse.Namespace) -> int:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
-    args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    args.context_tier = normalize_context_tier_helper(getattr(args, "context_tier", "8k-fast"))
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -797,7 +814,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
-    context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
+    context_profile = apply_context_profile_helper(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)

@@ -22,6 +22,59 @@ def test_chat_js_defines_touch_detection_hook():
     assert "detectTouchInput" in chat_js, "chat.js must implement touch detection helper"
 
 
+def test_landing_context_tier_selector_is_visible_persistent_and_disabled_while_pending():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert 'label for="context-tier-select">Context tier</label>' in index_html
+    assert 'data-testid="landing-context-tier-select"' in index_html
+    assert 'v-model="selectedContextTier"' in index_html
+    assert ':disabled="isGeneratingResponse"' in index_html
+    assert '<option value="8k-fast">8K Fast</option>' in index_html
+    assert '<option value="64k-full">64K Full</option>' in index_html
+
+    assert "CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1'" in chat_js
+    assert "DEFAULT_CONTEXT_TIER = '8k-fast'" in chat_js
+    assert "selectedContextTier: DEFAULT_CONTEXT_TIER" in chat_js
+    assert "loadStoredContextTier" in chat_js
+    assert "persistContextTier" in chat_js
+    assert "normalizeContextTier" in chat_js
+    assert "isKnownContextTier" in chat_js
+    assert "const normalizedValue = typeof value === 'string' ? value.trim() : value" in chat_js
+    assert "return this.isKnownContextTier(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER" in chat_js
+    assert "if (stored !== null && stored !== normalized)" in chat_js
+
+
+def test_landing_context_tier_selection_is_sent_to_next_server_and_encrypted_routing():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "new URLSearchParams" in chat_js
+    assert "model: this.selectedModelId" in chat_js
+    assert "context_tier: requestedContextTier" in chat_js
+    assert "`/api/v1/relay/servers/next?${params.toString()}`" in chat_js
+    assert "selected_context_tier" in chat_js
+    assert "selected_context_window_tokens" in chat_js
+    assert "selectedContextTierCanSatisfy(selectedContextTier, requestedContextTier)" in chat_js
+    assert "if (!selectedContextTier || !this.selectedContextTierCanSatisfy" in chat_js
+    assert "selectedProfileMetadata" in chat_js
+
+    assert "routing: {" in chat_js
+    assert "context_tier: this.normalizeContextTier(this.selectedContextTier)" in chat_js
+    assert "ciphertext: encryptedData.ciphertext" in chat_js
+    assert "messageContent" not in chat_js.split("const relayPayload = {", 1)[1].split("};\n", 1)[0]
+
+
+def test_landing_context_tier_errors_have_safe_user_messages():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "no_matching_compute_node" in chat_js
+    assert "No LLM servers are available for the selected context tier right now." in chat_js
+    assert "invalid_context_tier" in chat_js
+    assert "compute_node_context_tier_unsupported" in chat_js
+    assert "does not support the requested context tier" in chat_js
+    assert "server_public_key" not in chat_js.split("const codeToMessage = {", 1)[1].split("};\n", 1)[0]
+
+
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "/api/v1/relay/servers/next" in chat_js, (

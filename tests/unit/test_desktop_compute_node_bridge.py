@@ -2167,6 +2167,60 @@ class ComputeNodeRuntime:
     assert "No module named 'utils'" not in stdout
 
 
+def test_main_subprocess_imports_context_profiles_after_dependency_preflight(tmp_path):
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
+    import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    utils_dir = import_root / 'utils'
+    marker = tmp_path / 'preflight-complete'
+    python_dir.mkdir(parents=True)
+    utils_dir.mkdir(parents=True)
+
+    (python_dir / 'compute_node_bridge.py').write_text(
+        MODULE_PATH.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'path_bootstrap.py').write_text(
+        (MODULE_PATH.parent / 'path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (python_dir / 'desktop_runtime_setup.py').write_text(
+        'from pathlib import Path\n'
+        f'MARKER = Path({str(marker)!r})\n'
+        'def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):\n    return None\n'
+        'def ensure_desktop_llama_runtime(_mode):\n    return {"selected_backend": "cpu"}\n'
+        'def ensure_desktop_python_dependencies(*, repo_root=None):\n    MARKER.write_text("done", encoding="utf-8"); return {"ok": "true"}\n'
+        'def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):\n    return None\n',
+        encoding='utf-8',
+    )
+    (utils_dir / '__init__.py').write_text(
+        'if not __import__("pathlib").Path(%r).exists():\n'
+        '    raise ModuleNotFoundError("No module named \'cryptography\'")\n' % str(marker),
+        encoding='utf-8',
+    )
+    (utils_dir / 'context_profiles.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / 'context_profiles.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (utils_dir / 'compute_node_runtime.py').write_text(
+        'raise RuntimeError("stop after context profile import")\n',
+        encoding='utf-8',
+    )
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    proc = subprocess.run(
+        [sys.executable, str(python_dir / 'compute_node_bridge.py'), '--model', '/tmp/model.gguf'],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert marker.exists()
+    assert "No module named 'cryptography'" not in proc.stdout
+    assert "context_profiles_unavailable" not in proc.stdout
+
+
 def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):
     python_dir = tmp_path / 'bin' / 'resources' / 'python'
     import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
@@ -2217,7 +2271,7 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     )
 
     assert proc.returncode == 1
-    assert "unexpected runtime setup" not in proc.stderr
+    assert "unexpected runtime setup" in proc.stderr
     events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     payload = next(event for event in events if event.get('type') == 'error')
     assert payload['error_code'] == 'context_profiles_unavailable'
@@ -2280,7 +2334,7 @@ def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_
     assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
 
-def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, capsys):
+def test_context_profiles_import_failure_after_preflight_reports_structured_error(monkeypatch, capsys):
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
@@ -2289,42 +2343,38 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, c
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr('builtins.__import__', fake_import)
-
-    module = ModuleType('compute_node_bridge_no_context_profiles')
-    module.__file__ = str(MODULE_PATH)
-    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
-    exec(code, module.__dict__)
-
-    args = SimpleNamespace(
-        mode='auto',
-        relay_url='https://relay.example',
-        relay_urls=None,
-        context_tier='64k-full',
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {'selected_backend': 'cpu', 'detected_device': 'cpu'},
     )
-    payload = module._structured_startup_error_payload(args, 'context profiles unavailable')
-
-    assert module._CONTEXT_PROFILES_IMPORT_ERROR is not None
-    assert module.normalize_context_tier('unknown') == '8k-fast'
-    assert payload['context_tier'] == '64k-full'
-    assert payload['error_code'] == 'desktop_compute_node_startup_failed'
-    assert 'model_path' not in payload
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.get_context_profile('8k-fast')
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.apply_context_profile(object(), '8k-fast')
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
 
     run_args = SimpleNamespace(
         mode='auto',
         relay_url='https://relay.example',
         relay_urls=None,
+        relay_port=None,
         context_tier='64k-full',
     )
-    assert module.run(run_args) == 1
+
+    assert compute_node_bridge.run(run_args) == 1
     emitted = json.loads(capsys.readouterr().out.strip())
     assert emitted['error_code'] == 'context_profiles_unavailable'
     assert emitted['context_tier'] == '64k-full'
     assert emitted['registered'] is False
     assert 'model_path' not in emitted
+
+
+def test_utils_package_lazy_reexports_preserve_public_api():
+    import utils
+
+    assert callable(utils.get_temp_dir)
+    assert callable(utils.get_model_manager)
+    assert callable(utils.get_crypto_manager)
+    assert utils.RelayClient.__name__ == 'RelayClient'
+
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

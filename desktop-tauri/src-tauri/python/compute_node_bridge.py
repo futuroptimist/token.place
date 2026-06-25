@@ -28,25 +28,6 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
 
-_CONTEXT_PROFILES_IMPORT_ERROR: Optional[BaseException] = None
-try:
-    from utils.context_profiles import (
-        apply_context_profile,
-        get_context_profile,
-        normalize_context_tier,
-    )
-except Exception as exc:  # pragma: no cover - defensive packaged-startup fallback
-    _CONTEXT_PROFILES_IMPORT_ERROR = exc
-
-    def normalize_context_tier(_profile_id: Optional[str]) -> str:  # pragma: no cover
-        return "8k-fast"  # pragma: no cover
-
-    def get_context_profile(_profile_id: Optional[str]) -> object:  # pragma: no cover
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
-
-    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> object:  # pragma: no cover
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
-
 try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
@@ -538,11 +519,23 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
+def _safe_context_tier_for_startup(raw_context_tier: Any) -> str:
+    """Return a dependency-free context tier for early startup diagnostics."""
+
+    if isinstance(raw_context_tier, str) and raw_context_tier in {"8k-fast", "64k-full"}:
+        return raw_context_tier
+    return "8k-fast"
+
+
 def _startup_context_tier(args: argparse.Namespace) -> str:
-    raw_context_tier = getattr(args, "context_tier", "8k-fast")
-    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-        return raw_context_tier if isinstance(raw_context_tier, str) and raw_context_tier else "8k-fast"
-    return normalize_context_tier(raw_context_tier)
+    return _safe_context_tier_for_startup(getattr(args, "context_tier", "8k-fast"))
+
+
+def _safe_exception_detail(exc: BaseException) -> str:
+    detail = str(exc).replace("\n", " ").strip()
+    if not detail:
+        detail = exc.__class__.__name__
+    return detail[:500]
 
 
 def _structured_startup_error_payload(
@@ -662,11 +655,6 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
-    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-        setattr(args, "startup_error_code", "context_profiles_unavailable")
-        emit_startup_error(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
-        return 1
-
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -716,6 +704,27 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        from utils.context_profiles import (
+            apply_context_profile,
+            get_context_profile,
+            normalize_context_tier,
+        )
+    except Exception as exc:
+        setattr(args, "startup_error_code", "context_profiles_unavailable")
+        safe_tier = _safe_context_tier_for_startup(getattr(args, "context_tier", "8k-fast"))
+        setattr(args, "context_tier", safe_tier)
+        emit_startup_error(f"context profiles unavailable: {_safe_exception_detail(exc)}")
+        return 1
+
+    args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    try:
+        get_context_profile(args.context_tier)
+    except Exception as exc:
+        setattr(args, "startup_error_code", "context_profiles_unavailable")
+        emit_startup_error(f"context profiles unavailable: {_safe_exception_detail(exc)}")
+        return 1
+
+    try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
             compute_mode_diagnostics,
@@ -728,8 +737,6 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         emit_startup_error(f"runtime unavailable: {exc}")
         return 1
-
-    args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),

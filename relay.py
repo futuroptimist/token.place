@@ -687,8 +687,10 @@ def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: fl
     in_flight_requests = payload.get("api_v1_in_flight_requests")
     if not isinstance(in_flight_requests, dict):
         return 0
+    with api_v1_in_flight_requests_lock:
+        in_flight_entries = list(in_flight_requests.values())
     active = 0
-    for entry in in_flight_requests.values():
+    for entry in in_flight_entries:
         expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
         if isinstance(expires_at, (int, float)) and expires_at > now:
             active += 1
@@ -724,6 +726,7 @@ def _api_v1_scheduler_candidate(
     requested_context_tier: str,
     registration_index: int,
     now_monotonic: float,
+    include_capacity_limited: bool = False,
 ) -> dict[str, Any] | None:
     if not isinstance(payload, dict) or not bool(payload.get(API_V1_SERVER_MARKER)):
         return None
@@ -753,9 +756,11 @@ def _api_v1_scheduler_candidate(
     if not tier_tokens or context_tokens < tier_tokens:
         return None
     load = _api_v1_node_load_snapshot(server_public_key, payload, now_monotonic=now_monotonic)
-    if load["in_flight_count"] >= load["max_concurrency"]:
-        return None
-    if load["queue_depth"] >= _api_v1_max_queue_depth_per_node():
+    capacity_limited = (
+        load["in_flight_count"] >= load["max_concurrency"]
+        or load["queue_depth"] >= _api_v1_max_queue_depth_per_node()
+    )
+    if capacity_limited and not include_capacity_limited:
         return None
     return {
         "server_public_key": server_public_key,
@@ -765,8 +770,10 @@ def _api_v1_scheduler_candidate(
         "tier_tokens": CONTEXT_TIER_ORDER[active_tier],
         "context_window_tokens": context_tokens,
         "registration_index": registration_index,
+        "capacity_limited": capacity_limited,
         **load,
     }
+
 
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
@@ -1224,6 +1231,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
         all_api_v1_keys = _api_v1_round_robin_keys()
         registered_count = len(all_api_v1_keys)
         current_index = server_round_robin_next_index % registered_count if registered_count else 0
+        capacity_limited_count = 0
         candidates = []
         for registration_index, server_public_key in enumerate(all_api_v1_keys):
             candidate = _api_v1_scheduler_candidate(
@@ -1233,8 +1241,11 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
                 requested_context_tier=context_tier,
                 registration_index=registration_index,
                 now_monotonic=now_monotonic,
+                include_capacity_limited=True,
             )
-            if candidate is not None:
+            if candidate is not None and candidate["capacity_limited"]:
+                capacity_limited_count += 1
+            elif candidate is not None:
                 candidates.append(candidate)
 
         eligible_tier_counts: dict[str, int] = {}
@@ -1250,6 +1261,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
                 "round_robin_index": current_index,
                 "round_robin_position": None,
                 "selection_policy": API_V1_SELECTION_POLICY,
+                "capacity_limited_node_count": capacity_limited_count,
             }, None
 
         selected_tier_tokens = min(candidate["tier_tokens"] for candidate in candidates)
@@ -1257,7 +1269,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
         selected_load_score = min(candidate["load_score"] for candidate in tier_candidates)
         load_candidates = [candidate for candidate in tier_candidates if candidate["load_score"] == selected_load_score]
 
-        eligible_key = (str(selected_load_score), *[candidate["server_public_key"] for candidate in load_candidates])
+        eligible_key = tuple(candidate["server_public_key"] for candidate in load_candidates)
         if eligible_key in api_v1_filtered_round_robin_next_positions:
             selected_load_index = api_v1_filtered_round_robin_next_positions[eligible_key] % len(load_candidates)
         else:
@@ -1322,6 +1334,16 @@ def _select_next_server_payload(*, api_v1: bool = False):
     )
     if not server_public_key or server_payload is None:
         if selection.get("registered_api_v1_count", 0):
+            if selection.get("capacity_limited_node_count", 0):
+                return jsonify({
+                    'error': {
+                        'message': 'Registered compute nodes match the requested model/context tier, but all matching nodes are at capacity. Retry with backoff.',
+                        'code': 'no_available_capacity',
+                        'selection_policy': API_V1_SELECTION_POLICY,
+                        'requested_context_tier': context_tier,
+                        'requested_model': model,
+                    }
+                }), 503
             return jsonify({
                 'error': {
                     'message': 'Registered compute nodes are available, but none match the requested model/context tier.',

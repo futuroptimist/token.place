@@ -473,6 +473,43 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
 
 
+def test_api_v1_selection_reports_capacity_exhaustion_separately(client):
+    server = _server_key("saturated-capacity")
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast", ["model-a"]))
+    known_servers[server]["api_v1_in_flight_requests"] = {
+        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
+    }
+
+    response = client.get("/api/v1/relay/servers/next?model=model-a&context_tier=8k-fast")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["error"]["code"] == "no_available_capacity"
+    assert "at capacity" in payload["error"]["message"]
+
+
+def test_api_v1_filtered_round_robin_key_ignores_load_score_changes(client):
+    a = _server_key("rr-load-a")
+    b = _server_key("rr-load-b")
+    capabilities = _capabilities("8k-fast", ["model-a"])
+    capabilities["max_concurrency"] = 4
+    _register_api_v1_server_with_capabilities(client, a, dict(capabilities))
+    _register_api_v1_server_with_capabilities(client, b, dict(capabilities))
+
+    assert client.get("/api/v1/relay/servers/next?model=model-a").status_code == 200
+    keys_after_idle_selection = set(relay_module.api_v1_filtered_round_robin_next_positions)
+    known_servers[a]["api_v1_in_flight_requests"] = {
+        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
+    }
+    known_servers[b]["api_v1_in_flight_requests"] = {
+        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
+    }
+
+    assert client.get("/api/v1/relay/servers/next?model=model-a").status_code == 200
+
+    assert set(relay_module.api_v1_filtered_round_robin_next_positions) == keys_after_idle_selection
+
+
 def test_api_v1_filtered_round_robin_is_stable_across_alternating_filters(client):
     fast = _server_key("mixed-fast")
     full_a = _server_key("mixed-full-a")
@@ -3070,7 +3107,7 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
             request_id=f'req-round-robin-{idx}',
         )
 
-    assert selected_servers == [server_a, server_b, server_a, server_b]
+    assert selected_servers == [server_a, server_b, server_b, server_a]
 
     first_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
     second_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
@@ -3079,9 +3116,9 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
 
     assert [first_a.status_code, second_a.status_code, first_b.status_code, second_b.status_code] == [200] * 4
     assert first_a.get_json()['request_id'] == 'req-round-robin-0'
-    assert second_a.get_json()['request_id'] == 'req-round-robin-2'
+    assert second_a.get_json()['request_id'] == 'req-round-robin-3'
     assert first_b.get_json()['request_id'] == 'req-round-robin-1'
-    assert second_b.get_json()['request_id'] == 'req-round-robin-3'
+    assert second_b.get_json()['request_id'] == 'req-round-robin-2'
 
 
 def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):

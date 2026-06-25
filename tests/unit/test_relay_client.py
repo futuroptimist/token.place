@@ -4158,15 +4158,10 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],
-        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
         [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
         [{"role": "user", "content": [{"type": "text", "text": ""}]}],
         [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
         [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
-        [
-            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
-        ]
-        * 5,
     ],
 )
 def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
@@ -4185,6 +4180,95 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     assert error["code"] == "compute_node_invalid_request"
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
+
+
+def test_api_v1_large_messages_reach_structural_validation_boundaries():
+    limit = RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+
+    for length in (32769, 65536, limit):
+        messages = [{"role": "user", "content": "x" * length}]
+        result = RelayClient._validate_api_v1_chat_messages(messages)
+        assert result.valid is True
+        assert RelayClient._messages_are_valid_api_v1_chat(messages) is True
+        assert result.total_content_chars == length
+
+    too_large = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": "x" * (limit + 1)}]
+    )
+    assert too_large.valid is False
+    assert too_large.code == "compute_node_request_too_large"
+    assert RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": "x" * (limit + 1)}]
+    ) is False
+
+
+def test_api_v1_text_blocks_use_aggregate_limit_without_lower_message_cap():
+    limit = RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    valid_blocks = [
+        {"type": "text", "text": "a" * 20000},
+        {"type": "input_text", "text": "b" * 20000},
+    ]
+
+    result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": valid_blocks}]
+    )
+    assert result.valid is True
+    assert result.total_content_chars == 40000
+
+    assert RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": [{"type": "text", "text": "x"}] * 33}]
+    ).code == "compute_node_invalid_request"
+    assert RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]
+    ).code == "compute_node_invalid_request"
+    assert RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": [{"type": "unknown", "text": "x"}]}]
+    ).code == "compute_node_invalid_request"
+
+    too_large = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * limit},
+                    {"type": "text", "text": "y"},
+                ],
+            }
+        ]
+    )
+    assert too_large.valid is False
+    assert too_large.code == "compute_node_request_too_large"
+
+
+def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(caplog):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    distinctive_text = "DISTINCTIVE_PRIVATE_PROMPT_TEXT"
+
+    with caplog.at_level("ERROR", logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-too-large",
+            model_id="llama-3-8b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": distinctive_text
+                    + ("x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS),
+                }
+            ],
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_request_too_large"
+    assert error["type"] == "validation_error"
+    assert error["message_count"] == 1
+    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["retryable"] is False
+    assert distinctive_text not in json.dumps(error)
+    assert distinctive_text not in caplog.text
+    assert "aggregate_content_too_large" in caplog.text
+    manager.runtime.create_chat_completion.assert_not_called()
 
 
 def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
@@ -4310,6 +4394,33 @@ def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget
     assert error["prompt_tokens"] == 28
     assert error["requested_output_tokens"] == 5
     assert error["required_total_tokens"] == 33
+
+
+def test_api_v1_large_structurally_valid_message_uses_exact_tier_admission():
+    large_content = "x" * 65000
+    eight_k = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=5)
+    eight_k_client = _api_v1_validation_client(eight_k)
+
+    rejected = _admission_envelope(eight_k_client, eight_k, large_content)
+    error = rejected["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 65020
+    assert error["requested_output_tokens"] == 5
+    assert error["required_total_tokens"] == 65025
+    assert eight_k.runtime.calls == []
+
+    sixty_four_k = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=5)
+    sixty_four_k_client = _api_v1_validation_client(sixty_four_k)
+    accepted = _admission_envelope(
+        sixty_four_k_client, sixty_four_k, large_content, requested_tier="64k-full"
+    )
+
+    assert accepted["api_v1_response"]["message"] == {
+        "role": "assistant",
+        "content": "ok",
+    }
+    assert sixty_four_k.runtime.calls
+    assert sixty_four_k.runtime.calls[-1]["max_tokens"] == 5
 
 
 def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tokens():

@@ -978,7 +978,7 @@ new Vue({
                 compute_node_options_unsupported: 'The selected LLM server does not support one of the requested options. Please try again.',
                 compute_node_invalid_request: 'The LLM server rejected the request format. Please try again.',
                 compute_node_request_too_large: 'This request exceeds the current API size limit. Please shorten it and try again.',
-                compute_node_context_window_exceeded: 'This prompt exceeds the selected LLM server’s context window.',
+                compute_node_context_window_exceeded: "This prompt exceeds the selected LLM server's context window.",
                 compute_node_invalid_model_output: 'The LLM server returned an invalid response. Please try again.',
                 compute_node_internal_error: 'The LLM server failed while generating a response. Please try again.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',

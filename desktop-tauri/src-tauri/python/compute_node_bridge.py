@@ -35,17 +35,17 @@ try:
         get_context_profile,
         normalize_context_tier,
     )
-except Exception as exc:  # pragma: no cover - exercised via subprocess startup tests
+except Exception as exc:  # pragma: no cover - defensive packaged-startup fallback
     _CONTEXT_PROFILES_IMPORT_ERROR = exc
 
-    def normalize_context_tier(_profile_id: Optional[str]) -> str:
-        return "8k-fast"
+    def normalize_context_tier(_profile_id: Optional[str]) -> str:  # pragma: no cover
+        return "8k-fast"  # pragma: no cover
 
-    def get_context_profile(_profile_id: Optional[str]) -> object:
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+    def get_context_profile(_profile_id: Optional[str]) -> object:  # pragma: no cover
+        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
 
-    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> object:
-        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> object:  # pragma: no cover
+        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")  # pragma: no cover
 
 try:
     from desktop_runtime_setup import (

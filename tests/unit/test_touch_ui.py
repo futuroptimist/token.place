@@ -40,7 +40,9 @@ def test_landing_context_tier_selector_is_visible_persistent_and_disabled_while_
     assert "persistContextTier" in chat_js
     assert "normalizeContextTier" in chat_js
     assert "isKnownContextTier" in chat_js
-    assert "return this.isKnownContextTier(value) ? value : DEFAULT_CONTEXT_TIER" in chat_js
+    assert "const normalizedValue = typeof value === 'string' ? value.trim() : value" in chat_js
+    assert "return this.isKnownContextTier(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER" in chat_js
+    assert "if (stored !== null && stored !== normalized)" in chat_js
 
 
 def test_landing_context_tier_selection_is_sent_to_next_server_and_encrypted_routing():
@@ -59,7 +61,7 @@ def test_landing_context_tier_selection_is_sent_to_next_server_and_encrypted_rou
     assert "routing: {" in chat_js
     assert "context_tier: this.normalizeContextTier(this.selectedContextTier)" in chat_js
     assert "ciphertext: encryptedData.ciphertext" in chat_js
-    assert "messageContent" not in chat_js.split("const relayPayload = {", 1)[1].split("};", 1)[0]
+    assert "messageContent" not in chat_js.split("const relayPayload = {", 1)[1].split("};\n", 1)[0]
 
 
 def test_landing_context_tier_errors_have_safe_user_messages():
@@ -70,7 +72,7 @@ def test_landing_context_tier_errors_have_safe_user_messages():
     assert "invalid_context_tier" in chat_js
     assert "compute_node_context_tier_unsupported" in chat_js
     assert "does not support the requested context tier" in chat_js
-    assert "server_public_key" not in chat_js.split("const codeToMessage = {", 1)[1].split("};", 1)[0]
+    assert "server_public_key" not in chat_js.split("const codeToMessage = {", 1)[1].split("};\n", 1)[0]
 
 
 def test_landing_chat_js_avoids_relay_v2_streaming_path():

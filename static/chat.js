@@ -251,7 +251,8 @@ new Vue({
         },
 
         normalizeContextTier(value) {
-            return this.isKnownContextTier(value) ? value : DEFAULT_CONTEXT_TIER;
+            const normalizedValue = typeof value === 'string' ? value.trim() : value;
+            return this.isKnownContextTier(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER;
         },
 
         loadStoredContextTier() {
@@ -262,7 +263,7 @@ new Vue({
                 console.warn('Unable to read context-tier preference:', error);
             }
             const normalized = this.normalizeContextTier(stored);
-            if (stored !== normalized) {
+            if (stored !== null && stored !== normalized) {
                 this.persistContextTier(normalized);
             }
             return normalized;

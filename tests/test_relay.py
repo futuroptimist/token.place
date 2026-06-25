@@ -328,6 +328,103 @@ def test_api_v1_old_node_compatibility_and_64k_can_satisfy_8k(client):
     assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == full
 
 
+
+def test_api_v1_best_fit_prefers_8k_for_8k_requests_over_64k(client):
+    fast = _server_key("best-fit-fast")
+    full = _server_key("best-fit-full")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    selections = [
+        client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+        for _ in range(5)
+    ]
+
+    assert [payload["server_public_key"] for payload in selections] == [fast] * 5
+    assert {payload["spillover"] for payload in selections} == {False}
+    assert {payload["selection_policy"] for payload in selections} == {
+        relay_module.API_V1_SELECTION_POLICY
+    }
+
+
+def test_api_v1_best_fit_64k_requests_never_select_8k(client):
+    fast = _server_key("best-fit-fast-64k-filter")
+    full = _server_key("best-fit-full-64k-filter")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    selections = [
+        client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()
+        for _ in range(4)
+    ]
+
+    assert [payload["server_public_key"] for payload in selections] == [full] * 4
+    assert {payload["selected_context_tier"] for payload in selections} == {"64k-full"}
+    assert {payload["spillover"] for payload in selections} == {False}
+
+
+def test_api_v1_best_fit_spillover_when_8k_missing_or_saturated(client, monkeypatch):
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_SERVER", "1")
+    fast = _server_key("best-fit-saturated-fast")
+    full = _server_key("best-fit-spillover-full")
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    missing_fast = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert missing_fast["server_public_key"] == full
+    assert missing_fast["spillover"] is True
+    assert missing_fast["spillover_reason"] == "no_healthy_unsaturated_smaller_tier"
+
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    client_inference_requests[fast] = [{"e2ee_v1": True, "request_id": "queued-ciphertext-only"}]
+
+    saturated_fast = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    assert saturated_fast["server_public_key"] == full
+    assert saturated_fast["spillover"] is True
+
+
+def test_api_v1_best_fit_selects_least_loaded_within_tier(client):
+    fast_busy = _server_key("least-loaded-fast-busy")
+    fast_idle = _server_key("least-loaded-fast-idle")
+    full_busy = _server_key("least-loaded-full-busy")
+    full_idle = _server_key("least-loaded-full-idle")
+    _register_api_v1_server_with_capabilities(client, fast_busy, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, fast_idle, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full_busy, _capabilities("64k-full"))
+    _register_api_v1_server_with_capabilities(client, full_idle, _capabilities("64k-full"))
+    client_inference_requests[fast_busy] = [{"e2ee_v1": True, "request_id": "queued-ciphertext-only"}]
+    known_servers[full_busy]["api_v1_in_flight_requests"] = {
+        "in-flight-ciphertext-only": {"expires_at": time.monotonic() + 60.0}
+    }
+
+    fast_selection = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    full_selection = client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()
+
+    assert fast_selection["server_public_key"] == fast_idle
+    assert fast_selection["selected_load_score"] == 0
+    assert full_selection["server_public_key"] == full_idle
+    assert full_selection["selected_load_score"] == 0
+
+
+def test_api_v1_scheduler_privacy_helper_ignores_plaintext_like_fields(client):
+    server = _server_key("privacy-helper")
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
+    payload = dict(known_servers[server])
+    payload["messages"] = [{"content": "relay must ignore this"}]
+    payload["prompt"] = "relay must ignore this too"
+
+    candidate = relay_module._api_v1_scheduler_candidate(
+        server,
+        payload,
+        requested_model=None,
+        requested_context_tier="8k-fast",
+        registration_index=0,
+    )
+
+    assert candidate is not None
+    assert candidate["server_public_key"] == server
+    assert "messages" not in candidate
+    assert "prompt" not in candidate
+
 def test_api_v1_malformed_capabilities_are_rejected_without_registration(client):
     server = _server_key("malformed-cap")
     response = client.post(
@@ -2939,7 +3036,7 @@ def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(clien
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
 
 
-def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(client):
+def test_api_v1_least_loaded_request_queueing_preserves_per_server_isolation(client):
     server_a = _server_key('queue_a')
     server_b = _server_key('queue_b')
     _register_api_v1_server(client, server_a)
@@ -2955,7 +3052,7 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
             request_id=f'req-round-robin-{idx}',
         )
 
-    assert selected_servers == [server_a, server_b, server_a, server_b]
+    assert selected_servers == [server_a, server_b, server_b, server_a]
 
     first_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
     second_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
@@ -2964,9 +3061,9 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
 
     assert [first_a.status_code, second_a.status_code, first_b.status_code, second_b.status_code] == [200] * 4
     assert first_a.get_json()['request_id'] == 'req-round-robin-0'
-    assert second_a.get_json()['request_id'] == 'req-round-robin-2'
+    assert second_a.get_json()['request_id'] == 'req-round-robin-3'
     assert first_b.get_json()['request_id'] == 'req-round-robin-1'
-    assert second_b.get_json()['request_id'] == 'req-round-robin-3'
+    assert second_b.get_json()['request_id'] == 'req-round-robin-2'
 
 
 def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):
@@ -3060,14 +3157,12 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert next_response.get_json()['error']['code'] == 'no_matching_compute_node'
 
     time.sleep(2.1)
     expired = client.get('/api/v1/relay/servers/next')
     assert expired.status_code == 503
-
-
 
 
 def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_removed(client, monkeypatch):
@@ -3104,6 +3199,8 @@ def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_r
 
     next_response = client.get('/api/v1/relay/servers/next')
     assert next_response.status_code == 503
+
+
 def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
@@ -3141,8 +3238,8 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert next_response.get_json()['error']['code'] == 'no_matching_compute_node'
 
 
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):

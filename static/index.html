@@ -112,16 +112,19 @@
             border-color: rgba(255, 255, 255, 0.25);
             background-color: rgba(255, 255, 255, 0.08);
         }
-        .model-selector-container {
+        .model-selector-container,
+        .context-tier-selector-container {
             margin-bottom: 15px;
         }
-        .model-selector-container label {
+        .model-selector-container label,
+        .context-tier-selector-container label {
             display: block;
             margin-bottom: 6px;
             color: #cccccc;
             font-size: 14px;
         }
-        .model-select {
+        .model-select,
+        .context-tier-select {
             width: 100%;
             padding: 10px;
             box-sizing: border-box;
@@ -500,6 +503,21 @@
                     <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
                 </select>
                 <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsError || (modelsLoaded && availableModels.length === 0 ? 'No API v1 models available' : '')"></p>
+            </div>
+            <div class="context-tier-selector-container">
+                <label for="context-tier-select">Context tier</label>
+                <select
+                    id="context-tier-select"
+                    v-model="selectedContextTier"
+                    class="context-tier-select"
+                    aria-label="Context tier"
+                    data-testid="landing-context-tier-select"
+                    :disabled="isGeneratingResponse"
+                    @change="handleContextTierChange"
+                >
+                    <option value="8k-fast">8K Fast</option>
+                    <option value="64k-full">64K Full</option>
+                </select>
             </div>
             <p class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div

@@ -22,6 +22,61 @@ def test_chat_js_defines_touch_detection_hook():
     assert "detectTouchInput" in chat_js, "chat.js must implement touch detection helper"
 
 
+
+def test_landing_context_tier_selector_template_and_persistence_contract():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert 'for="context-tier-select"' in index_html
+    assert 'Context tier' in index_html
+    assert 'data-testid="landing-context-tier-select"' in index_html
+    assert 'v-model="selectedContextTier"' in index_html
+    assert ':disabled="isGeneratingResponse"' in index_html
+    assert 'value="8k-fast"' in index_html
+    assert '8K Fast' in index_html
+    assert 'value="64k-full"' in index_html
+    assert '64K Full' in index_html
+
+    assert "LANDING_CONTEXT_TIER_STORAGE_KEY = 'tokenplace.landing.api_v1.context_tier'" in chat_js
+    assert "DEFAULT_CONTEXT_TIER = '8k-fast'" in chat_js
+    assert "SUPPORTED_CONTEXT_TIERS = ['8k-fast', '64k-full']" in chat_js
+    assert "selectedContextTier: DEFAULT_CONTEXT_TIER" in chat_js
+    assert "loadPersistedContextTier()" in chat_js
+    assert "localStorage.getItem(LANDING_CONTEXT_TIER_STORAGE_KEY)" in chat_js
+    assert "localStorage.setItem(LANDING_CONTEXT_TIER_STORAGE_KEY, this.selectedContextTier)" in chat_js
+    assert "return SUPPORTED_CONTEXT_TIERS.includes(value) ? value : DEFAULT_CONTEXT_TIER" in chat_js
+    assert "handleContextTierChange()" in chat_js
+
+
+def test_landing_next_server_selection_includes_model_and_context_tier():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "selectionUrl.searchParams.set('model', this.selectedModelId);" in chat_js
+    assert "selectionUrl.searchParams.set('context_tier', this.selectedContextTier);" in chat_js
+    assert "selectionUrl.searchParams.set('selected_profile_echo_v1', '1');" in chat_js
+    assert "selected_context_tier" in chat_js
+    assert "contextTierCanSatisfy(selectedContextTier, this.selectedContextTier)" in chat_js
+    assert "selectedProfileMetadata" in chat_js
+
+
+def test_landing_encrypted_api_v1_routing_contains_context_tier_without_plaintext_dispatch():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "routing: {" in chat_js
+    assert "context_tier: this.selectedContextTier" in chat_js
+    assert "body: JSON.stringify(relayPayload)" in chat_js
+    relay_payload_start = chat_js.index("const relayPayload = {")
+    relay_payload_end = chat_js.index("const dispatchResponse", relay_payload_start)
+    relay_payload_block = chat_js[relay_payload_start:relay_payload_end]
+    assert "ciphertext: encryptedData.ciphertext" in relay_payload_block
+    assert "cipherkey: encryptedData.cipherkey" in relay_payload_block
+    assert "iv: encryptedData.iv" in relay_payload_block
+    assert "messages" not in relay_payload_block
+    assert "prompt" not in relay_payload_block
+    assert "content" not in relay_payload_block
+    assert "token_count" not in relay_payload_block
+    assert "prompt_length" not in relay_payload_block
+
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "/api/v1/relay/servers/next" in chat_js, (
@@ -63,18 +118,23 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "getUserFacingApiError" in chat_js
     assert "no_registered_compute_nodes" in chat_js
+    assert "no_matching_compute_node" in chat_js
     assert "compute_node_timeout" in chat_js
     assert "compute_node_bridge_timeout" in chat_js
     assert "compute_node_unreachable" in chat_js
     assert "compute_node_invalid_payload" in chat_js
     assert "compute_node_request_too_large" in chat_js
     assert "compute_node_context_window_exceeded" in chat_js
+    assert "compute_node_context_tier_mismatch" in chat_js
+    assert "compute_node_context_tier_unsupported" in chat_js
     assert "No LLM servers are available right now." in chat_js
+    assert "No LLM server is available for the selected context tier right now." in chat_js
     assert "The LLM server took too long to respond. Please try again." in chat_js
     assert "The LLM server is unavailable right now. Please try again." in chat_js
     assert "The LLM server returned an invalid response. Please try again." in chat_js
     assert "This request exceeds the current API size limit. Please shorten it and try again." in chat_js
     assert "This prompt exceeds the selected LLM server's context window." in chat_js
+    assert "The selected LLM server cannot satisfy the requested context tier." in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
 

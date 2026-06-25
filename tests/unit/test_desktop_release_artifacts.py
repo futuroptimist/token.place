@@ -261,7 +261,7 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     )
     dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg_path.write_bytes(b'dmg')
-    detach_calls = []
+    cleanup_state_calls = []
     cleaned = []
 
     class FakeMountTemporaryDirectory:
@@ -274,17 +274,17 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
         assert dmg == dmg_path
         return FakeMountTemporaryDirectory()
 
-    def fake_run_best_effort(cmd):
-        detach_calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, '', '')
+    def fake_cleanup_state(path, cleanup_mount_dir):
+        cleanup_state_calls.append((path, cleanup_mount_dir))
+        return 'hdiutil info snapshot'
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
-    monkeypatch.setattr(validator, '_run_best_effort', fake_run_best_effort)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
-    assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert cleanup_state_calls == [(dmg_path, mount_dir)]
     assert cleaned == [str(mount_dir)]
 
 
@@ -355,6 +355,98 @@ def test_validator_attach_retries_with_fresh_mountpoints_and_cleanup(monkeypatch
     assert sleeps == [0.01]
     temp_dir.cleanup()
 
+
+
+def test_validator_cleanup_only_detaches_referenced_mountpoint_and_matched_device(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    other_dmg_path = tmp_path / 'other.dmg'
+    other_dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+    plist_calls = []
+    snapshots = []
+
+    first_plist = {
+        'images': [
+            {
+                'image-path': str(dmg_path),
+                'system-entities': [
+                    {'dev-entry': '/dev/disk4', 'mount-point': str(mount_dir)},
+                    {'dev-entry': '/dev/disk4s1', 'mount-point': str(mount_dir)},
+                ],
+            },
+            {
+                'image-path': str(other_dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk9', 'mount-point': '/Volumes/Other'}],
+            },
+        ]
+    }
+    second_plist = {
+        'images': [
+            {
+                'image-path': str(dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk4s1'}],
+            },
+            {
+                'image-path': str(other_dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk9', 'mount-point': '/Volumes/Other'}],
+            },
+        ]
+    }
+
+    def fake_info_plist():
+        plist_calls.append('plist')
+        return first_plist if len(plist_calls) == 1 else second_plist
+
+    def fake_run_best_effort(cmd):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(validator, '_hdiutil_info_plist', fake_info_plist)
+    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda: snapshots.append('snapshot') or 'snapshot')
+    monkeypatch.setattr(validator, '_run_best_effort', fake_run_best_effort)
+
+    assert validator._cleanup_dmg_attach_state(dmg_path, mount_dir) == 'snapshot'
+
+    assert calls == [['hdiutil', 'detach', str(mount_dir)], ['hdiutil', 'detach', '/dev/disk4s1']]
+    assert len(plist_calls) == 2
+    assert snapshots == ['snapshot']
+    assert mount_dir.exists()
+
+
+def test_validator_cleanup_skips_unreferenced_mountpoint(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+
+    monkeypatch.setattr(
+        validator,
+        '_hdiutil_info_plist',
+        lambda: {
+            'images': [
+                {
+                    'image-path': str(dmg_path),
+                    'system-entities': [{'dev-entry': '/dev/disk5', 'mount-point': '/Volumes/Target'}],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda: 'snapshot')
+    monkeypatch.setattr(
+        validator,
+        '_run_best_effort',
+        lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+    )
+
+    validator._cleanup_dmg_attach_state(dmg_path, mount_dir)
+
+    assert calls == [['hdiutil', 'detach', '/dev/disk5']]
 
 def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()

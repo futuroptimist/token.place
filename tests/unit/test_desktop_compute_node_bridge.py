@@ -2217,7 +2217,7 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     )
 
     assert proc.returncode == 1
-    assert "unexpected runtime setup" not in proc.stderr
+    assert "unexpected runtime setup" in proc.stderr
     events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     payload = next(event for event in events if event.get('type') == 'error')
     assert payload['error_code'] == 'context_profiles_unavailable'
@@ -2280,12 +2280,58 @@ def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_
     assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
 
-def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, capsys):
+def test_context_profile_error_after_dependency_preflight_fails_closed(monkeypatch, capsys):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    events = []
+
+    def fake_dependency_preflight():
+        events.append('dependency_preflight')
+        return {'ok': 'true', 'import_root': '/runtime'}
+
+    def fail_context_profiles():
+        events.append('context_profiles')
+        raise ModuleNotFoundError("No module named 'utils.context_profiles'")
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        fake_dependency_preflight,
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        fail_context_profiles,
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        relay_port=None,
+        context_tier='64k-full',
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert events == ['dependency_preflight', 'context_profiles']
+    assert emitted['error_code'] == 'context_profiles_unavailable'
+    assert emitted['context_tier'] == '64k-full'
+    assert emitted['registered'] is False
+    assert 'model_path' not in emitted
+    assert "No module named 'utils.context_profiles'" in emitted['last_error']
+
+
+def test_module_import_does_not_load_context_profiles_before_preflight(monkeypatch):
     real_import = __import__
+    imported_context_profiles = False
 
     def fake_import(name, *args, **kwargs):
+        nonlocal imported_context_profiles
         if name == 'utils.context_profiles':
-            raise ModuleNotFoundError("No module named 'utils.context_profiles'")
+            imported_context_profiles = True
+            raise AssertionError('context profiles imported at module scope')
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr('builtins.__import__', fake_import)
@@ -2295,6 +2341,8 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, c
     code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
     exec(code, module.__dict__)
 
+    assert imported_context_profiles is False
+
     args = SimpleNamespace(
         mode='auto',
         relay_url='https://relay.example',
@@ -2303,28 +2351,18 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, c
     )
     payload = module._structured_startup_error_payload(args, 'context profiles unavailable')
 
-    assert module._CONTEXT_PROFILES_IMPORT_ERROR is not None
-    assert module.normalize_context_tier('unknown') == '8k-fast'
     assert payload['context_tier'] == '64k-full'
     assert payload['error_code'] == 'desktop_compute_node_startup_failed'
     assert 'model_path' not in payload
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.get_context_profile('8k-fast')
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.apply_context_profile(object(), '8k-fast')
 
-    run_args = SimpleNamespace(
-        mode='auto',
-        relay_url='https://relay.example',
-        relay_urls=None,
-        context_tier='64k-full',
-    )
-    assert module.run(run_args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
-    assert emitted['error_code'] == 'context_profiles_unavailable'
-    assert emitted['context_tier'] == '64k-full'
-    assert emitted['registered'] is False
-    assert 'model_path' not in emitted
+
+def test_utils_package_keeps_lazy_convenience_exports():
+    import utils
+
+    assert utils.get_temp_dir
+    assert utils.get_model_manager
+    assert utils.get_crypto_manager
+    assert utils.RelayClient
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

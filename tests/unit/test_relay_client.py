@@ -4,6 +4,7 @@ Unit tests for the relay client module.
 import base64
 import builtins
 import json
+import logging
 import math
 import pytest
 import sys
@@ -4158,15 +4159,10 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],
-        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
         [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
         [{"role": "user", "content": [{"type": "text", "text": ""}]}],
         [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
         [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
-        [
-            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
-        ]
-        * 5,
     ],
 )
 def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
@@ -4186,6 +4182,89 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
 
+
+def test_api_v1_large_messages_reach_structural_validation_limit():
+    valid_lengths = [32769, 65536, RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS]
+    for length in valid_lengths:
+        messages = [{"role": "user", "content": "x" * length}]
+        result = RelayClient._api_v1_chat_validation_result(messages)
+        assert result["valid"] is True
+        assert RelayClient._messages_are_valid_api_v1_chat(messages) is True
+
+    too_large = [
+        {
+            "role": "user",
+            "content": "x" * (RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1),
+        }
+    ]
+    result = RelayClient._api_v1_chat_validation_result(too_large)
+    assert result["valid"] is False
+    assert result["code"] == "compute_node_request_too_large"
+    assert result["total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1
+
+
+def test_api_v1_text_blocks_share_aggregate_safety_limit_without_per_block_cap():
+    content = [{"type": "text", "text": "x" * 20000} for _ in range(2)]
+    result = RelayClient._api_v1_chat_validation_result(
+        [{"role": "user", "content": content}]
+    )
+    assert result["valid"] is True
+
+    too_many_blocks = [
+        {"type": "text", "text": "x"}
+        for _ in range(RelayClient._API_V1_MAX_TEXT_BLOCKS + 1)
+    ]
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": too_many_blocks}]
+    )
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]
+    )
+    assert not RelayClient._messages_are_valid_api_v1_chat(
+        [{"role": "user", "content": [{"type": "unknown", "text": "x"}]}]
+    )
+
+    over_limit_blocks = [
+        {"type": "text", "text": "x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS},
+        {"type": "text", "text": "y"},
+    ]
+    result = RelayClient._api_v1_chat_validation_result(
+        [{"role": "user", "content": over_limit_blocks}]
+    )
+    assert result["valid"] is False
+    assert result["code"] == "compute_node_request_too_large"
+
+
+def test_api_v1_too_large_error_and_validation_log_are_privacy_safe(caplog):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    distinctive = "DISTINCTIVE_SECRET_PROMPT"
+    messages = [
+        {
+            "role": "user",
+            "content": distinctive + ("x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS),
+        }
+    ]
+
+    with caplog.at_level(logging.INFO, logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-too-large",
+            model_id="llama-3-8b-instruct",
+            messages=messages,
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_request_too_large"
+    assert error["type"] == "request_too_large"
+    assert error["retryable"] is False
+    assert error["message_count"] == 1
+    assert error["total_content_chars"] > RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert distinctive not in json.dumps(error)
+    assert distinctive not in caplog.text
+    assert "total_content_chars_exceeded" in caplog.text
+    manager.runtime.create_chat_completion.assert_not_called()
 
 def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
     manager = _ApiV1RuntimeManager()
@@ -4295,6 +4374,29 @@ def _admission_envelope(client, manager, content, *, options=None, requested_tie
         requested_context_tier=requested_tier or manager.context_tier,
     )
 
+
+def test_api_v1_large_structurally_valid_prompt_reaches_exact_admission_on_each_tier():
+    content = "x" * 40000
+
+    eight_k_manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=7)
+    eight_k_client = _api_v1_validation_client(eight_k_manager)
+    eight_k = _admission_envelope(eight_k_client, eight_k_manager, content)
+
+    error = eight_k["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 40020
+    assert error["requested_output_tokens"] == 7
+    assert error["required_total_tokens"] == 40027
+    assert eight_k_manager.runtime.calls == []
+
+    full_manager = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=7)
+    full_client = _api_v1_validation_client(full_manager)
+    full = _admission_envelope(full_client, full_manager, content)
+
+    assert "error" not in full["api_v1_response"]
+    assert full_manager.runtime.calls
+    assert full_manager.runtime.calls[-1]["max_tokens"] == 7
+    assert full["api_v1_response"]["message"]["content"] == "ok"
 
 def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():
     manager = _AdmissionManager(window=32)

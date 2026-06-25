@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from utils.processing_result import RelayProcessingResult
@@ -25,6 +26,18 @@ from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, no
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class _ApiV1ChatValidationResult:
+    valid: bool
+    code: Optional[str] = None
+    reason: str = ""
+    message_count: int = 0
+    offending_message_index: Optional[int] = None
+    per_message_content_chars: Optional[int] = None
+    total_content_chars: int = 0
+    maximum_total_content_chars: int = 0
 
 
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
@@ -524,8 +537,8 @@ class RelayClient:
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant"}
     _API_V1_MAX_MESSAGES = 64
-    _API_V1_MAX_MESSAGE_CONTENT_CHARS = 32768
     _API_V1_MAX_TEXT_BLOCKS = 32
+    # Aggregate plaintext transport/abuse ceiling. Exact context admission is token-based.
     _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
@@ -1889,37 +1902,157 @@ class RelayClient:
 
     @classmethod
     def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
+        return cls._validate_api_v1_chat_messages(messages).valid
+
+    @classmethod
+    def _validate_api_v1_chat_messages(cls, messages: Any) -> _ApiV1ChatValidationResult:
+        maximum_total_content_chars = cls._API_V1_MAX_TOTAL_REQUEST_CHARS
         if (
             not isinstance(messages, list)
             or not messages
             or len(messages) > cls._API_V1_MAX_MESSAGES
         ):
-            return False
+            message_count = len(messages) if isinstance(messages, list) else 0
+            return _ApiV1ChatValidationResult(
+                valid=False,
+                code="compute_node_invalid_request",
+                reason="message_count",
+                message_count=message_count,
+                maximum_total_content_chars=maximum_total_content_chars,
+            )
         total_content_chars = 0
-        for message in messages:
+        for index, message in enumerate(messages):
             if not isinstance(message, dict):
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="message_object",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             allowed_keys = {"role", "content", "name"}
             if set(message) - allowed_keys:
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="unknown_message_key",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             role = message.get("role")
             if (
                 not isinstance(role, str)
                 or role not in cls._API_V1_ALLOWED_MESSAGE_ROLES
             ):
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="role",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             name = message.get("name")
             if name is not None and (not isinstance(name, str) or len(name) > 128):
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="name",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             if "content" not in message:
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="missing_content",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             content_size = cls._api_v1_content_validation_size(message.get("content"))
             if content_size is None:
-                return False
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_invalid_request",
+                    reason="content_shape",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
             total_content_chars += content_size
             if total_content_chars > cls._API_V1_MAX_TOTAL_REQUEST_CHARS:
-                return False
-        return True
+                return _ApiV1ChatValidationResult(
+                    valid=False,
+                    code="compute_node_request_too_large",
+                    reason="aggregate_content_chars",
+                    message_count=len(messages),
+                    offending_message_index=index,
+                    per_message_content_chars=content_size,
+                    total_content_chars=total_content_chars,
+                    maximum_total_content_chars=maximum_total_content_chars,
+                )
+        return _ApiV1ChatValidationResult(
+            valid=True,
+            message_count=len(messages),
+            total_content_chars=total_content_chars,
+            maximum_total_content_chars=maximum_total_content_chars,
+        )
+
+    @staticmethod
+    def _api_v1_invalid_request_message_validation_error(
+        validation: _ApiV1ChatValidationResult,
+    ) -> Dict[str, Any]:
+        if validation.code == "compute_node_request_too_large":
+            return {
+                "code": "compute_node_request_too_large",
+                "type": "validation_error",
+                "message": "API v1 request content exceeds the current aggregate size limit",
+                "message_count": validation.message_count,
+                "total_content_chars": validation.total_content_chars,
+                "maximum_total_content_chars": validation.maximum_total_content_chars,
+                "retryable": False,
+            }
+        return {
+            "code": "compute_node_invalid_request",
+            "message": "Invalid chat message format",
+        }
+
+    @staticmethod
+    def _log_api_v1_message_validation_rejection(
+        validation: _ApiV1ChatValidationResult,
+    ) -> None:
+        log_error(
+            (
+                "api_v1.message_validation result=rejected safe_error_code={} reason={} "
+                "message_count={} offending_message_index={} per_message_content_chars={} "
+                "total_content_chars={} maximum_total_content_chars={}"
+            ),
+            validation.code or "compute_node_invalid_request",
+            validation.reason or "unknown",
+            validation.message_count,
+            (
+                validation.offending_message_index
+                if validation.offending_message_index is not None
+                else "none"
+            ),
+            (
+                validation.per_message_content_chars
+                if validation.per_message_content_chars is not None
+                else "unknown"
+            ),
+            validation.total_content_chars,
+            validation.maximum_total_content_chars,
+        )
 
     @staticmethod
     def _api_v1_stringify_content_blocks(content: Any) -> Any:
@@ -2296,8 +2429,6 @@ class RelayClient:
     @classmethod
     def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
         if isinstance(content, str):
-            if len(content) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS:
-                return None
             return len(content)
         if (
             not isinstance(content, list)
@@ -2316,11 +2447,6 @@ class RelayClient:
             if not isinstance(text, str) or not text:
                 return None
             total += len(text)
-            if (
-                len(text) > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-                or total > cls._API_V1_MAX_MESSAGE_CONTENT_CHARS
-            ):
-                return None
         return total
 
     @staticmethod
@@ -2651,13 +2777,14 @@ class RelayClient:
             "recovery_succeeded": False,
         }
 
-        if not self._messages_are_valid_api_v1_chat(messages):
+        message_validation = self._validate_api_v1_chat_messages(messages)
+        if not message_validation.valid:
+            self._log_api_v1_message_validation_rejection(message_validation)
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": "compute_node_invalid_request",
-                    "message": "Invalid chat message format",
-                },
+                error=self._api_v1_invalid_request_message_validation_error(
+                    message_validation
+                ),
             )
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)

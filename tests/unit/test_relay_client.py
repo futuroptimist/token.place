@@ -4397,21 +4397,19 @@ def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget
 
 
 def test_api_v1_large_structurally_valid_message_uses_exact_tier_admission():
-    large_content = "x" * 32769
-    eight_k = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=256)
+    large_content = "x" * 65000
+    eight_k = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=5)
     eight_k_client = _api_v1_validation_client(eight_k)
 
     rejected = _admission_envelope(eight_k_client, eight_k, large_content)
     error = rejected["api_v1_response"]["error"]
     assert error["code"] == "compute_node_context_window_exceeded"
-    assert error["prompt_tokens"] == 32789
-    assert error["requested_output_tokens"] == 256
-    assert error["required_total_tokens"] == 33045
+    assert error["prompt_tokens"] == 65020
+    assert error["requested_output_tokens"] == 5
+    assert error["required_total_tokens"] == 65025
     assert eight_k.runtime.calls == []
 
-    sixty_four_k = _AdmissionManager(
-        tier="64k-full", window=65536, default_max_tokens=256
-    )
+    sixty_four_k = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=5)
     sixty_four_k_client = _api_v1_validation_client(sixty_four_k)
     accepted = _admission_envelope(
         sixty_four_k_client, sixty_four_k, large_content, requested_tier="64k-full"
@@ -4422,7 +4420,7 @@ def test_api_v1_large_structurally_valid_message_uses_exact_tier_admission():
         "content": "ok",
     }
     assert sixty_four_k.runtime.calls
-    assert sixty_four_k.runtime.calls[-1]["max_tokens"] == 256
+    assert sixty_four_k.runtime.calls[-1]["max_tokens"] == 5
 
 
 def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tokens():

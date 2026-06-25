@@ -38,22 +38,14 @@ try:
 except Exception as exc:  # pragma: no cover - exercised via subprocess startup tests
     _CONTEXT_PROFILES_IMPORT_ERROR = exc
 
-    class _MissingContextProfile:
-        profile_id = "8k-fast"
-        total_context_tokens = 8192
-
     def normalize_context_tier(_profile_id: Optional[str]) -> str:
         return "8k-fast"
 
-    def get_context_profile(_profile_id: Optional[str]) -> _MissingContextProfile:
-        if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-            raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
-        return _MissingContextProfile()
+    def get_context_profile(_profile_id: Optional[str]) -> object:
+        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
 
-    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> _MissingContextProfile:
-        if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-            raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
-        return _MissingContextProfile()
+    def apply_context_profile(_manager: object, _profile_id: Optional[str]) -> object:
+        raise RuntimeError(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
 
 try:
     from desktop_runtime_setup import (

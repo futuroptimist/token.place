@@ -2363,6 +2363,13 @@ def test_utils_package_keeps_lazy_convenience_exports():
     assert utils.get_model_manager
     assert utils.get_crypto_manager
     assert utils.RelayClient
+    assert {
+        'get_model_manager',
+        'get_crypto_manager',
+        'get_temp_dir',
+        'RelayClient',
+    } <= set(dir(utils))
+
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

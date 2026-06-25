@@ -7,6 +7,12 @@ from utils.path_handling import get_temp_dir
 __all__ = ['get_model_manager', 'get_crypto_manager', 'get_temp_dir', 'RelayClient']
 
 
+def __dir__():
+    """List lazy convenience exports for star imports and IDE completion."""
+
+    return sorted(__all__)
+
+
 def __getattr__(name):
     """Lazily expose convenience imports without front-loading runtime dependencies."""
 

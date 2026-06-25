@@ -526,16 +526,12 @@ def _startup_context_tier(args: argparse.Namespace) -> str:
     return "8k-fast"
 
 
-def _load_context_profile_helpers() -> Tuple[Any, Any, Any]:
+def _load_context_profile_helpers() -> Tuple[Any, Any]:
     """Import context-profile helpers after baseline dependency preflight."""
 
-    from utils.context_profiles import (
-        apply_context_profile,
-        get_context_profile,
-        normalize_context_tier,
-    )
+    from utils.context_profiles import apply_context_profile, normalize_context_tier
 
-    return apply_context_profile, get_context_profile, normalize_context_tier
+    return apply_context_profile, normalize_context_tier
 
 
 def _structured_startup_error_payload(
@@ -704,9 +700,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        apply_context_profile, _get_context_profile, normalize_context_tier = (
-            _load_context_profile_helpers()
-        )
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
     except Exception as exc:
         setattr(args, "startup_error_code", "context_profiles_unavailable")
         emit_startup_error(f"context profiles unavailable: {exc}")

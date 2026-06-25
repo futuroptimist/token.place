@@ -718,6 +718,36 @@ def _api_v1_node_state(payload: dict[str, Any]) -> str:
     return state.strip().lower() if isinstance(state, str) else ""
 
 
+def _api_v1_node_has_ineligible_flag(payload: dict[str, Any]) -> bool:
+    return any(payload.get(flag) is True for flag in ("failed", "recovering", "draining", "unregistering"))
+
+
+def _api_v1_node_is_stale(payload: dict[str, Any], *, now_monotonic: float) -> bool:
+    polling_until = payload.get("polling_until_monotonic")
+    if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+        return False
+    stale_after = payload.get("last_ping_duration", _server_stale_seconds())
+    if not isinstance(stale_after, (int, float)):
+        stale_after = _server_stale_seconds()
+    return _server_ping_age_seconds(payload.get("last_ping")) > max(float(stale_after), 1.0)
+
+
+def _api_v1_safe_selected_server_payload(server_public_key: str, capabilities: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "public_key": server_public_key,
+        "capabilities": {
+            "api_version": "v1",
+            "supported_model_ids": list(capabilities.get("supported_model_ids", [])),
+            "active_context_tier": capabilities.get("active_context_tier"),
+            "maximum_total_context_tokens": capabilities.get("maximum_total_context_tokens"),
+            "default_output_token_reservation": capabilities.get("default_output_token_reservation"),
+            "maximum_output_tokens": capabilities.get("maximum_output_tokens"),
+            "max_concurrency": capabilities.get("max_concurrency"),
+            "backend_class": capabilities.get("backend_class", "unknown"),
+        },
+    }
+
+
 def _api_v1_scheduler_candidate(
     server_public_key: str,
     payload: dict[str, Any],
@@ -731,15 +761,14 @@ def _api_v1_scheduler_candidate(
     if not isinstance(payload, dict) or not bool(payload.get(API_V1_SERVER_MARKER)):
         return None
     state = _api_v1_node_state(payload)
-    if state in {"failed", "recovering", "draining", "unregistering"}:
+    if state in {"failed", "recovering", "draining", "unregistering"} or _api_v1_node_has_ineligible_flag(payload):
         return None
-    stale_after = payload.get("last_ping_duration", _server_stale_seconds())
-    if not isinstance(stale_after, (int, float)):
-        stale_after = _server_stale_seconds()
-    if _server_ping_age_seconds(payload.get("last_ping")) > max(float(stale_after), 1.0):
+    if _api_v1_node_is_stale(payload, now_monotonic=now_monotonic):
         return None
     capabilities = payload.get("capabilities")
     if not isinstance(capabilities, dict):
+        return None
+    if capabilities.get("api_version") != "v1":
         return None
     active_tier = capabilities.get("active_context_tier")
     if not _context_tier_can_satisfy(active_tier, requested_context_tier):
@@ -764,7 +793,7 @@ def _api_v1_scheduler_candidate(
         return None
     return {
         "server_public_key": server_public_key,
-        "payload": dict(payload),
+        "selected_server": _api_v1_safe_selected_server_payload(server_public_key, capabilities),
         "capabilities": dict(capabilities),
         "tier": active_tier,
         "tier_tokens": CONTEXT_TIER_ORDER[active_tier],
@@ -1300,7 +1329,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             "spillover": spillover,
             "spillover_reason": spillover_reason,
         }
-        return selected["server_public_key"], selection, selected["payload"]
+        return selected["server_public_key"], selection, selected["selected_server"]
 
 
 def _select_next_server_payload(*, api_v1: bool = False):
@@ -1342,6 +1371,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
                         'selection_policy': API_V1_SELECTION_POLICY,
                         'requested_context_tier': context_tier,
                         'requested_model': model,
+                        'eligible_node_count': selection.get("eligible_node_count", 0),
+                        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
                     }
                 }), 503
             return jsonify({
@@ -1351,6 +1382,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
                     'selection_policy': API_V1_SELECTION_POLICY,
                     'requested_context_tier': context_tier,
                     'requested_model': model,
+                    'eligible_node_count': selection.get("eligible_node_count", 0),
+                    'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
                 }
             }), 503
         return jsonify({

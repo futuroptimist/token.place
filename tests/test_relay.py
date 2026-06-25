@@ -429,9 +429,148 @@ def test_api_v1_scheduler_helper_uses_only_safe_metadata():
 
     assert candidate is not None
     assert candidate["tier"] == "8k-fast"
-    assert "chat_history" not in candidate
-    assert "messages" not in candidate
-    assert "prompt" not in candidate
+    unsafe_keys = {"chat_history", "ciphertext", "messages", "prompt", "content", "text"}
+    assert unsafe_keys.isdisjoint(candidate)
+    assert "payload" not in candidate
+    assert "selected_server" in candidate
+
+    def assert_safe_nested(value):
+        if isinstance(value, dict):
+            assert unsafe_keys.isdisjoint(value)
+            for nested in value.values():
+                assert_safe_nested(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                assert_safe_nested(nested)
+
+    assert_safe_nested(candidate["selected_server"])
+
+
+def test_api_v1_scheduler_helper_rejects_unsafe_boolean_state_flags(client):
+    for flag in ("failed", "recovering", "draining", "unregistering"):
+        payload = {
+            relay_module.API_V1_SERVER_MARKER: True,
+            "last_ping": datetime.now(),
+            "last_ping_duration": 30,
+            "capabilities": _capabilities("8k-fast", ["safe-model"]),
+            flag: True,
+        }
+
+        candidate = relay_module._api_v1_scheduler_candidate(
+            f"unsafe-flag-{flag}",
+            payload,
+            requested_model="safe-model",
+            requested_context_tier="8k-fast",
+            registration_index=0,
+            now_monotonic=time.monotonic(),
+        )
+
+        assert candidate is None
+
+
+def test_api_v1_scheduler_helper_rejects_non_v1_capabilities(client):
+    payload = {
+        relay_module.API_V1_SERVER_MARKER: True,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 30,
+        "capabilities": {**_capabilities("8k-fast", ["safe-model"]), "api_version": "v2"},
+    }
+
+    candidate = relay_module._api_v1_scheduler_candidate(
+        "wrong-api-version",
+        payload,
+        requested_model="safe-model",
+        requested_context_tier="8k-fast",
+        registration_index=0,
+        now_monotonic=time.monotonic(),
+    )
+
+    assert candidate is None
+
+
+def test_api_v1_next_keeps_long_polling_server_eligible_when_last_ping_is_stale(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    server = _server_key("long-poll-eligible")
+    _register_api_v1_server(client, server)
+    known_servers[server]["last_ping"] = datetime.now() - timedelta(seconds=5)
+    known_servers[server]["last_ping_duration"] = 1
+    known_servers[server]["polling_until_monotonic"] = time.monotonic() + 30
+
+    response = client.get("/api/v1/relay/servers/next")
+
+    assert response.status_code == 200
+    assert response.get_json()["server_public_key"] == server
+
+
+def test_api_v1_no_match_includes_safe_scheduler_metadata(client):
+    server = _server_key("no-match-metadata")
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast", ["model-a"]))
+
+    response = client.get("/api/v1/relay/servers/next?model=model-b&context_tier=8k-fast")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["error"]["code"] == "no_matching_compute_node"
+    assert payload["error"]["selection_policy"] == relay_module.API_V1_SELECTION_POLICY
+    assert payload["error"]["requested_context_tier"] == "8k-fast"
+    assert payload["error"]["requested_model"] == "model-b"
+    assert payload["error"]["eligible_node_count"] == 0
+    assert payload["error"]["eligible_tier_counts"] == {}
+
+
+class _LockAssertingInFlightRequests(dict):
+    def __init__(self, lock_probe, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lock_probe = lock_probe
+        self.values_checked_under_in_flight_lock = False
+
+    def values(self):
+        if self.lock_probe.locked:
+            self.values_checked_under_in_flight_lock = True
+        return super().values()
+
+
+class _LockProbe:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.locked = False
+
+    def __enter__(self):
+        self.wrapped.acquire()
+        self.locked = True
+        return self
+
+    def __exit__(self, *_args):
+        self.locked = False
+        self.wrapped.release()
+        return False
+
+
+def test_api_v1_in_flight_count_snapshots_under_lock_without_mutating_payload(client, monkeypatch):
+    lock_probe = _LockProbe(relay_module.api_v1_in_flight_requests_lock)
+    monkeypatch.setattr(relay_module, "api_v1_in_flight_requests_lock", lock_probe)
+    in_flight = _LockAssertingInFlightRequests(lock_probe, {
+        "req-active": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY},
+        "req-expired": {"expires_at": time.monotonic() - 60, "client_public_key": DUMMY_CLIENT_PUB_KEY},
+    })
+    payload = {
+        relay_module.API_V1_SERVER_MARKER: True,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 30,
+        "capabilities": _capabilities("8k-fast"),
+        "api_v1_in_flight_requests": in_flight,
+    }
+
+    load = relay_module._api_v1_node_load_snapshot(
+        "lock-snapshot-node",
+        payload,
+        now_monotonic=time.monotonic(),
+    )
+
+    assert load["in_flight_count"] == 1
+    assert in_flight.values_checked_under_in_flight_lock is True
+    assert set(payload["api_v1_in_flight_requests"]) == {"req-active", "req-expired"}
+
 
 def test_api_v1_malformed_capabilities_are_rejected_without_registration(client):
     server = _server_key("malformed-cap")

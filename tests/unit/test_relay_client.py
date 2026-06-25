@@ -4158,15 +4158,10 @@ def test_api_v1_invalid_and_unsupported_options_do_not_call_worker(options, code
         [{"role": "tool", "content": "hello"}],
         [{"role": "user"}],
         [{"role": "user", "content": "x", "tool_calls": []}],
-        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS + 1)}],
         [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}],
         [{"role": "user", "content": [{"type": "text", "text": ""}]}],
         [{"role": "user", "content": [{"type": "text", "text": "x", "extra": "no"}]}],
         [{"role": "user", "content": "x"}] * (RelayClient._API_V1_MAX_MESSAGES + 1),
-        [
-            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_MESSAGE_CONTENT_CHARS}
-        ]
-        * 5,
     ],
 )
 def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
@@ -4185,6 +4180,112 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
     assert error["code"] == "compute_node_invalid_request"
     manager.runtime.create_chat_completion.assert_not_called()
     assert (manager.worker_health, manager.recovery_count) == before
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "x" * 32769}],
+        [{"role": "user", "content": "x" * 65536}],
+        [{"role": "user", "content": "x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS}],
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * 20000},
+                    {"type": "input_text", "text": "y" * 20000},
+                ],
+            }
+        ],
+    ],
+)
+def test_api_v1_large_structurally_valid_messages_reach_exact_admission(messages):
+    manager = _ApiV1RuntimeManager()
+    manager.context_tier = "64k-full"
+    manager.context_window_tokens = RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1024
+    manager.runtime.tokenize.side_effect = lambda payload, _add_bos=False: [1]
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-large-valid",
+        model_id="llama-3-8b-instruct",
+        messages=messages,
+        options={},
+        requested_context_tier="64k-full",
+    )
+
+    assert "error" not in envelope["api_v1_response"]
+    manager.runtime.create_chat_completion.assert_called()
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "x" * (RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS + 1)}],
+        [
+            {"role": "user", "content": "x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS},
+            {"role": "assistant", "content": "y"},
+        ],
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS},
+                    {"type": "input_text", "text": "y"},
+                ],
+            }
+        ],
+    ],
+)
+def test_api_v1_aggregate_content_too_large_returns_specific_error_and_safe_logs(
+    messages,
+    caplog,
+):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    distinctive = "SECRET_PROMPT_SENTINEL"
+    if isinstance(messages[0]["content"], str):
+        messages[0]["content"] = distinctive + messages[0]["content"]
+
+    with caplog.at_level("ERROR", logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-too-large",
+            model_id="llama-3-8b-instruct",
+            messages=messages,
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_request_too_large"
+    assert error["type"] == "validation_error"
+    assert error["message_count"] == len(messages)
+    assert error["total_content_chars"] > RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["retryable"] is False
+    assert distinctive not in json.dumps(error)
+    assert distinctive not in caplog.text
+    assert "compute_node_request_too_large" in caplog.text
+    manager.runtime.create_chat_completion.assert_not_called()
+
+
+def test_api_v1_text_block_count_limit_remains_structural_invalid_request():
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-too-many-blocks",
+        model_id="llama-3-8b-instruct",
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "x"}] * (RelayClient._API_V1_MAX_TEXT_BLOCKS + 1),
+            }
+        ],
+        options={},
+    )
+
+    assert envelope["api_v1_response"]["error"]["code"] == "compute_node_invalid_request"
+    manager.runtime.create_chat_completion.assert_not_called()
 
 
 def test_api_v1_unsupported_option_error_message_caps_attacker_controlled_names():
@@ -4487,6 +4588,42 @@ def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():
     assert error["recommended_context_tier"] == "64k-full"
     assert error["retryable"] is True
     assert manager.runtime.calls == []
+
+
+def test_api_v1_large_valid_message_overflows_8k_after_exact_token_admission():
+    manager = _AdmissionManager(tier="8k-fast", window=8192, default_max_tokens=5)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "x" * 9000,
+        options={"max_tokens": 5},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 9020
+    assert error["requested_output_tokens"] == 5
+    assert error["required_total_tokens"] == 9025
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_large_valid_message_is_admitted_on_64k_when_exact_tokens_fit():
+    manager = _AdmissionManager(tier="64k-full", window=65536, default_max_tokens=5)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "x" * 65000,
+        options={"max_tokens": 5},
+        requested_tier="64k-full",
+    )
+
+    assert "error" not in envelope["api_v1_response"]
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.calls[-1]["max_tokens"] == 5
 
 
 def test_api_v1_64k_request_on_8k_runtime_reports_tier_unsupported_when_it_fits():

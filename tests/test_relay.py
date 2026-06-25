@@ -317,6 +317,81 @@ def test_api_v1_capability_registration_and_tier_selection(client):
     assert full_response.get_json()["server_public_key"] == full
 
 
+def test_api_v1_best_fit_keeps_8k_requests_on_healthy_8k_node(client):
+    fast = _server_key("best-fit-fast")
+    full = _server_key("best-fit-full")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    payloads = [
+        client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+        for _ in range(5)
+    ]
+
+    assert [payload["server_public_key"] for payload in payloads] == [fast] * 5
+    assert {payload["spillover"] for payload in payloads} == {False}
+    assert payloads[-1]["selection_policy"] == relay_module.API_V1_SELECTION_POLICY
+    assert payloads[-1]["eligible_tier_counts"] == {"8k-fast": 1, "64k-full": 1}
+
+
+def test_api_v1_64k_requests_select_only_64k_capable_nodes(client):
+    fast = _server_key("best-fit-fast-64")
+    full = _server_key("best-fit-full-64")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    payloads = [
+        client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()
+        for _ in range(3)
+    ]
+
+    assert [payload["server_public_key"] for payload in payloads] == [full] * 3
+    assert {payload["selected_context_tier"] for payload in payloads} == {"64k-full"}
+
+
+def test_api_v1_best_fit_reports_controlled_spillover_to_larger_tier(client):
+    full = _server_key("spillover-full")
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+
+    response = client.get("/api/v1/relay/servers/next?context_tier=8k-fast")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["server_public_key"] == full
+    assert payload["spillover"] is True
+    assert payload["spillover_reason"] == "no_smaller_healthy_unsaturated_eligible_node"
+
+
+def test_api_v1_best_fit_spills_over_when_smaller_tier_is_saturated(client):
+    fast = _server_key("spillover-fast-saturated")
+    full = _server_key("spillover-full-available")
+    _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
+    known_servers[fast]["api_v1_in_flight_requests"] = {
+        "req-saturating-fast": {"expires_at": time.monotonic() + 60}
+    }
+
+    payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+
+    assert payload["server_public_key"] == full
+    assert payload["spillover"] is True
+    assert payload["selected_in_flight_count"] == 0
+
+
+def test_api_v1_best_fit_uses_least_loaded_within_selected_tier(client):
+    busy = _server_key("least-loaded-busy")
+    idle = _server_key("least-loaded-idle")
+    _register_api_v1_server_with_capabilities(client, busy, _capabilities("8k-fast"))
+    _register_api_v1_server_with_capabilities(client, idle, _capabilities("8k-fast"))
+    client_inference_requests[busy] = [{"e2ee_v1": True, "request_id": "queued"}]
+
+    payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+
+    assert payload["server_public_key"] == idle
+    assert payload["selected_queue_depth"] == 0
+    assert payload["selected_load_score"] == 0
+
+
 def test_api_v1_old_node_compatibility_and_64k_can_satisfy_8k(client):
     old = _server_key("old-node")
     full = _server_key("full-only")
@@ -2753,10 +2828,10 @@ def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(clien
     known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
 
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [
-        server_c,
         server_a,
         server_c,
         server_a,
+        server_c,
     ]
     assert server_b not in known_servers
 
@@ -2955,7 +3030,7 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
             request_id=f'req-round-robin-{idx}',
         )
 
-    assert selected_servers == [server_a, server_b, server_a, server_b]
+    assert selected_servers == [server_a, server_b, server_b, server_a]
 
     first_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
     second_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
@@ -2964,9 +3039,9 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
 
     assert [first_a.status_code, second_a.status_code, first_b.status_code, second_b.status_code] == [200] * 4
     assert first_a.get_json()['request_id'] == 'req-round-robin-0'
-    assert second_a.get_json()['request_id'] == 'req-round-robin-2'
+    assert second_a.get_json()['request_id'] == 'req-round-robin-3'
     assert first_b.get_json()['request_id'] == 'req-round-robin-1'
-    assert second_b.get_json()['request_id'] == 'req-round-robin-3'
+    assert second_b.get_json()['request_id'] == 'req-round-robin-2'
 
 
 def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):
@@ -3060,8 +3135,8 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert DUMMY_SERVER_PUB_KEY in known_servers
 
     time.sleep(2.1)
     expired = client.get('/api/v1/relay/servers/next')
@@ -3141,8 +3216,8 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
 
     time.sleep(1.2)
     next_response = client.get('/api/v1/relay/servers/next')
-    assert next_response.status_code == 200
-    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+    assert next_response.status_code == 503
+    assert DUMMY_SERVER_PUB_KEY in known_servers
 
 
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):

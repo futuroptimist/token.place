@@ -3,6 +3,10 @@ const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an i
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
+const LANDING_CONTEXT_TIER_STORAGE_KEY = 'tokenplace.landing.api_v1.context_tier';
+const DEFAULT_CONTEXT_TIER = '8k-fast';
+const SUPPORTED_CONTEXT_TIERS = ['8k-fast', '64k-full'];
+const CONTEXT_TIER_RANK = { '8k-fast': 1, '64k-full': 2 };
 
 new Vue({
     el: '#app',
@@ -18,6 +22,8 @@ new Vue({
         clientPublicKey: null,
         availableModels: [],
         selectedModelId: '',
+        selectedContextTier: DEFAULT_CONTEXT_TIER,
+        selectedProfileMetadata: null,
         modelsLoading: false,
         modelsLoaded: false,
         modelsError: '',
@@ -32,6 +38,7 @@ new Vue({
     },
     mounted() {
         this.detectTouchInput();
+        this.loadPersistedContextTier();
         this.fetchModels();
         this.generateClientKeys();
         this.refreshComputeNodeCount();
@@ -88,6 +95,41 @@ new Vue({
         }
     },
     methods: {
+        normalizeContextTier(value) {
+            return SUPPORTED_CONTEXT_TIERS.includes(value) ? value : DEFAULT_CONTEXT_TIER;
+        },
+
+        loadPersistedContextTier() {
+            let storedTier = null;
+            try {
+                storedTier = window.localStorage.getItem(LANDING_CONTEXT_TIER_STORAGE_KEY);
+            } catch (error) {
+                console.warn('Unable to read landing context tier preference:', error);
+            }
+            this.selectedContextTier = this.normalizeContextTier(storedTier);
+            this.persistSelectedContextTier();
+        },
+
+        persistSelectedContextTier() {
+            this.selectedContextTier = this.normalizeContextTier(this.selectedContextTier);
+            try {
+                window.localStorage.setItem(LANDING_CONTEXT_TIER_STORAGE_KEY, this.selectedContextTier);
+            } catch (error) {
+                console.warn('Unable to persist landing context tier preference:', error);
+            }
+        },
+
+        handleContextTierChange() {
+            this.persistSelectedContextTier();
+            this.clearSelectedServer();
+        },
+
+        contextTierCanSatisfy(selectedTier, requestedTier) {
+            const selectedRank = CONTEXT_TIER_RANK[this.normalizeContextTier(selectedTier)];
+            const requestedRank = CONTEXT_TIER_RANK[this.normalizeContextTier(requestedTier)];
+            return selectedRank >= requestedRank;
+        },
+
         async refreshComputeNodeCount(options = {}) {
             // Failover capacity refreshes must be allowed to apply their own
             // successful diagnostics result even if the background poller starts
@@ -239,6 +281,7 @@ new Vue({
 
         async ensureSelectedServer(options = {}) {
             const forceReselect = Boolean(options.forceReselect);
+            const requestedContextTier = this.normalizeContextTier(this.selectedContextTier);
             if (forceReselect) {
                 this.clearSelectedServer();
             }
@@ -248,7 +291,10 @@ new Vue({
             }
 
             try {
-                const response = await fetch('/api/v1/relay/servers/next', { cache: 'no-store' });
+                const selectionParams = new URLSearchParams();
+                selectionParams.set('model', this.selectedModelId);
+                selectionParams.set('context_tier', requestedContextTier);
+                const response = await fetch(`/api/v1/relay/servers/next?${selectionParams.toString()}`, { cache: 'no-store' });
                 if (!response.ok) {
                     let errorData = null;
                     try {
@@ -264,6 +310,14 @@ new Vue({
                 }
 
                 const data = await response.json();
+                if (data && data.selected_context_tier && !this.contextTierCanSatisfy(data.selected_context_tier, requestedContextTier)) {
+                    return {
+                        error: {
+                            userMessage: 'The selected LLM server does not support the requested context tier. Please try again.'
+                        }
+                    };
+                }
+
                 const rawKey = data && data.server_public_key;
                 const normalizedKey = this.normalizeServerPublicKey(rawKey);
                 if (!normalizedKey) {
@@ -277,6 +331,12 @@ new Vue({
                     ? this.encodePemToBase64(normalizedKey)
                     : rawKeyText.replace(/\s+/g, '');
                 this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
+                this.selectedProfileMetadata = {
+                    selected_context_tier: data.selected_context_tier || null,
+                    selected_context_window_tokens: Number.isInteger(data.selected_context_window_tokens) ? data.selected_context_window_tokens : null,
+                    selected_model_support: Array.isArray(data.selected_model_support) ? data.selected_model_support.slice(0, 20) : [],
+                    selection_policy: typeof data.selection_policy === 'string' ? data.selection_policy : ''
+                };
                 return true;
             } catch (error) {
                 console.error('Error selecting API v1 compute node:', error);
@@ -305,6 +365,7 @@ new Vue({
             this.selectedServerPublicKeyB64 = null;
             this.serverPublicKey = null;
             this.selectedServerKeyLabel = '';
+            this.selectedProfileMetadata = null;
         },
 
         markSelectedServerTerminalFailure(message) {
@@ -755,7 +816,10 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: this.createApiV1Messages(messageContent),
-                    options: {}
+                    options: {},
+                    routing: {
+                        context_tier: this.normalizeContextTier(this.selectedContextTier)
+                    }
                 }
             };
 
@@ -974,6 +1038,10 @@ new Vue({
             const errorCode = typeof error.code === 'string' ? error.code.trim() : '';
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now. Your chat history is still here.',
+                no_matching_compute_node: 'No LLM servers are available for the selected model and context tier right now. Please choose a different tier or try again later.',
+                invalid_context_tier: 'The selected context tier is not supported. Please choose another tier.',
+                selected_server_unavailable: 'The selected LLM server is unavailable right now. Please try again.',
+                selected_server_expired: 'The selected LLM server is unavailable right now. Please try again.',
                 compute_node_model_unsupported: 'The selected model is not available on this LLM server. Please try again.',
                 compute_node_options_unsupported: 'The selected LLM server does not support one of the requested options. Please try again.',
                 compute_node_invalid_request: 'The LLM server rejected the request format. Please try again.',

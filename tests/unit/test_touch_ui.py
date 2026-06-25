@@ -143,3 +143,53 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
     assert "No LLM servers are available right now. Your chat history is still here." in chat_js
     assert "this.clearSelectedServer()" in chat_js
+
+
+def test_landing_context_tier_selector_default_persistence_and_disabled_state():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert 'label for="context-tier-select">Context tier</label>' in index_html
+    assert 'data-testid="landing-context-tier-select"' in index_html
+    assert '<option value="8k-fast">8K Fast</option>' in index_html
+    assert '<option value="64k-full">64K Full</option>' in index_html
+    assert ':disabled="isGeneratingResponse"' in index_html
+    assert "LANDING_CONTEXT_TIER_STORAGE_KEY = 'tokenplace.landing.api_v1.context_tier'" in chat_js
+    assert "DEFAULT_CONTEXT_TIER = '8k-fast'" in chat_js
+    assert "SUPPORTED_CONTEXT_TIERS = ['8k-fast', '64k-full']" in chat_js
+    assert "selectedContextTier: DEFAULT_CONTEXT_TIER" in chat_js
+    assert "loadPersistedContextTier" in chat_js
+    assert "localStorage.getItem(LANDING_CONTEXT_TIER_STORAGE_KEY)" in chat_js
+    assert "localStorage.setItem(LANDING_CONTEXT_TIER_STORAGE_KEY, this.selectedContextTier)" in chat_js
+    assert "return SUPPORTED_CONTEXT_TIERS.includes(value) ? value : DEFAULT_CONTEXT_TIER" in chat_js
+
+
+def test_landing_context_tier_selection_request_and_encrypted_routing_metadata():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "selectionParams.set('model', this.selectedModelId);" in chat_js
+    assert "selectionParams.set('context_tier', requestedContextTier);" in chat_js
+    assert "/api/v1/relay/servers/next?${selectionParams.toString()}" in chat_js
+    assert "selectedProfileMetadata" in chat_js
+    assert "selected_context_tier" in chat_js
+    assert "contextTierCanSatisfy(data.selected_context_tier, requestedContextTier)" in chat_js
+    assert "routing: {" in chat_js
+    assert "context_tier: this.normalizeContextTier(this.selectedContextTier)" in chat_js
+    assert "server_public_key: this.selectedServerPublicKeyB64" in chat_js
+    assert "ciphertext: encryptedData.ciphertext" in chat_js
+    assert "messages: this.createApiV1Messages(messageContent)" in chat_js
+
+
+def test_landing_context_tier_error_messages_and_no_auto_escalation():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "no_matching_compute_node" in chat_js
+    assert "No LLM servers are available for the selected model and context tier right now." in chat_js
+    assert "The selected LLM server does not support the requested context tier. Please try again." in chat_js
+    assert "selected_server_unavailable" in chat_js
+    assert "selected_server_expired" in chat_js
+    assert "compute_node_context_window_exceeded" in chat_js
+    assert "compute_node_request_too_large" in chat_js
+    assert "64k-full'" in chat_js
+    assert "automatically" not in chat_js.lower()
+    assert "retry" not in chat_js.lower().replace("retry-chat-button", "").replace("landing-new-chat-retry", "")

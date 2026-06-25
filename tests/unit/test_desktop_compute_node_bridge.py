@@ -2279,6 +2279,40 @@ def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_
     assert payload['source'] == 'bundled'
     assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
+
+def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.context_profiles':
+            raise ModuleNotFoundError("No module named 'utils.context_profiles'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+
+    module = ModuleType('compute_node_bridge_no_context_profiles')
+    module.__file__ = str(MODULE_PATH)
+    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
+    exec(code, module.__dict__)
+
+    args = SimpleNamespace(
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        context_tier='64k-full',
+    )
+    payload = module._structured_startup_error_payload(args, 'context profiles unavailable')
+
+    assert module._CONTEXT_PROFILES_IMPORT_ERROR is not None
+    assert module.normalize_context_tier('unknown') == '8k-fast'
+    assert payload['context_tier'] == '64k-full'
+    assert payload['error_code'] == 'desktop_compute_node_startup_failed'
+    assert 'model_path' not in payload
+    with pytest.raises(RuntimeError, match='context profiles unavailable'):
+        module.get_context_profile('8k-fast')
+    with pytest.raises(RuntimeError, match='context profiles unavailable'):
+        module.apply_context_profile(object(), '8k-fast')
+
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__
 

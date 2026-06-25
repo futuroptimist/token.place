@@ -521,3 +521,112 @@ def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) 
     assert 'attach attempts: 1/3' in message
     assert 'permission denied' in message
     assert 'redacted hdiutil info snapshot' in message
+
+
+def test_validator_hdiutil_info_helpers_preserve_raw_matching_and_redact(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    raw_path = '/private/var/folders/zz/example/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg'
+
+    def fake_run(cmd, *, check, capture_output, text=None):
+        if cmd == ['hdiutil', 'info']:
+            return subprocess.CompletedProcess(cmd, 3, f'image-path: {raw_path}', 'raw stderr')
+        if cmd == ['hdiutil', 'info', '-plist']:
+            return subprocess.CompletedProcess(cmd, 0, b'not a plist', b'')
+        return subprocess.CompletedProcess(cmd, 7, 'best stdout', 'best stderr')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._hdiutil_info_raw() == (f'image-path: {raw_path}\nraw stderr', 3)
+    snapshot = validator._hdiutil_info_snapshot()
+    assert 'hdiutil info failed with exit code 3' in snapshot
+    assert '/private/var/folders/<redacted>' in snapshot
+    assert raw_path not in snapshot
+    assert validator._hdiutil_info_plist() == {}
+
+    result = validator._run_best_effort(['hdiutil', 'detach', str(tmp_path / 'missing')])
+
+    assert result.returncode == 7
+    warning = capsys.readouterr().out
+    assert '::warning::Best-effort command failed' in warning
+    assert 'best stdout' in warning
+    assert 'best stderr' in warning
+
+
+def test_validator_hdiutil_matching_helpers_handle_malformed_entries(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    other_path = tmp_path / 'other.dmg'
+    other_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+
+    original_resolve = validator.Path.resolve
+
+    def fake_resolve(self):
+        if str(self).startswith('/bad/path'):
+            raise OSError('unresolvable')
+        return original_resolve(self)
+
+    monkeypatch.setattr(validator.Path, 'resolve', fake_resolve)
+
+    assert validator._image_entries({'images': 'not-a-list'}) == []
+    assert not validator._image_matches_dmg({'image-path': 123}, dmg_path)
+    relative_dmg_path = Path('release-artifacts/target.dmg')
+    assert validator._path_matches_dmg('/bad/path/release-artifacts/target.dmg', relative_dmg_path)
+    assert not validator._path_matches_dmg('/bad/path/release-artifacts/other.dmg', relative_dmg_path)
+    assert not validator._mountpoint_referenced(
+        mount_dir,
+        {'images': [{'image-path': str(dmg_path), 'system-entities': 'not-a-list'}]},
+    )
+
+    devices = validator._matching_hdiutil_devices(
+        dmg_path,
+        {
+            'images': [
+                {'image-path': str(other_path), 'system-entities': [{'dev-entry': '/dev/disk2'}]},
+                {'image-path': str(dmg_path), 'system-entities': 'not-a-list'},
+                {
+                    'image-path': str(dmg_path),
+                    'system-entities': [
+                        'not-a-dict',
+                        {'dev-entry': 'not-a-disk'},
+                        {'dev-entry': '/dev/disk3'},
+                    ],
+                },
+            ]
+        },
+        raw_info=f'image-path: {dmg_path}\n/dev/disk3\n/dev/disk4\nimage-path: {other_path}\n/dev/disk9',
+    )
+
+    assert devices == ['/dev/disk3', '/dev/disk4']
+
+
+def test_validator_hdiutil_plist_and_retry_edge_branches(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    plist_payload = validator.plistlib.dumps({'images': []})
+    calls = []
+
+    def fake_run(cmd, *, check, capture_output, text=None):
+        calls.append(cmd)
+        if cmd == ['hdiutil', 'info', '-plist'] and len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 2, b'', b'plist failed')
+        if cmd == ['hdiutil', 'info', '-plist']:
+            return subprocess.CompletedProcess(cmd, 0, plist_payload, b'')
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._hdiutil_info_plist() == {}
+    assert validator._hdiutil_info_plist() == {'images': []}
+    assert validator._path_matches_dmg(str(dmg_path.resolve()), dmg_path)
+
+    try:
+        validator._attach_dmg_with_retries(dmg_path, attempts=0)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected zero-attempt attach helper call to exit')
+
+    assert 'no attempts were run' in message

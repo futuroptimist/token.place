@@ -2181,7 +2181,9 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     )
     (python_dir / 'desktop_runtime_setup.py').write_text(
         'def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):\n    return None\n'
-        'def ensure_desktop_llama_runtime(_mode):\n    return {"selected_backend": "cpu"}\n'
+        'def ensure_desktop_llama_runtime(_mode):\n'
+        '    print("unexpected runtime setup", file=__import__("sys").stderr)\n'
+        '    return {"selected_backend": "cpu"}\n'
         'def ensure_desktop_python_dependencies(*, repo_root=None):\n    return {"ok": "true"}\n'
         'def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):\n    return None\n',
         encoding='utf-8',
@@ -2212,6 +2214,7 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     )
 
     assert proc.returncode == 1
+    assert "unexpected runtime setup" not in proc.stderr
     events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     payload = next(event for event in events if event.get('type') == 'error')
     assert payload['error_code'] == 'context_profiles_unavailable'

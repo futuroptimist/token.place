@@ -670,6 +670,11 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
+    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
+        setattr(args, "startup_error_code", "context_profiles_unavailable")
+        emit_startup_error(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
+        return 1
+
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -693,11 +698,6 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
-    if _CONTEXT_PROFILES_IMPORT_ERROR is not None:
-        setattr(args, "startup_error_code", "context_profiles_unavailable")
-        emit_startup_error(f"context profiles unavailable: {_CONTEXT_PROFILES_IMPORT_ERROR}")
-        return 1
-
     dependency_setup = ensure_desktop_python_dependencies()
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"

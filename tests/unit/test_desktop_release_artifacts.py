@@ -406,14 +406,19 @@ def test_validator_cleanup_only_detaches_referenced_mountpoint_and_matched_devic
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
     monkeypatch.setattr(validator, '_hdiutil_info_plist', fake_info_plist)
-    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda: snapshots.append('snapshot') or 'snapshot')
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: ('hdiutil info raw', 0))
+    monkeypatch.setattr(
+        validator,
+        '_hdiutil_info_snapshot',
+        lambda raw_info=None, returncode=0: snapshots.append((raw_info, returncode)) or 'snapshot',
+    )
     monkeypatch.setattr(validator, '_run_best_effort', fake_run_best_effort)
 
     assert validator._cleanup_dmg_attach_state(dmg_path, mount_dir) == 'snapshot'
 
     assert calls == [['hdiutil', 'detach', str(mount_dir)], ['hdiutil', 'detach', '/dev/disk4s1']]
     assert len(plist_calls) == 2
-    assert snapshots == ['snapshot']
+    assert snapshots == [('hdiutil info raw', 0)]
     assert mount_dir.exists()
 
 
@@ -437,7 +442,8 @@ def test_validator_cleanup_skips_unreferenced_mountpoint(monkeypatch, tmp_path) 
             ]
         },
     )
-    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda: 'snapshot')
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: ('hdiutil info raw', 0))
+    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda raw_info=None, returncode=0: 'snapshot')
     monkeypatch.setattr(
         validator,
         '_run_best_effort',
@@ -447,6 +453,36 @@ def test_validator_cleanup_skips_unreferenced_mountpoint(monkeypatch, tmp_path) 
     validator._cleanup_dmg_attach_state(dmg_path, mount_dir)
 
     assert calls == [['hdiutil', 'detach', '/dev/disk5']]
+
+
+def test_validator_cleanup_uses_raw_hdiutil_info_for_matching_but_redacts_diagnostics(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = Path('release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+    raw_info = """
+image-path: /private/var/folders/zz/redacted-test/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg
+/dev/disk8           Apple_partition_scheme
+/dev/disk8s1         Apple_HFS
+image-path: /private/var/folders/zz/redacted-test/release-artifacts/other.dmg
+/dev/disk9           Apple_partition_scheme
+""".strip()
+
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: (raw_info, 0))
+    monkeypatch.setattr(validator, '_hdiutil_info_plist', lambda: {})
+    monkeypatch.setattr(
+        validator,
+        '_run_best_effort',
+        lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+    )
+
+    diagnostic = validator._cleanup_dmg_attach_state(dmg_path, mount_dir)
+
+    assert calls == [['hdiutil', 'detach', '/dev/disk8'], ['hdiutil', 'detach', '/dev/disk8s1']]
+    assert '/dev/disk9' not in {call[-1] for call in calls}
+    assert '/private/var/folders/<redacted>' in diagnostic
+    assert '/private/var/folders/zz/redacted-test' not in diagnostic
 
 def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()

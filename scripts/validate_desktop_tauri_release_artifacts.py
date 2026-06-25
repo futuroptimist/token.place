@@ -93,12 +93,18 @@ def _redact_hdiutil_info(info: str) -> str:
     return re.sub(r"/private/var/folders/[^\s]+", "/private/var/folders/<redacted>", info)
 
 
-def _hdiutil_info_snapshot() -> str:
+def _hdiutil_info_raw() -> tuple[str, int]:
     result = subprocess.run(["hdiutil", "info"], check=False, capture_output=True, text=True)
     output = f"{result.stdout}\n{result.stderr}".strip()
-    if result.returncode != 0:
-        return f"hdiutil info failed with exit code {result.returncode}:\n{_redact_hdiutil_info(output)}"
-    return _redact_hdiutil_info(output)
+    return output, result.returncode
+
+
+def _hdiutil_info_snapshot(raw_info: str | None = None, returncode: int = 0) -> str:
+    if raw_info is None:
+        raw_info, returncode = _hdiutil_info_raw()
+    if returncode != 0:
+        return f"hdiutil info failed with exit code {returncode}:\n{_redact_hdiutil_info(raw_info)}"
+    return _redact_hdiutil_info(raw_info)
 
 
 def _hdiutil_info_plist() -> dict[str, object]:
@@ -125,12 +131,18 @@ def _image_matches_dmg(image: dict[str, object], dmg_path: Path) -> bool:
     image_path = image.get("image-path")
     if not isinstance(image_path, str):
         return False
+    return _path_matches_dmg(image_path, dmg_path)
+
+
+def _path_matches_dmg(image_path: str, dmg_path: Path) -> bool:
     if image_path == str(dmg_path) or image_path == str(dmg_path.resolve()):
         return True
     try:
-        return Path(image_path).resolve() == dmg_path.resolve()
+        if Path(image_path).resolve() == dmg_path.resolve():
+            return True
     except OSError:
-        return False
+        pass
+    return image_path.endswith(f"/{dmg_path}")
 
 
 def _mountpoint_referenced(mount_dir: Path, info_plist: dict[str, object]) -> bool:
@@ -145,7 +157,18 @@ def _mountpoint_referenced(mount_dir: Path, info_plist: dict[str, object]) -> bo
     return False
 
 
-def _matching_hdiutil_devices(dmg_path: Path, info_plist: dict[str, object]) -> list[str]:
+def _matching_hdiutil_devices_from_text(dmg_path: Path, raw_info: str) -> list[str]:
+    devices: list[str] = []
+    image_blocks = re.split(r"(?=^image-path\s*:)", raw_info, flags=re.MULTILINE)
+    for block in image_blocks:
+        image_match = re.search(r"^image-path\s*:\s*(.+)$", block, flags=re.MULTILINE)
+        if image_match is None or not _path_matches_dmg(image_match.group(1).strip(), dmg_path):
+            continue
+        devices.extend(re.findall(r"^(/dev/disk\S+)", block, flags=re.MULTILINE))
+    return devices
+
+
+def _matching_hdiutil_devices(dmg_path: Path, info_plist: dict[str, object], raw_info: str = "") -> list[str]:
     devices: list[str] = []
     for image in _image_entries(info_plist):
         if not _image_matches_dmg(image, dmg_path):
@@ -159,19 +182,23 @@ def _matching_hdiutil_devices(dmg_path: Path, info_plist: dict[str, object]) -> 
             device = entity.get("dev-entry")
             if isinstance(device, str) and device.startswith("/dev/disk"):
                 devices.append(device)
+    if raw_info:
+        devices.extend(_matching_hdiutil_devices_from_text(dmg_path, raw_info))
     return list(dict.fromkeys(devices))
 
 
 def _cleanup_dmg_attach_state(dmg_path: Path, mount_dir: Path) -> str:
+    raw_info, raw_returncode = _hdiutil_info_raw()
     info_plist = _hdiutil_info_plist()
     if mount_dir.exists() and _mountpoint_referenced(mount_dir, info_plist):
         _run_best_effort(["hdiutil", "detach", str(mount_dir)])
+        raw_info, raw_returncode = _hdiutil_info_raw()
         info_plist = _hdiutil_info_plist()
-    for device in _matching_hdiutil_devices(dmg_path, info_plist):
+    for device in _matching_hdiutil_devices(dmg_path, info_plist, raw_info):
         _run_best_effort(["hdiutil", "detach", device])
     shutil.rmtree(mount_dir, ignore_errors=True)
     mount_dir.mkdir(parents=True, exist_ok=True)
-    return _hdiutil_info_snapshot()
+    return _hdiutil_info_snapshot(raw_info, raw_returncode)
 
 
 def _is_transient_hdiutil_attach_failure(result: subprocess.CompletedProcess[str]) -> bool:

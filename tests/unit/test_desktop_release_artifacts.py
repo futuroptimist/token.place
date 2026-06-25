@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 WORKFLOW = Path('.github/workflows/desktop-release.yml')
@@ -260,42 +261,31 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     )
     dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg_path.write_bytes(b'dmg')
-    attach_calls = []
-    detach_calls = []
+    cleanup_state_calls = []
+    cleaned = []
 
-    class FakeTemporaryDirectory:
-        def __init__(self, *, prefix):
-            assert prefix == 'token-place-dmg-mount-'
+    class FakeMountTemporaryDirectory:
+        name = str(mount_dir)
 
-        def __enter__(self):
-            return str(mount_dir)
+        def cleanup(self):
+            cleaned.append(self.name)
 
-        def __exit__(self, *args):
-            return False
+    def fake_attach(dmg):
+        assert dmg == dmg_path
+        return FakeMountTemporaryDirectory()
 
-    def fake_run_with_retries(cmd, *, attempts, retry_messages):
-        attach_calls.append((cmd, attempts, retry_messages))
-        return '/dev/disk4'
-
-    def fake_run(cmd):
-        detach_calls.append(cmd)
-        return ''
+    def fake_cleanup_state(path, cleanup_mount_dir):
+        cleanup_state_calls.append((path, cleanup_mount_dir))
+        return 'hdiutil info snapshot'
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
-    monkeypatch.setattr(validator, '_run_with_retries', fake_run_with_retries)
-    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
-    assert attach_calls == [
-        (
-            ['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount_dir), str(dmg_path)],
-            8,
-            ('Resource temporarily unavailable', 'Resource busy'),
-        )
-    ]
-    assert detach_calls == [['hdiutil', 'detach', str(mount_dir)]]
+    assert cleanup_state_calls == [(dmg_path, mount_dir)]
+    assert cleaned == [str(mount_dir)]
 
 
 def test_validator_run_formats_command_failures(monkeypatch) -> None:
@@ -318,3 +308,325 @@ def test_validator_run_formats_command_failures(monkeypatch) -> None:
     assert 'Command failed (codesign --verify example.app)' in message
     assert 'stdout detail' in message
     assert 'stderr detail' in message
+
+
+def test_validator_attach_retries_with_fresh_mountpoints_and_cleanup(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_roots = [tmp_path / 'mount-1', tmp_path / 'mount-2']
+    cleanup_calls = []
+    run_calls = []
+    sleeps = []
+
+    class FakeTemporaryDirectory:
+        counter = 0
+
+        def __init__(self, *, prefix):
+            assert prefix == 'token-place-dmg-mount-'
+            self.name = str(mount_roots[FakeTemporaryDirectory.counter])
+            FakeTemporaryDirectory.counter += 1
+            Path(self.name).mkdir()
+
+        def cleanup(self):
+            cleanup_calls.append(self.name)
+
+    def fake_cleanup(path, mount_dir):
+        cleanup_calls.append(f'cleanup-state:{mount_dir}')
+        return f'image-path: {path}\n/dev/disk9s1 Apple_HFS'
+
+    def fake_run(cmd, *, check, capture_output, text):
+        run_calls.append(cmd)
+        if len(run_calls) == 1:
+            return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - Resource temporarily unavailable')
+        return subprocess.CompletedProcess(cmd, 0, '/dev/disk4', '')
+
+    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator.time, 'sleep', sleeps.append)
+
+    temp_dir = validator._attach_dmg_with_retries(dmg_path, attempts=3, delay_seconds=0.01)
+
+    assert temp_dir.name == str(mount_roots[1])
+    assert [call[5] for call in run_calls] == [str(mount_roots[0]), str(mount_roots[1])]
+    assert f'cleanup-state:{mount_roots[0]}' in cleanup_calls
+    assert str(mount_roots[0]) in cleanup_calls
+    assert sleeps == [0.01]
+    temp_dir.cleanup()
+
+
+
+def test_validator_cleanup_only_detaches_referenced_mountpoint_and_matched_device(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    other_dmg_path = tmp_path / 'other.dmg'
+    other_dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+    plist_calls = []
+    snapshots = []
+
+    first_plist = {
+        'images': [
+            {
+                'image-path': str(dmg_path),
+                'system-entities': [
+                    {'dev-entry': '/dev/disk4', 'mount-point': str(mount_dir)},
+                    {'dev-entry': '/dev/disk4s1', 'mount-point': str(mount_dir)},
+                ],
+            },
+            {
+                'image-path': str(other_dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk9', 'mount-point': '/Volumes/Other'}],
+            },
+        ]
+    }
+    second_plist = {
+        'images': [
+            {
+                'image-path': str(dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk4s1'}],
+            },
+            {
+                'image-path': str(other_dmg_path),
+                'system-entities': [{'dev-entry': '/dev/disk9', 'mount-point': '/Volumes/Other'}],
+            },
+        ]
+    }
+
+    def fake_info_plist():
+        plist_calls.append('plist')
+        return first_plist if len(plist_calls) == 1 else second_plist
+
+    def fake_run_best_effort(cmd):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(validator, '_hdiutil_info_plist', fake_info_plist)
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: ('hdiutil info raw', 0))
+    monkeypatch.setattr(
+        validator,
+        '_hdiutil_info_snapshot',
+        lambda raw_info=None, returncode=0: snapshots.append((raw_info, returncode)) or 'snapshot',
+    )
+    monkeypatch.setattr(validator, '_run_best_effort', fake_run_best_effort)
+
+    assert validator._cleanup_dmg_attach_state(dmg_path, mount_dir) == 'snapshot'
+
+    assert calls == [['hdiutil', 'detach', str(mount_dir)], ['hdiutil', 'detach', '/dev/disk4s1']]
+    assert len(plist_calls) == 2
+    assert snapshots == [('hdiutil info raw', 0)]
+    assert mount_dir.exists()
+
+
+def test_validator_cleanup_skips_unreferenced_mountpoint(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+
+    monkeypatch.setattr(
+        validator,
+        '_hdiutil_info_plist',
+        lambda: {
+            'images': [
+                {
+                    'image-path': str(dmg_path),
+                    'system-entities': [{'dev-entry': '/dev/disk5', 'mount-point': '/Volumes/Target'}],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: ('hdiutil info raw', 0))
+    monkeypatch.setattr(validator, '_hdiutil_info_snapshot', lambda raw_info=None, returncode=0: 'snapshot')
+    monkeypatch.setattr(
+        validator,
+        '_run_best_effort',
+        lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+    )
+
+    validator._cleanup_dmg_attach_state(dmg_path, mount_dir)
+
+    assert calls == [['hdiutil', 'detach', '/dev/disk5']]
+
+
+def test_validator_cleanup_uses_raw_hdiutil_info_for_matching_but_redacts_diagnostics(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = Path('release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg')
+    mount_dir = tmp_path / 'mount'
+    mount_dir.mkdir()
+    calls = []
+    raw_info = """
+image-path: /private/var/folders/zz/redacted-test/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg
+/dev/disk8           Apple_partition_scheme
+/dev/disk8s1         Apple_HFS
+image-path: /private/var/folders/zz/redacted-test/release-artifacts/other.dmg
+/dev/disk9           Apple_partition_scheme
+""".strip()
+
+    monkeypatch.setattr(validator, '_hdiutil_info_raw', lambda: (raw_info, 0))
+    monkeypatch.setattr(validator, '_hdiutil_info_plist', lambda: {})
+    monkeypatch.setattr(
+        validator,
+        '_run_best_effort',
+        lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+    )
+
+    diagnostic = validator._cleanup_dmg_attach_state(dmg_path, mount_dir)
+
+    assert calls == [['hdiutil', 'detach', '/dev/disk8'], ['hdiutil', 'detach', '/dev/disk8s1']]
+    assert '/dev/disk9' not in {call[-1] for call in calls}
+    assert '/private/var/folders/<redacted>' in diagnostic
+    assert '/private/var/folders/zz/redacted-test' not in diagnostic
+
+def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount-1'
+    run_calls = []
+
+    class FakeTemporaryDirectory:
+        def __init__(self, *, prefix):
+            self.name = str(mount_dir)
+            mount_dir.mkdir()
+
+        def cleanup(self):
+            pass
+
+    def fake_cleanup(path, _mount_dir):
+        return 'hdiutil info snapshot'
+
+    def fake_run(cmd, *, check, capture_output, text):
+        run_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, 'attach stdout', 'permission denied')
+
+    monkeypatch.setattr(validator.tempfile, 'TemporaryDirectory', FakeTemporaryDirectory)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    try:
+        validator._attach_dmg_with_retries(dmg_path, attempts=3, delay_seconds=0.01)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected non-transient attach failure to exit')
+
+    assert len(run_calls) == 1
+    assert 'attach attempts: 1/3' in message
+    assert 'permission denied' in message
+    assert 'redacted hdiutil info snapshot' in message
+
+
+def test_validator_hdiutil_info_helpers_preserve_raw_matching_and_redact(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    raw_path = '/private/var/folders/zz/example/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg'
+
+    def fake_run(cmd, *, check, capture_output, text=None):
+        if cmd == ['hdiutil', 'info']:
+            return subprocess.CompletedProcess(cmd, 3, f'image-path: {raw_path}', 'raw stderr')
+        if cmd == ['hdiutil', 'info', '-plist']:
+            return subprocess.CompletedProcess(cmd, 0, b'not a plist', b'')
+        return subprocess.CompletedProcess(cmd, 7, 'best stdout', 'best stderr')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._hdiutil_info_raw() == (f'image-path: {raw_path}\nraw stderr', 3)
+    snapshot = validator._hdiutil_info_snapshot()
+    assert 'hdiutil info failed with exit code 3' in snapshot
+    assert '/private/var/folders/<redacted>' in snapshot
+    assert raw_path not in snapshot
+    assert validator._hdiutil_info_plist() == {}
+
+    result = validator._run_best_effort(['hdiutil', 'detach', str(tmp_path / 'missing')])
+
+    assert result.returncode == 7
+    warning = capsys.readouterr().out
+    assert '::warning::Best-effort command failed' in warning
+    assert 'best stdout' in warning
+    assert 'best stderr' in warning
+
+
+def test_validator_hdiutil_matching_helpers_handle_malformed_entries(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    other_path = tmp_path / 'other.dmg'
+    other_path.write_bytes(b'dmg')
+    mount_dir = tmp_path / 'mount'
+
+    original_resolve = validator.Path.resolve
+
+    def fake_resolve(self):
+        if str(self).startswith('/bad/path'):
+            raise OSError('unresolvable')
+        return original_resolve(self)
+
+    monkeypatch.setattr(validator.Path, 'resolve', fake_resolve)
+
+    assert validator._image_entries({'images': 'not-a-list'}) == []
+    assert not validator._image_matches_dmg({'image-path': 123}, dmg_path)
+    relative_dmg_path = Path('release-artifacts/target.dmg')
+    assert validator._path_matches_dmg('/bad/path/release-artifacts/target.dmg', relative_dmg_path)
+    assert not validator._path_matches_dmg('/bad/path/release-artifacts/other.dmg', relative_dmg_path)
+    assert not validator._mountpoint_referenced(
+        mount_dir,
+        {'images': [{'image-path': str(dmg_path), 'system-entities': 'not-a-list'}]},
+    )
+
+    devices = validator._matching_hdiutil_devices(
+        dmg_path,
+        {
+            'images': [
+                {'image-path': str(other_path), 'system-entities': [{'dev-entry': '/dev/disk2'}]},
+                {'image-path': str(dmg_path), 'system-entities': 'not-a-list'},
+                {
+                    'image-path': str(dmg_path),
+                    'system-entities': [
+                        'not-a-dict',
+                        {'dev-entry': 'not-a-disk'},
+                        {'dev-entry': '/dev/disk3'},
+                    ],
+                },
+            ]
+        },
+        raw_info=f'image-path: {dmg_path}\n/dev/disk3\n/dev/disk4\nimage-path: {other_path}\n/dev/disk9',
+    )
+
+    assert devices == ['/dev/disk3', '/dev/disk4']
+
+
+def test_validator_hdiutil_plist_and_retry_edge_branches(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg_path = tmp_path / 'target.dmg'
+    dmg_path.write_bytes(b'dmg')
+    plist_payload = validator.plistlib.dumps({'images': []})
+    calls = []
+
+    def fake_run(cmd, *, check, capture_output, text=None):
+        calls.append(cmd)
+        if cmd == ['hdiutil', 'info', '-plist'] and len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 2, b'', b'plist failed')
+        if cmd == ['hdiutil', 'info', '-plist']:
+            return subprocess.CompletedProcess(cmd, 0, plist_payload, b'')
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._hdiutil_info_plist() == {}
+    assert validator._hdiutil_info_plist() == {'images': []}
+    assert validator._path_matches_dmg(str(dmg_path.resolve()), dmg_path)
+
+    try:
+        validator._attach_dmg_with_retries(dmg_path, attempts=0)
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('expected zero-attempt attach helper call to exit')
+
+    assert 'no attempts were run' in message

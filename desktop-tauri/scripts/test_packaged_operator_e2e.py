@@ -643,6 +643,7 @@ def run_compute_bridge_startup_probe(
 
         forbidden_output = (
             "No module named 'cryptography'",
+            "context_profiles_unavailable",
             "ModuleNotFoundError",
             "ImportError",
             "compute-node bridge exited before emitting a startup event",

@@ -2044,7 +2044,14 @@ def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
         + "\n",
         encoding='utf-8',
     )
-    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_dir / '__init__.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / '__init__.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (utils_dir / 'path_handling.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / 'path_handling.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
 SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
@@ -2167,7 +2174,7 @@ class ComputeNodeRuntime:
     assert "No module named 'utils'" not in stdout
 
 
-def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):
+def test_main_subprocess_emits_structured_error_when_context_profiles_missing_after_preflight(tmp_path):
     python_dir = tmp_path / 'bin' / 'resources' / 'python'
     import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
     utils_dir = import_root / 'utils'
@@ -2185,13 +2192,19 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     (python_dir / 'desktop_runtime_setup.py').write_text(
         'def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):\n    return None\n'
         'def ensure_desktop_llama_runtime(_mode):\n'
-        '    print("unexpected runtime setup", file=__import__("sys").stderr)\n'
         '    return {"selected_backend": "cpu"}\n'
         'def ensure_desktop_python_dependencies(*, repo_root=None):\n    return {"ok": "true"}\n'
         'def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):\n    return None\n',
         encoding='utf-8',
     )
-    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_dir / '__init__.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / '__init__.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (utils_dir / 'path_handling.py').write_text(
+        (Path(__file__).resolve().parents[2] / 'utils' / 'path_handling.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
 
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
@@ -2217,7 +2230,6 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     )
 
     assert proc.returncode == 1
-    assert "unexpected runtime setup" not in proc.stderr
     events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     payload = next(event for event in events if event.get('type') == 'error')
     assert payload['error_code'] == 'context_profiles_unavailable'
@@ -2228,6 +2240,84 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     assert payload['log_file_path'] == str(tmp_path / 'operator.log')
     assert 'context profiles unavailable' in payload['message']
     assert 'model_path' not in payload
+
+
+def test_run_runs_dependency_preflight_before_context_profile_import(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    order = []
+
+    def fake_dependency_preflight(*, repo_root=None):
+        order.append('preflight')
+        return {'ok': 'true', 'action': 'fake_installed'}
+
+    real_import = __import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name == 'utils.context_profiles':
+            order.append('context_profiles_import')
+            assert 'preflight' in order
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        fake_dependency_preflight,
+    )
+    monkeypatch.setattr('builtins.__import__', tracking_import)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+        context_tier='8k-fast',
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    assert order[:2] == ['preflight', 'context_profiles_import']
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+
+
+def test_run_dependency_preflight_failure_is_not_context_profile_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    import_attempts = []
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {
+            'ok': 'false',
+            'missing': 'cryptography',
+            'detail': 'mock install failed',
+            'interpreter': sys.executable,
+            'import_root': '/tmp/import-root',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        lambda: import_attempts.append('context') or (_ for _ in ()).throw(AssertionError()),
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_urls=None,
+        relay_port=None,
+        context_tier='8k-fast',
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    assert import_attempts == []
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['error_code'] == 'desktop_compute_node_startup_failed'
+    assert 'desktop runtime dependency preflight failed' in payload['message']
+    assert 'context profiles unavailable' not in payload['message']
+    assert payload['registered'] is False
 
 
 def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_packages(tmp_path):
@@ -2280,7 +2370,7 @@ def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_
     assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
 
-def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, capsys):
+def test_post_preflight_context_profile_import_failure_is_structured(monkeypatch, capsys):
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
@@ -2294,6 +2384,7 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, c
     module.__file__ = str(MODULE_PATH)
     code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
     exec(code, module.__dict__)
+    module.ensure_desktop_python_dependencies = lambda: {'ok': 'true'}
 
     args = SimpleNamespace(
         mode='auto',
@@ -2303,15 +2394,9 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, c
     )
     payload = module._structured_startup_error_payload(args, 'context profiles unavailable')
 
-    assert module._CONTEXT_PROFILES_IMPORT_ERROR is not None
-    assert module.normalize_context_tier('unknown') == '8k-fast'
     assert payload['context_tier'] == '64k-full'
     assert payload['error_code'] == 'desktop_compute_node_startup_failed'
     assert 'model_path' not in payload
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.get_context_profile('8k-fast')
-    with pytest.raises(RuntimeError, match='context profiles unavailable'):
-        module.apply_context_profile(object(), '8k-fast')
 
     run_args = SimpleNamespace(
         mode='auto',

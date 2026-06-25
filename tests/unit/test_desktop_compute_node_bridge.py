@@ -2280,7 +2280,7 @@ def test_ensure_runtime_import_paths_prefers_bundled_context_profiles_over_site_
     assert Path(payload['origin']).resolve() == (bundled_utils / 'context_profiles.py').resolve()
 
 
-def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch):
+def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch, capsys):
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
@@ -2312,6 +2312,19 @@ def test_module_level_fallback_when_context_profiles_import_fails(monkeypatch):
         module.get_context_profile('8k-fast')
     with pytest.raises(RuntimeError, match='context profiles unavailable'):
         module.apply_context_profile(object(), '8k-fast')
+
+    run_args = SimpleNamespace(
+        mode='auto',
+        relay_url='https://relay.example',
+        relay_urls=None,
+        context_tier='64k-full',
+    )
+    assert module.run(run_args) == 1
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert emitted['error_code'] == 'context_profiles_unavailable'
+    assert emitted['context_tier'] == '64k-full'
+    assert emitted['registered'] is False
+    assert 'model_path' not in emitted
 
 def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__

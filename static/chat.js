@@ -3,6 +3,9 @@ const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an i
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
+const LANDING_CONTEXT_TIER_STORAGE_KEY = 'tokenplace.landing.api_v1.context_tier';
+const DEFAULT_CONTEXT_TIER = '8k-fast';
+const SUPPORTED_CONTEXT_TIERS = ['8k-fast', '64k-full'];
 
 new Vue({
     el: '#app',
@@ -18,6 +21,8 @@ new Vue({
         clientPublicKey: null,
         availableModels: [],
         selectedModelId: '',
+        selectedContextTier: DEFAULT_CONTEXT_TIER,
+        selectedProfileMetadata: null,
         modelsLoading: false,
         modelsLoaded: false,
         modelsError: '',
@@ -31,6 +36,7 @@ new Vue({
         computeNodeCountRequestId: 0
     },
     mounted() {
+        this.selectedContextTier = this.loadPersistedContextTier();
         this.detectTouchInput();
         this.fetchModels();
         this.generateClientKeys();
@@ -78,6 +84,12 @@ new Vue({
         hasClientKeypair() {
             return Boolean(this.clientPrivateKey && this.clientPublicKey);
         },
+        contextTierOptions() {
+            return [
+                { id: '8k-fast', label: '8K Fast' },
+                { id: '64k-full', label: '64K Full' }
+            ];
+        },
         canSendMessage() {
             return Boolean(
                 this.newMessage.trim() &&
@@ -87,7 +99,58 @@ new Vue({
             );
         }
     },
+    watch: {
+        selectedModelId() {
+            this.clearSelectedServer();
+        },
+        selectedContextTier(newValue) {
+            const normalized = this.normalizeContextTier(newValue);
+            if (newValue !== normalized) {
+                this.selectedContextTier = normalized;
+                return;
+            }
+            this.persistContextTier(normalized);
+            this.clearSelectedServer();
+        }
+    },
     methods: {
+        normalizeContextTier(value) {
+            return SUPPORTED_CONTEXT_TIERS.includes(value) ? value : DEFAULT_CONTEXT_TIER;
+        },
+
+        loadPersistedContextTier() {
+            try {
+                const stored = typeof localStorage !== 'undefined'
+                    ? localStorage.getItem(LANDING_CONTEXT_TIER_STORAGE_KEY)
+                    : null;
+                const normalized = this.normalizeContextTier(stored);
+                if (stored !== normalized) {
+                    this.persistContextTier(normalized);
+                }
+                return normalized;
+            } catch (error) {
+                console.warn('Unable to load landing context tier:', error);
+                return DEFAULT_CONTEXT_TIER;
+            }
+        },
+
+        persistContextTier(value) {
+            try {
+                if (typeof localStorage !== 'undefined') {
+                    localStorage.setItem(LANDING_CONTEXT_TIER_STORAGE_KEY, this.normalizeContextTier(value));
+                }
+            } catch (error) {
+                console.warn('Unable to persist landing context tier:', error);
+            }
+        },
+
+        contextTierCanSatisfy(activeTier, requestedTier) {
+            const order = { '8k-fast': 8192, '64k-full': 65536 };
+            const active = this.normalizeContextTier(activeTier);
+            const requested = this.normalizeContextTier(requestedTier);
+            return order[active] >= order[requested];
+        },
+
         async refreshComputeNodeCount(options = {}) {
             // Failover capacity refreshes must be allowed to apply their own
             // successful diagnostics result even if the background poller starts
@@ -248,7 +311,11 @@ new Vue({
             }
 
             try {
-                const response = await fetch('/api/v1/relay/servers/next', { cache: 'no-store' });
+                const selectionParams = new URLSearchParams({
+                    model: this.selectedModelId,
+                    context_tier: this.normalizeContextTier(this.selectedContextTier)
+                });
+                const response = await fetch(`/api/v1/relay/servers/next?${selectionParams.toString()}`, { cache: 'no-store' });
                 if (!response.ok) {
                     let errorData = null;
                     try {
@@ -265,6 +332,16 @@ new Vue({
 
                 const data = await response.json();
                 const rawKey = data && data.server_public_key;
+                const selectedContextTier = data && typeof data.selected_context_tier === 'string'
+                    ? data.selected_context_tier.trim()
+                    : '';
+                if (selectedContextTier && !this.contextTierCanSatisfy(selectedContextTier, this.selectedContextTier)) {
+                    return {
+                        error: {
+                            userMessage: 'The selected context tier is unavailable right now. Please choose another tier or try again later.'
+                        }
+                    };
+                }
                 const normalizedKey = this.normalizeServerPublicKey(rawKey);
                 if (!normalizedKey) {
                     throw new Error('Relay returned an invalid compute-node public key');
@@ -277,6 +354,13 @@ new Vue({
                     ? this.encodePemToBase64(normalizedKey)
                     : rawKeyText.replace(/\s+/g, '');
                 this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
+                this.selectedProfileMetadata = {
+                    selected_context_tier: selectedContextTier || null,
+                    selected_context_window_tokens: Number.isInteger(data && data.selected_context_window_tokens)
+                        ? data.selected_context_window_tokens
+                        : null,
+                    selection_policy: data && typeof data.selection_policy === 'string' ? data.selection_policy : ''
+                };
                 return true;
             } catch (error) {
                 console.error('Error selecting API v1 compute node:', error);
@@ -305,6 +389,7 @@ new Vue({
             this.selectedServerPublicKeyB64 = null;
             this.serverPublicKey = null;
             this.selectedServerKeyLabel = '';
+            this.selectedProfileMetadata = null;
         },
 
         markSelectedServerTerminalFailure(message) {
@@ -755,7 +840,10 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: this.createApiV1Messages(messageContent),
-                    options: {}
+                    options: {},
+                    routing: {
+                        context_tier: this.normalizeContextTier(this.selectedContextTier)
+                    }
                 }
             };
 
@@ -974,6 +1062,12 @@ new Vue({
             const errorCode = typeof error.code === 'string' ? error.code.trim() : '';
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now. Your chat history is still here.',
+                no_matching_compute_node: 'No LLM server is available for the selected model and context tier right now. Please choose another tier or try again later.',
+                invalid_context_tier: 'The selected context tier is not supported. Please choose another tier.',
+                selected_server_unavailable: 'The selected LLM server is unavailable or expired. Please try again.',
+                selected_server_expired: 'The selected LLM server is unavailable or expired. Please try again.',
+                selected_server_removed: 'The selected LLM server is unavailable or expired. Please try again.',
+                compute_node_context_tier_unsupported: 'The selected LLM server cannot satisfy the requested context tier. Please choose another tier or try again later.',
                 compute_node_model_unsupported: 'The selected model is not available on this LLM server. Please try again.',
                 compute_node_options_unsupported: 'The selected LLM server does not support one of the requested options. Please try again.',
                 compute_node_invalid_request: 'The LLM server rejected the request format. Please try again.',

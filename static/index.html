@@ -115,6 +115,12 @@
         .model-selector-container {
             margin-bottom: 15px;
         }
+        .chat-selectors {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 15px;
+        }
         .model-selector-container label {
             display: block;
             margin-bottom: 6px;
@@ -483,23 +489,38 @@
             <small class="compute-node-status-updated" v-text="computeNodeCountLastUpdatedLabel"></small>
         </div>
         <div class="chat-container">
-            <div class="model-selector-container">
-                <label for="model-select">Model</label>
-                <select
-                    id="model-select"
-                    v-model="selectedModelId"
-                    class="model-select"
-                    aria-label="Model"
-                    data-testid="landing-model-select"
-                    disabled
-                    :disabled="modelsLoading || (!modelsError && availableModels.length === 0)"
-                >
-                    <option v-if="modelsError" :value="selectedModelId" v-text="`${selectedModelId} (emergency fallback)`"></option>
-                    <option v-else-if="modelsLoading || (!modelsLoaded && availableModels.length === 0)" value="" disabled></option>
-                    <option v-else-if="availableModels.length === 0" value="" disabled v-text="'No API v1 models available'"></option>
-                    <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
-                </select>
-                <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsError || (modelsLoaded && availableModels.length === 0 ? 'No API v1 models available' : '')"></p>
+            <div class="chat-selectors">
+                <div class="model-selector-container">
+                    <label for="model-select">Model</label>
+                    <select
+                        id="model-select"
+                        v-model="selectedModelId"
+                        class="model-select"
+                        aria-label="Model"
+                        data-testid="landing-model-select"
+                        disabled
+                        :disabled="modelsLoading || (!modelsError && availableModels.length === 0) || isGeneratingResponse"
+                    >
+                        <option v-if="modelsError" :value="selectedModelId" v-text="`${selectedModelId} (emergency fallback)`"></option>
+                        <option v-else-if="modelsLoading || (!modelsLoaded && availableModels.length === 0)" value="" disabled></option>
+                        <option v-else-if="availableModels.length === 0" value="" disabled v-text="'No API v1 models available'"></option>
+                        <option v-for="model in availableModels" :key="model.id" :value="model.id" v-text="model.id"></option>
+                    </select>
+                    <p class="model-status" :class="{'model-error': modelsError}" v-text="modelsError || (modelsLoaded && availableModels.length === 0 ? 'No API v1 models available' : '')"></p>
+                </div>
+                <div class="model-selector-container">
+                    <label for="context-tier-select">Context tier</label>
+                    <select
+                        id="context-tier-select"
+                        v-model="selectedContextTier"
+                        class="model-select"
+                        aria-label="Context tier"
+                        data-testid="landing-context-tier-select"
+                        :disabled="isGeneratingResponse"
+                    >
+                        <option v-for="tier in contextTierOptions" :key="tier.id" :value="tier.id" v-text="tier.label"></option>
+                    </select>
+                </div>
             </div>
             <p class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div

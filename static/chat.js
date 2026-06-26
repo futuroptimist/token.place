@@ -4,7 +4,11 @@ const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
-const DEFAULT_CONTEXT_TIER = '8k-fast';
+const AUTO_CONTEXT_TIER = 'auto';
+const DEFAULT_CONTEXT_TIER = AUTO_CONTEXT_TIER;
+const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
+const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 512;
+const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -26,6 +30,7 @@ new Vue({
         selectedModelId: '',
         selectedContextTier: DEFAULT_CONTEXT_TIER,
         selectedProfileMetadata: null,
+        contextTierStatus: '',
         modelsLoading: false,
         modelsLoaded: false,
         modelsError: '',
@@ -250,9 +255,18 @@ new Vue({
             return Object.prototype.hasOwnProperty.call(CONTEXT_TIER_ORDER, value);
         },
 
+        isKnownContextTierSelectorValue(value) {
+            return value === AUTO_CONTEXT_TIER || this.isKnownContextTier(value);
+        },
+
         normalizeContextTier(value) {
             const normalizedValue = typeof value === 'string' ? value.trim() : value;
-            return this.isKnownContextTier(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER;
+            return this.isKnownContextTierSelectorValue(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER;
+        },
+
+        normalizeWireContextTier(value) {
+            const normalizedValue = typeof value === 'string' ? value.trim() : value;
+            return this.isKnownContextTier(normalizedValue) ? normalizedValue : '8k-fast';
         },
 
         loadStoredContextTier() {
@@ -279,16 +293,18 @@ new Vue({
 
         handleContextTierChange() {
             this.selectedContextTier = this.normalizeContextTier(this.selectedContextTier);
+            this.contextTierStatus = '';
             this.persistContextTier(this.selectedContextTier);
             this.clearSelectedServer();
         },
 
         selectedContextTierCanSatisfy(selectedTier, requestedTier) {
-            return (CONTEXT_TIER_ORDER[selectedTier] || 0) >= (CONTEXT_TIER_ORDER[requestedTier] || CONTEXT_TIER_ORDER[DEFAULT_CONTEXT_TIER]);
+            return (CONTEXT_TIER_ORDER[selectedTier] || 0) >= (CONTEXT_TIER_ORDER[requestedTier] || CONTEXT_TIER_ORDER['8k-fast']);
         },
 
         async ensureSelectedServer(options = {}) {
             const forceReselect = Boolean(options.forceReselect);
+            const requestedContextTier = this.normalizeWireContextTier(options.requestedContextTier || this.selectedContextTier);
             if (forceReselect) {
                 this.clearSelectedServer();
             }
@@ -298,7 +314,6 @@ new Vue({
             }
 
             try {
-                const requestedContextTier = this.normalizeContextTier(this.selectedContextTier);
                 const params = new URLSearchParams({
                     model: this.selectedModelId,
                     context_tier: requestedContextTier
@@ -401,6 +416,59 @@ new Vue({
             this.$nextTick(() => {
                 this.adjustMessageInputHeight();
             });
+        },
+
+        estimateApiV1MessagesForAutoContextTier(apiV1Messages) {
+            const messages = Array.isArray(apiV1Messages) ? apiV1Messages : [];
+            let totalCharacters = 0;
+            let totalWords = 0;
+            for (const message of messages) {
+                const content = message && typeof message.content === 'string' ? message.content : '';
+                totalCharacters += content.length;
+                const trimmed = content.trim();
+                if (trimmed) {
+                    totalWords += trimmed.split(/\s+/).length;
+                }
+            }
+            const characterEstimate = Math.ceil(totalCharacters / 4);
+            const wordEstimate = Math.ceil(totalWords * 1.35);
+            const messageOverhead = messages.length * AUTO_MESSAGE_OVERHEAD_TOKENS;
+            const promptEstimate = Math.max(characterEstimate, wordEstimate) + messageOverhead;
+            const requiredEstimate = promptEstimate + AUTO_OUTPUT_RESERVATION_TOKENS + AUTO_CONTEXT_SAFETY_MARGIN_TOKENS;
+            const resolvedTier = requiredEstimate <= CONTEXT_TIER_ORDER['8k-fast'] ? '8k-fast' : '64k-full';
+            return {
+                totalCharacters,
+                totalWords,
+                promptEstimate,
+                requiredEstimate,
+                resolvedTier
+            };
+        },
+
+        resolveContextTierForRequest(apiV1Messages, selectorValue) {
+            const normalizedSelector = this.normalizeContextTier(selectorValue);
+            if (normalizedSelector !== AUTO_CONTEXT_TIER) {
+                return {
+                    selectorMode: normalizedSelector,
+                    requestedContextTier: this.normalizeWireContextTier(normalizedSelector),
+                    autoEstimate: null
+                };
+            }
+            const autoEstimate = this.estimateApiV1MessagesForAutoContextTier(apiV1Messages);
+            return {
+                selectorMode: AUTO_CONTEXT_TIER,
+                requestedContextTier: autoEstimate.resolvedTier,
+                autoEstimate
+            };
+        },
+
+        setAutoContextTierStatus(resolvedTier) {
+            if (this.normalizeContextTier(this.selectedContextTier) !== AUTO_CONTEXT_TIER) {
+                this.contextTierStatus = '';
+                return;
+            }
+            const label = resolvedTier === '64k-full' ? '64K Full' : '8K Fast';
+            this.contextTierStatus = `Auto selected ${label} for this prompt`;
         },
 
         createApiV1Messages(messageContent) {
@@ -811,13 +879,20 @@ new Vue({
         },
 
         // Send a message through the relay-blind API v1 E2EE request routes.
-        async sendMessageApiOnce(messageContent) {
+        async sendMessageApiOnce(messageContent, options = {}) {
             if (!this.selectedModel) {
                 console.error('No API v1 catalogue model selected');
                 return null;
             }
 
-            const selectedServer = await this.ensureSelectedServer();
+            const requestedContextTier = this.normalizeWireContextTier(options.requestedContextTier || this.selectedContextTier);
+            const apiV1Messages = Array.isArray(options.apiV1Messages)
+                ? options.apiV1Messages
+                : this.createApiV1Messages(messageContent);
+            const selectedServer = await this.ensureSelectedServer({
+                forceReselect: Boolean(options.forceReselect),
+                requestedContextTier
+            });
             if (selectedServer !== true) {
                 return selectedServer;
             }
@@ -832,10 +907,10 @@ new Vue({
                 client_public_key: clientPublicKeyB64,
                 api_v1_request: {
                     model: this.selectedModelId,
-                    messages: this.createApiV1Messages(messageContent),
+                    messages: apiV1Messages,
                     options: {},
                     routing: {
-                        context_tier: this.normalizeContextTier(this.selectedContextTier)
+                        context_tier: requestedContextTier
                     }
                 }
             };
@@ -917,7 +992,14 @@ new Vue({
                     throw new Error('Invalid relay response envelope');
                 }
 
-                return responseEnvelope.api_v1_response;
+                return Object.assign({}, responseEnvelope.api_v1_response, {
+                    __landingContextTier: {
+                        requestedContextTier,
+                        selectedContextTier: this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier
+                            ? this.selectedProfileMetadata.selected_context_tier
+                            : ''
+                    }
+                });
             } catch (error) {
                 console.error('API v1 relay request error:', error);
                 return null;
@@ -925,6 +1007,14 @@ new Vue({
         },
 
         async sendMessageApi(messageContent) {
+            const apiV1Messages = this.createApiV1Messages(messageContent);
+            const selectorMode = this.normalizeContextTier(this.selectedContextTier);
+            const tierResolution = this.resolveContextTierForRequest(apiV1Messages, selectorMode);
+            let requestedContextTier = tierResolution.requestedContextTier;
+            const autoMode = tierResolution.selectorMode === AUTO_CONTEXT_TIER;
+            let autoRetryAttempted = false;
+            this.setAutoContextTierStatus(autoMode ? requestedContextTier : '');
+
             let maxFailovers = this.getFailoverAttemptLimit();
             let refreshedFailoverCapacity = false;
             let skippedFailedServerSelections = 0;
@@ -934,9 +1024,31 @@ new Vue({
 
             while (failovers <= maxFailovers) {
                 if (needsDispatch) {
-                    const response = await this.sendMessageApiOnce(messageContent);
+                    const response = await this.sendMessageApiOnce(messageContent, {
+                        apiV1Messages,
+                        requestedContextTier,
+                        forceReselect: autoMode
+                    });
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
+                    }
+                    const normalizedError = this.normalizeApiV1ResponseError(response);
+                    const selectedContextTier = response && response.__landingContextTier
+                        ? response.__landingContextTier.selectedContextTier
+                        : '';
+                    const shouldAutoRetryOn64k = autoMode &&
+                        !autoRetryAttempted &&
+                        requestedContextTier === '8k-fast' &&
+                        normalizedError &&
+                        normalizedError.code === 'compute_node_context_window_exceeded' &&
+                        selectedContextTier !== '64k-full';
+                    if (shouldAutoRetryOn64k) {
+                        autoRetryAttempted = true;
+                        requestedContextTier = '64k-full';
+                        this.setAutoContextTierStatus(requestedContextTier);
+                        this.clearSelectedServer();
+                        needsDispatch = true;
+                        continue;
                     }
                     if (!response || !response.error || response.error.terminalSelectedServer !== true) {
                         if (response && !(response.error && response.error.terminalSelectedServer === true)) {
@@ -969,7 +1081,10 @@ new Vue({
 
                 this.clearSelectedServer();
                 this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
-                const selectedServer = await this.ensureSelectedServer({ forceReselect: true });
+                const selectedServer = await this.ensureSelectedServer({
+                    forceReselect: true,
+                    requestedContextTier
+                });
                 if (selectedServer !== true) {
                     const userMessage = selectedServer && selectedServer.error && selectedServer.error.userMessage
                         ? selectedServer.error.userMessage

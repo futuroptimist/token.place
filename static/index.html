@@ -518,10 +518,12 @@
                     :disabled="isGeneratingResponse"
                     @change="handleContextTierChange"
                 >
+                    <option value="auto">Auto</option>
                     <option value="8k-fast">8K Fast</option>
                     <option value="64k-full">64K Full</option>
                 </select>
             </div>
+            <p class="model-status" data-testid="landing-auto-context-tier-status" v-text="autoContextTierStatus"></p>
             <p class="server-key-label" data-testid="landing-server-key-label" v-text="selectedServerKeyLabel"></p>
             <div
                 v-if="selectedServerTerminalFailure"

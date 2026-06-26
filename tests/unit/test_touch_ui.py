@@ -30,11 +30,13 @@ def test_landing_context_tier_selector_is_visible_persistent_and_disabled_while_
     assert 'data-testid="landing-context-tier-select"' in index_html
     assert 'v-model="selectedContextTier"' in index_html
     assert ':disabled="isGeneratingResponse"' in index_html
+    assert index_html.index('<option value="auto">Auto</option>') < index_html.index('<option value="8k-fast">8K Fast</option>')
     assert '<option value="8k-fast">8K Fast</option>' in index_html
     assert '<option value="64k-full">64K Full</option>' in index_html
 
     assert "CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1'" in chat_js
-    assert "DEFAULT_CONTEXT_TIER = '8k-fast'" in chat_js
+    assert "DEFAULT_CONTEXT_TIER = 'auto'" in chat_js
+    assert "DEFAULT_WIRE_CONTEXT_TIER = '8k-fast'" in chat_js
     assert "selectedContextTier: DEFAULT_CONTEXT_TIER" in chat_js
     assert "loadStoredContextTier" in chat_js
     assert "persistContextTier" in chat_js
@@ -59,10 +61,35 @@ def test_landing_context_tier_selection_is_sent_to_next_server_and_encrypted_rou
     assert "selectedProfileMetadata" in chat_js
 
     assert "routing: {" in chat_js
-    assert "context_tier: this.normalizeContextTier(this.selectedContextTier)" in chat_js
+    assert "context_tier: requestedContextTier" in chat_js
+    assert "normalizeWireContextTier" in chat_js
+    assert "Never send auto" not in chat_js
     assert "ciphertext: encryptedData.ciphertext" in chat_js
     assert "messageContent" not in chat_js.split("const relayPayload = {", 1)[1].split("};\n", 1)[0]
 
+
+
+def test_landing_auto_context_tier_estimator_and_retry_guards_are_present():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+
+    assert "AUTO_OUTPUT_RESERVATION_TOKENS" in chat_js
+    assert "AUTO_CONTEXT_SAFETY_MARGIN_TOKENS" in chat_js
+    assert "AUTO_MESSAGE_OVERHEAD_TOKENS" in chat_js
+    assert "estimateApiV1MessagesForAutoContextTier" in chat_js
+    assert "totalCharacters += content.length" in chat_js
+    assert "totalWords += trimmed.split(/\\s+/).length" in chat_js
+    assert "Math.ceil(totalCharacters / 4)" in chat_js
+    assert "Math.ceil(totalWords * 1.35)" in chat_js
+    assert "estimate.requiredEstimate <= CONTEXT_TIER_ORDER[DEFAULT_WIRE_CONTEXT_TIER]" in chat_js
+    assert "resolvedContextTier" in chat_js
+    assert "? '8k-fast'" in chat_js
+    assert ": '64k-full'" in chat_js
+    assert "resolvedContextTier: 'auto'" not in chat_js
+    assert "forceReselect: Boolean(options.forceReselect) || selectorMode === AUTO_CONTEXT_TIER" in chat_js
+    assert "responseErrorCode === 'compute_node_context_window_exceeded'" in chat_js
+    assert "!autoContextRetryUsed" in chat_js
+    assert "requestedContextTier: '64k-full'" in chat_js
+    assert "autoContextTierStatus" in chat_js
 
 def test_landing_context_tier_errors_have_safe_user_messages():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
@@ -136,7 +163,8 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "createApiV1Messages" in chat_js
     assert "this.chatHistory" in chat_js
-    assert "messages: this.createApiV1Messages(messageContent)" in chat_js
+    assert "const apiV1Messages = this.createApiV1Messages(messageContent)" in chat_js
+    assert "messages: apiV1Messages" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js
     assert "response.choices[0].message" in chat_js
 
@@ -185,7 +213,8 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "const maxSkippedFailedServerSelections = Math.max(maxFailovers + terminallyFailedServerPublicKeysB64.size, 1);" in chat_js
     assert "skippedFailedServerSelections >= maxSkippedFailedServerSelections" in chat_js
     assert "sendMessageApiOnce" in chat_js
-    assert "ensureSelectedServer({ forceReselect: true })" in chat_js
+    assert "forceReselect: true" in chat_js
+    assert "requestedContextTier: currentRequestedContextTier" in chat_js
     assert "terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)" in chat_js
     assert "skippedFailedServerSelections += 1;" in chat_js
     assert "skippedFailedServerSelections = 0;" in chat_js

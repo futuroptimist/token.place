@@ -1030,6 +1030,7 @@ new Vue({
             let failovers = 0;
             let needsDispatch = true;
             let preserveSelectedServerForDispatch = false;
+            let forceReselectForDispatch = false;
             const terminallyFailedServerPublicKeysB64 = new Set();
 
             while (failovers <= maxFailovers) {
@@ -1039,17 +1040,19 @@ new Vue({
                         tierResolution: autoContextRetryAttempted
                             ? { selectorMode: AUTO_CONTEXT_TIER, requestedContextTier: '64k-full', estimate: initialTierResolution.estimate }
                             : initialTierResolution,
-                        forceReselect: autoContextRetryAttempted,
+                        forceReselect: forceReselectForDispatch,
                         preserveSelectedServer: preserveSelectedServerForDispatch,
                         retryAttempted: autoContextRetryAttempted
                     });
                     preserveSelectedServerForDispatch = false;
+                    forceReselectForDispatch = false;
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
                     if (response && this.shouldRetryAutoContextTier(response, response._autoContextAttempt)) {
                         autoContextRetryAttempted = true;
                         this.clearSelectedServer();
+                        forceReselectForDispatch = true;
                         needsDispatch = true;
                         continue;
                     }

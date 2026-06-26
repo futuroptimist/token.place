@@ -4,7 +4,11 @@ const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3.1-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
-const DEFAULT_CONTEXT_TIER = '8k-fast';
+const AUTO_CONTEXT_TIER = 'auto';
+const DEFAULT_CONTEXT_TIER = AUTO_CONTEXT_TIER;
+const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
+const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 768;
+const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -250,9 +254,18 @@ new Vue({
             return Object.prototype.hasOwnProperty.call(CONTEXT_TIER_ORDER, value);
         },
 
+        isKnownContextTierSelectorValue(value) {
+            return value === AUTO_CONTEXT_TIER || this.isKnownContextTier(value);
+        },
+
         normalizeContextTier(value) {
             const normalizedValue = typeof value === 'string' ? value.trim() : value;
-            return this.isKnownContextTier(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER;
+            return this.isKnownContextTier(normalizedValue) ? normalizedValue : '8k-fast';
+        },
+
+        normalizeContextTierSelectorValue(value) {
+            const normalizedValue = typeof value === 'string' ? value.trim() : value;
+            return this.isKnownContextTierSelectorValue(normalizedValue) ? normalizedValue : DEFAULT_CONTEXT_TIER;
         },
 
         loadStoredContextTier() {
@@ -262,7 +275,7 @@ new Vue({
             } catch (error) {
                 console.warn('Unable to read context-tier preference:', error);
             }
-            const normalized = this.normalizeContextTier(stored);
+            const normalized = this.normalizeContextTierSelectorValue(stored);
             if (stored !== null && stored !== normalized) {
                 this.persistContextTier(normalized);
             }
@@ -271,24 +284,25 @@ new Vue({
 
         persistContextTier(value) {
             try {
-                window.localStorage.setItem(CONTEXT_TIER_STORAGE_KEY, this.normalizeContextTier(value));
+                window.localStorage.setItem(CONTEXT_TIER_STORAGE_KEY, this.normalizeContextTierSelectorValue(value));
             } catch (error) {
                 console.warn('Unable to store context-tier preference:', error);
             }
         },
 
         handleContextTierChange() {
-            this.selectedContextTier = this.normalizeContextTier(this.selectedContextTier);
+            this.selectedContextTier = this.normalizeContextTierSelectorValue(this.selectedContextTier);
             this.persistContextTier(this.selectedContextTier);
             this.clearSelectedServer();
         },
 
         selectedContextTierCanSatisfy(selectedTier, requestedTier) {
-            return (CONTEXT_TIER_ORDER[selectedTier] || 0) >= (CONTEXT_TIER_ORDER[requestedTier] || CONTEXT_TIER_ORDER[DEFAULT_CONTEXT_TIER]);
+            return (CONTEXT_TIER_ORDER[selectedTier] || 0) >= (CONTEXT_TIER_ORDER[requestedTier] || CONTEXT_TIER_ORDER['8k-fast']);
         },
 
         async ensureSelectedServer(options = {}) {
             const forceReselect = Boolean(options.forceReselect);
+            const requestedContextTier = this.normalizeContextTier(options.requestedContextTier || this.selectedContextTier);
             if (forceReselect) {
                 this.clearSelectedServer();
             }
@@ -298,7 +312,6 @@ new Vue({
             }
 
             try {
-                const requestedContextTier = this.normalizeContextTier(this.selectedContextTier);
                 const params = new URLSearchParams({
                     model: this.selectedModelId,
                     context_tier: requestedContextTier
@@ -422,6 +435,56 @@ new Vue({
                 });
             }
             return messages;
+        },
+
+
+        estimateApiV1MessagesForAutoContextTier(apiV1Messages) {
+            const messages = Array.isArray(apiV1Messages) ? apiV1Messages : [];
+            const totals = messages.reduce((accumulator, message) => {
+                const content = message && typeof message.content === 'string' ? message.content : '';
+                accumulator.characters += content.length;
+                const words = content.trim() ? content.trim().split(/\s+/).length : 0;
+                accumulator.words += words;
+                return accumulator;
+            }, { characters: 0, words: 0 });
+            const characterEstimate = Math.ceil(totals.characters / 4);
+            const wordEstimate = Math.ceil(totals.words * 1.35);
+            const messageOverhead = messages.length * AUTO_MESSAGE_OVERHEAD_TOKENS;
+            const promptEstimate = Math.max(characterEstimate, wordEstimate) + messageOverhead;
+            const requiredEstimate = promptEstimate + AUTO_OUTPUT_RESERVATION_TOKENS + AUTO_CONTEXT_SAFETY_MARGIN_TOKENS;
+            return {
+                characters: totals.characters,
+                words: totals.words,
+                promptEstimate,
+                requiredEstimate,
+                resolvedContextTier: requiredEstimate <= CONTEXT_TIER_ORDER['8k-fast'] ? '8k-fast' : '64k-full'
+            };
+        },
+
+        resolveContextTierForRequest(apiV1Messages, options = {}) {
+            if (options.forceContextTier) {
+                return {
+                    selectorContextTier: this.normalizeContextTierSelectorValue(this.selectedContextTier),
+                    requestedContextTier: this.normalizeContextTier(options.forceContextTier),
+                    autoEstimate: null
+                };
+            }
+
+            const selectorContextTier = this.normalizeContextTierSelectorValue(this.selectedContextTier);
+            if (selectorContextTier !== AUTO_CONTEXT_TIER) {
+                return {
+                    selectorContextTier,
+                    requestedContextTier: this.normalizeContextTier(selectorContextTier),
+                    autoEstimate: null
+                };
+            }
+
+            const autoEstimate = this.estimateApiV1MessagesForAutoContextTier(apiV1Messages);
+            return {
+                selectorContextTier,
+                requestedContextTier: autoEstimate.resolvedContextTier,
+                autoEstimate
+            };
         },
 
         generateClientKeys() {
@@ -811,17 +874,24 @@ new Vue({
         },
 
         // Send a message through the relay-blind API v1 E2EE request routes.
-        async sendMessageApiOnce(messageContent) {
+        async sendMessageApiOnce(messageContent, options = {}) {
             if (!this.selectedModel) {
                 console.error('No API v1 catalogue model selected');
                 return null;
             }
 
-            const selectedServer = await this.ensureSelectedServer();
+            const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
+            const tierResolution = this.resolveContextTierForRequest(apiV1Messages, options);
+            const requestedContextTier = tierResolution.requestedContextTier;
+            const selectedServer = await this.ensureSelectedServer({
+                requestedContextTier,
+                forceReselect: Boolean(options.forceReselect) || tierResolution.selectorContextTier === AUTO_CONTEXT_TIER
+            });
             if (selectedServer !== true) {
                 return selectedServer;
             }
 
+            const firstSelectedContextTier = this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier;
             const requestId = this.createRequestId();
             const cancelToken = this.createRequestId();
             const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
@@ -832,10 +902,10 @@ new Vue({
                 client_public_key: clientPublicKeyB64,
                 api_v1_request: {
                     model: this.selectedModelId,
-                    messages: this.createApiV1Messages(messageContent),
+                    messages: apiV1Messages,
                     options: {},
                     routing: {
-                        context_tier: this.normalizeContextTier(this.selectedContextTier)
+                        context_tier: requestedContextTier
                     }
                 }
             };
@@ -917,7 +987,18 @@ new Vue({
                     throw new Error('Invalid relay response envelope');
                 }
 
-                return responseEnvelope.api_v1_response;
+                const apiV1Response = responseEnvelope.api_v1_response;
+                if (apiV1Response && typeof apiV1Response === 'object') {
+                    apiV1Response._landingContextTierRequest = {
+                        selectorContextTier: tierResolution.selectorContextTier,
+                        requestedContextTier,
+                        selectedContextTier: firstSelectedContextTier || '',
+                        requestId,
+                        cancelToken,
+                        apiV1Messages
+                    };
+                }
+                return apiV1Response;
             } catch (error) {
                 console.error('API v1 relay request error:', error);
                 return null;
@@ -931,10 +1012,24 @@ new Vue({
             let failovers = 0;
             let needsDispatch = true;
             const terminallyFailedServerPublicKeysB64 = new Set();
+            const apiV1Messages = this.createApiV1Messages(messageContent);
 
             while (failovers <= maxFailovers) {
                 if (needsDispatch) {
-                    const response = await this.sendMessageApiOnce(messageContent);
+                    let response = await this.sendMessageApiOnce(messageContent, { apiV1Messages });
+                    const requestMeta = response && response._landingContextTierRequest ? response._landingContextTierRequest : null;
+                    const normalizedError = this.normalizeApiV1ResponseError(response);
+                    if (requestMeta && normalizedError &&
+                        requestMeta.selectorContextTier === AUTO_CONTEXT_TIER &&
+                        requestMeta.requestedContextTier === '8k-fast' &&
+                        requestMeta.selectedContextTier !== '64k-full' &&
+                        normalizedError.code === 'compute_node_context_window_exceeded') {
+                        response = await this.sendMessageApiOnce(messageContent, {
+                            apiV1Messages: requestMeta.apiV1Messages,
+                            forceContextTier: '64k-full',
+                            forceReselect: true
+                        });
+                    }
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
@@ -969,7 +1064,11 @@ new Vue({
 
                 this.clearSelectedServer();
                 this.markSelectedServerTerminalFailure('The previous LLM server disconnected. Continuing with another available server.');
-                const selectedServer = await this.ensureSelectedServer({ forceReselect: true });
+                const failoverTierResolution = this.resolveContextTierForRequest(apiV1Messages);
+                const selectedServer = await this.ensureSelectedServer({
+                    forceReselect: true,
+                    requestedContextTier: failoverTierResolution.requestedContextTier
+                });
                 if (selectedServer !== true) {
                     const userMessage = selectedServer && selectedServer.error && selectedServer.error.userMessage
                         ? selectedServer.error.userMessage

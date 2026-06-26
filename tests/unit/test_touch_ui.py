@@ -79,7 +79,8 @@ def test_landing_auto_context_tier_estimator_and_retry_are_bounded():
     assert "resolvedContextTier: requiredEstimate <= CONTEXT_TIER_ORDER['8k-fast'] ? '8k-fast' : '64k-full'" in chat_js
     assert "resolveContextTierForRequest(apiV1Messages, this.selectedContextTier)" in chat_js
     assert "requestedContextTier: estimate.resolvedContextTier" in chat_js
-    assert "forceReselect = Boolean(options.forceReselect) || tierResolution.selectorMode === AUTO_CONTEXT_TIER" in chat_js
+    assert "options.preserveSelectedServer !== true" in chat_js
+    assert "content.split(/\\s+/)" not in chat_js
     assert "errorCode === 'compute_node_context_window_exceeded'" in chat_js
     assert "attempt.requestedContextTier === '8k-fast'" in chat_js
     assert "attempt.retryAttempted !== true" in chat_js
@@ -217,6 +218,9 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "terminallyFailedServerPublicKeysB64.has(this.selectedServerPublicKeyB64)" in chat_js
     assert "skippedFailedServerSelections += 1;" in chat_js
     assert "skippedFailedServerSelections = 0;" in chat_js
+    assert "let preserveSelectedServerForDispatch = false;" in chat_js
+    assert "preserveSelectedServerForDispatch = true;" in chat_js
+    assert "preserveSelectedServer: preserveSelectedServerForDispatch" in chat_js
     assert "originalFailedServerPublicKeyB64" not in chat_js
     assert "failedServerPublicKeyB64" not in chat_js
     assert "reselectAttempts" not in chat_js

@@ -302,14 +302,21 @@ new Vue({
 
         estimateApiV1MessagesForAutoContextTier(apiV1Messages) {
             const messages = Array.isArray(apiV1Messages) ? apiV1Messages : [];
-            const totalCharacters = messages.reduce((sum, message) => {
+            const totals = messages.reduce((accumulator, message) => {
                 const content = message && typeof message.content === 'string' ? message.content : '';
-                return sum + content.length;
-            }, 0);
-            const totalWords = messages.reduce((sum, message) => {
-                const content = message && typeof message.content === 'string' ? message.content.trim() : '';
-                return sum + (content ? content.split(/\s+/).length : 0);
-            }, 0);
+                accumulator.totalCharacters += content.length;
+                let inWord = false;
+                for (const character of content) {
+                    if (/\s/.test(character)) {
+                        inWord = false;
+                    } else if (!inWord) {
+                        accumulator.totalWords += 1;
+                        inWord = true;
+                    }
+                }
+                return accumulator;
+            }, { totalCharacters: 0, totalWords: 0 });
+            const { totalCharacters, totalWords } = totals;
             const characterEstimate = Math.ceil(totalCharacters / 4);
             const wordEstimate = Math.ceil(totalWords * 1.35);
             const messageOverhead = messages.length * AUTO_MESSAGE_OVERHEAD_TOKENS;
@@ -886,7 +893,8 @@ new Vue({
 
             const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
             const tierResolution = options.tierResolution || this.resolveContextTierForRequest(apiV1Messages, this.selectedContextTier);
-            const forceReselect = Boolean(options.forceReselect) || tierResolution.selectorMode === AUTO_CONTEXT_TIER;
+            const forceReselect = Boolean(options.forceReselect)
+                || (tierResolution.selectorMode === AUTO_CONTEXT_TIER && options.preserveSelectedServer !== true);
             const selectedServer = await this.ensureSelectedServer({
                 requestedContextTier: tierResolution.requestedContextTier,
                 forceReselect
@@ -994,12 +1002,15 @@ new Vue({
                 }
 
                 const apiV1Response = responseEnvelope.api_v1_response;
-                if (apiV1Response && typeof apiV1Response === 'object') {
-                    apiV1Response._autoContextAttempt = {
-                        selectorMode: tierResolution.selectorMode,
-                        requestedContextTier: tierResolution.requestedContextTier,
-                        selectedServerContextTier,
-                        retryAttempted: Boolean(options.retryAttempted)
+                if (apiV1Response && typeof apiV1Response === 'object' && !Array.isArray(apiV1Response)) {
+                    return {
+                        ...apiV1Response,
+                        _autoContextAttempt: {
+                            selectorMode: tierResolution.selectorMode,
+                            requestedContextTier: tierResolution.requestedContextTier,
+                            selectedServerContextTier,
+                            retryAttempted: Boolean(options.retryAttempted)
+                        }
                     };
                 }
                 return apiV1Response;
@@ -1018,6 +1029,7 @@ new Vue({
             let skippedFailedServerSelections = 0;
             let failovers = 0;
             let needsDispatch = true;
+            let preserveSelectedServerForDispatch = false;
             const terminallyFailedServerPublicKeysB64 = new Set();
 
             while (failovers <= maxFailovers) {
@@ -1028,8 +1040,10 @@ new Vue({
                             ? { selectorMode: AUTO_CONTEXT_TIER, requestedContextTier: '64k-full', estimate: initialTierResolution.estimate }
                             : initialTierResolution,
                         forceReselect: autoContextRetryAttempted,
+                        preserveSelectedServer: preserveSelectedServerForDispatch,
                         retryAttempted: autoContextRetryAttempted
                     });
+                    preserveSelectedServerForDispatch = false;
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
@@ -1089,6 +1103,7 @@ new Vue({
                 }
                 skippedFailedServerSelections = 0;
                 failovers += 1;
+                preserveSelectedServerForDispatch = true;
                 needsDispatch = true;
             }
 

@@ -1261,6 +1261,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
         registered_count = len(all_api_v1_keys)
         current_index = server_round_robin_next_index % registered_count if registered_count else 0
         capacity_limited_count = 0
+        capacity_limited_tier_counts: dict[str, int] = {}
         candidates = []
         for registration_index, server_public_key in enumerate(all_api_v1_keys):
             candidate = _api_v1_scheduler_candidate(
@@ -1274,6 +1275,8 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             )
             if candidate is not None and candidate["capacity_limited"]:
                 capacity_limited_count += 1
+                tier = candidate["tier"]
+                capacity_limited_tier_counts[tier] = capacity_limited_tier_counts.get(tier, 0) + 1
             elif candidate is not None:
                 candidates.append(candidate)
 
@@ -1285,7 +1288,8 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             return None, {
                 "eligible_count": 0,
                 "eligible_node_count": 0,
-                "eligible_tier_counts": eligible_tier_counts,
+                "eligible_tier_counts": eligible_tier_counts or capacity_limited_tier_counts,
+                "capacity_limited_tier_counts": capacity_limited_tier_counts,
                 "registered_api_v1_count": registered_count,
                 "round_robin_index": current_index,
                 "round_robin_position": None,
@@ -1320,6 +1324,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             "eligible_count": len(candidates),
             "eligible_node_count": len(candidates),
             "eligible_tier_counts": eligible_tier_counts,
+            "capacity_limited_tier_counts": capacity_limited_tier_counts,
             "round_robin_index": server_round_robin_next_index,
             "round_robin_position": selected_load_index,
             "selection_policy": API_V1_SELECTION_POLICY,
@@ -1373,6 +1378,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
                         'requested_model': model,
                         'eligible_node_count': selection.get("eligible_node_count", 0),
                         'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
+                        'capacity_limited_node_count': selection.get("capacity_limited_node_count", 0),
+                        'capacity_limited_tier_counts': selection.get("capacity_limited_tier_counts", {}),
                     }
                 }), 503
             return jsonify({

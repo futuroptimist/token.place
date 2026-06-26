@@ -624,6 +624,9 @@ def test_api_v1_selection_reports_capacity_exhaustion_separately(client):
 
     assert response.status_code == 503
     assert payload["error"]["code"] == "no_available_capacity"
+    assert payload["error"]["eligible_tier_counts"] == {"8k-fast": 1}
+    assert payload["error"]["capacity_limited_node_count"] == 1
+    assert payload["error"]["capacity_limited_tier_counts"] == {"8k-fast": 1}
     assert "at capacity" in payload["error"]["message"]
 
 

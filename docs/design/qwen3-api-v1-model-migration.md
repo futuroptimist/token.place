@@ -109,8 +109,12 @@ surfaces from historical docs/tests. P23b-P23d should check at least these paths
   - Any hardcoded labels or model metadata fallback.
 - [ ] `static/index.html`
   - Visible model labels, descriptions, placeholders, and help text.
-- [ ] Release docs, smoke scripts, promotion docs, and tests
+- [ ] Release docs, smoke scripts, promotion docs, design/architecture docs, and tests
   - Current operational docs such as production promotion checks.
+  - Companion design docs with schema examples, including
+    `docs/design/context-tiered-compute.md` context profile `model_ids` and
+    capability registration `supported_model_ids` examples that currently name
+    only `llama-3.1-8b-instruct`.
   - Smoke scripts that require exactly `llama-3.1-8b-instruct`.
   - Unit/integration tests that encode Llama as the only active default.
   - Historical release notes should remain historically accurate; only present
@@ -407,6 +411,9 @@ staging:
 - Qwen `8k-fast` tests prove no YaRN/RoPE scaling is enabled.
 - Qwen `64k-full` tests prove YaRN/RoPE factor `2.0`, original context `32768`,
   target context `65536`, and safe diagnostics are configured.
+- Boundary admission tests cover exact `64k-full` edges at `65535` and `65536`
+  tokens to catch llama-cpp-python YaRN/RoPE rounding, truncation, or off-by-one
+  behavior at the effective tier limit.
 - Llama `8k-fast`/`64k-full` tests prove existing behavior remains unchanged.
 - Warm-load failure tests prove Qwen `64k-full` fails clearly when YaRN/RoPE is
   unsupported.
@@ -434,8 +441,8 @@ staging:
 - Desktop inspect/download tests cover missing Qwen file, existing Llama file,
   Qwen download path, and clear errors.
 - Landing model dropdown tests cover catalog-driven Qwen default and fallback.
-- Exact admission tests cover near-8K, near-32K, and near-64K prompts with safe
-  synthetic/private-safe text.
+- Exact admission tests cover near-8K, near-32K, near-64K, and exact `65535` /
+  `65536` token prompts with safe synthetic/private-safe text.
 - Manual staging smoke prompts for token.place and DSPACE:
   - `hi`
   - `do I have enough green PLA?`

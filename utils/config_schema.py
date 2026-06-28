@@ -16,6 +16,7 @@ from utils.llm.model_profiles import get_default_model_profile
 
 _DEFAULT_MODEL_PROFILE = get_default_model_profile()
 
+
 class ServerSettings(TypedDict, total=False):
     host: str
     port: int

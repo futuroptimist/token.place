@@ -1564,17 +1564,15 @@ class ModelManager:
             config.get('model.profile_id', None),
             config.get('model.api_model_id', None),
         )
-        self.model_profile = get_model_profile(self.profile_id) or get_model_profile(
-            resolve_profile_id(None, None)
-        )
+        self.model_profile = get_model_profile(self.profile_id)
         assert self.model_profile is not None
-        self.api_model_id = config.get('model.api_model_id', self.model_profile['api_model_id'])
+        self.api_model_id = self.model_profile['api_model_id']
         self.display_name = self.model_profile['display_name']
-        self.file_name = config.get('model.filename', self.model_profile['filename'])
-        self.url = config.get('model.url', self.model_profile['download_url'])
-        self.canonical_family_url = config.get(
-            'model.canonical_family_url',
-            self.model_profile['canonical_family_url'],
+        self.file_name = self._get_profile_artifact_config('filename', 'filename')
+        self.url = self._get_profile_artifact_config('url', 'download_url')
+        self.canonical_family_url = self._get_profile_artifact_config(
+            'canonical_family_url',
+            'canonical_family_url',
         )
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
         # Network timeout for model downloads (seconds)
@@ -1791,6 +1789,18 @@ class ModelManager:
             'n_gpu_layers': -1,
             'fallback_reason': None,
         }
+
+    def _get_profile_artifact_config(self, config_key: str, profile_key: str) -> Any:
+        """Return a model artifact config override or the active profile default."""
+        profile_value = self.model_profile[profile_key]
+        configured_value = self.config.get(f'model.{config_key}', profile_value)
+        from utils.config_schema import DEFAULT_CONFIG
+
+        default_model_config = DEFAULT_CONFIG.get('model', {})
+        default_value = default_model_config.get(config_key)
+        if self.profile_id != default_model_config.get('profile_id') and configured_value == default_value:
+            return profile_value
+        return configured_value
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""

@@ -252,7 +252,7 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     resources_dir = tmp_path / 'bin' / 'resources'
     import_root = resources_dir / '_up_' / '_up_'
     utils_llm_dir = import_root / 'utils' / 'llm'
-    model_profiles_path = Path('utils/llm/model_profiles.py')
+    model_profiles_path = MODULE_PATH.parents[3] / 'utils' / 'llm' / 'model_profiles.py'
     python_dir.mkdir(parents=True)
     utils_llm_dir.mkdir(parents=True)
 

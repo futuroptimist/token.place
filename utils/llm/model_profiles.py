@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 from typing import Any, Dict, Iterable, Optional, TypedDict
 
+logger = logging.getLogger(__name__)
 
-class ModelProfile(TypedDict, total=False):
+
+class _ModelProfileRequired(TypedDict):
     profile_id: str
     api_model_id: str
     display_name: str
@@ -16,8 +19,6 @@ class ModelProfile(TypedDict, total=False):
     source_model: str
     parameters: str
     quantization: str
-    license: str
-    gguf_repo: str
     filename: str
     download_url: str
     canonical_family_url: str
@@ -29,9 +30,14 @@ class ModelProfile(TypedDict, total=False):
     thinking_mode: str
     generation_defaults: Dict[str, Any]
     aliases: list[str]
-    rope_scaling_policy: Optional[Dict[str, Any]]
     public_catalog: bool
     runnable: bool
+
+
+class ModelProfile(_ModelProfileRequired, total=False):
+    license: str
+    gguf_repo: str
+    rope_scaling_policy: Optional[Dict[str, Any]]
 
 
 LLAMA_3_1_8B_PROFILE_ID = "llama-3.1-8b-q4-k-m"
@@ -113,7 +119,13 @@ def get_model_profile(profile_id: str) -> Optional[ModelProfile]:
 
 
 def get_default_model_profile() -> ModelProfile:
-    return get_model_profile(LLAMA_3_1_8B_PROFILE_ID)  # type: ignore[return-value]
+    profile = get_model_profile(LLAMA_3_1_8B_PROFILE_ID)
+    if profile is None:
+        raise RuntimeError(
+            f"Default model profile '{LLAMA_3_1_8B_PROFILE_ID}' not found in MODEL_PROFILES. "
+            "Ensure the Llama profile has not been removed."
+        )
+    return profile
 
 
 def iter_model_profiles(*, public_only: bool = False) -> Iterable[ModelProfile]:
@@ -130,6 +142,13 @@ def resolve_profile_id(profile_id: Optional[str], api_model_id: Optional[str] = 
         for candidate_id, profile in MODEL_PROFILES.items():
             if profile["api_model_id"] == api_model_id:
                 return candidate_id
+    if profile_id or api_model_id:
+        logger.warning(
+            "Unknown model profile selection (profile_id=%r, api_model_id=%r); falling back to %s",
+            profile_id,
+            api_model_id,
+            LLAMA_3_1_8B_PROFILE_ID,
+        )
     return LLAMA_3_1_8B_PROFILE_ID
 
 

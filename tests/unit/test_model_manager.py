@@ -169,6 +169,68 @@ class TestModelManager:
         assert missing_metadata['exists'] is False
         assert missing_metadata['size_bytes'] is None
 
+    def test_profile_artifacts_follow_selected_profile_when_defaults_are_seeded(self):
+        """Selecting a profile should replace seeded Llama artifact defaults."""
+        from utils.config_schema import DEFAULT_CONFIG
+
+        mock_config = MagicMock()
+        mock_config.is_production = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def get_config(key, default=None):
+                config_values = {
+                    'model.profile_id': 'qwen3-8b-q4-k-m',
+                    'model.api_model_id': DEFAULT_CONFIG['model']['api_model_id'],
+                    'model.filename': DEFAULT_CONFIG['model']['filename'],
+                    'model.url': DEFAULT_CONFIG['model']['url'],
+                    'model.canonical_family_url': DEFAULT_CONFIG['model']['canonical_family_url'],
+                    'model.download_chunk_size_mb': 1,
+                    'paths.models_dir': temp_dir,
+                    'model.use_mock': False,
+                    'model.n_gpu_layers': -1,
+                    'model.gpu_memory_headroom_percent': 0.1,
+                    'model.enforce_gpu_memory_headroom': True,
+                }
+                return config_values.get(key, default)
+
+            mock_config.get.side_effect = get_config
+            manager = ModelManager(mock_config)
+
+        assert manager.profile_id == 'qwen3-8b-q4-k-m'
+        assert manager.api_model_id == 'qwen3-8b-instruct'
+        assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
+
+    def test_profile_artifacts_preserve_explicit_overrides(self):
+        """Non-default profiles still honor artifact values that differ from seeded defaults."""
+        mock_config = MagicMock()
+        mock_config.is_production = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def get_config(key, default=None):
+                config_values = {
+                    'model.profile_id': 'qwen3-8b-q4-k-m',
+                    'model.filename': 'custom.gguf',
+                    'model.url': 'https://example.com/custom.gguf',
+                    'model.canonical_family_url': 'https://example.com/family',
+                    'model.download_chunk_size_mb': 1,
+                    'paths.models_dir': temp_dir,
+                    'model.use_mock': False,
+                    'model.n_gpu_layers': -1,
+                    'model.gpu_memory_headroom_percent': 0.1,
+                    'model.enforce_gpu_memory_headroom': True,
+                }
+                return config_values.get(key, default)
+
+            mock_config.get.side_effect = get_config
+            manager = ModelManager(mock_config)
+
+        assert manager.api_model_id == 'qwen3-8b-instruct'
+        assert manager.file_name == 'custom.gguf'
+        assert manager.url == 'https://example.com/custom.gguf'
+        assert manager.canonical_family_url == 'https://example.com/family'
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist

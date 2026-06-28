@@ -163,6 +163,30 @@ class TestModelManager:
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
 
+    def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
+        """API v1 admission is limited to the active profile/runtime identifiers."""
+        assert model_manager.supports_api_v1_model('qwen3-8b-instruct') is True
+        assert model_manager.supports_api_v1_model('qwen3-8b-q4-k-m') is True
+        assert model_manager.supports_api_v1_model('test_model.gguf') is True
+        assert model_manager.supports_api_v1_model(' TEST_MODEL.GGUF ') is True
+
+        assert model_manager.supports_api_v1_model('llama-3.1-8b-instruct') is False
+        assert model_manager.supports_api_v1_model('') is False
+        assert model_manager.supports_api_v1_model(None) is False
+
+    def test_supports_api_v1_model_rejects_qwen_for_stale_llama_runtime(self):
+        """A stale Llama runtime/file must not advertise the Qwen API v1 default."""
+        manager = self._build_manager_with_model_config({
+            'model.profile_id': 'llama-3.1-8b-q4-k-m',
+            'model.api_model_id': 'llama-3.1-8b-instruct',
+            'model.filename': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
+        })
+
+        assert manager.supports_api_v1_model('llama-3.1-8b-instruct') is True
+        assert manager.supports_api_v1_model('Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf') is True
+        assert manager.supports_api_v1_model('qwen3-8b-instruct') is False
+        assert manager.supports_api_v1_model('Qwen3-8B-Q4_K_M.gguf') is False
+
     def test_get_model_artifact_metadata(self, model_manager):
         """Test runtime model metadata includes expected keys and file state."""
         metadata = model_manager.get_model_artifact_metadata()

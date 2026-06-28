@@ -75,8 +75,8 @@ class FakeDesktopModelManager:
     use_mock_llm = False
     api_model_id = None
     model_id = None
-    file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
-    model_path = "/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+    file_name = "Qwen3-8B-Q4_K_M.gguf"
+    model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
 
     def __init__(self):
         self.runtime = FakeDesktopRuntime()
@@ -244,7 +244,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
         browser_crypto = EncryptionManager()
         user_text = "ping from browser"
         payload = {
-            "model": "llama-3-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "encrypted": True,
             "client_public_key": browser_crypto.public_key_b64,
             "messages": _encrypt_browser_messages(
@@ -343,7 +343,7 @@ def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(monk
             response = requests.post(
                 f"{base_url}/api/v1/chat/completions",
                 json={
-                    "model": "llama-3-8b-instruct",
+                    "model": "qwen3-8b-instruct",
                     "encrypted": True,
                     "client_public_key": browser_crypto.public_key_b64,
                     "messages": _encrypt_browser_messages([{"role": "user", "content": f"turn {index}"}]),
@@ -411,7 +411,7 @@ def test_api_v1_desktop_bridge_without_response_post_times_out_instead_of_passin
         response = requests.post(
             f"{base_url}/api/v1/chat/completions",
             json={
-                "model": "llama-3-8b-instruct",
+                "model": "qwen3-8b-instruct",
                 "encrypted": True,
                 "client_public_key": browser_crypto.public_key_b64,
                 "messages": _encrypt_browser_messages(
@@ -437,7 +437,7 @@ def test_api_v1_stream_true_fails_before_relay_queue():
         response = client.post(
             "/api/v1/chat/completions",
             json={
-                "model": "llama-3-8b-instruct",
+                "model": "qwen3-8b-instruct",
                 "stream": True,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -509,7 +509,7 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
         browser_crypto = EncryptionManager()
         user_text = "ping after idle no-work"
         payload = {
-            "model": "llama-3-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "encrypted": True,
             "client_public_key": browser_crypto.public_key_b64,
             "messages": _encrypt_browser_messages(
@@ -566,7 +566,7 @@ def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     if encrypted:
         browser_crypto = EncryptionManager()
         payload = {
-            "model": "llama-3-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "encrypted": True,
             "client_public_key": browser_crypto.public_key_b64,
             "messages": _encrypt_browser_messages(messages),
@@ -576,7 +576,7 @@ def test_api_v1_image_content_fails_before_relay_queue(encrypted):
             },
         }
     else:
-        payload = {"model": "llama-3-8b-instruct", "messages": messages}
+        payload = {"model": "qwen3-8b-instruct", "messages": messages}
 
     with relay.app.test_client() as client:
         response = client.post("/api/v1/chat/completions", json=payload)

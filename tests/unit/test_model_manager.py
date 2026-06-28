@@ -4008,3 +4008,90 @@ def test_get_llm_instance_with_recovery_attempts_replacement_when_unavailable(st
     assert standalone_model_manager.get_llm_instance_with_recovery() is replacement
     standalone_model_manager.get_llm_instance.assert_called_once_with()
     standalone_model_manager._ensure_replacement_llm.assert_called_once_with(7)
+
+
+def test_qwen_runtime_init_uses_gguf_template_without_llama_chat_format(tmp_path):
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    mock_config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': 8192,
+        'model.n_gpu_layers': 0,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': False,
+    }.get(key, default)
+    (tmp_path / 'Qwen3-8B-Q4_K_M.gguf').write_bytes(b'fake')
+    manager = ModelManager(mock_config)
+    instance = MagicMock()
+    mock_llama = MagicMock(return_value=instance)
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)):
+        assert manager.get_llm_instance() is instance
+
+    kwargs = mock_llama.call_args.kwargs
+    assert kwargs['model_path'].endswith('Qwen3-8B-Q4_K_M.gguf')
+    assert kwargs['n_ctx'] == 8192
+    assert 'chat_format' not in kwargs
+    assert 'rope_scaling_type' not in kwargs
+    assert instance.token_place_chat_template_kwargs == {'enable_thinking': False}
+    assert instance.token_place_model_diagnostics['chat_template_mode'] == 'gguf-jinja'
+    assert instance.token_place_model_diagnostics['rope_yarn_enabled'] is False
+
+
+def test_qwen_64k_runtime_init_enables_yarn_rope(tmp_path):
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    mock_config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': 65536,
+        'model.n_gpu_layers': 0,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': False,
+    }.get(key, default)
+    (tmp_path / 'Qwen3-8B-Q4_K_M.gguf').write_bytes(b'fake')
+    manager = ModelManager(mock_config)
+    manager.context_tier = '64k-full'
+    instance = MagicMock()
+    mock_llama = MagicMock(return_value=instance)
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)):
+        assert manager.get_llm_instance() is instance
+
+    kwargs = mock_llama.call_args.kwargs
+    assert kwargs['rope_scaling_type'] == 'yarn'
+    assert kwargs['yarn_ext_factor'] == 2.0
+    assert kwargs['yarn_orig_ctx'] == 32768
+    assert instance.token_place_model_diagnostics['rope_yarn_enabled'] is True
+    assert instance.token_place_model_diagnostics['yarn_original_context'] == 32768
+
+
+def test_qwen_64k_runtime_init_fails_when_yarn_kwargs_unsupported(tmp_path):
+    class UnsupportedLlama:
+        def __init__(self, model_path, n_gpu_layers, context_tokens, verbose_logging):
+            self.model_path = model_path
+            self.n_gpu_layers = n_gpu_layers
+            self.context_tokens = context_tokens
+            self.verbose_logging = verbose_logging
+
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    mock_config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': 65536,
+        'model.n_gpu_layers': 0,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': False,
+    }.get(key, default)
+    (tmp_path / 'Qwen3-8B-Q4_K_M.gguf').write_bytes(b'fake')
+    manager = ModelManager(mock_config)
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=UnsupportedLlama)):
+        assert manager.get_llm_instance() is None
+
+    assert 'Qwen3 64K context requires llama-cpp-python YaRN/RoPE kwargs' in manager.last_runtime_init_error

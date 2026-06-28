@@ -2465,7 +2465,10 @@ class RelayClient:
         if callable(apply_chat_template):
             try:
                 rendered = apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **getattr(llm_instance, "token_place_chat_template_kwargs", {}),
                 )
             except TypeError:
                 try:
@@ -2487,12 +2490,20 @@ class RelayClient:
             if callable(tokenizer_template):
                 try:
                     rendered = tokenizer_template(
-                        messages, tokenize=False, add_generation_prompt=True
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **getattr(llm_instance, "token_place_chat_template_kwargs", {}),
                     )
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
                     return rendered
+        if getattr(llm_instance, "token_place_chat_template_kwargs", None):
+            # Qwen must use the GGUF/Jinja template path with enable_thinking=False;
+            # falling back to llama_cpp.llama_chat_format would silently select a
+            # Llama formatter and desynchronise context admission from generation.
+            return None
         try:
             if not hasattr(llm_instance, "chat_format"):
                 return None
@@ -2722,6 +2733,16 @@ class RelayClient:
             "stream": False,
         }
         completion_kwargs.update(safe_options)
+        template_kwargs = getattr(self.model_manager, "runtime_chat_template_kwargs", None)
+        if callable(template_kwargs):
+            template_kwargs = template_kwargs()
+        else:
+            runtime = getattr(self.model_manager, "runtime", None)
+            template_kwargs = getattr(runtime, "token_place_chat_template_kwargs", None)
+        if template_kwargs:
+            # llama-cpp-python passes chat_template_kwargs through to the GGUF/Jinja
+            # renderer. Qwen3 API v1 requires enable_thinking=False.
+            completion_kwargs["chat_template_kwargs"] = dict(template_kwargs)
         return completion_kwargs
 
     def _assistant_message_from_runtime_completion(
@@ -2895,6 +2916,20 @@ class RelayClient:
                 )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
+                )
+
+            if (
+                assistant_message is not None
+                and isinstance(assistant_message.get("content"), str)
+                and "<think" in assistant_message["content"].lower()
+            ):
+                log_error("Desktop runtime returned disallowed Qwen thinking content")
+                return self._api_v1_response_envelope(
+                    request_id,
+                    error={
+                        "code": "compute_node_invalid_model_output",
+                        "message": "Desktop runtime returned invalid assistant output",
+                    },
                 )
 
             if assistant_message is None:

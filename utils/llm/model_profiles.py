@@ -108,7 +108,7 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "aliases": [],
         "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
         "public_catalog": False,
-        "runnable": False,
+        "runnable": True,
     },
 }
 

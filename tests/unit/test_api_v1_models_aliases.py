@@ -1,7 +1,9 @@
 """Tests covering alias resolution behaviour for API v1 models."""
 
 import importlib
+import importlib.util
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
@@ -16,8 +18,11 @@ def _reload_models(env=None):
     fake_llama_module = MagicMock()
     with patch.dict("sys.modules", {"llama_cpp": fake_llama_module}):
         with patch.dict(os.environ, env_vars, clear=True):
-            import api.v1.models as models
-            importlib.reload(models)
+            module_path = Path(__file__).resolve().parents[2] / "api" / "v1" / "models.py"
+            spec = importlib.util.spec_from_file_location("api_v1_models_alias_test", module_path)
+            models = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(models)
     return models
 
 
@@ -41,3 +46,10 @@ def test_resolve_model_alias_missing_target_logs_and_returns_none():
                 result = models.resolve_model_alias("local-alias")
     assert result is None
     mock_log_warning.assert_called_once()
+
+
+def test_qwen_is_not_aliased_to_llama_or_from_llama():
+    models = _reload_models()
+    assert models.resolve_model_alias("qwen3-8b-instruct") is None
+    assert "qwen3-8b-instruct" not in models.MODEL_ALIASES.values()
+    assert models.MODEL_ALIASES["gpt-5-chat-latest"] == "llama-3.1-8b-instruct"

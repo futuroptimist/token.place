@@ -36,3 +36,43 @@ def test_llama_catalog_targets_latest_4090_ready_release():
     assert base_entry["name"] == "Meta Llama 3.1 8B Instruct"
     assert base_entry["file_name"] == "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     assert base_entry["file_name"] in base_entry["url"]
+
+
+def test_model_profiles_include_non_default_qwen_metadata():
+    from utils.llm.model_profiles import (
+        DEFAULT_MODEL_PROFILE_ID,
+        LLAMA_3_1_8B_Q4_K_M_PROFILE,
+        MODEL_PROFILES,
+        QWEN3_8B_Q4_K_M_PROFILE,
+        get_active_model_profile,
+    )
+
+    assert DEFAULT_MODEL_PROFILE_ID == LLAMA_3_1_8B_Q4_K_M_PROFILE.profile_id
+    assert get_active_model_profile().api_model_id == "llama-3.1-8b-instruct"
+
+    qwen = MODEL_PROFILES["qwen3-8b-q4-k-m"]
+    assert qwen is QWEN3_8B_Q4_K_M_PROFILE
+    assert qwen.api_model_id == "qwen3-8b-instruct"
+    assert qwen.display_name == "Qwen3 8B Instruct"
+    assert qwen.source_model == "Qwen/Qwen3-8B"
+    assert qwen.gguf_repo == "Qwen/Qwen3-8B-GGUF"
+    assert qwen.filename == "Qwen3-8B-Q4_K_M.gguf"
+    assert qwen.quantization == "Q4_K_M"
+    assert qwen.license == "apache-2.0"
+    assert qwen.parameters == "8.2B"
+    assert qwen.native_context_tokens == 32768
+    assert qwen.maximum_validated_context_tokens == 131072
+    assert qwen.supported_context_tiers == ["8k-fast", "64k-full"]
+    assert qwen.thinking_mode == "disabled"
+    assert qwen.chat_template_policy == "gguf-jinja"
+    assert qwen.rope_scaling_policy["factor"] == 2.0
+    assert qwen.public_catalog is False
+
+
+@mock.patch.dict(os.environ, {"USE_MOCK_LLM": "1"})
+def test_qwen_profile_is_not_advertised_in_public_api_v1_catalog():
+    import api.v1.models as models
+
+    importlib.reload(models)
+
+    assert "qwen3-8b-instruct" not in [entry["id"] for entry in models.get_models_info()]

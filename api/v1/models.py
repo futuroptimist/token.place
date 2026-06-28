@@ -10,6 +10,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from utils.llm.model_profiles import (
+    MODEL_ALIASES,
+    public_catalog_profiles,
+    LLAMA_3_1_8B_Q4_K_M_PROFILE,
+)
+
 try:
     import llama_cpp as _llama_cpp_module
     from llama_cpp import Llama as _llama_runtime
@@ -103,41 +109,10 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
-CANONICAL_LAUNCH_MODEL_ID = "llama-3.1-8b-instruct"
-
-MODEL_ALIASES: Dict[str, str] = {
-    # Invisible compatibility aliases that route to the fixed Meta Llama 3.1
-    # 8B launch backend. They are accepted by request paths but are not listed
-    # as first-class API v1 models.
-    "llama-3-8b-instruct": CANONICAL_LAUNCH_MODEL_ID,
-    "gpt-3.5-turbo": CANONICAL_LAUNCH_MODEL_ID,
-    "gpt-5-chat-latest": CANONICAL_LAUNCH_MODEL_ID,
-}
+CANONICAL_LAUNCH_MODEL_ID = LLAMA_3_1_8B_Q4_K_M_PROFILE.api_model_id
 
 
-AVAILABLE_MODELS = [
-    {
-        "id": CANONICAL_LAUNCH_MODEL_ID,
-        "name": "Meta Llama 3.1 8B Instruct",
-        "description": (
-            "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
-            "Q4_K_M quantisation that comfortably fits within a 24 GB RTX 4090."
-        ),
-        "owner": "Meta",
-        "owned_by": "Meta",
-        "provider": "meta",
-        "source_model": "meta-llama/Llama-3.1-8B-Instruct",
-        "parameters": "8B",
-        "quantization": "Q4_K_M",
-        "context_length": 8192,
-        "url": (
-            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
-            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        ),
-        "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        "adapters": [],
-    }
-]
+AVAILABLE_MODELS = [profile.catalog_entry() for profile in public_catalog_profiles()]
 
 
 # Dictionary mapping model IDs to loaded model instances

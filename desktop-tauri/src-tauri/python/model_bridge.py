@@ -22,6 +22,24 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__)
 from pathlib import Path
 
+
+_DEFAULT_PROFILE_ID = "llama-3.1-8b-instruct-q4-k-m"
+_DEFAULT_API_MODEL_ID = "llama-3.1-8b-instruct"
+_DEFAULT_DISPLAY_NAME = "Meta Llama 3.1 8B Instruct"
+_DEFAULT_SOURCE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+_DEFAULT_GGUF_REPO = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+_DEFAULT_QUANTIZATION = "Q4_K_M"
+_DEFAULT_LICENSE = "llama3.1"
+_DEFAULT_NATIVE_CONTEXT_TOKENS = 8192
+_DEFAULT_MAXIMUM_VALIDATED_CONTEXT_TOKENS = 8192
+_DEFAULT_SUPPORTED_CONTEXT_TIERS = ["8k-fast"]
+_DEFAULT_CANONICAL_FAMILY_URL = "https://huggingface.co/meta-llama/Meta-Llama-3-8B"
+_DEFAULT_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+_DEFAULT_URL = (
+    "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
+    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+)
+
 try:
     from desktop_runtime_setup import ensure_desktop_python_dependencies
 except ModuleNotFoundError:
@@ -67,24 +85,36 @@ def _fallback_model_metadata() -> Dict[str, Any]:
 
     canonical_family_url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL",
-        "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
+        _DEFAULT_CANONICAL_FAMILY_URL,
     )
     filename = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FILENAME",
-        "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        _DEFAULT_FILENAME,
     )
     url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_URL",
-        "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        _DEFAULT_URL,
     )
     resolved_model_path = models_dir / filename
     exists = resolved_model_path.exists()
     size_bytes = resolved_model_path.stat().st_size if exists else None
 
     return {
+        "api_model_id": _DEFAULT_API_MODEL_ID,
+        "active_api_model_id": _DEFAULT_API_MODEL_ID,
+        "profile_id": _DEFAULT_PROFILE_ID,
+        "active_profile_id": _DEFAULT_PROFILE_ID,
+        "display_name": _DEFAULT_DISPLAY_NAME,
         "canonical_family_url": canonical_family_url,
         "filename": filename,
         "url": url,
+        "gguf_repo": _DEFAULT_GGUF_REPO,
+        "source_model": _DEFAULT_SOURCE_MODEL,
+        "quantization": _DEFAULT_QUANTIZATION,
+        "license": _DEFAULT_LICENSE,
+        "native_context_tokens": _DEFAULT_NATIVE_CONTEXT_TOKENS,
+        "maximum_validated_context_tokens": _DEFAULT_MAXIMUM_VALIDATED_CONTEXT_TOKENS,
+        "supported_context_tiers": _DEFAULT_SUPPORTED_CONTEXT_TIERS,
         "models_dir": str(models_dir),
         "resolved_model_path": str(resolved_model_path),
         "exists": exists,

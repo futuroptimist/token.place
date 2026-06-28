@@ -2112,6 +2112,27 @@ class RelayClient:
         return prepared
 
     @staticmethod
+    def _api_v1_qwen_no_think_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Inject Qwen's template-supported non-thinking control into user text."""
+
+        prepared = [dict(message) for message in messages]
+        for index in range(len(prepared) - 1, -1, -1):
+            if prepared[index].get("role") != "user":
+                continue
+            content = prepared[index].get("content")
+            if isinstance(content, str):
+                prepared[index]["content"] = "/no_think\n" + content
+                return prepared
+            if isinstance(content, list):
+                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
+                for block in copied_blocks:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        block["text"] = "/no_think\n" + block["text"]
+                        prepared[index]["content"] = copied_blocks
+                        return prepared
+        return prepared
+
+    @staticmethod
     def _api_v1_models_module() -> Optional[Any]:
         """Return the optional repo API v1 models module when it is importable."""
 
@@ -2458,15 +2479,22 @@ class RelayClient:
         return None
 
     @staticmethod
-    def _api_v1_render_chat_prompt(llm_instance: Any, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def _api_v1_render_chat_prompt(
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: Optional[bool] = None,
+        allow_chat_format_fallback: bool = True,
+    ) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
 
         apply_chat_template = getattr(llm_instance, "apply_chat_template", None)
         if callable(apply_chat_template):
             try:
-                rendered = apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                kwargs = {"tokenize": False, "add_generation_prompt": True}
+                if enable_thinking is not None:
+                    kwargs["enable_thinking"] = enable_thinking
+                rendered = apply_chat_template(messages, **kwargs)
             except TypeError:
                 try:
                     rendered = apply_chat_template(messages)
@@ -2486,14 +2514,17 @@ class RelayClient:
             tokenizer_template = getattr(tokenizer, "apply_chat_template", None)
             if callable(tokenizer_template):
                 try:
-                    rendered = tokenizer_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    kwargs = {"tokenize": False, "add_generation_prompt": True}
+                    if enable_thinking is not None:
+                        kwargs["enable_thinking"] = enable_thinking
+                    rendered = tokenizer_template(messages, **kwargs)
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
                     return rendered
         try:
+            if not allow_chat_format_fallback:
+                return None
             if not hasattr(llm_instance, "chat_format"):
                 return None
             chat_format = getattr(llm_instance, "chat_format", None) or "llama-2"
@@ -2643,7 +2674,17 @@ class RelayClient:
             )
             or active_profile.total_context_tokens
         )
-        rendered_prompt = self._api_v1_render_chat_prompt(llm_instance, messages)
+        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+        is_qwen_non_thinking = (
+            model_profile.get("provider") == "qwen"
+            and model_profile.get("thinking_mode") == "disabled"
+        )
+        rendered_prompt = self._api_v1_render_chat_prompt(
+            llm_instance,
+            messages,
+            enable_thinking=False if is_qwen_non_thinking else None,
+            allow_chat_format_fallback=not is_qwen_non_thinking,
+        )
         prompt_tokens = (
             self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
             if rendered_prompt is not None
@@ -2721,6 +2762,12 @@ class RelayClient:
             "stop": configured("model.stop_tokens", []),
             "stream": False,
         }
+        profile_defaults = (
+            getattr(self.model_manager, "model_profile", {}) or {}
+        ).get("generation_defaults") or {}
+        for key in ("temperature", "top_p", "top_k"):
+            if key in profile_defaults:
+                completion_kwargs[key] = profile_defaults[key]
         completion_kwargs.update(safe_options)
         return completion_kwargs
 
@@ -2735,9 +2782,21 @@ class RelayClient:
             and completion["choices"]
             and isinstance(completion["choices"][0], dict)
         ):
-            return self._valid_api_v1_assistant_message(
+            message = self._valid_api_v1_assistant_message(
                 completion["choices"][0].get("message")
             )
+            model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+            if (
+                message is not None
+                and model_profile.get("provider") == "qwen"
+                and model_profile.get("thinking_mode") == "disabled"
+                and isinstance(message.get("content"), str)
+                and "<think" in message["content"].lower()
+            ):
+                # Fail closed instead of stripping so no hidden reasoning can be
+                # partially leaked or mis-accounted in API v1 relay responses.
+                return None
+            return message
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
         # a complete chat completion object for this path.
@@ -2826,6 +2885,18 @@ class RelayClient:
             )
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
+        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+        if (
+            model_profile.get("provider") == "qwen"
+            and model_profile.get("thinking_mode") == "disabled"
+        ):
+            # Use both supported controls for Qwen3: llama-cpp-python's
+            # apply_chat_template(enable_thinking=False) is used for exact context
+            # admission, while create_chat_completion renders internally, so we
+            # also inject Qwen's documented /no_think control into the user turn
+            # before both admission and generation.  Output validation below still
+            # fails closed if a runtime returns a <think> block.
+            runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = get_llm_instance() if callable(get_llm_instance) else None

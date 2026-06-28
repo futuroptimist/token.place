@@ -75,7 +75,14 @@ small and reversible:
 ## Current hardcoded Llama touchpoints and repo-audit checklist
 
 The migration should begin with an audit that distinguishes active runtime
-surfaces from historical docs/tests. P23b-P23d should check at least these paths:
+surfaces from historical docs/tests. P23b-P23d should check at least these paths.
+A focused search should include the root relay entrypoint, for example:
+
+```sh
+rg -n "llama|DEFAULT_MODEL_IDS|supported_model_ids" \
+  api/v1 utils relay.py desktop-tauri static docs tests scripts
+```
+
 
 - [ ] `api/v1/models.py`
   - Public `/api/v1/models` ids and display metadata.
@@ -95,6 +102,13 @@ surfaces from historical docs/tests. P23b-P23d should check at least these paths
   - Node capability registration, `supported_model_ids`, active context tier,
     artifact metadata, and safe diagnostics.
   - Compute-side model mismatch handling after decrypting the request.
+- [ ] `relay.py`
+  - Relay default capability plumbing: `DEFAULT_MODEL_IDS`,
+    `_api_v1_default_capabilities()`, and `supported_model_ids` in safe
+    selected-server metadata.
+  - Scheduler rejection/filtering behavior for unsupported requested models,
+    including nodes omitted because `requested_model` is absent from
+    `supported_model_ids`.
 - [ ] `desktop-tauri/src-tauri/python/model_bridge.py`
   - Desktop fallback metadata when the Python model manager cannot be imported.
   - Environment overrides such as `TOKEN_PLACE_DEFAULT_MODEL_FILENAME`,

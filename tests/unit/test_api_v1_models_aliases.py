@@ -13,6 +13,10 @@ def _reload_models(env=None):
         env_vars.update(env)
 
     # Ensure the module is reloaded under the patched environment and dependencies.
+    # Import the package before injecting the fake llama_cpp module so package-level
+    # cryptography imports never observe the MagicMock dependency shim.
+    import api  # noqa: F401
+
     fake_llama_module = MagicMock()
     with patch.dict("sys.modules", {"llama_cpp": fake_llama_module}):
         with patch.dict(os.environ, env_vars, clear=True):
@@ -41,3 +45,9 @@ def test_resolve_model_alias_missing_target_logs_and_returns_none():
                 result = models.resolve_model_alias("local-alias")
     assert result is None
     mock_log_warning.assert_called_once()
+
+
+def test_qwen_is_not_aliased_to_llama_or_advertised():
+    models = _reload_models()
+    assert models.resolve_model_alias("qwen3-8b-instruct") is None
+    assert "qwen3-8b-instruct" not in [entry["id"] for entry in models.get_models_info()]

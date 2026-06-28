@@ -4782,3 +4782,48 @@ def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
     relay_client.stop()
 
     assert relay_client._api_v1_heartbeat_thread is None
+
+
+def test_qwen_context_admission_uses_qwen_template_kwargs_without_llama_fallback(monkeypatch):
+    class QwenRuntime:
+        token_place_chat_template_kwargs = {'enable_thinking': False}
+        chat_format = 'llama-3'
+        def __init__(self):
+            self.template_kwargs = None
+            self.calls = []
+        def apply_chat_template(self, messages, **kwargs):
+            self.template_kwargs = kwargs
+            return '<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n'
+        def tokenize(self, payload, *args, **kwargs):
+            return [1, 2, 3]
+        def create_chat_completion(self, **kwargs):
+            self.calls.append(kwargs)
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    manager = _AdmissionManager()
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.runtime = QwenRuntime()
+    manager.runtime_chat_template_kwargs = lambda: {'enable_thinking': False}
+    client = _api_v1_validation_client(manager)
+    monkeypatch.setattr(RelayClient, '_api_v1_llama_chat_format_module', MagicMock(side_effect=AssertionError('llama fallback used')))
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen', model_id='qwen3-8b-instruct', messages=[{'role': 'user', 'content': 'hi'}], options={}
+    )
+
+    assert 'message' in envelope['api_v1_response']
+    assert manager.runtime.template_kwargs['enable_thinking'] is False
+    assert manager.runtime.calls[0]['chat_template_kwargs'] == {'enable_thinking': False}
+
+
+def test_api_v1_rejects_think_blocks_from_runtime_output():
+    manager = _AdmissionManager()
+    manager.runtime.create_chat_completion = MagicMock(return_value={
+        'choices': [{'message': {'role': 'assistant', 'content': '<think>secret</think>final'}}]
+    })
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, 'hi')
+
+    error = envelope['api_v1_response']['error']
+    assert error['code'] == 'compute_node_invalid_model_output'
+    assert '<think>' not in json.dumps(envelope)

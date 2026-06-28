@@ -8,6 +8,7 @@ from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib
+import inspect
 import subprocess
 import queue
 import signal
@@ -126,6 +127,28 @@ def _stdlib_safe_path_order(entries: Iterable[str]) -> list[str]:
 
 DESKTOP_RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
 _LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
+
+
+def _callable_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
+    """Return whether a callable advertises support for a keyword argument."""
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == kwarg
+        for name, parameter in signature.parameters.items()
+    )
+
+
+def _llama_init_supports_rope_yarn(Llama: Any) -> bool:
+    """llama-cpp-python exposes YaRN via rope_scaling_type/yarn_* Llama kwargs."""
+    required = (
+        'rope_scaling_type',
+        'yarn_ext_factor',
+        'yarn_orig_ctx',
+    )
+    return all(_callable_accepts_kwarg(Llama, kwarg) for kwarg in required)
 
 
 class LlamaCppInferenceRequestError(RuntimeError):
@@ -2083,16 +2106,26 @@ class ModelManager:
 
                             self.log_info(f"About to instantiate Llama model from {self.model_path}...")
                             self.log_info(f"Llama init started for {self.model_path}.")
-                            self.llm = Llama(
-                                model_path=self.model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3'),
-                                verbose=llama_cpp_verbose_logging_enabled(),
+                            llama_init_kwargs = self._llama_init_kwargs(Llama, n_gpu_layers)
+                            self.llm = Llama(**llama_init_kwargs)
+                            if self._runtime_chat_template_kwargs():
+                                setattr(
+                                    self.llm,
+                                    'token_place_chat_template_kwargs',
+                                    self._runtime_chat_template_kwargs(),
+                                )
+                            runtime_model_diagnostics = self._runtime_model_diagnostics(llama_init_kwargs)
+                            setattr(self.llm, 'token_place_model_diagnostics', runtime_model_diagnostics)
+                            self.log_info(
+                                "runtime_model "
+                                + " ".join(f"{key}={value}" for key, value in runtime_model_diagnostics.items())
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
-                            compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)
+                            compute_plan['context_window_tokens'] = llama_init_kwargs.get(
+                                'n_ctx',
+                                self.config.get('model.context_size', 8192),
+                            )
                             compute_plan['kv_cache_device'] = (
                                 compute_plan['backend_used']
                                 if n_gpu_layers < 0
@@ -2144,6 +2177,72 @@ class ModelManager:
                             return None
 
         return self.llm
+
+    def _is_qwen_profile(self) -> bool:
+        return str(self.model_profile.get('provider') or '').lower() == 'qwen'
+
+    def runtime_chat_template_kwargs(self) -> Dict[str, Any]:
+        return self._runtime_chat_template_kwargs()
+
+    def _runtime_chat_template_kwargs(self) -> Dict[str, Any]:
+        if self._is_qwen_profile():
+            # Qwen3 GGUF/Jinja templates support enable_thinking; API v1 requires
+            # non-thinking output so context admission and generation share this flag.
+            return {'enable_thinking': False}
+        return {}
+
+    def _llama_init_kwargs(self, Llama: Any, n_gpu_layers: int) -> Dict[str, Any]:
+        context_tokens = int(self.config.get('model.context_size', 8192))
+        kwargs: Dict[str, Any] = {
+            'model_path': self.model_path,
+            'n_gpu_layers': n_gpu_layers,
+            'n_ctx': context_tokens,
+            'verbose': llama_cpp_verbose_logging_enabled(),
+        }
+        if self._is_qwen_profile():
+            # Do not pass chat_format='llama-3' for Qwen. Omitting chat_format lets
+            # llama-cpp-python use the GGUF tokenizer.chat_template/Jinja path.
+            # If the active 64K profile extends past Qwen3's native 32768 context,
+            # llama-cpp-python must advertise the exact YaRN/RoPE kwargs below.
+            rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+            native_context = int(
+                self.model_profile.get('native_context_tokens') or context_tokens
+            )
+            if context_tokens > native_context:
+                if not _llama_init_supports_rope_yarn(Llama):
+                    raise RuntimeError(
+                        'Qwen3 64K context requires llama-cpp-python YaRN/RoPE kwargs '
+                        '(rope_scaling_type, yarn_ext_factor, yarn_orig_ctx), but this runtime '
+                        'does not advertise them'
+                    )
+                kwargs.update({
+                    'rope_scaling_type': rope_policy.get('type', 'yarn'),
+                    'yarn_ext_factor': float(rope_policy.get('factor', 2.0)),
+                    'yarn_orig_ctx': int(
+                        rope_policy.get('original_context_tokens', native_context)
+                    ),
+                })
+            return kwargs
+        kwargs['chat_format'] = self.config.get('model.chat_format', 'llama-3')
+        return kwargs
+
+    def _runtime_model_diagnostics(self, init_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        rope_enabled = 'rope_scaling_type' in init_kwargs
+        return {
+            'active_model_id': self.api_model_id,
+            'active_profile_id': self.profile_id,
+            'gguf_filename': self.file_name,
+            'quantization': self.model_profile.get('quantization'),
+            'chat_template_mode': self.model_profile.get('chat_template_policy'),
+            'thinking_mode_disabled': self.model_profile.get('thinking_mode') == 'disabled',
+            'n_ctx': init_kwargs.get('n_ctx'),
+            'native_context_tokens': self.model_profile.get('native_context_tokens'),
+            'maximum_validated_context_tokens': self.model_profile.get('maximum_validated_context_tokens'),
+            'rope_yarn_enabled': rope_enabled,
+            'rope_yarn_factor': init_kwargs.get('yarn_ext_factor'),
+            'yarn_original_context': init_kwargs.get('yarn_orig_ctx'),
+        }
+
 
     def _close_llm_proxy(self, llm: Any) -> None:
         close = getattr(llm, 'close', None)

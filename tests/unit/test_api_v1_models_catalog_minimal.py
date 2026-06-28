@@ -64,7 +64,7 @@ def test_qwen3_profile_exists_but_is_not_public_catalog_default():
         "original_context_tokens": 32768,
     }
     assert qwen["public_catalog"] is False
-    assert qwen["runnable"] is False
+    assert qwen["runnable"] is True
     assert [profile["api_model_id"] for profile in iter_model_profiles(public_only=True)] == [
         "llama-3.1-8b-instruct"
     ]

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import importlib
 from typing import Any, Dict
 
 
@@ -21,6 +22,7 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__)
 from pathlib import Path
+
 
 try:
     from desktop_runtime_setup import ensure_desktop_python_dependencies
@@ -59,32 +61,66 @@ def _default_models_dir() -> Path:
     return Path.home() / ".local" / "share" / "token.place" / "models"
 
 
+def _fallback_default_profile() -> Any:
+    if importlib.util.find_spec("utils.llm.model_profiles") is not None:
+        profile_module = importlib.import_module("utils.llm.model_profiles")
+        return profile_module.get_default_model_profile()
+    return type("FallbackModelProfile", (), {
+        "api_model_id": "llama-3.1-8b-instruct",
+        "profile_id": "llama-3.1-8b-q4-k-m",
+        "display_name": "Meta Llama 3.1 8B Instruct",
+        "canonical_family_url": "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
+        "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "download_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "gguf_repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "source_model": "meta-llama/Llama-3.1-8B-Instruct",
+        "quantization": "Q4_K_M",
+        "license": "llama3.1",
+        "native_context_tokens": 8192,
+        "maximum_validated_context_tokens": 8192,
+        "supported_context_tiers": ["8k-fast"],
+    })()
+
+
 def _fallback_model_metadata() -> Dict[str, Any]:
     models_dir = _default_models_dir()
     models_dir_override = os.environ.get("TOKEN_PLACE_MODELS_DIR")
     if models_dir_override:
         models_dir = Path(models_dir_override)
 
+    profile = _fallback_default_profile()
     canonical_family_url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL",
-        "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
+        profile.canonical_family_url,
     )
     filename = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FILENAME",
-        "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        profile.filename,
     )
     url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_URL",
-        "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        profile.download_url,
     )
     resolved_model_path = models_dir / filename
     exists = resolved_model_path.exists()
     size_bytes = resolved_model_path.stat().st_size if exists else None
 
     return {
+        "api_model_id": profile.api_model_id,
+        "active_api_model_id": profile.api_model_id,
+        "profile_id": profile.profile_id,
+        "active_profile_id": profile.profile_id,
+        "display_name": profile.display_name,
         "canonical_family_url": canonical_family_url,
         "filename": filename,
         "url": url,
+        "gguf_repo": profile.gguf_repo,
+        "source_model": profile.source_model,
+        "quantization": profile.quantization,
+        "license": profile.license,
+        "native_context_tokens": profile.native_context_tokens,
+        "maximum_validated_context_tokens": profile.maximum_validated_context_tokens,
+        "supported_context_tiers": list(profile.supported_context_tiers),
         "models_dir": str(models_dir),
         "resolved_model_path": str(resolved_model_path),
         "exists": exists,

@@ -4782,3 +4782,108 @@ def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
     relay_client.stop()
 
     assert relay_client._api_v1_heartbeat_thread is None
+
+
+def test_qwen_context_admission_uses_generation_aligned_no_think_messages_without_llama_fallback():
+    class Runtime(_AdmissionRuntime):
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.calls.append({'template_kwargs': kwargs, 'messages': messages})
+            return super().apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-template',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['message']['content'] == 'ok'
+    assert manager.runtime.calls[0]['template_kwargs'] == {}
+    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
+    assert manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
+
+
+def test_qwen_no_think_messages_injects_text_block_when_user_content_list_has_no_text():
+    prepared = RelayClient._api_v1_qwen_no_think_messages([
+        {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}]},
+    ])
+
+    assert prepared[0]['content'][0] == {'type': 'text', 'text': '/no_think\n'}
+    assert prepared[0]['content'][1]['type'] == 'image_url'
+
+
+def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_control():
+    class Runtime:
+        def apply_chat_template(self, messages, **kwargs):
+            if 'enable_thinking' in kwargs:
+                raise TypeError('unexpected keyword argument enable_thinking')
+            return '<thinking-default>'
+
+    assert RelayClient._api_v1_render_chat_prompt(
+        Runtime(),
+        [{'role': 'user', 'content': 'hello'}],
+        enable_thinking=False,
+        allow_chat_format_fallback=False,
+    ) is None
+
+
+def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallback():
+    class Runtime:
+        chat_format = 'llama-3'
+        def tokenize(self, payload, *args):
+            return [1]
+        def create_chat_completion(self, **kwargs):
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-template-missing',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['error']['code'] == 'compute_node_context_admission_unavailable'
+
+
+def test_qwen_think_output_is_rejected():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        'choices': [{'message': {'role': 'assistant', 'content': '<think>secret</think>answer'}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-think',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['error']['code'] == 'compute_node_invalid_model_output'
+
+
+def test_qwen_profile_generation_defaults_include_top_k():
+    manager = _AdmissionManager()
+    manager.model_profile = {'generation_defaults': {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20}}
+    client = _api_v1_validation_client(manager)
+
+    kwargs = client._api_v1_runtime_completion_kwargs({})
+
+    assert kwargs['temperature'] == 0.7
+    assert kwargs['top_p'] == 0.8
+    assert kwargs['top_k'] == 20

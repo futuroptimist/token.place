@@ -245,7 +245,7 @@ class TestModelManager:
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
         assert metadata['native_context_tokens'] == 32768
-        assert metadata['maximum_validated_context_tokens'] == 131072
+        assert metadata['maximum_validated_context_tokens'] == 65536
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
@@ -4008,3 +4008,271 @@ def test_get_llm_instance_with_recovery_attempts_replacement_when_unavailable(st
     assert standalone_model_manager.get_llm_instance_with_recovery() is replacement
     standalone_model_manager.get_llm_instance.assert_called_once_with()
     standalone_model_manager._ensure_replacement_llm.assert_called_once_with(7)
+
+
+def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    Path(manager.model_path).write_text('fake')
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return '<qwen>'
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
+
+        def tokenizer(self):
+            return FakeTokenizer()
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert 'chat_format' not in llm.kwargs
+    assert 'yarn_ext_factor' not in llm.kwargs
+    assert manager.last_compute_diagnostics['chat_template_mode'] == 'gguf-jinja'
+    assert manager.last_compute_diagnostics['thinking_mode_disabled'] is True
+    assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
+
+
+def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        LLAMA_ROPE_SCALING_TYPE_YARN = 2
+
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            captured.update({
+                'model_path': model_path,
+                'n_gpu_layers': n_gpu_layers,
+                'n_ctx': n_ctx,
+                'verbose': verbose,
+                'rope_scaling_type': rope_scaling_type,
+                'yarn_ext_factor': yarn_ext_factor,
+                'yarn_orig_ctx': yarn_orig_ctx,
+            })
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['n_ctx'] == 65536
+    assert captured['rope_scaling_type'] == 2
+    assert captured['yarn_ext_factor'] == 2.0
+    assert captured['yarn_orig_ctx'] == 32768
+    assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
+    assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
+
+
+def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            pass
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert 'Qwen 64K YaRN/RoPE is unsupported' in manager.last_runtime_init_error
+
+
+def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert 'missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant' in manager.last_runtime_init_error
+
+
+def test_qwen_validation_failure_does_not_cache_invalid_llm(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    Path(manager.model_path).write_text('fake')
+
+    constructed = []
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            constructed.append(self)
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is None
+        assert manager.llm is None
+        first_failed = constructed[0]
+        assert manager.get_llm_instance() is None
+
+    assert len(constructed) == 2
+    assert manager.llm is None
+    assert manager.llm is not first_failed
+    assert 'Qwen runtime requires GGUF/Jinja apply_chat_template support' in manager.last_runtime_init_error
+
+
+def test_runtime_signature_helpers_cover_constructor_variants():
+    manager = object.__new__(ModelManager)
+
+    class ExplicitLlama:
+        def __init__(self, model_path, rope_scaling_type):
+            pass
+
+    class KwargsLlama:
+        def __init__(self, model_path, **kwargs):
+            pass
+
+    assert manager._llama_constructor_accepts(ExplicitLlama, 'rope_scaling_type') is True
+    assert manager._llama_constructor_accepts(KwargsLlama, 'yarn_ext_factor') is True
+    assert manager._llama_constructor_accepts(ExplicitLlama, 'yarn_ext_factor') is False
+    assert manager._llama_constructor_accepts(42, 'rope_scaling_type') is False
+
+
+def test_apply_chat_template_accepts_direct_runtime_and_tokenizer_paths():
+    manager = object.__new__(ModelManager)
+
+    class DirectRenderer:
+        def apply_chat_template(self, messages, enable_thinking=False):
+            return '<direct>'
+
+    class KwargsTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return '<tokenizer>'
+
+    class TokenizerBackedRenderer:
+        def tokenizer(self):
+            return KwargsTokenizer()
+
+    class MissingRenderer:
+        pass
+
+    assert manager._apply_chat_template_accepts(DirectRenderer(), 'enable_thinking') is True
+    assert manager._apply_chat_template_accepts(TokenizerBackedRenderer(), 'enable_thinking') is True
+    assert manager._apply_chat_template_accepts(MissingRenderer(), 'enable_thinking') is False
+
+
+def test_apply_chat_template_accepts_handles_tokenizer_and_signature_failures():
+    manager = object.__new__(ModelManager)
+
+    class BrokenTokenizerRuntime:
+        def tokenizer(self):
+            raise RuntimeError('tokenizer unavailable')
+
+    class BuiltinRenderer:
+        apply_chat_template = len
+
+    assert manager._apply_chat_template_accepts(BrokenTokenizerRuntime(), 'enable_thinking') is False
+    assert manager._apply_chat_template_accepts(BuiltinRenderer(), 'enable_thinking') is False
+
+
+def test_apply_chat_template_accepts_returns_false_when_signature_uninspectable(monkeypatch):
+    manager = object.__new__(ModelManager)
+
+    class DirectRenderer:
+        def apply_chat_template(self, messages):
+            return '<direct>'
+
+    import inspect
+
+    original_signature = inspect.signature
+
+    def fake_signature(target):
+        if getattr(target, '__name__', '') == 'apply_chat_template':
+            raise ValueError('uninspectable')
+        return original_signature(target)
+
+    monkeypatch.setattr('utils.llm.model_manager.inspect.signature', fake_signature)
+
+    assert manager._apply_chat_template_accepts(DirectRenderer(), 'enable_thinking') is False
+
+
+def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
+    config = MagicMock()
+    config.get.side_effect = lambda key, default=None: {
+        'model.context_size': 8192,
+    }.get(key, default)
+    manager = object.__new__(ModelManager)
+    manager.config = config
+    manager.model_path = str(tmp_path / 'model.gguf')
+    manager.model_profile = {
+        'provider': 'qwen',
+        'chat_template_policy': 'llama-3',
+        'native_context_tokens': 32768,
+    }
+
+    class FakeLlama:
+        pass
+
+    with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
+        manager._runtime_init_kwargs(FakeLlama, 0)

@@ -8,6 +8,7 @@ from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib
+import inspect
 import subprocess
 import queue
 import signal
@@ -1802,6 +1803,116 @@ class ModelManager:
             return profile_value
         return configured_value
 
+    def _llama_constructor_accepts(self, llama_cls: Any, kwarg: str) -> bool:
+        """Return whether the imported llama-cpp-python Llama constructor accepts a kwarg."""
+
+        try:
+            signature = inspect.signature(llama_cls)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        return kwarg in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _apply_chat_template_accepts(self, llm: Any, kwarg: str) -> bool:
+        """Return whether runtime chat-template rendering accepts a kwarg."""
+
+        renderer = getattr(llm, 'apply_chat_template', None)
+        if not callable(renderer):
+            tokenizer = getattr(llm, 'tokenizer', None)
+            if callable(tokenizer):
+                try:
+                    tokenizer = tokenizer()
+                except Exception:
+                    tokenizer = None
+            renderer = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+        if not callable(renderer):
+            return False
+        try:
+            signature = inspect.signature(renderer)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        return kwarg in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _chat_template_mode(self) -> str:
+        """Return the runtime chat-template policy for the active profile."""
+
+        return str(self.model_profile.get('chat_template_policy') or 'llama-3')
+
+    def _qwen_non_thinking_required(self) -> bool:
+        return self.model_profile.get('provider') == 'qwen' and self.model_profile.get('thinking_mode') == 'disabled'
+
+    def _runtime_init_kwargs(self, llama_cls: Any, n_gpu_layers: int) -> Dict[str, Any]:
+        """Build verified llama-cpp-python runtime kwargs for the selected profile.
+
+        llama-cpp-python uses the GGUF/Jinja chat template when ``chat_format`` is
+        omitted.  Qwen3 must therefore not inherit token.place's historical
+        ``chat_format='llama-3'`` default; if the runtime cannot expose a template
+        after initialization, warm-load fails below instead of running Qwen with a
+        Llama template.  YaRN/RoPE kwargs are only passed after constructor
+        signature verification so unsupported runtimes fail closed before a node
+        can advertise false 64K Qwen capability.
+        """
+
+        n_ctx = int(self.config.get('model.context_size', 8192))
+        kwargs: Dict[str, Any] = {
+            'model_path': self.model_path,
+            'n_gpu_layers': n_gpu_layers,
+            'n_ctx': n_ctx,
+            'verbose': llama_cpp_verbose_logging_enabled(),
+        }
+        if self.model_profile.get('provider') == 'qwen':
+            if self._chat_template_mode() != 'gguf-jinja':
+                raise RuntimeError('Qwen runtime requires GGUF/Jinja chat template policy')
+        else:
+            kwargs['chat_format'] = self.config.get('model.chat_format', 'llama-3')
+
+        rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+        context_tier = getattr(self, 'context_tier', '8k-fast')
+        native_context = int(self.model_profile.get('native_context_tokens') or n_ctx)
+        needs_yarn = (
+            self.model_profile.get('provider') == 'qwen'
+            and rope_policy.get('type') == 'yarn'
+            and context_tier == rope_policy.get('required_for_tier')
+            and n_ctx > native_context
+        )
+        if needs_yarn:
+            required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
+            unsupported = [
+                name for name in required_kwargs
+                if not self._llama_constructor_accepts(llama_cls, name)
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
+                    f'runtime; missing constructor kwargs: {", ".join(unsupported)}'
+                )
+            llama_module = inspect.getmodule(llama_cls)
+            yarn_scaling_type = getattr(
+                llama_module,
+                'LLAMA_ROPE_SCALING_TYPE_YARN',
+                getattr(llama_cls, 'LLAMA_ROPE_SCALING_TYPE_YARN', None),
+            )
+            if yarn_scaling_type is None:
+                raise RuntimeError(
+                    'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
+                    'runtime; missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant'
+                )
+            kwargs.update(
+                {
+                    'rope_scaling_type': yarn_scaling_type,
+                    'yarn_ext_factor': float(rope_policy.get('factor', 2.0)),
+                    'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
+                }
+            )
+        return kwargs
+
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
         file_exists = os.path.exists(self.model_path)
@@ -2083,13 +2194,18 @@ class ModelManager:
 
                             self.log_info(f"About to instantiate Llama model from {self.model_path}...")
                             self.log_info(f"Llama init started for {self.model_path}.")
-                            self.llm = Llama(
-                                model_path=self.model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3'),
-                                verbose=llama_cpp_verbose_logging_enabled(),
-                            )
+                            runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers)
+                            llm_instance = Llama(**runtime_kwargs)
+                            if self.model_profile.get('provider') == 'qwen':
+                                if not callable(getattr(llm_instance, 'apply_chat_template', None)):
+                                    tokenizer = getattr(llm_instance, 'tokenizer', None)
+                                    tokenizer_instance = tokenizer() if callable(tokenizer) else None
+                                    if not callable(getattr(tokenizer_instance, 'apply_chat_template', None)):
+                                        raise RuntimeError(
+                                            'Qwen runtime requires GGUF/Jinja apply_chat_template support; '
+                                            'refusing to run with a Llama fallback template'
+                                        )
+                            self.llm = llm_instance
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
                             compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)
@@ -2103,6 +2219,24 @@ class ModelManager:
                             )
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
+                            rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+                            compute_plan.update({
+                                'active_model_id': self.api_model_id,
+                                'active_profile_id': self.profile_id,
+                                'gguf_filename': self.file_name,
+                                'quantization': self.model_profile.get('quantization'),
+                                'chat_template_mode': self._chat_template_mode(),
+                                'thinking_mode_disabled': self._qwen_non_thinking_required(),
+                                'n_ctx': runtime_kwargs.get('n_ctx'),
+                                'native_context_tokens': self.model_profile.get('native_context_tokens'),
+                                'maximum_validated_context_tokens': min(
+                                    int(self.model_profile.get('maximum_validated_context_tokens') or runtime_kwargs.get('n_ctx')),
+                                    int(runtime_kwargs.get('n_ctx') or 0),
+                                ),
+                                'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
+                                'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
+                                'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
+                            })
                             self.last_compute_diagnostics = compute_plan
                             if compute_plan['requested_mode'] == 'cpu':
                                 runtime_identity = {
@@ -2132,6 +2266,7 @@ class ModelManager:
                             self.log_info("Llama init completed successfully.")
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
+                            self.llm = None
                             self.last_runtime_init_error = str(e)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)

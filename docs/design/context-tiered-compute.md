@@ -127,6 +127,8 @@ assignments, not universal claims about the hardware classes.
 
 The planning model is Llama 3.1 8B in a quantized GGUF runtime.
 
+For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model migration design](qwen3-api-v1-model-migration.md). That design preserves these tiers while adding Qwen-specific non-thinking and YaRN/RoPE requirements.
+
 - Quantized weights are approximately 5-6 GB, depending on the file and runtime
   representation.
 - A rough 64K f16 KV-cache estimate for this GQA model is about 8 GB before

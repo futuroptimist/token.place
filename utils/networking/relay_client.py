@@ -2235,7 +2235,11 @@ class RelayClient:
             getattr(type(self.model_manager), "supports_api_v1_model", None)
         )
         if callable(supports_api_v1_model) and manager_defines_supports_model:
-            return supports_api_v1_model(normalized_model) is True
+            requested_ids = self._api_v1_requested_model_ids(normalized_model)
+            return any(
+                supports_api_v1_model(requested_model_id) is True
+                for requested_model_id in requested_ids
+            )
 
         if getattr(self.model_manager, "use_mock_llm", False) is True:
             return True

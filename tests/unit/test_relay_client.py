@@ -2724,6 +2724,71 @@ class TestRelayClient:
         assert encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_resolves_alias_before_manager_support_hook(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Qwen runtimes should accept relay-scheduled compatibility alias payloads."""
+
+        class _Manager:
+            use_mock_llm = False
+
+            def supports_api_v1_model(self, model_id):
+                self.checked_model_ids.append(model_id)
+                return model_id == "qwen3-8b-instruct"
+
+            def __init__(self):
+                self.checked_model_ids = []
+                self.runtime = MagicMock()
+                self.runtime.create_chat_completion.return_value = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "alias ok",
+                            }
+                        }
+                    ]
+                }
+                self.runtime.apply_chat_template.side_effect = (
+                    lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                        f"<{message['role']}>{message['content']}" for message in messages
+                    ) + ("<assistant>" if add_generation_prompt else "")
+                )
+                self.runtime.tokenize.side_effect = (
+                    lambda payload, _add_bos=False: list(range(len(payload)))
+                )
+
+            def get_llm_instance(self):
+                return self.runtime
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-alias-model",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3.1-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert "qwen3-8b-instruct" in manager.checked_model_ids
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == "alias ok"
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_role_posts_invalid_request(
         self,
         mock_post,

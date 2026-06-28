@@ -102,6 +102,7 @@ class TestModelManager:
     def _mock_config_get(self, key, default=None):
         """Mock implementation of config.get()."""
         config_values = {
+            'model.profile_id': 'llama-3.1-8b-q4-k-m',
             'model.filename': 'test_model.gguf',
             'model.url': 'https://example.com/model.gguf',
             'model.download_chunk_size_mb': 1,
@@ -190,27 +191,29 @@ class TestModelManager:
         assert missing_metadata['exists'] is False
         assert missing_metadata['size_bytes'] is None
 
-    def test_default_model_artifact_metadata_remains_llama_profile(self):
-        """Unselected profiles should keep the existing Llama artifact defaults."""
+    def test_default_model_artifact_metadata_uses_qwen_profile(self):
+        """Unselected profiles should use the Qwen3 artifact defaults."""
         manager = self._build_manager_with_model_config({})
         metadata = manager.get_model_artifact_metadata()
 
-        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
-        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
-        assert metadata['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        assert metadata['url'] == (
-            'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
-            'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        )
-        assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
-        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['api_model_id'] == 'qwen3-8b-instruct'
+        assert metadata['profile_id'] == 'qwen3-8b-q4-k-m'
+        assert metadata['display_name'] == 'Qwen3 8B Instruct'
+        assert metadata['filename'] == 'Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
+        assert metadata['source_model'] == 'Qwen/Qwen3-8B'
+        assert metadata['gguf_repo'] == 'Qwen/Qwen3-8B-GGUF'
         assert metadata['quantization'] == 'Q4_K_M'
-        assert metadata['native_context_tokens'] == 8192
-        assert metadata['maximum_validated_context_tokens'] == 8192
-        assert metadata['supported_context_tiers'] == ['8k-fast']
+        assert metadata['license'] == 'apache-2.0'
+        assert metadata['native_context_tokens'] == 32768
+        assert metadata['maximum_validated_context_tokens'] == 65536
+        assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
+        assert metadata['chat_template_policy'] == 'gguf-jinja'
+        assert metadata['thinking_mode'] == 'disabled'
 
     def test_profile_artifacts_follow_selected_profile_when_defaults_are_seeded(self):
-        """Selecting a profile should replace seeded Llama artifact defaults."""
+        """Selecting a profile should preserve seeded Qwen artifact defaults."""
         from utils.config_schema import DEFAULT_CONFIG
 
         mock_config = MagicMock()
@@ -249,7 +252,7 @@ class TestModelManager:
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
-        """Selecting the Qwen API id should resolve the matching non-default profile."""
+        """Selecting the Qwen API id should resolve the matching default profile."""
         manager = self._build_manager_with_model_config({'model.api_model_id': 'qwen3-8b-instruct'})
         metadata = manager.get_model_artifact_metadata()
 
@@ -1282,6 +1285,7 @@ def standalone_model_manager(tmp_path):
 
     def _get(key, default=None):
         values = {
+            'model.profile_id': 'llama-3.1-8b-q4-k-m',
             'model.filename': 'test_model.gguf',
             'model.url': 'https://example.com/model.gguf',
             'model.download_chunk_size_mb': 1,
@@ -2044,6 +2048,7 @@ def test_no_signal_warm_load_uses_subprocess_facade(monkeypatch, tmp_path):
     config = MagicMock()
     config.is_production = False
     config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
         'model.filename': 'test_model.gguf',
         'model.url': 'https://example.com/model.gguf',
         'model.download_chunk_size_mb': 1,
@@ -3301,6 +3306,7 @@ class _RestartTestConfig:
 
     def get(self, key, default=None):
         values = {
+            'model.profile_id': 'llama-3.1-8b-q4-k-m',
             'model.filename': 'test_model.gguf',
             'model.url': 'https://example.com/model.gguf',
             'model.download_chunk_size_mb': 1,

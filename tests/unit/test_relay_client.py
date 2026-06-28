@@ -4423,6 +4423,101 @@ def test_api_v1_large_structurally_valid_message_uses_exact_tier_admission():
     assert sixty_four_k.runtime.calls[-1]["max_tokens"] == 5
 
 
+def test_qwen_context_admission_uses_non_thinking_template_kwargs():
+    from utils.llm.model_profiles import get_model_profile
+
+    class QwenRuntime:
+        def __init__(self):
+            self.template_calls = []
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=True):
+            self.template_calls.append(
+                {
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                    "enable_thinking": enable_thinking,
+                }
+            )
+            return "<|user|>hello<|assistant|>"
+
+        def tokenize(self, payload, *args, **kwargs):
+            return [1, 2, 3]
+
+        def create_chat_completion(self, **kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    manager = _ApiV1RuntimeManager()
+    manager.runtime = QwenRuntime()
+    manager.model_profile = get_model_profile("qwen3-8b-q4-k-m")
+    manager.api_model_id = "qwen3-8b-instruct"
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-template",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={},
+    )
+
+    assert "error" not in envelope["api_v1_response"]
+    assert manager.runtime.template_calls[-1]["enable_thinking"] is False
+
+
+def test_qwen_context_admission_does_not_use_llama_formatter_fallback():
+    from utils.llm.model_profiles import get_model_profile
+
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = get_model_profile("qwen3-8b-q4-k-m")
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.runtime.apply_chat_template.side_effect = TypeError("enable_thinking unsupported")
+    manager.runtime.chat_format = "llama-3"
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-no-llama-fallback",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    manager.runtime.create_chat_completion.assert_not_called()
+
+
+def test_qwen_runtime_completion_forces_non_thinking_and_rejects_think_output():
+    from utils.llm.model_profiles import get_model_profile
+
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = get_model_profile("qwen3-8b-q4-k-m")
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.runtime.apply_chat_template.side_effect = (
+        lambda messages, tokenize=False, add_generation_prompt=True, enable_thinking=False:
+        "".join(f"<{message['role']}>{message['content']}" for message in messages)
+        + ("<assistant>" if add_generation_prompt else "")
+    )
+    manager.runtime.create_chat_completion.return_value = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "<think>secret</think> visible"}}
+        ]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-think",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={},
+    )
+
+    kwargs = manager.runtime.create_chat_completion.call_args.kwargs
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["top_p"] == 0.8
+    assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+
+
 def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tokens():
     manager = _AdmissionManager(window=32, default_max_tokens=4)
     client = _api_v1_validation_client(manager)

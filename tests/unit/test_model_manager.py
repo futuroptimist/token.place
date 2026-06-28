@@ -245,7 +245,7 @@ class TestModelManager:
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
         assert metadata['native_context_tokens'] == 32768
-        assert metadata['maximum_validated_context_tokens'] == 131072
+        assert metadata['maximum_validated_context_tokens'] == 65536
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
@@ -1298,6 +1298,166 @@ def standalone_model_manager(tmp_path):
 
     mock_config.get.side_effect = _get
     return ModelManager(mock_config)
+
+
+def _qwen_model_manager(tmp_path, *, context_size=8192, context_tier="8k-fast"):
+    from utils.context_profiles import apply_context_profile
+
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    model_file = tmp_path / 'Qwen3-8B-Q4_K_M.gguf'
+    model_file.write_bytes(b'fake model data')
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.download_chunk_size_mb': 1,
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': context_size,
+        'model.chat_format': 'llama-3',
+        'model.n_gpu_layers': 0,
+        'model.hybrid_n_gpu_layers': 24,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': False,
+    }
+
+    def _get(key, default=None):
+        return values.get(key, default)
+
+    def _set(key, value):
+        values[key] = value
+
+    mock_config.get.side_effect = _get
+    mock_config.set.side_effect = _set
+    manager = ModelManager(mock_config)
+    apply_context_profile(manager, context_tier)
+    if context_size != manager.config.get('model.context_size'):
+        manager.config.set('model.context_size', context_size)
+        manager.context_window_tokens = context_size
+    manager.requested_compute_mode = 'cpu'
+    return manager
+
+
+def test_qwen_runtime_init_omits_llama_chat_format_for_gguf_template(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    captured = {}
+
+    class FakeLlama:
+        def __init__(self, *, model_path, n_gpu_layers, n_ctx, verbose):
+            captured.update({
+                'model_path': model_path,
+                'n_gpu_layers': n_gpu_layers,
+                'n_ctx': n_ctx,
+                'verbose': verbose,
+            })
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: SimpleNamespace(Llama=FakeLlama, __file__='/site/llama_cpp/__init__.py'),
+    )
+    manager = _qwen_model_manager(tmp_path)
+
+    assert manager.get_llm_instance() is not None
+    assert 'chat_format' not in captured
+    assert captured['n_ctx'] == 8192
+    assert manager.last_compute_diagnostics['chat_template_mode'] == 'gguf-jinja'
+    assert manager.last_compute_diagnostics['thinking_mode_disabled'] is True
+    assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
+
+
+def test_qwen_64k_runtime_init_enables_yarn_rope_kwargs(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    captured = {}
+
+    class FakeLlama:
+        def __init__(
+            self,
+            *,
+            model_path,
+            n_gpu_layers,
+            n_ctx,
+            verbose,
+            rope_scaling_type,
+            rope_freq_scale,
+            yarn_ext_factor,
+            yarn_orig_ctx,
+        ):
+            captured.update({
+                'model_path': model_path,
+                'n_gpu_layers': n_gpu_layers,
+                'n_ctx': n_ctx,
+                'verbose': verbose,
+                'rope_scaling_type': rope_scaling_type,
+                'rope_freq_scale': rope_freq_scale,
+                'yarn_ext_factor': yarn_ext_factor,
+                'yarn_orig_ctx': yarn_orig_ctx,
+            })
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: SimpleNamespace(
+            Llama=FakeLlama,
+            LLAMA_ROPE_SCALING_TYPE_YARN=2,
+            __file__='/site/llama_cpp/__init__.py',
+        ),
+    )
+    manager = _qwen_model_manager(tmp_path, context_size=65536, context_tier='64k-full')
+
+    assert manager.get_llm_instance() is not None
+    assert captured['rope_scaling_type'] == 2
+    assert captured['rope_freq_scale'] == 0.5
+    assert captured['yarn_ext_factor'] == 2.0
+    assert captured['yarn_orig_ctx'] == 32768
+    assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
+    assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
+    assert manager.last_compute_diagnostics['yarn_original_context'] == 32768
+
+
+def test_qwen_64k_runtime_init_fails_when_yarn_kwargs_unsupported(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, *, model_path, n_gpu_layers, n_ctx, verbose):
+            _ = (model_path, n_gpu_layers, n_ctx, verbose)
+            raise AssertionError("unsupported runtime must fail before construction")
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: SimpleNamespace(
+            Llama=FakeLlama,
+            LLAMA_ROPE_SCALING_TYPE_YARN=2,
+            __file__='/site/llama_cpp/__init__.py',
+        ),
+    )
+    manager = _qwen_model_manager(tmp_path, context_size=65536, context_tier='64k-full')
+
+    assert manager.get_llm_instance() is None
+    assert 'Qwen 64K context requires llama-cpp-python YaRN/RoPE init kwargs' in manager.last_runtime_init_error
+
+
+def test_llama_runtime_init_keeps_existing_chat_format(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    captured = {}
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: SimpleNamespace(Llama=FakeLlama, __file__='/site/llama_cpp/__init__.py'),
+    )
+    standalone_model_manager.requested_compute_mode = 'cpu'
+
+    assert standalone_model_manager.get_llm_instance() is not None
+    assert captured['chat_format'] == 'llama-3'
+    assert 'rope_scaling_type' not in captured
 
 
 def test_get_llm_instance_records_bounded_runtime_discovery_timeout(standalone_model_manager):

@@ -8,6 +8,7 @@ from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib
+import inspect
 import subprocess
 import queue
 import signal
@@ -20,12 +21,14 @@ from typing import Dict, List, Any, Optional, Iterable
 
 from utils.system import resource_monitor
 from utils.llm.model_profiles import get_model_profile, resolve_profile_id
+from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile
 
 # Configure logging
 logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+QWEN3_8B_PROFILE_ID = "qwen3-8b-q4-k-m"
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -1802,6 +1805,98 @@ class ModelManager:
             return profile_value
         return configured_value
 
+    def _is_qwen_profile(self) -> bool:
+        return self.profile_id == QWEN3_8B_PROFILE_ID or self.model_profile.get('provider') == 'qwen'
+
+    @staticmethod
+    def _callable_accepts_kwargs(callable_obj: Any, required_kwargs: Iterable[str]) -> bool:
+        """Return whether a callable advertises support for all required kwargs.
+
+        llama-cpp-python exposes YaRN/RoPE controls as explicit ``Llama`` init
+        kwargs on supported releases.  We accept a ``**kwargs`` signature as
+        supported because some test fakes and wrapper classes preserve runtime
+        validation behind a variadic Python signature; otherwise every required
+        kwarg must be present so unsupported YaRN never gets silently guessed.
+        """
+
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            return True
+        return all(name in parameters for name in required_kwargs)
+
+    def _qwen_runtime_init_kwargs(self, Llama: Any, llama_cpp: Any) -> Dict[str, Any]:
+        """Build Qwen-specific llama.cpp init kwargs after capability checks."""
+
+        if not self._is_qwen_profile():
+            return {}
+
+        policy = self.model_profile.get('chat_template_policy')
+        if policy != 'gguf-jinja':
+            raise RuntimeError(f"unsupported Qwen chat template policy: {policy}")
+
+        # Verified implementation choice:
+        # - Qwen must not set ``chat_format='llama-3'``. Omitting chat_format lets
+        #   llama-cpp-python use the GGUF/Jinja chat template embedded in Qwen GGUFs.
+        # - Context admission calls ``apply_chat_template(..., enable_thinking=False)``
+        #   through the same runtime surface used by generation.
+        kwargs: Dict[str, Any] = {}
+        active_tier = getattr(self, 'context_tier', DEFAULT_CONTEXT_TIER)
+        context_tokens = int(self.config.get('model.context_size', 8192) or 8192)
+        native_tokens = int(self.model_profile.get('native_context_tokens') or 0)
+        rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+        required_tier = rope_policy.get('required_for_tier')
+        requires_extension = (
+            required_tier == active_tier
+            and native_tokens > 0
+            and context_tokens > native_tokens
+        )
+        if not requires_extension:
+            return kwargs
+
+        yarn_scaling_type = getattr(llama_cpp, 'LLAMA_ROPE_SCALING_TYPE_YARN', None)
+        if yarn_scaling_type is None:
+            raise RuntimeError(
+                "Qwen 64K context requires llama-cpp-python LLAMA_ROPE_SCALING_TYPE_YARN support"
+            )
+        factor = float(rope_policy.get('factor', 1.0))
+        rope_kwargs = {
+            'rope_scaling_type': yarn_scaling_type,
+            'rope_freq_scale': 1.0 / factor,
+            'yarn_ext_factor': factor,
+            'yarn_orig_ctx': int(rope_policy.get('original_context_tokens') or native_tokens),
+        }
+        required_kwargs = tuple(rope_kwargs)
+        if not self._callable_accepts_kwargs(Llama, required_kwargs):
+            raise RuntimeError(
+                "Qwen 64K context requires llama-cpp-python YaRN/RoPE init kwargs "
+                f"{sorted(required_kwargs)}, but this runtime does not advertise them"
+            )
+        return rope_kwargs
+
+    def _runtime_init_diagnostics(self, *, init_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+        rope_enabled = bool(rope_policy.get('type') == 'yarn' and 'rope_scaling_type' in init_kwargs)
+        return {
+            'model_profile_id': self.profile_id,
+            'api_model_id': self.api_model_id,
+            'gguf_filename': self.file_name,
+            'quantization': self.model_profile.get('quantization'),
+            'chat_template_mode': self.model_profile.get('chat_template_policy'),
+            'thinking_mode_disabled': self.model_profile.get('thinking_mode') == 'disabled',
+            'n_ctx': self.config.get('model.context_size', 8192),
+            'native_context_tokens': self.model_profile.get('native_context_tokens'),
+            'maximum_validated_context_tokens': (
+                get_context_profile(getattr(self, 'context_tier', DEFAULT_CONTEXT_TIER)).total_context_tokens
+            ),
+            'rope_yarn_enabled': rope_enabled,
+            'rope_yarn_factor': rope_policy.get('factor') if rope_enabled else None,
+            'yarn_original_context': rope_policy.get('original_context_tokens') if rope_enabled else None,
+        }
+
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
         file_exists = os.path.exists(self.model_path)
@@ -2083,13 +2178,33 @@ class ModelManager:
 
                             self.log_info(f"About to instantiate Llama model from {self.model_path}...")
                             self.log_info(f"Llama init started for {self.model_path}.")
-                            self.llm = Llama(
-                                model_path=self.model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3'),
-                                verbose=llama_cpp_verbose_logging_enabled(),
+                            init_kwargs: Dict[str, Any] = {
+                                'model_path': self.model_path,
+                                'n_gpu_layers': n_gpu_layers,
+                                'n_ctx': self.config.get('model.context_size', 8192),
+                                'verbose': llama_cpp_verbose_logging_enabled(),
+                            }
+                            if self._is_qwen_profile():
+                                init_kwargs.update(self._qwen_runtime_init_kwargs(Llama, llama_cpp))
+                            else:
+                                init_kwargs['chat_format'] = self.config.get('model.chat_format', 'llama-3')
+                            runtime_model_diagnostics = self._runtime_init_diagnostics(init_kwargs=init_kwargs)
+                            self.log_info(
+                                "llm.runtime_profile "
+                                f"model_profile_id={runtime_model_diagnostics['model_profile_id']} "
+                                f"api_model_id={runtime_model_diagnostics['api_model_id']} "
+                                f"gguf_filename={runtime_model_diagnostics['gguf_filename']} "
+                                f"quantization={runtime_model_diagnostics['quantization']} "
+                                f"chat_template_mode={runtime_model_diagnostics['chat_template_mode']} "
+                                f"thinking_mode_disabled={runtime_model_diagnostics['thinking_mode_disabled']} "
+                                f"n_ctx={runtime_model_diagnostics['n_ctx']} "
+                                f"native_context_tokens={runtime_model_diagnostics['native_context_tokens']} "
+                                f"maximum_validated_context_tokens={runtime_model_diagnostics['maximum_validated_context_tokens']} "
+                                f"rope_yarn_enabled={runtime_model_diagnostics['rope_yarn_enabled']} "
+                                f"rope_yarn_factor={runtime_model_diagnostics['rope_yarn_factor']} "
+                                f"yarn_original_context={runtime_model_diagnostics['yarn_original_context']}"
                             )
+                            self.llm = Llama(**init_kwargs)
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
                             compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)
@@ -2103,6 +2218,7 @@ class ModelManager:
                             )
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
+                            compute_plan.update(runtime_model_diagnostics)
                             self.last_compute_diagnostics = compute_plan
                             if compute_plan['requested_mode'] == 'cpu':
                                 runtime_identity = {

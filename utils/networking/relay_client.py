@@ -21,10 +21,13 @@ from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
 from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
+from utils.llm.model_profiles import get_model_profile, resolve_profile_id
 
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+QWEN3_8B_PROFILE_ID = "qwen3-8b-q4-k-m"
+_API_V1_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE + re.DOTALL)
 
 
 class _ApiV1ChatValidationResult(NamedTuple):
@@ -2457,17 +2460,40 @@ class RelayClient:
             return None
         return None
 
-    @staticmethod
-    def _api_v1_render_chat_prompt(llm_instance: Any, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def _active_model_profile(self) -> Dict[str, Any]:
+        manager = getattr(self, "model_manager", None)
+        profile = getattr(manager, "model_profile", None)
+        if isinstance(profile, dict):
+            return profile
+        config = getattr(manager, "config", None)
+        config_get = getattr(config, "get", None)
+        profile_id = None
+        api_model_id = None
+        if callable(config_get):
+            profile_id = config_get("model.profile_id", None)
+            api_model_id = config_get("model.api_model_id", None)
+        return get_model_profile(resolve_profile_id(profile_id, api_model_id)) or {}
+
+    def _active_model_is_qwen(self) -> bool:
+        profile = self._active_model_profile()
+        return profile.get("profile_id") == QWEN3_8B_PROFILE_ID or profile.get("provider") == "qwen"
+
+    def _qwen_non_thinking_template_kwargs(self) -> Dict[str, Any]:
+        return {"enable_thinking": False} if self._active_model_is_qwen() else {}
+
+    def _api_v1_render_chat_prompt(self, llm_instance: Any, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
 
         apply_chat_template = getattr(llm_instance, "apply_chat_template", None)
+        template_kwargs = self._qwen_non_thinking_template_kwargs()
         if callable(apply_chat_template):
             try:
                 rendered = apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=True, **template_kwargs
                 )
             except TypeError:
+                if template_kwargs:
+                    return None
                 try:
                     rendered = apply_chat_template(messages)
                 except Exception:
@@ -2487,12 +2513,21 @@ class RelayClient:
             if callable(tokenizer_template):
                 try:
                     rendered = tokenizer_template(
-                        messages, tokenize=False, add_generation_prompt=True
+                        messages, tokenize=False, add_generation_prompt=True, **template_kwargs
                     )
+                except TypeError:
+                    if template_kwargs:
+                        rendered = None
+                    else:
+                        raise
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
                     return rendered
+        if self._active_model_is_qwen():
+            # Qwen must use its GGUF/Jinja template.  The llama-cpp chat-format
+            # fallback below only exists to preserve legacy Llama admission.
+            return None
         try:
             if not hasattr(llm_instance, "chat_format"):
                 return None
@@ -2721,6 +2756,15 @@ class RelayClient:
             "stop": configured("model.stop_tokens", []),
             "stream": False,
         }
+        profile_defaults = self._active_model_profile().get("generation_defaults") or {}
+        if self._active_model_is_qwen():
+            for key in ("temperature", "top_p"):
+                if key in profile_defaults:
+                    completion_kwargs[key] = profile_defaults[key]
+            # llama-cpp-python forwards chat_template_kwargs to the Jinja/GGUF
+            # template renderer; for Qwen3 this is the verified non-thinking
+            # control and keeps generation aligned with context admission.
+            completion_kwargs["chat_template_kwargs"] = self._qwen_non_thinking_template_kwargs()
         completion_kwargs.update(safe_options)
         return completion_kwargs
 
@@ -2735,9 +2779,18 @@ class RelayClient:
             and completion["choices"]
             and isinstance(completion["choices"][0], dict)
         ):
-            return self._valid_api_v1_assistant_message(
+            assistant = self._valid_api_v1_assistant_message(
                 completion["choices"][0].get("message")
             )
+            if assistant is None:
+                return None
+            content = assistant.get("content")
+            if isinstance(content, str) and _API_V1_THINK_BLOCK_RE.search(content):
+                # Fail closed rather than stripping so hidden reasoning is never
+                # leaked or silently transformed for API v1 clients.
+                log_error("Desktop runtime returned Qwen thinking content; rejecting assistant output")
+                return None
+            return assistant
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
         # a complete chat completion object for this path.

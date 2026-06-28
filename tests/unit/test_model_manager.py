@@ -245,7 +245,7 @@ class TestModelManager:
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
         assert metadata['native_context_tokens'] == 32768
-        assert metadata['maximum_validated_context_tokens'] == 131072
+        assert metadata['maximum_validated_context_tokens'] == 65536
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
@@ -4023,11 +4023,16 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
     manager = ModelManager(config)
     Path(manager.model_path).write_text('fake')
 
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return '<qwen>'
+
     class FakeLlama:
         def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
             self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
-            return '<qwen>'
+
+        def tokenizer(self):
+            return FakeTokenizer()
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
@@ -4158,13 +4163,20 @@ def test_qwen_validation_failure_does_not_cache_invalid_llm(tmp_path):
     manager = ModelManager(config)
     Path(manager.model_path).write_text('fake')
 
+    constructed = []
+
     class FakeLlama:
         def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
-            pass
+            constructed.append(self)
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
         assert manager.get_llm_instance() is None
+        assert manager.llm is None
+        first_failed = constructed[0]
+        assert manager.get_llm_instance() is None
 
+    assert len(constructed) == 2
     assert manager.llm is None
+    assert manager.llm is not first_failed
     assert 'Qwen runtime requires GGUF/Jinja apply_chat_template support' in manager.last_runtime_init_error

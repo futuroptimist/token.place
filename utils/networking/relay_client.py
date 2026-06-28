@@ -2906,12 +2906,13 @@ class RelayClient:
             model_profile.get("provider") == "qwen"
             and model_profile.get("thinking_mode") == "disabled"
         ):
-            # Use both supported controls for Qwen3: llama-cpp-python's
-            # apply_chat_template(enable_thinking=False) is used for exact context
-            # admission, while create_chat_completion renders internally, so we
-            # also inject Qwen's documented /no_think control into the user turn
-            # before both admission and generation.  Output validation below still
-            # fails closed if a runtime returns a <think> block.
+            # Use Qwen's documented /no_think message-level control before
+            # both admission and generation.  llama-cpp-python's
+            # create_chat_completion does not expose template kwargs, so admission
+            # intentionally renders the same message shape instead of adding an
+            # admission-only enable_thinking=False assistant prefix.  Output
+            # validation below still fails closed if a runtime returns a <think>
+            # block.
             runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None

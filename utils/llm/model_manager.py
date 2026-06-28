@@ -2205,11 +2205,6 @@ class ModelManager:
                                             'Qwen runtime requires GGUF/Jinja apply_chat_template support; '
                                             'refusing to run with a Llama fallback template'
                                         )
-                                if self._qwen_non_thinking_required() and not self._apply_chat_template_accepts(llm_instance, 'enable_thinking'):
-                                    raise RuntimeError(
-                                        'Qwen runtime requires apply_chat_template(enable_thinking=False) '
-                                        'for API v1 non-thinking mode'
-                                    )
                             self.llm = llm_instance
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
@@ -2271,6 +2266,7 @@ class ModelManager:
                             self.log_info("Llama init completed successfully.")
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
+                            self.llm = None
                             self.last_runtime_init_error = str(e)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)

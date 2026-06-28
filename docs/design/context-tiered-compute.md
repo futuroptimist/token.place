@@ -5,6 +5,9 @@ normative for planned static context tiers, desktop operator selection,
 capability registration, exact admission control, and tier-aware relay
 scheduling.
 
+
+> Follow-up model-family migration: [Qwen3 8B Q4_K_M API v1 model migration](qwen3-api-v1-model-migration.md) defines the planned P23 Llama-to-Qwen swap while preserving these context-tier and relay-blind API v1 invariants.
+
 ## Scope and non-goals
 
 ### In scope

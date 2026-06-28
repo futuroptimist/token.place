@@ -10,6 +10,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from utils.llm.model_profiles import (
+    CANONICAL_API_V1_MODEL_ID,
+    build_model_aliases,
+    iter_model_profiles,
+)
+
 try:
     import llama_cpp as _llama_cpp_module
     from llama_cpp import Llama as _llama_runtime
@@ -103,42 +109,42 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
-CANONICAL_LAUNCH_MODEL_ID = "llama-3.1-8b-instruct"
+CANONICAL_LAUNCH_MODEL_ID = CANONICAL_API_V1_MODEL_ID
 
-MODEL_ALIASES: Dict[str, str] = {
-    # Invisible compatibility aliases that route to the fixed Meta Llama 3.1
-    # 8B launch backend. They are accepted by request paths but are not listed
-    # as first-class API v1 models.
-    "llama-3-8b-instruct": CANONICAL_LAUNCH_MODEL_ID,
-    "gpt-3.5-turbo": CANONICAL_LAUNCH_MODEL_ID,
-    "gpt-5-chat-latest": CANONICAL_LAUNCH_MODEL_ID,
-}
+MODEL_ALIASES: Dict[str, str] = build_model_aliases()
 
 
-AVAILABLE_MODELS = [
-    {
-        "id": CANONICAL_LAUNCH_MODEL_ID,
-        "name": "Meta Llama 3.1 8B Instruct",
-        "description": (
-            "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
-            "Q4_K_M quantisation that comfortably fits within a 24 GB RTX 4090."
-        ),
-        "owner": "Meta",
-        "owned_by": "Meta",
-        "provider": "meta",
-        "source_model": "meta-llama/Llama-3.1-8B-Instruct",
-        "parameters": "8B",
-        "quantization": "Q4_K_M",
-        "context_length": 8192,
-        "url": (
-            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
-            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        ),
-        "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+def _profile_to_catalog_entry(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a centralized model profile into the legacy API v1 catalog shape."""
+
+    return {
+        "id": profile["api_model_id"],
+        "profile_id": profile["profile_id"],
+        "name": profile["display_name"],
+        "display_name": profile["display_name"],
+        "description": profile["description"],
+        "owner": profile["owner"],
+        "owned_by": profile["owner"],
+        "provider": profile["provider"],
+        "source_model": profile["source_model"],
+        "parameters": profile["parameters"],
+        "quantization": profile["quantization"],
+        "license": profile.get("license"),
+        "gguf_repo": profile.get("gguf_repo"),
+        "context_length": profile["default_context_tokens"],
+        "native_context_tokens": profile["native_context_tokens"],
+        "maximum_validated_context_tokens": profile["maximum_validated_context_tokens"],
+        "supported_context_tiers": profile["supported_context_tiers"],
+        "chat_template_policy": profile["chat_template_policy"],
+        "thinking_mode": profile["thinking_mode"],
+        "runnable": profile.get("runnable", False),
+        "url": profile["download_url"],
+        "file_name": profile["filename"],
         "adapters": [],
     }
-]
 
+
+AVAILABLE_MODELS = [_profile_to_catalog_entry(profile) for profile in iter_model_profiles(public_only=True)]
 
 # Dictionary mapping model IDs to loaded model instances
 _loaded_models = {}

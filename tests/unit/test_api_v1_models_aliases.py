@@ -2,6 +2,7 @@
 
 import importlib
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -14,7 +15,12 @@ def _reload_models(env=None):
 
     # Ensure the module is reloaded under the patched environment and dependencies.
     fake_llama_module = MagicMock()
-    with patch.dict("sys.modules", {"llama_cpp": fake_llama_module}):
+    fake_routes_module = SimpleNamespace(bp=MagicMock())
+    with patch.dict("sys.modules", {
+        "llama_cpp": fake_llama_module,
+        "api.v1.routes": fake_routes_module,
+        "api.v2.routes": fake_routes_module,
+    }):
         with patch.dict(os.environ, env_vars, clear=True):
             import api.v1.models as models
             importlib.reload(models)

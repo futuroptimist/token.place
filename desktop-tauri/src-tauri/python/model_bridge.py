@@ -22,6 +22,8 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__)
 from pathlib import Path
 
+from utils.llm.model_profiles import get_default_model_profile
+
 try:
     from desktop_runtime_setup import ensure_desktop_python_dependencies
 except ModuleNotFoundError:
@@ -65,26 +67,42 @@ def _fallback_model_metadata() -> Dict[str, Any]:
     if models_dir_override:
         models_dir = Path(models_dir_override)
 
+    profile = get_default_model_profile()
     canonical_family_url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL",
-        "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
+        profile["canonical_family_url"],
     )
     filename = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_FILENAME",
-        "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        profile["filename"],
     )
     url = os.environ.get(
         "TOKEN_PLACE_DEFAULT_MODEL_URL",
-        "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        profile["download_url"],
     )
     resolved_model_path = models_dir / filename
     exists = resolved_model_path.exists()
     size_bytes = resolved_model_path.stat().st_size if exists else None
 
     return {
+        "api_model_id": profile["api_model_id"],
+        "active_api_model_id": profile["api_model_id"],
+        "profile_id": profile["profile_id"],
+        "active_profile_id": profile["profile_id"],
+        "display_name": profile["display_name"],
         "canonical_family_url": canonical_family_url,
         "filename": filename,
         "url": url,
+        "download_url": url,
+        "gguf_repo": profile.get("gguf_repo"),
+        "source_model": profile.get("source_model"),
+        "quantization": profile.get("quantization"),
+        "license": profile.get("license"),
+        "native_context_tokens": profile.get("native_context_tokens"),
+        "maximum_validated_context_tokens": profile.get("maximum_validated_context_tokens"),
+        "supported_context_tiers": profile.get("supported_context_tiers"),
+        "chat_template_policy": profile.get("chat_template_policy"),
+        "thinking_mode": profile.get("thinking_mode"),
         "models_dir": str(models_dir),
         "resolved_model_path": str(resolved_model_path),
         "exists": exists,

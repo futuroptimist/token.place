@@ -148,7 +148,7 @@ Run these checks against staging before production promotion:
 - [ ] `GET /healthz` returns healthy JSON (`status: ok`) and no unexpected degraded details.
 - [ ] `GET /relay/diagnostics` reports the live compute-node count accurately, including
       `total_api_v1_registered_compute_nodes`.
-- [ ] `GET /api/v1/models` returns exactly one public model: `llama-3.1-8b-instruct`.
+- [ ] `GET /api/v1/models` returns exactly one public model: `qwen3-8b-instruct`.
 - [ ] The landing page model dropdown has exactly one model.
 - [ ] The landing UI does not show `owned by token.place`.
 - [ ] Two compute nodes round-robin across new browser clients.
@@ -171,7 +171,7 @@ promotion complete:
 - [ ] `GET /healthz` returns healthy JSON (`status: ok`) and no unexpected degraded details.
 - [ ] `GET /relay/diagnostics` reports the live compute-node count accurately, including
       `total_api_v1_registered_compute_nodes`.
-- [ ] `GET /api/v1/models` returns exactly one public model: `llama-3.1-8b-instruct`.
+- [ ] `GET /api/v1/models` returns exactly one public model: `qwen3-8b-instruct`.
 - [ ] The landing page model dropdown has exactly one model.
 - [ ] The landing UI does not show `owned by token.place`.
 - [ ] Two compute nodes round-robin across new browser clients.
@@ -189,7 +189,7 @@ promotion complete:
 ## Multi-relay desktop validation
 
 For v0.1.x, one desktop compute node can serve both production and staging because API v1 exposes a
-single model, `llama-3.1-8b-instruct`, and the desktop runtime reuses one warmed llama.cpp runtime
+single model, `qwen3-8b-instruct`, and the desktop runtime reuses one warmed llama.cpp runtime
 while polling each configured relay. Validate simultaneous prod+staging registration before closing
 the release:
 
@@ -263,3 +263,12 @@ Browser-only checklist items such as dropdown count, missing owner text, no full
 DOM, no landing-chat `/api/v2` calls, no landing-chat `/api/v1/chat/completions` calls, sticky
 routing, two-node round-robin, and automatic history-preserving failover still require the Playwright
 or manual browser evidence listed above.
+
+### API v1 Qwen3 rollback note
+
+The active token.place API v1 default model is `qwen3-8b-instruct` backed by the
+`qwen3-8b-q4-k-m` profile (`Qwen3-8B-Q4_K_M.gguf`). If staging must roll back,
+operators can select the preserved Llama profile/config (`llama-3.1-8b-q4-k-m`)
+and DSPACE clients can temporarily continue sending the old Llama API model id;
+token.place resolves that compatibility alias to the active API v1 model during
+this transition.

@@ -1937,8 +1937,8 @@ class TestRelayClient:
         mock_model_manager.use_mock_llm = False
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -1991,8 +1991,8 @@ class TestRelayClient:
         mock_model_manager.use_mock_llm = False
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2056,8 +2056,8 @@ class TestRelayClient:
         mock_model_manager.use_mock_llm = False
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2425,8 +2425,8 @@ class TestRelayClient:
         mock_model_manager.use_mock_llm = False
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2577,8 +2577,8 @@ class TestRelayClient:
         mock_model_manager.use_mock_llm = False
         mock_model_manager.api_model_id = None
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -3075,8 +3075,8 @@ class TestRelayClient:
             use_mock_llm = False
             api_model_id = None
             model_id = None
-            file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-            model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+            file_name = "Qwen3-8B-Q4_K_M.gguf"
+            model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
 
             def __init__(self):
                 self.config = _Config()

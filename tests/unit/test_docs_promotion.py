@@ -16,7 +16,7 @@ def test_production_promotion_checklist_captures_0_1_0_smoke_risks() -> None:
         "`GET /livez` returns healthy JSON (`status: alive`)",
         "`GET /healthz` returns healthy JSON (`status: ok`)",
         "`GET /relay/diagnostics` reports the live compute-node count accurately",
-        "`GET /api/v1/models` returns exactly one public model: `llama-3.1-8b-instruct`",
+        "`GET /api/v1/models` returns exactly one public model: `qwen3-8b-instruct`",
         "landing page model dropdown has exactly one model",
         "landing UI does not show `owned by token.place`",
         "Two compute nodes round-robin across new browser clients",
@@ -54,7 +54,7 @@ def test_testing_guide_links_promotion_smoke_helper_and_offline_default() -> Non
     text = TESTING_DOC.read_text(encoding="utf-8")
     required = (
         "[PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md)",
-        "`llama-3.1-8b-instruct` as the only public\nmodel",
+        "`qwen3-8b-instruct` as the only public\nmodel",
         "absence of `owned by token.place`",
         "automatic\nhistory-preserving failover",
         "RUN_PROMOTION_SMOKE=1",

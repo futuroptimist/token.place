@@ -361,7 +361,7 @@ The repeatable 0.1.x staging-to-production checklist lives in
 [PRODUCTION_PROMOTION.md](PRODUCTION_PROMOTION.md). It preserves the historical v0.1.0 API v1
 launch contract while adding evergreen v0.1.1 release validation for the environment/version badge
 and desktop multi-relay prod+staging operation. It covers API v1 model identity
-(`llama-3.1-8b-instruct` as the only public
+(`qwen3-8b-instruct` as the only public
 model), landing dropdown count, absence of `owned by token.place`, live
 compute-node diagnostics, desktop registered-count status for `https://token.place` plus
 `https://staging.token.place`, two-node round-robin, sticky server routing, automatic

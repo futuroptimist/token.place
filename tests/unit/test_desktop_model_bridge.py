@@ -374,12 +374,12 @@ def test_fallback_model_metadata_reports_llama_profile_by_default(monkeypatch):
 
     payload = model_bridge._fallback_model_metadata()
 
-    assert payload['api_model_id'] == 'llama-3.1-8b-instruct'
-    assert payload['profile_id'] == 'llama-3.1-8b-q4-k-m'
-    assert payload['display_name'] == 'Meta Llama 3.1 8B Instruct'
-    assert payload['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-    assert payload['url'].endswith('/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf')
-    assert payload['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+    assert payload['api_model_id'] == 'qwen3-8b-instruct'
+    assert payload['profile_id'] == 'qwen3-8b-q4-k-m'
+    assert payload['display_name'] == 'Qwen3 8B Instruct'
+    assert payload['filename'] == 'Qwen3-8B-Q4_K_M.gguf'
+    assert payload['url'].endswith('/Qwen3-8B-Q4_K_M.gguf')
+    assert payload['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
 
 
 def test_fallback_model_metadata_preserves_model_env_overrides(monkeypatch):
@@ -390,7 +390,7 @@ def test_fallback_model_metadata_preserves_model_env_overrides(monkeypatch):
 
     payload = model_bridge._fallback_model_metadata()
 
-    assert payload['profile_id'] == 'llama-3.1-8b-q4-k-m'
+    assert payload['profile_id'] == 'qwen3-8b-q4-k-m'
     assert payload['filename'] == 'override.gguf'
     assert payload['url'] == 'https://example.com/override.gguf'
     assert payload['canonical_family_url'] == 'https://example.com/family'

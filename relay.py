@@ -520,8 +520,22 @@ API_V1_MAX_QUEUE_DEPTH_ENV = "TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_NODE"
 DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
-DEFAULT_MODEL_IDS = ["llama-3.1-8b-instruct", "llama-3-8b-instruct"]
+DEFAULT_MODEL_IDS = ["qwen3-8b-instruct"]
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
+
+API_V1_MODEL_ALIASES = {
+    "llama-3.1-8b-instruct": "qwen3-8b-instruct",
+    "llama-3-8b-instruct": "qwen3-8b-instruct",
+    "gpt-3.5-turbo": "qwen3-8b-instruct",
+    "gpt-5-chat-latest": "qwen3-8b-instruct",
+}
+
+
+def _resolve_api_v1_requested_model(model: str | None) -> str | None:
+    requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
+    if requested_model is None:
+        return None
+    return API_V1_MODEL_ALIASES.get(requested_model, requested_model)
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -1254,7 +1268,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
     """Select an API v1 node by smallest capable tier, then least load, then RR tie-break."""
 
     global server_round_robin_next_index
-    requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
+    requested_model = _resolve_api_v1_requested_model(model)
     now_monotonic = time.monotonic()
     with server_round_robin_lock:
         all_api_v1_keys = _api_v1_round_robin_keys()

@@ -219,7 +219,7 @@ def test_stream_chat_completion_yields_chunks(mock_post):
     mock_post.assert_called_with(
         'https://stream.test/api/v1/chat/completions',
         json={
-            'model': 'llama-3-8b-instruct',
+            'model': 'qwen3-8b-instruct',
             'messages': messages,
             'stream': True,
         },

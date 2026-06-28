@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 from typing import Dict, List, Any, Optional, Iterable
 
 from utils.system import resource_monitor
+from utils.llm.model_profiles import get_active_model_profile
 
 # Configure logging
 logger = logging.getLogger('model_manager')
@@ -1557,20 +1558,16 @@ class ModelManager:
 
         self.config = config
 
-        # Llama model configuration
-        self.file_name = config.get(
-            'model.filename', 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        )
-        self.url = config.get(
-            'model.url',
-            (
-                'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
-                'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-            ),
-        )
+        # Model artifact configuration sourced from the active profile.
+        self.model_profile = get_active_model_profile(config)
+        self.profile_id = config.get('model.profile_id', self.model_profile.profile_id)
+        self.api_model_id = config.get('model.api_model_id', self.model_profile.api_model_id)
+        self.display_name = self.model_profile.display_name
+        self.file_name = config.get('model.filename', self.model_profile.filename)
+        self.url = config.get('model.url', self.model_profile.download_url)
         self.canonical_family_url = config.get(
             'model.canonical_family_url',
-            'https://huggingface.co/meta-llama/Meta-Llama-3-8B',
+            self.model_profile.canonical_family_url,
         )
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
         # Network timeout for model downloads (seconds)
@@ -1792,9 +1789,19 @@ class ModelManager:
         """Return runtime model metadata used by server and desktop bridges."""
         file_exists = os.path.exists(self.model_path)
         return {
+            'api_model_id': self.api_model_id,
+            'profile_id': self.profile_id,
+            'display_name': self.display_name,
             'canonical_family_url': self.canonical_family_url,
             'filename': self.file_name,
             'url': self.url,
+            'gguf_repo': self.model_profile.gguf_repo,
+            'source_model': self.model_profile.source_model,
+            'quantization': self.model_profile.quantization,
+            'license': self.model_profile.license,
+            'native_context_tokens': self.model_profile.native_context_tokens,
+            'maximum_validated_context_tokens': self.model_profile.maximum_validated_context_tokens,
+            'supported_context_tiers': list(self.model_profile.supported_context_tiers),
             'models_dir': self.models_dir,
             'resolved_model_path': self.model_path,
             'exists': file_exists,

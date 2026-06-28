@@ -265,6 +265,10 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     (python_dir / 'requirements_desktop_runtime.txt').write_text('psutil==7.1.0\nrequests==2.32.5\npython-dotenv==1.1.1\ncryptography==46.0.1\n', encoding='utf-8')
     (import_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / 'model_profiles.py').write_text(
+        Path('utils/llm/model_profiles.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
     (utils_llm_dir / 'model_manager.py').write_text(
         """
 class _Manager:

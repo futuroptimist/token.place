@@ -252,6 +252,7 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     resources_dir = tmp_path / 'bin' / 'resources'
     import_root = resources_dir / '_up_' / '_up_'
     utils_llm_dir = import_root / 'utils' / 'llm'
+    model_profiles_path = MODULE_PATH.parents[3] / 'utils' / 'llm' / 'model_profiles.py'
     python_dir.mkdir(parents=True)
     utils_llm_dir.mkdir(parents=True)
 
@@ -265,6 +266,7 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     (python_dir / 'requirements_desktop_runtime.txt').write_text('psutil==7.1.0\nrequests==2.32.5\npython-dotenv==1.1.1\ncryptography==46.0.1\n', encoding='utf-8')
     (import_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / 'model_profiles.py').write_text(model_profiles_path.read_text(encoding='utf-8'), encoding='utf-8')
     (utils_llm_dir / 'model_manager.py').write_text(
         """
 class _Manager:
@@ -362,3 +364,33 @@ def test_download_fails_when_dependency_preflight_fails(capsys):
 
     assert status == 1
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}
+
+
+def test_fallback_model_metadata_reports_llama_profile_by_default(monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_URL', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', raising=False)
+    monkeypatch.setenv('TOKEN_PLACE_MODELS_DIR', '/tmp/token-place-models')
+
+    payload = model_bridge._fallback_model_metadata()
+
+    assert payload['api_model_id'] == 'llama-3.1-8b-instruct'
+    assert payload['profile_id'] == 'llama-3.1-8b-q4-k-m'
+    assert payload['display_name'] == 'Meta Llama 3.1 8B Instruct'
+    assert payload['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+    assert payload['url'].endswith('/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf')
+    assert payload['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+
+
+def test_fallback_model_metadata_preserves_model_env_overrides(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', 'override.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_URL', 'https://example.com/override.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', 'https://example.com/family')
+    monkeypatch.setenv('TOKEN_PLACE_MODELS_DIR', '/tmp/token-place-models')
+
+    payload = model_bridge._fallback_model_metadata()
+
+    assert payload['profile_id'] == 'llama-3.1-8b-q4-k-m'
+    assert payload['filename'] == 'override.gguf'
+    assert payload['url'] == 'https://example.com/override.gguf'
+    assert payload['canonical_family_url'] == 'https://example.com/family'

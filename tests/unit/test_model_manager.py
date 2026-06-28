@@ -55,6 +55,27 @@ class _DictAttributeOnly:
 class TestModelManager:
     """Test class for ModelManager."""
 
+    def _build_manager_with_model_config(self, model_config):
+        """Create a ModelManager with focused model config overrides."""
+        mock_config = MagicMock()
+        mock_config.is_production = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def get_config(key, default=None):
+                config_values = {
+                    'model.download_chunk_size_mb': 1,
+                    'paths.models_dir': temp_dir,
+                    'model.use_mock': False,
+                    'model.n_gpu_layers': -1,
+                    'model.gpu_memory_headroom_percent': 0.1,
+                    'model.enforce_gpu_memory_headroom': True,
+                    **model_config,
+                }
+                return config_values.get(key, default)
+
+            mock_config.get.side_effect = get_config
+            return ModelManager(mock_config)
+
     @pytest.fixture
     def model_manager(self):
         """Fixture that returns a model manager instance with mocked config."""
@@ -146,9 +167,19 @@ class TestModelManager:
         """Test runtime model metadata includes expected keys and file state."""
         metadata = model_manager.get_model_artifact_metadata()
 
+        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
+        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
+        assert metadata['display_name'] == 'Meta Llama 3.1 8B Instruct'
         assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
         assert metadata['filename'] == 'test_model.gguf'
         assert metadata['url'] == 'https://example.com/model.gguf'
+        assert metadata['gguf_repo'] == 'bartowski/Meta-Llama-3.1-8B-Instruct-GGUF'
+        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['quantization'] == 'Q4_K_M'
+        assert metadata['license'] == 'llama3.1'
+        assert metadata['native_context_tokens'] == 8192
+        assert metadata['maximum_validated_context_tokens'] == 8192
+        assert metadata['supported_context_tiers'] == ['8k-fast']
         assert metadata['models_dir'] == self._temp_dir
         assert metadata['resolved_model_path'] == os.path.join(self._temp_dir, 'test_model.gguf')
         assert metadata['exists'] is True
@@ -158,6 +189,107 @@ class TestModelManager:
         missing_metadata = model_manager.get_model_artifact_metadata()
         assert missing_metadata['exists'] is False
         assert missing_metadata['size_bytes'] is None
+
+    def test_default_model_artifact_metadata_remains_llama_profile(self):
+        """Unselected profiles should keep the existing Llama artifact defaults."""
+        manager = self._build_manager_with_model_config({})
+        metadata = manager.get_model_artifact_metadata()
+
+        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
+        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
+        assert metadata['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+        assert metadata['url'] == (
+            'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
+            'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+        )
+        assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['quantization'] == 'Q4_K_M'
+        assert metadata['native_context_tokens'] == 8192
+        assert metadata['maximum_validated_context_tokens'] == 8192
+        assert metadata['supported_context_tiers'] == ['8k-fast']
+
+    def test_profile_artifacts_follow_selected_profile_when_defaults_are_seeded(self):
+        """Selecting a profile should replace seeded Llama artifact defaults."""
+        from utils.config_schema import DEFAULT_CONFIG
+
+        mock_config = MagicMock()
+        mock_config.is_production = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def get_config(key, default=None):
+                config_values = {
+                    'model.profile_id': 'qwen3-8b-q4-k-m',
+                    'model.api_model_id': DEFAULT_CONFIG['model']['api_model_id'],
+                    'model.filename': DEFAULT_CONFIG['model']['filename'],
+                    'model.url': DEFAULT_CONFIG['model']['url'],
+                    'model.canonical_family_url': DEFAULT_CONFIG['model']['canonical_family_url'],
+                    'model.download_chunk_size_mb': 1,
+                    'paths.models_dir': temp_dir,
+                    'model.use_mock': False,
+                    'model.n_gpu_layers': -1,
+                    'model.gpu_memory_headroom_percent': 0.1,
+                    'model.enforce_gpu_memory_headroom': True,
+                }
+                return config_values.get(key, default)
+
+            mock_config.get.side_effect = get_config
+            manager = ModelManager(mock_config)
+
+        assert manager.profile_id == 'qwen3-8b-q4-k-m'
+        assert manager.api_model_id == 'qwen3-8b-instruct'
+        assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
+        metadata = manager.get_model_artifact_metadata()
+        assert metadata['source_model'] == 'Qwen/Qwen3-8B'
+        assert metadata['quantization'] == 'Q4_K_M'
+        assert metadata['native_context_tokens'] == 32768
+        assert metadata['maximum_validated_context_tokens'] == 131072
+        assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
+
+    def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
+        """Selecting the Qwen API id should resolve the matching non-default profile."""
+        manager = self._build_manager_with_model_config({'model.api_model_id': 'qwen3-8b-instruct'})
+        metadata = manager.get_model_artifact_metadata()
+
+        assert manager.profile_id == 'qwen3-8b-q4-k-m'
+        assert manager.api_model_id == 'qwen3-8b-instruct'
+        assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
+        assert metadata['source_model'] == 'Qwen/Qwen3-8B'
+        assert metadata['quantization'] == 'Q4_K_M'
+        assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
+
+    def test_profile_artifacts_preserve_explicit_overrides(self):
+        """Non-default profiles still honor artifact values that differ from seeded defaults."""
+        mock_config = MagicMock()
+        mock_config.is_production = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def get_config(key, default=None):
+                config_values = {
+                    'model.profile_id': 'qwen3-8b-q4-k-m',
+                    'model.filename': 'custom.gguf',
+                    'model.url': 'https://example.com/custom.gguf',
+                    'model.canonical_family_url': 'https://example.com/family',
+                    'model.download_chunk_size_mb': 1,
+                    'paths.models_dir': temp_dir,
+                    'model.use_mock': False,
+                    'model.n_gpu_layers': -1,
+                    'model.gpu_memory_headroom_percent': 0.1,
+                    'model.enforce_gpu_memory_headroom': True,
+                }
+                return config_values.get(key, default)
+
+            mock_config.get.side_effect = get_config
+            manager = ModelManager(mock_config)
+
+        assert manager.api_model_id == 'qwen3-8b-instruct'
+        assert manager.file_name == 'custom.gguf'
+        assert manager.url == 'https://example.com/custom.gguf'
+        assert manager.canonical_family_url == 'https://example.com/family'
 
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""

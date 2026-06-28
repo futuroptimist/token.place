@@ -519,6 +519,9 @@ class RelayClient:
     """
 
     _API_V1_LOCAL_LLAMA_RUNTIME_IDS = {
+        "qwen3-8b-instruct",
+        "qwen/qwen3-8b",
+        "qwen3-8b-q4_k_m.gguf",
         "llama-3.1-8b-instruct",
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
@@ -527,9 +530,10 @@ class RelayClient:
         "meta-llama-3-8b-instruct-q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
-        "llama-3-8b-instruct": "llama-3.1-8b-instruct",
-        "gpt-3.5-turbo": "llama-3.1-8b-instruct",
-        "gpt-5-chat-latest": "llama-3.1-8b-instruct",
+        "llama-3.1-8b-instruct": "qwen3-8b-instruct",
+        "llama-3-8b-instruct": "qwen3-8b-instruct",
+        "gpt-3.5-turbo": "qwen3-8b-instruct",
+        "gpt-5-chat-latest": "qwen3-8b-instruct",
     }
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant"}

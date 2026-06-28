@@ -93,7 +93,7 @@ E2EE relay contract stays unchanged in this patch.
    - `https://token.place`
    - `https://staging.token.place`
 4. Start the operator and wait for the shared llama.cpp runtime to warm. For v0.1.x, one node can
-   serve both prod and staging because API v1 exposes one model: `llama-3.1-8b-instruct`.
+   serve both prod and staging because API v1 exposes one model: `qwen3-8b-instruct`.
 5. Confirm status shows the configured relay URLs and a registered count such as `2/2` when both
    relays accept registration. Status entries use relay labels/counts only; docs and examples must
    not include full public keys.

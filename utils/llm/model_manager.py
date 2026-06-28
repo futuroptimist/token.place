@@ -2196,7 +2196,7 @@ class ModelManager:
                             self.log_info(f"Llama init started for {self.model_path}.")
                             runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers)
                             llm_instance = Llama(**runtime_kwargs)
-                            if self.model_profile.get('provider') == 'qwen':
+                            if self.model_profile.get('provider') == 'qwen' and str(self.file_name).startswith('Qwen3'):
                                 if not callable(getattr(llm_instance, 'apply_chat_template', None)):
                                     tokenizer = getattr(llm_instance, 'tokenizer', None)
                                     tokenizer_instance = tokenizer() if callable(tokenizer) else None

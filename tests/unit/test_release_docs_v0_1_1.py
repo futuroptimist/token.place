@@ -83,7 +83,7 @@ def test_desktop_docs_explain_stopped_only_multi_relay_operation() -> None:
         "changes apply\n   on the next Start operator action",
         "https://token.place",
         "https://staging.token.place",
-        "one model: `llama-3.1-8b-instruct`",
+        "one model: `qwen3-8b-instruct`",
         "registered count such as `2/2`",
         "Partial failures are isolated per relay",
         "unregister from every configured\nrelay",

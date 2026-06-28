@@ -53,7 +53,7 @@ def test_qwen3_profile_exists_but_is_not_public_catalog_default():
     assert qwen["license"] == "apache-2.0"
     assert qwen["parameters"] == "8.2B"
     assert qwen["native_context_tokens"] == 32768
-    assert qwen["maximum_validated_context_tokens"] == 131072
+    assert qwen["maximum_validated_context_tokens"] == 65536
     assert qwen["supported_context_tiers"] == ["8k-fast", "64k-full"]
     assert qwen["thinking_mode"] == "disabled"
     assert qwen["chat_template_policy"] == "gguf-jinja"
@@ -64,7 +64,7 @@ def test_qwen3_profile_exists_but_is_not_public_catalog_default():
         "original_context_tokens": 32768,
     }
     assert qwen["public_catalog"] is False
-    assert qwen["runnable"] is False
+    assert qwen["runnable"] is True
     assert [profile["api_model_id"] for profile in iter_model_profiles(public_only=True)] == [
         "llama-3.1-8b-instruct"
     ]

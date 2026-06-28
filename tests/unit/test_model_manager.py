@@ -245,7 +245,7 @@ class TestModelManager:
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
         assert metadata['native_context_tokens'] == 32768
-        assert metadata['maximum_validated_context_tokens'] == 131072
+        assert metadata['maximum_validated_context_tokens'] == 65536
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_api_model_id_selection_resolves_qwen_profile_artifacts(self):
@@ -4008,3 +4008,102 @@ def test_get_llm_instance_with_recovery_attempts_replacement_when_unavailable(st
     assert standalone_model_manager.get_llm_instance_with_recovery() is replacement
     standalone_model_manager.get_llm_instance.assert_called_once_with()
     standalone_model_manager._ensure_replacement_llm.assert_called_once_with(7)
+
+
+def _qwen_manager(tmp_path, context_size=8192, tier="8k-fast"):
+    model_path = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model_path.write_bytes(b"fake")
+    config = MagicMock()
+    config.is_production = False
+    values = {
+        "model.profile_id": "qwen3-8b-q4-k-m",
+        "model.download_chunk_size_mb": 1,
+        "paths.models_dir": str(tmp_path),
+        "model.use_mock": False,
+        "model.n_gpu_layers": 0,
+        "model.gpu_memory_headroom_percent": 0.1,
+        "model.enforce_gpu_memory_headroom": False,
+        "model.context_size": context_size,
+        "model.chat_format": "llama-3",
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    manager = ModelManager(config)
+    manager.context_tier = tier
+    manager.context_window_tokens = context_size
+    return manager
+
+
+class _SupportedLlama:
+    def __init__(
+        self,
+        *,
+        model_path,
+        n_gpu_layers=0,
+        n_ctx=512,
+        chat_format=None,
+        rope_scaling_type=-1,
+        yarn_ext_factor=-1.0,
+        yarn_orig_ctx=0,
+        verbose=True,
+    ):
+        self._init_args = (model_path, n_gpu_layers, n_ctx, chat_format, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx, verbose)
+
+
+class _NoYarnLlama:
+    def __init__(self, *, model_path, n_gpu_layers=0, n_ctx=512, chat_format=None, verbose=True):
+        self._init_args = (model_path, n_gpu_layers, n_ctx, chat_format, verbose)
+
+
+def test_qwen_8k_runtime_init_uses_gguf_template_without_yarn(tmp_path):
+    manager = _qwen_manager(tmp_path, context_size=8192, tier="8k-fast")
+
+    kwargs = manager._build_llama_init_kwargs(_SupportedLlama, n_gpu_layers=0)
+
+    assert kwargs["chat_format"] is None
+    assert "rope_scaling_type" not in kwargs
+    assert "yarn_ext_factor" not in kwargs
+    assert manager.last_runtime_model_diagnostics["rope_yarn_enabled"] is False
+    assert manager.last_runtime_model_diagnostics["chat_template_mode"] == "gguf-jinja"
+
+
+def test_qwen_64k_runtime_init_enables_yarn_factor_two(tmp_path):
+    manager = _qwen_manager(tmp_path, context_size=65536, tier="64k-full")
+
+    kwargs = manager._build_llama_init_kwargs(_SupportedLlama, n_gpu_layers=0)
+
+    assert kwargs["chat_format"] is None
+    assert kwargs["rope_scaling_type"] == 2
+    assert kwargs["yarn_ext_factor"] == 2.0
+    assert kwargs["yarn_orig_ctx"] == 32768
+    assert manager.last_runtime_model_diagnostics["rope_yarn_enabled"] is True
+
+
+def test_qwen_64k_runtime_init_fails_when_yarn_kwargs_unsupported(tmp_path):
+    manager = _qwen_manager(tmp_path, context_size=65536, tier="64k-full")
+
+    with pytest.raises(RuntimeError, match="YaRN/RoPE kwargs"):
+        manager._build_llama_init_kwargs(_NoYarnLlama, n_gpu_layers=0)
+
+
+def test_llama_runtime_init_still_forces_configured_llama_chat_format(tmp_path):
+    model_path = tmp_path / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    model_path.write_bytes(b"fake")
+    config = MagicMock()
+    config.is_production = False
+    values = {
+        "model.download_chunk_size_mb": 1,
+        "paths.models_dir": str(tmp_path),
+        "model.use_mock": False,
+        "model.n_gpu_layers": 0,
+        "model.gpu_memory_headroom_percent": 0.1,
+        "model.enforce_gpu_memory_headroom": False,
+        "model.context_size": 8192,
+        "model.chat_format": "llama-3",
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    manager = ModelManager(config)
+
+    kwargs = manager._build_llama_init_kwargs(_SupportedLlama, n_gpu_layers=0)
+
+    assert kwargs["chat_format"] == "llama-3"
+    assert "yarn_ext_factor" not in kwargs

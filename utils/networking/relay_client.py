@@ -1892,6 +1892,8 @@ class RelayClient:
         content = message.get("content")
         tool_calls = message.get("tool_calls")
         if isinstance(content, str) and content.strip():
+            if re.search(r"<think\b", content, flags=re.IGNORECASE):
+                return None
             return dict(message)
         if isinstance(tool_calls, list) and tool_calls:
             return dict(message)
@@ -2458,18 +2460,34 @@ class RelayClient:
         return None
 
     @staticmethod
-    def _api_v1_render_chat_prompt(llm_instance: Any, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def _api_v1_render_chat_prompt(
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        model_profile: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
+
+        provider = str((model_profile or {}).get("provider") or "").lower()
+        template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if (model_profile or {}).get("thinking_mode") == "disabled":
+            # llama-cpp-python forwards extra kwargs to the GGUF/Jinja template
+            # when supported. Qwen3 templates understand enable_thinking=False;
+            # older runtimes raise TypeError and are retried below with /no_think.
+            template_kwargs["enable_thinking"] = False
 
         apply_chat_template = getattr(llm_instance, "apply_chat_template", None)
         if callable(apply_chat_template):
             try:
-                rendered = apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                rendered = apply_chat_template(messages, **template_kwargs)
             except TypeError:
                 try:
-                    rendered = apply_chat_template(messages)
+                    rendered = apply_chat_template(
+                        RelayClient._api_v1_qwen_no_think_messages(messages)
+                        if provider == "qwen" else messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
                 except Exception:
                     rendered = None
             except Exception:
@@ -2486,13 +2504,24 @@ class RelayClient:
             tokenizer_template = getattr(tokenizer, "apply_chat_template", None)
             if callable(tokenizer_template):
                 try:
-                    rendered = tokenizer_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    rendered = tokenizer_template(messages, **template_kwargs)
+                except TypeError:
+                    try:
+                        rendered = tokenizer_template(
+                            RelayClient._api_v1_qwen_no_think_messages(messages)
+                            if provider == "qwen" else messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    except Exception:
+                        rendered = None
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
                     return rendered
+        if provider == "qwen":
+            # Qwen must not fall back to llama_cpp.llama_chat_format format_llama3.
+            return None
         try:
             if not hasattr(llm_instance, "chat_format"):
                 return None
@@ -2515,6 +2544,19 @@ class RelayClient:
         except Exception:
             return None
         return None
+
+    @staticmethod
+    def _api_v1_qwen_no_think_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Inject a minimal Qwen-supported non-thinking control without logging content."""
+
+        prepared = [dict(message) for message in messages]
+        for message in reversed(prepared):
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                content = message["content"]
+                if "/no_think" not in content:
+                    message["content"] = f"{content}\n/no_think"
+                return prepared
+        return [{"role": "user", "content": "/no_think"}] + prepared
 
     @staticmethod
     def _api_v1_llama_chat_format_module() -> Any:
@@ -2643,7 +2685,11 @@ class RelayClient:
             )
             or active_profile.total_context_tokens
         )
-        rendered_prompt = self._api_v1_render_chat_prompt(llm_instance, messages)
+        rendered_prompt = self._api_v1_render_chat_prompt(
+            llm_instance,
+            messages,
+            model_profile=getattr(self.model_manager, "model_profile", None),
+        )
         prompt_tokens = (
             self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
             if rendered_prompt is not None
@@ -2721,6 +2767,13 @@ class RelayClient:
             "stop": configured("model.stop_tokens", []),
             "stream": False,
         }
+        profile_defaults = getattr(self.model_manager, "model_profile", {}).get(
+            "generation_defaults", {}
+        )
+        if isinstance(profile_defaults, dict):
+            for key in ("temperature", "top_p", "top_k"):
+                if key in profile_defaults:
+                    completion_kwargs[key] = profile_defaults[key]
         completion_kwargs.update(safe_options)
         return completion_kwargs
 
@@ -2826,6 +2879,17 @@ class RelayClient:
             )
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
+        active_model_profile = getattr(self.model_manager, "model_profile", {})
+        if (
+            active_model_profile.get("thinking_mode") == "disabled"
+            and str(active_model_profile.get("provider") or "").lower() == "qwen"
+        ):
+            # create_chat_completion does not expose Qwen's enable_thinking
+            # template kwarg in the inspected llama-cpp-python API, so generation
+            # uses Qwen's documented /no_think message control. Context admission
+            # receives the same runtime_messages and additionally passes
+            # enable_thinking=False when template rendering supports it.
+            runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             llm_instance = get_llm_instance() if callable(get_llm_instance) else None

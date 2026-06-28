@@ -261,13 +261,17 @@ def _server_key(label):
     return base64.b64encode(f"server_public_key_{label}".encode()).decode("utf-8")
 
 
-def _register_api_v1_server(client, server_public_key):
+def _register_api_v1_server_without_capabilities(client, server_public_key):
     response = client.post(
         '/api/v1/relay/servers/register',
         json={'server_public_key': server_public_key},
     )
     assert response.status_code == 200
     return response
+
+
+def _register_api_v1_server(client, server_public_key):
+    return _register_api_v1_server_with_capabilities(client, server_public_key, _capabilities("8k-fast"))
 
 
 def _capabilities(tier="8k-fast", models=None):
@@ -491,7 +495,7 @@ def test_api_v1_scheduler_helper_rejects_non_v1_capabilities(client):
 def test_api_v1_next_keeps_long_polling_server_eligible_when_last_ping_is_stale(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
     server = _server_key("long-poll-eligible")
-    _register_api_v1_server(client, server)
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
     known_servers[server]["last_ping"] = datetime.now() - timedelta(seconds=5)
     known_servers[server]["last_ping_duration"] = 1
     known_servers[server]["polling_until_monotonic"] = time.monotonic() + 30
@@ -611,6 +615,18 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     assert no_match.status_code == 503
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
 
+
+
+def test_api_v1_missing_capabilities_are_not_qwen_capable(client):
+    server = _server_key("missing-capabilities")
+    _register_api_v1_server_without_capabilities(client, server)
+
+    response = client.get("/api/v1/relay/servers/next?model=qwen3-8b-instruct&context_tier=8k-fast")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["error"]["code"] == "no_matching_compute_node"
+    assert payload["error"]["requested_model"] == "qwen3-8b-instruct"
 
 
 def test_api_v1_selection_resolves_old_llama_alias_to_qwen_and_skips_stale_llama_nodes(client):
@@ -2749,7 +2765,7 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
 
 
 def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
 
     queued = client.post('/api/v1/relay/requests', json={
@@ -2793,7 +2809,7 @@ def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(c
 
 
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.5')
 
@@ -2827,7 +2843,7 @@ def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypat
 
 
 def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.01')
 
@@ -2843,7 +2859,7 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
 
 
 def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
 
     for request_id in ("req-fifo-1", "req-fifo-2"):
@@ -2929,7 +2945,7 @@ def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypa
 
 
 def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.5')
 
@@ -3458,7 +3474,7 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
 
 
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     assert client.get('/api/v1/relay/servers/next').status_code == 200
 

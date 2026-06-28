@@ -311,7 +311,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     )
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://staging.token.place/api/v1/relay/servers/next"
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
@@ -372,7 +372,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
         lambda *_args, **_kwargs: pytest.fail("local inference was called"),
     )
 
-    def fake_no_node_get(url, timeout):
+    def fake_no_node_get(url, timeout, params=None):
         assert url == "https://staging.token.place/api/v1/relay/servers/next"
         return _FakeResponse(
             503,

@@ -1791,6 +1791,30 @@ class ModelManager:
             'fallback_reason': None,
         }
 
+
+    def supports_api_v1_model(self, model_id: str) -> bool:
+        """Return whether the active runtime profile can serve an API v1 model id.
+
+        Capability reporting is intentionally profile-derived: a Qwen profile
+        advertises Qwen only, while stale Llama profiles/files never satisfy the
+        Qwen API v1 default.
+        """
+
+        if not isinstance(model_id, str) or not model_id.strip():
+            return False
+        normalized_model = model_id.strip().lower()
+        active_ids = {
+            str(value).strip().lower()
+            for value in (
+                self.api_model_id,
+                self.profile_id,
+                self.file_name,
+                os.path.basename(str(self.model_path)),
+            )
+            if value
+        }
+        return normalized_model in active_ids
+
     def _get_profile_artifact_config(self, config_key: str, profile_key: str) -> Any:
         """Return a model artifact config override or the active profile default."""
         profile_value = self.model_profile[profile_key]

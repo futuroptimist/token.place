@@ -522,6 +522,9 @@ DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
 DEFAULT_MODEL_IDS = ["qwen3-8b-instruct"]
+# Missing capability payloads are accepted for diagnostics, but fail closed for
+# model-aware API v1 scheduling until the node explicitly reports model support.
+DEFAULT_CAPABILITY_MODEL_IDS: list[str] = []
 MODEL_ALIASES = build_model_aliases()
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
 
@@ -589,7 +592,7 @@ def _api_v1_in_flight_ttl_seconds() -> float:
 def _api_v1_default_capabilities() -> dict[str, Any]:
     return {
         "api_version": "v1",
-        "supported_model_ids": list(DEFAULT_MODEL_IDS),
+        "supported_model_ids": list(DEFAULT_CAPABILITY_MODEL_IDS),
         "active_context_tier": DEFAULT_CONTEXT_TIER,
         "maximum_total_context_tokens": CONTEXT_TIER_ORDER[DEFAULT_CONTEXT_TIER],
         "default_output_token_reservation": 1024,
@@ -1363,6 +1366,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
             return jsonify({'server_public_key': server_payload['public_key']})
 
     model = request.args.get("model") if api_v1 else None
+    if api_v1 and not (isinstance(model, str) and model.strip()):
+        model = DEFAULT_MODEL_IDS[0]
     context_tier = request.args.get("context_tier") if api_v1 else None
     context_tier = context_tier.strip() if isinstance(context_tier, str) and context_tier.strip() else DEFAULT_CONTEXT_TIER
     if api_v1 and context_tier not in CONTEXT_TIER_ORDER:

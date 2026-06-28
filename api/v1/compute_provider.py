@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from api.v1.models import generate_response
+from api.v1.models import CANONICAL_LAUNCH_MODEL_ID, generate_response
 from utils.crypto.crypto_manager import CryptoManager
 
 logger = logging.getLogger("api.v1.compute_provider")
@@ -258,6 +258,10 @@ class DistributedApiV1ComputeProvider:
         try:
             next_server_response = requests.get(
                 self._relay_url("/api/v1/relay/servers/next"),
+                params={
+                    "model": model_id or CANONICAL_LAUNCH_MODEL_ID,
+                    "context_tier": "8k-fast",
+                },
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:

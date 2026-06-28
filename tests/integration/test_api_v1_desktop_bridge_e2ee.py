@@ -73,10 +73,10 @@ class FakeDesktopModelManager:
     """Small fake desktop model that never loads llama.cpp/GPU."""
 
     use_mock_llm = False
-    api_model_id = None
+    api_model_id = "qwen3-8b-instruct"
     model_id = None
-    file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
-    model_path = "/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+    file_name = "Qwen3-8B-Q4_K_M.gguf"
+    model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
 
     def __init__(self):
         self.runtime = FakeDesktopRuntime()

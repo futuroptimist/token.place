@@ -4,7 +4,6 @@ import importlib
 from typing import Dict
 
 ADAPTER_ID = "llama-3-8b-instruct:alignment"
-CANONICAL_ADAPTER_ID = "qwen3-8b-instruct:alignment"
 BASE_ID = "qwen3-8b-instruct"
 
 
@@ -26,7 +25,6 @@ def test_get_models_info_does_not_expose_alignment_adapter(monkeypatch):
 
     assert ids == [BASE_ID]
     assert ADAPTER_ID not in ids
-    assert CANONICAL_ADAPTER_ID not in ids
 
 
 def test_generate_response_rejects_removed_alignment_adapter(monkeypatch):
@@ -34,7 +32,7 @@ def test_generate_response_rejects_removed_alignment_adapter(monkeypatch):
 
     with monkeypatch.context() as _context:
         messages = [{"role": "user", "content": "hello"}]
-        for removed_id in (ADAPTER_ID, CANONICAL_ADAPTER_ID):
+        for removed_id in (ADAPTER_ID, "llama-3.1-8b-instruct:alignment"):
             try:
                 models.generate_response(removed_id, list(messages))
             except models.ModelError as exc:

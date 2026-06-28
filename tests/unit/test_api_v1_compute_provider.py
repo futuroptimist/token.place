@@ -80,8 +80,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     retrieve_calls = []
     retrieve_attempt = {"count": 0}
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
+        assert params == {"model": "qwen3-8b-instruct", "context_tier": "8k-fast"}
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
@@ -161,7 +162,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
     response = provider.complete_chat(
-        model_id="llama-3.1-8b-instruct",
+        model_id="qwen3-8b-instruct",
         messages=[{"role": "user", "content": "hi"}],
         options={"temperature": 0.2},
     )
@@ -189,7 +190,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 def test_distributed_compute_provider_treats_retrieve_404_as_unknown_request(monkeypatch):
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -227,7 +228,7 @@ def test_distributed_compute_provider_rejects_response_client_key_binding_mismat
     for bound_client_key in (None, "other-client-public-key"):
         fake_crypto = _FakeCryptoManager()
 
-        def fake_get(url, timeout):
+        def fake_get(url, timeout, params=None):
             assert url == "https://node-a.example/api/v1/relay/servers/next"
             assert 0 < timeout <= 5
             return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -306,7 +307,7 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
 def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(monkeypatch):
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -338,7 +339,7 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
 def test_distributed_compute_provider_maps_encryption_failure_to_provider_error(monkeypatch):
     fake_crypto = _FailingEncryptCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "bad-server-key"})
@@ -423,7 +424,7 @@ def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypa
     def fake_time():
         return next(timestamps)
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         observed_timeouts["get"] = timeout
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -459,7 +460,7 @@ def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypa
 def test_distributed_compute_provider_maps_decrypted_payload_shape_errors(monkeypatch):
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -499,7 +500,7 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
     fake_crypto = _FakeCryptoManager()
     retrieve_attempt = {"count": 0}
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -787,7 +788,7 @@ def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch)
 def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch):
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
@@ -863,7 +864,7 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
     monkeypatch.setattr(
         compute_provider.requests,
         "get",
-        lambda url, timeout: _FakeResponse(
+        lambda url, timeout, params=None: _FakeResponse(
             200, {"server_public_key": "server-public-key"}
         ),
     )
@@ -923,7 +924,7 @@ def test_distributed_compute_provider_cancel_failure_does_not_mask_timeout(monke
     monkeypatch.setattr(
         compute_provider.requests,
         "get",
-        lambda url, timeout: _FakeResponse(
+        lambda url, timeout, params=None: _FakeResponse(
             200, {"server_public_key": "server-public-key"}
         ),
     )
@@ -962,7 +963,7 @@ def test_distributed_compute_provider_maps_relay_410_cancelled_and_expired(monke
     for terminal_code in ("cancelled", "expired"):
         fake_crypto = _FakeCryptoManager()
 
-        def fake_get(url, timeout):
+        def fake_get(url, timeout, params=None):
             assert url == "https://node-a.example/api/v1/relay/servers/next"
             return _FakeResponse(200, {"server_public_key": "server-public-key"})
 

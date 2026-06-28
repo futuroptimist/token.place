@@ -488,7 +488,7 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
                 }
             }
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://staging.token.place/api/v1/relay/servers/next"
         return NoNodesResponse()
 

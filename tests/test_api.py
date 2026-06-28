@@ -503,7 +503,7 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello staging"}],
         },
     )
@@ -718,7 +718,7 @@ def test_v1_completions_legacy_alias_routes_canonical_but_echoes_requested_model
     client, monkeypatch
 ):
     requested_model_id = 'llama-3-8b-instruct'
-    canonical_model_id = 'llama-3.1-8b-instruct'
+    canonical_model_id = 'qwen3-8b-instruct'
     captured = {}
 
     class FakeLocalProvider:
@@ -1133,12 +1133,12 @@ def test_v1_completions_reject_stream_flag(client, mock_llama):
     assert "Streaming is not supported for API v1" in error["error"]["message"]
 
 
-def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
+def test_v1_chat_completion_uses_fixed_qwen3_8b_model(client, monkeypatch):
     """API v1 chat completions should execute using the canonical token.place model."""
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
-        lambda: [{"id": "llama-3.1-8b-instruct"}],
+        lambda: [{"id": "qwen3-8b-instruct"}],
     )
     monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
 
@@ -1151,7 +1151,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
             captured["options"] = options
             return {
                 "role": "assistant",
-                "content": "Llama response",
+                "content": "Qwen response",
             }
 
     monkeypatch.setattr(
@@ -1168,7 +1168,7 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
     )
 
     payload = {
-        "model": "llama-3.1-8b-instruct",
+        "model": "qwen3-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
     }
 
@@ -1178,10 +1178,10 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
     assert response.is_json
 
     body = response.get_json()
-    assert body["model"] == "llama-3.1-8b-instruct"
-    assert captured["model_id"] == "llama-3.1-8b-instruct"
+    assert body["model"] == "qwen3-8b-instruct"
+    assert captured["model_id"] == "qwen3-8b-instruct"
     assert captured["messages"] == payload["messages"]
-    assert body["choices"][0]["message"]["content"] == "Llama response"
+    assert body["choices"][0]["message"]["content"] == "Qwen response"
 
 
 def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatch):

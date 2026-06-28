@@ -274,7 +274,7 @@ def _capabilities(tier="8k-fast", models=None):
     tokens = 65536 if tier == "64k-full" else 8192
     return {
         "api_version": "v1",
-        "supported_model_ids": models or ["llama-3.1-8b-instruct"],
+        "supported_model_ids": models or ["qwen3-8b-instruct"],
         "active_context_tier": tier,
         "maximum_total_context_tokens": tokens,
         "default_output_token_reservation": 1024,
@@ -611,6 +611,22 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     assert no_match.status_code == 503
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
 
+
+
+def test_api_v1_selection_resolves_old_llama_alias_to_qwen_and_skips_stale_llama_nodes(client):
+    qwen = _server_key("qwen-capable")
+    stale_llama = _server_key("stale-llama-only")
+    _register_api_v1_server_with_capabilities(client, stale_llama, _capabilities("8k-fast", ["llama-3.1-8b-instruct"]))
+    _register_api_v1_server_with_capabilities(client, qwen, _capabilities("8k-fast", ["qwen3-8b-instruct"]))
+
+    response = client.get("/api/v1/relay/servers/next?model=llama-3.1-8b-instruct&context_tier=8k-fast")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["server_public_key"] == qwen
+    assert payload["requested_model"] == "llama-3.1-8b-instruct"
+    assert payload["resolved_model"] == "qwen3-8b-instruct"
+    assert payload["selected_model_support"] == ["qwen3-8b-instruct"]
 
 def test_api_v1_selection_reports_capacity_exhaustion_separately(client):
     server = _server_key("saturated-capacity")

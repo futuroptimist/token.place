@@ -612,6 +612,33 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
     assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
 
 
+def test_api_v1_selection_resolves_llama_alias_to_qwen_and_rejects_stale_nodes(client):
+    stale_llama = _server_key("stale-llama")
+    qwen = _server_key("qwen")
+    _register_api_v1_server_with_capabilities(
+        client,
+        stale_llama,
+        _capabilities("8k-fast", ["llama-3.1-8b-instruct"]),
+    )
+    _register_api_v1_server_with_capabilities(
+        client,
+        qwen,
+        _capabilities("8k-fast", ["qwen3-8b-instruct"]),
+    )
+
+    alias_selected = client.get(
+        "/api/v1/relay/servers/next?model=llama-3.1-8b-instruct&context_tier=8k-fast"
+    )
+    canonical_selected = client.get(
+        "/api/v1/relay/servers/next?model=qwen3-8b-instruct&context_tier=8k-fast"
+    )
+
+    assert alias_selected.status_code == 200
+    assert alias_selected.get_json()["server_public_key"] == qwen
+    assert canonical_selected.status_code == 200
+    assert canonical_selected.get_json()["server_public_key"] == qwen
+
+
 def test_api_v1_selection_reports_capacity_exhaustion_separately(client):
     server = _server_key("saturated-capacity")
     _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast", ["model-a"]))

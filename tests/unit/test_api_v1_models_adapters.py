@@ -5,7 +5,7 @@ from typing import Dict
 
 ADAPTER_ID = "llama-3-8b-instruct:alignment"
 CANONICAL_ADAPTER_ID = "llama-3.1-8b-instruct:alignment"
-BASE_ID = "llama-3.1-8b-instruct"
+BASE_ID = "qwen3-8b-instruct"
 
 
 def _reload_models(monkeypatch, env: Dict[str, str] | None = None):

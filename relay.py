@@ -520,7 +520,7 @@ API_V1_MAX_QUEUE_DEPTH_ENV = "TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_NODE"
 DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
-DEFAULT_MODEL_IDS = ["llama-3.1-8b-instruct", "llama-3-8b-instruct"]
+DEFAULT_MODEL_IDS = ["qwen3-8b-instruct"]
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
 
 
@@ -776,8 +776,14 @@ def _api_v1_scheduler_candidate(
     supported_models = capabilities.get("supported_model_ids")
     if not isinstance(supported_models, list) or not supported_models:
         return None
-    if requested_model and requested_model not in supported_models:
-        return None
+    if requested_model:
+        try:
+            from api.v1.models import resolve_model_alias
+            canonical_requested_model = resolve_model_alias(requested_model) or requested_model
+        except Exception:  # pragma: no cover - defensive scheduler fallback
+            canonical_requested_model = requested_model
+        if canonical_requested_model not in supported_models:
+            return None
     context_tokens = capabilities.get("maximum_total_context_tokens")
     if not isinstance(context_tokens, int) or isinstance(context_tokens, bool):
         return None

@@ -29,9 +29,10 @@ def _reload_models(env=None):
 
 def test_resolve_model_alias_returns_canonical_id_for_compat_aliases():
     models = _reload_models()
-    assert models.resolve_model_alias("llama-3-8b-instruct") == "llama-3.1-8b-instruct"
-    assert models.resolve_model_alias("gpt-5-chat-latest") == "llama-3.1-8b-instruct"
-    assert models.resolve_model_alias("gpt-3.5-turbo") == "llama-3.1-8b-instruct"
+    assert models.resolve_model_alias("llama-3.1-8b-instruct") == "qwen3-8b-instruct"
+    assert models.resolve_model_alias("llama-3-8b-instruct") == "qwen3-8b-instruct"
+    assert models.resolve_model_alias("gpt-5-chat-latest") == "qwen3-8b-instruct"
+    assert models.resolve_model_alias("gpt-3.5-turbo") == "qwen3-8b-instruct"
 
 
 def test_resolve_model_alias_rejects_unsupported_gpt_id():

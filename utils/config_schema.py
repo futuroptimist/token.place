@@ -10,7 +10,9 @@ offer better auto-completion for developers.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
+
+from utils.llm.model_profiles import LLAMA_3_1_8B_Q4_K_M_PROFILE
 
 class ServerSettings(TypedDict, total=False):
     host: str
@@ -57,6 +59,8 @@ class PathsSettings(TypedDict, total=False):
 
 
 class ModelSettings(TypedDict, total=False):
+    profile_id: str
+    api_model_id: str
     default_model: str
     fallback_model: str
     temperature: float
@@ -67,6 +71,12 @@ class ModelSettings(TypedDict, total=False):
     canonical_family_url: str
     context_size: int
     chat_format: str
+    chat_template_policy: str
+    thinking_mode: str
+    native_context_tokens: int
+    maximum_validated_context_tokens: int
+    supported_context_tiers: List[str]
+    rope_scaling_policy: Optional[Dict[str, Any]]
     download_chunk_size_mb: int
 
 
@@ -138,19 +148,24 @@ DEFAULT_CONFIG: AppConfig = {
         "config_dir": "",
     },
     "model": {
+        "profile_id": LLAMA_3_1_8B_Q4_K_M_PROFILE.profile_id,
+        "api_model_id": LLAMA_3_1_8B_Q4_K_M_PROFILE.api_model_id,
         "default_model": "gpt-5-chat-latest",
         "fallback_model": "gpt-5-chat-latest",
         "temperature": 0.7,
         "max_tokens": 1000,
         "use_mock": False,
-        "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        "url": (
-            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
-            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        ),
-        "canonical_family_url": "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
-        "context_size": 8192,
+        "filename": LLAMA_3_1_8B_Q4_K_M_PROFILE.filename,
+        "url": LLAMA_3_1_8B_Q4_K_M_PROFILE.download_url,
+        "canonical_family_url": LLAMA_3_1_8B_Q4_K_M_PROFILE.canonical_family_url,
+        "context_size": LLAMA_3_1_8B_Q4_K_M_PROFILE.default_context_tokens,
         "chat_format": "llama-3",
+        "chat_template_policy": LLAMA_3_1_8B_Q4_K_M_PROFILE.chat_template_policy,
+        "thinking_mode": LLAMA_3_1_8B_Q4_K_M_PROFILE.thinking_mode,
+        "native_context_tokens": LLAMA_3_1_8B_Q4_K_M_PROFILE.native_context_tokens,
+        "maximum_validated_context_tokens": LLAMA_3_1_8B_Q4_K_M_PROFILE.maximum_validated_context_tokens,
+        "supported_context_tiers": LLAMA_3_1_8B_Q4_K_M_PROFILE.supported_context_tiers,
+        "rope_scaling_policy": LLAMA_3_1_8B_Q4_K_M_PROFILE.rope_scaling_policy,
         "download_chunk_size_mb": 10,
     },
     "constants": {

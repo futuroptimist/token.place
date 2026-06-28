@@ -362,3 +362,35 @@ def test_download_fails_when_dependency_preflight_fails(capsys):
 
     assert status == 1
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}
+
+
+def test_fallback_metadata_reports_llama_profile_by_default(monkeypatch):
+    module = model_bridge
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_URL', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_MODELS_DIR', raising=False)
+
+    metadata = module._fallback_model_metadata()
+
+    assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
+    assert metadata['profile_id'] == 'llama-3.1-8b-instruct-q4-k-m'
+    assert metadata['display_name'] == 'Meta Llama 3.1 8B Instruct'
+    assert metadata['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+    assert metadata['url'].endswith('/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf')
+
+
+def test_fallback_metadata_preserves_model_env_overrides(monkeypatch, tmp_path):
+    module = model_bridge
+    monkeypatch.setenv('TOKEN_PLACE_MODELS_DIR', str(tmp_path))
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', 'override.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_URL', 'https://example.com/override.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', 'https://example.com/family')
+
+    metadata = module._fallback_model_metadata()
+
+    assert metadata['profile_id'] == 'llama-3.1-8b-instruct-q4-k-m'
+    assert metadata['filename'] == 'override.gguf'
+    assert metadata['url'] == 'https://example.com/override.gguf'
+    assert metadata['canonical_family_url'] == 'https://example.com/family'
+    assert metadata['resolved_model_path'] == str(tmp_path / 'override.gguf')

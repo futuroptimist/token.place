@@ -99,7 +99,7 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "download_url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
         "canonical_family_url": "https://huggingface.co/Qwen/Qwen3-8B",
         "native_context_tokens": 32768,
-        "maximum_validated_context_tokens": 131072,
+        "maximum_validated_context_tokens": 65536,
         "default_context_tokens": 8192,
         "supported_context_tiers": ["8k-fast", "64k-full"],
         "chat_template_policy": "gguf-jinja",
@@ -108,7 +108,7 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "aliases": [],
         "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
         "public_catalog": False,
-        "runnable": False,
+        "runnable": True,
     },
 }
 

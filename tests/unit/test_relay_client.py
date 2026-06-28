@@ -4782,3 +4782,118 @@ def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
     relay_client.stop()
 
     assert relay_client._api_v1_heartbeat_thread is None
+
+
+def test_api_v1_qwen_context_admission_uses_enable_thinking_not_llama_fallback(monkeypatch):
+    calls = []
+
+    class QwenRuntime:
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append((messages, kwargs))
+            return "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+
+        def tokenize(self, content, add_bos=False):
+            return [1, 2, 3]
+
+    client = RelayClient.__new__(RelayClient)
+    client.model_manager = SimpleNamespace(
+        context_tier="8k-fast",
+        context_window_tokens=8192,
+        model_profile={"provider": "qwen", "thinking_mode": "disabled"},
+    )
+    monkeypatch.setattr(RelayClient, "_api_v1_llama_chat_format_module", MagicMock())
+
+    admitted, error, prompt_tokens = client._api_v1_authoritative_context_admission(
+        llm_instance=QwenRuntime(),
+        messages=[{"role": "user", "content": "hi"}],
+        requested_output_tokens=10,
+        requested_context_tier="8k-fast",
+    )
+
+    assert admitted is True
+    assert error is None
+    assert prompt_tokens == 3
+    assert calls[0][1]["enable_thinking"] is False
+    RelayClient._api_v1_llama_chat_format_module.assert_not_called()
+
+
+def test_api_v1_qwen_template_falls_back_to_no_think_without_llama_formatter(monkeypatch):
+    calls = []
+
+    class QwenRuntime:
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append((messages, kwargs))
+            if "enable_thinking" in kwargs:
+                raise TypeError("unsupported kw")
+            return messages[-1]["content"]
+
+    monkeypatch.setattr(RelayClient, "_api_v1_llama_chat_format_module", MagicMock())
+    rendered = RelayClient._api_v1_render_chat_prompt(
+        QwenRuntime(),
+        [{"role": "user", "content": "hi"}],
+        model_profile={"provider": "qwen", "thinking_mode": "disabled"},
+    )
+
+    assert rendered.endswith("/no_think")
+    RelayClient._api_v1_llama_chat_format_module.assert_not_called()
+
+
+def test_api_v1_rejects_think_blocks_from_runtime_output():
+    message = RelayClient._assistant_message_from_runtime_completion(
+        RelayClient.__new__(RelayClient),
+        {"choices": [{"message": {"role": "assistant", "content": "<think>secret</think> answer"}}]},
+    )
+
+    assert message is None
+
+
+def test_api_v1_qwen_generation_defaults_include_top_k():
+    client = RelayClient.__new__(RelayClient)
+    client.model_manager = SimpleNamespace(
+        config=SimpleNamespace(get=lambda key, default=None: default),
+        model_profile={"generation_defaults": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}},
+    )
+
+    kwargs = client._api_v1_runtime_completion_kwargs({})
+
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["top_p"] == 0.8
+    assert kwargs["top_k"] == 20
+
+
+def test_api_v1_qwen_generation_messages_include_no_think_control():
+    completion_calls = []
+
+    class Runtime:
+        def apply_chat_template(self, messages, **kwargs):
+            return "rendered"
+
+        def tokenize(self, content, add_bos=False):
+            return [1]
+
+        def create_chat_completion(self, **kwargs):
+            completion_calls.append(kwargs)
+            return {"choices": [{"message": {"role": "assistant", "content": "answer"}}]}
+
+    client = RelayClient.__new__(RelayClient)
+    runtime = Runtime()
+    client.model_manager = SimpleNamespace(
+        config=SimpleNamespace(get=lambda key, default=None: default),
+        context_tier="8k-fast",
+        context_window_tokens=8192,
+        model_profile={"provider": "qwen", "thinking_mode": "disabled", "generation_defaults": {}},
+        get_llm_instance=lambda: runtime,
+        create_chat_completion_with_recovery=None,
+    )
+    client._runtime_model_can_satisfy = lambda model_id: True
+
+    response = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-no-think",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+        requested_context_tier="8k-fast",
+    )
+
+    assert response["api_v1_response"]["message"]["content"] == "answer"
+    assert completion_calls[0]["messages"][-1]["content"].endswith("/no_think")

@@ -2130,6 +2130,9 @@ class RelayClient:
                         block["text"] = "/no_think\n" + block["text"]
                         prepared[index]["content"] = copied_blocks
                         return prepared
+                copied_blocks.insert(0, {"type": "text", "text": "/no_think\n"})
+                prepared[index]["content"] = copied_blocks
+                return prepared
         return prepared
 
     @staticmethod
@@ -2496,6 +2499,13 @@ class RelayClient:
                     kwargs["enable_thinking"] = enable_thinking
                 rendered = apply_chat_template(messages, **kwargs)
             except TypeError:
+                if enable_thinking is not None:
+                    logger.warning(
+                        "api_v1.chat_template_render result=rejected "
+                        "reason=enable_thinking_unsupported safe_error_code=%s",
+                        "compute_node_context_admission_unavailable",
+                    )
+                    return None
                 try:
                     rendered = apply_chat_template(messages)
                 except Exception:
@@ -2682,7 +2692,13 @@ class RelayClient:
         rendered_prompt = self._api_v1_render_chat_prompt(
             llm_instance,
             messages,
-            enable_thinking=False if is_qwen_non_thinking else None,
+            # Qwen generation below is controlled by the message-level
+            # ``/no_think`` directive because llama-cpp-python's
+            # ``create_chat_completion`` API does not expose template kwargs.
+            # Admission must render the same message shape, rather than adding
+            # an admission-only ``enable_thinking=False`` assistant prefix that
+            # over-counts near-limit requests.
+            enable_thinking=None,
             allow_chat_format_fallback=not is_qwen_non_thinking,
         )
         prompt_tokens = (

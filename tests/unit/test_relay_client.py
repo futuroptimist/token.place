@@ -4784,10 +4784,10 @@ def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
     assert relay_client._api_v1_heartbeat_thread is None
 
 
-def test_qwen_context_admission_passes_enable_thinking_false_without_llama_fallback():
+def test_qwen_context_admission_uses_generation_aligned_no_think_messages_without_llama_fallback():
     class Runtime(_AdmissionRuntime):
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=True):
-            self.calls.append({'enable_thinking': enable_thinking})
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.calls.append({'template_kwargs': kwargs, 'messages': messages})
             return super().apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
     manager = _AdmissionManager(window=128)
     manager.api_model_id = 'qwen3-8b-instruct'
@@ -4804,8 +4804,33 @@ def test_qwen_context_admission_passes_enable_thinking_false_without_llama_fallb
     )
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
-    assert manager.runtime.calls[0]['enable_thinking'] is False
+    assert manager.runtime.calls[0]['template_kwargs'] == {}
+    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
     assert manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
+
+
+def test_qwen_no_think_messages_injects_text_block_when_user_content_list_has_no_text():
+    prepared = RelayClient._api_v1_qwen_no_think_messages([
+        {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}]},
+    ])
+
+    assert prepared[0]['content'][0] == {'type': 'text', 'text': '/no_think\n'}
+    assert prepared[0]['content'][1]['type'] == 'image_url'
+
+
+def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_control():
+    class Runtime:
+        def apply_chat_template(self, messages, **kwargs):
+            if 'enable_thinking' in kwargs:
+                raise TypeError('unexpected keyword argument enable_thinking')
+            return '<thinking-default>'
+
+    assert RelayClient._api_v1_render_chat_prompt(
+        Runtime(),
+        [{'role': 'user', 'content': 'hello'}],
+        enable_thinking=False,
+        allow_chat_format_fallback=False,
+    ) is None
 
 
 def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallback():

@@ -1893,11 +1893,20 @@ class ModelManager:
                     'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
                     f'runtime; missing constructor kwargs: {", ".join(unsupported)}'
                 )
+            llama_module = inspect.getmodule(llama_cls)
+            yarn_scaling_type = getattr(
+                llama_module,
+                'LLAMA_ROPE_SCALING_TYPE_YARN',
+                getattr(llama_cls, 'LLAMA_ROPE_SCALING_TYPE_YARN', None),
+            )
+            if yarn_scaling_type is None:
+                raise RuntimeError(
+                    'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
+                    'runtime; missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant'
+                )
             kwargs.update(
                 {
-                    # llama-cpp-python exposes llama.cpp's enum as an int kwarg;
-                    # current releases use 2 for LLAMA_ROPE_SCALING_TYPE_YARN.
-                    'rope_scaling_type': 2,
+                    'rope_scaling_type': yarn_scaling_type,
                     'yarn_ext_factor': float(rope_policy.get('factor', 2.0)),
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
@@ -2186,21 +2195,22 @@ class ModelManager:
                             self.log_info(f"About to instantiate Llama model from {self.model_path}...")
                             self.log_info(f"Llama init started for {self.model_path}.")
                             runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers)
-                            self.llm = Llama(**runtime_kwargs)
+                            llm_instance = Llama(**runtime_kwargs)
                             if self.model_profile.get('provider') == 'qwen':
-                                if not callable(getattr(self.llm, 'apply_chat_template', None)):
-                                    tokenizer = getattr(self.llm, 'tokenizer', None)
+                                if not callable(getattr(llm_instance, 'apply_chat_template', None)):
+                                    tokenizer = getattr(llm_instance, 'tokenizer', None)
                                     tokenizer_instance = tokenizer() if callable(tokenizer) else None
                                     if not callable(getattr(tokenizer_instance, 'apply_chat_template', None)):
                                         raise RuntimeError(
                                             'Qwen runtime requires GGUF/Jinja apply_chat_template support; '
                                             'refusing to run with a Llama fallback template'
                                         )
-                                if self._qwen_non_thinking_required() and not self._apply_chat_template_accepts(self.llm, 'enable_thinking'):
+                                if self._qwen_non_thinking_required() and not self._apply_chat_template_accepts(llm_instance, 'enable_thinking'):
                                     raise RuntimeError(
                                         'Qwen runtime requires apply_chat_template(enable_thinking=False) '
                                         'for API v1 non-thinking mode'
                                     )
+                            self.llm = llm_instance
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
                             compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)

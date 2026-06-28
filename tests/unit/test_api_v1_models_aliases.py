@@ -2,7 +2,8 @@
 
 import importlib
 import os
-from unittest.mock import MagicMock, patch
+import sys
+from unittest.mock import patch
 
 
 def _reload_models(env=None):
@@ -12,12 +13,13 @@ def _reload_models(env=None):
     if env:
         env_vars.update(env)
 
-    # Ensure the module is reloaded under the patched environment and dependencies.
-    fake_llama_module = MagicMock()
-    with patch.dict("sys.modules", {"llama_cpp": fake_llama_module}):
-        with patch.dict(os.environ, env_vars, clear=True):
+    # Ensure the module is reloaded under the patched environment.
+    with patch.dict(os.environ, env_vars, clear=False):
+        if "api.v1.models" in sys.modules:
+            models = sys.modules["api.v1.models"]
+        else:
             import api.v1.models as models
-            importlib.reload(models)
+        importlib.reload(models)
     return models
 
 
@@ -41,3 +43,9 @@ def test_resolve_model_alias_missing_target_logs_and_returns_none():
                 result = models.resolve_model_alias("local-alias")
     assert result is None
     mock_log_warning.assert_called_once()
+
+
+def test_qwen_is_not_alias_for_llama_or_default():
+    models = _reload_models()
+    assert models.resolve_model_alias("qwen3-8b-instruct") is None
+    assert models.resolve_model_alias("llama-3.1-8b-instruct") is None

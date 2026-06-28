@@ -230,6 +230,34 @@ def test_inspect_returns_fallback_when_dotenv_missing(capsys):
         assert key in response['payload']
 
 
+
+def test_fallback_model_metadata_uses_llama_profile_defaults(monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_URL', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', raising=False)
+
+    payload = model_bridge._fallback_model_metadata()
+
+    assert payload['api_model_id'] == 'llama-3.1-8b-instruct'
+    assert payload['profile_id'] == 'llama-3.1-8b-q4-k-m'
+    assert payload['display_name'] == 'Meta Llama 3.1 8B Instruct'
+    assert payload['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+    assert payload['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+    assert payload['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+
+
+def test_fallback_model_metadata_preserves_environment_overrides(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FILENAME', 'custom.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_URL', 'https://example.com/custom.gguf')
+    monkeypatch.setenv('TOKEN_PLACE_DEFAULT_MODEL_FAMILY_URL', 'https://example.com/family')
+
+    payload = model_bridge._fallback_model_metadata()
+
+    assert payload['filename'] == 'custom.gguf'
+    assert payload['url'] == 'https://example.com/custom.gguf'
+    assert payload['canonical_family_url'] == 'https://example.com/family'
+    assert payload['api_model_id'] == 'llama-3.1-8b-instruct'
+
 def test_main_dispatches_inspect_action():
     with patch.object(model_bridge.argparse.ArgumentParser, 'parse_args', return_value=SimpleNamespace(action='inspect')):
         with patch.object(model_bridge, 'inspect_model', return_value=0) as inspect_model:

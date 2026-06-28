@@ -146,7 +146,15 @@ class TestModelManager:
         """Test runtime model metadata includes expected keys and file state."""
         metadata = model_manager.get_model_artifact_metadata()
 
+        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
+        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
+        assert metadata['display_name'] == 'Meta Llama 3.1 8B Instruct'
         assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+        assert metadata['gguf_repo'] == 'bartowski/Meta-Llama-3.1-8B-Instruct-GGUF'
+        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['quantization'] == 'Q4_K_M'
+        assert metadata['native_context_tokens'] == 8192
+        assert metadata['maximum_validated_context_tokens'] == 8192
         assert metadata['filename'] == 'test_model.gguf'
         assert metadata['url'] == 'https://example.com/model.gguf'
         assert metadata['models_dir'] == self._temp_dir

@@ -4180,3 +4180,99 @@ def test_qwen_validation_failure_does_not_cache_invalid_llm(tmp_path):
     assert manager.llm is None
     assert manager.llm is not first_failed
     assert 'Qwen runtime requires GGUF/Jinja apply_chat_template support' in manager.last_runtime_init_error
+
+
+def test_runtime_signature_helpers_cover_constructor_variants():
+    manager = object.__new__(ModelManager)
+
+    class ExplicitLlama:
+        def __init__(self, model_path, rope_scaling_type):
+            pass
+
+    class KwargsLlama:
+        def __init__(self, model_path, **kwargs):
+            pass
+
+    assert manager._llama_constructor_accepts(ExplicitLlama, 'rope_scaling_type') is True
+    assert manager._llama_constructor_accepts(KwargsLlama, 'yarn_ext_factor') is True
+    assert manager._llama_constructor_accepts(ExplicitLlama, 'yarn_ext_factor') is False
+    assert manager._llama_constructor_accepts(42, 'rope_scaling_type') is False
+
+
+def test_apply_chat_template_accepts_direct_runtime_and_tokenizer_paths():
+    manager = object.__new__(ModelManager)
+
+    class DirectRenderer:
+        def apply_chat_template(self, messages, enable_thinking=False):
+            return '<direct>'
+
+    class KwargsTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return '<tokenizer>'
+
+    class TokenizerBackedRenderer:
+        def tokenizer(self):
+            return KwargsTokenizer()
+
+    class MissingRenderer:
+        pass
+
+    assert manager._apply_chat_template_accepts(DirectRenderer(), 'enable_thinking') is True
+    assert manager._apply_chat_template_accepts(TokenizerBackedRenderer(), 'enable_thinking') is True
+    assert manager._apply_chat_template_accepts(MissingRenderer(), 'enable_thinking') is False
+
+
+def test_apply_chat_template_accepts_handles_tokenizer_and_signature_failures():
+    manager = object.__new__(ModelManager)
+
+    class BrokenTokenizerRuntime:
+        def tokenizer(self):
+            raise RuntimeError('tokenizer unavailable')
+
+    class BuiltinRenderer:
+        apply_chat_template = len
+
+    assert manager._apply_chat_template_accepts(BrokenTokenizerRuntime(), 'enable_thinking') is False
+    assert manager._apply_chat_template_accepts(BuiltinRenderer(), 'enable_thinking') is False
+
+
+def test_apply_chat_template_accepts_returns_false_when_signature_uninspectable(monkeypatch):
+    manager = object.__new__(ModelManager)
+
+    class DirectRenderer:
+        def apply_chat_template(self, messages):
+            return '<direct>'
+
+    import inspect
+
+    original_signature = inspect.signature
+
+    def fake_signature(target):
+        if getattr(target, '__name__', '') == 'apply_chat_template':
+            raise ValueError('uninspectable')
+        return original_signature(target)
+
+    monkeypatch.setattr('utils.llm.model_manager.inspect.signature', fake_signature)
+
+    assert manager._apply_chat_template_accepts(DirectRenderer(), 'enable_thinking') is False
+
+
+def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
+    config = MagicMock()
+    config.get.side_effect = lambda key, default=None: {
+        'model.context_size': 8192,
+    }.get(key, default)
+    manager = object.__new__(ModelManager)
+    manager.config = config
+    manager.model_path = str(tmp_path / 'model.gguf')
+    manager.model_profile = {
+        'provider': 'qwen',
+        'chat_template_policy': 'llama-3',
+        'native_context_tokens': 32768,
+    }
+
+    class FakeLlama:
+        pass
+
+    with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
+        manager._runtime_init_kwargs(FakeLlama, 0)

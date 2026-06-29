@@ -4930,6 +4930,40 @@ def test_qwen_context_admission_uses_generation_aligned_no_think_messages_withou
     assert manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
 
 
+def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
+    class Runtime(_AdmissionRuntime):
+        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.calls.append({
+                'bridge': 'render_and_tokenize_chat',
+                'messages': messages,
+                'template_kwargs': kwargs,
+            })
+            assert tokenize is False
+            assert add_generation_prompt is True
+            return {'prompt_tokens': 7}
+
+        def apply_chat_template(self, *args, **kwargs):  # pragma: no cover - should not be used
+            raise AssertionError('legacy parent render path should not be used')
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-bridge',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['message']['content'] == 'ok'
+    assert manager.runtime.calls[0]['bridge'] == 'render_and_tokenize_chat'
+    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
+
+
 def test_qwen_no_think_messages_injects_text_block_when_user_content_list_has_no_text():
     prepared = RelayClient._api_v1_qwen_no_think_messages([
         {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}]},

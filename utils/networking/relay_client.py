@@ -2431,6 +2431,42 @@ class RelayClient:
             total += len(text)
         return total
 
+
+    @staticmethod
+    def _api_v1_render_and_tokenize_chat_prompt(
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: Optional[bool] = None,
+    ) -> Optional[int]:
+        """Render and tokenize in one runtime bridge call when the facade exposes it."""
+
+        render_and_tokenize = getattr(llm_instance, "render_and_tokenize_chat", None)
+        if not callable(render_and_tokenize):
+            return None
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        try:
+            result = render_and_tokenize(messages, **kwargs)
+        except TypeError:
+            if enable_thinking is not None:
+                logger.warning(
+                    "api_v1.chat_template_render result=rejected "
+                    "reason=enable_thinking_unsupported safe_error_code=%s",
+                    "compute_node_context_admission_unavailable",
+                )
+            return None
+        except Exception:
+            return None
+        if isinstance(result, dict):
+            prompt_tokens = result.get("prompt_tokens")
+        else:
+            prompt_tokens = result
+        if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
+            return prompt_tokens
+        return None
+
     @staticmethod
     def _api_v1_tokenize_rendered_prompt(llm_instance: Any, rendered_prompt: str) -> Optional[int]:
         """Count prompt tokens with the active llama.cpp runtime tokenizer."""
@@ -2664,28 +2700,38 @@ class RelayClient:
             model_profile.get("provider") == "qwen"
             and model_profile.get("thinking_mode") == "disabled"
         )
-        rendered_prompt = self._api_v1_render_chat_prompt(
+        # Prefer a packaged-runtime bridge that renders and tokenizes inside the
+        # loaded worker process. This keeps Qwen admission aligned with the same
+        # GGUF/Jinja template surface used by generation and avoids returning or
+        # logging rendered prompt text in the parent process.
+        prompt_tokens = self._api_v1_render_and_tokenize_chat_prompt(
             llm_instance,
             messages,
-            # Qwen generation below is controlled by the message-level
-            # ``/no_think`` directive because llama-cpp-python's
-            # ``create_chat_completion`` API does not expose template kwargs.
-            # Admission must render the same message shape, rather than adding
-            # an admission-only ``enable_thinking=False`` assistant prefix that
-            # over-counts near-limit requests.
             enable_thinking=None,
-            allow_chat_format_fallback=not is_qwen_non_thinking,
         )
-        prompt_tokens = (
-            self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
-            if rendered_prompt is not None
-            else None
-        )
+        if prompt_tokens is None:
+            rendered_prompt = self._api_v1_render_chat_prompt(
+                llm_instance,
+                messages,
+                # Qwen generation below is controlled by the message-level
+                # ``/no_think`` directive because llama-cpp-python's
+                # ``create_chat_completion`` API does not expose template kwargs.
+                # Admission must render the same message shape, rather than adding
+                # an admission-only ``enable_thinking=False`` assistant prefix that
+                # over-counts near-limit requests.
+                enable_thinking=None,
+                allow_chat_format_fallback=not is_qwen_non_thinking,
+            )
+            prompt_tokens = (
+                self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
+                if rendered_prompt is not None
+                else None
+            )
         if prompt_tokens is None:
             log_error(
                 "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={}",
                 active_context_tier,
-                "runtime_tokenizer_unavailable",
+                "runtime_template_tokenizer_bridge_unavailable",
                 "compute_node_context_admission_unavailable",
             )
             return (

@@ -205,10 +205,17 @@ def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_mis
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
     model_manager.get_llm_instance.return_value = MissingBridgeRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            False,
+            {"code": "compute_node_context_admission_unavailable"},
+            None,
+        )
+    )
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=MagicMock(),
+        relay_client=relay_client,
         crypto_manager=MagicMock(),
     )
 

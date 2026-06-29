@@ -396,14 +396,23 @@ class ComputeNodeRuntime:
         context_tier = getattr(self.model_manager, "context_tier", "8k-fast")
         context_window_tokens = getattr(self.model_manager, "context_window_tokens", None)
         rope_policy = model_profile.get("rope_scaling_policy") or {}
+        packaged_render_tokenize_bridge_available = callable(
+            getattr(llm_runtime, "render_and_tokenize_chat", None)
+        )
+        legacy_template_available = callable(getattr(llm_runtime, "apply_chat_template", None))
+        legacy_tokenizer_available = callable(getattr(llm_runtime, "tokenize", None))
         diagnostics.update({
             "api_v1_readiness_model_id": getattr(self.model_manager, "api_model_id", None),
             "api_v1_readiness_context_tier": context_tier,
             "api_v1_readiness_context_window_tokens": context_window_tokens,
             "api_v1_readiness_template_mode": model_profile.get("chat_template_policy") or "llama-3",
-            "api_v1_readiness_tokenizer_render_bridge_available": callable(
-                getattr(llm_runtime, "render_and_tokenize_chat", None)
-            ) or callable(getattr(llm_runtime, "apply_chat_template", None)),
+            "api_v1_readiness_packaged_bridge_available": packaged_render_tokenize_bridge_available,
+            "api_v1_readiness_legacy_template_available": legacy_template_available,
+            "api_v1_readiness_legacy_tokenizer_available": legacy_tokenizer_available,
+            "api_v1_readiness_tokenizer_render_bridge_available": (
+                packaged_render_tokenize_bridge_available
+                or (legacy_template_available and legacy_tokenizer_available)
+            ),
             "api_v1_readiness_non_thinking_enforced": (
                 model_profile.get("provider") == "qwen"
                 and model_profile.get("thinking_mode") == "disabled"
@@ -440,11 +449,17 @@ class ComputeNodeRuntime:
         })
         self.model_manager.last_compute_diagnostics = diagnostics
         if not admitted:
+            admission_code = (admission_error or {}).get("code") or "unknown"
+            qwen_bridge_missing = (
+                diagnostics.get("api_v1_readiness_non_thinking_enforced")
+                and not diagnostics.get("api_v1_readiness_packaged_bridge_available")
+                and admission_code == "compute_node_context_admission_unavailable"
+            )
             message = (
                 "Qwen API v1 context admission unavailable: "
                 "runtime template/tokenizer bridge missing"
-                if model_profile.get("provider") == "qwen"
-                else "API v1 context admission readiness failed"
+                if qwen_bridge_missing
+                else f"API v1 context admission readiness failed: {admission_code}"
             )
             setattr(self.model_manager, 'last_runtime_init_error', message)
             _log_error(message)

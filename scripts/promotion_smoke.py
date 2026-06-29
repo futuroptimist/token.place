@@ -19,7 +19,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
-EXPECTED_MODEL_ID = "llama-3.1-8b-instruct"
+EXPECTED_MODEL_ID = "qwen3-8b-instruct"
+EXPECTED_MODEL_OWNER = "Qwen"
 ENABLE_ENV = "RUN_PROMOTION_SMOKE"
 BASE_URL_ENV = "TOKENPLACE_SMOKE_BASE_URL"
 ENVIRONMENT_ENV = "TOKENPLACE_SMOKE_ENV"
@@ -220,8 +221,10 @@ def validate_models(payload: Any) -> None:
             f"/api/v1/models must expose exactly [{EXPECTED_MODEL_ID!r}], got {ids!r}"
         )
     owner = data[0].get("owned_by")
-    if owner != "Meta":
-        raise SmokeCheckError("/api/v1/models launch model must be owned_by=Meta")
+    if owner != EXPECTED_MODEL_OWNER:
+        raise SmokeCheckError(
+            f"/api/v1/models launch model must be owned_by={EXPECTED_MODEL_OWNER}"
+        )
 
 
 def validate_release_metadata(

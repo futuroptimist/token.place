@@ -75,9 +75,9 @@ def test_validate_models_requires_exact_launch_model() -> None:
             "object": "list",
             "data": [
                 {
-                    "id": "llama-3.1-8b-instruct",
+                    "id": "qwen3-8b-instruct",
                     "object": "model",
-                    "owned_by": "Meta",
+                    "owned_by": "Qwen",
                 }
             ],
         }
@@ -88,18 +88,26 @@ def test_validate_models_requires_exact_launch_model() -> None:
             {
                 "object": "list",
                 "data": [
-                    {"id": "llama-3.1-8b-instruct", "owned_by": "Meta"},
-                    {"id": "llama-3.1-8b-instruct:alignment", "owned_by": "Meta"},
+                    {"id": "qwen3-8b-instruct", "owned_by": "Qwen"},
+                    {"id": "qwen3-8b-instruct:alignment", "owned_by": "Qwen"},
                 ],
             }
         )
 
-    with pytest.raises(promotion_smoke.SmokeCheckError, match="owned_by=Meta"):
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="exactly"):
+        promotion_smoke.validate_models(
+            {
+                "object": "list",
+                "data": [{"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+            }
+        )
+
+    with pytest.raises(promotion_smoke.SmokeCheckError, match="owned_by=Qwen"):
         promotion_smoke.validate_models(
             {
                 "object": "list",
                 "data": [
-                    {"id": "llama-3.1-8b-instruct", "owned_by": "token.place"},
+                    {"id": "qwen3-8b-instruct", "owned_by": "token.place"},
                 ],
             }
         )
@@ -199,7 +207,7 @@ def test_run_smoke_checks_uses_expected_json_endpoints_without_network() -> None
         },
         "https://staging.token.place/api/v1/models": {
             "object": "list",
-            "data": [{"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+            "data": [{"id": "qwen3-8b-instruct", "owned_by": "Qwen"}],
         },
     }
     called: list[str] = []
@@ -293,7 +301,7 @@ def test_validate_models_rejects_non_object_entries() -> None:
         promotion_smoke.validate_models(
             {
                 "object": "list",
-                "data": ["oops", {"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+                "data": ["oops", {"id": "qwen3-8b-instruct", "owned_by": "Qwen"}],
             }
         )
 
@@ -495,7 +503,7 @@ def test_run_smoke_checks_optionally_validates_release_metadata_offline() -> Non
         },
         "https://staging.token.place/api/v1/models": {
             "object": "list",
-            "data": [{"id": "llama-3.1-8b-instruct", "owned_by": "Meta"}],
+            "data": [{"id": "qwen3-8b-instruct", "owned_by": "Qwen"}],
         },
         "https://staging.token.place/api/v1/version": {
             "environment": "staging",

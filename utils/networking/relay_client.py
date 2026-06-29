@@ -666,6 +666,8 @@ class RelayClient:
         self._api_v1_heartbeat_stop = threading.Event()
         self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
         self._api_v1_heartbeat_stopping = False
+        self._api_v1_readiness_validated = False
+        self._api_v1_last_readiness_diagnostics: Dict[str, Any] = {}
 
 
     def _api_v1_start_heartbeat_worker(self) -> None:
@@ -1318,7 +1320,87 @@ class RelayClient:
             'relay_http_diagnostic': diagnostic,
         }
 
+
+    def validate_api_v1_context_admission_readiness(self) -> Tuple[bool, Dict[str, Any]]:
+        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        active_context_tier = normalize_context_tier(
+            getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+        )
+        profile = get_context_profile(active_context_tier)
+        configured_context_tokens = int(
+            getattr(
+                self.model_manager,
+                "context_window_tokens",
+                profile.total_context_tokens,
+            )
+            or profile.total_context_tokens
+        )
+        readiness = {
+            "active_model_id": getattr(self.model_manager, "api_model_id", None),
+            "active_profile_id": getattr(self.model_manager, "profile_id", None),
+            "context_tier": active_context_tier,
+            "context_window_tokens": configured_context_tokens,
+            "template_mode": model_profile.get("chat_template_policy")
+            or diagnostics.get("chat_template_mode"),
+            "tokenizer_render_bridge_available": False,
+            "non_thinking_enforced": model_profile.get("provider") != "qwen"
+            or model_profile.get("thinking_mode") == "disabled",
+            "rope_yarn_enabled": bool(diagnostics.get("rope_yarn_enabled")),
+            "rope_yarn_factor": diagnostics.get("rope_yarn_factor"),
+            "readiness_result": "failed",
+        }
+        is_qwen_profile = model_profile.get("provider") == "qwen"
+        if not is_qwen_profile:
+            readiness["readiness_result"] = "passed"
+            readiness["reason"] = "non_qwen_profile"
+            self._api_v1_last_readiness_diagnostics = readiness
+            return True, readiness
+        llm_instance = self.model_manager.get_llm_instance()
+        if llm_instance is None:
+            readiness["reason"] = "runtime_unavailable"
+            self._api_v1_last_readiness_diagnostics = readiness
+            return False, readiness
+        messages = self._api_v1_qwen_no_think_messages([{"role": "user", "content": "hi"}])
+        token_count = self._api_v1_render_tokenize_chat_count(
+            llm_instance,
+            messages,
+            enable_thinking=None,
+            allow_chat_format_fallback=False,
+        )
+        readiness["tokenizer_render_bridge_available"] = token_count is not None
+        if token_count is None:
+            readiness["reason"] = "runtime_template_tokenizer_bridge_unavailable"
+            self._api_v1_last_readiness_diagnostics = readiness
+            return False, readiness
+        readiness["readiness_result"] = "passed"
+        readiness["prompt_tokens"] = token_count
+        self._api_v1_last_readiness_diagnostics = readiness
+        log_info(
+            "api_v1.readiness active_model_id={} context_tier={} context_window_tokens={} template_mode={} tokenizer_render_bridge_available={} non_thinking_enforced={} rope_yarn_enabled={} rope_yarn_factor={} readiness_result={}",
+            readiness.get("active_model_id"),
+            active_context_tier,
+            configured_context_tokens,
+            readiness.get("template_mode"),
+            True,
+            readiness.get("non_thinking_enforced"),
+            readiness.get("rope_yarn_enabled"),
+            readiness.get("rope_yarn_factor"),
+            "passed",
+        )
+        return True, readiness
+
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
+        ready, readiness = self.validate_api_v1_context_admission_readiness()
+        if not ready:
+            return {
+                "error": "Qwen API v1 context admission unavailable: runtime template/tokenizer bridge missing",
+                "readiness_diagnostics": readiness,
+                "next_ping_in_x_seconds": self._request_timeout,
+            }
+        self._api_v1_readiness_validated = True
         target_url = relay_url or self.relay_url
         payload = {
             'server_public_key': self.crypto_manager.public_key_b64,
@@ -2532,6 +2614,50 @@ class RelayClient:
             return None
         return None
 
+
+    def _api_v1_render_tokenize_chat_count(
+        self,
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: Optional[bool] = None,
+        allow_chat_format_fallback: bool = True,
+    ) -> Optional[int]:
+        bridge = getattr(llm_instance, "render_and_tokenize_chat", None)
+        if callable(bridge):
+            kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if enable_thinking is not None:
+                kwargs["enable_thinking"] = enable_thinking
+            try:
+                result = bridge(messages, **kwargs)
+            except TypeError:
+                if enable_thinking is not None:
+                    return None
+                try:
+                    result = bridge(messages)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+            if isinstance(result, dict):
+                count = result.get("prompt_tokens")
+                if isinstance(count, int) and count >= 0:
+                    return count
+            if isinstance(result, (list, tuple)):
+                return len(result)
+            if isinstance(result, int) and result >= 0:
+                return result
+
+        rendered_prompt = self._api_v1_render_chat_prompt(
+            llm_instance,
+            messages,
+            enable_thinking=enable_thinking,
+            allow_chat_format_fallback=allow_chat_format_fallback,
+        )
+        if rendered_prompt is None:
+            return None
+        return self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
+
     @staticmethod
     def _api_v1_llama_chat_format_module() -> Any:
         """Import llama.cpp chat formatting without the repo-local llama_cpp stub."""
@@ -2664,7 +2790,7 @@ class RelayClient:
             model_profile.get("provider") == "qwen"
             and model_profile.get("thinking_mode") == "disabled"
         )
-        rendered_prompt = self._api_v1_render_chat_prompt(
+        prompt_tokens = self._api_v1_render_tokenize_chat_count(
             llm_instance,
             messages,
             # Qwen generation below is controlled by the message-level
@@ -2676,16 +2802,11 @@ class RelayClient:
             enable_thinking=None,
             allow_chat_format_fallback=not is_qwen_non_thinking,
         )
-        prompt_tokens = (
-            self._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prompt)
-            if rendered_prompt is not None
-            else None
-        )
         if prompt_tokens is None:
             log_error(
                 "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={}",
                 active_context_tier,
-                "runtime_tokenizer_unavailable",
+                "runtime_template_tokenizer_bridge_unavailable",
                 "compute_node_context_admission_unavailable",
             )
             return (

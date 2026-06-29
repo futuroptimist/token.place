@@ -3959,15 +3959,22 @@ def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeyp
         captured_reads.append((stage, timeout_seconds))
         if stage == 'llama_cpp_prompt_render':
             return {'status': 'ok', 'result': '<|user|>\nhello'}
+        if stage == 'llama_cpp_prompt_render_tokenize':
+            return {'status': 'ok', 'result': {'prompt_tokens': 2}}
         return {'status': 'ok', 'result': [10, 11]}
 
     monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _fake_read)
 
     rendered = proxy.apply_chat_template([{'role': 'user', 'content': 'hello'}], tokenize=False)
     tokens = proxy.tokenize(rendered.encode('utf-8'), add_bos=False)
+    bridge_count = proxy.render_and_tokenize_chat(
+        [{'role': 'user', 'content': 'hello'}],
+        add_generation_prompt=True,
+    )
 
     assert rendered == '<|user|>\nhello'
     assert tokens == [10, 11]
+    assert bridge_count == {'prompt_tokens': 2}
     assert proxy._send.call_args_list == [
         call({
             'method': 'apply_chat_template',
@@ -3979,10 +3986,16 @@ def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeyp
             'args': ({'__token_place_bytes_utf8__': '<|user|>\nhello'},),
             'kwargs': {'add_bos': False},
         }),
+        call({
+            'method': 'render_and_tokenize_chat',
+            'args': ([{'role': 'user', 'content': 'hello'}],),
+            'kwargs': {'add_generation_prompt': True},
+        }),
     ]
     assert captured_reads == [
         ('llama_cpp_prompt_render', 3.25),
         ('llama_cpp_prompt_tokenize', 3.25),
+        ('llama_cpp_prompt_render_tokenize', 3.25),
     ]
 
 
@@ -4008,6 +4021,11 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     proxy._closed = False
     with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
         proxy.tokenize(b'hello', add_bos=False)
+    assert proxy._closed is True
+
+    proxy._closed = False
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.render_and_tokenize_chat([], add_generation_prompt=True)
     assert proxy._closed is True
 
 

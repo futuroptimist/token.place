@@ -387,6 +387,9 @@ class ComputeNodeRuntime:
             )
             return False
 
+        if not self._validate_api_v1_context_admission_ready(llm_runtime):
+            return False
+
         _log_info(f"API v1 runtime warmup model instantiated: {model_path}")
 
         diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
@@ -395,6 +398,110 @@ class ComputeNodeRuntime:
             self.model_manager.last_compute_diagnostics = diagnostics
 
         setattr(self.model_manager, 'last_runtime_init_error', None)
+        return True
+
+    def _validate_api_v1_context_admission_ready(self, llm_runtime: Any) -> bool:
+        """Run a safe pre-registration context-admission smoke for Qwen profiles."""
+
+        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+        if not isinstance(model_profile, dict) or model_profile.get("provider") != "qwen":
+            return True
+
+        from utils.networking.relay_client import RelayClient
+
+        active_context_tier = getattr(self.model_manager, "context_tier", "8k-fast")
+        configured_context_tokens = getattr(self.model_manager, "context_window_tokens", None)
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        diagnostics.update(
+            {
+                "api_v1_context_admission_ready": False,
+                "api_v1_context_admission_readiness_result": "pending",
+                "api_v1_template_tokenizer_bridge_available": False,
+                "active_model_id": getattr(self.model_manager, "api_model_id", None),
+                "active_profile_id": getattr(self.model_manager, "profile_id", None),
+                "context_tier": active_context_tier,
+                "context_window_tokens": configured_context_tokens,
+                "chat_template_mode": model_profile.get("chat_template_policy"),
+                "thinking_mode_disabled": model_profile.get("thinking_mode") == "disabled",
+            }
+        )
+        rope_policy = model_profile.get("rope_scaling_policy") or {}
+        diagnostics.setdefault(
+            "rope_yarn_enabled",
+            bool(rope_policy and active_context_tier == rope_policy.get("required_for_tier")),
+        )
+        diagnostics.setdefault("rope_yarn_factor", rope_policy.get("factor"))
+        diagnostics.setdefault("yarn_original_context", rope_policy.get("original_context_tokens"))
+
+        # Minimal plaintext is only used in-process to exercise the runtime
+        # template/tokenizer bridge; never log messages or rendered prompts.
+        messages = RelayClient._api_v1_qwen_no_think_messages(
+            [
+                {"role": "system", "content": "API v1 readiness smoke."},
+                {"role": "user", "content": "hi"},
+            ]
+        )
+        rendered_prompt = RelayClient._api_v1_render_chat_prompt(
+            llm_runtime,
+            messages,
+            enable_thinking=None,
+            allow_chat_format_fallback=False,
+        )
+        prompt_tokens = (
+            RelayClient._api_v1_tokenize_rendered_prompt(llm_runtime, rendered_prompt)
+            if rendered_prompt is not None
+            else None
+        )
+        non_thinking_enforced = any(
+            isinstance(message.get("content"), str) and "/no_think" in message["content"]
+            for message in messages
+            if message.get("role") == "user"
+        )
+        diagnostics["api_v1_template_tokenizer_bridge_available"] = prompt_tokens is not None
+        diagnostics["api_v1_non_thinking_enforced"] = non_thinking_enforced
+        if prompt_tokens is None or not non_thinking_enforced:
+            diagnostics["api_v1_context_admission_readiness_result"] = "failed"
+            self.model_manager.last_compute_diagnostics = diagnostics
+            setattr(
+                self.model_manager,
+                "last_runtime_init_error",
+                "Qwen API v1 context admission unavailable: runtime template/tokenizer bridge missing",
+            )
+            _log_error(
+                "api_v1.context_admission_readiness "
+                f"active_model_id={getattr(self.model_manager, 'api_model_id', None)} "
+                f"active_profile_id={getattr(self.model_manager, 'profile_id', None)} "
+                f"context_tier={active_context_tier} "
+                f"context_window_tokens={configured_context_tokens} "
+                f"template_mode={model_profile.get('chat_template_policy')} "
+                f"tokenizer_render_bridge_available={prompt_tokens is not None} "
+                f"non_thinking_enforced={non_thinking_enforced} "
+                f"rope_yarn_enabled={diagnostics.get('rope_yarn_enabled')} "
+                f"rope_yarn_factor={diagnostics.get('rope_yarn_factor')} "
+                f"yarn_original_context={diagnostics.get('yarn_original_context')} "
+                "result=failed reason=runtime_template_tokenizer_bridge_unavailable"
+            )
+            return False
+
+        diagnostics["api_v1_context_admission_ready"] = True
+        diagnostics["api_v1_context_admission_readiness_result"] = "passed"
+        self.model_manager.last_compute_diagnostics = diagnostics
+        _log_info(
+            "api_v1.context_admission_readiness "
+            f"active_model_id={getattr(self.model_manager, 'api_model_id', None)} "
+            f"active_profile_id={getattr(self.model_manager, 'profile_id', None)} "
+            f"context_tier={active_context_tier} "
+            f"context_window_tokens={configured_context_tokens} "
+            f"template_mode={model_profile.get('chat_template_policy')} "
+            "tokenizer_render_bridge_available=True "
+            f"non_thinking_enforced={non_thinking_enforced} "
+            f"rope_yarn_enabled={diagnostics.get('rope_yarn_enabled')} "
+            f"rope_yarn_factor={diagnostics.get('rope_yarn_factor')} "
+            f"yarn_original_context={diagnostics.get('yarn_original_context')} "
+            "result=passed"
+        )
         return True
 
     def start_relay_polling(self) -> threading.Thread:

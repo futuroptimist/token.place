@@ -951,20 +951,37 @@ class _SubprocessLlamaProxy:
                 raise
         return message.get('result')
 
-    def tokenize(self, *args, **kwargs):
-        serializable_args = tuple(
+    @staticmethod
+    def _json_safe_args(args):
+        return tuple(
             {'__token_place_bytes_utf8__': arg.decode('utf-8')}
             if isinstance(arg, (bytes, bytearray))
             else arg
             for arg in args
         )
+
+    def tokenize(self, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs})
+            self._send({'method': 'tokenize', 'args': self._json_safe_args(args), 'kwargs': kwargs})
             try:
                 message = _read_llama_subprocess_message(
                     self._process,
                     timeout_seconds=self._timeout_seconds,
                     stage='llama_cpp_prompt_tokenize',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+    def render_and_tokenize_chat(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'render_and_tokenize_chat', 'args': self._json_safe_args(args), 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=self._timeout_seconds,
+                    stage='llama_cpp_prompt_render_tokenize',
                 )
             except LlamaCppWorkerEOFError:
                 self._closed = True
@@ -1107,14 +1124,14 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_request'))
             continue
         method = request.get('method')
-        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize'}:
+        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
             continue
-        if method == 'apply_chat_template':
+        if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
             render = getattr(llama, 'apply_chat_template', None)
             if not callable(render):
                 tokenizer = getattr(llama, 'tokenizer', None)
@@ -1125,34 +1142,27 @@ for line in sys.stdin:
                         tokenizer = None
                 render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
             if not callable(render):
-                try:
-                    chat_format = getattr(llama, 'chat_format', None) or 'llama-2'
-                    chat_format_module = importlib.import_module('llama_cpp.llama_chat_format')
-                    formatter_key = str(chat_format).replace("-", "_")
-                    formatter_name = (
-                        "format_llama2"
-                        if formatter_key == "llama_2"
-                        else "format_" + formatter_key
-                    )
-                    if formatter_name == "format_llama_3":
-                        formatter_name = "format_llama3"
-                    formatter = getattr(chat_format_module, formatter_name, None)
-                    if not callable(formatter):
-                        _emit(_safe_request_error('prompt_render_unavailable', request=request))
-                        continue
-                    rendered = formatter(*request.get('args', []), **kwargs)
+                _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                continue
+            try:
+                rendered = render(*request.get('args', []), **kwargs)
+                if method == 'render_and_tokenize_chat':
                     prompt = getattr(rendered, 'prompt', rendered)
-                    if kwargs.get('tokenize'):
+                    tokens = rendered if kwargs.get('tokenize') else None
+                    if tokens is None:
                         tokenize = getattr(llama, 'tokenize', None)
                         if not callable(tokenize):
                             _emit(_safe_request_error('tokenizer_unavailable', request=request))
                             continue
-                        prompt = tokenize(str(prompt).encode('utf-8'), add_bos=False)
-                    _emit({'status': 'ok', 'result': prompt})
-                except Exception as exc:
-                    _emit(_safe_request_error('prompt_render_unavailable', request=request, exc=exc))
-                continue
-            _emit({'status': 'ok', 'result': render(*request.get('args', []), **kwargs)})
+                        tokens = tokenize(str(prompt).encode('utf-8'), add_bos=False)
+                    if not isinstance(tokens, (list, tuple)):
+                        _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                        continue
+                    _emit({'status': 'ok', 'result': {'prompt_tokens': len(tokens)}})
+                else:
+                    _emit({'status': 'ok', 'result': rendered})
+            except Exception as exc:
+                _emit(_safe_request_error('prompt_render_unavailable', request=request, exc=exc))
             continue
         if method == 'tokenize':
             tokenize = getattr(llama, 'tokenize', None)

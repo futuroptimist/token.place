@@ -5008,3 +5008,103 @@ def test_qwen_profile_generation_defaults_include_top_k():
     assert kwargs['temperature'] == 0.7
     assert kwargs['top_p'] == 0.8
     assert kwargs['top_k'] == 20
+
+
+def test_qwen_context_admission_uses_subprocess_render_tokenize_bridge_without_prompt_roundtrip():
+    class BridgeRuntime(_AdmissionRuntime):
+        def __init__(self):
+            super().__init__()
+            self.tokenize_called = False
+
+        def render_and_tokenize_chat(self, messages, **kwargs):
+            self.calls.append({"bridge_kwargs": kwargs, "messages": messages})
+            assert messages[-1]["content"].startswith("/no_think\n")
+            return {"prompt_tokens": 12}
+
+        def tokenize(self, payload, *args):  # pragma: no cover - must not be used
+            self.tokenize_called = True
+            raise AssertionError("subprocess bridge should avoid returning rendered prompt")
+
+    manager = _AdmissionManager(window=32)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "gguf-jinja",
+    }
+    manager.runtime = BridgeRuntime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-bridge",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.tokenize_called is False
+    assert manager.runtime.calls[0]["bridge_kwargs"] == {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+
+
+def test_api_v1_registration_fails_closed_when_qwen_bridge_missing(monkeypatch):
+    class Runtime:
+        def create_chat_completion(self, **kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.profile_id = "qwen3-8b-q4-k-m-8k"
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "gguf-jinja",
+    }
+    manager.last_compute_diagnostics = {"chat_template_mode": "gguf-jinja"}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    def fail_post(*args, **kwargs):  # pragma: no cover - must not register
+        raise AssertionError("registration should be gated by readiness")
+
+    monkeypatch.setattr(relay_client_module.requests, "post", fail_post)
+
+    result = client.register_api_v1_compute_node("http://relay.test")
+
+    assert "context admission unavailable" in result["error"]
+    assert result["readiness_diagnostics"]["reason"] == "runtime_template_tokenizer_bridge_unavailable"
+    assert result["readiness_diagnostics"]["tokenizer_render_bridge_available"] is False
+    assert client._api_v1_registered_relays == set()
+
+
+def test_api_v1_registration_readiness_passes_for_qwen_64k_yarn(monkeypatch):
+    manager = _AdmissionManager(tier="64k-full", window=65536)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.profile_id = "qwen3-8b-q4-k-m-64k"
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "gguf-jinja",
+    }
+    manager.last_compute_diagnostics = {
+        "chat_template_mode": "gguf-jinja",
+        "rope_yarn_enabled": True,
+        "rope_yarn_factor": 2.0,
+    }
+    client = _api_v1_validation_client(manager)
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"next_ping_in_x_seconds": 30, "poll_wait_seconds": 0}
+    monkeypatch.setattr(relay_client_module.requests, "post", MagicMock(return_value=response))
+
+    result = client.register_api_v1_compute_node("http://relay.test")
+
+    assert result == {"next_ping_in_x_seconds": 30, "poll_wait_seconds": 0}
+    readiness = client._api_v1_last_readiness_diagnostics
+    assert readiness["readiness_result"] == "passed"
+    assert readiness["context_tier"] == "64k-full"
+    assert readiness["rope_yarn_enabled"] is True
+    assert readiness["rope_yarn_factor"] == 2.0

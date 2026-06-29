@@ -2683,9 +2683,11 @@ class RelayClient:
         )
         if prompt_tokens is None:
             log_error(
-                "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={}",
+                "api_v1.context_admission active_tier={} result=rejected reason={} "
+                "internal_reason={} safe_error_code={}",
                 active_context_tier,
                 "runtime_tokenizer_unavailable",
+                "runtime_template_tokenizer_bridge_unavailable",
                 "compute_node_context_admission_unavailable",
             )
             return (

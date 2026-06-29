@@ -169,6 +169,122 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     assert model_manager.last_compute_diagnostics["api_v1_runtime_ready"] is True
 
 
+def _qwen_model_manager(llm_runtime, *, context_tier="8k-fast"):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.profile_id = "qwen3-8b-q4-k-m"
+    model_manager.context_tier = context_tier
+    model_manager.context_window_tokens = 65536 if context_tier == "64k-full" else 8192
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "chat_template_policy": "gguf-jinja",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "required_for_tier": "64k-full",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    model_manager.last_compute_diagnostics = {
+        "requested_mode": "gpu",
+        "rope_yarn_enabled": context_tier == "64k-full",
+        "rope_yarn_factor": 2.0 if context_tier == "64k-full" else None,
+        "yarn_original_context": 32768 if context_tier == "64k-full" else None,
+    }
+    model_manager.get_llm_instance.return_value = llm_runtime
+    return model_manager
+
+
+class QwenReadinessRuntime:
+    def __init__(self):
+        self.rendered_messages = None
+
+    def create_chat_completion(self, **_kwargs):
+        return {}
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        self.rendered_messages = messages
+        return "<qwen>" + "".join(str(message.get("content", "")) for message in messages)
+
+    def tokenize(self, prompt, add_bos=False):
+        assert add_bos is False
+        assert isinstance(prompt, (bytes, bytearray))
+        return [1, 2, 3, 4]
+
+
+def test_compute_node_runtime_qwen_readiness_smoke_requires_template_tokenizer_bridge(caplog):
+    llm_runtime = QwenReadinessRuntime()
+    model_manager = _qwen_model_manager(llm_runtime)
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_api_v1_runtime_ready() is True
+
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_runtime_ready"] is True
+    assert diagnostics["api_v1_context_admission_ready"] is True
+    assert diagnostics["api_v1_template_tokenizer_bridge_available"] is True
+    assert diagnostics["api_v1_non_thinking_enforced"] is True
+    assert "/no_think" in llm_runtime.rendered_messages[-1]["content"]
+    assert "/no_think\nhi" not in caplog.text
+    assert "<qwen>" not in caplog.text
+
+
+def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope_diagnostics():
+    llm_runtime = QwenReadinessRuntime()
+    model_manager = _qwen_model_manager(llm_runtime, context_tier="64k-full")
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_context_admission_ready"] is True
+    assert diagnostics["rope_yarn_enabled"] is True
+    assert diagnostics["rope_yarn_factor"] == 2.0
+    assert diagnostics["yarn_original_context"] == 32768
+
+
+def test_compute_node_runtime_qwen_missing_template_tokenizer_fails_pre_registration():
+    class MissingBridgeRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+    model_manager = _qwen_model_manager(MissingBridgeRuntime())
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert (
+        model_manager.last_runtime_init_error
+        == "Qwen API v1 context admission unavailable: runtime template/tokenizer bridge missing"
+    )
+    assert model_manager.last_compute_diagnostics["api_v1_context_admission_ready"] is False
+    assert (
+        model_manager.last_compute_diagnostics["api_v1_context_admission_readiness_result"]
+        == "failed"
+    )
+
+
 @pytest.mark.parametrize(
     "llm_instance,getter,expected",
     [

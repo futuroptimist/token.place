@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import call, MagicMock
 
 import pytest
@@ -17,6 +18,26 @@ from utils.compute_node_runtime import (
     resolve_relay_port,
     resolve_relay_url,
 )
+
+
+def _ready_relay_client():
+    return SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 3)
+    )
+
+
+class _ReadyRuntime:
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **_kwargs):
+        rendered = "".join(str(message.get("content", "")) for message in messages)
+        return rendered + ("<assistant>" if add_generation_prompt else "")
+
+    def tokenize(self, payload, *args, **_kwargs):
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        return list(range(max(1, len(str(payload)))))
+
+    def create_chat_completion(self, **_kwargs):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
 
 def test_first_env_skips_blank_values(monkeypatch):
@@ -72,13 +93,12 @@ def test_compute_node_runtime_warmup_logs_model_instantiation_stages(caplog):
     model_manager.use_mock_llm = True
     model_manager.model_path = "/tmp/model.gguf"
     model_manager.last_compute_diagnostics = {"requested_mode": "cpu"}
-    llm_runtime = MagicMock()
-    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    llm_runtime = _ReadyRuntime()
     model_manager.get_llm_instance.return_value = llm_runtime
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=MagicMock(),
+        relay_client=_ready_relay_client(),
         crypto_manager=MagicMock(),
     )
 
@@ -156,17 +176,188 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     model_manager.last_compute_diagnostics = {"requested_mode": "cpu"}
-    llm_runtime = MagicMock()
-    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    llm_runtime = _ReadyRuntime()
     model_manager.get_llm_instance.return_value = llm_runtime
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=MagicMock(),
+        relay_client=_ready_relay_client(),
         crypto_manager=MagicMock(),
     )
     assert runtime.ensure_api_v1_runtime_ready() is True
-    assert model_manager.last_compute_diagnostics["api_v1_runtime_ready"] is True
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_result"] == "passed"
+
+
+def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridge_missing():
+    class BridgeRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 1}
+
+    def _raise_admission_error(**_kwargs):
+        raise TimeoutError("relay admission timed out")
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = BridgeRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=_raise_admission_error
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == (
+        "API v1 context admission readiness failed: "
+        "compute_node_context_admission_unavailable reason=unknown"
+    )
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_exception_type"] == "TimeoutError"
+    assert diagnostics["api_v1_readiness_packaged_bridge_available"] is True
+    assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is False
+
+
+def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_missing():
+    class MissingBridgeRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "gguf-jinja",
+    }
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = MissingBridgeRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            False,
+            {
+                "code": "compute_node_context_admission_unavailable",
+                "internal_reason": "runtime_template_tokenizer_bridge_unavailable",
+            },
+            None,
+        )
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == (
+        "Qwen API v1 context admission unavailable: runtime template/tokenizer bridge missing"
+    )
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_result"] == "failed"
+    assert (
+        model_manager.last_compute_diagnostics[
+            "api_v1_readiness_tokenizer_render_bridge_available"
+        ]
+        is False
+    )
+
+
+def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason():
+    class BridgeRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 1}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = BridgeRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            False,
+            {
+                "code": "compute_node_context_tier_unsupported",
+                "reason": "requested_tier_not_active",
+            },
+            8,
+        )
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == (
+        "API v1 context admission readiness failed: "
+        "compute_node_context_tier_unsupported reason=requested_tier_not_active"
+    )
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_error_reason"] == (
+        "requested_tier_not_active"
+    )
+
+
+def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
+    class ReadyRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = ReadyRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_yarn_rope_enabled"] is True
+    assert diagnostics["api_v1_readiness_yarn_rope_factor"] == 2.0
+    assert diagnostics["api_v1_readiness_yarn_original_context_tokens"] == 32768
+    assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is True
 
 
 @pytest.mark.parametrize(
@@ -215,19 +406,18 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_without_diagnostics_di
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     model_manager.last_compute_diagnostics = "not-a-dict"
-    llm_runtime = MagicMock()
-    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    llm_runtime = _ReadyRuntime()
     model_manager.get_llm_instance.return_value = llm_runtime
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=MagicMock(),
+        relay_client=_ready_relay_client(),
         crypto_manager=MagicMock(),
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    assert model_manager.last_compute_diagnostics == "not-a-dict"
+    assert model_manager.last_compute_diagnostics["api_v1_runtime_ready"] is True
 
 
 def test_compute_node_runtime_polling_thread_delegates_to_relay():

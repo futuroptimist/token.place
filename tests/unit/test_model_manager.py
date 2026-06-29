@@ -4,6 +4,7 @@ Unit tests for the model manager module.
 import logging
 import os
 import queue
+import subprocess
 import threading
 import pytest
 import shutil
@@ -3959,20 +3960,33 @@ def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeyp
         captured_reads.append((stage, timeout_seconds))
         if stage == 'llama_cpp_prompt_render':
             return {'status': 'ok', 'result': '<|user|>\nhello'}
+        if stage == 'llama_cpp_prompt_render_tokenize':
+            return {'status': 'ok', 'result': {'prompt_tokens': 2}}
         return {'status': 'ok', 'result': [10, 11]}
 
     monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _fake_read)
 
     rendered = proxy.apply_chat_template([{'role': 'user', 'content': 'hello'}], tokenize=False)
+    token_summary = proxy.render_and_tokenize_chat(
+        [{'role': 'user', 'content': 'hello'}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     tokens = proxy.tokenize(rendered.encode('utf-8'), add_bos=False)
 
     assert rendered == '<|user|>\nhello'
+    assert token_summary == {'prompt_tokens': 2}
     assert tokens == [10, 11]
     assert proxy._send.call_args_list == [
         call({
             'method': 'apply_chat_template',
             'args': ([{'role': 'user', 'content': 'hello'}],),
             'kwargs': {'tokenize': False},
+        }),
+        call({
+            'method': 'render_and_tokenize_chat',
+            'args': ([{'role': 'user', 'content': 'hello'}],),
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
         }),
         call({
             'method': 'tokenize',
@@ -3982,6 +3996,7 @@ def test_subprocess_llama_proxy_prompt_helpers_use_runtime_stage_timeout(monkeyp
     ]
     assert captured_reads == [
         ('llama_cpp_prompt_render', 3.25),
+        ('llama_cpp_prompt_render_tokenize', 3.25),
         ('llama_cpp_prompt_tokenize', 3.25),
     ]
 
@@ -4007,8 +4022,146 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
 
     proxy._closed = False
     with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.render_and_tokenize_chat([], tokenize=False)
+    assert proxy._closed is True
+
+    proxy._closed = False
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
         proxy.tokenize(b'hello', add_bos=False)
     assert proxy._closed is True
+
+
+def _run_llama_worker_request(tmp_path, request, *, llama_body):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(llama_body)
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.flush()
+    init = process.stdout.readline()
+    assert init.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
+    assert json.loads(init.split(':', 1)[1])['status'] == 'ok'
+    process.stdin.write(json.dumps(request) + '\n')
+    process.stdin.flush()
+    response = process.stdout.readline()
+    process.kill()
+    process.wait(timeout=5)
+    assert response.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
+    return json.loads(response.split(':', 1)[1])
+
+
+def test_llama_worker_render_and_tokenize_chat_returns_only_token_count(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        return 'rendered secret prompt'
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'rendered secret prompt'
+        return [1, 2, 3]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_retries_without_enable_thinking(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.calls = []
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append(kwargs)
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        return 'rendered fallback prompt'
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'rendered fallback prompt'
+        return [1, 2]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 2}}
+    assert 'secret prompt' not in json.dumps(response)
+    assert 'rendered fallback prompt' not in json.dumps(response)
+
+
+def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text("""
+class Llama:
+    chat_format = 'llama-2'
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        return [7, 8]
+""")
+    (package_dir / 'llama_chat_format.py').write_text("""
+class Rendered:
+    prompt = '<fallback prompt>'
+def format_llama2(*args, **kwargs):
+    return Rendered()
+""")
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.flush()
+    assert json.loads(process.stdout.readline().split(':', 1)[1])['status'] == 'ok'
+    process.stdin.write(json.dumps({
+        'method': 'apply_chat_template',
+        'args': [[{'role': 'user', 'content': 'hello'}]],
+        'kwargs': {'tokenize': True},
+    }) + '\n')
+    process.stdin.flush()
+    response = json.loads(process.stdout.readline().split(':', 1)[1])
+    process.kill()
+    process.wait(timeout=5)
+
+    assert response == {'status': 'ok', 'result': [7, 8]}
 
 
 def test_get_llm_instance_with_recovery_returns_existing_runtime(standalone_model_manager):

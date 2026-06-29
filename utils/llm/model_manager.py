@@ -1143,7 +1143,17 @@ for line in sys.stdin:
                     _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request))
                     continue
                 try:
-                    rendered_prompt = render(*request.get('args', []), **kwargs)
+                    try:
+                        rendered_prompt = render(*request.get('args', []), **kwargs)
+                    except TypeError:
+                        if 'enable_thinking' not in kwargs:
+                            raise
+                        compatibility_kwargs = dict(kwargs)
+                        compatibility_kwargs.pop('enable_thinking', None)
+                        rendered_prompt = render(
+                            *request.get('args', []),
+                            **compatibility_kwargs,
+                        )
                     if not isinstance(rendered_prompt, str):
                         _emit(_safe_request_error('prompt_render_unavailable', request=request))
                         continue

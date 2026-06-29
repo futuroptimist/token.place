@@ -4086,6 +4086,38 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
+def test_llama_worker_render_and_tokenize_chat_retries_without_enable_thinking(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.calls = []
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append(kwargs)
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        return 'rendered fallback prompt'
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'rendered fallback prompt'
+        return [1, 2]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 2}}
+    assert 'secret prompt' not in json.dumps(response)
+    assert 'rendered fallback prompt' not in json.dumps(response)
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()

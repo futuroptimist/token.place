@@ -409,16 +409,20 @@ class ComputeNodeRuntime:
             "api_v1_readiness_packaged_bridge_available": packaged_render_tokenize_bridge_available,
             "api_v1_readiness_legacy_template_available": legacy_template_available,
             "api_v1_readiness_legacy_tokenizer_available": legacy_tokenizer_available,
-            "api_v1_readiness_tokenizer_render_bridge_available": (
+            "api_v1_readiness_tokenizer_render_bridge_capability_available": (
                 packaged_render_tokenize_bridge_available
                 or (legacy_template_available and legacy_tokenizer_available)
             ),
+            "api_v1_readiness_tokenizer_render_bridge_available": False,
             "api_v1_readiness_non_thinking_enforced": (
                 model_profile.get("provider") == "qwen"
                 and model_profile.get("thinking_mode") == "disabled"
             ),
             "api_v1_readiness_yarn_rope_enabled": bool(rope_policy.get("type") == "yarn"),
             "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
+            "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
+                "original_context_tokens"
+            ),
         })
 
         try:
@@ -441,25 +445,50 @@ class ComputeNodeRuntime:
             prompt_tokens = None
             diagnostics["api_v1_readiness_exception_type"] = type(exc).__name__
 
+        prompt_tokens_available = isinstance(prompt_tokens, int) and prompt_tokens > 0
         diagnostics.update({
             "api_v1_runtime_ready": bool(admitted),
             "api_v1_readiness_result": "passed" if admitted else "failed",
             "api_v1_readiness_prompt_tokens": prompt_tokens,
+            "api_v1_readiness_tokenizer_render_bridge_available": bool(
+                admitted and prompt_tokens_available
+            ),
             "api_v1_readiness_error_code": (admission_error or {}).get("code") if not admitted else None,
+            "api_v1_readiness_error_reason": (
+                (admission_error or {}).get("internal_reason")
+                or (admission_error or {}).get("reason")
+            ) if not admitted else None,
         })
         self.model_manager.last_compute_diagnostics = diagnostics
         if not admitted:
             admission_code = (admission_error or {}).get("code") or "unknown"
+            admission_reason = (
+                (admission_error or {}).get("internal_reason")
+                or (admission_error or {}).get("reason")
+                or "unknown"
+            )
+            bridge_capability_missing = not diagnostics.get(
+                "api_v1_readiness_tokenizer_render_bridge_capability_available"
+            )
+            bridge_admission_failure = (
+                admission_reason == "runtime_template_tokenizer_bridge_unavailable"
+                or (
+                    admission_code == "compute_node_context_admission_unavailable"
+                    and bridge_capability_missing
+                )
+            )
             qwen_bridge_missing = (
                 diagnostics.get("api_v1_readiness_non_thinking_enforced")
-                and not diagnostics.get("api_v1_readiness_packaged_bridge_available")
-                and admission_code == "compute_node_context_admission_unavailable"
+                and bridge_admission_failure
             )
             message = (
                 "Qwen API v1 context admission unavailable: "
                 "runtime template/tokenizer bridge missing"
                 if qwen_bridge_missing
-                else f"API v1 context admission readiness failed: {admission_code}"
+                else (
+                    "API v1 context admission readiness failed: "
+                    f"{admission_code} reason={admission_reason}"
+                )
             )
             setattr(self.model_manager, 'last_runtime_init_error', message)
             _log_error(message)

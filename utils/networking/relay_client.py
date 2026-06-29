@@ -2634,6 +2634,7 @@ class RelayClient:
             "requested_context_tier": requested_context_tier,
             "configured_context_tokens": configured_context_tokens,
             "retryable": False,
+            "internal_reason": "runtime_template_tokenizer_bridge_unavailable",
         }
 
     def _api_v1_context_admission_error(

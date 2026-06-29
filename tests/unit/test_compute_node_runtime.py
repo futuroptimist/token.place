@@ -208,7 +208,10 @@ def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_mis
     relay_client = SimpleNamespace(
         _api_v1_authoritative_context_admission=lambda **_kwargs: (
             False,
-            {"code": "compute_node_context_admission_unavailable"},
+            {
+                "code": "compute_node_context_admission_unavailable",
+                "internal_reason": "runtime_template_tokenizer_bridge_unavailable",
+            },
             None,
         )
     )
@@ -230,6 +233,91 @@ def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_mis
         ]
         is False
     )
+
+
+def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason():
+    class BridgeRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 1}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = BridgeRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            False,
+            {
+                "code": "compute_node_context_tier_unsupported",
+                "reason": "requested_tier_not_active",
+            },
+            8,
+        )
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == (
+        "API v1 context admission readiness failed: "
+        "compute_node_context_tier_unsupported reason=requested_tier_not_active"
+    )
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_error_reason"] == (
+        "requested_tier_not_active"
+    )
+
+
+def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
+    class ReadyRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = ReadyRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_yarn_rope_enabled"] is True
+    assert diagnostics["api_v1_readiness_yarn_rope_factor"] == 2.0
+    assert diagnostics["api_v1_readiness_yarn_original_context_tokens"] == 32768
+    assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is True
 
 
 @pytest.mark.parametrize(

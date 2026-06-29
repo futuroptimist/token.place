@@ -429,7 +429,21 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
         "        self.args = args\n"
         "        self.kwargs = kwargs\n"
         "    def create_chat_completion(self, *args, **kwargs):\n"
-        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n",
+        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n"
+        "    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):\n"
+        "        rendered = '\\n'.join(str(message.get('content', '')) for message in messages)\n"
+        "        if add_generation_prompt:\n"
+        "            rendered += '\\nassistant:'\n"
+        "        if tokenize:\n"
+        "            return self.tokenize(rendered.encode('utf-8'), add_bos=False)\n"
+        "        return rendered\n"
+        "    def tokenize(self, payload, add_bos=False, **kwargs):\n"
+        "        if isinstance(payload, (bytes, bytearray)):\n"
+        "            text = payload.decode('utf-8')\n"
+        "        else:\n"
+        "            text = str(payload)\n"
+        "        tokens = [idx + 1 for idx, part in enumerate(text.split()) if part]\n"
+        "        return ([0] if add_bos else []) + tokens\n",
         encoding="utf-8",
     )
     return fake_site, fake_init
@@ -915,7 +929,21 @@ def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
         "        self.args = args\n"
         "        self.kwargs = kwargs\n"
         "    def create_chat_completion(self, *args, **kwargs):\n"
-        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake metal ok'}}]}\n",
+        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake metal ok'}}]}\n"
+        "    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):\n"
+        "        rendered = '\\n'.join(str(message.get('content', '')) for message in messages)\n"
+        "        if add_generation_prompt:\n"
+        "            rendered += '\\nassistant:'\n"
+        "        if tokenize:\n"
+        "            return self.tokenize(rendered.encode('utf-8'), add_bos=False)\n"
+        "        return rendered\n"
+        "    def tokenize(self, payload, add_bos=False, **kwargs):\n"
+        "        if isinstance(payload, (bytes, bytearray)):\n"
+        "            text = payload.decode('utf-8')\n"
+        "        else:\n"
+        "            text = str(payload)\n"
+        "        tokens = [idx + 1 for idx, part in enumerate(text.split()) if part]\n"
+        "        return ([0] if add_bos else []) + tokens\n",
         encoding="utf-8",
     )
     return fake_site

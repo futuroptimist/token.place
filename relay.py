@@ -15,6 +15,7 @@ from typing import Any, Dict
 from urllib.parse import urlparse
 
 from release_metadata import get_release_metadata, resolve_asset_version
+from utils.llm.model_profiles import build_model_aliases
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -520,7 +521,11 @@ API_V1_MAX_QUEUE_DEPTH_ENV = "TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_NODE"
 DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
-DEFAULT_MODEL_IDS = ["llama-3.1-8b-instruct", "llama-3-8b-instruct"]
+DEFAULT_MODEL_IDS = ["qwen3-8b-instruct"]
+# Missing capability payloads are accepted for diagnostics, but fail closed for
+# model-aware API v1 scheduling until the node explicitly reports model support.
+DEFAULT_CAPABILITY_MODEL_IDS: list[str] = []
+MODEL_ALIASES = build_model_aliases()
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
 
 
@@ -587,7 +592,7 @@ def _api_v1_in_flight_ttl_seconds() -> float:
 def _api_v1_default_capabilities() -> dict[str, Any]:
     return {
         "api_version": "v1",
-        "supported_model_ids": list(DEFAULT_MODEL_IDS),
+        "supported_model_ids": list(DEFAULT_CAPABILITY_MODEL_IDS),
         "active_context_tier": DEFAULT_CONTEXT_TIER,
         "maximum_total_context_tokens": CONTEXT_TIER_ORDER[DEFAULT_CONTEXT_TIER],
         "default_output_token_reservation": 1024,
@@ -1255,6 +1260,8 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
 
     global server_round_robin_next_index
     requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
+    if requested_model:
+        requested_model = MODEL_ALIASES.get(requested_model, requested_model)
     now_monotonic = time.monotonic()
     with server_round_robin_lock:
         all_api_v1_keys = _api_v1_round_robin_keys()
@@ -1288,6 +1295,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             return None, {
                 "eligible_count": 0,
                 "eligible_node_count": 0,
+                "requested_model": requested_model,
                 "eligible_tier_counts": eligible_tier_counts or capacity_limited_tier_counts,
                 "capacity_limited_tier_counts": capacity_limited_tier_counts,
                 "registered_api_v1_count": registered_count,
@@ -1323,6 +1331,7 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
         selection = {
             "eligible_count": len(candidates),
             "eligible_node_count": len(candidates),
+            "requested_model": requested_model,
             "eligible_tier_counts": eligible_tier_counts,
             "capacity_limited_tier_counts": capacity_limited_tier_counts,
             "round_robin_index": server_round_robin_next_index,
@@ -1357,6 +1366,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
             return jsonify({'server_public_key': server_payload['public_key']})
 
     model = request.args.get("model") if api_v1 else None
+    if api_v1 and not (isinstance(model, str) and model.strip()):
+        model = DEFAULT_MODEL_IDS[0]
     context_tier = request.args.get("context_tier") if api_v1 else None
     context_tier = context_tier.strip() if isinstance(context_tier, str) and context_tier.strip() else DEFAULT_CONTEXT_TIER
     if api_v1 and context_tier not in CONTEXT_TIER_ORDER:
@@ -1421,6 +1432,8 @@ def _select_next_server_payload(*, api_v1: bool = False):
     return jsonify({
         'server_public_key': server_payload['public_key'],
         'requested_context_tier': context_tier,
+        'requested_model': model,
+        'resolved_model': selection.get('requested_model'),
         'selected_context_tier': capabilities.get("active_context_tier"),
         'selected_context_window_tokens': capabilities.get("maximum_total_context_tokens"),
         'selected_model_support': capabilities.get("supported_model_ids", []),

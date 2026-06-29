@@ -21,6 +21,7 @@ from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
 from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
+from utils.llm.model_profiles import build_model_aliases
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -518,19 +519,7 @@ class RelayClient:
         ```
     """
 
-    _API_V1_LOCAL_LLAMA_RUNTIME_IDS = {
-        "llama-3.1-8b-instruct",
-        "llama-3-8b-instruct",
-        "meta/llama-3.1-8b-instruct",
-        "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
-        "meta-llama-3-8b-instruct.q4_k_m.gguf",
-        "meta-llama-3-8b-instruct-q4_k_m.gguf",
-    }
-    _API_V1_LOCAL_MODEL_ALIASES = {
-        "llama-3-8b-instruct": "llama-3.1-8b-instruct",
-        "gpt-3.5-turbo": "llama-3.1-8b-instruct",
-        "gpt-5-chat-latest": "llama-3.1-8b-instruct",
-    }
+    _API_V1_LOCAL_MODEL_ALIASES = build_model_aliases()
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {}
     _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant"}
     _API_V1_MAX_MESSAGES = 64
@@ -1396,19 +1385,16 @@ class RelayClient:
         )
         if callable(supports_api_v1_model) and manager_defines_supports_model:
             candidate_ids = set(model_ids)
-            candidate_ids.update(self._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
             candidate_ids.update(self._API_V1_LOCAL_MODEL_ALIASES)
             candidate_ids.update(self._API_V1_LOCAL_MODEL_ALIASES.values())
             model_ids = {
                 model_id
                 for model_id in candidate_ids
-                if supports_api_v1_model(model_id)
+                if supports_api_v1_model(model_id) is True
             }
         else:
-            model_ids.update(self._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
-            model_ids.update(self._API_V1_LOCAL_MODEL_ALIASES)
-            model_ids.update(self._API_V1_LOCAL_MODEL_ALIASES.values())
-        return sorted(model_ids)
+            model_ids.update(self._api_v1_catalogue_ids_for_configured_runtime(model_ids))
+        return sorted(model_id for model_id in model_ids if not model_id.endswith(".gguf"))
 
     def _api_v1_compute_node_capabilities(self) -> Dict[str, Any]:
         context_tier = normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
@@ -2164,16 +2150,9 @@ class RelayClient:
     def _api_v1_local_model_ids_for_configured_runtime(
         cls, configured_ids: Set[str]
     ) -> Set[str]:
-        """Return local API v1 aliases served by the packaged Llama runtime."""
+        """Return API v1 IDs supported by the active configured runtime profile."""
 
-        local_ids = set(cls._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
-        local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES)
-        local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES.values())
-        local_ids.update(cls._API_V1_LOCAL_ADAPTER_BASE_MODELS)
-        local_ids.update(cls._API_V1_LOCAL_ADAPTER_BASE_MODELS.values())
-        if configured_ids & local_ids:
-            return local_ids
-        return set()
+        return cls._api_v1_catalogue_ids_for_configured_runtime(configured_ids)
 
     @classmethod
     def _api_v1_requested_model_ids(cls, model_id: str) -> Set[str]:
@@ -2217,14 +2196,6 @@ class RelayClient:
             if entry_ids & configured_ids:
                 runtime_catalogue_ids.update(entry_ids)
 
-        aliases = getattr(models_module, "MODEL_ALIASES", {})
-        if isinstance(aliases, dict):
-            for alias, target in aliases.items():
-                alias_id = str(alias).strip().lower()
-                target_id = str(target).strip().lower()
-                if target_id in runtime_catalogue_ids:
-                    runtime_catalogue_ids.add(alias_id)
-
         return runtime_catalogue_ids
 
     @classmethod
@@ -2264,7 +2235,11 @@ class RelayClient:
             getattr(type(self.model_manager), "supports_api_v1_model", None)
         )
         if callable(supports_api_v1_model) and manager_defines_supports_model:
-            return bool(supports_api_v1_model(normalized_model))
+            requested_ids = self._api_v1_requested_model_ids(normalized_model)
+            return any(
+                supports_api_v1_model(requested_model_id) is True
+                for requested_model_id in requested_ids
+            )
 
         if getattr(self.model_manager, "use_mock_llm", False) is True:
             return True

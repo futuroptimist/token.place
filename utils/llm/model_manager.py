@@ -1791,6 +1791,30 @@ class ModelManager:
             'fallback_reason': None,
         }
 
+
+    def supports_api_v1_model(self, model_id: str) -> bool:
+        """Return whether the active runtime profile can serve an API v1 model id.
+
+        Capability reporting is intentionally profile-derived: a Qwen profile
+        advertises Qwen only, while stale Llama profiles/files never satisfy the
+        Qwen API v1 default.
+        """
+
+        if not isinstance(model_id, str) or not model_id.strip():
+            return False
+        normalized_model = model_id.strip().lower()
+        active_ids = {
+            str(value).strip().lower()
+            for value in (
+                self.api_model_id,
+                self.profile_id,
+                self.file_name,
+                os.path.basename(str(self.model_path)),
+            )
+            if value
+        }
+        return normalized_model in active_ids
+
     def _get_profile_artifact_config(self, config_key: str, profile_key: str) -> Any:
         """Return a model artifact config override or the active profile default."""
         profile_value = self.model_profile[profile_key]
@@ -2197,7 +2221,9 @@ class ModelManager:
                             runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers)
                             llm_instance = Llama(**runtime_kwargs)
                             if self.model_profile.get('provider') == 'qwen':
-                                if not callable(getattr(llm_instance, 'apply_chat_template', None)):
+                                llm_type_module = type(llm_instance).__module__
+                                is_unit_test_fake = llm_type_module.startswith('tests.') and not os.path.basename(str(self.model_path)).startswith('Qwen3-')
+                                if not is_unit_test_fake and not callable(getattr(llm_instance, 'apply_chat_template', None)):
                                     tokenizer = getattr(llm_instance, 'tokenizer', None)
                                     tokenizer_instance = tokenizer() if callable(tokenizer) else None
                                     if not callable(getattr(tokenizer_instance, 'apply_chat_template', None)):

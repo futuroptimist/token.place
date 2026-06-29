@@ -29,9 +29,9 @@ def _reload_models(env=None):
 
 def test_resolve_model_alias_returns_canonical_id_for_compat_aliases():
     models = _reload_models()
-    assert models.resolve_model_alias("llama-3-8b-instruct") == "llama-3.1-8b-instruct"
-    assert models.resolve_model_alias("gpt-5-chat-latest") == "llama-3.1-8b-instruct"
-    assert models.resolve_model_alias("gpt-3.5-turbo") == "llama-3.1-8b-instruct"
+    assert models.resolve_model_alias("llama-3-8b-instruct") == "qwen3-8b-instruct"
+    assert models.resolve_model_alias("gpt-5-chat-latest") == "qwen3-8b-instruct"
+    assert models.resolve_model_alias("gpt-3.5-turbo") == "qwen3-8b-instruct"
 
 
 def test_resolve_model_alias_rejects_unsupported_gpt_id():
@@ -47,3 +47,16 @@ def test_resolve_model_alias_missing_target_logs_and_returns_none():
                 result = models.resolve_model_alias("local-alias")
     assert result is None
     mock_log_warning.assert_called_once()
+
+
+def test_api_v1_alias_sources_agree_across_relay_and_client():
+    models = _reload_models()
+    import relay
+    from utils.llm.model_profiles import build_model_aliases
+    from utils.networking.relay_client import RelayClient
+
+    expected = build_model_aliases()
+
+    assert models.MODEL_ALIASES == expected
+    assert relay.MODEL_ALIASES == expected
+    assert RelayClient._API_V1_LOCAL_MODEL_ALIASES == expected

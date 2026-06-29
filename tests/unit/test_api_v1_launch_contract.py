@@ -153,9 +153,9 @@ def test_landing_page_documents_openai_aliases_and_excludes_api_v2_launch_docs()
 def test_landing_page_freezes_single_meta_llama_model_without_owner_display():
     html = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert "llama-3.1-8b-instruct" in html
+    assert "qwen3-8b-instruct" in html
     assert "llama-3-8b-instruct:alignment" not in html
-    assert "llama-3.1-8b-instruct:alignment" not in html
+    assert "qwen3-8b-instruct:alignment" not in html
     assert "owned by token.place" not in html
     assert "selectedModelSummary" not in html
 
@@ -181,7 +181,7 @@ def test_api_v1_chat_completions_rejects_stream_true(client):
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         },
@@ -201,9 +201,9 @@ def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
     assert payload["object"] == "list"
     assert len(payload["data"]) == 1
     model = payload["data"][0]
-    assert model["id"] == "llama-3.1-8b-instruct"
+    assert model["id"] == "qwen3-8b-instruct"
     assert model["object"] == "model"
-    assert model["owned_by"] == "Meta"
+    assert model["owned_by"] == "Qwen"
     assert "token.place" not in model["owned_by"]
     assert "permission" in model
     assert isinstance(model["permission"], list)
@@ -217,13 +217,13 @@ def test_api_v1_model_aliases_are_invisible_and_alignment_is_rejected(client):
     listing = client.get("/api/v1/models").get_json()["data"]
     listed_ids = [model["id"] for model in listing]
 
-    assert listed_ids == ["llama-3.1-8b-instruct"]
+    assert listed_ids == ["qwen3-8b-instruct"]
     assert "llama-3-8b-instruct" not in listed_ids
     assert "llama-3-8b-instruct:alignment" not in listed_ids
 
     alias_response = client.get("/api/v1/models/llama-3-8b-instruct")
     assert alias_response.status_code == 200
-    assert alias_response.get_json()["id"] == "llama-3.1-8b-instruct"
+    assert alias_response.get_json()["id"] == "qwen3-8b-instruct"
 
     alignment_response = client.get("/api/v1/models/llama-3-8b-instruct:alignment")
     assert alignment_response.status_code == 404
@@ -246,7 +246,7 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
     original_compute_generator = compute_provider.generate_response
 
     def fake_generate_response(model_id, messages, **options):
-        assert model_id == "llama-3.1-8b-instruct"
+        assert model_id == "qwen3-8b-instruct"
         assert options == {"temperature": 0.2}
         return messages + [{"role": "assistant", "content": "request-local bridge"}]
 
@@ -254,7 +254,7 @@ def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
 
     result = routes._call_provider_complete_chat(
         compute_provider.LocalApiV1ComputeProvider(),
-        model_id="llama-3.1-8b-instruct",
+        model_id="qwen3-8b-instruct",
         messages=[{"role": "user", "content": "hello"}],
         options={"temperature": 0.2},
     )
@@ -311,7 +311,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     )
     fake_crypto = _FakeCryptoManager()
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, params=None):
         assert url == "https://staging.token.place/api/v1/relay/servers/next"
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
@@ -345,7 +345,7 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
         },
     )
@@ -372,7 +372,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
         lambda *_args, **_kwargs: pytest.fail("local inference was called"),
     )
 
-    def fake_no_node_get(url, timeout):
+    def fake_no_node_get(url, timeout, params=None):
         assert url == "https://staging.token.place/api/v1/relay/servers/next"
         return _FakeResponse(
             503,
@@ -389,7 +389,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
         },
         headers={"Origin": "https://staging.democratized.space"},
@@ -423,7 +423,7 @@ def test_local_public_chat_still_reports_missing_llama_dependency(monkeypatch, c
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
         },
     )
@@ -455,7 +455,7 @@ def test_explicit_local_public_chat_ignores_relay_public_url(monkeypatch, client
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
         },
     )
@@ -498,7 +498,7 @@ def test_compute_error_remap_fails_closed_when_implicit_relay_check_fails(
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "llama-3.1-8b-instruct",
+            "model": "qwen3-8b-instruct",
             "messages": [{"role": "user", "content": "hello"}],
         },
     )

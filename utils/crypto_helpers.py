@@ -35,6 +35,8 @@ from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
 import uuid
 
+DEFAULT_API_V1_MODEL_ID = "qwen3-8b-instruct"
+
 # Import encryption functions
 from encrypt import (
     generate_keys,
@@ -317,7 +319,7 @@ class CryptoClient:
             "request_id": request_id,
             "client_public_key": self.client_public_key_b64,
             "api_v1_request": {
-                "model": "llama-3-8b-instruct",
+                "model": DEFAULT_API_V1_MODEL_ID,
                 "messages": chat_history,
                 "options": {},
             },
@@ -519,7 +521,7 @@ class CryptoClient:
         logger.error(f"Failed to retrieve chat response after {max_retries} attempts")
         return None
 
-    def send_api_request(self, messages: List[Dict], model: str = 'llama-3-8b-instruct') -> Optional[Dict]:
+    def send_api_request(self, messages: List[Dict], model: str = DEFAULT_API_V1_MODEL_ID) -> Optional[Dict]:
         """
         Send an encrypted API request to the chat completions endpoint
 
@@ -617,7 +619,7 @@ class CryptoClient:
         self,
         messages: List[Dict[str, Any]],
         *,
-        model: str = 'llama-3-8b-instruct',
+        model: str = DEFAULT_API_V1_MODEL_ID,
         endpoint: str = '/api/v1/chat/completions',
         timeout: float = 30,
         max_retries: int = 1,

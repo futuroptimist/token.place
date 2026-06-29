@@ -1078,6 +1078,10 @@ class TestRelayClient:
         response = MagicMock(status_code=200)
         response.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0}
         mock_post.return_value = response
+        relay_client.model_manager.api_model_id = "qwen3-8b-instruct"
+        relay_client.model_manager.model_id = None
+        relay_client.model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        relay_client.model_manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
         relay_client.model_manager.context_tier = "64k-full"
         relay_client.model_manager.context_window_tokens = 65536
         relay_client.model_manager.last_compute_diagnostics = {"backend_used": "cuda"}
@@ -1091,7 +1095,7 @@ class TestRelayClient:
         assert payload["capabilities"]["maximum_total_context_tokens"] == 65536
         assert payload["capabilities"]["max_concurrency"] == 1
         assert payload["capabilities"]["backend_class"] == "cuda"
-        assert "llama-3.1-8b-instruct" in payload["capabilities"]["supported_model_ids"]
+        assert payload["capabilities"]["supported_model_ids"] == ["qwen3-8b-instruct"]
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
@@ -1935,10 +1939,10 @@ class TestRelayClient:
         )
         request_data = TEST_VALID_RESPONSE.copy()
         mock_model_manager.use_mock_llm = False
-        mock_model_manager.api_model_id = None
+        mock_model_manager.api_model_id = "qwen3-8b-instruct"
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -1972,7 +1976,7 @@ class TestRelayClient:
 
     @pytest.mark.parametrize("model_id", ["gpt-3.5-turbo", "gpt-5-chat-latest"])
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_api_v1_local_aliases_use_packaged_llama_runtime(
+    def test_process_client_request_api_v1_aliases_use_active_qwen_runtime(
         self,
         mock_post,
         model_id,
@@ -1981,7 +1985,7 @@ class TestRelayClient:
         mock_model_manager,
         monkeypatch,
     ):
-        """Local alias map preserves API v1 semantics without importing api.v1.models."""
+        """Profile-derived alias map preserves API v1 semantics for an active Qwen runtime."""
 
         monkeypatch.setattr(
             "utils.networking.relay_client.importlib.import_module",
@@ -1989,10 +1993,10 @@ class TestRelayClient:
         )
         request_data = TEST_VALID_RESPONSE.copy()
         mock_model_manager.use_mock_llm = False
-        mock_model_manager.api_model_id = None
+        mock_model_manager.api_model_id = "qwen3-8b-instruct"
         mock_model_manager.model_id = None
-        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.file_name = "Qwen3-8B-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2463,6 +2467,20 @@ class TestRelayClient:
 
         assert "none" not in supported_model_ids
 
+
+    def test_api_v1_supported_model_ids_stale_llama_runtime_does_not_advertise_qwen(
+        self, relay_client, mock_model_manager
+    ):
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+
+        supported_model_ids = relay_client._api_v1_supported_model_ids()
+
+        assert "qwen3-8b-instruct" not in supported_model_ids
+
     def test_api_v1_supported_model_ids_respects_manager_support_hook(self, relay_client):
         class _Manager:
             api_model_id = "custom-local-api-v1-model"
@@ -2602,6 +2620,44 @@ class TestRelayClient:
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_stale_llama_runtime_rejects_qwen(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-stale-llama-qwen",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "qwen3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_model_unsupported"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_uses_manager_model_support_hook(
         self,
@@ -2666,6 +2722,71 @@ class TestRelayClient:
         assert manager.checked_model_ids == ["custom-local-api-v1-model"]
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_resolves_alias_before_manager_support_hook(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Qwen runtimes should accept relay-scheduled compatibility alias payloads."""
+
+        class _Manager:
+            use_mock_llm = False
+
+            def supports_api_v1_model(self, model_id):
+                self.checked_model_ids.append(model_id)
+                return model_id == "qwen3-8b-instruct"
+
+            def __init__(self):
+                self.checked_model_ids = []
+                self.runtime = MagicMock()
+                self.runtime.create_chat_completion.return_value = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "alias ok",
+                            }
+                        }
+                    ]
+                }
+                self.runtime.apply_chat_template.side_effect = (
+                    lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+                        f"<{message['role']}>{message['content']}" for message in messages
+                    ) + ("<assistant>" if add_generation_prompt else "")
+                )
+                self.runtime.tokenize.side_effect = (
+                    lambda payload, _add_bos=False: list(range(len(payload)))
+                )
+
+            def get_llm_instance(self):
+                return self.runtime
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-alias-model",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3.1-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert "qwen3-8b-instruct" in manager.checked_model_ids
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == "alias ok"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_role_posts_invalid_request(
@@ -3073,10 +3194,10 @@ class TestRelayClient:
 
         class _Manager:
             use_mock_llm = False
-            api_model_id = None
+            api_model_id = "qwen3-8b-instruct"
             model_id = None
-            file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-            model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+            file_name = "Qwen3-8B-Q4_K_M.gguf"
+            model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
 
             def __init__(self):
                 self.config = _Config()
@@ -3097,7 +3218,7 @@ class TestRelayClient:
             "request_id": "req-openai-options",
             "client_public_key": request_data["client_public_key"],
             "api_v1_request": {
-                "model": "llama-3-8b-instruct",
+                "model": "qwen3-8b-instruct",
                 "messages": [{"role": "user", "content": "Hello"}],
                 "options": {
                     "frequency_penalty": 0.1,

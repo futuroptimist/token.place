@@ -41,9 +41,10 @@ class ModelProfile(_ModelProfileRequired, total=False):
 
 
 LLAMA_3_1_8B_PROFILE_ID = "llama-3.1-8b-q4-k-m"
-CANONICAL_API_V1_MODEL_ID = "llama-3.1-8b-instruct"
+LLAMA_3_1_API_MODEL_ID = "llama-3.1-8b-instruct"
+CANONICAL_API_V1_MODEL_ID = "qwen3-8b-instruct"
 QWEN3_8B_PROFILE_ID = "qwen3-8b-q4-k-m"
-QWEN3_API_MODEL_ID = "qwen3-8b-instruct"
+QWEN3_API_MODEL_ID = CANONICAL_API_V1_MODEL_ID
 
 LLAMA_DOWNLOAD_URL = (
     "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
@@ -55,7 +56,7 @@ LLAMA_FAMILY_URL = "https://huggingface.co/meta-llama/Meta-Llama-3-8B"
 MODEL_PROFILES: Dict[str, ModelProfile] = {
     LLAMA_3_1_8B_PROFILE_ID: {
         "profile_id": LLAMA_3_1_8B_PROFILE_ID,
-        "api_model_id": CANONICAL_API_V1_MODEL_ID,
+        "api_model_id": LLAMA_3_1_API_MODEL_ID,
         "display_name": "Meta Llama 3.1 8B Instruct",
         "description": (
             "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
@@ -78,16 +79,16 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "chat_template_policy": "llama-3",
         "thinking_mode": "not-applicable",
         "generation_defaults": {},
-        "aliases": ["llama-3-8b-instruct", "gpt-3.5-turbo", "gpt-5-chat-latest"],
+        "aliases": [],
         "rope_scaling_policy": None,
-        "public_catalog": True,
+        "public_catalog": False,
         "runnable": True,
     },
     QWEN3_8B_PROFILE_ID: {
         "profile_id": QWEN3_8B_PROFILE_ID,
         "api_model_id": QWEN3_API_MODEL_ID,
         "display_name": "Qwen3 8B Instruct",
-        "description": "Internal non-default profile metadata for future Qwen3 8B API v1 support.",
+        "description": "Qwen3 8B Instruct Q4_K_M with API v1 non-thinking mode enforced and validated 8K/64K context tiers.",
         "owner": "Qwen",
         "provider": "qwen",
         "source_model": "Qwen/Qwen3-8B",
@@ -105,9 +106,9 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "chat_template_policy": "gguf-jinja",
         "thinking_mode": "disabled",
         "generation_defaults": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0},
-        "aliases": [],
+        "aliases": ["llama-3.1-8b-instruct", "llama-3-8b-instruct", "gpt-3.5-turbo", "gpt-5-chat-latest"],
         "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
-        "public_catalog": False,
+        "public_catalog": True,
         "runnable": True,
     },
 }
@@ -119,11 +120,11 @@ def get_model_profile(profile_id: str) -> Optional[ModelProfile]:
 
 
 def get_default_model_profile() -> ModelProfile:
-    profile = get_model_profile(LLAMA_3_1_8B_PROFILE_ID)
+    profile = get_model_profile(QWEN3_8B_PROFILE_ID)
     if profile is None:
         raise RuntimeError(
-            f"Default model profile '{LLAMA_3_1_8B_PROFILE_ID}' not found in MODEL_PROFILES. "
-            "Ensure the Llama profile has not been removed."
+            f"Default model profile '{QWEN3_8B_PROFILE_ID}' not found in MODEL_PROFILES. "
+            "Ensure the Qwen profile has not been removed."
         )
     return profile
 
@@ -147,9 +148,9 @@ def resolve_profile_id(profile_id: Optional[str], api_model_id: Optional[str] = 
             "Unknown model profile selection (profile_id=%r, api_model_id=%r); falling back to %s",
             profile_id,
             api_model_id,
-            LLAMA_3_1_8B_PROFILE_ID,
+            QWEN3_8B_PROFILE_ID,
         )
-    return LLAMA_3_1_8B_PROFILE_ID
+    return QWEN3_8B_PROFILE_ID
 
 
 def build_model_aliases() -> Dict[str, str]:

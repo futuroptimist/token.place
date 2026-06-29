@@ -163,23 +163,47 @@ class TestModelManager:
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
 
+    def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
+        """API v1 admission is limited to the active profile/runtime identifiers."""
+        assert model_manager.supports_api_v1_model('qwen3-8b-instruct') is True
+        assert model_manager.supports_api_v1_model('qwen3-8b-q4-k-m') is True
+        assert model_manager.supports_api_v1_model('test_model.gguf') is True
+        assert model_manager.supports_api_v1_model(' TEST_MODEL.GGUF ') is True
+
+        assert model_manager.supports_api_v1_model('llama-3.1-8b-instruct') is False
+        assert model_manager.supports_api_v1_model('') is False
+        assert model_manager.supports_api_v1_model(None) is False
+
+    def test_supports_api_v1_model_rejects_qwen_for_stale_llama_runtime(self):
+        """A stale Llama runtime/file must not advertise the Qwen API v1 default."""
+        manager = self._build_manager_with_model_config({
+            'model.profile_id': 'llama-3.1-8b-q4-k-m',
+            'model.api_model_id': 'llama-3.1-8b-instruct',
+            'model.filename': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
+        })
+
+        assert manager.supports_api_v1_model('llama-3.1-8b-instruct') is True
+        assert manager.supports_api_v1_model('Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf') is True
+        assert manager.supports_api_v1_model('qwen3-8b-instruct') is False
+        assert manager.supports_api_v1_model('Qwen3-8B-Q4_K_M.gguf') is False
+
     def test_get_model_artifact_metadata(self, model_manager):
         """Test runtime model metadata includes expected keys and file state."""
         metadata = model_manager.get_model_artifact_metadata()
 
-        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
-        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
-        assert metadata['display_name'] == 'Meta Llama 3.1 8B Instruct'
-        assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+        assert metadata['api_model_id'] == 'qwen3-8b-instruct'
+        assert metadata['profile_id'] == 'qwen3-8b-q4-k-m'
+        assert metadata['display_name'] == 'Qwen3 8B Instruct'
+        assert metadata['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
         assert metadata['filename'] == 'test_model.gguf'
         assert metadata['url'] == 'https://example.com/model.gguf'
-        assert metadata['gguf_repo'] == 'bartowski/Meta-Llama-3.1-8B-Instruct-GGUF'
-        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['gguf_repo'] == 'Qwen/Qwen3-8B-GGUF'
+        assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
-        assert metadata['license'] == 'llama3.1'
-        assert metadata['native_context_tokens'] == 8192
-        assert metadata['maximum_validated_context_tokens'] == 8192
-        assert metadata['supported_context_tiers'] == ['8k-fast']
+        assert metadata['license'] == 'apache-2.0'
+        assert metadata['native_context_tokens'] == 32768
+        assert metadata['maximum_validated_context_tokens'] == 65536
+        assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
         assert metadata['models_dir'] == self._temp_dir
         assert metadata['resolved_model_path'] == os.path.join(self._temp_dir, 'test_model.gguf')
         assert metadata['exists'] is True
@@ -190,24 +214,21 @@ class TestModelManager:
         assert missing_metadata['exists'] is False
         assert missing_metadata['size_bytes'] is None
 
-    def test_default_model_artifact_metadata_remains_llama_profile(self):
-        """Unselected profiles should keep the existing Llama artifact defaults."""
+    def test_default_model_artifact_metadata_uses_qwen_profile(self):
+        """Default profile should use the Qwen artifact defaults."""
         manager = self._build_manager_with_model_config({})
         metadata = manager.get_model_artifact_metadata()
 
-        assert metadata['api_model_id'] == 'llama-3.1-8b-instruct'
-        assert metadata['profile_id'] == 'llama-3.1-8b-q4-k-m'
-        assert metadata['filename'] == 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        assert metadata['url'] == (
-            'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
-            'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        )
-        assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
-        assert metadata['source_model'] == 'meta-llama/Llama-3.1-8B-Instruct'
+        assert metadata['api_model_id'] == 'qwen3-8b-instruct'
+        assert metadata['profile_id'] == 'qwen3-8b-q4-k-m'
+        assert metadata['filename'] == 'Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
+        assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
-        assert metadata['native_context_tokens'] == 8192
-        assert metadata['maximum_validated_context_tokens'] == 8192
-        assert metadata['supported_context_tiers'] == ['8k-fast']
+        assert metadata['native_context_tokens'] == 32768
+        assert metadata['maximum_validated_context_tokens'] == 65536
+        assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
     def test_profile_artifacts_follow_selected_profile_when_defaults_are_seeded(self):
         """Selecting a profile should replace seeded Llama artifact defaults."""
@@ -2044,6 +2065,7 @@ def test_no_signal_warm_load_uses_subprocess_facade(monkeypatch, tmp_path):
     config = MagicMock()
     config.is_production = False
     config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
         'model.filename': 'test_model.gguf',
         'model.url': 'https://example.com/model.gguf',
         'model.download_chunk_size_mb': 1,

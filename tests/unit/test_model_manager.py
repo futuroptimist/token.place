@@ -4118,6 +4118,68 @@ class Llama:
     assert 'rendered fallback prompt' not in json.dumps(response)
 
 
+def test_llama_worker_render_and_tokenize_chat_uses_qwen_gguf_jinja_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    metadata = {
+        'general.name': 'Qwen3-8B',
+        'tokenizer.chat_template': (
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\\n"
+            "{{ message['content'] }}<|im_end|>\\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\\n{% endif %}"
+        ),
+    }
+    def __init__(self, *args, **kwargs):
+        pass
+    def create_chat_completion(self, *args, **kwargs):
+        return {'choices': [{'message': {'content': 'ok'}}]}
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt.startswith(b'<|im_start|>user')
+        assert b'/no_think' in prompt
+        assert prompt.endswith(b'<|im_start|>assistant\\n')
+        return [1, 2, 3, 4]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    serialized = json.dumps(response)
+    assert 'secret prompt' not in serialized
+    assert '<|im_start|>' not in serialized
+
+
+def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    metadata = {}
+    def __init__(self, *args, **kwargs):
+        pass
+    def create_chat_completion(self, *args, **kwargs):
+        return {'choices': [{'message': {'content': 'ok'}}]}
+    def tokenize(self, prompt, add_bos=False):
+        return [1]
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
+    assert response['diagnostics']['metadata_template_found'] is False
+    assert 'secret prompt' not in json.dumps(response)
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()

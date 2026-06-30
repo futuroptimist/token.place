@@ -802,7 +802,7 @@ def _read_llama_subprocess_message(
         raise LlamaCppWorkerEOFError(str(message.get('error') or f'{stage} worker exited before response'))
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
-        if stage == 'llama_cpp_inference' and message.get('request_error'):
+        if message.get('request_error') and stage != 'llama_cpp_init':
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
@@ -1101,6 +1101,134 @@ def _safe_request_error(reason, *, request=None, exc=None):
         'diagnostics': diagnostics,
     }
 
+def _worker_metadata_value(metadata, key):
+    if not isinstance(metadata, dict):
+        return None
+    if key in metadata:
+        return metadata.get(key)
+    suffix = '.' + key
+    for candidate_key, value in metadata.items():
+        if str(candidate_key).endswith(suffix):
+            return value
+    return None
+
+def _worker_collect_metadata(llama):
+    metadata = {}
+    for attr in ('metadata', 'model_metadata'):
+        value = getattr(llama, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        if isinstance(value, dict):
+            metadata.update(value)
+    model = getattr(llama, 'model', None)
+    if model is not None:
+        for attr in ('metadata', 'model_metadata'):
+            value = getattr(model, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    value = None
+            if isinstance(value, dict):
+                metadata.update(value)
+    tokenizer = getattr(llama, 'tokenizer', None)
+    if callable(tokenizer):
+        try:
+            tokenizer = tokenizer()
+        except Exception:
+            tokenizer = None
+    if tokenizer is not None:
+        for attr in ('metadata', 'model_metadata'):
+            value = getattr(tokenizer, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    value = None
+            if isinstance(value, dict):
+                metadata.update(value)
+    return metadata
+
+def _worker_direct_chat_template_renderer(llama):
+    render = getattr(llama, 'apply_chat_template', None)
+    if callable(render):
+        return render, True
+    tokenizer = getattr(llama, 'tokenizer', None)
+    if callable(tokenizer):
+        try:
+            tokenizer = tokenizer()
+        except Exception:
+            tokenizer = None
+    render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+    return (render, False) if callable(render) else (None, False)
+
+def _worker_gguf_jinja_chat_template_renderer(llama):
+    metadata = _worker_collect_metadata(llama)
+    template = _worker_metadata_value(metadata, 'tokenizer.chat_template')
+    if template is None:
+        template = _worker_metadata_value(metadata, 'chat_template')
+    if not isinstance(template, str) or not template.strip():
+        return None, {
+            'reason': 'runtime_chat_template_metadata_missing',
+            'metadata_template_found': False,
+            'jinja_renderer_found': False,
+        }
+    qwen_hint = False
+    for key, value in metadata.items():
+        if isinstance(value, str) and 'qwen' in value.lower():
+            qwen_hint = True
+            break
+        if 'qwen' in str(key).lower():
+            qwen_hint = True
+            break
+    if not qwen_hint and 'qwen' in template.lower():
+        qwen_hint = True
+    if not qwen_hint:
+        return None, {
+            'reason': 'runtime_chat_template_renderer_unavailable',
+            'metadata_template_found': True,
+            'jinja_renderer_found': False,
+        }
+    try:
+        jinja2 = importlib.import_module('jinja2')
+    except Exception:
+        return None, {
+            'reason': 'runtime_chat_template_renderer_unavailable',
+            'metadata_template_found': True,
+            'jinja_renderer_found': False,
+        }
+    try:
+        compiled_template = jinja2.Environment(
+            trim_blocks=True,
+            lstrip_blocks=True,
+        ).from_string(template)
+    except Exception:
+        return None, {
+            'reason': 'runtime_chat_template_renderer_unavailable',
+            'metadata_template_found': True,
+            'jinja_renderer_found': True,
+        }
+
+    def _render(messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        if tokenize:
+            raise TypeError('worker GGUF/Jinja render path returns text only')
+        return compiled_template.render(
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+            bos_token=_worker_metadata_value(metadata, 'tokenizer.ggml.bos_token') or '',
+            eos_token=_worker_metadata_value(metadata, 'tokenizer.ggml.eos_token') or '<|endoftext|>',
+            enable_thinking=kwargs.get('enable_thinking', False),
+        )
+
+    return _render, {
+        'reason': None,
+        'metadata_template_found': True,
+        'jinja_renderer_found': True,
+    }
+
 try:
     init_line = sys.stdin.readline()
     if not init_line:
@@ -1129,18 +1257,24 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_kwargs', request=request))
             continue
         if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
-            render = getattr(llama, 'apply_chat_template', None)
+            render, direct_apply = _worker_direct_chat_template_renderer(llama)
+            template_diagnostics = {
+                'direct_apply_chat_template': bool(direct_apply and callable(render)),
+                'metadata_template_found': False,
+                'jinja_renderer_found': False,
+            }
             if not callable(render):
-                tokenizer = getattr(llama, 'tokenizer', None)
-                if callable(tokenizer):
-                    try:
-                        tokenizer = tokenizer()
-                    except Exception:
-                        tokenizer = None
-                render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+                render, gguf_diagnostics = _worker_gguf_jinja_chat_template_renderer(llama)
+                template_diagnostics.update({
+                    key: value for key, value in gguf_diagnostics.items()
+                    if key in {'metadata_template_found', 'jinja_renderer_found'}
+                })
             if method == 'render_and_tokenize_chat':
                 if not callable(render):
-                    _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request))
+                    reason = (gguf_diagnostics or {}).get('reason') or 'runtime_template_tokenizer_bridge_unavailable'
+                    response = _safe_request_error(reason, request=request)
+                    response['diagnostics'].update(template_diagnostics)
+                    _emit(response)
                     continue
                 try:
                     try:
@@ -1159,15 +1293,21 @@ for line in sys.stdin:
                         continue
                     tokenize = getattr(llama, 'tokenize', None)
                     if not callable(tokenize):
-                        _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request))
+                        response = _safe_request_error('runtime_tokenizer_unavailable', request=request)
+                        response['diagnostics'].update(template_diagnostics)
+                        _emit(response)
                         continue
                     tokens = tokenize(rendered_prompt.encode('utf-8'), add_bos=False)
                     if not isinstance(tokens, (list, tuple)):
-                        _emit(_safe_request_error('tokenizer_unavailable', request=request))
+                        response = _safe_request_error('runtime_tokenizer_unavailable', request=request)
+                        response['diagnostics'].update(template_diagnostics)
+                        _emit(response)
                         continue
                     _emit({'status': 'ok', 'result': {'prompt_tokens': len(tokens)}})
                 except Exception as exc:
-                    _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request, exc=exc))
+                    response = _safe_request_error('runtime_chat_template_render_exception', request=request, exc=exc)
+                    response['diagnostics'].update(template_diagnostics)
+                    _emit(response)
                 continue
             if not callable(render):
                 try:
@@ -2268,7 +2408,11 @@ class ModelManager:
                             if self.model_profile.get('provider') == 'qwen':
                                 llm_type_module = type(llm_instance).__module__
                                 is_unit_test_fake = llm_type_module.startswith('tests.') and not os.path.basename(str(self.model_path)).startswith('Qwen3-')
-                                if not is_unit_test_fake and not callable(getattr(llm_instance, 'apply_chat_template', None)):
+                                if (
+                                    not is_unit_test_fake
+                                    and not callable(getattr(llm_instance, 'apply_chat_template', None))
+                                    and not callable(getattr(llm_instance, 'render_and_tokenize_chat', None))
+                                ):
                                     tokenizer = getattr(llm_instance, 'tokenizer', None)
                                     tokenizer_instance = tokenizer() if callable(tokenizer) else None
                                     if not callable(getattr(tokenizer_instance, 'apply_chat_template', None)):

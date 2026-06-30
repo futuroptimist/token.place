@@ -4031,10 +4031,28 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     assert proxy._closed is True
 
 
-def _run_llama_worker_request(tmp_path, request, *, llama_body):
+def _run_llama_worker_request(tmp_path, request, *, llama_body, jinja_body='default'):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
     (package_dir / '__init__.py').write_text(llama_body)
+    if jinja_body == 'default':
+        jinja_body = """
+class Rendered:
+    def __init__(self, prompt):
+        self.prompt = prompt
+class Jinja2ChatFormatter:
+    def __init__(self, template=None, chat_template=None):
+        self.template = template or chat_template
+    def __call__(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        parts = []
+        for message in messages:
+            parts.append(f"<|im_start|>{message.get('role')}\\n{message.get('content', '')}<|im_end|>")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\\n")
+        return Rendered("\\n".join(parts))
+"""
+    if jinja_body is not None:
+        (package_dir / 'llama_chat_format.py').write_text(jinja_body)
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
     process = subprocess.Popen(
@@ -4451,3 +4469,76 @@ def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
 
     with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
         manager._runtime_init_kwargs(FakeLlama, 0)
+
+
+def test_llama_worker_render_and_tokenize_chat_uses_qwen_gguf_jinja_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    metadata = {'tokenizer.chat_template': 'qwen <|im_start|>{{ messages }}'}
+    def __init__(self, *args, **kwargs):
+        pass
+    def create_chat_completion(self, **kwargs):
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    def tokenizer(self):
+        class Tokenizer:
+            pass
+        return Tokenizer()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'<|im_start|>user\\n/no_think\\nsecret prompt<|im_end|>\\n<|im_start|>assistant\\n'
+        return [1, 2, 3, 4]
+class Rendered:
+    def __init__(self, prompt):
+        self.prompt = prompt
+class Jinja2ChatFormatter:
+    def __init__(self, template=None, chat_template=None):
+        self.template = template or chat_template
+    def __call__(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        parts = []
+        for message in messages:
+            parts.append(f"<|im_start|>{message.get('role')}\\n{message.get('content', '')}<|im_end|>")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\\n")
+        return Rendered("\\n".join(parts))
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    serialized = json.dumps(response)
+    assert 'secret prompt' not in serialized
+    assert '<|im_start|>' not in serialized
+
+
+def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_jinja_renderer(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    metadata = {'tokenizer.chat_template': 'qwen <|im_start|>{{ messages }}'}
+    chat_format = 'llama-2'
+    def __init__(self, *args, **kwargs):
+        pass
+    def create_chat_completion(self, **kwargs):
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    def tokenize(self, prompt, add_bos=False):
+        return [1]
+""",
+        jinja_body=None,
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_renderer_unavailable'
+    assert response['diagnostics']['metadata_template_exists'] is True
+    assert response['diagnostics']['jinja_renderer_exists'] is False
+    assert 'secret prompt' not in json.dumps(response)

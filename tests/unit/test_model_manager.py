@@ -4247,6 +4247,34 @@ class Llama:
     assert 'secret prompt' not in json.dumps(second_response)
 
 
+def test_llama_worker_render_and_tokenize_chat_keeps_qwen_evidence_from_later_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body=r"""
+class Metadata(dict):
+    pass
+
+class Llama:
+    metadata = {
+        'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    }
+    def __init__(self, *args, **kwargs):
+        self._model = type('Model', (), {'metadata': {'general.name': 'Qwen3 test'}})()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'secret prompt'
+        return [1, 2, 3]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
 def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_evidence(tmp_path):
     response = _run_llama_worker_request(
         tmp_path,

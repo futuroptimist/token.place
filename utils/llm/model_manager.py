@@ -1151,6 +1151,8 @@ def _runtime_chat_template(llama):
                 evidence = evidence.decode('utf-8', errors='ignore')
             if isinstance(evidence, str) and 'qwen' in evidence.lower():
                 qwen_evidence = True
+
+    for metadata in metadata_candidates:
         for key in (
             'tokenizer.chat_template',
             'chat_template',

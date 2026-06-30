@@ -4031,10 +4031,12 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     assert proxy._closed is True
 
 
-def _run_llama_worker_request(tmp_path, request, *, llama_body):
+def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
     (package_dir / '__init__.py').write_text(llama_body)
+    if llama_chat_format_body is not None:
+        (package_dir / 'llama_chat_format.py').write_text(llama_chat_format_body)
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
     process = subprocess.Popen(
@@ -4116,6 +4118,340 @@ class Llama:
     assert response == {'status': 'ok', 'result': {'prompt_tokens': 2}}
     assert 'secret prompt' not in json.dumps(response)
     assert 'rendered fallback prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_uses_gguf_jinja_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': '/no_think\nsecret prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+            },
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {
+        'general.name': 'Qwen3 test',
+        'tokenizer.chat_template': (
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+            "{% if enable_thinking == false %}<|no_think|>{% endif %}"
+        )
+    }
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenizer(self):
+        class Tokenizer:
+            pass
+        return Tokenizer()
+    def tokenize(self, prompt, add_bos=False):
+        text = prompt.decode('utf-8')
+        assert '/no_think\nsecret prompt' in text
+        assert '<|im_start|>assistant' in text
+        assert '<|no_think|>' in text
+        return [1, 2, 3, 4]
+    def create_chat_completion(self, **kwargs):
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_fails_closed_without_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenizer(self):
+        class Tokenizer:
+            pass
+        return Tokenizer()
+    def tokenize(self, prompt, add_bos=False):
+        return [1, 2]
+    def create_chat_completion(self, **kwargs):
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_error_diagnostics_are_request_scoped(tmp_path):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(r"""
+class Llama:
+    metadata = {
+        'general.name': 'Qwen3 test',
+        'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    }
+    def __init__(self, *args, **kwargs):
+        self.calls = 0
+    def tokenize(self, prompt, add_bos=False):
+        self.calls += 1
+        self.metadata = {}
+        return [1]
+""")
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.flush()
+    assert json.loads(process.stdout.readline().split(':', 1)[1])['status'] == 'ok'
+
+    request = {
+        'method': 'render_and_tokenize_chat',
+        'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+        'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+    }
+    process.stdin.write(json.dumps(request) + '\n')
+    process.stdin.flush()
+    first_response = json.loads(process.stdout.readline().split(':', 1)[1])
+    process.stdin.write(json.dumps(request) + '\n')
+    process.stdin.flush()
+    second_response = json.loads(process.stdout.readline().split(':', 1)[1])
+    process.kill()
+    process.wait(timeout=5)
+
+    assert first_response == {'status': 'ok', 'result': {'prompt_tokens': 1}}
+    assert second_response['status'] == 'error'
+    assert second_response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
+    assert 'metadata_template_available' not in second_response['diagnostics']
+    assert 'secret prompt' not in json.dumps(second_response)
+
+
+def test_llama_worker_render_and_tokenize_chat_keeps_qwen_evidence_from_later_metadata(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body=r"""
+class Metadata(dict):
+    pass
+
+class Llama:
+    metadata = {
+        'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    }
+    def __init__(self, *args, **kwargs):
+        self._model = type('Model', (), {'metadata': {'general.name': 'Qwen3 test'}})()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'secret prompt'
+        return [1, 2, 3]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_evidence(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('must fail closed before rendering non-Qwen metadata')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_qwen_evidence_missing'
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_does_not_use_llama_formatter_for_qwen_metadata_path(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'hello'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {
+        'general.name': 'Qwen3 test',
+        'tokenizer.chat_template': "{% for message in messages %}qwen:{{ message['role'] }}{% endfor %}{% if add_generation_prompt %}assistant{% endif %}"
+    }
+    chat_format = 'llama-3'
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt.startswith(b'qwen:')
+        return [1]
+""",
+        llama_chat_format_body="""
+def format_llama3(*args, **kwargs):
+    raise AssertionError('Llama formatter must not be used for render_and_tokenize_chat metadata path')
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 1}}
+
+
+def test_llama_worker_render_and_tokenize_chat_formatter_falls_back_without_enable_thinking_support(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{% for message in messages %}plain:{{ message['content'] }}{% endfor %}{% if enable_thinking == false %}:no-think{% endif %}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'plain:secret prompt:no-think'
+        return [1, 2, 3]
+""",
+        llama_chat_format_body="""
+class Jinja2ChatFormatter:
+    def __init__(self, *, template, bos_token='', eos_token=''):
+        self.template = template
+    def __call__(self, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+        raise RuntimeError('formatter cannot render this template')
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_passes_bos_eos_to_formatter_and_jinja(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'hello'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def token_bos(self):
+        return 101
+    def token_eos(self):
+        return 102
+    def token_get_text(self, token_id):
+        return {101: b'<s>', 102: b'</s>'}[token_id]
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'<s>formatter hello</s>'
+        return [1, 2, 3, 4]
+""",
+        llama_chat_format_body="""
+class Rendered:
+    def __init__(self, prompt):
+        self.prompt = prompt
+class Jinja2ChatFormatter:
+    def __init__(self, *, template, bos_token='', eos_token=''):
+        self.bos_token = bos_token
+        self.eos_token = eos_token
+    def __call__(self, **kwargs):
+        assert self.bos_token == '<s>'
+        assert self.eos_token == '</s>'
+        return Rendered(self.bos_token + 'formatter hello' + self.eos_token)
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+
+
+def test_llama_worker_render_and_tokenize_chat_plain_jinja_uses_bos_eos_and_sandbox(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'hello'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def token_bos(self):
+        return 101
+    def token_eos(self):
+        return 102
+    def detokenize(self, token_ids):
+        return {101: b'<s>', 102: b'</s>'}[token_ids[0]]
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'<s>hello</s>'
+        return [1, 2, 3]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+
+
+def test_llama_worker_render_and_tokenize_chat_does_not_retry_unrelated_type_error(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.calls = 0
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls += 1
+        raise TypeError('template helper failed internally')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize should not run')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_render_exception'
+    assert 'secret prompt' not in json.dumps(response)
 
 
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):

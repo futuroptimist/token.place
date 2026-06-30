@@ -2438,6 +2438,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: Optional[bool] = None,
+        model_profile: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
         """Render and tokenize in one runtime bridge call when the facade exposes it."""
 
@@ -2445,6 +2446,13 @@ class RelayClient:
         if not callable(render_and_tokenize):
             return None
         kwargs = {"tokenize": False, "add_generation_prompt": True}
+        model_manager = getattr(llm_instance, "model_manager", None)
+        profile = model_profile or getattr(model_manager, "model_profile", None) or getattr(llm_instance, "model_profile", None) or {}
+        if isinstance(profile, dict):
+            if profile.get("provider"):
+                kwargs["token_place_provider"] = profile.get("provider")
+            if profile.get("chat_template_policy"):
+                kwargs["token_place_template_policy"] = profile.get("chat_template_policy")
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
         try:
@@ -2457,13 +2465,25 @@ class RelayClient:
                     "compute_node_context_admission_unavailable",
                 )
             return None
-        except Exception:
+        except Exception as exc:
+            if _is_llama_cpp_inference_request_error(exc):
+                diagnostics = getattr(exc, "diagnostics", None)
+                if isinstance(diagnostics, dict):
+                    safe_diagnostics = {}
+                    for key, value in diagnostics.items():
+                        if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
+                            safe_diagnostics[key] = value
+                    llm_instance._token_place_last_render_tokenize_error = safe_diagnostics
+                else:
+                    llm_instance._token_place_last_render_tokenize_error = {}
             return None
         if isinstance(result, dict):
             prompt_tokens = result.get("prompt_tokens")
         else:
             prompt_tokens = result
         if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
+            if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                delattr(llm_instance, "_token_place_last_render_tokenize_error")
             return prompt_tokens
         return None
 
@@ -2622,8 +2642,10 @@ class RelayClient:
         active_context_tier: str,
         configured_context_tokens: int,
         requested_context_tier: str,
+        internal_reason: str = "runtime_template_tokenizer_bridge_unavailable",
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
+        error = {
             "code": "compute_node_context_admission_unavailable",
             "type": "validation_error",
             "message": (
@@ -2634,8 +2656,23 @@ class RelayClient:
             "requested_context_tier": requested_context_tier,
             "configured_context_tokens": configured_context_tokens,
             "retryable": False,
-            "internal_reason": "runtime_template_tokenizer_bridge_unavailable",
+            "internal_reason": internal_reason,
         }
+        safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        for key in (
+            "active_model_id",
+            "active_profile_id",
+            "context_tier",
+            "template_policy",
+            "non_thinking_mode",
+            "runtime_facade_type",
+            "direct_apply_chat_template_available",
+            "metadata_template_available",
+            "jinja_renderer_available",
+        ):
+            if key in safe_diagnostics:
+                error[key] = safe_diagnostics[key]
+        return error
 
     def _api_v1_context_admission_error(
         self,
@@ -2709,6 +2746,7 @@ class RelayClient:
             llm_instance,
             messages,
             enable_thinking=None,
+            model_profile=model_profile,
         )
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
@@ -2729,11 +2767,34 @@ class RelayClient:
                 else None
             )
         if prompt_tokens is None:
+            worker_diagnostics = getattr(llm_instance, "_token_place_last_render_tokenize_error", None)
+            internal_reason = "runtime_template_tokenizer_bridge_unavailable"
+            if isinstance(worker_diagnostics, dict) and isinstance(worker_diagnostics.get("reason"), str):
+                internal_reason = worker_diagnostics["reason"]
+            safe_diagnostics = {
+                "active_model_id": getattr(self.model_manager, "api_model_id", None),
+                "active_profile_id": model_profile.get("id") or model_profile.get("model_id"),
+                "context_tier": active_context_tier,
+                "template_policy": model_profile.get("chat_template_policy") or "llama-3",
+                "non_thinking_mode": is_qwen_non_thinking,
+                "runtime_facade_type": type(llm_instance).__name__,
+                "direct_apply_chat_template_available": callable(getattr(llm_instance, "apply_chat_template", None)),
+                "metadata_template_available": internal_reason != "runtime_chat_template_metadata_missing",
+                "jinja_renderer_available": internal_reason != "runtime_chat_template_renderer_unavailable",
+            }
             log_error(
-                "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={}",
+                "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={} model_id={} profile_id={} template_policy={} non_thinking={} runtime_facade={} direct_apply_chat_template_available={} metadata_template_available={} jinja_renderer_available={}",
                 active_context_tier,
-                "runtime_template_tokenizer_bridge_unavailable",
+                internal_reason,
                 "compute_node_context_admission_unavailable",
+                safe_diagnostics["active_model_id"],
+                safe_diagnostics["active_profile_id"],
+                safe_diagnostics["template_policy"],
+                safe_diagnostics["non_thinking_mode"],
+                safe_diagnostics["runtime_facade_type"],
+                safe_diagnostics["direct_apply_chat_template_available"],
+                safe_diagnostics["metadata_template_available"],
+                safe_diagnostics["jinja_renderer_available"],
             )
             return (
                 False,
@@ -2741,6 +2802,8 @@ class RelayClient:
                     active_context_tier=active_context_tier,
                     configured_context_tokens=configured_context_tokens,
                     requested_context_tier=requested_context_tier,
+                    internal_reason=internal_reason,
+                    diagnostics=safe_diagnostics,
                 ),
                 None,
             )

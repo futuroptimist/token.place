@@ -360,6 +360,112 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is True
 
 
+def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
+    class SmokeRuntime:
+        def __init__(self):
+            self.completion_kwargs = None
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **kwargs):
+            self.completion_kwargs = kwargs
+            return {"choices": [{"message": {"role": "assistant", "content": "ready"}}]}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    llm_runtime = SmokeRuntime()
+    model_manager.get_llm_instance.return_value = llm_runtime
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_readiness_result"] == "passed"
+    assert llm_runtime.completion_kwargs["stream"] is False
+    assert llm_runtime.completion_kwargs["max_tokens"] == 4
+    assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(monkeypatch):
+    class ThinkRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "<think>no"}}]}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = ThinkRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_result"] == "failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(monkeypatch):
+    class RaisingRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            raise RuntimeError("prompt text must not leak")
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = RaisingRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert "prompt text" not in str(diagnostics)
+
 @pytest.mark.parametrize(
     "llm_instance,getter,expected",
     [

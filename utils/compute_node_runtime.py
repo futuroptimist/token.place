@@ -460,6 +460,47 @@ class ComputeNodeRuntime:
             ) if not admitted else None,
         })
         self.model_manager.last_compute_diagnostics = diagnostics
+        if admitted and os.getenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION") == "1":
+            try:
+                smoke_completion = create_chat_completion(
+                    messages=smoke_messages,
+                    max_tokens=4,
+                    stream=False,
+                )
+                smoke_message = None
+                if (
+                    isinstance(smoke_completion, dict)
+                    and isinstance(smoke_completion.get("choices"), list)
+                    and smoke_completion["choices"]
+                    and isinstance(smoke_completion["choices"][0], dict)
+                ):
+                    smoke_message = smoke_completion["choices"][0].get("message")
+                smoke_content = smoke_message.get("content") if isinstance(smoke_message, dict) else None
+                smoke_ok = isinstance(smoke_content, str) and bool(smoke_content.strip()) and "<think" not in smoke_content.lower()
+                diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
+                if not smoke_ok:
+                    admitted = False
+                    admission_error = {
+                        "code": "compute_node_context_admission_unavailable",
+                        "internal_reason": "runtime_completion_smoke_failed",
+                    }
+            except Exception as exc:
+                admitted = False
+                admission_error = {
+                    "code": "compute_node_context_admission_unavailable",
+                    "internal_reason": "runtime_completion_smoke_failed",
+                }
+                diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = type(exc).__name__
+            diagnostics["api_v1_runtime_ready"] = bool(admitted)
+            diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
+            diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None
+            diagnostics["api_v1_readiness_error_reason"] = (
+                (admission_error or {}).get("internal_reason")
+                or (admission_error or {}).get("reason")
+            ) if not admitted else None
+            self.model_manager.last_compute_diagnostics = diagnostics
+
         if not admitted:
             admission_code = (admission_error or {}).get("code") or "unknown"
             admission_reason = (

@@ -2465,13 +2465,25 @@ class RelayClient:
                     "compute_node_context_admission_unavailable",
                 )
             return None
-        except Exception:
+        except Exception as exc:
+            if _is_llama_cpp_inference_request_error(exc):
+                diagnostics = getattr(exc, "diagnostics", None)
+                if isinstance(diagnostics, dict):
+                    safe_diagnostics = {}
+                    for key, value in diagnostics.items():
+                        if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
+                            safe_diagnostics[key] = value
+                    llm_instance._token_place_last_render_tokenize_error = safe_diagnostics
+                else:
+                    llm_instance._token_place_last_render_tokenize_error = {}
             return None
         if isinstance(result, dict):
             prompt_tokens = result.get("prompt_tokens")
         else:
             prompt_tokens = result
         if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
+            if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                delattr(llm_instance, "_token_place_last_render_tokenize_error")
             return prompt_tokens
         return None
 

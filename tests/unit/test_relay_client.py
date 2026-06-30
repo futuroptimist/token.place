@@ -5057,3 +5057,87 @@ def test_qwen_profile_generation_defaults_include_top_k():
     assert kwargs['temperature'] == 0.7
     assert kwargs['top_p'] == 0.8
     assert kwargs['top_k'] == 20
+
+
+def test_qwen_render_tokenize_worker_diagnostics_propagate_to_admission_error():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        def render_and_tokenize_chat(self, messages, **kwargs):
+            self.calls.append({"messages": messages, "kwargs": kwargs})
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "reason": "runtime_chat_template_metadata_missing",
+                    "method": "unsupported",
+                    "stream": False,
+                    "exception_type": "RuntimeError",
+                    "unsafe_prompt": "do not expose me",
+                    "nested": {"message": "do not expose me"},
+                },
+            )
+
+        def create_chat_completion(self, **kwargs):  # pragma: no cover - admission fails first
+            raise AssertionError("generation should not run when admission is unavailable")
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {
+        "id": "qwen3-local",
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "qwen3-no-think",
+    }
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-worker-diagnostics",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello diagnostic secret"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_admission_unavailable"
+    assert error["internal_reason"] == "runtime_chat_template_metadata_missing"
+    assert error["active_model_id"] == "qwen3-8b-instruct"
+    assert error["active_profile_id"] == "qwen3-local"
+    assert error["context_tier"] == "8k-fast"
+    assert error["template_policy"] == "qwen3-no-think"
+    assert error["non_thinking_mode"] is True
+    assert error["runtime_facade_type"] == "Runtime"
+    assert error["direct_apply_chat_template_available"] is False
+    assert error["metadata_template_available"] is False
+    assert error["jinja_renderer_available"] is True
+    assert manager.runtime._token_place_last_render_tokenize_error["reason"] == "runtime_chat_template_metadata_missing"
+    serialized = json.dumps(error, sort_keys=True)
+    assert "hello diagnostic secret" not in serialized
+    assert "do not expose me" not in serialized
+    assert "unsafe_prompt" not in serialized
+
+
+def test_render_tokenize_success_clears_stale_worker_diagnostics():
+    class Runtime:
+        def __init__(self):
+            self._token_place_last_render_tokenize_error = {
+                "reason": "runtime_chat_template_metadata_missing"
+            }
+
+        def render_and_tokenize_chat(self, messages, **kwargs):
+            return {"prompt_tokens": 3}
+
+    runtime = Runtime()
+
+    prompt_tokens = RelayClient._api_v1_render_and_tokenize_chat_prompt(
+        runtime,
+        [{"role": "user", "content": "hello"}],
+        model_profile={"provider": "qwen", "chat_template_policy": "qwen3-no-think"},
+    )
+
+    assert prompt_tokens == 3
+    assert not hasattr(runtime, "_token_place_last_render_tokenize_error")

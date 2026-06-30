@@ -802,7 +802,7 @@ def _read_llama_subprocess_message(
         raise LlamaCppWorkerEOFError(str(message.get('error') or f'{stage} worker exited before response'))
     if message.get('status') == 'error':
         error = str(message.get('error') or f'{stage} failed')
-        if stage == 'llama_cpp_inference' and message.get('request_error'):
+        if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize'} and message.get('request_error'):
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
@@ -1081,8 +1081,12 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
-def _safe_request_error(reason, *, request=None, exc=None):
+def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
+                diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
         if method == 'create_chat_completion':
@@ -1133,7 +1137,20 @@ def _runtime_chat_template(llama):
             getattr(tokenizer, 'metadata', None),
             getattr(tokenizer, 'model_metadata', None),
         ])
+    qwen_evidence = False
     for metadata in metadata_candidates:
+        for evidence_key in (
+            'general.name',
+            'general.architecture',
+            'tokenizer.ggml.model',
+            'tokenizer.chat_template.policy',
+            'chat_template_policy',
+        ):
+            evidence = _metadata_value(metadata, evidence_key)
+            if isinstance(evidence, bytes):
+                evidence = evidence.decode('utf-8', errors='ignore')
+            if isinstance(evidence, str) and 'qwen' in evidence.lower():
+                qwen_evidence = True
         for key in (
             'tokenizer.chat_template',
             'chat_template',
@@ -1144,8 +1161,8 @@ def _runtime_chat_template(llama):
             if isinstance(value, bytes):
                 value = value.decode('utf-8', errors='ignore')
             if isinstance(value, str) and value.strip():
-                return value
-    return None
+                return value, qwen_evidence
+    return None, qwen_evidence
 
 def _jinja_renderer_available():
     try:
@@ -1253,6 +1270,9 @@ def _type_error_is_unexpected_keyword(exc, keyword):
     )
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
+    kwargs = dict(kwargs)
+    provider_hint = str(kwargs.pop('token_place_provider', '') or '').lower()
+    policy_hint = str(kwargs.pop('token_place_template_policy', '') or '').lower()
     render = getattr(llama, 'apply_chat_template', None)
     direct_apply_available = callable(render)
     if not direct_apply_available:
@@ -1280,9 +1300,12 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'metadata_template': False,
                 'jinja_renderer': False,
             }
-    template = _runtime_chat_template(llama)
+    template, metadata_qwen_evidence = _runtime_chat_template(llama)
     if not isinstance(template, str) or not template.strip():
         raise RuntimeError('runtime_chat_template_metadata_missing')
+    qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
+    if not qwen_safe:
+        raise RuntimeError('runtime_chat_template_qwen_evidence_missing')
     if not _jinja_renderer_available():
         raise RuntimeError('runtime_chat_template_renderer_unavailable')
     messages = args[0] if args else kwargs.get('messages')
@@ -1299,6 +1322,7 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
         'direct_apply_chat_template': False,
         'metadata_template': True,
         'jinja_renderer': True,
+        'qwen_evidence': True,
     }
 
 try:
@@ -1353,8 +1377,9 @@ for line in sys.stdin:
                         'runtime_tokenizer_unavailable',
                         'runtime_template_tokenizer_bridge_unavailable',
                         'runtime_chat_template_render_exception',
+                        'runtime_chat_template_qwen_evidence_missing',
                     } else 'runtime_chat_template_render_exception'
-                    _emit(_safe_request_error(reason, request=request, exc=exc))
+                    _emit(_safe_request_error(reason, request=request, exc=exc, extra=_render_diagnostics if isinstance(locals().get('_render_diagnostics'), dict) else None))
                 continue
             render = getattr(llama, 'apply_chat_template', None)
             if not callable(render):

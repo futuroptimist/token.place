@@ -4135,6 +4135,7 @@ def test_llama_worker_render_and_tokenize_chat_uses_gguf_jinja_metadata(tmp_path
         llama_body=r"""
 class Llama:
     metadata = {
+        'general.name': 'Qwen3 test',
         'tokenizer.chat_template': (
             "{% for message in messages %}"
             "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
@@ -4192,6 +4193,29 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
+def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_evidence(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('must fail closed before rendering non-Qwen metadata')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_qwen_evidence_missing'
+    assert 'secret prompt' not in json.dumps(response)
+
+
 def test_llama_worker_render_and_tokenize_chat_does_not_use_llama_formatter_for_qwen_metadata_path(tmp_path):
     response = _run_llama_worker_request(
         tmp_path,
@@ -4203,6 +4227,7 @@ def test_llama_worker_render_and_tokenize_chat_does_not_use_llama_formatter_for_
         llama_body=r"""
 class Llama:
     metadata = {
+        'general.name': 'Qwen3 test',
         'tokenizer.chat_template': "{% for message in messages %}qwen:{{ message['role'] }}{% endfor %}{% if add_generation_prompt %}assistant{% endif %}"
     }
     chat_format = 'llama-3'
@@ -4231,7 +4256,7 @@ def test_llama_worker_render_and_tokenize_chat_formatter_falls_back_without_enab
         },
         llama_body=r"""
 class Llama:
-    metadata = {'tokenizer.chat_template': "{% for message in messages %}plain:{{ message['content'] }}{% endfor %}{% if enable_thinking == false %}:no-think{% endif %}"}
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{% for message in messages %}plain:{{ message['content'] }}{% endfor %}{% if enable_thinking == false %}:no-think{% endif %}"}
     def __init__(self, *args, **kwargs):
         pass
     def tokenize(self, prompt, add_bos=False):
@@ -4263,7 +4288,7 @@ def test_llama_worker_render_and_tokenize_chat_passes_bos_eos_to_formatter_and_j
         },
         llama_body=r"""
 class Llama:
-    metadata = {'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
     def __init__(self, *args, **kwargs):
         pass
     def token_bos(self):
@@ -4304,7 +4329,7 @@ def test_llama_worker_render_and_tokenize_chat_plain_jinja_uses_bos_eos_and_sand
         },
         llama_body=r"""
 class Llama:
-    metadata = {'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
     def __init__(self, *args, **kwargs):
         pass
     def token_bos(self):

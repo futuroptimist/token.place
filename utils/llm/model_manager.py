@@ -1101,6 +1101,147 @@ def _safe_request_error(reason, *, request=None, exc=None):
         'diagnostics': diagnostics,
     }
 
+def _metadata_value(container, key):
+    if container is None:
+        return None
+    try:
+        if isinstance(container, dict):
+            return container.get(key)
+        getter = getattr(container, 'get', None)
+        if callable(getter):
+            value = getter(key)
+            if value is not None:
+                return value
+        return getattr(container, key, None)
+    except Exception:
+        return None
+
+def _runtime_chat_template(llama):
+    metadata_candidates = [
+        getattr(llama, 'metadata', None),
+        getattr(llama, 'model_metadata', None),
+        getattr(getattr(llama, '_model', None), 'metadata', None),
+        getattr(getattr(llama, 'model', None), 'metadata', None),
+    ]
+    tokenizer_factory = getattr(llama, 'tokenizer', None)
+    if callable(tokenizer_factory):
+        try:
+            tokenizer = tokenizer_factory()
+        except Exception:
+            tokenizer = None
+        metadata_candidates.extend([
+            getattr(tokenizer, 'metadata', None),
+            getattr(tokenizer, 'model_metadata', None),
+        ])
+    for metadata in metadata_candidates:
+        for key in (
+            'tokenizer.chat_template',
+            'chat_template',
+            'tokenizer_chat_template',
+            'llama.chat_template',
+        ):
+            value = _metadata_value(metadata, key)
+            if isinstance(value, bytes):
+                value = value.decode('utf-8', errors='ignore')
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+def _jinja_renderer_available():
+    try:
+        importlib.import_module('jinja2')
+        return True
+    except Exception:
+        return False
+
+def _render_gguf_jinja_chat_template(template, messages, *, add_generation_prompt=True, enable_thinking=None):
+    chat_format_module = None
+    try:
+        chat_format_module = importlib.import_module('llama_cpp.llama_chat_format')
+    except Exception:
+        chat_format_module = None
+    if chat_format_module is not None:
+        formatter_cls = getattr(chat_format_module, 'Jinja2ChatFormatter', None)
+        if callable(formatter_cls):
+            formatter = formatter_cls(template=template)
+            rendered = formatter(
+                messages=messages,
+                functions=None,
+                tools=None,
+                tool_choice=None,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+            prompt = getattr(rendered, 'prompt', rendered)
+            if isinstance(prompt, str):
+                return prompt
+    jinja2 = importlib.import_module('jinja2')
+    env = jinja2.Environment(autoescape=False)
+    def _raise_exception(message):
+        raise RuntimeError('runtime_chat_template_render_exception')
+    env.globals['raise_exception'] = _raise_exception
+    rendered = env.from_string(template).render(
+        messages=messages,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=enable_thinking,
+        bos_token='',
+        eos_token='',
+        tools=None,
+        documents=None,
+        date_string='',
+    )
+    if not isinstance(rendered, str):
+        raise RuntimeError('GGUF/Jinja chat template did not render text')
+    return rendered
+
+def _render_chat_with_runtime_template(llama, args, kwargs):
+    render = getattr(llama, 'apply_chat_template', None)
+    direct_apply_available = callable(render)
+    if not direct_apply_available:
+        tokenizer = getattr(llama, 'tokenizer', None)
+        if callable(tokenizer):
+            try:
+                tokenizer = tokenizer()
+            except Exception:
+                tokenizer = None
+        render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+    if callable(render):
+        try:
+            return render(*args, **kwargs), {
+                'direct_apply_chat_template': direct_apply_available,
+                'metadata_template': False,
+                'jinja_renderer': False,
+            }
+        except TypeError:
+            if 'enable_thinking' not in kwargs:
+                raise
+            compatibility_kwargs = dict(kwargs)
+            compatibility_kwargs.pop('enable_thinking', None)
+            return render(*args, **compatibility_kwargs), {
+                'direct_apply_chat_template': direct_apply_available,
+                'metadata_template': False,
+                'jinja_renderer': False,
+            }
+    template = _runtime_chat_template(llama)
+    if not isinstance(template, str) or not template.strip():
+        raise RuntimeError('runtime_chat_template_metadata_missing')
+    if not _jinja_renderer_available():
+        raise RuntimeError('runtime_chat_template_renderer_unavailable')
+    messages = args[0] if args else kwargs.get('messages')
+    if not isinstance(messages, list):
+        raise RuntimeError('runtime_chat_template_render_exception')
+    rendered = _render_gguf_jinja_chat_template(
+        template,
+        messages,
+        add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
+        enable_thinking=kwargs.get('enable_thinking'),
+    )
+    return rendered, {
+        'direct_apply_chat_template': False,
+        'metadata_template': True,
+        'jinja_renderer': True,
+    }
+
 try:
     init_line = sys.stdin.readline()
     if not init_line:
@@ -1129,6 +1270,33 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_kwargs', request=request))
             continue
         if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
+            if method == 'render_and_tokenize_chat':
+                try:
+                    rendered_prompt, _render_diagnostics = _render_chat_with_runtime_template(
+                        llama, request.get('args', []), kwargs
+                    )
+                    if not isinstance(rendered_prompt, str):
+                        _emit(_safe_request_error('prompt_render_unavailable', request=request))
+                        continue
+                    tokenize = getattr(llama, 'tokenize', None)
+                    if not callable(tokenize):
+                        _emit(_safe_request_error('runtime_tokenizer_unavailable', request=request))
+                        continue
+                    tokens = tokenize(rendered_prompt.encode('utf-8'), add_bos=False)
+                    if not isinstance(tokens, (list, tuple)):
+                        _emit(_safe_request_error('runtime_tokenizer_unavailable', request=request))
+                        continue
+                    _emit({'status': 'ok', 'result': {'prompt_tokens': len(tokens)}})
+                except Exception as exc:
+                    reason = str(exc) if str(exc) in {
+                        'runtime_chat_template_metadata_missing',
+                        'runtime_chat_template_renderer_unavailable',
+                        'runtime_tokenizer_unavailable',
+                        'runtime_template_tokenizer_bridge_unavailable',
+                        'runtime_chat_template_render_exception',
+                    } else 'runtime_chat_template_render_exception'
+                    _emit(_safe_request_error(reason, request=request, exc=exc))
+                continue
             render = getattr(llama, 'apply_chat_template', None)
             if not callable(render):
                 tokenizer = getattr(llama, 'tokenizer', None)
@@ -1138,37 +1306,6 @@ for line in sys.stdin:
                     except Exception:
                         tokenizer = None
                 render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
-            if method == 'render_and_tokenize_chat':
-                if not callable(render):
-                    _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request))
-                    continue
-                try:
-                    try:
-                        rendered_prompt = render(*request.get('args', []), **kwargs)
-                    except TypeError:
-                        if 'enable_thinking' not in kwargs:
-                            raise
-                        compatibility_kwargs = dict(kwargs)
-                        compatibility_kwargs.pop('enable_thinking', None)
-                        rendered_prompt = render(
-                            *request.get('args', []),
-                            **compatibility_kwargs,
-                        )
-                    if not isinstance(rendered_prompt, str):
-                        _emit(_safe_request_error('prompt_render_unavailable', request=request))
-                        continue
-                    tokenize = getattr(llama, 'tokenize', None)
-                    if not callable(tokenize):
-                        _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request))
-                        continue
-                    tokens = tokenize(rendered_prompt.encode('utf-8'), add_bos=False)
-                    if not isinstance(tokens, (list, tuple)):
-                        _emit(_safe_request_error('tokenizer_unavailable', request=request))
-                        continue
-                    _emit({'status': 'ok', 'result': {'prompt_tokens': len(tokens)}})
-                except Exception as exc:
-                    _emit(_safe_request_error('runtime_template_tokenizer_bridge_unavailable', request=request, exc=exc))
-                continue
             if not callable(render):
                 try:
                     chat_format = getattr(llama, 'chat_format', None) or 'llama-2'

@@ -4193,6 +4193,60 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
+def test_llama_worker_render_and_tokenize_chat_error_diagnostics_are_request_scoped(tmp_path):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(r"""
+class Llama:
+    metadata = {
+        'general.name': 'Qwen3 test',
+        'tokenizer.chat_template': "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    }
+    def __init__(self, *args, **kwargs):
+        self.calls = 0
+    def tokenize(self, prompt, add_bos=False):
+        self.calls += 1
+        self.metadata = {}
+        return [1]
+""")
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.flush()
+    assert json.loads(process.stdout.readline().split(':', 1)[1])['status'] == 'ok'
+
+    request = {
+        'method': 'render_and_tokenize_chat',
+        'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+        'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+    }
+    process.stdin.write(json.dumps(request) + '\n')
+    process.stdin.flush()
+    first_response = json.loads(process.stdout.readline().split(':', 1)[1])
+    process.stdin.write(json.dumps(request) + '\n')
+    process.stdin.flush()
+    second_response = json.loads(process.stdout.readline().split(':', 1)[1])
+    process.kill()
+    process.wait(timeout=5)
+
+    assert first_response == {'status': 'ok', 'result': {'prompt_tokens': 1}}
+    assert second_response['status'] == 'error'
+    assert second_response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
+    assert 'metadata_template_available' not in second_response['diagnostics']
+    assert 'secret prompt' not in json.dumps(second_response)
+
+
 def test_llama_worker_render_and_tokenize_chat_fails_closed_without_qwen_evidence(tmp_path):
     response = _run_llama_worker_request(
         tmp_path,

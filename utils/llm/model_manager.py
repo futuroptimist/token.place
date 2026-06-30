@@ -1354,6 +1354,7 @@ for line in sys.stdin:
             continue
         if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
             if method == 'render_and_tokenize_chat':
+                _render_diagnostics = None
                 try:
                     rendered_prompt, _render_diagnostics = _render_chat_with_runtime_template(
                         llama, request.get('args', []), kwargs

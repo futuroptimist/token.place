@@ -2127,13 +2127,7 @@ class RelayClient:
 
         try:
             return importlib.import_module("api.v1.models")
-        except Exception as exc:
-            diagnostics = getattr(exc, "diagnostics", None)
-            if isinstance(diagnostics, dict):
-                try:
-                    setattr(llm_instance, "_token_place_last_render_tokenize_error", dict(diagnostics))
-                except Exception:
-                    pass
+        except Exception:
             return None
 
     @staticmethod

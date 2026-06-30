@@ -22,6 +22,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
 
+
+def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):
+    """Module import probing is separate from request-scoped worker diagnostics."""
+
+    class ImportFailureWithDiagnostics(RuntimeError):
+        diagnostics = {"reason": "runtime_chat_template_metadata_missing"}
+
+    def fail_import(name):
+        assert name == "api.v1.models"
+        raise ImportFailureWithDiagnostics("api v1 models unavailable")
+
+    monkeypatch.setattr(relay_client_module.importlib, "import_module", fail_import)
+
+    assert RelayClient._api_v1_models_module() is None
+
 # Common test data
 TEST_VALID_RESPONSE = {
     'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',  # Base64 encoded "client_key_b64"

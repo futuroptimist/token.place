@@ -1149,34 +1149,81 @@ def _runtime_chat_template(llama):
 
 def _jinja_renderer_available():
     try:
-        importlib.import_module('jinja2')
+        importlib.import_module('jinja2.sandbox')
         return True
     except Exception:
         return False
 
-def _render_gguf_jinja_chat_template(template, messages, *, add_generation_prompt=True, enable_thinking=None):
+def _runtime_token_text(llama, token_name):
+    token_id_getter = getattr(llama, 'token_' + token_name, None)
+    token_id = None
+    if callable(token_id_getter):
+        try:
+            token_id = token_id_getter()
+        except Exception:
+            token_id = None
+    if isinstance(token_id, str):
+        return token_id
+    if token_id is None:
+        return ''
+    text_getter = getattr(llama, 'token_get_text', None)
+    if callable(text_getter):
+        try:
+            token_text = text_getter(token_id)
+            if isinstance(token_text, bytes):
+                return token_text.decode('utf-8', errors='ignore')
+            if isinstance(token_text, str):
+                return token_text
+        except Exception:
+            pass
+    detokenize = getattr(llama, 'detokenize', None)
+    if callable(detokenize):
+        try:
+            token_text = detokenize([token_id])
+            if isinstance(token_text, bytes):
+                return token_text.decode('utf-8', errors='ignore')
+            if isinstance(token_text, str):
+                return token_text
+        except Exception:
+            pass
+    return ''
+
+def _render_gguf_jinja_chat_template(template, messages, llama, *, add_generation_prompt=True, enable_thinking=None):
     chat_format_module = None
     try:
         chat_format_module = importlib.import_module('llama_cpp.llama_chat_format')
     except Exception:
         chat_format_module = None
+    bos_token = _runtime_token_text(llama, 'bos')
+    eos_token = _runtime_token_text(llama, 'eos')
     if chat_format_module is not None:
         formatter_cls = getattr(chat_format_module, 'Jinja2ChatFormatter', None)
         if callable(formatter_cls):
-            formatter = formatter_cls(template=template)
-            rendered = formatter(
-                messages=messages,
-                functions=None,
-                tools=None,
-                tool_choice=None,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-            prompt = getattr(rendered, 'prompt', rendered)
-            if isinstance(prompt, str):
-                return prompt
-    jinja2 = importlib.import_module('jinja2')
-    env = jinja2.Environment(autoescape=False)
+            try:
+                formatter = formatter_cls(template=template, bos_token=bos_token, eos_token=eos_token)
+                formatter_kwargs = {
+                    'messages': messages,
+                    'functions': None,
+                    'tools': None,
+                    'tool_choice': None,
+                    'add_generation_prompt': add_generation_prompt,
+                }
+                if enable_thinking is not None:
+                    formatter_kwargs['enable_thinking'] = enable_thinking
+                try:
+                    rendered = formatter(**formatter_kwargs)
+                except TypeError as exc:
+                    if not _type_error_is_unexpected_keyword(exc, 'enable_thinking'):
+                        raise
+                    formatter_kwargs.pop('enable_thinking', None)
+                    rendered = formatter(**formatter_kwargs)
+                prompt = getattr(rendered, 'prompt', rendered)
+                if isinstance(prompt, str):
+                    return prompt
+            except Exception:
+                pass
+    sandbox = importlib.import_module('jinja2.sandbox')
+    env = sandbox.SandboxedEnvironment(autoescape=False)
     def _raise_exception(message):
         raise RuntimeError('runtime_chat_template_render_exception')
     env.globals['raise_exception'] = _raise_exception
@@ -1184,8 +1231,8 @@ def _render_gguf_jinja_chat_template(template, messages, *, add_generation_promp
         messages=messages,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
-        bos_token='',
-        eos_token='',
+        bos_token=bos_token,
+        eos_token=eos_token,
         tools=None,
         documents=None,
         date_string='',
@@ -1193,6 +1240,17 @@ def _render_gguf_jinja_chat_template(template, messages, *, add_generation_promp
     if not isinstance(rendered, str):
         raise RuntimeError('GGUF/Jinja chat template did not render text')
     return rendered
+
+def _type_error_is_unexpected_keyword(exc, keyword):
+    message = str(exc)
+    return (
+        ("unexpected keyword argument '%s'" % keyword) in message
+        or ('unexpected keyword argument "%s"' % keyword) in message
+        or ("got an unexpected keyword argument '%s'" % keyword) in message
+        or ('got an unexpected keyword argument "%s"' % keyword) in message
+        or ('unexpected keyword argument %s' % keyword) in message
+        or ('got an unexpected keyword argument %s' % keyword) in message
+    )
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
     render = getattr(llama, 'apply_chat_template', None)
@@ -1212,8 +1270,8 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'metadata_template': False,
                 'jinja_renderer': False,
             }
-        except TypeError:
-            if 'enable_thinking' not in kwargs:
+        except TypeError as exc:
+            if 'enable_thinking' not in kwargs or not _type_error_is_unexpected_keyword(exc, 'enable_thinking'):
                 raise
             compatibility_kwargs = dict(kwargs)
             compatibility_kwargs.pop('enable_thinking', None)
@@ -1233,6 +1291,7 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
     rendered = _render_gguf_jinja_chat_template(
         template,
         messages,
+        llama,
         add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
         enable_thinking=kwargs.get('enable_thinking'),
     )

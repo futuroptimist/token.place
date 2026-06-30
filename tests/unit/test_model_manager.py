@@ -4221,6 +4221,132 @@ def format_llama3(*args, **kwargs):
     assert response == {'status': 'ok', 'result': {'prompt_tokens': 1}}
 
 
+def test_llama_worker_render_and_tokenize_chat_formatter_falls_back_without_enable_thinking_support(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'tokenizer.chat_template': "{% for message in messages %}plain:{{ message['content'] }}{% endfor %}{% if enable_thinking == false %}:no-think{% endif %}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'plain:secret prompt:no-think'
+        return [1, 2, 3]
+""",
+        llama_chat_format_body="""
+class Jinja2ChatFormatter:
+    def __init__(self, *, template, bos_token='', eos_token=''):
+        self.template = template
+    def __call__(self, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+        raise RuntimeError('formatter cannot render this template')
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_passes_bos_eos_to_formatter_and_jinja(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'hello'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def token_bos(self):
+        return 101
+    def token_eos(self):
+        return 102
+    def token_get_text(self, token_id):
+        return {101: b'<s>', 102: b'</s>'}[token_id]
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'<s>formatter hello</s>'
+        return [1, 2, 3, 4]
+""",
+        llama_chat_format_body="""
+class Rendered:
+    def __init__(self, prompt):
+        self.prompt = prompt
+class Jinja2ChatFormatter:
+    def __init__(self, *, template, bos_token='', eos_token=''):
+        self.bos_token = bos_token
+        self.eos_token = eos_token
+    def __call__(self, **kwargs):
+        assert self.bos_token == '<s>'
+        assert self.eos_token == '</s>'
+        return Rendered(self.bos_token + 'formatter hello' + self.eos_token)
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+
+
+def test_llama_worker_render_and_tokenize_chat_plain_jinja_uses_bos_eos_and_sandbox(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'hello'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': False},
+        },
+        llama_body=r"""
+class Llama:
+    metadata = {'tokenizer.chat_template': "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}{{ eos_token }}"}
+    def __init__(self, *args, **kwargs):
+        pass
+    def token_bos(self):
+        return 101
+    def token_eos(self):
+        return 102
+    def detokenize(self, token_ids):
+        return {101: b'<s>', 102: b'</s>'}[token_ids[0]]
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt == b'<s>hello</s>'
+        return [1, 2, 3]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+
+
+def test_llama_worker_render_and_tokenize_chat_does_not_retry_unrelated_type_error(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.calls = 0
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls += 1
+        raise TypeError('template helper failed internally')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize should not run')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_render_exception'
+    assert 'secret prompt' not in json.dumps(response)
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()

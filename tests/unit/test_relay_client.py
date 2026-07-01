@@ -5060,6 +5060,82 @@ def test_qwen_think_output_is_rejected():
     assert 'secret' not in json.dumps(error)
 
 
+@pytest.mark.parametrize(
+    "leaked_content",
+    [
+        "<think>secret</think>answer",
+        "<THINK>secret</THINK>answer",
+        "   <think>secret</think>answer",
+        "< think>secret</ think>answer",
+        "<think secret partial",
+    ],
+)
+def test_qwen_think_output_variants_are_rejected_with_safe_reason(leaked_content):
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        "choices": [{"message": {"role": "assistant", "content": leaked_content}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-think-variant",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert "secret" not in json.dumps(error)
+
+
+def test_qwen_reasoning_content_field_is_rejected_with_safe_reason():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "final answer",
+                    "reasoning_content": "secret hidden reasoning",
+                }
+            }
+        ]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-reasoning-content",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_reasoning_content_leaked"
+    assert "secret hidden reasoning" not in json.dumps(error)
+
+
+def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():
+    policy = RelayClient._API_V1_QWEN_NON_THINKING_POLICY
+
+    assert policy["thinking_mode"] == "disabled"
+    assert policy["message_control"] == "/no_think"
+    assert policy["visible_think_output_forbidden"] is True
+    assert policy["reasoning_content_forbidden"] is True
+    assert RelayClient._api_v1_qwen_non_thinking_required(
+        {"provider": "qwen", "thinking_mode": "disabled"}
+    )
+
+
 def test_qwen_profile_generation_defaults_include_top_k():
     manager = _AdmissionManager()
     manager.model_profile = {'generation_defaults': {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20}}

@@ -401,6 +401,12 @@ class ComputeNodeRuntime:
         )
         legacy_template_available = callable(getattr(llm_runtime, "apply_chat_template", None))
         legacy_tokenizer_available = callable(getattr(llm_runtime, "tokenize", None))
+        from utils.networking.relay_client import RelayClient
+
+        qwen_non_thinking_enforced = RelayClient._api_v1_qwen_non_thinking_required(
+            model_profile
+        )
+
         diagnostics.update({
             "api_v1_readiness_model_id": getattr(self.model_manager, "api_model_id", None),
             "api_v1_readiness_context_tier": context_tier,
@@ -414,10 +420,7 @@ class ComputeNodeRuntime:
                 or (legacy_template_available and legacy_tokenizer_available)
             ),
             "api_v1_readiness_tokenizer_render_bridge_available": False,
-            "api_v1_readiness_non_thinking_enforced": (
-                model_profile.get("provider") == "qwen"
-                and model_profile.get("thinking_mode") == "disabled"
-            ),
+            "api_v1_readiness_non_thinking_enforced": qwen_non_thinking_enforced,
             "api_v1_readiness_yarn_rope_enabled": bool(rope_policy.get("type") == "yarn"),
             "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
@@ -426,11 +429,10 @@ class ComputeNodeRuntime:
         })
 
         try:
-            from utils.networking.relay_client import RelayClient
-
             smoke_messages = [{"role": "system", "content": "ok"}, {"role": "user", "content": "hi"}]
-            if diagnostics["api_v1_readiness_non_thinking_enforced"]:
-                smoke_messages = RelayClient._api_v1_qwen_no_think_messages(smoke_messages)
+            smoke_messages = RelayClient._api_v1_prepare_qwen_non_thinking_messages(
+                smoke_messages, model_profile
+            )
             admitted, admission_error, prompt_tokens = (
                 self.relay_client._api_v1_authoritative_context_admission(
                     llm_instance=llm_runtime,
@@ -460,7 +462,11 @@ class ComputeNodeRuntime:
             ) if not admitted else None,
         })
         self.model_manager.last_compute_diagnostics = diagnostics
-        if admitted and os.getenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION") == "1":
+        completion_smoke_required = bool(
+            diagnostics["api_v1_readiness_non_thinking_enforced"]
+            or os.getenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION") == "1"
+        )
+        if admitted and completion_smoke_required:
             try:
                 smoke_completion = create_chat_completion(
                     messages=smoke_messages,
@@ -468,15 +474,29 @@ class ComputeNodeRuntime:
                     stream=False,
                 )
                 smoke_message = None
+                smoke_content = None
                 if (
                     isinstance(smoke_completion, dict)
                     and isinstance(smoke_completion.get("choices"), list)
                     and smoke_completion["choices"]
                     and isinstance(smoke_completion["choices"][0], dict)
                 ):
-                    smoke_message = smoke_completion["choices"][0].get("message")
-                smoke_content = smoke_message.get("content") if isinstance(smoke_message, dict) else None
-                smoke_ok = isinstance(smoke_content, str) and bool(smoke_content.strip()) and "<think" not in smoke_content.lower()
+                    smoke_choice = smoke_completion["choices"][0]
+                    smoke_message = smoke_choice.get("message")
+                    if isinstance(smoke_message, dict):
+                        smoke_content = smoke_message.get("content")
+                    elif "text" in smoke_choice:
+                        smoke_content = smoke_choice.get("text")
+                smoke_ok = (
+                    isinstance(smoke_content, str)
+                    and bool(smoke_content.strip())
+                    and not RelayClient._api_v1_qwen_thinking_leaked(
+                        model_profile, smoke_content
+                    )
+                    and not RelayClient._api_v1_qwen_reasoning_content_leaked(
+                        model_profile, smoke_choice
+                    )
+                )
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
                 if not smoke_ok:
                     admitted = False

@@ -530,6 +530,17 @@ class RelayClient:
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
     _API_V1_MAX_SEED = 2**32 - 1
+    # Single source of truth for API v1 Qwen behavior. API v1 is a
+    # non-reasoning chat-completions surface: Qwen thinking is disabled via the
+    # documented message-level /no_think control because the packaged
+    # llama-cpp-python create_chat_completion path used here does not reliably
+    # expose chat-template kwargs such as enable_thinking/template_kwargs.
+    _API_V1_QWEN_NON_THINKING_POLICY = {
+        "thinking_mode": "disabled",
+        "message_control": "/no_think",
+        "visible_think_output_forbidden": True,
+        "reasoning_content_forbidden": True,
+    }
 
     def __init__(
         self,
@@ -2097,29 +2108,81 @@ class RelayClient:
             prepared.insert(0, adapter_message)
         return prepared
 
-    @staticmethod
-    def _api_v1_qwen_no_think_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    @classmethod
+    def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Inject Qwen's template-supported non-thinking control into user text."""
 
+        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
         prepared = [dict(message) for message in messages]
         for index in range(len(prepared) - 1, -1, -1):
             if prepared[index].get("role") != "user":
                 continue
             content = prepared[index].get("content")
             if isinstance(content, str):
-                prepared[index]["content"] = "/no_think\n" + content
+                prepared[index]["content"] = f"{message_control}\n{content}"
                 return prepared
             if isinstance(content, list):
                 copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
                 for block in copied_blocks:
                     if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = "/no_think\n" + block["text"]
+                        block["text"] = f"{message_control}\n{block['text']}"
                         prepared[index]["content"] = copied_blocks
                         return prepared
-                copied_blocks.insert(0, {"type": "text", "text": "/no_think\n"})
+                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
                 prepared[index]["content"] = copied_blocks
                 return prepared
         return prepared
+
+    @classmethod
+    def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
+        return (
+            isinstance(model_profile, dict)
+            and model_profile.get("provider") == "qwen"
+            and model_profile.get("thinking_mode")
+            == cls._API_V1_QWEN_NON_THINKING_POLICY["thinking_mode"]
+        )
+
+    @classmethod
+    def _api_v1_prepare_qwen_non_thinking_messages(
+        cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        if cls._api_v1_qwen_non_thinking_required(model_profile):
+            return cls._api_v1_qwen_no_think_messages(messages)
+        return messages
+
+    @classmethod
+    def _api_v1_qwen_thinking_leaked(
+        cls, model_profile: Dict[str, Any], content: Any
+    ) -> bool:
+        return (
+            cls._api_v1_qwen_non_thinking_required(model_profile)
+            and isinstance(content, str)
+            and bool(re.search(r"<\s*think", content, flags=re.IGNORECASE))
+        )
+
+    @classmethod
+    def _api_v1_qwen_reasoning_content_leaked(
+        cls, model_profile: Dict[str, Any], payload: Any
+    ) -> bool:
+        if not (
+            cls._api_v1_qwen_non_thinking_required(model_profile)
+            and cls._API_V1_QWEN_NON_THINKING_POLICY["reasoning_content_forbidden"]
+        ):
+            return False
+        forbidden_reasoning_fields = {"reasoning_content", "reasoning"}
+        if isinstance(payload, dict):
+            if any(payload.get(field) not in (None, "") for field in forbidden_reasoning_fields):
+                return True
+            return any(
+                cls._api_v1_qwen_reasoning_content_leaked(model_profile, value)
+                for value in payload.values()
+            )
+        if isinstance(payload, list):
+            return any(
+                cls._api_v1_qwen_reasoning_content_leaked(model_profile, item)
+                for item in payload
+            )
+        return False
 
     @staticmethod
     def _api_v1_models_module() -> Optional[Any]:
@@ -2735,8 +2798,7 @@ class RelayClient:
         )
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
         is_qwen_non_thinking = (
-            model_profile.get("provider") == "qwen"
-            and model_profile.get("thinking_mode") == "disabled"
+            self._api_v1_qwen_non_thinking_required(model_profile)
         )
         # Prefer a packaged-runtime bridge that renders and tokenizes inside the
         # loaded worker process. This keeps Qwen admission aligned with the same
@@ -2947,6 +3009,13 @@ class RelayClient:
             and isinstance(completion["choices"][0], dict)
         ):
             choice = completion["choices"][0]
+            if self._api_v1_qwen_reasoning_content_leaked(
+                getattr(self.model_manager, "model_profile", {}) or {}, choice
+            ):
+                # Fail closed before normalizing the runtime choice so hidden
+                # reasoning fields are never forwarded or echoed.
+                self._last_api_v1_invalid_model_output_reason = "qwen_reasoning_content_leaked"
+                return None
             raw_message = choice.get("message")
             if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
                 raw_message = {**raw_message, "role": "assistant"}
@@ -2956,12 +3025,8 @@ class RelayClient:
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-            if (
-                message is not None
-                and model_profile.get("provider") == "qwen"
-                and model_profile.get("thinking_mode") == "disabled"
-                and isinstance(message.get("content"), str)
-                and "<think" in message["content"].lower()
+            if message is not None and self._api_v1_qwen_thinking_leaked(
+                model_profile, message.get("content")
             ):
                 # Fail closed instead of stripping so no hidden reasoning can be
                 # partially leaked or mis-accounted in API v1 relay responses.
@@ -3105,18 +3170,15 @@ class RelayClient:
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-        if (
-            model_profile.get("provider") == "qwen"
-            and model_profile.get("thinking_mode") == "disabled"
-        ):
-            # Use Qwen's documented /no_think message-level control before
-            # both admission and generation.  llama-cpp-python's
-            # create_chat_completion does not expose template kwargs, so admission
-            # intentionally renders the same message shape instead of adding an
-            # admission-only enable_thinking=False assistant prefix.  Output
-            # validation below still fails closed if a runtime returns a <think>
-            # block.
-            runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
+        # Use Qwen's documented /no_think message-level control before both
+        # admission and generation.  llama-cpp-python's create_chat_completion
+        # does not expose template kwargs, so admission intentionally renders the
+        # same message shape instead of adding an admission-only
+        # enable_thinking=False assistant prefix.  Output validation below still
+        # fails closed if a runtime returns visible or hidden thinking output.
+        runtime_messages = self._api_v1_prepare_qwen_non_thinking_messages(
+            runtime_messages, model_profile
+        )
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             completion = None

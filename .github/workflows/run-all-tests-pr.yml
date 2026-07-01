@@ -99,7 +99,7 @@ jobs:
 
   macos-run-all-tests:
     name: macOS run_all_tests.sh
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 90
     permissions:
       contents: read
@@ -107,8 +107,8 @@ jobs:
       TEST_COVERAGE: '1'
       TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
       # Build llama_cpp_python from source with Metal enabled. CMAKE_ARGS is
-      # written after checkout from the actual runner architecture so macos-latest
-      # works on both Intel and Apple Silicon hosts.
+      # written after checkout from the actual runner architecture while the job pins macos-15
+      # to avoid macos-latest image migrations breaking Metal builds.
       FORCE_CMAKE: '1'
     steps:
       - uses: actions/checkout@v4

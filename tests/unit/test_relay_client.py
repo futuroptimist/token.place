@@ -5027,27 +5027,39 @@ def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallb
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_context_admission_unavailable'
 
 
-def test_qwen_think_output_is_rejected():
+@pytest.mark.parametrize(
+    "leaked_content",
+    [
+        "<think>secret</think>answer",
+        "<THINK>secret</THINK>answer",
+        "   <think>secret</think>answer",
+        "<think secret partial tag",
+    ],
+)
+def test_qwen_think_output_is_rejected(leaked_content, caplog):
     manager = _AdmissionManager(window=128)
     manager.api_model_id = 'qwen3-8b-instruct'
     manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
     manager.runtime.create_chat_completion = lambda **kwargs: {
-        'choices': [{'message': {'role': 'assistant', 'content': '<think>secret</think>answer'}}]
+        'choices': [{'message': {'role': 'assistant', 'content': leaked_content}}]
     }
     client = _api_v1_validation_client(manager)
 
-    envelope = client._generate_api_v1_response_with_runtime_model(
-        request_id='req-qwen-think',
-        model_id='qwen3-8b-instruct',
-        messages=[{'role': 'user', 'content': 'hello'}],
-        options={'max_tokens': 5},
-        requested_context_tier='8k-fast',
-    )
+    with caplog.at_level('ERROR'):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id='req-qwen-think',
+            model_id='qwen3-8b-instruct',
+            messages=[{'role': 'user', 'content': 'hello'}],
+            options={'max_tokens': 5},
+            requested_context_tier='8k-fast',
+        )
 
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_invalid_model_output'
     error = envelope['api_v1_response']['error']
     assert error['request_id'] == 'req-qwen-think'
     assert error['internal_reason'] == 'qwen_thinking_output_leaked'
+    assert 'secret' not in caplog.text
+    assert 'secret' not in json.dumps(envelope, sort_keys=True)
     assert error['active_context_tier'] == '8k-fast'
     assert error['requested_context_tier'] == '8k-fast'
     assert error['configured_context_tokens'] == 128

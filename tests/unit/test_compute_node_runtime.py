@@ -191,7 +191,7 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
 def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridge_missing():
     class BridgeRuntime:
         def create_chat_completion(self, **_kwargs):
-            return {}
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 1}
@@ -278,7 +278,7 @@ def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_mis
 def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason():
     class BridgeRuntime:
         def create_chat_completion(self, **_kwargs):
-            return {}
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 1}
@@ -321,7 +321,7 @@ def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason()
 def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     class ReadyRuntime:
         def create_chat_completion(self, **_kwargs):
-            return {}
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}

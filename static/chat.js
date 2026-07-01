@@ -1216,6 +1216,7 @@ new Vue({
                 'internal_reason',
                 'active_context_tier',
                 'requested_context_tier',
+                'rejected_option',
                 'retryable',
                 'configured_context_tokens',
                 'prompt_tokens',

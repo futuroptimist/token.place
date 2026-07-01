@@ -11,7 +11,6 @@ import importlib
 import inspect
 import subprocess
 import queue
-import re
 import signal
 import threading
 import sysconfig

@@ -5249,3 +5249,37 @@ def test_api_v1_runtime_rejected_generation_option_is_safe_options_error():
     assert error["request_id"] == "req-option-rejected"
     assert error["internal_reason"] == "unsupported_generation_option"
     assert error["rejected_option"] == "top_k"
+    assert error["runtime_healthy"] is True
+    assert error["recovery_attempted"] is False
+    assert error["recovery_succeeded"] is False
+
+
+def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_callable():
+    class RuntimeWithoutCompletion:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return "".join(
+                f"<{message['role']}>{message['content']}" for message in messages
+            ) + ("<assistant>" if add_generation_prompt else "")
+
+        def tokenize(self, payload, _add_bos=False):
+            return list(range(len(payload)))
+
+    class ManagerWithoutCompletion(_ApiV1RuntimeManager):
+        def __init__(self):
+            super().__init__()
+            self.runtime = RuntimeWithoutCompletion()
+
+    manager = ManagerWithoutCompletion()
+    client = _api_v1_validation_client(manager)
+    client._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-stale-invalid-reason",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "unsupported_completion_shape"

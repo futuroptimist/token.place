@@ -2953,6 +2953,7 @@ class RelayClient:
             "recovery_attempted": False,
             "recovery_succeeded": False,
         }
+        self._last_api_v1_invalid_model_output_reason = None
 
         validation_result = self._validate_api_v1_chat_messages(messages)
         if not validation_result.valid:
@@ -3035,6 +3036,7 @@ class RelayClient:
             runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
+            completion = None
             llm_instance = get_llm_instance() if callable(get_llm_instance) else None
             if llm_instance is None and callable(recovery_completion):
                 recover_runtime = getattr(
@@ -3112,7 +3114,7 @@ class RelayClient:
                 log_error(
                     "Desktop runtime returned invalid API v1 assistant output reason={} shape={}",
                     invalid_reason,
-                    self._api_v1_safe_completion_shape(completion if "completion" in locals() else None),
+                    self._api_v1_safe_completion_shape(completion),
                 )
                 return self._api_v1_response_envelope(
                     request_id,
@@ -3160,6 +3162,7 @@ class RelayClient:
                         "request_id": request_id,
                         "internal_reason": internal_reason,
                         **({"rejected_option": rejected_option} if rejected_option else {}),
+                        **self._last_api_v1_runtime_health,
                     },
                 )
             recovery_attempted = (

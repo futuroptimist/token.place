@@ -243,6 +243,7 @@ def test_api_v1_structured_error_logs_safe_diagnostic_fields():
         "internal_reason",
         "active_context_tier",
         "requested_context_tier",
+        "rejected_option",
         "retryable",
     ):
         assert field in chat_js

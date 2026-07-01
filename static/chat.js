@@ -1211,10 +1211,31 @@ new Vue({
             }
 
             const code = typeof error.code === 'string' && error.code.trim() ? error.code.trim() : '';
+            const safeFieldNames = [
+                'request_id',
+                'internal_reason',
+                'active_context_tier',
+                'requested_context_tier',
+                'configured_context_tokens',
+                'prompt_tokens',
+                'requested_output_tokens',
+                'runtime_healthy',
+                'recovery_attempted',
+                'recovery_succeeded',
+                'retryable'
+            ];
+            const diagnostics = { code };
+            safeFieldNames.forEach((fieldName) => {
+                const value = error[fieldName];
+                if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                    diagnostics[fieldName] = value;
+                }
+            });
             return {
                 userMessage: this.getUserFacingApiError(response),
                 terminalSelectedServer: error.terminalSelectedServer === true,
-                code
+                code,
+                diagnostics
             };
         },
 
@@ -1255,7 +1276,7 @@ new Vue({
                     const normalizedError = this.normalizeApiV1ResponseError(response);
                     if (normalizedError) {
                         if (normalizedError.code) {
-                            console.warn('API v1 structured error rendered:', { code: normalizedError.code });
+                            console.warn('API v1 structured error rendered:', normalizedError.diagnostics);
                         }
                         this.chatHistory.push({
                             role: 'assistant',

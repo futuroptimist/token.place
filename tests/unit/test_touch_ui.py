@@ -233,3 +233,14 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
     assert "No LLM servers are available right now. Your chat history is still here." in chat_js
     assert "this.clearSelectedServer()" in chat_js
+
+def test_landing_chat_js_logs_safe_api_v1_structured_error_diagnostics():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "const safeFieldNames = [" in chat_js
+    assert "'request_id'" in chat_js
+    assert "'internal_reason'" in chat_js
+    assert "'active_context_tier'" in chat_js
+    assert "'requested_context_tier'" in chat_js
+    assert "'retryable'" in chat_js
+    assert "console.warn('API v1 structured error rendered:', normalizedError.diagnostics);" in chat_js
+    assert "console.warn('API v1 structured error rendered:', { code: normalizedError.code });" not in chat_js

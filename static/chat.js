@@ -1211,11 +1211,24 @@ new Vue({
             }
 
             const code = typeof error.code === 'string' && error.code.trim() ? error.code.trim() : '';
-            return {
+            const sanitized = {
                 userMessage: this.getUserFacingApiError(response),
                 terminalSelectedServer: error.terminalSelectedServer === true,
                 code
             };
+            [
+                'request_id',
+                'internal_reason',
+                'active_context_tier',
+                'requested_context_tier',
+                'retryable'
+            ].forEach((field) => {
+                const value = error[field];
+                if (typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number') {
+                    sanitized[field] = value;
+                }
+            });
+            return sanitized;
         },
 
         isInvalidAssistantResponseContent(content) {
@@ -1255,7 +1268,7 @@ new Vue({
                     const normalizedError = this.normalizeApiV1ResponseError(response);
                     if (normalizedError) {
                         if (normalizedError.code) {
-                            console.warn('API v1 structured error rendered:', { code: normalizedError.code });
+                            console.warn('API v1 structured error rendered:', normalizedError);
                         }
                         this.chatHistory.push({
                             role: 'assistant',

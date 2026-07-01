@@ -396,7 +396,7 @@ def test_run_all_tests_pr_workflow_has_visible_linux_and_macos_jobs() -> None:
     assert jobs["linux-run-all-tests"]["name"] == "Linux run_all_tests.sh"
     assert jobs["macos-run-all-tests"]["name"] == "macOS run_all_tests.sh"
     assert jobs["linux-run-all-tests"]["runs-on"] == "ubuntu-latest"
-    assert jobs["macos-run-all-tests"]["runs-on"] == "macos-15"
+    assert jobs["macos-run-all-tests"]["runs-on"] == "macos-latest"
 
 
 def test_run_all_tests_pr_jobs_invoke_the_full_suite() -> None:
@@ -438,7 +438,7 @@ def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None
 
     assert env.get("FORCE_CMAKE") == "1"
     assert "CMAKE_ARGS" not in env, (
-        "macOS runners may run on Intel or Apple Silicon; CMAKE_ARGS must be "
+        "macos-latest may run on Intel or Apple Silicon; CMAKE_ARGS must be "
         "derived from uname -m instead of hard-coding an arm64 cross-build."
     )
     assert "Configure macOS Metal llama-cpp build" in str(macos_job), (
@@ -449,7 +449,7 @@ def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None
         "GPU-capable desktop modes do not silently fall back to CPU."
     )
     assert "-DGGML_NATIVE=off" in step_runs, (
-        "macOS runners must disable fragile native CPU feature probing "
+        "macos-latest runners must disable fragile native CPU feature probing "
         "so dependency validation does not fail before run_all_tests.sh."
     )
     assert "-DCMAKE_OSX_ARCHITECTURES=${arch}" in step_runs

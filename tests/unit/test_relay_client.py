@@ -5045,6 +5045,19 @@ def test_qwen_think_output_is_rejected():
     )
 
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_invalid_model_output'
+    error = envelope['api_v1_response']['error']
+    assert error['request_id'] == 'req-qwen-think'
+    assert error['internal_reason'] == 'qwen_thinking_output_leaked'
+    assert error['active_context_tier'] == '8k-fast'
+    assert error['requested_context_tier'] == '8k-fast'
+    assert error['configured_context_tokens'] == 128
+    assert isinstance(error['prompt_tokens'], int)
+    assert error['prompt_tokens'] > 0
+    assert error['requested_output_tokens'] == 5
+    assert error['runtime_healthy'] is True
+    assert error['recovery_attempted'] is False
+    assert error['recovery_succeeded'] is False
+    assert 'secret' not in json.dumps(error)
 
 
 def test_qwen_profile_generation_defaults_include_top_k():
@@ -5218,6 +5231,16 @@ def test_api_v1_malformed_qwen_completion_reports_safe_shape_not_content(caplog)
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_model_output"
     assert error["internal_reason"] == "unsupported_completion_shape"
+    assert error["request_id"] == "req-qwen-bad"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert isinstance(error["prompt_tokens"], int)
+    assert error["prompt_tokens"] > 0
+    assert error["requested_output_tokens"] == 512
+    assert error["runtime_healthy"] is True
+    assert error["recovery_attempted"] is False
+    assert error["recovery_succeeded"] is False
     assert "SECRET" not in json.dumps(error)
     assert "SECRET" not in caplog.text
     assert "message_content_type" in caplog.text
@@ -5249,6 +5272,12 @@ def test_api_v1_runtime_rejected_generation_option_is_safe_options_error():
     assert error["request_id"] == "req-option-rejected"
     assert error["internal_reason"] == "unsupported_generation_option"
     assert error["rejected_option"] == "top_k"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert isinstance(error["prompt_tokens"], int)
+    assert error["prompt_tokens"] > 0
+    assert error["requested_output_tokens"] == 512
     assert error["runtime_healthy"] is True
     assert error["recovery_attempted"] is False
     assert error["recovery_succeeded"] is False

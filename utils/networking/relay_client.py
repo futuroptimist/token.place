@@ -2872,6 +2872,68 @@ class RelayClient:
         completion_kwargs.update(safe_options)
         return completion_kwargs
 
+    def _api_v1_enrich_safe_error(
+        self,
+        error: Dict[str, Any],
+        *,
+        request_id: str,
+        requested_context_tier: str,
+        prompt_tokens: Optional[int] = None,
+        requested_output_tokens: Optional[int] = None,
+        internal_reason: Optional[str] = None,
+        rejected_option: Optional[str] = None,
+        retryable: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Attach request-scoped, non-sensitive API v1 diagnostics to an error."""
+
+        enriched = dict(error)
+        enriched["request_id"] = request_id
+        enriched.setdefault(
+            "active_context_tier",
+            normalize_context_tier(
+                getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+            ),
+        )
+        enriched.setdefault(
+            "requested_context_tier", normalize_context_tier(requested_context_tier)
+        )
+        try:
+            active_profile = get_context_profile(enriched["active_context_tier"])
+        except Exception:
+            active_profile = get_context_profile(DEFAULT_CONTEXT_TIER)
+        configured_context_tokens = int(
+            getattr(
+                self.model_manager,
+                "context_window_tokens",
+                active_profile.total_context_tokens,
+            )
+            or active_profile.total_context_tokens
+        )
+        enriched.setdefault("configured_context_tokens", configured_context_tokens)
+        if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
+            enriched.setdefault("prompt_tokens", prompt_tokens)
+        if isinstance(requested_output_tokens, int) and requested_output_tokens >= 0:
+            enriched.setdefault("requested_output_tokens", requested_output_tokens)
+        if internal_reason:
+            enriched.setdefault("internal_reason", internal_reason)
+        if rejected_option:
+            enriched.setdefault("rejected_option", rejected_option)
+        if retryable is not None:
+            enriched.setdefault("retryable", retryable)
+        runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+        if not isinstance(runtime_health, dict):
+            runtime_health = {}
+        enriched.setdefault(
+            "runtime_healthy", bool(runtime_health.get("runtime_healthy", True))
+        )
+        enriched.setdefault(
+            "recovery_attempted", bool(runtime_health.get("recovery_attempted", False))
+        )
+        enriched.setdefault(
+            "recovery_succeeded", bool(runtime_health.get("recovery_succeeded", False))
+        )
+        return enriched
+
     def _assistant_message_from_runtime_completion(
         self, completion: Any
     ) -> Optional[Dict[str, Any]]:
@@ -2973,10 +3035,14 @@ class RelayClient:
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": "compute_node_model_unsupported",
-                    "message": "Requested model is not available in the desktop runtime",
-                },
+                error=self._api_v1_enrich_safe_error(
+                    {
+                        "code": "compute_node_model_unsupported",
+                        "message": "Requested model is not available in the desktop runtime",
+                    },
+                    request_id=request_id,
+                    requested_context_tier=requested_context_tier,
+                ),
             )
 
         (
@@ -2999,10 +3065,21 @@ class RelayClient:
                 )
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": error_code,
-                    "message": error_message,
-                },
+                error=self._api_v1_enrich_safe_error(
+                    {
+                        "code": error_code,
+                        "message": error_message,
+                    },
+                    request_id=request_id,
+                    requested_context_tier=requested_context_tier,
+                    internal_reason=(
+                        "invalid_generation_option"
+                        if error_code == "compute_node_invalid_request"
+                        else "unsupported_generation_option"
+                    ),
+                    rejected_option=rejected_option,
+                    retryable=False,
+                ),
             )
 
         if not has_direct_runtime_completion:
@@ -3011,13 +3088,19 @@ class RelayClient:
             # for empty options and explicit stream:false requests as well.
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": "compute_node_model_unsupported",
-                    "message": (
-                        "Desktop runtime does not expose API v1 non-streaming "
-                        "chat completion"
-                    ),
-                },
+                error=self._api_v1_enrich_safe_error(
+                    {
+                        "code": "compute_node_model_unsupported",
+                        "message": (
+                            "Desktop runtime does not expose API v1 non-streaming "
+                            "chat completion"
+                        ),
+                    },
+                    request_id=request_id,
+                    requested_context_tier=requested_context_tier,
+                    internal_reason="direct_runtime_completion_unavailable",
+                    retryable=False,
+                ),
             )
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
@@ -3037,6 +3120,8 @@ class RelayClient:
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             completion = None
+            prompt_tokens: Optional[int] = None
+            requested_output_tokens: Optional[int] = None
             llm_instance = get_llm_instance() if callable(get_llm_instance) else None
             if llm_instance is None and callable(recovery_completion):
                 recover_runtime = getattr(
@@ -3057,21 +3142,39 @@ class RelayClient:
                 log_error("Desktop runtime LLM initialization failed for API v1 relay request")
                 return self._api_v1_response_envelope(
                     request_id,
-                    error={
-                        "code": "compute_node_internal_error",
-                        "message": "Desktop runtime inference failed",
-                    },
+                    error=self._api_v1_enrich_safe_error(
+                        {
+                            "code": "compute_node_internal_error",
+                            "message": "Desktop runtime inference failed",
+                        },
+                        request_id=request_id,
+                        requested_context_tier=requested_context_tier,
+                        internal_reason="runtime_initialization_failed",
+                    ),
                 )
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            requested_output_tokens = int(completion_kwargs["max_tokens"])
             admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
                 messages=runtime_messages,
-                requested_output_tokens=int(completion_kwargs["max_tokens"]),
+                requested_output_tokens=requested_output_tokens,
                 requested_context_tier=requested_context_tier,
             )
             if not admitted:
-                return self._api_v1_response_envelope(request_id, error=admission_error)
+                return self._api_v1_response_envelope(
+                    request_id,
+                    error=self._api_v1_enrich_safe_error(
+                        admission_error or {
+                            "code": "compute_node_context_admission_unavailable",
+                            "message": "Desktop runtime context admission failed",
+                        },
+                        request_id=request_id,
+                        requested_context_tier=requested_context_tier,
+                        prompt_tokens=prompt_tokens,
+                        requested_output_tokens=requested_output_tokens,
+                    ),
+                )
 
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
@@ -3118,12 +3221,17 @@ class RelayClient:
                 )
                 return self._api_v1_response_envelope(
                     request_id,
-                    error={
-                        "code": "compute_node_invalid_model_output",
-                        "message": "Desktop runtime returned invalid assistant output",
-                        "request_id": request_id,
-                        "internal_reason": invalid_reason,
-                    },
+                    error=self._api_v1_enrich_safe_error(
+                        {
+                            "code": "compute_node_invalid_model_output",
+                            "message": "Desktop runtime returned invalid assistant output",
+                        },
+                        request_id=request_id,
+                        requested_context_tier=requested_context_tier,
+                        prompt_tokens=prompt_tokens,
+                        requested_output_tokens=requested_output_tokens,
+                        internal_reason=invalid_reason,
+                    ),
                 )
 
             return self._api_v1_response_envelope(request_id, message=assistant_message)
@@ -3156,14 +3264,18 @@ class RelayClient:
                 )
                 return self._api_v1_response_envelope(
                     request_id,
-                    error={
-                        "code": error_code,
-                        "message": "Desktop runtime rejected the inference request",
-                        "request_id": request_id,
-                        "internal_reason": internal_reason,
-                        **({"rejected_option": rejected_option} if rejected_option else {}),
-                        **self._last_api_v1_runtime_health,
-                    },
+                    error=self._api_v1_enrich_safe_error(
+                        {
+                            "code": error_code,
+                            "message": "Desktop runtime rejected the inference request",
+                        },
+                        request_id=request_id,
+                        requested_context_tier=requested_context_tier,
+                        prompt_tokens=prompt_tokens,
+                        requested_output_tokens=requested_output_tokens,
+                        internal_reason=internal_reason,
+                        rejected_option=rejected_option,
+                    ),
                 )
             recovery_attempted = (
                 "replacement" in str(exc).lower()
@@ -3185,12 +3297,17 @@ class RelayClient:
             )
             return self._api_v1_response_envelope(
                 request_id,
-                error={
-                    "code": "compute_node_internal_error",
-                    "message": "Desktop runtime inference failed",
-                    "request_id": request_id,
-                    **self._last_api_v1_runtime_health,
-                },
+                error=self._api_v1_enrich_safe_error(
+                    {
+                        "code": "compute_node_internal_error",
+                        "message": "Desktop runtime inference failed",
+                    },
+                    request_id=request_id,
+                    requested_context_tier=requested_context_tier,
+                    prompt_tokens=prompt_tokens,
+                    requested_output_tokens=requested_output_tokens,
+                    internal_reason="runtime_inference_failed",
+                ),
             )
 
     def process_client_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:

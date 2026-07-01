@@ -1380,6 +1380,11 @@ def test_landing_chat_structured_compute_error_renders_safe_message(
                 "error": {
                     "code": "compute_node_model_unsupported",
                     "message": "Requested model is not available in the desktop runtime",
+                    "request_id": "req-safe-diag",
+                    "internal_reason": "model_id_unavailable",
+                    "active_context_tier": "8k-fast",
+                    "requested_context_tier": "64k-full",
+                    "retryable": False,
                 }
             }
         ],
@@ -1408,7 +1413,12 @@ def test_landing_chat_structured_compute_error_renders_safe_message(
     body_text = page.locator("body").inner_text()
     assert "hello structured error" in body_text
     assert not any("Unexpected response format" in message for message in console_errors)
-    assert any("compute_node_model_unsupported" in message for message in console_warnings)
+    warning_text = "\n".join(console_warnings)
+    assert "compute_node_model_unsupported" in warning_text
+    assert "req-safe-diag" in warning_text
+    assert "model_id_unavailable" in warning_text
+    assert "8k-fast" in warning_text
+    assert "64k-full" in warning_text
     assert state["relay_requests"], "expected the landing chat to POST an API v1 relay payload"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []

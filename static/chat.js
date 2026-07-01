@@ -1211,10 +1211,39 @@ new Vue({
             }
 
             const code = typeof error.code === 'string' && error.code.trim() ? error.code.trim() : '';
+            const safeDiagnosticKeys = [
+                'request_id',
+                'internal_reason',
+                'active_context_tier',
+                'requested_context_tier',
+                'rejected_option',
+                'retryable',
+                'configured_context_tokens',
+                'prompt_tokens',
+                'requested_output_tokens',
+                'runtime_healthy',
+                'recovery_attempted',
+                'recovery_succeeded'
+            ];
+            const diagnostics = { code };
+            safeDiagnosticKeys.forEach((key) => {
+                if (Object.prototype.hasOwnProperty.call(error, key)) {
+                    const value = error[key];
+                    if (
+                        typeof value === 'string'
+                        || typeof value === 'number'
+                        || typeof value === 'boolean'
+                        || value === null
+                    ) {
+                        diagnostics[key] = value;
+                    }
+                }
+            });
             return {
                 userMessage: this.getUserFacingApiError(response),
                 terminalSelectedServer: error.terminalSelectedServer === true,
-                code
+                code,
+                diagnostics
             };
         },
 
@@ -1255,7 +1284,7 @@ new Vue({
                     const normalizedError = this.normalizeApiV1ResponseError(response);
                     if (normalizedError) {
                         if (normalizedError.code) {
-                            console.warn('API v1 structured error rendered:', { code: normalizedError.code });
+                            console.warn('API v1 structured error rendered:', JSON.stringify(normalizedError.diagnostics));
                         }
                         this.chatHistory.push({
                             role: 'assistant',

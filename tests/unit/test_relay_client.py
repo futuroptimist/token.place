@@ -5045,6 +5045,19 @@ def test_qwen_think_output_is_rejected():
     )
 
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_invalid_model_output'
+    error = envelope['api_v1_response']['error']
+    assert error['request_id'] == 'req-qwen-think'
+    assert error['internal_reason'] == 'qwen_thinking_output_leaked'
+    assert error['active_context_tier'] == '8k-fast'
+    assert error['requested_context_tier'] == '8k-fast'
+    assert error['configured_context_tokens'] == 128
+    assert isinstance(error['prompt_tokens'], int)
+    assert error['prompt_tokens'] > 0
+    assert error['requested_output_tokens'] == 5
+    assert error['runtime_healthy'] is True
+    assert error['recovery_attempted'] is False
+    assert error['recovery_succeeded'] is False
+    assert 'secret' not in json.dumps(error)
 
 
 def test_qwen_profile_generation_defaults_include_top_k():
@@ -5141,3 +5154,161 @@ def test_render_tokenize_success_clears_stale_worker_diagnostics():
 
     assert prompt_tokens == 3
     assert not hasattr(runtime, "_token_place_last_render_tokenize_error")
+
+
+def test_api_v1_qwen_completion_text_fallback_converts_to_assistant_message():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion.return_value = {"choices": [{"text": "Qwen ok"}]}
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-text",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "Qwen ok"}
+
+
+def test_api_v1_qwen_message_without_role_converts_to_assistant_message():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion.return_value = {"choices": [{"message": {"content": "Qwen ok"}}]}
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-no-role",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "Qwen ok"}
+
+
+def test_api_v1_qwen_thinking_output_is_rejected_with_safe_reason(caplog):
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": "<think>secret reasoning</think> final"}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    with caplog.at_level("ERROR", logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-qwen-think",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["request_id"] == "req-qwen-think"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert "secret reasoning" not in caplog.text
+    assert "qwen_thinking_output_leaked" in caplog.text
+
+
+def test_api_v1_malformed_qwen_completion_reports_safe_shape_not_content(caplog):
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": ["SECRET"]}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    with caplog.at_level("ERROR", logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-qwen-bad",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "unsupported_completion_shape"
+    assert error["request_id"] == "req-qwen-bad"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert isinstance(error["prompt_tokens"], int)
+    assert error["prompt_tokens"] > 0
+    assert error["requested_output_tokens"] == 512
+    assert error["runtime_healthy"] is True
+    assert error["recovery_attempted"] is False
+    assert error["recovery_succeeded"] is False
+    assert "SECRET" not in json.dumps(error)
+    assert "SECRET" not in caplog.text
+    assert "message_content_type" in caplog.text
+
+
+def test_api_v1_runtime_rejected_generation_option_is_safe_options_error():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+        "unexpected keyword argument 'top_k'",
+        diagnostics={
+            "code": "compute_node_options_unsupported",
+            "reason": "unsupported_generation_option",
+            "rejected_option": "top_k",
+        },
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-option-rejected",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["request_id"] == "req-option-rejected"
+    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["rejected_option"] == "top_k"
+    assert error["active_context_tier"] == "8k-fast"
+    assert error["requested_context_tier"] == "8k-fast"
+    assert error["configured_context_tokens"] == 8192
+    assert isinstance(error["prompt_tokens"], int)
+    assert error["prompt_tokens"] > 0
+    assert error["requested_output_tokens"] == 512
+    assert error["runtime_healthy"] is True
+    assert error["recovery_attempted"] is False
+    assert error["recovery_succeeded"] is False
+
+
+def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_callable():
+    class RuntimeWithoutCompletion:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return "".join(
+                f"<{message['role']}>{message['content']}" for message in messages
+            ) + ("<assistant>" if add_generation_prompt else "")
+
+        def tokenize(self, payload, _add_bos=False):
+            return list(range(len(payload)))
+
+    class ManagerWithoutCompletion(_ApiV1RuntimeManager):
+        def __init__(self):
+            super().__init__()
+            self.runtime = RuntimeWithoutCompletion()
+
+    manager = ManagerWithoutCompletion()
+    client = _api_v1_validation_client(manager)
+    client._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-stale-invalid-reason",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "unsupported_completion_shape"

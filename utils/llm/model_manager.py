@@ -1065,7 +1065,7 @@ class _SubprocessLlamaCppModule:
 
 
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
-import importlib, json, sys, traceback
+import importlib, json, re, sys, traceback
 
 def _jsonable(value):
     if hasattr(value, 'model_dump'):
@@ -1098,6 +1098,13 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             diagnostics['stream'] = bool(kwargs.get('stream'))
     if exc is not None:
         diagnostics['exception_type'] = type(exc).__name__
+        if reason == 'inference_exception':
+            message = str(exc)
+            match = re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument) [\\'"]?([A-Za-z_][A-Za-z0-9_]*)', message)
+            if match:
+                diagnostics['reason'] = 'unsupported_generation_option'
+                diagnostics['code'] = 'compute_node_options_unsupported'
+                diagnostics['rejected_option'] = match.group(1)
     return {
         'status': 'error',
         'request_error': True,

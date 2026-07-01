@@ -233,3 +233,18 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "The previous LLM server disconnected. Continuing with another available server." in chat_js
     assert "No LLM servers are available right now. Your chat history is still here." in chat_js
     assert "this.clearSelectedServer()" in chat_js
+
+
+def test_api_v1_structured_error_logs_safe_diagnostic_fields():
+    chat_js = Path("static/chat.js").read_text()
+    assert "JSON.stringify(normalizedError.diagnostics)" in chat_js
+    for field in (
+        "request_id",
+        "internal_reason",
+        "active_context_tier",
+        "requested_context_tier",
+        "rejected_option",
+        "retryable",
+    ):
+        assert field in chat_js
+    assert "{ code: normalizedError.code }" not in chat_js

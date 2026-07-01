@@ -2108,26 +2108,27 @@ class RelayClient:
             prepared.insert(0, adapter_message)
         return prepared
 
-    @staticmethod
-    def _api_v1_qwen_no_think_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    @classmethod
+    def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Inject Qwen's template-supported non-thinking control into user text."""
 
+        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
         prepared = [dict(message) for message in messages]
         for index in range(len(prepared) - 1, -1, -1):
             if prepared[index].get("role") != "user":
                 continue
             content = prepared[index].get("content")
             if isinstance(content, str):
-                prepared[index]["content"] = "/no_think\n" + content
+                prepared[index]["content"] = f"{message_control}\n{content}"
                 return prepared
             if isinstance(content, list):
                 copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
                 for block in copied_blocks:
                     if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = "/no_think\n" + block["text"]
+                        block["text"] = f"{message_control}\n{block['text']}"
                         prepared[index]["content"] = copied_blocks
                         return prepared
-                copied_blocks.insert(0, {"type": "text", "text": "/no_think\n"})
+                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
                 prepared[index]["content"] = copied_blocks
                 return prepared
         return prepared
@@ -2156,8 +2157,21 @@ class RelayClient:
         return (
             cls._api_v1_qwen_non_thinking_required(model_profile)
             and isinstance(content, str)
-            and "<think" in content.lower()
+            and bool(re.search(r"<\s*think", content, flags=re.IGNORECASE))
         )
+
+    @classmethod
+    def _api_v1_qwen_reasoning_content_leaked(
+        cls, model_profile: Dict[str, Any], message: Any
+    ) -> bool:
+        if not (
+            cls._api_v1_qwen_non_thinking_required(model_profile)
+            and cls._API_V1_QWEN_NON_THINKING_POLICY["reasoning_content_forbidden"]
+            and isinstance(message, dict)
+        ):
+            return False
+        forbidden_reasoning_fields = {"reasoning_content", "reasoning"}
+        return any(message.get(field) not in (None, "") for field in forbidden_reasoning_fields)
 
     @staticmethod
     def _api_v1_models_module() -> Optional[Any]:
@@ -3000,6 +3014,14 @@ class RelayClient:
                 # partially leaked or mis-accounted in API v1 relay responses.
                 self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
                 return None
+            if message is not None and self._api_v1_qwen_reasoning_content_leaked(
+                model_profile, message
+            ):
+                # Fail closed instead of forwarding runtime-specific hidden
+                # reasoning fields alongside an otherwise valid assistant
+                # response.
+                self._last_api_v1_invalid_model_output_reason = "qwen_reasoning_content_leaked"
+                return None
             if message is None:
                 self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message
@@ -3138,17 +3160,15 @@ class RelayClient:
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-        if self._api_v1_qwen_non_thinking_required(model_profile):
-            # Use Qwen's documented /no_think message-level control before
-            # both admission and generation.  llama-cpp-python's
-            # create_chat_completion does not expose template kwargs, so admission
-            # intentionally renders the same message shape instead of adding an
-            # admission-only enable_thinking=False assistant prefix.  Output
-            # validation below still fails closed if a runtime returns a <think>
-            # block.
-            runtime_messages = self._api_v1_prepare_qwen_non_thinking_messages(
-                runtime_messages, model_profile
-            )
+        # Use Qwen's documented /no_think message-level control before both
+        # admission and generation.  llama-cpp-python's create_chat_completion
+        # does not expose template kwargs, so admission intentionally renders the
+        # same message shape instead of adding an admission-only
+        # enable_thinking=False assistant prefix.  Output validation below still
+        # fails closed if a runtime returns visible or hidden thinking output.
+        runtime_messages = self._api_v1_prepare_qwen_non_thinking_messages(
+            runtime_messages, model_profile
+        )
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             completion = None

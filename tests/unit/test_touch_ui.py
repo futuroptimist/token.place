@@ -159,6 +159,12 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "The LLM server returned an invalid response. Please try again." in chat_js
     assert "This request exceeds the current API size limit. Please shorten it and try again." in chat_js
     assert "This prompt exceeds the selected LLM server's context window." in chat_js
+    assert "API v1 structured error rendered:" in chat_js
+    assert "request_id" in chat_js
+    assert "internal_reason" in chat_js
+    assert "active_context_tier" in chat_js
+    assert "requested_context_tier" in chat_js
+    assert "retryable" in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
 

@@ -5141,3 +5141,102 @@ def test_render_tokenize_success_clears_stale_worker_diagnostics():
 
     assert prompt_tokens == 3
     assert not hasattr(runtime, "_token_place_last_render_tokenize_error")
+
+
+def test_qwen_completion_text_shape_converts_to_assistant_message():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        'choices': [{'text': 'text fallback ok'}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-text',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['message'] == {
+        'role': 'assistant',
+        'content': 'text fallback ok',
+    }
+
+
+def test_qwen_completion_message_without_role_converts_to_assistant_message():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        'choices': [{'message': {'content': 'role omitted ok'}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-role-omitted',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['message'] == {
+        'role': 'assistant',
+        'content': 'role omitted ok',
+    }
+
+
+def test_qwen_think_output_error_includes_safe_reason_and_request_id():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        'choices': [{'message': {'role': 'assistant', 'content': '<think>secret</think>answer'}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-think-safe',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    error = envelope['api_v1_response']['error']
+    assert error['code'] == 'compute_node_invalid_model_output'
+    assert error['request_id'] == 'req-qwen-think-safe'
+    assert error['internal_reason'] == 'qwen_thinking_output_leaked'
+    assert error['prompt_tokens'] is not None
+    assert error['requested_output_tokens'] == 5
+    assert error['runtime_healthy'] is True
+    assert 'secret' not in json.dumps(error)
+
+
+def test_runtime_unsupported_option_exception_is_safe_structured_error():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _AdmissionManager(window=128)
+    manager.runtime.create_chat_completion = MagicMock(
+        side_effect=LlamaCppInferenceRequestError(
+            'unsupported kwarg: top_k',
+            diagnostics={'reason': 'unsupported_option', 'option': 'top_k'},
+        )
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-unsupported-runtime-option',
+        model_id='llama-3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    error = envelope['api_v1_response']['error']
+    assert error['code'] == 'compute_node_options_unsupported'
+    assert error['request_id'] == 'req-unsupported-runtime-option'
+    assert error['internal_reason'] == 'runtime_options_unsupported'

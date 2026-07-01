@@ -321,7 +321,7 @@ def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason()
 def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     class ReadyRuntime:
         def create_chat_completion(self, **_kwargs):
-            return {}
+            return {"choices": [{"message": {"role": "assistant", "content": "ready"}}]}
 
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
@@ -399,6 +399,38 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert llm_runtime.completion_kwargs["stream"] is False
     assert llm_runtime.completion_kwargs["max_tokens"] == 4
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+
+
+def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
+    class ThinkRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "<THINK>no"}}]}
+
+    monkeypatch.delenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", raising=False)
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = ThinkRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(monkeypatch):

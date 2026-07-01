@@ -530,6 +530,17 @@ class RelayClient:
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
     _API_V1_MAX_SEED = 2**32 - 1
+    # Single source of truth for API v1 Qwen behavior. API v1 is a
+    # non-reasoning chat-completions surface: Qwen thinking is disabled via the
+    # documented message-level /no_think control because the packaged
+    # llama-cpp-python create_chat_completion path used here does not reliably
+    # expose chat-template kwargs such as enable_thinking/template_kwargs.
+    _API_V1_QWEN_NON_THINKING_POLICY = {
+        "thinking_mode": "disabled",
+        "message_control": "/no_think",
+        "visible_think_output_forbidden": True,
+        "reasoning_content_forbidden": True,
+    }
 
     def __init__(
         self,
@@ -2121,6 +2132,33 @@ class RelayClient:
                 return prepared
         return prepared
 
+    @classmethod
+    def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
+        return (
+            isinstance(model_profile, dict)
+            and model_profile.get("provider") == "qwen"
+            and model_profile.get("thinking_mode")
+            == cls._API_V1_QWEN_NON_THINKING_POLICY["thinking_mode"]
+        )
+
+    @classmethod
+    def _api_v1_prepare_qwen_non_thinking_messages(
+        cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        if cls._api_v1_qwen_non_thinking_required(model_profile):
+            return cls._api_v1_qwen_no_think_messages(messages)
+        return messages
+
+    @classmethod
+    def _api_v1_qwen_thinking_leaked(
+        cls, model_profile: Dict[str, Any], content: Any
+    ) -> bool:
+        return (
+            cls._api_v1_qwen_non_thinking_required(model_profile)
+            and isinstance(content, str)
+            and "<think" in content.lower()
+        )
+
     @staticmethod
     def _api_v1_models_module() -> Optional[Any]:
         """Return the optional repo API v1 models module when it is importable."""
@@ -2735,8 +2773,7 @@ class RelayClient:
         )
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
         is_qwen_non_thinking = (
-            model_profile.get("provider") == "qwen"
-            and model_profile.get("thinking_mode") == "disabled"
+            self._api_v1_qwen_non_thinking_required(model_profile)
         )
         # Prefer a packaged-runtime bridge that renders and tokenizes inside the
         # loaded worker process. This keeps Qwen admission aligned with the same
@@ -2956,12 +2993,8 @@ class RelayClient:
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-            if (
-                message is not None
-                and model_profile.get("provider") == "qwen"
-                and model_profile.get("thinking_mode") == "disabled"
-                and isinstance(message.get("content"), str)
-                and "<think" in message["content"].lower()
+            if message is not None and self._api_v1_qwen_thinking_leaked(
+                model_profile, message.get("content")
             ):
                 # Fail closed instead of stripping so no hidden reasoning can be
                 # partially leaked or mis-accounted in API v1 relay responses.
@@ -3105,10 +3138,7 @@ class RelayClient:
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-        if (
-            model_profile.get("provider") == "qwen"
-            and model_profile.get("thinking_mode") == "disabled"
-        ):
+        if self._api_v1_qwen_non_thinking_required(model_profile):
             # Use Qwen's documented /no_think message-level control before
             # both admission and generation.  llama-cpp-python's
             # create_chat_completion does not expose template kwargs, so admission
@@ -3116,7 +3146,9 @@ class RelayClient:
             # admission-only enable_thinking=False assistant prefix.  Output
             # validation below still fails closed if a runtime returns a <think>
             # block.
-            runtime_messages = self._api_v1_qwen_no_think_messages(runtime_messages)
+            runtime_messages = self._api_v1_prepare_qwen_non_thinking_messages(
+                runtime_messages, model_profile
+            )
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             completion = None

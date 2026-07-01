@@ -429,8 +429,9 @@ class ComputeNodeRuntime:
             from utils.networking.relay_client import RelayClient
 
             smoke_messages = [{"role": "system", "content": "ok"}, {"role": "user", "content": "hi"}]
-            if diagnostics["api_v1_readiness_non_thinking_enforced"]:
-                smoke_messages = RelayClient._api_v1_qwen_no_think_messages(smoke_messages)
+            smoke_messages = RelayClient._api_v1_prepare_qwen_non_thinking_messages(
+                smoke_messages, model_profile
+            )
             admitted, admission_error, prompt_tokens = (
                 self.relay_client._api_v1_authoritative_context_admission(
                     llm_instance=llm_runtime,
@@ -460,7 +461,11 @@ class ComputeNodeRuntime:
             ) if not admitted else None,
         })
         self.model_manager.last_compute_diagnostics = diagnostics
-        if admitted and os.getenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION") == "1":
+        completion_smoke_required = bool(
+            diagnostics["api_v1_readiness_non_thinking_enforced"]
+            or os.getenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION") == "1"
+        )
+        if admitted and completion_smoke_required:
             try:
                 smoke_completion = create_chat_completion(
                     messages=smoke_messages,
@@ -476,7 +481,13 @@ class ComputeNodeRuntime:
                 ):
                     smoke_message = smoke_completion["choices"][0].get("message")
                 smoke_content = smoke_message.get("content") if isinstance(smoke_message, dict) else None
-                smoke_ok = isinstance(smoke_content, str) and bool(smoke_content.strip()) and "<think" not in smoke_content.lower()
+                smoke_ok = (
+                    isinstance(smoke_content, str)
+                    and bool(smoke_content.strip())
+                    and not RelayClient._api_v1_qwen_thinking_leaked(
+                        model_profile, smoke_content
+                    )
+                )
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
                 if not smoke_ok:
                     admitted = False

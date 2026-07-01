@@ -530,6 +530,17 @@ class RelayClient:
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
     _API_V1_MAX_SEED = 2**32 - 1
+    # Single source of truth for API v1 Qwen behavior: v1 is a
+    # non-reasoning/non-thinking chat-completions API.  The packaged
+    # llama-cpp-python runtime available to the desktop worker does not expose
+    # create_chat_completion(template_kwargs=...) or chat_template_kwargs for
+    # Qwen3 in a way this repo can rely on; the verified generation-aligned
+    # control is Qwen's template-level /no_think directive injected into the
+    # final user message before both admission render/tokenize and generation.
+    _API_V1_QWEN_THINKING_ENABLED = False
+    _API_V1_QWEN_VISIBLE_THINK_TAG_FORBIDDEN = True
+    _API_V1_QWEN_REASONING_CONTENT_FORBIDDEN = True
+    _API_V1_QWEN_NO_THINK_DIRECTIVE = "/no_think\n"
 
     def __init__(
         self,
@@ -2097,8 +2108,8 @@ class RelayClient:
             prepared.insert(0, adapter_message)
         return prepared
 
-    @staticmethod
-    def _api_v1_qwen_no_think_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    @classmethod
+    def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Inject Qwen's template-supported non-thinking control into user text."""
 
         prepared = [dict(message) for message in messages]
@@ -2107,16 +2118,16 @@ class RelayClient:
                 continue
             content = prepared[index].get("content")
             if isinstance(content, str):
-                prepared[index]["content"] = "/no_think\n" + content
+                prepared[index]["content"] = cls._API_V1_QWEN_NO_THINK_DIRECTIVE + content
                 return prepared
             if isinstance(content, list):
                 copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
                 for block in copied_blocks:
                     if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = "/no_think\n" + block["text"]
+                        block["text"] = cls._API_V1_QWEN_NO_THINK_DIRECTIVE + block["text"]
                         prepared[index]["content"] = copied_blocks
                         return prepared
-                copied_blocks.insert(0, {"type": "text", "text": "/no_think\n"})
+                copied_blocks.insert(0, {"type": "text", "text": cls._API_V1_QWEN_NO_THINK_DIRECTIVE})
                 prepared[index]["content"] = copied_blocks
                 return prepared
         return prepared

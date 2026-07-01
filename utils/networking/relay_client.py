@@ -2162,16 +2162,27 @@ class RelayClient:
 
     @classmethod
     def _api_v1_qwen_reasoning_content_leaked(
-        cls, model_profile: Dict[str, Any], message: Any
+        cls, model_profile: Dict[str, Any], payload: Any
     ) -> bool:
         if not (
             cls._api_v1_qwen_non_thinking_required(model_profile)
             and cls._API_V1_QWEN_NON_THINKING_POLICY["reasoning_content_forbidden"]
-            and isinstance(message, dict)
         ):
             return False
         forbidden_reasoning_fields = {"reasoning_content", "reasoning"}
-        return any(message.get(field) not in (None, "") for field in forbidden_reasoning_fields)
+        if isinstance(payload, dict):
+            if any(payload.get(field) not in (None, "") for field in forbidden_reasoning_fields):
+                return True
+            return any(
+                cls._api_v1_qwen_reasoning_content_leaked(model_profile, value)
+                for value in payload.values()
+            )
+        if isinstance(payload, list):
+            return any(
+                cls._api_v1_qwen_reasoning_content_leaked(model_profile, item)
+                for item in payload
+            )
+        return False
 
     @staticmethod
     def _api_v1_models_module() -> Optional[Any]:
@@ -2998,6 +3009,13 @@ class RelayClient:
             and isinstance(completion["choices"][0], dict)
         ):
             choice = completion["choices"][0]
+            if self._api_v1_qwen_reasoning_content_leaked(
+                getattr(self.model_manager, "model_profile", {}) or {}, choice
+            ):
+                # Fail closed before normalizing the runtime choice so hidden
+                # reasoning fields are never forwarded or echoed.
+                self._last_api_v1_invalid_model_output_reason = "qwen_reasoning_content_leaked"
+                return None
             raw_message = choice.get("message")
             if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
                 raw_message = {**raw_message, "role": "assistant"}
@@ -3013,14 +3031,6 @@ class RelayClient:
                 # Fail closed instead of stripping so no hidden reasoning can be
                 # partially leaked or mis-accounted in API v1 relay responses.
                 self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
-                return None
-            if message is not None and self._api_v1_qwen_reasoning_content_leaked(
-                model_profile, message
-            ):
-                # Fail closed instead of forwarding runtime-specific hidden
-                # reasoning fields alongside an otherwise valid assistant
-                # response.
-                self._last_api_v1_invalid_model_output_reason = "qwen_reasoning_content_leaked"
                 return None
             if message is None:
                 self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"

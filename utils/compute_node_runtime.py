@@ -493,6 +493,9 @@ class ComputeNodeRuntime:
                     and not RelayClient._api_v1_qwen_thinking_leaked(
                         model_profile, smoke_content
                     )
+                    and not RelayClient._api_v1_qwen_reasoning_content_leaked(
+                        model_profile, smoke_choice
+                    )
                 )
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
                 if not smoke_ok:

@@ -2431,6 +2431,77 @@ class TestRelayClient:
         assert relay_visible_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
         assert relay_visible_payload["version"] == 1
 
+
+    def test_assistant_message_extracts_qwen_text_completion_fallback(self, relay_client, mock_model_manager):
+        mock_model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+
+        message = relay_client._assistant_message_from_runtime_completion(
+            {"choices": [{"text": "Qwen response"}]}
+        )
+
+        assert message == {"role": "assistant", "content": "Qwen response"}
+
+    def test_assistant_message_accepts_message_without_role(self, relay_client):
+        message = relay_client._assistant_message_from_runtime_completion(
+            {"choices": [{"message": {"content": "No role response"}}]}
+        )
+
+        assert message == {"role": "assistant", "content": "No role response"}
+
+    def test_assistant_message_rejects_qwen_think_leak_with_safe_reason(self, relay_client, mock_model_manager):
+        mock_model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+
+        message = relay_client._assistant_message_from_runtime_completion(
+            {"choices": [{"message": {"role": "assistant", "content": "<think>hidden</think>Hi"}}]}
+        )
+
+        assert message is None
+        assert relay_client._last_api_v1_completion_invalid_reason == "qwen_thinking_output_leaked"
+
+    def test_generate_api_v1_qwen_think_leak_returns_safe_structured_error(self, relay_client, mock_model_manager):
+        mock_model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+        mock_model_manager.runtime.create_chat_completion.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "<think>hidden</think>Hi"}}]
+        }
+
+        envelope = relay_client._generate_api_v1_response_with_runtime_model(
+            request_id="req-think",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "Hello"}],
+            options={},
+            requested_context_tier="8k-fast",
+        )
+
+        error = envelope["api_v1_response"]["error"]
+        assert error["code"] == "compute_node_invalid_model_output"
+        assert error["request_id"] == "req-think"
+        assert error["internal_reason"] == "qwen_thinking_output_leaked"
+        assert error["active_context_tier"] == "8k-fast"
+        assert error["requested_context_tier"] == "8k-fast"
+        assert error["configured_context_tokens"] == 8192
+        assert "hidden" not in json.dumps(error)
+
+    def test_generate_api_v1_runtime_option_rejection_returns_specific_safe_error(self, relay_client, mock_model_manager):
+        class LlamaCppInferenceRequestError(RuntimeError):
+            pass
+
+        mock_model_manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+            "unexpected keyword argument top_k"
+        )
+
+        envelope = relay_client._generate_api_v1_response_with_runtime_model(
+            request_id="req-options",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "Hello"}],
+            options={},
+            requested_context_tier="8k-fast",
+        )
+
+        error = envelope["api_v1_response"]["error"]
+        assert error["code"] == "compute_node_options_unsupported"
+        assert error["request_id"] == "req-options"
+        assert error["internal_reason"] == "runtime_generation_options_unsupported"
+
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_unsupported_model_posts_encrypted_error(
         self,

@@ -1737,7 +1737,7 @@ class RelayClient:
         request_id: str,
         *,
         message: Optional[Dict[str, Any]] = None,
-        error: Optional[Dict[str, str]] = None,
+        error: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build an encrypted API v1 relay response envelope body."""
 
@@ -2877,15 +2877,22 @@ class RelayClient:
     ) -> Optional[Dict[str, Any]]:
         """Extract an API v1 assistant message from direct llama.cpp output."""
 
+        self._last_api_v1_invalid_model_output_reason = None
         if (
             isinstance(completion, dict)
             and isinstance(completion.get("choices"), list)
             and completion["choices"]
             and isinstance(completion["choices"][0], dict)
         ):
-            message = self._valid_api_v1_assistant_message(
-                completion["choices"][0].get("message")
-            )
+            choice = completion["choices"][0]
+            raw_message = choice.get("message")
+            if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
+                raw_message = {**raw_message, "role": "assistant"}
+            message = self._valid_api_v1_assistant_message(raw_message)
+            if message is None and "text" in choice and "message" not in choice:
+                text = choice.get("text")
+                if isinstance(text, str) and text.strip():
+                    message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
             if (
                 message is not None
@@ -2896,12 +2903,39 @@ class RelayClient:
             ):
                 # Fail closed instead of stripping so no hidden reasoning can be
                 # partially leaked or mis-accounted in API v1 relay responses.
+                self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
                 return None
+            if message is None:
+                self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
         # a complete chat completion object for this path.
+        self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
         return None
+
+    @staticmethod
+    def _api_v1_safe_completion_shape(completion: Any) -> Dict[str, Any]:
+        """Return safe diagnostics for a runtime completion without model text."""
+
+        shape: Dict[str, Any] = {"type": type(completion).__name__}
+        if isinstance(completion, dict):
+            shape["keys"] = sorted(str(key) for key in completion.keys())[:10]
+            choices = completion.get("choices")
+            if isinstance(choices, list):
+                shape["choices_type"] = "list"
+                shape["choices_count"] = len(choices)
+                if choices and isinstance(choices[0], dict):
+                    choice = choices[0]
+                    shape["choice_keys"] = sorted(str(key) for key in choice.keys())[:10]
+                    message = choice.get("message")
+                    if isinstance(message, dict):
+                        shape["message_keys"] = sorted(str(key) for key in message.keys())[:10]
+                        content = message.get("content")
+                        shape["message_content_type"] = type(content).__name__
+                    if "text" in choice:
+                        shape["text_type"] = type(choice.get("text")).__name__
+        return shape
 
     def _generate_api_v1_response_with_runtime_model(
         self,
@@ -3071,18 +3105,44 @@ class RelayClient:
                 )
 
             if assistant_message is None:
-                log_error("Desktop runtime returned invalid API v1 assistant output")
+                invalid_reason = (
+                    getattr(self, "_last_api_v1_invalid_model_output_reason", None)
+                    or "unsupported_completion_shape"
+                )
+                log_error(
+                    "Desktop runtime returned invalid API v1 assistant output reason={} shape={}",
+                    invalid_reason,
+                    self._api_v1_safe_completion_shape(completion if "completion" in locals() else None),
+                )
                 return self._api_v1_response_envelope(
                     request_id,
                     error={
                         "code": "compute_node_invalid_model_output",
                         "message": "Desktop runtime returned invalid assistant output",
+                        "request_id": request_id,
+                        "internal_reason": invalid_reason,
                     },
                 )
 
             return self._api_v1_response_envelope(request_id, message=assistant_message)
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
+                diagnostics = getattr(exc, "diagnostics", {})
+                internal_reason = (
+                    diagnostics.get("reason")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
+                    else "runtime_rejected_generation_options"
+                )
+                rejected_option = (
+                    diagnostics.get("rejected_option")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str)
+                    else None
+                )
+                error_code = (
+                    diagnostics.get("code")
+                    if isinstance(diagnostics, dict) and diagnostics.get("code") == "compute_node_options_unsupported"
+                    else "compute_node_internal_error"
+                )
                 self._last_api_v1_runtime_health = {
                     "runtime_healthy": True,
                     "recovery_attempted": False,
@@ -3095,8 +3155,11 @@ class RelayClient:
                 return self._api_v1_response_envelope(
                     request_id,
                     error={
-                        "code": "compute_node_internal_error",
+                        "code": error_code,
                         "message": "Desktop runtime rejected the inference request",
+                        "request_id": request_id,
+                        "internal_reason": internal_reason,
+                        **({"rejected_option": rejected_option} if rejected_option else {}),
                     },
                 )
             recovery_attempted = (
@@ -3122,6 +3185,8 @@ class RelayClient:
                 error={
                     "code": "compute_node_internal_error",
                     "message": "Desktop runtime inference failed",
+                    "request_id": request_id,
+                    **self._last_api_v1_runtime_health,
                 },
             )
 

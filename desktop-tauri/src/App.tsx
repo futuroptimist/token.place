@@ -155,8 +155,12 @@ function displayStatusValue(value: string | null | undefined, fallback: string):
   return value && value.trim() ? value : fallback;
 }
 
-function isStoppedOrIdleOperatorStatus(status: ComputeNodeStatus, isStarting: boolean): boolean {
-  if (isStarting || status.running) {
+function isStoppedOrIdleOperatorStatus(
+  status: ComputeNodeStatus,
+  isStarting: boolean,
+  isStopping = false
+): boolean {
+  if (isStarting || isStopping || status.running) {
     return false;
   }
   const workerState = status.worker_state?.trim().toLowerCase() || 'stopped';
@@ -302,6 +306,27 @@ export function removeRelayUrl(config: DesktopConfig, index: number): DesktopCon
   };
 }
 
+function stoppedComputeStatus(
+  prev: ComputeNodeStatus,
+  lastError: string | null = null
+): ComputeNodeStatus {
+  return {
+    ...prev,
+    running: false,
+    registered: false,
+    active_relay_url: '',
+    relay_statuses: [],
+    registered_relay_count: 0,
+    registered_relay_urls: [],
+    active_relay_urls: [],
+    relay_runtime_state: 'stopped',
+    warm_load_state: 'stopped',
+    worker_state: 'stopped',
+    worker_alive: false,
+    last_error: lastError,
+  };
+}
+
 function mergeComputeStatusEvent(
   prev: ComputeNodeStatus,
   payload: Record<string, unknown>
@@ -341,53 +366,71 @@ function mergeComputeStatusEvent(
     return prev;
   }
 
+  const isStoppedEvent = payload.type === 'stopped';
+  const stoppedBase = isStoppedEvent ? stoppedComputeStatus(prev, null) : prev;
+
   return {
+    ...stoppedBase,
     running:
-      typeof payload.running === 'boolean'
-        ? payload.running
-        : payload.type === 'error'
+      isStoppedEvent
+        ? stoppedBase.running
+        : typeof payload.running === 'boolean'
+          ? payload.running
+          : payload.type === 'error'
           ? false
-          : prev.running,
+          : stoppedBase.running,
     registered:
-      typeof payload.registered === 'boolean'
-        ? payload.registered
-        : payload.type === 'error'
+      isStoppedEvent
+        ? stoppedBase.registered
+        : typeof payload.registered === 'boolean'
+          ? payload.registered
+          : payload.type === 'error'
           ? false
-          : prev.registered,
+          : stoppedBase.registered,
     active_relay_url:
-      typeof payload.active_relay_url === 'string'
+      isStoppedEvent
+        ? stoppedBase.active_relay_url
+        : typeof payload.active_relay_url === 'string'
         ? payload.active_relay_url
-        : prev.active_relay_url,
+        : stoppedBase.active_relay_url,
     configured_relay_urls:
       Array.isArray(payload.configured_relay_urls)
         ? stringArrayPayload(payload.configured_relay_urls)
         : prev.configured_relay_urls,
     relay_statuses:
-      Array.isArray(payload.relay_statuses)
+      isStoppedEvent
+        ? stoppedBase.relay_statuses
+        : Array.isArray(payload.relay_statuses)
         ? relayStatusesPayload(payload.relay_statuses)
-        : prev.relay_statuses,
+        : stoppedBase.relay_statuses,
     registered_relay_count:
-      typeof payload.registered_relay_count === 'number'
-        ? payload.registered_relay_count
-        : payload.type === 'error'
+      isStoppedEvent
+        ? stoppedBase.registered_relay_count
+        : typeof payload.registered_relay_count === 'number'
+          ? payload.registered_relay_count
+          : payload.type === 'error'
           ? 0
-          : prev.registered_relay_count,
+          : stoppedBase.registered_relay_count,
     configured_relay_count:
       typeof payload.configured_relay_count === 'number'
         ? payload.configured_relay_count
         : prev.configured_relay_count,
     registered_relay_urls:
-      Array.isArray(payload.registered_relay_urls)
-        ? stringArrayPayload(payload.registered_relay_urls)
-        : payload.type === 'error'
+      isStoppedEvent
+        ? stoppedBase.registered_relay_urls
+        : Array.isArray(payload.registered_relay_urls)
+          ? stringArrayPayload(payload.registered_relay_urls)
+          : payload.type === 'error'
           ? []
-          : prev.registered_relay_urls,
+          : stoppedBase.registered_relay_urls,
     active_relay_urls:
-      Array.isArray(payload.active_relay_urls)
-        ? stringArrayPayload(payload.active_relay_urls)
-        : payload.type === 'error'
+      isStoppedEvent
+        ? stoppedBase.active_relay_urls
+        : Array.isArray(payload.active_relay_urls)
+          ? stringArrayPayload(payload.active_relay_urls)
+          : payload.type === 'error'
           ? []
-          : prev.active_relay_urls,
+          : stoppedBase.active_relay_urls,
     requested_mode:
       typeof payload.requested_mode === 'string' ? payload.requested_mode : prev.requested_mode,
     effective_mode:
@@ -410,19 +453,21 @@ function mergeComputeStatusEvent(
           : prev.fallback_reason,
     model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
     relay_runtime_state:
-      typeof payload.relay_runtime_state === 'string'
-        ? payload.relay_runtime_state
-        : typeof payload.warm_load_state === 'string'
-          ? payload.warm_load_state
+      isStoppedEvent
+        ? stoppedBase.relay_runtime_state
+        : typeof payload.relay_runtime_state === 'string'
+          ? payload.relay_runtime_state
           : payload.type === 'error'
             ? 'failed'
             : prev.relay_runtime_state,
     warm_load_state:
-      typeof payload.warm_load_state === 'string'
-        ? payload.warm_load_state
-        : payload.type === 'error'
-          ? 'failed'
-          : prev.warm_load_state,
+      isStoppedEvent
+        ? stoppedBase.warm_load_state
+        : typeof payload.warm_load_state === 'string'
+          ? payload.warm_load_state
+          : payload.type === 'error'
+            ? 'failed'
+            : prev.warm_load_state,
     warm_load_enabled:
       typeof payload.warm_load_enabled === 'boolean'
         ? payload.warm_load_enabled
@@ -437,21 +482,25 @@ function mergeComputeStatusEvent(
         ? payload.relay_runtime_path
         : prev.relay_runtime_path,
     worker_state:
-      typeof payload.worker_state === 'string'
-        ? payload.worker_state
-        : payload.type === 'error'
-          ? 'failed'
-          : prev.worker_state,
+      isStoppedEvent
+        ? stoppedBase.worker_state
+        : typeof payload.worker_state === 'string'
+          ? payload.worker_state
+          : payload.type === 'error'
+            ? 'failed'
+            : prev.worker_state,
     worker_generation:
       typeof payload.worker_generation === 'number' ? payload.worker_generation : prev.worker_generation,
     worker_restart_count:
       typeof payload.worker_restart_count === 'number' ? payload.worker_restart_count : prev.worker_restart_count,
     worker_alive:
-      typeof payload.worker_alive === 'boolean'
-        ? payload.worker_alive
-        : payload.type === 'error'
-          ? false
-          : prev.worker_alive,
+      isStoppedEvent
+        ? stoppedBase.worker_alive
+        : typeof payload.worker_alive === 'boolean'
+          ? payload.worker_alive
+          : payload.type === 'error'
+            ? false
+            : prev.worker_alive,
     last_worker_error_code:
       payload.last_worker_error_code === null
         ? null
@@ -491,7 +540,7 @@ function mergeComputeStatusEvent(
           ? payload.last_error
           : typeof payload.message === 'string'
             ? payload.message
-            : prev.last_error,
+            : stoppedBase.last_error,
   };
 }
 
@@ -524,6 +573,7 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const [isStoppingComputeNode, setIsStoppingComputeNode] = useState(false);
   const [operatorLogText, setOperatorLogText] = useState('');
   const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState =
@@ -605,8 +655,11 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error') {
+      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
         setIsStartingComputeNode(false);
+      }
+      if (payload.type === 'stopped') {
+        setIsStoppingComputeNode(false);
       }
       if (payload.type === 'error') {
         const computeMessage =
@@ -642,12 +695,20 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
-    [config.model_path, computeStatus.running, isStartingComputeNode]
+    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
+  );
+  const operatorControlsDisabled = useMemo(
+    () => isStartingComputeNode || isStoppingComputeNode,
+    [isStartingComputeNode, isStoppingComputeNode]
+  );
+  const operatorEditControlsDisabled = useMemo(
+    () => computeStatus.running || operatorControlsDisabled,
+    [computeStatus.running, operatorControlsDisabled]
   );
   const canChangeContextTier = useMemo(
-    () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode),
-    [computeStatus, isStartingComputeNode]
+    () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
+    [computeStatus, isStartingComputeNode, isStoppingComputeNode]
   );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
@@ -794,9 +855,21 @@ export function App() {
 
   const stopComputeNode = async () => {
     try {
+      setIsStoppingComputeNode(true);
+      setError('');
       await invoke('stop_compute_node');
+      const nextStatus = stoppedComputeStatus(computeStatusRef.current, null);
+      computeStatusRef.current = nextStatus;
+      setComputeStatus(nextStatus);
+      setIsStartingComputeNode(false);
+      setIsStoppingComputeNode(false);
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setIsStoppingComputeNode(false);
+      const message = formatErrorMessage(e);
+      const failedStopStatus = { ...computeStatusRef.current, last_error: message };
+      computeStatusRef.current = failedStopStatus;
+      setComputeStatus(failedStopStatus);
+      setError(message);
     }
   };
 
@@ -915,14 +988,14 @@ export function App() {
 
       <section aria-labelledby="relay-urls-heading" style={{ marginTop: 12 }}>
         <h2 id="relay-urls-heading" style={{ fontSize: 16, marginBottom: 8 }}>Relay URLs</h2>
-        {(computeStatus.running || isStartingComputeNode) && (
+        {operatorEditControlsDisabled && (
           <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>
             Stop the operator to edit relay URLs. Changes apply on next start.
           </p>
         )}
         {config.relay_base_urls.map((relayUrl, index) => {
           const inputId = `relay-url-${index}`;
-          const relayControlsDisabled = computeStatus.running || isStartingComputeNode;
+          const relayControlsDisabled = operatorEditControlsDisabled;
           return (
             <div key={index} style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
               <label htmlFor={inputId} style={{ minWidth: 92 }}>Relay URL {index + 1}</label>
@@ -949,7 +1022,7 @@ export function App() {
         <button
           type="button"
           onClick={() => updateConfig(addRelayUrl(config))}
-          disabled={computeStatus.running || isStartingComputeNode || config.relay_base_urls.length >= MAX_RELAY_BASE_URLS}
+          disabled={operatorEditControlsDisabled || config.relay_base_urls.length >= MAX_RELAY_BASE_URLS}
           style={{ marginTop: 8 }}
         >
           Add new relay URL
@@ -979,7 +1052,7 @@ export function App() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running}
+            disabled={!computeStatus.running || operatorControlsDisabled}
             onClick={stopComputeNode}
           >
             Stop operator

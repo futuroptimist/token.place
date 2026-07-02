@@ -37,6 +37,43 @@ def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics
 
     assert RelayClient._api_v1_models_module() is None
 
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("answer", "answer"),
+        (" <think></think> answer ", "answer"),
+        ("<think>\n\n</think>\n\nok", "ok"),
+        ("<THINK>   </THINK>\nAnswer", "Answer"),
+        ("<think></think><think> </think> final", "final"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_strips_only_empty_leading_wrappers(raw, expected):
+    cleaned, reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert cleaned == expected
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    "raw, reason",
+    [
+        ("<think>I am reasoning</think>\nanswer", "qwen_thinking_output_leaked"),
+        ("<think secret partial", "qwen_thinking_output_leaked"),
+        ("answer <think></think>", "qwen_thinking_output_leaked"),
+        ("<think></think>", "qwen_empty_after_think_wrapper_strip"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_rejects_reasoning_and_empty(raw, reason):
+    cleaned, observed_reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert cleaned is None
+    assert observed_reason == reason
+
 # Common test data
 TEST_VALID_RESPONSE = {
     'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',  # Base64 encoded "client_key_b64"
@@ -5235,7 +5272,7 @@ def test_render_tokenize_success_clears_stale_worker_diagnostics():
 def test_api_v1_qwen_completion_text_fallback_converts_to_assistant_message():
     manager = _ApiV1RuntimeManager()
     manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
-    manager.runtime.create_chat_completion.return_value = {"choices": [{"text": "Qwen ok"}]}
+    manager.runtime.create_chat_completion.return_value = {"choices": [{"text": "<think>\n\n</think>\n\nQwen ok"}]}
     client = _api_v1_validation_client(manager)
 
     envelope = client._generate_api_v1_response_with_runtime_model(
@@ -5246,6 +5283,7 @@ def test_api_v1_qwen_completion_text_fallback_converts_to_assistant_message():
     )
 
     assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "Qwen ok"}
+    assert "<think" not in envelope["api_v1_response"]["message"]["content"].lower()
 
 
 def test_api_v1_qwen_message_without_role_converts_to_assistant_message():

@@ -398,7 +398,46 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert llm_runtime.completion_kwargs["stream"] is False
-    assert llm_runtime.completion_kwargs["max_tokens"] == 4
+    assert llm_runtime.completion_kwargs["max_tokens"] == 64
+    assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+
+
+def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_think_wrapper(monkeypatch):
+    class EmptyThinkRuntime:
+        def __init__(self):
+            self.completion_kwargs = None
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **kwargs):
+            self.completion_kwargs = kwargs
+            return {"choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nok"}}]}
+
+    monkeypatch.delenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", raising=False)
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    llm_runtime = EmptyThinkRuntime()
+    model_manager.get_llm_instance.return_value = llm_runtime
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "choices_message_content"
+    assert diagnostics["api_v1_readiness_completion_smoke_max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
 
@@ -431,7 +470,7 @@ def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_withou
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(monkeypatch):
@@ -464,7 +503,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(mo
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_content(monkeypatch):
@@ -506,7 +545,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "reasoning_field_present"
     assert "secret hidden reasoning" not in json.dumps(diagnostics)
 
 

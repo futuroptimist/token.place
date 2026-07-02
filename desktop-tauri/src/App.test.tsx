@@ -1760,4 +1760,200 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last worker error code:/).textContent).toContain('fatal_worker_exit');
   });
 
+
+  it('re-enables context tier and relay controls immediately after successful Stop Operator', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+      registered_relay_count: 1,
+      registered_relay_urls: ['https://token.place'],
+      active_relay_urls: ['https://token.place'],
+      operator_session_id: 'session-1',
+      sequence: 2,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const addRelayButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    const stopOperatorButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+    expect(relayInput.disabled).toBe(true);
+    expect(addRelayButton.disabled).toBe(true);
+
+    fireEvent.click(stopOperatorButton);
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(relayInput.disabled).toBe(false);
+    expect(addRelayButton.disabled).toBe(false);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+
+    fireEvent.change(contextSelect, { target: { value: '64k-full' } });
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'start_compute_node' && args?.request?.context_tier === '64k-full'
+        )
+      ).toBe(true)
+    );
+  });
+
+  it('treats stopped events with omitted fields as terminal stopped state', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+      operator_session_id: 'session-1',
+      sequence: 2,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
+    expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
+  });
+
+  it('re-enables context tier after pre-registration failure event', async () => {
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+
+    fireEvent.click(startButton);
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        warm_load_state: 'failed',
+        worker_state: 'failed',
+        worker_alive: false,
+        last_error: 'registration failed before ready',
+        operator_session_id: 'session-failed',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Last error:/).textContent).toContain('registration failed before ready');
+  });
+
+  it('keeps stopped controls enabled when stale previous-session running events arrive after stop', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      worker_state: 'ready',
+      operator_session_id: 'session-2',
+      sequence: 5,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        worker_state: 'stopped',
+        operator_session_id: 'session-2',
+        sequence: 6,
+      },
+    });
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        worker_state: 'ready',
+        operator_session_id: 'session-1',
+        sequence: 100,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+  });
+
+  it('leaves the running state intact and surfaces safe error when Stop Operator fails', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'stop_compute_node') {
+        return Promise.reject(new Error('stop failed safely'));
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: true,
+          registered: true,
+          active_relay_url: 'https://token.place',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '/tmp/model.gguf',
+          last_error: null,
+          relay_runtime_state: 'ready',
+          worker_state: 'ready',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const stopButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    fireEvent.click(stopButton);
+
+    await waitFor(() => expect(screen.getByText(/Error:/).textContent).toContain('stop failed safely'));
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(contextSelect.disabled).toBe(true);
+  });
+
 });

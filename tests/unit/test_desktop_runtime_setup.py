@@ -27,7 +27,16 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
-def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
+def _probe(
+    *,
+    backend='cpu',
+    gpu=False,
+    device='cpu',
+    error=None,
+    yarn_supported=False,
+    yarn_source='unsupported',
+    version='unknown',
+):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,
         gpu_offload_supported=gpu,
@@ -36,6 +45,9 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
         prefix=sys.prefix,
         llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
         error=error,
+        llama_cpp_python_version=version,
+        yarn_resolver_source=yarn_source,
+        qwen_64k_rope_supported=yarn_supported,
     )
 
 
@@ -136,6 +148,90 @@ def test_macos_metal_already_supported_reports_metal_action(monkeypatch):
     assert result['runtime_action'] == 'metal_already_supported'
 
 
+
+
+def test_macos_metal_already_supported_is_not_enough_for_qwen_64k_without_yarn(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'platform', 'darwin')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv('TOKEN_PLACE_CONTEXT_TIER', '64k-full')
+    monkeypatch.setenv('TOKEN_PLACE_MODEL_PROFILE_ID', 'qwen3-8b-q4-k-m')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='metal', gpu=True, device='metal', yarn_supported=False),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (Path('/tmp/site'), None),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert 'missing Qwen 64K YaRN/RoPE support' in result['fallback_reason']
+    assert result['yarn_resolver_source'] == 'unsupported'
+
+
+def test_macos_qwen_64k_stale_runtime_reinstalls_then_reexecs(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'platform', 'darwin')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv('TOKEN_PLACE_CONTEXT_TIER', '64k-full')
+    monkeypatch.setenv('TOKEN_PLACE_MODEL_PROFILE_ID', 'qwen3-8b-q4-k-m')
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal', yarn_supported=False, version='0.3.16'),
+        _probe(backend='metal', gpu=True, device='metal', yarn_supported=True, yarn_source='numeric_fallback', version='0.3.32'),
+    ])
+    installs = []
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (Path('/tmp/site'), None),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *args, **kwargs: (installs.append(args[0]) or (True, 'ok')),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert installs
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['qwen_64k_rope_supported'] == 'true'
+    assert result['yarn_resolver_source'] == 'numeric_fallback'
+
+
+def test_macos_qwen_64k_yarn_capable_runtime_does_not_reinstall(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'platform', 'darwin')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv('TOKEN_PLACE_CONTEXT_TIER', '64k-full')
+    monkeypatch.setenv('TOKEN_PLACE_MODEL_PROFILE_ID', 'qwen3-8b-q4-k-m')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend='metal',
+            gpu=True,
+            device='metal',
+            yarn_supported=True,
+            yarn_source='top_level_enum',
+            version='0.3.32',
+        ),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: pytest.fail('unexpected reinstall'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == 'metal_already_supported'
+    assert result['qwen_64k_rope_supported'] == 'true'
+    assert result['yarn_resolver_source'] == 'top_level_enum'
 
 def test_already_supported_runtime_prepends_dependency_target(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))

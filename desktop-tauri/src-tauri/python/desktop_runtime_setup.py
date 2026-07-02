@@ -58,6 +58,9 @@ class RuntimeProbe:
     base_prefix: str = "unknown"
     dependency_target: str = "unknown"
     pip_version: str = "unknown"
+    llama_cpp_python_version: str = "unknown"
+    yarn_resolver_source: str = "unsupported"
+    qwen_64k_rope_supported: bool = False
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
@@ -102,6 +105,7 @@ _PROCESS_PYTHON_VERSION = sys.version.split()[0]
 
 _PROBE_SNIPPET = r"""
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -134,6 +138,42 @@ if bootstrap_script:
     ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
 
 from pathlib import Path
+
+def _constructor_accepts_kwarg(callable_obj, kwarg):
+    import inspect
+    if not callable(callable_obj):
+        return False
+    constructor = getattr(callable_obj, "__init__", callable_obj)
+    try:
+        parameters = inspect.signature(constructor).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+def _llama_version(module):
+    version = getattr(module, "__version__", None)
+    if version:
+        return str(version)
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("llama-cpp-python")
+    except Exception:
+        return "unknown"
+
+def _qwen_yarn_source(module):
+    llama_cls = getattr(module, "Llama", None)
+    if getattr(module, "LLAMA_ROPE_SCALING_TYPE_YARN", None) is not None:
+        return "top_level_enum", True
+    nested = getattr(module, "llama_cpp", None)
+    if getattr(nested, "LLAMA_ROPE_SCALING_TYPE_YARN", None) is not None:
+        return "nested_enum", True
+    required = ("rope_scaling_type", "yarn_ext_factor", "yarn_orig_ctx")
+    if all(_constructor_accepts_kwarg(llama_cls, name) for name in required):
+        return "numeric_fallback", True
+    return "unsupported", False
 
 repo_root = Path(_safe_resolve_path_text(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", os.getcwd())))
 
@@ -185,6 +225,7 @@ try:
     if gpu_offload_supported and backend == "cpu":
         backend = "metal" if sys.platform == "darwin" else "cuda"
 
+    yarn_source, yarn_supported = _qwen_yarn_source(llama_cpp)
     payload = {
         "backend": backend,
         "gpu_offload_supported": gpu_offload_supported,
@@ -196,6 +237,9 @@ try:
         "dependency_target": dependency_target or "unknown",
         "pip_version": os.environ.get("TOKEN_PLACE_DESKTOP_PIP_VERSION", "unknown"),
         "llama_module_path": llama_module_path or "unknown",
+        "llama_cpp_python_version": _llama_version(llama_cpp),
+        "yarn_resolver_source": yarn_source,
+        "qwen_64k_rope_supported": yarn_supported,
         "error": None,
     }
 except Exception as exc:
@@ -210,6 +254,9 @@ except Exception as exc:
         "dependency_target": dependency_target or "unknown",
         "pip_version": os.environ.get("TOKEN_PLACE_DESKTOP_PIP_VERSION", "unknown"),
         "llama_module_path": "missing",
+        "llama_cpp_python_version": "unknown",
+        "yarn_resolver_source": "unsupported",
+        "qwen_64k_rope_supported": False,
         "error": str(exc),
     }
 
@@ -318,6 +365,9 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
             base_prefix=getattr(sys, "base_prefix", sys.prefix),
             dependency_target=dependency_target_text,
             pip_version=pip_version,
+            llama_cpp_python_version="unknown",
+            yarn_resolver_source="unsupported",
+            qwen_64k_rope_supported=False,
         )
 
     stdout = (result.stdout or "").strip()
@@ -335,6 +385,9 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
             base_prefix=getattr(sys, "base_prefix", sys.prefix),
             dependency_target=dependency_target_text,
             pip_version=pip_version,
+            llama_cpp_python_version="unknown",
+            yarn_resolver_source="unsupported",
+            qwen_64k_rope_supported=False,
         )
 
     try:
@@ -362,6 +415,9 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         base_prefix=str(payload.get("base_prefix", getattr(sys, "base_prefix", sys.prefix))),
         dependency_target=str(payload.get("dependency_target", dependency_target_text)),
         pip_version=str(payload.get("pip_version", pip_version)),
+        llama_cpp_python_version=str(payload.get("llama_cpp_python_version", "unknown")),
+        yarn_resolver_source=str(payload.get("yarn_resolver_source", "unsupported")),
+        qwen_64k_rope_supported=bool(payload.get("qwen_64k_rope_supported", False)),
     )
 
 
@@ -594,6 +650,9 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
         "dependency_target": probe.dependency_target,
         "pip_version": probe.pip_version,
         "llama_module_path": probe.llama_module_path,
+        "llama_cpp_python_version": probe.llama_cpp_python_version,
+        "yarn_resolver_source": probe.yarn_resolver_source,
+        "qwen_64k_rope_supported": str(bool(probe.qwen_64k_rope_supported)).lower(),
     }
 
 
@@ -812,6 +871,38 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
+def _qwen_64k_requested() -> bool:
+    profile = os.getenv("TOKEN_PLACE_MODEL_PROFILE_ID", "qwen3-8b-q4-k-m").strip().lower()
+    tier = os.getenv("TOKEN_PLACE_CONTEXT_TIER", os.getenv("TOKEN_PLACE_CONTEXT_PROFILE", "8k-fast")).strip().lower()
+    api_model = os.getenv("TOKEN_PLACE_API_MODEL_ID", "").strip().lower()
+    qwen = profile.startswith("qwen") or api_model.startswith("qwen")
+    return qwen and tier == "64k-full"
+
+
+def _version_less_than(installed: str, required_spec: str) -> bool:
+    if "==" not in required_spec or not installed or installed == "unknown":
+        return False
+    required = required_spec.split("==", 1)[1].strip()
+    try:
+        from packaging.version import Version
+        return Version(installed) < Version(required)
+    except Exception:
+        return installed != required
+
+
+def _qwen_64k_runtime_needs_repair(probe: RuntimeProbe, requirements_path: Path) -> tuple[bool, str]:
+    if not _qwen_64k_requested():
+        return False, ""
+    if not probe.qwen_64k_rope_supported:
+        return True, f"missing Qwen 64K YaRN/RoPE support (resolver={probe.yarn_resolver_source})"
+    try:
+        required_spec = llama_cpp_requirement_spec(requirements_path)
+    except (FileNotFoundError, OSError, ValueError):
+        required_spec = ""
+    if required_spec and _version_less_than(probe.llama_cpp_python_version, required_spec):
+        return True, f"llama-cpp-python {probe.llama_cpp_python_version} older than {required_spec}"
+    return False, ""
+
 def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
@@ -832,6 +923,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             **_probe_result_payload(before),
         }
 
+    requirements_path = _resolve_requirements_path(target_root)
+
     if selected_mode not in GPU_MODES:
         return {
             "selected_backend": "cpu",
@@ -840,7 +933,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             **_probe_result_payload(before),
         }
 
-    if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
+    qwen_64k_repair_needed, qwen_64k_repair_reason = _qwen_64k_runtime_needs_repair(before, requirements_path)
+    if before.gpu_offload_supported and before.backend in {"cuda", "metal"} and not qwen_64k_repair_needed:
         return {
             "selected_backend": before.backend,
             "fallback_reason": "",
@@ -899,8 +993,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             **_probe_result_payload(before),
         }
 
-    requirements_path = _resolve_requirements_path(target_root)
-    last_error = ""
+    last_error = qwen_64k_repair_reason or ""
     install_diagnostics: Dict[str, str] = {}
 
     if expected_backend == "cuda":
@@ -994,7 +1087,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend
         accepted_source_probe = plan_satisfied and after.backend != plan.backend
-        if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
+        after_qwen_repair_needed, after_qwen_repair_reason = _qwen_64k_runtime_needs_repair(after, requirements_path)
+        if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe) and not after_qwen_repair_needed:
             if verified_backend:
                 reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"
                 selected_backend = plan.backend
@@ -1027,6 +1121,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             }
 
         if plan.backend in {"cuda", "metal"}:
+            if locals().get("after_qwen_repair_needed"):
+                last_error = after_qwen_repair_reason
+                continue
             last_error = (
                 f"{plan.backend.upper()} install completed but follow-up probe reported "
                 f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}; "

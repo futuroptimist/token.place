@@ -4628,7 +4628,7 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert 'Qwen 64K YaRN/RoPE is unsupported' in manager.last_runtime_init_error
+    assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
 
 
 def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
@@ -4787,3 +4787,52 @@ def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
 
     with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
         manager._runtime_init_kwargs(FakeLlama, 0)
+
+
+def test_qwen_yarn_enum_resolves_from_top_level_llama_cpp():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    module = SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=2, __file__='/site/llama_cpp/__init__.py')
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(module, FakeLlama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['yarn_enum_value'] == 2
+    assert diagnostics['yarn_enum_location'] == 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
+
+
+def test_qwen_yarn_enum_resolves_from_nested_llama_cpp_module():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    nested = SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=2)
+    module = SimpleNamespace(llama_cpp=nested, __file__='/site/llama_cpp/__init__.py')
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(module, FakeLlama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['yarn_enum_value'] == 2
+    assert diagnostics['yarn_enum_location'] == 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
+
+
+def test_qwen_yarn_runtime_probe_reports_missing_constructor_kwargs():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            pass
+
+    module = SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=2, __file__='/site/llama_cpp/__init__.py')
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(module, FakeLlama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_constructor_kwargs'] == ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx']
+    assert 'missing constructor kwargs' in diagnostics['reason']

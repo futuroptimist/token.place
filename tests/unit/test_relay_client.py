@@ -5124,6 +5124,65 @@ def test_qwen_reasoning_content_field_is_rejected_with_safe_reason():
     assert "secret hidden reasoning" not in json.dumps(error)
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("answer", "answer"),
+        ("  <think></think>  answer  ", "answer"),
+        ("<think>\n\n</think>\n\nok", "ok"),
+        ("<THINK>   </THINK>\nFinal", "Final"),
+        ("<think></think><think> </think> final", "final"),
+        ("<xml>not think</xml>", "<xml>not think</xml>"),
+    ],
+)
+def test_api_v1_normalize_qwen_non_thinking_content_strips_only_empty_leading_wrappers(raw, expected):
+    cleaned, reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert cleaned == expected
+    assert reason is None
+    assert "<think" not in cleaned.lower()
+
+
+@pytest.mark.parametrize(
+    "raw,reason",
+    [
+        ("<think>reasoning</think> answer", "qwen_thinking_output_leaked"),
+        ("<think></think><think>reasoning</think> answer", "qwen_thinking_output_leaked"),
+        ("answer <think>later</think>", "qwen_thinking_output_leaked"),
+        ("<think partial", "qwen_thinking_output_leaked"),
+        ("<think></think>", "qwen_empty_after_think_wrapper_strip"),
+    ],
+)
+def test_api_v1_normalize_qwen_non_thinking_content_rejects_reasoning_or_empty(raw, reason):
+    cleaned, actual_reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert cleaned is None
+    assert actual_reason == reason
+
+
+def test_api_v1_qwen_empty_think_wrapper_is_stripped_from_runtime_response_and_history():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nQwen ok"}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-empty-think",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "Qwen ok"}
+    assert "<think" not in json.dumps(envelope).lower()
+
+
 def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():
     policy = RelayClient._API_V1_QWEN_NON_THINKING_POLICY
 

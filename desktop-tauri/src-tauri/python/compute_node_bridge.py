@@ -40,7 +40,7 @@ except ModuleNotFoundError:
     def desktop_gpu_runtime_failure_message(_mode: str, _runtime_setup: Dict[str, str]) -> None:
         return None
 
-    def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
+    def ensure_desktop_llama_runtime(_mode: str, **_kwargs: Any) -> Dict[str, str]:
         return {
             "selected_backend": "cpu",
             "detected_device": "cpu",
@@ -219,7 +219,6 @@ def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
         except TypeError:
             return bool(is_fresh())
     return False
-
 
 
 def _cached_poll_wait_seconds(relay_client: Any, relay_url: str, default: float) -> float:
@@ -520,6 +519,14 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
+def _ensure_desktop_llama_runtime_for_context(mode: str, context_tier: str) -> Dict[str, str]:
+    try:
+        return ensure_desktop_llama_runtime(mode, context_tier=context_tier)
+    except TypeError as exc:
+        if "context_tier" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        return ensure_desktop_llama_runtime(mode)
+
 def _startup_context_tier(args: argparse.Namespace) -> str:
     raw_context_tier = getattr(args, "context_tier", "8k-fast")
     if raw_context_tier in {"8k-fast", "64k-full"}:
@@ -533,7 +540,6 @@ def _load_context_profile_helpers() -> Tuple[Any, Any]:
     from utils.context_profiles import apply_context_profile, normalize_context_tier
 
     return apply_context_profile, normalize_context_tier
-
 
 
 def _sanitize_context_profile_import_error(exc: BaseException) -> str:
@@ -603,7 +609,6 @@ def _sleep_with_cancel(seconds: float) -> bool:
     return stop_requested()
 
 
-
 def _expand_relay_url_candidate(candidate: Any) -> List[str]:
     """Expand one CLI relay-url value without logging secrets or payloads."""
 
@@ -666,7 +671,7 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
-    runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "

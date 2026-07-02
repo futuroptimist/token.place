@@ -95,6 +95,13 @@ def test_requirement_spec_parses_comments_and_blank_lines(tmp_path):
     assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
 
 
+def test_repo_llama_cpp_pin_is_yarn_capable():
+    spec = llama_cpp_requirement_spec(ROOT / "requirements.txt")
+    version = tuple(int(part) for part in spec.split("==", 1)[1].split("."))
+
+    assert version >= (0, 3, 16)
+
+
 def test_requirement_spec_accepts_underscore_package_name(tmp_path):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("llama_cpp_python==0.2.90\n", encoding="utf-8")

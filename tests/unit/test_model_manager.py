@@ -20,7 +20,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
-from utils.llm.model_manager import ModelManager
+from utils.llm.model_manager import ModelManager, _runtime_supports_qwen_yarn_rope
 
 
 class _ToDictOnly:
@@ -532,7 +532,7 @@ class TestModelManager:
             'model.chat_format': 'llama-3',
         }.get(key, self._mock_config_get(key, default))
 
-        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)), \
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama, LLAMA_ROPE_SCALING_TYPE_YARN=2)), \
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=True), \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
              patch.object(model_manager, '_runtime_capabilities', return_value={
@@ -4601,6 +4601,47 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     assert captured['yarn_orig_ctx'] == 32768
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
     assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
+    assert manager.last_compute_diagnostics['yarn_rope_enum_source'] == 'Llama.LLAMA_ROPE_SCALING_TYPE_YARN'
+
+
+def test_qwen_64k_runtime_resolves_nested_yarn_enum(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            captured.update({'n_ctx': n_ctx, 'rope_scaling_type': rope_scaling_type})
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_module = SimpleNamespace(
+        __file__='/site-packages/llama_cpp/__init__.py',
+        __version__='0.3.16',
+        llama_cpp=SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=2),
+        Llama=FakeLlama,
+    )
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_module), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured == {'n_ctx': 65536, 'rope_scaling_type': 2}
+    assert manager.last_compute_diagnostics['yarn_rope_enum_source'] == 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
 
 
 def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
@@ -4628,7 +4669,7 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert 'Qwen 64K YaRN/RoPE is unsupported' in manager.last_runtime_init_error
+    assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
 
 
 def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
@@ -4708,6 +4749,27 @@ def test_runtime_signature_helpers_cover_constructor_variants():
     assert manager._llama_constructor_accepts(KwargsLlama, 'yarn_ext_factor') is True
     assert manager._llama_constructor_accepts(ExplicitLlama, 'yarn_ext_factor') is False
     assert manager._llama_constructor_accepts(42, 'rope_scaling_type') is False
+
+
+def test_qwen_yarn_runtime_probe_reports_constructor_kwargs_and_enum():
+    class FakeLlama:
+        def __init__(self, model_path, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    probe = _runtime_supports_qwen_yarn_rope(
+        SimpleNamespace(
+            __file__='/runtime/llama_cpp/__init__.py',
+            __version__='0.3.16',
+            LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        ),
+        FakeLlama,
+    )
+
+    assert probe['supported'] is True
+    assert probe['yarn_enum_source'] == 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
+    assert probe['yarn_enum_value'] == 2
+    assert 'rope_scaling_type' in probe['accepted_constructor_kwargs']
+    assert probe['llama_module_path'] == '/runtime/llama_cpp/__init__.py'
 
 
 def test_apply_chat_template_accepts_direct_runtime_and_tokenizer_paths():

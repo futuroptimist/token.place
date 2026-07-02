@@ -27,7 +27,7 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
-def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
+def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, qwen_64k_rope_supported=False, yarn_resolver_path='unsupported'):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,
         gpu_offload_supported=gpu,
@@ -36,6 +36,8 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
         prefix=sys.prefix,
         llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
         error=error,
+        qwen_64k_rope_supported=qwen_64k_rope_supported,
+        yarn_resolver_path=yarn_resolver_path,
     )
 
 
@@ -135,6 +137,63 @@ def test_macos_metal_already_supported_reports_metal_action(monkeypatch):
     assert result['selected_backend'] == 'metal'
     assert result['runtime_action'] == 'metal_already_supported'
 
+
+
+
+def test_macos_qwen_64k_stale_metal_runtime_triggers_reinstall(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal', qwen_64k_rope_supported=False),
+        _probe(backend='metal', gpu=True, device='metal', qwen_64k_rope_supported=True, yarn_resolver_path='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
+        cmake_args='-DGGML_METAL=on', force_cmake=True, index_url='https://pypi.org/simple',
+        only_binary=False, no_binary=True,
+    )
+    invoked = {'pip': False}
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (invoked.update(pip=True), 'ok') and (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='64k-full')
+
+    assert invoked['pip'] is True
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['qwen_64k_rope_supported'] == 'true'
+    assert result['yarn_resolver_path'] == 'numeric_fallback'
+
+
+def test_macos_qwen_64k_supported_metal_runtime_does_not_reinstall(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='metal', gpu=True, device='metal', qwen_64k_rope_supported=True, yarn_resolver_path='top_level_enum'),
+    )
+    invoked = {'pip': False}
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (invoked.update(pip=True), '') and (False, 'unexpected'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='64k-full')
+
+    assert invoked['pip'] is False
+    assert result['runtime_action'] == 'metal_already_supported'
+    assert result['qwen_64k_rope_supported'] == 'true'
+
+
+def test_macos_qwen_8k_does_not_require_yarn_before_metal_already_supported(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='metal', gpu=True, device='metal', qwen_64k_rope_supported=False),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='8k-fast')
+
+    assert result['runtime_action'] == 'metal_already_supported'
 
 
 def test_already_supported_runtime_prepends_dependency_target(monkeypatch, tmp_path):

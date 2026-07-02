@@ -63,6 +63,15 @@ except ModuleNotFoundError:
     ) -> None:
         return
 
+
+def _ensure_desktop_llama_runtime_for_context(mode: str, context_tier: Optional[str]) -> Dict[str, str]:
+    try:
+        return ensure_desktop_llama_runtime(mode, context_tier=context_tier)
+    except TypeError as exc:
+        if "context_tier" not in str(exc):
+            raise
+        return ensure_desktop_llama_runtime(mode)
+
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     try:
         from utils.llm.model_manager import _is_repo_llama_cpp_shim as _shim_detector
@@ -666,7 +675,7 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
-    runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, getattr(args, "context_tier", None))
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "

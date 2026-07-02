@@ -2185,7 +2185,7 @@ class RelayClient:
                 if stripped_any
                 else "unsupported_completion_shape",
             )
-        if re.search(r"<\s*think", cleaned, flags=re.IGNORECASE):
+        if re.search(r"<\s*/?\s*think\b", cleaned, flags=re.IGNORECASE):
             return None, "qwen_thinking_output_leaked"
         return cleaned, None
 
@@ -3059,14 +3059,13 @@ class RelayClient:
             and completion["choices"]
             and isinstance(completion["choices"][0], dict)
         ):
-            choice = completion["choices"][0]
-            if self._api_v1_qwen_reasoning_content_leaked(
-                getattr(self.model_manager, "model_profile", {}) or {}, choice
-            ):
-                # Fail closed before normalizing the runtime choice so hidden
-                # reasoning fields are never forwarded or echoed.
+            model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+            if self._api_v1_qwen_reasoning_content_leaked(model_profile, completion):
+                # Fail closed before normalizing the runtime completion so hidden
+                # reasoning fields anywhere in the response are never forwarded or echoed.
                 self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
                 return None
+            choice = completion["choices"][0]
             raw_message = choice.get("message")
             if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
                 raw_message = {**raw_message, "role": "assistant"}
@@ -3075,7 +3074,6 @@ class RelayClient:
                 text = choice.get("text")
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
-            model_profile = getattr(self.model_manager, "model_profile", {}) or {}
             if (
                 message is not None
                 and isinstance(message.get("content"), str)

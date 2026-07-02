@@ -5027,6 +5027,140 @@ def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallb
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_context_admission_unavailable'
 
 
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ("ready", "ready"),
+        (" <think></think> ready ", "ready"),
+        ("<think>\n\n</think>\n\nok", "ok"),
+        ("<THINK>   </THINK> final", "final"),
+        ("<think></think><think> </think> answer", "answer"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_strips_only_empty_leading_wrappers(content, expected):
+    cleaned, reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, content
+    )
+    assert cleaned == expected
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    "content,reason",
+    [
+        ("<think>I am reasoning</think> answer", "qwen_thinking_output_leaked"),
+        ("answer <think></think>", "qwen_thinking_output_leaked"),
+        ("<think partial", "qwen_thinking_output_leaked"),
+        ("<think></think>", "qwen_empty_after_think_wrapper_strip"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_rejects_reasoning_and_empty_output(content, reason):
+    cleaned, actual_reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, content
+    )
+    assert cleaned is None
+    assert actual_reason == reason
+
+
+def test_assistant_message_extraction_strips_empty_qwen_think_wrapper_from_message():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+
+    message = client._assistant_message_from_runtime_completion(
+        {"choices": [{"message": {"content": "<think>\n\n</think>\n\nok"}}]}
+    )
+
+    assert message == {"role": "assistant", "content": "ok"}
+
+
+def test_assistant_message_extraction_strips_empty_qwen_think_wrapper_from_text_choice():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+
+    message = client._assistant_message_from_runtime_completion(
+        {"choices": [{"text": "<think></think> final"}]}
+    )
+
+    assert message == {"role": "assistant", "content": "final"}
+
+
+def test_assistant_message_extraction_preserves_tool_call_only_message():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+
+    message = client._assistant_message_from_runtime_completion(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls,
+                    }
+                }
+            ]
+        }
+    )
+
+    assert message == {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    assert client._last_api_v1_invalid_model_output_reason is None
+
+
+def test_assistant_message_extraction_preserves_tool_calls_when_normalizing_content():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+
+    message = client._assistant_message_from_runtime_completion(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "<think></think> final",
+                        "tool_calls": tool_calls,
+                    }
+                }
+            ]
+        }
+    )
+
+    assert message == {"role": "assistant", "content": "final", "tool_calls": tool_calls}
+    assert client._last_api_v1_invalid_model_output_reason is None
+
+
+def test_assistant_message_extraction_allows_non_think_xml_like_content():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+
+    message = client._assistant_message_from_runtime_completion(
+        {"choices": [{"message": {"role": "assistant", "content": "<note>ordinary</note>"}}]}
+    )
+
+    assert message == {"role": "assistant", "content": "<note>ordinary</note>"}
+    assert client._last_api_v1_invalid_model_output_reason is None
+
+
 def test_qwen_think_output_is_rejected():
     manager = _AdmissionManager(window=128)
     manager.api_model_id = 'qwen3-8b-instruct'
@@ -5068,6 +5202,7 @@ def test_qwen_think_output_is_rejected():
         "   <think>secret</think>answer",
         "< think>secret</ think>answer",
         "<think secret partial",
+        "</think>answer",
     ],
 )
 def test_qwen_think_output_variants_are_rejected_with_safe_reason(leaked_content):
@@ -5120,8 +5255,128 @@ def test_qwen_reasoning_content_field_is_rejected_with_safe_reason():
 
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_model_output"
-    assert error["internal_reason"] == "qwen_reasoning_content_leaked"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
     assert "secret hidden reasoning" not in json.dumps(error)
+
+def test_qwen_top_level_reasoning_content_field_is_rejected_with_safe_reason():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    leaked_reasoning = "top level secret reasoning"
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        "reasoning_content": leaked_reasoning,
+        "choices": [{"message": {"role": "assistant", "content": "final answer"}}],
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-top-level-reasoning",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    response_json = json.dumps(envelope["api_v1_response"], sort_keys=True)
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert leaked_reasoning not in response_json
+
+
+def test_qwen_nested_reasoning_field_outside_first_choice_is_rejected_with_safe_reason():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    leaked_reasoning = "nested secret reasoning"
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        "choices": [{"message": {"role": "assistant", "content": "final answer"}}],
+        "usage": {"diagnostics": [{"reasoning": leaked_reasoning}]},
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-nested-reasoning",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    response_json = json.dumps(envelope["api_v1_response"], sort_keys=True)
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert leaked_reasoning not in response_json
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value", "completion_patch"),
+    [
+        ("reasoning_content", "", {"reasoning_content": ""}),
+        ("reasoning", None, {"reasoning": None}),
+        (
+            "reasoning_content",
+            "",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final answer",
+                            "reasoning_content": "",
+                        }
+                    }
+                ]
+            },
+        ),
+        (
+            "reasoning",
+            None,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final answer",
+                            "reasoning": None,
+                        }
+                    }
+                ]
+            },
+        ),
+        ("reasoning_content", "", {"usage": {"details": [{"reasoning_content": ""}]}}),
+        ("reasoning", None, {"usage": {"details": [{"reasoning": None}]}}),
+    ],
+)
+def test_qwen_reasoning_field_presence_is_rejected_even_when_empty_or_none(
+    field_name, field_value, completion_patch
+):
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_text = "final answer"
+    base_completion = {"choices": [{"message": {"role": "assistant", "content": model_text}}]}
+    completion = {**base_completion, **completion_patch}
+    manager.runtime.create_chat_completion = lambda **kwargs: completion
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-field-present",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    response_json = json.dumps(envelope["api_v1_response"], sort_keys=True)
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert model_text not in response_json
+    assert field_name not in response_json
+    if field_value not in (None, ""):
+        assert str(field_value) not in response_json
 
 
 def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():

@@ -202,7 +202,11 @@ def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridg
 
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
-    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+    }
     model_manager.context_tier = "8k-fast"
     model_manager.context_window_tokens = 8192
     model_manager.api_model_id = "qwen3-8b-instruct"
@@ -376,7 +380,11 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
-    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+    }
     model_manager.context_tier = "8k-fast"
     model_manager.context_window_tokens = 8192
     model_manager.api_model_id = "qwen3-8b-instruct"
@@ -397,9 +405,179 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
+    assert diagnostics["api_v1_readiness_model_profile_id"] == "qwen3-8b-q4-k-m"
     assert llm_runtime.completion_kwargs["stream"] is False
-    assert llm_runtime.completion_kwargs["max_tokens"] == 4
+    assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+
+
+
+
+def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_think_wrapper(monkeypatch):
+    class SmokeRuntime:
+        def __init__(self):
+            self.completion_kwargs = None
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **kwargs):
+            self.completion_kwargs = kwargs
+            return {"choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nok"}}]}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    llm_runtime = SmokeRuntime()
+    model_manager.get_llm_instance.return_value = llm_runtime
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "choices_message_content"
+    assert llm_runtime.completion_kwargs["max_tokens"] == 64
+    assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+
+
+def test_compute_node_runtime_readiness_smoke_completion_empty_after_strip(monkeypatch):
+    class SmokeRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "<think></think>"}}]}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = SmokeRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_empty_after_think_strip"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_empty_output(monkeypatch):
+    class EmptyRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "   "}}]}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = EmptyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_empty_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_empty_output"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape(monkeypatch):
+    class MalformedRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": []}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = MalformedRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content(monkeypatch):
+    class MissingContentRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant"}}]}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = MissingContentRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
 
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
@@ -431,7 +609,7 @@ def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_withou
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(monkeypatch):
@@ -464,7 +642,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(mo
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_content(monkeypatch):
@@ -506,7 +684,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "reasoning_field_present"
     assert "secret hidden reasoning" not in json.dumps(diagnostics)
 
 
@@ -571,6 +750,7 @@ def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_exception"
     assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
     assert "prompt text" not in str(diagnostics)
 

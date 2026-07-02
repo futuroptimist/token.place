@@ -4894,3 +4894,20 @@ def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
 
     with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
         manager._runtime_init_kwargs(FakeLlama, 0)
+
+
+def test_qwen_64k_missing_reason_does_not_repeat_rope_scaling_type():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            pass
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
+        SimpleNamespace(Llama=FakeLlama),
+        FakeLlama,
+    )
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'].count('rope_scaling_type') == 1
+    assert 'missing constructor kwargs: yarn_ext_factor, yarn_orig_ctx' in diagnostics['missing_reason']

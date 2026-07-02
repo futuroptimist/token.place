@@ -150,8 +150,11 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
     missing_reasons = []
     if resolver_source == 'unsupported':
         missing_reasons.append('missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant and rope_scaling_type constructor support')
-    if missing_kwargs:
-        missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs)}')
+        missing_kwargs_for_reason = [name for name in missing_kwargs if name != 'rope_scaling_type']
+    else:
+        missing_kwargs_for_reason = missing_kwargs
+    if missing_kwargs_for_reason:
+        missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs_for_reason)}')
     return {
         'supported': not missing_reasons,
         'yarn_enum_value': yarn_value,

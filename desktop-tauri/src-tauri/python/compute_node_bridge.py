@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import inspect
 import json
 import math
 import os
@@ -521,11 +522,16 @@ def _bridge_session_id_from_env() -> str:
 
 def _ensure_desktop_llama_runtime_for_context(mode: str, context_tier: str) -> Dict[str, str]:
     try:
+        parameters = inspect.signature(ensure_desktop_llama_runtime).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_context_tier = (
+        "context_tier" in parameters
+        or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    )
+    if accepts_context_tier:
         return ensure_desktop_llama_runtime(mode, context_tier=context_tier)
-    except TypeError as exc:
-        if "context_tier" not in str(exc) and "unexpected keyword" not in str(exc):
-            raise
-        return ensure_desktop_llama_runtime(mode)
+    return ensure_desktop_llama_runtime(mode)
 
 def _startup_context_tier(args: argparse.Namespace) -> str:
     raw_context_tier = getattr(args, "context_tier", "8k-fast")

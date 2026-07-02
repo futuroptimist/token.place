@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.metadata
 import importlib.util
-import inspect
 import json
 import os
 import platform as platform_module
@@ -907,6 +905,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             **_probe_result_payload(before),
         }
 
+    last_error = ""
+
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
         if not qwen_64k_required or before.yarn_rope_supported:
             return {
@@ -942,8 +942,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                f"GPU runtime probe only ({before.error or before.backend}); {policy.bootstrap_reason}"
-            ),
+                f"{last_error}; " if last_error else ""
+            ) + f"GPU runtime probe only ({before.error or before.backend}); {policy.bootstrap_reason}",
             "runtime_action": "probe_only",
             **_probe_result_payload(before),
         }
@@ -966,7 +966,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                f"{disabled_reason}; platform={policy.platform}; arch={policy.arch}; "
+                (f"{last_error}; " if last_error else "")
+                + f"{disabled_reason}; platform={policy.platform}; arch={policy.arch}; "
                 f"expected_backend={expected_backend}; interpreter={before.interpreter}; "
                 f"prefix={before.prefix}; llama_module_path={before.llama_module_path}"
             ),
@@ -975,7 +976,6 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         }
 
     requirements_path = _resolve_requirements_path(target_root)
-    last_error = locals().get("last_error", "")
     install_diagnostics: Dict[str, str] = {}
 
     if expected_backend == "cuda":
@@ -995,18 +995,26 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                     )
                     after = _probe_runtime(target_root)
                     if after.gpu_offload_supported and after.backend == "cuda":
-                        return {
-                            "selected_backend": "cuda",
-                            "fallback_reason": "installed CUDA runtime; re-executing sidecar",
-                            "runtime_action": "installed_cuda_reexec",
-                            **_probe_result_payload(after),
-                            **install_diagnostics,
-                        }
+                        if not qwen_64k_required or after.yarn_rope_supported:
+                            return {
+                                "selected_backend": "cuda",
+                                "fallback_reason": "installed CUDA runtime; re-executing sidecar",
+                                "runtime_action": "installed_cuda_reexec",
+                                **_probe_result_payload(after),
+                                **install_diagnostics,
+                            }
+                        last_error = (
+                            "CUDA source reinstall completed but Qwen 64K YaRN/RoPE support is still missing; "
+                            f"resolver={after.yarn_resolver_source}; version={after.llama_cpp_python_version}; "
+                            f"module={after.llama_module_path}"
+                        )
+                        _record_source_repair_failure(last_error)
                     source_detail = _summarize_install_error(source_log)
-                    last_error = (
-                        "CUDA source reinstall completed but runtime still CPU-only; "
-                        "check CUDA toolkit/build tools"
-                    )
+                    if not last_error:
+                        last_error = (
+                            "CUDA source reinstall completed but runtime still CPU-only; "
+                            "check CUDA toolkit/build tools"
+                        )
                     if source_detail and source_detail != "install failed":
                         last_error = f"{last_error}; source repair detail: {source_detail}"
                     _record_source_repair_failure(last_error)

@@ -432,6 +432,8 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
+            "api_v1_readiness_yarn_rope_enum_source": diagnostics.get("yarn_rope_enum_source"),
+            "api_v1_readiness_yarn_rope_runtime_supported": diagnostics.get("yarn_rope_supported"),
         })
 
         try:

@@ -1845,6 +1845,45 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
   });
 
+  it('forces stopped worker fields even when stopped events include ready lifecycle values', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+      operator_session_id: 'session-1',
+      sequence: 2,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'ready',
+        warm_load_state: 'ready',
+        worker_state: 'ready',
+        worker_alive: true,
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
+    expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
+  });
+
   it('re-enables context tier after pre-registration failure event', async () => {
     render(<App />);
     const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;

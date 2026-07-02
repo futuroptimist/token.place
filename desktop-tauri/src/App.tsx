@@ -439,23 +439,23 @@ function mergeComputeStatusEvent(
           : prev.fallback_reason,
     model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
     relay_runtime_state:
-      typeof payload.relay_runtime_state === 'string'
-        ? payload.relay_runtime_state
+      isStoppedEvent
+        ? stoppedBase.relay_runtime_state
+        : typeof payload.relay_runtime_state === 'string'
+          ? payload.relay_runtime_state
+          : payload.type === 'error'
+            ? 'failed'
+            : typeof payload.warm_load_state === 'string'
+              ? 'idle'
+              : prev.relay_runtime_state,
+    warm_load_state:
+      isStoppedEvent
+        ? stoppedBase.warm_load_state
         : typeof payload.warm_load_state === 'string'
           ? payload.warm_load_state
           : payload.type === 'error'
             ? 'failed'
-            : isStoppedEvent
-              ? 'stopped'
-              : stoppedBase.relay_runtime_state,
-    warm_load_state:
-      typeof payload.warm_load_state === 'string'
-        ? payload.warm_load_state
-        : payload.type === 'error'
-          ? 'failed'
-          : isStoppedEvent
-            ? 'stopped'
-            : stoppedBase.warm_load_state,
+            : prev.warm_load_state,
     warm_load_enabled:
       typeof payload.warm_load_enabled === 'boolean'
         ? payload.warm_load_enabled
@@ -470,23 +470,25 @@ function mergeComputeStatusEvent(
         ? payload.relay_runtime_path
         : prev.relay_runtime_path,
     worker_state:
-      typeof payload.worker_state === 'string'
-        ? payload.worker_state
-        : payload.type === 'error'
-          ? 'failed'
-          : isStoppedEvent
-            ? 'stopped'
-            : stoppedBase.worker_state,
+      isStoppedEvent
+        ? stoppedBase.worker_state
+        : typeof payload.worker_state === 'string'
+          ? payload.worker_state
+          : payload.type === 'error'
+            ? 'failed'
+            : prev.worker_state,
     worker_generation:
       typeof payload.worker_generation === 'number' ? payload.worker_generation : prev.worker_generation,
     worker_restart_count:
       typeof payload.worker_restart_count === 'number' ? payload.worker_restart_count : prev.worker_restart_count,
     worker_alive:
-      typeof payload.worker_alive === 'boolean'
-        ? payload.worker_alive
-        : payload.type === 'error' || isStoppedEvent
-          ? false
-          : stoppedBase.worker_alive,
+      isStoppedEvent
+        ? stoppedBase.worker_alive
+        : typeof payload.worker_alive === 'boolean'
+          ? payload.worker_alive
+          : payload.type === 'error'
+            ? false
+            : prev.worker_alive,
     last_worker_error_code:
       payload.last_worker_error_code === null
         ? null
@@ -684,8 +686,14 @@ export function App() {
     () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
     [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
-  const operatorControlsDisabled = isStartingComputeNode || isStoppingComputeNode;
-  const operatorEditControlsDisabled = computeStatus.running || operatorControlsDisabled;
+  const operatorControlsDisabled = useMemo(
+    () => isStartingComputeNode || isStoppingComputeNode,
+    [isStartingComputeNode, isStoppingComputeNode]
+  );
+  const operatorEditControlsDisabled = useMemo(
+    () => computeStatus.running || operatorControlsDisabled,
+    [computeStatus.running, operatorControlsDisabled]
+  );
   const canChangeContextTier = useMemo(
     () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
     [computeStatus, isStartingComputeNode, isStoppingComputeNode]

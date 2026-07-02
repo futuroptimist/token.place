@@ -372,19 +372,25 @@ function mergeComputeStatusEvent(
   return {
     ...stoppedBase,
     running:
-      typeof payload.running === 'boolean'
-        ? payload.running
-        : payload.type === 'error' || isStoppedEvent
+      isStoppedEvent
+        ? stoppedBase.running
+        : typeof payload.running === 'boolean'
+          ? payload.running
+          : payload.type === 'error'
           ? false
           : stoppedBase.running,
     registered:
-      typeof payload.registered === 'boolean'
-        ? payload.registered
-        : payload.type === 'error' || isStoppedEvent
+      isStoppedEvent
+        ? stoppedBase.registered
+        : typeof payload.registered === 'boolean'
+          ? payload.registered
+          : payload.type === 'error'
           ? false
           : stoppedBase.registered,
     active_relay_url:
-      typeof payload.active_relay_url === 'string'
+      isStoppedEvent
+        ? stoppedBase.active_relay_url
+        : typeof payload.active_relay_url === 'string'
         ? payload.active_relay_url
         : stoppedBase.active_relay_url,
     configured_relay_urls:
@@ -392,13 +398,17 @@ function mergeComputeStatusEvent(
         ? stringArrayPayload(payload.configured_relay_urls)
         : prev.configured_relay_urls,
     relay_statuses:
-      Array.isArray(payload.relay_statuses)
+      isStoppedEvent
+        ? stoppedBase.relay_statuses
+        : Array.isArray(payload.relay_statuses)
         ? relayStatusesPayload(payload.relay_statuses)
         : stoppedBase.relay_statuses,
     registered_relay_count:
-      typeof payload.registered_relay_count === 'number'
-        ? payload.registered_relay_count
-        : payload.type === 'error' || isStoppedEvent
+      isStoppedEvent
+        ? stoppedBase.registered_relay_count
+        : typeof payload.registered_relay_count === 'number'
+          ? payload.registered_relay_count
+          : payload.type === 'error'
           ? 0
           : stoppedBase.registered_relay_count,
     configured_relay_count:
@@ -406,15 +416,19 @@ function mergeComputeStatusEvent(
         ? payload.configured_relay_count
         : prev.configured_relay_count,
     registered_relay_urls:
-      Array.isArray(payload.registered_relay_urls)
-        ? stringArrayPayload(payload.registered_relay_urls)
-        : payload.type === 'error' || isStoppedEvent
+      isStoppedEvent
+        ? stoppedBase.registered_relay_urls
+        : Array.isArray(payload.registered_relay_urls)
+          ? stringArrayPayload(payload.registered_relay_urls)
+          : payload.type === 'error'
           ? []
           : stoppedBase.registered_relay_urls,
     active_relay_urls:
-      Array.isArray(payload.active_relay_urls)
-        ? stringArrayPayload(payload.active_relay_urls)
-        : payload.type === 'error' || isStoppedEvent
+      isStoppedEvent
+        ? stoppedBase.active_relay_urls
+        : Array.isArray(payload.active_relay_urls)
+          ? stringArrayPayload(payload.active_relay_urls)
+          : payload.type === 'error'
           ? []
           : stoppedBase.active_relay_urls,
     requested_mode:
@@ -445,9 +459,7 @@ function mergeComputeStatusEvent(
           ? payload.relay_runtime_state
           : payload.type === 'error'
             ? 'failed'
-            : typeof payload.warm_load_state === 'string'
-              ? 'idle'
-              : prev.relay_runtime_state,
+            : prev.relay_runtime_state,
     warm_load_state:
       isStoppedEvent
         ? stoppedBase.warm_load_state

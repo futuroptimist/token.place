@@ -535,6 +535,7 @@ describe('desktop app start failure handling', () => {
         type: 'status',
         running: true,
         registered: true,
+        relay_runtime_state: 'ready',
         warm_load_state: 'ready',
         last_error: null,
       },
@@ -1874,28 +1875,71 @@ describe('desktop app start failure handling', () => {
 
     render(<App />);
     const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const addRelayButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
     await waitFor(() => expect(contextSelect.disabled).toBe(true));
+    expect(relayInput.disabled).toBe(true);
+    expect(addRelayButton.disabled).toBe(true);
 
     const computeHandler = eventHandlers.get('compute_node_event');
     expect(computeHandler).toBeTruthy();
     computeHandler?.({
       payload: {
         type: 'stopped',
-        running: false,
-        registered: false,
+        running: true,
+        registered: true,
+        active_relay_url: 'https://token.place',
         relay_runtime_state: 'ready',
         warm_load_state: 'ready',
         worker_state: 'ready',
         worker_alive: true,
+        registered_relay_count: 1,
+        registered_relay_urls: ['https://token.place'],
+        active_relay_urls: ['https://token.place'],
+        relay_statuses: [{ relay_url: 'https://token.place', registered: true }],
         operator_session_id: 'session-1',
         sequence: 3,
       },
     });
 
     await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(relayInput.disabled).toBe(false);
+    expect(addRelayButton.disabled).toBe(false);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
     expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
     expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
+    expect(screen.queryByText(/Per-relay status/)).toBeNull();
+  });
+
+  it('preserves relay runtime state when status events only include warm-load state', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'failed',
+      warm_load_state: 'failed',
+      worker_state: 'failed',
+      worker_alive: false,
+      operator_session_id: 'session-1',
+      sequence: 2,
+    });
+
+    render(<App />);
+    await screen.findByText(/Relay runtime state:/);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        warm_load_state: 'ready',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed'));
   });
 
   it('re-enables context tier after pre-registration failure event', async () => {

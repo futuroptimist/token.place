@@ -88,11 +88,11 @@ def test_requirement_spec_parses_comments_and_blank_lines(tmp_path):
     requirements.write_text(
         "# comment\n\n"
         "numpy==2.0.0\n"
-        "llama-cpp-python==0.3.16\n",
+        "llama-cpp-python==0.3.32\n",
         encoding="utf-8",
     )
 
-    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
+    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.32"
 
 
 def test_requirement_spec_accepts_underscore_package_name(tmp_path):
@@ -117,7 +117,7 @@ def test_pip_install_args_include_index_and_binary_flags():
     plan = LlamaCppInstallPlan(
         platform="darwin",
         backend="metal",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args=None,
         force_cmake=False,
         index_url="https://example.invalid/simple",
@@ -246,7 +246,7 @@ def test_pip_env_omits_force_cmake_when_disabled():
     plan = LlamaCppInstallPlan(
         platform="darwin",
         backend="metal",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args="-DGGML_METAL=on",
         force_cmake=False,
     )
@@ -256,16 +256,16 @@ def test_pip_env_omits_force_cmake_when_disabled():
 
 def test_requirement_spec_strips_spaces_around_version_pin(tmp_path):
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("llama-cpp-python== 0.3.16 \n", encoding="utf-8")
+    requirements.write_text("llama-cpp-python== 0.3.32 \n", encoding="utf-8")
 
-    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
+    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.32"
 
 
 def test_backend_probe_satisfies_plan_for_matching_backend():
     plan = LlamaCppInstallPlan(
         platform="win32",
         backend="cuda",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args="-DGGML_CUDA=on",
         force_cmake=True,
     )
@@ -278,7 +278,7 @@ def test_backend_probe_rejects_mismatched_cuda_backend():
     plan = LlamaCppInstallPlan(
         platform="win32",
         backend="cuda",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args="-DGGML_CUDA=on",
         force_cmake=True,
     )
@@ -291,7 +291,7 @@ def test_backend_probe_accepts_macos_metal_source_build_with_clean_import_probe(
     plan = LlamaCppInstallPlan(
         platform="darwin",
         backend="metal",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
         force_cmake=True,
     )
@@ -304,7 +304,7 @@ def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
     plan = LlamaCppInstallPlan(
         platform="darwin",
         backend="metal",
-        package_spec="llama-cpp-python==0.3.16",
+        package_spec="llama-cpp-python==0.3.32",
         cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
         force_cmake=True,
     )

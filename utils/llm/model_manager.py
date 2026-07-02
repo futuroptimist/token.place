@@ -8,6 +8,7 @@ from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib
+import importlib.metadata
 import inspect
 import subprocess
 import queue
@@ -29,8 +30,13 @@ REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
 QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
     'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; '
-    'update or rebuild the runtime'
+    'runtime repair failed'
 )
+# llama.cpp's enum value for LLAMA_ROPE_SCALING_TYPE_YARN.  Some
+# llama-cpp-python wheels accept the constructor kwarg but do not export the
+# generated Python enum symbol, so use this only after constructor support is
+# verified.
+LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -61,28 +67,58 @@ def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
     )
 
 
-def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, Optional[str]]:
-    """Resolve llama-cpp-python's YaRN enum from known safe exports.
+def _llama_constructor_supports_kwargs(llama_cls: Any, required_kwargs: Iterable[str]) -> Dict[str, bool]:
+    return {name: _constructor_accepts_kwarg(llama_cls, name) for name in required_kwargs}
 
-    Runtime inspection checks the supplied ``Llama.__init__`` signature and both
-    top-level and nested ``llama_cpp.llama_cpp`` constants.  Older
-    llama-cpp-python builds may not re-export the enum at the top level, while
-    newer generated bindings can expose it from the nested ctypes module.
+
+def _llama_cpp_python_version(llama_cpp_module: Any) -> Optional[str]:
+    version = getattr(llama_cpp_module, '__version__', None)
+    if version:
+        return str(version)
+    try:
+        return importlib.metadata.version('llama-cpp-python')
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _resolve_yarn_rope_scaling_type(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, str]:
+    """Resolve the YaRN scaling type from safe runtime evidence.
+
+    Prefer exported llama-cpp-python constants.  If a build omits those generated
+    Python symbols but its constructor accepts ``rope_scaling_type``, fall back to
+    llama.cpp's stable YaRN enum value.  This avoids rejecting capable packaged
+    runtimes solely because the binding did not re-export the enum constant.
     """
 
-    locations = (
-        (llama_cpp_module, 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'),
-        (getattr(llama_cpp_module, 'llama_cpp', None), 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'),
-        (llama_cls, 'Llama.LLAMA_ROPE_SCALING_TYPE_YARN'),
-    )
-    for owner, location in locations:
-        if owner is None:
-            continue
-        value = getattr(owner, 'LLAMA_ROPE_SCALING_TYPE_YARN', None)
-        if value is not None:
-            return value, location
-    return None, None
+    top_level = getattr(llama_cpp_module, 'LLAMA_ROPE_SCALING_TYPE_YARN', None)
+    if top_level is not None:
+        return top_level, 'top_level_enum'
 
+    nested = getattr(getattr(llama_cpp_module, 'llama_cpp', None), 'LLAMA_ROPE_SCALING_TYPE_YARN', None)
+    if nested is not None:
+        return nested, 'nested_enum'
+
+    for wrapper_name in ('llama_rope_scaling_type', 'LLAMA_ROPE_SCALING_TYPE'):
+        wrapper = getattr(llama_cpp_module, wrapper_name, None)
+        value = getattr(wrapper, 'LLAMA_ROPE_SCALING_TYPE_YARN', None) if wrapper is not None else None
+        if value is not None:
+            return value, f'enum_wrapper:{wrapper_name}'
+
+    if llama_cls is not None and _constructor_accepts_kwarg(llama_cls, 'rope_scaling_type'):
+        return LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK, 'numeric_fallback'
+
+    return None, 'unsupported'
+
+
+def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, Optional[str]]:
+    value, source = _resolve_yarn_rope_scaling_type(llama_cpp_module, llama_cls)
+    legacy_locations = {
+        'top_level_enum': 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN',
+        'nested_enum': 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN',
+        'numeric_fallback': 'numeric_fallback',
+        'unsupported': None,
+    }
+    return value, legacy_locations.get(source, source)
 
 def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
     safe_fields = (
@@ -91,6 +127,8 @@ def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> st
         'llama_module_path',
         'llama_cpp_python_version',
         'missing_reason',
+        'yarn_resolver',
+        'constructor_kwarg_support',
     )
     return ', '.join(
         f'{field}={diagnostics.get(field) or "unknown"}'
@@ -98,39 +136,46 @@ def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> st
     )
 
 
-def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
-    accepted_kwargs = sorted(
-        name for name in (
-            'rope_scaling_type',
-            'yarn_ext_factor',
-            'yarn_attn_factor',
-            'yarn_beta_fast',
-            'yarn_beta_slow',
-            'yarn_orig_ctx',
-            'rope_freq_base',
-            'rope_freq_scale',
-        )
-        if _constructor_accepts_kwarg(llama_cls, name)
+def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
+    qwen_kwargs = (
+        'rope_scaling_type',
+        'yarn_ext_factor',
+        'yarn_attn_factor',
+        'yarn_beta_fast',
+        'yarn_beta_slow',
+        'yarn_orig_ctx',
+        'rope_freq_base',
+        'rope_freq_scale',
     )
-    yarn_value, yarn_location = _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module, llama_cls)
+    kwarg_support = _llama_constructor_supports_kwargs(llama_cls, qwen_kwargs)
+    accepted_kwargs = sorted(name for name, accepted in kwarg_support.items() if accepted)
+    yarn_value, resolver = _resolve_yarn_rope_scaling_type(llama_cpp_module, llama_cls)
     required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
-    missing_kwargs = [name for name in required_kwargs if name not in accepted_kwargs]
+    missing_kwargs = [name for name in required_kwargs if not kwarg_support.get(name)]
     missing_reasons = []
-    if yarn_location is None:
-        missing_reasons.append('missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant')
+    if resolver == 'unsupported':
+        missing_reasons.append('missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant and rope_scaling_type constructor support')
     if missing_kwargs:
         missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs)}')
     return {
         'supported': not missing_reasons,
         'yarn_enum_value': yarn_value,
-        'yarn_enum_location': yarn_location,
+        'yarn_enum_location': {
+            'top_level_enum': 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN',
+            'nested_enum': 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN',
+        }.get(resolver, resolver),
+        'yarn_resolver': resolver,
         'accepted_constructor_kwargs': accepted_kwargs,
+        'constructor_kwarg_support': kwarg_support,
         'missing_required_kwargs': missing_kwargs,
         'missing_reason': '; '.join(missing_reasons) if missing_reasons else None,
         'llama_module_path': getattr(llama_cpp_module, '__file__', None),
-        'llama_cpp_python_version': getattr(llama_cpp_module, '__version__', None),
+        'llama_cpp_python_version': _llama_cpp_python_version(llama_cpp_module),
     }
 
+
+def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
+    return _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
 
 def _is_site_packages_path(path_text: Any) -> bool:
     normalized = str(path_text).replace('\\', '/').lower()
@@ -2273,7 +2318,9 @@ class ModelManager:
             self.last_yarn_rope_diagnostics = {
                 'supported': yarn_probe['supported'],
                 'yarn_enum_location': yarn_probe['yarn_enum_location'],
+                'yarn_resolver': yarn_probe.get('yarn_resolver'),
                 'accepted_constructor_kwargs': yarn_probe['accepted_constructor_kwargs'],
+                'constructor_kwarg_support': yarn_probe.get('constructor_kwarg_support'),
                 'active_profile_id': self.profile_id,
                 'active_context_tier': context_tier,
                 'requested_n_ctx': n_ctx,

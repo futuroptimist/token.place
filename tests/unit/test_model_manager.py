@@ -4607,9 +4607,7 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     assert captured['yarn_orig_ctx'] == 32768
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
     assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
-    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == (
-        'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
-    )
+    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'top_level_enum'
 
 
 def test_qwen_64k_runtime_resolves_nested_yarn_enum(tmp_path):
@@ -4648,9 +4646,7 @@ def test_qwen_64k_runtime_resolves_nested_yarn_enum(tmp_path):
         assert manager.get_llm_instance() is not None
 
     assert captured['rope_scaling_type'] == 2
-    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == (
-        'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
-    )
+    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'nested_enum'
 
 
 def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
@@ -4682,12 +4678,13 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
     assert 'active_profile_id=qwen3-8b-q4-k-m' in manager.last_runtime_init_error
     assert 'active_context_tier=64k-full' in manager.last_runtime_init_error
     assert 'llama_module_path=unknown' in manager.last_runtime_init_error
-    assert 'llama_cpp_python_version=unknown' in manager.last_runtime_init_error
+    assert 'llama_cpp_python_version=' in manager.last_runtime_init_error
     assert 'missing constructor kwargs' in manager.last_runtime_init_error
 
 
-def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
+def test_qwen_64k_runtime_uses_numeric_yarn_fallback_when_enum_constant_missing(tmp_path):
     from utils.context_profiles import apply_context_profile
+    captured = {}
     config = MagicMock(is_production=False)
     values = {
         'model.profile_id': 'qwen3-8b-q4-k-m',
@@ -4705,17 +4702,63 @@ def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
 
     class FakeLlama:
         def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            captured.update({
+                'n_ctx': n_ctx,
+                'rope_scaling_type': rope_scaling_type,
+                'yarn_ext_factor': yarn_ext_factor,
+                'yarn_orig_ctx': yarn_orig_ctx,
+            })
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        llama_cpp=SimpleNamespace(),
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured == {
+        'n_ctx': 65536,
+        'rope_scaling_type': 2,
+        'yarn_ext_factor': 2.0,
+        'yarn_orig_ctx': 32768,
+    }
+    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'numeric_fallback'
+    assert manager.last_yarn_rope_diagnostics['constructor_kwarg_support']['rope_scaling_type'] is True
+
+
+def test_qwen_64k_runtime_fails_when_yarn_enum_missing_and_constructor_lacks_rope_scaling(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, yarn_ext_factor, yarn_orig_ctx):
             pass
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
             return '<qwen>'
 
-    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama, llama_cpp=SimpleNamespace())), \
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
         assert manager.get_llm_instance() is None
 
     assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
-    assert 'missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant' in manager.last_runtime_init_error
-
+    assert 'rope_scaling_type constructor support' in manager.last_runtime_init_error
 
 def test_qwen_validation_failure_does_not_cache_invalid_llm(tmp_path):
     config = MagicMock(is_production=False)
@@ -4851,3 +4894,20 @@ def test_qwen_runtime_init_kwargs_rejects_non_gguf_jinja_policy(tmp_path):
 
     with pytest.raises(RuntimeError, match='GGUF/Jinja chat template policy'):
         manager._runtime_init_kwargs(FakeLlama, 0)
+
+
+def test_qwen_64k_missing_reason_does_not_repeat_rope_scaling_type():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            pass
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
+        SimpleNamespace(Llama=FakeLlama),
+        FakeLlama,
+    )
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'].count('rope_scaling_type') == 1
+    assert 'missing constructor kwargs: yarn_ext_factor, yarn_orig_ctx' in diagnostics['missing_reason']

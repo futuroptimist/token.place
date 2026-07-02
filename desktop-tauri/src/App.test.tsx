@@ -141,7 +141,10 @@ describe('desktop app start failure handling', () => {
     return Promise.resolve(undefined);
   };
 
-  const mockInitialComputeStatus = (statusOverrides: Record<string, unknown>) => {
+  const mockInitialComputeStatus = (
+    statusOverrides: Record<string, unknown>,
+    configOverrides: Record<string, unknown> = {}
+  ) => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'detect_backend') {
         return Promise.resolve({
@@ -156,6 +159,7 @@ describe('desktop app start failure handling', () => {
           model_path: '/tmp/model.gguf',
           relay_base_url: 'https://token.place',
           preferred_mode: 'auto',
+          ...configOverrides,
         });
       }
       if (command === 'get_compute_node_status') {
@@ -1762,36 +1766,46 @@ describe('desktop app start failure handling', () => {
 
 
   it('re-enables context tier and relay controls immediately after successful Stop Operator', async () => {
-    mockInitialComputeStatus({
-      running: true,
-      registered: true,
-      active_relay_url: 'https://token.place',
-      relay_runtime_state: 'ready',
-      warm_load_state: 'ready',
-      worker_state: 'ready',
-      worker_alive: true,
-      registered_relay_count: 1,
-      registered_relay_urls: ['https://token.place'],
-      active_relay_urls: ['https://token.place'],
-      operator_session_id: 'session-1',
-      sequence: 2,
-    });
+    mockInitialComputeStatus(
+      {
+        running: true,
+        registered: true,
+        active_relay_url: 'https://token.place',
+        relay_runtime_state: 'ready',
+        warm_load_state: 'ready',
+        worker_state: 'ready',
+        worker_alive: true,
+        registered_relay_count: 2,
+        registered_relay_urls: ['https://token.place', 'https://staging.token.place'],
+        active_relay_urls: ['https://token.place', 'https://staging.token.place'],
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+      {
+        relay_base_urls: ['https://token.place', 'https://staging.token.place'],
+      }
+    );
 
     render(<App />);
     const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
     const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
     const addRelayButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    const deleteSecondRelayButton = (await screen.findByLabelText(
+      'Delete relay URL 2'
+    )) as HTMLButtonElement;
     const stopOperatorButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
 
     await waitFor(() => expect(contextSelect.disabled).toBe(true));
     expect(relayInput.disabled).toBe(true);
     expect(addRelayButton.disabled).toBe(true);
+    expect(deleteSecondRelayButton.disabled).toBe(true);
 
     fireEvent.click(stopOperatorButton);
 
     await waitFor(() => expect(contextSelect.disabled).toBe(false));
     expect(relayInput.disabled).toBe(false);
     expect(addRelayButton.disabled).toBe(false);
+    expect(deleteSecondRelayButton.disabled).toBe(false);
     expect(screen.getByText(/Running:/).textContent).toContain('no');
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');

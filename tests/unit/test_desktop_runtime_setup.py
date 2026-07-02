@@ -1851,3 +1851,48 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert result['install_command_summary'].startswith('python -m pip install')
+
+
+def test_macos_metal_already_supported_not_enough_for_qwen_64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal'),
+        desktop_runtime_setup.RuntimeProbe(
+            backend='metal', gpu_offload_supported=True, detected_device='metal',
+            interpreter=sys.executable, prefix=sys.prefix,
+            llama_module_path='/site/llama_cpp/__init__.py',
+            qwen_64k_yarn_supported=True, yarn_resolver='numeric_fallback',
+            rope_scaling_type_supported=True, yarn_ext_factor_supported=True,
+            yarn_orig_ctx_supported=True,
+        ),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (REPO_ROOT, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_, **__: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['qwen_64k_yarn_supported'] == 'true'
+    assert result['yarn_resolver'] == 'numeric_fallback'
+    os.environ.pop(desktop_runtime_setup.RUNTIME_PROBE_ENV, None)
+
+
+def test_macos_metal_qwen_64k_yarn_supported_skips_reinstall(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='metal', gpu_offload_supported=True, detected_device='metal',
+        interpreter=sys.executable, prefix=sys.prefix,
+        llama_module_path='/site/llama_cpp/__init__.py',
+        qwen_64k_yarn_supported=True, yarn_resolver='top_level_enum',
+        rope_scaling_type_supported=True, yarn_ext_factor_supported=True,
+        yarn_orig_ctx_supported=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: probe)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'metal_already_supported'
+    assert result['qwen_64k_yarn_supported'] == 'true'
+    os.environ.pop(desktop_runtime_setup.RUNTIME_PROBE_ENV, None)

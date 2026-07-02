@@ -4682,11 +4682,11 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
     assert 'active_profile_id=qwen3-8b-q4-k-m' in manager.last_runtime_init_error
     assert 'active_context_tier=64k-full' in manager.last_runtime_init_error
     assert 'llama_module_path=unknown' in manager.last_runtime_init_error
-    assert 'llama_cpp_python_version=unknown' in manager.last_runtime_init_error
+    assert 'llama_cpp_python_version=' in manager.last_runtime_init_error
     assert 'missing constructor kwargs' in manager.last_runtime_init_error
 
 
-def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
+def test_qwen_64k_runtime_uses_numeric_fallback_when_yarn_enum_constant_missing(tmp_path):
     from utils.context_profiles import apply_context_profile
     config = MagicMock(is_production=False)
     values = {
@@ -4711,10 +4711,10 @@ def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
-        assert manager.get_llm_instance() is None
+        assert manager.get_llm_instance() is not None
 
-    assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
-    assert 'missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant' in manager.last_runtime_init_error
+    assert manager.last_yarn_rope_diagnostics['yarn_resolver'] == 'numeric_fallback'
+    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'numeric_fallback'
 
 
 def test_qwen_validation_failure_does_not_cache_invalid_llm(tmp_path):

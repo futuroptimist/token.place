@@ -407,6 +407,10 @@ class ComputeNodeRuntime:
             model_profile
         )
 
+        yarn_diagnostics = getattr(self.model_manager, "last_yarn_rope_diagnostics", None)
+        if not isinstance(yarn_diagnostics, dict):
+            yarn_diagnostics = {}
+
         diagnostics.update({
             "api_v1_readiness_model_id": getattr(self.model_manager, "api_model_id", None),
             "api_v1_readiness_model_profile_provider": model_profile.get("provider"),
@@ -427,12 +431,39 @@ class ComputeNodeRuntime:
             ),
             "api_v1_readiness_tokenizer_render_bridge_available": False,
             "api_v1_readiness_non_thinking_enforced": qwen_non_thinking_enforced,
-            "api_v1_readiness_yarn_rope_enabled": bool(rope_policy.get("type") == "yarn"),
+            "api_v1_readiness_yarn_rope_enabled": bool(
+                rope_policy.get("type") == "yarn" and yarn_diagnostics.get("supported") is True
+            ),
+            "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get("supported"),
+            "api_v1_readiness_yarn_rope_missing_reason": yarn_diagnostics.get("missing_reason"),
             "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
         })
+
+        yarn_required_for_active_tier = (
+            model_profile.get("provider") == "qwen"
+            and rope_policy.get("type") == "yarn"
+            and context_tier == rope_policy.get("required_for_tier", "64k-full")
+        )
+        if yarn_required_for_active_tier and yarn_diagnostics.get("supported") is not True:
+            diagnostics.update({
+                "api_v1_runtime_ready": False,
+                "api_v1_readiness_result": "failed",
+                "api_v1_readiness_error_code": "compute_node_yarn_rope_unsupported",
+                "api_v1_readiness_error_reason": (
+                    yarn_diagnostics.get("missing_reason") or "missing_yarn_rope_runtime_support"
+                ),
+            })
+            self.model_manager.last_compute_diagnostics = diagnostics
+            setattr(
+                self.model_manager,
+                'last_runtime_init_error',
+                "API v1 runtime readiness failed: Qwen 64K YaRN/RoPE support missing",
+            )
+            _log_error("API v1 runtime readiness failed: Qwen 64K YaRN/RoPE support missing")
+            return False
 
         try:
             smoke_messages = [{"role": "system", "content": "ok"}, {"role": "user", "content": "hi"}]

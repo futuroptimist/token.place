@@ -170,7 +170,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
     plan = desktop_runtime_setup.LlamaCppInstallPlan(
         platform='darwin',
         backend='metal',
-        package_spec='llama-cpp-python==0.3.16',
+        package_spec='llama-cpp-python==0.3.32',
         cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off',
         force_cmake=True,
         index_url='https://pypi.org/simple',
@@ -210,12 +210,12 @@ def test_macos_metal_source_install_clean_cpu_probe_reexecs_auto(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plans = [
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
             cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
             index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
         ),
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='cpu', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='cpu', package_spec='llama-cpp-python==0.3.32',
             cmake_args=None, force_cmake=False, index_url='https://pypi.org/simple',
             only_binary=True, no_binary=False,
         ),
@@ -253,12 +253,12 @@ def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_re
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plans = [
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
             cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
             index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
         ),
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='cpu', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='cpu', package_spec='llama-cpp-python==0.3.32',
             cmake_args=None, force_cmake=False, index_url='https://pypi.org/simple',
             only_binary=True, no_binary=False,
         ),
@@ -294,7 +294,7 @@ def test_macos_metal_install_unsatisfied_cpu_probe_falls_back_to_cpu_in_auto(mon
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plans = [
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
             cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
             index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
         ),
@@ -329,7 +329,7 @@ def test_macos_cpu_fallback_fails_when_follow_up_probe_is_not_importable(monkeyp
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plans = [
         desktop_runtime_setup.LlamaCppInstallPlan(
-            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
             cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
             index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
         ),
@@ -368,7 +368,7 @@ def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_
     ])
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plan = desktop_runtime_setup.LlamaCppInstallPlan(
-        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.32',
         cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
         index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
     )
@@ -969,7 +969,7 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
 def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     requirements_path = tmp_path / 'requirements.txt'
-    requirements_path.write_text('llama_cpp_python==0.3.16\n', encoding='utf-8')
+    requirements_path.write_text('llama_cpp_python==0.3.32\n', encoding='utf-8')
     dependency_target = tmp_path / 'desktop deps'
     captured = {}
 
@@ -994,7 +994,7 @@ def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
 def test_windows_source_repair_uses_active_interpreter(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     requirements_path = tmp_path / 'requirements.txt'
-    requirements_path.write_text('llama_cpp_python==0.3.16\n', encoding='utf-8')
+    requirements_path.write_text('llama_cpp_python==0.3.32\n', encoding='utf-8')
     captured = {}
 
     def fake_run(cmd, env, timeout_seconds):
@@ -1422,7 +1422,7 @@ def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_mis
     target_root = tmp_path / 'token-place-installed'
     packaged_requirements = target_root / 'resources' / 'requirements.txt'
     packaged_requirements.parent.mkdir(parents=True)
-    packaged_requirements.write_text('llama-cpp-python==0.3.16\n', encoding='utf-8')
+    packaged_requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
 
     resolved = desktop_runtime_setup._resolve_requirements_path(target_root)
 
@@ -1448,7 +1448,7 @@ def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_
     packaged_root = tmp_path / 'AppData' / 'Local' / 'token.place'
     packaged_requirements = packaged_root / 'resources' / 'requirements.txt'
     packaged_requirements.parent.mkdir(parents=True)
-    packaged_requirements.write_text('llama-cpp-python==0.3.16\n', encoding='utf-8')
+    packaged_requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
 
@@ -1466,7 +1466,7 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
         desktop_runtime_setup.LlamaCppInstallPlan(
             platform='win32',
             backend='cuda',
-            package_spec='llama-cpp-python==0.3.16',
+            package_spec='llama-cpp-python==0.3.32',
             cmake_args='-DGGML_CUDA=on',
             force_cmake=True,
             index_url='https://pypi.org/simple',

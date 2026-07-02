@@ -346,6 +346,7 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     model_manager.context_window_tokens = 65536
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {"supported": True, "missing_reason": None}
     model_manager.get_llm_instance.return_value = ReadyRuntime()
     relay_client = SimpleNamespace(
         _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
@@ -364,6 +365,86 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     assert diagnostics["api_v1_readiness_yarn_original_context_tokens"] == 32768
     assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is True
 
+
+def test_compute_node_runtime_qwen_64k_readiness_rejects_missing_yarn_rope():
+    class ReadyRuntime:
+        def create_chat_completion(self, **_kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "ready"}}]}
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 2}
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+            "required_for_tier": "64k-full",
+        },
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {
+        "supported": False,
+        "missing_reason": "missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant",
+    }
+    model_manager.get_llm_instance.return_value = ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_yarn_rope_enabled"] is False
+    assert diagnostics["api_v1_readiness_error_code"] == "compute_node_yarn_rope_unsupported"
+    assert diagnostics["api_v1_readiness_error_reason"] == (
+        "missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant"
+    )
+
+
+def test_compute_node_runtime_qwen_8k_readiness_ignores_missing_yarn_rope_support():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+            "required_for_tier": "64k-full",
+        },
+    }
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {
+        "supported": False,
+        "required": False,
+        "missing_reason": "not_required_for_active_profile_or_tier",
+    }
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_context_tier"] == "8k-fast"
+    assert diagnostics["api_v1_runtime_ready"] is True
 
 def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     class SmokeRuntime:

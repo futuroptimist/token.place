@@ -166,6 +166,95 @@ def _format_runtime_stage_timeout(exc: LlamaCppRuntimeStageTimeout) -> str:
     return f"{exc.stage}_timeout after {exc.timeout_seconds:g}s"
 
 
+def _llama_constructor_accepted_kwargs(llama_cls: Any) -> list[str]:
+    """Return explicitly accepted ``Llama`` constructor kwargs.
+
+    The real llama-cpp-python API exposes YaRN/RoPE controls on
+    ``Llama.__init__`` (for example ``rope_scaling_type``,
+    ``yarn_ext_factor`` and ``yarn_orig_ctx``).  Test fakes sometimes expose
+    the callable signature on the class itself, so inspect both surfaces before
+    deciding the runtime is unsupported.
+    """
+
+    if not isinstance(llama_cls, type) and not callable(llama_cls):
+        return []
+    for target in (getattr(llama_cls, '__init__', None), llama_cls):
+        if not callable(target):
+            continue
+        try:
+            signature = inspect.signature(target)
+        except (TypeError, ValueError):
+            continue
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return ['**kwargs']
+        return [
+            name for name, parameter in signature.parameters.items()
+            if name != 'self'
+            and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        ]
+    return []
+
+
+def _llama_constructor_accepts_kwarg(llama_cls: Any, kwarg: str) -> bool:
+    accepted = _llama_constructor_accepted_kwargs(llama_cls)
+    return '**kwargs' in accepted or kwarg in accepted
+
+
+def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, Optional[str]]:
+    """Resolve the llama-cpp-python YaRN enum from all verified safe locations."""
+
+    candidates: list[tuple[str, Any]] = []
+    if llama_cpp_module is not None:
+        candidates.append(('llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN', llama_cpp_module))
+        nested = getattr(llama_cpp_module, 'llama_cpp', None)
+        if nested is not None:
+            candidates.append(('llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN', nested))
+    if llama_cls is not None:
+        candidates.append(('Llama.LLAMA_ROPE_SCALING_TYPE_YARN', llama_cls))
+        class_module = inspect.getmodule(llama_cls)
+        if class_module is not None and class_module is not llama_cpp_module:
+            candidates.append(('inspect.getmodule(Llama).LLAMA_ROPE_SCALING_TYPE_YARN', class_module))
+            nested = getattr(class_module, 'llama_cpp', None)
+            if nested is not None:
+                candidates.append(('inspect.getmodule(Llama).llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN', nested))
+
+    for location, owner in candidates:
+        value = getattr(owner, 'LLAMA_ROPE_SCALING_TYPE_YARN', None)
+        if value is not None:
+            return value, location
+    return None, None
+
+
+def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
+    """Probe safe Qwen 64K YaRN/RoPE support without loading prompts or a model."""
+
+    required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
+    accepted_kwargs = _llama_constructor_accepted_kwargs(llama_cls)
+    missing_kwargs = [
+        name for name in required_kwargs
+        if name not in accepted_kwargs and '**kwargs' not in accepted_kwargs
+    ]
+    yarn_value, yarn_enum_location = _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module, llama_cls)
+    missing_reasons: list[str] = []
+    if missing_kwargs:
+        missing_reasons.append(f"missing constructor kwargs: {', '.join(missing_kwargs)}")
+    if yarn_value is None:
+        missing_reasons.append('missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant')
+    return {
+        'supported': not missing_reasons,
+        'yarn_enum_location': yarn_enum_location,
+        'yarn_scaling_type': yarn_value,
+        'accepted_constructor_kwargs': accepted_kwargs,
+        'missing_constructor_kwargs': missing_kwargs,
+        'missing_reason': '; '.join(missing_reasons) or None,
+        'runtime_module_path': getattr(llama_cpp_module, '__file__', None),
+        'llama_cpp_python_version': getattr(llama_cpp_module, '__version__', None),
+    }
+
+
 def _strip_windows_extended_path_prefix(path_text: str) -> str:
     """Return a path string with Windows extended-length prefixes removed for comparison."""
 
@@ -2106,15 +2195,7 @@ class ModelManager:
     def _llama_constructor_accepts(self, llama_cls: Any, kwarg: str) -> bool:
         """Return whether the imported llama-cpp-python Llama constructor accepts a kwarg."""
 
-        try:
-            signature = inspect.signature(llama_cls)
-        except (TypeError, ValueError):
-            return False
-        parameters = signature.parameters
-        return kwarg in parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
+        return _llama_constructor_accepts_kwarg(llama_cls, kwarg)
 
     def _apply_chat_template_accepts(self, llm: Any, kwarg: str) -> bool:
         """Return whether runtime chat-template rendering accepts a kwarg."""
@@ -2167,6 +2248,7 @@ class ModelManager:
             'n_ctx': n_ctx,
             'verbose': llama_cpp_verbose_logging_enabled(),
         }
+        self.last_yarn_rope_diagnostics = None
         if self.model_profile.get('provider') == 'qwen':
             if self._chat_template_mode() != 'gguf-jinja':
                 raise RuntimeError('Qwen runtime requires GGUF/Jinja chat template policy')
@@ -2183,27 +2265,21 @@ class ModelManager:
             and n_ctx > native_context
         )
         if needs_yarn:
-            required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
-            unsupported = [
-                name for name in required_kwargs
-                if not self._llama_constructor_accepts(llama_cls, name)
-            ]
-            if unsupported:
+            llama_module = getattr(self, '_active_llama_cpp_module', None) or inspect.getmodule(llama_cls)
+            runtime_probe = _runtime_supports_qwen_yarn_rope(llama_module, llama_cls)
+            # The verified llama-cpp-python 0.3.32 path exposes YaRN as
+            # ``llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN`` and accepts
+            # explicit YaRN constructor kwargs.  Older wheels may only expose a
+            # top-level shim or no enum at all, so resolve every safe location
+            # and fail closed before the desktop node can register false 64K
+            # capability.
+            if not runtime_probe['supported']:
                 raise RuntimeError(
-                    'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
-                    f'runtime; missing constructor kwargs: {", ".join(unsupported)}'
+                    'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; '
+                    'update or rebuild the desktop runtime '
+                    f"({runtime_probe['missing_reason']})"
                 )
-            llama_module = inspect.getmodule(llama_cls)
-            yarn_scaling_type = getattr(
-                llama_module,
-                'LLAMA_ROPE_SCALING_TYPE_YARN',
-                getattr(llama_cls, 'LLAMA_ROPE_SCALING_TYPE_YARN', None),
-            )
-            if yarn_scaling_type is None:
-                raise RuntimeError(
-                    'Qwen 64K YaRN/RoPE is unsupported by this llama-cpp-python '
-                    'runtime; missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant'
-                )
+            yarn_scaling_type = runtime_probe['yarn_scaling_type']
             kwargs.update(
                 {
                     'rope_scaling_type': yarn_scaling_type,
@@ -2211,6 +2287,7 @@ class ModelManager:
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
             )
+            self.last_yarn_rope_diagnostics = runtime_probe
         return kwargs
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
@@ -2456,6 +2533,7 @@ class ModelManager:
                                 desktop_runtime_probe=getattr(self, 'desktop_runtime_probe', None),
                             )
                             self._imported_llama_cpp_module_path = getattr(llama_cpp, '__file__', None)
+                            self._active_llama_cpp_module = llama_cpp
                             self.log_info(
                                 "llama_cpp runtime located "
                                 f"module_path={self._imported_llama_cpp_module_path or 'unknown'}"
@@ -2522,6 +2600,7 @@ class ModelManager:
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
                             rope_policy = self.model_profile.get('rope_scaling_policy') or {}
+                            yarn_probe = getattr(self, 'last_yarn_rope_diagnostics', None)
                             compute_plan.update({
                                 'active_model_id': self.api_model_id,
                                 'active_profile_id': self.profile_id,
@@ -2538,6 +2617,9 @@ class ModelManager:
                                 'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
+                                'yarn_rope_enum_location': yarn_probe.get('yarn_enum_location') if isinstance(yarn_probe, dict) else None,
+                                'yarn_rope_constructor_kwargs': yarn_probe.get('accepted_constructor_kwargs') if isinstance(yarn_probe, dict) else None,
+                                'yarn_rope_runtime_supported': yarn_probe.get('supported') if isinstance(yarn_probe, dict) else None,
                             })
                             self.last_compute_diagnostics = compute_plan
                             if compute_plan['requested_mode'] == 'cpu':

@@ -20,7 +20,11 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
-from utils.llm.model_manager import ModelManager
+from utils.llm.model_manager import (
+    ModelManager,
+    _resolve_llama_cpp_rope_scaling_type_yarn,
+    _runtime_supports_qwen_yarn_rope,
+)
 
 
 class _ToDictOnly:
@@ -4601,6 +4605,39 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     assert captured['yarn_orig_ctx'] == 32768
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
     assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
+    assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'Llama.LLAMA_ROPE_SCALING_TYPE_YARN'
+
+
+def test_qwen_yarn_enum_found_at_top_level_llama_cpp():
+    class FakeLlama:
+        def __init__(self, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    module = SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=7)
+
+    value, location = _resolve_llama_cpp_rope_scaling_type_yarn(module, FakeLlama)
+    probe = _runtime_supports_qwen_yarn_rope(module, FakeLlama)
+
+    assert value == 7
+    assert location == 'llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
+    assert probe['supported'] is True
+    assert probe['yarn_enum_location'] == location
+
+
+def test_qwen_yarn_enum_found_at_nested_llama_cpp_module():
+    class FakeLlama:
+        def __init__(self, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    module = SimpleNamespace(llama_cpp=SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN=9))
+
+    value, location = _resolve_llama_cpp_rope_scaling_type_yarn(module, FakeLlama)
+    probe = _runtime_supports_qwen_yarn_rope(module, FakeLlama)
+
+    assert value == 9
+    assert location == 'llama_cpp.llama_cpp.LLAMA_ROPE_SCALING_TYPE_YARN'
+    assert probe['supported'] is True
+    assert probe['accepted_constructor_kwargs'] == ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx']
 
 
 def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
@@ -4628,7 +4665,7 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert 'Qwen 64K YaRN/RoPE is unsupported' in manager.last_runtime_init_error
+    assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
 
 
 def test_qwen_64k_runtime_fails_when_yarn_enum_constant_missing(tmp_path):

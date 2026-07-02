@@ -1321,6 +1321,42 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     )
 
 
+def test_probe_subprocess_keeps_stdlib_ahead_of_polluted_dependency_target(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'resources'
+    (runtime_root / 'utils').mkdir(parents=True)
+    dependency_target = runtime_root / '.token_place_desktop_site'
+    llama_package = dependency_target / 'llama_cpp'
+    llama_package.mkdir(parents=True)
+    llama_package.joinpath('__init__.py').write_text(
+        '\n'.join(
+            [
+                '__version__ = "0.3.0"',
+                'GGML_METAL = True',
+                'LLAMA_ROPE_SCALING_TYPE_YARN = 2',
+                'def llama_supports_gpu_offload():',
+                '    return True',
+                'class Llama:',
+                '    def __init__(self, rope_scaling_type=None, yarn_ext_factor=None, yarn_orig_ctx=None):',
+                '        pass',
+            ]
+        ),
+        encoding='utf-8',
+    )
+    dependency_target.joinpath('pathlib.py').write_text(
+        'from collections import Sequence\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=runtime_root)
+
+    assert probe.error is None
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.yarn_rope_supported is True
+    assert probe.llama_cpp_python_version == '0.3.0'
+
+
 def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 

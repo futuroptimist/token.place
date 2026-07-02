@@ -107,10 +107,6 @@ _PROCESS_SYS_PATH = sys.path
 _PROCESS_PYTHON_VERSION = sys.version.split()[0]
 
 _PROBE_SNIPPET = r"""
-import importlib
-import importlib.metadata
-import importlib.util
-import inspect
 import json
 import os
 import sys
@@ -141,6 +137,10 @@ if bootstrap_script:
 
     ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
 
+import importlib
+import importlib.metadata
+import importlib.util
+import inspect
 from pathlib import Path
 
 repo_root = Path(_safe_resolve_path_text(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", os.getcwd())))

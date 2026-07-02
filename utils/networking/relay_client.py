@@ -2151,13 +2151,58 @@ class RelayClient:
         return messages
 
     @classmethod
+    def _api_v1_normalize_qwen_non_thinking_content(
+        cls, model_profile: Dict[str, Any], content: Any
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Strip empty leading Qwen think wrappers while rejecting reasoning leaks.
+
+        Returns ``(cleaned_content, safe_internal_reason)``.  A non-``None``
+        reason means the content must fail closed and must not be forwarded.
+        """
+
+        if not isinstance(content, str):
+            return None, "unsupported_completion_shape"
+        if not cls._api_v1_qwen_non_thinking_required(model_profile):
+            cleaned = content.strip()
+            return (cleaned, None) if cleaned else (None, "unsupported_completion_shape")
+
+        remaining = content.lstrip()
+        stripped_any = False
+        while True:
+            match = re.match(
+                r"^<\s*think\s*>(?P<body>.*?)<\s*/\s*think\s*>",
+                remaining,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                break
+            if match.group("body").strip():
+                return None, "qwen_thinking_output_leaked"
+            stripped_any = True
+            remaining = remaining[match.end():].lstrip()
+
+        if re.search(r"<\s*/?\s*think\b|<\s*think", remaining, flags=re.IGNORECASE):
+            return None, "qwen_thinking_output_leaked"
+
+        cleaned = remaining.strip()
+        if not cleaned:
+            reason = (
+                "qwen_empty_after_think_wrapper_strip"
+                if stripped_any
+                else "unsupported_completion_shape"
+            )
+            return None, reason
+        return cleaned, None
+
+    @classmethod
     def _api_v1_qwen_thinking_leaked(
         cls, model_profile: Dict[str, Any], content: Any
     ) -> bool:
         return (
             cls._api_v1_qwen_non_thinking_required(model_profile)
             and isinstance(content, str)
-            and bool(re.search(r"<\s*think", content, flags=re.IGNORECASE))
+            and cls._api_v1_normalize_qwen_non_thinking_content(model_profile, content)[1]
+            in {"qwen_thinking_output_leaked", "qwen_empty_after_think_wrapper_strip"}
         )
 
     @classmethod
@@ -3014,7 +3059,7 @@ class RelayClient:
             ):
                 # Fail closed before normalizing the runtime choice so hidden
                 # reasoning fields are never forwarded or echoed.
-                self._last_api_v1_invalid_model_output_reason = "qwen_reasoning_content_leaked"
+                self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
                 return None
             raw_message = choice.get("message")
             if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
@@ -3025,13 +3070,14 @@ class RelayClient:
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-            if message is not None and self._api_v1_qwen_thinking_leaked(
-                model_profile, message.get("content")
-            ):
-                # Fail closed instead of stripping so no hidden reasoning can be
-                # partially leaked or mis-accounted in API v1 relay responses.
-                self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
-                return None
+            if message is not None:
+                cleaned_content, invalid_reason = self._api_v1_normalize_qwen_non_thinking_content(
+                    model_profile, message.get("content")
+                )
+                if invalid_reason is not None:
+                    self._last_api_v1_invalid_model_output_reason = invalid_reason
+                    return None
+                message = {"role": "assistant", "content": cleaned_content}
             if message is None:
                 self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message

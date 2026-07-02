@@ -5027,6 +5027,47 @@ def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallb
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_context_admission_unavailable'
 
 
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("<think></think>ok", "ok"),
+        ("<think>\n\n</think>\n\nok", "ok"),
+        ("   <THINK>   </THINK> final answer  ", "final answer"),
+        ("<think></think><think> </think>ok", "ok"),
+        ("normal <xml>content</xml>", "normal <xml>content</xml>"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_strips_only_empty_leading_wrappers(raw, expected):
+    cleaned, reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert reason is None
+    assert cleaned == expected
+
+
+@pytest.mark.parametrize(
+    "raw,reason",
+    [
+        ("<think>secret</think>answer", "qwen_thinking_output_leaked"),
+        ("<THINK>secret</THINK>answer", "qwen_thinking_output_leaked"),
+        ("<think secret partial", "qwen_thinking_output_leaked"),
+        ("<think></think>", "qwen_empty_after_think_wrapper_strip"),
+        ("<think></think>  ", "qwen_empty_after_think_wrapper_strip"),
+        ("answer <think></think>", "qwen_thinking_output_leaked"),
+    ],
+)
+def test_qwen_non_thinking_normalizer_rejects_reasoning_or_empty_output(raw, reason):
+    cleaned, actual_reason = RelayClient._api_v1_normalize_qwen_non_thinking_content(
+        {"provider": "qwen", "thinking_mode": "disabled"}, raw
+    )
+
+    assert cleaned is None
+    assert actual_reason == reason
+
+
 def test_qwen_think_output_is_rejected():
     manager = _AdmissionManager(window=128)
     manager.api_model_id = 'qwen3-8b-instruct'
@@ -5120,8 +5161,30 @@ def test_qwen_reasoning_content_field_is_rejected_with_safe_reason():
 
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_model_output"
-    assert error["internal_reason"] == "qwen_reasoning_content_leaked"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
     assert "secret hidden reasoning" not in json.dumps(error)
+
+
+def test_qwen_empty_leading_think_wrapper_is_stripped_from_runtime_response():
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion = lambda **kwargs: {
+        "choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nok"}}]
+    }
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-empty-wrapper",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    message = envelope["api_v1_response"]["message"]
+    assert message == {"role": "assistant", "content": "ok"}
+    assert "<think" not in json.dumps(envelope).lower()
 
 
 def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():

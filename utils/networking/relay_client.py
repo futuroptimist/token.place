@@ -2200,7 +2200,7 @@ class RelayClient:
             return False
         forbidden_reasoning_fields = {"reasoning_content", "reasoning"}
         if isinstance(payload, dict):
-            if any(payload.get(field) not in (None, "") for field in forbidden_reasoning_fields):
+            if any(field in payload for field in forbidden_reasoning_fields):
                 return True
             return any(
                 cls._api_v1_qwen_reasoning_content_leaked(model_profile, value)

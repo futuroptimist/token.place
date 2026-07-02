@@ -5310,6 +5310,75 @@ def test_qwen_nested_reasoning_field_outside_first_choice_is_rejected_with_safe_
     assert leaked_reasoning not in response_json
 
 
+@pytest.mark.parametrize(
+    ("field_name", "field_value", "completion_patch"),
+    [
+        ("reasoning_content", "", {"reasoning_content": ""}),
+        ("reasoning", None, {"reasoning": None}),
+        (
+            "reasoning_content",
+            "",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final answer",
+                            "reasoning_content": "",
+                        }
+                    }
+                ]
+            },
+        ),
+        (
+            "reasoning",
+            None,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final answer",
+                            "reasoning": None,
+                        }
+                    }
+                ]
+            },
+        ),
+        ("reasoning_content", "", {"usage": {"details": [{"reasoning_content": ""}]}}),
+        ("reasoning", None, {"usage": {"details": [{"reasoning": None}]}}),
+    ],
+)
+def test_qwen_reasoning_field_presence_is_rejected_even_when_empty_or_none(
+    field_name, field_value, completion_patch
+):
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_text = "final answer"
+    base_completion = {"choices": [{"message": {"role": "assistant", "content": model_text}}]}
+    completion = {**base_completion, **completion_patch}
+    manager.runtime.create_chat_completion = lambda **kwargs: completion
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-field-present",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    response_json = json.dumps(envelope["api_v1_response"], sort_keys=True)
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert model_text not in response_json
+    assert field_name not in response_json
+    if field_value not in (None, ""):
+        assert str(field_value) not in response_json
+
+
 def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():
     policy = RelayClient._API_V1_QWEN_NON_THINKING_POLICY
 

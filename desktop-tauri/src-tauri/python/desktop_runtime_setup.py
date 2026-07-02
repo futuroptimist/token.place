@@ -661,6 +661,17 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
     }
 
 
+def _qwen_64k_runtime_repair_failed_reason(probe: RuntimeProbe) -> str:
+    return (
+        "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed; "
+        f"resolver={probe.yarn_resolver_source}; version={probe.llama_cpp_python_version}; "
+        f"module={probe.llama_module_path}; "
+        f"rope_scaling_type_supported={probe.rope_scaling_type_supported}; "
+        f"yarn_ext_factor_supported={probe.yarn_ext_factor_supported}; "
+        f"yarn_orig_ctx_supported={probe.yarn_orig_ctx_supported}"
+    )
+
+
 def _repo_llama_shim_path(repo_root: Path) -> str:
     return str((repo_root / "llama_cpp.py").resolve())
 
@@ -1003,11 +1014,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                                 **_probe_result_payload(after),
                                 **install_diagnostics,
                             }
-                        last_error = (
-                            "CUDA source reinstall completed but Qwen 64K YaRN/RoPE support is still missing; "
-                            f"resolver={after.yarn_resolver_source}; version={after.llama_cpp_python_version}; "
-                            f"module={after.llama_module_path}"
-                        )
+                        last_error = _qwen_64k_runtime_repair_failed_reason(after)
                         _record_source_repair_failure(last_error)
                     source_detail = _summarize_install_error(source_log)
                     if not last_error:
@@ -1079,11 +1086,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         accepted_source_probe = plan_satisfied and after.backend != plan.backend
         if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
             if qwen_64k_required and not after.yarn_rope_supported:
-                last_error = (
-                    "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed; "
-                    f"resolver={after.yarn_resolver_source}; version={after.llama_cpp_python_version}; "
-                    f"module={after.llama_module_path}"
-                )
+                last_error = _qwen_64k_runtime_repair_failed_reason(after)
                 continue
             if verified_backend:
                 reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"

@@ -1960,8 +1960,44 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
 
     assert result['runtime_action'] == 'failed'
     assert result['yarn_rope_supported'] == 'false'
-    assert 'Qwen 64K YaRN/RoPE support is still missing' in result['fallback_reason']
+    assert (
+        'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed'
+        in result['fallback_reason']
+    )
+    assert 'resolver=unsupported' in result['fallback_reason']
+    assert 'version=0.3.16' in result['fallback_reason']
+    assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
+    assert 'rope_scaling_type_supported=False' in result['fallback_reason']
+    assert 'yarn_ext_factor_supported=False' in result['fallback_reason']
+    assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
     assert recorded_failures
+
+
+def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    probes = iter([
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=False),
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *_args: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert result['selected_backend'] == 'cuda'
+    assert result['yarn_rope_supported'] == 'true'
 
 
 def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp_path):

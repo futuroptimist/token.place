@@ -51,7 +51,10 @@ def _safe_signature_parameters(callable_obj: Any) -> Dict[str, inspect.Parameter
 
 
 def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
-    parameters = _safe_signature_parameters(callable_obj)
+    if not callable(callable_obj):
+        return False
+    constructor = getattr(callable_obj, '__init__', callable_obj)
+    parameters = _safe_signature_parameters(constructor)
     return kwarg in parameters or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
@@ -61,7 +64,7 @@ def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
 def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, Optional[str]]:
     """Resolve llama-cpp-python's YaRN enum from known safe exports.
 
-    Runtime inspection checks the supplied Llama callable signature and both
+    Runtime inspection checks the supplied ``Llama.__init__`` signature and both
     top-level and nested ``llama_cpp.llama_cpp`` constants.  Older
     llama-cpp-python builds may not re-export the enum at the top level, while
     newer generated bindings can expose it from the nested ctypes module.
@@ -79,6 +82,20 @@ def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: 
         if value is not None:
             return value, location
     return None, None
+
+
+def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
+    safe_fields = (
+        'active_profile_id',
+        'active_context_tier',
+        'llama_module_path',
+        'llama_cpp_python_version',
+        'missing_reason',
+    )
+    return ', '.join(
+        f'{field}={diagnostics.get(field) or "unknown"}'
+        for field in safe_fields
+    )
 
 
 def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
@@ -2257,6 +2274,7 @@ class ModelManager:
                 'supported': yarn_probe['supported'],
                 'yarn_enum_location': yarn_probe['yarn_enum_location'],
                 'accepted_constructor_kwargs': yarn_probe['accepted_constructor_kwargs'],
+                'active_profile_id': self.profile_id,
                 'active_context_tier': context_tier,
                 'requested_n_ctx': n_ctx,
                 'llama_module_path': yarn_probe['llama_module_path'],
@@ -2264,8 +2282,11 @@ class ModelManager:
                 'missing_reason': yarn_probe['missing_reason'],
             }
             if not yarn_probe['supported']:
+                safe_diagnostics = _format_qwen_yarn_unsupported_diagnostics(
+                    self.last_yarn_rope_diagnostics
+                )
                 raise RuntimeError(
-                    f'{QWEN_64K_YARN_UNSUPPORTED_MESSAGE}; {yarn_probe["missing_reason"]}'
+                    f'{QWEN_64K_YARN_UNSUPPORTED_MESSAGE}; {safe_diagnostics}'
                 )
             kwargs.update(
                 {
@@ -2279,6 +2300,7 @@ class ModelManager:
                 'supported': False,
                 'active': False,
                 'required': False,
+                'active_profile_id': self.profile_id,
                 'active_context_tier': context_tier,
                 'requested_n_ctx': n_ctx,
                 'missing_reason': 'not_required_for_active_profile_or_tier',

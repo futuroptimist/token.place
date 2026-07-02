@@ -4679,6 +4679,10 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
         assert manager.get_llm_instance() is None
 
     assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
+    assert 'active_profile_id=qwen3-8b-q4-k-m' in manager.last_runtime_init_error
+    assert 'active_context_tier=64k-full' in manager.last_runtime_init_error
+    assert 'llama_module_path=unknown' in manager.last_runtime_init_error
+    assert 'llama_cpp_python_version=unknown' in manager.last_runtime_init_error
     assert 'missing constructor kwargs' in manager.last_runtime_init_error
 
 
@@ -4756,8 +4760,16 @@ def test_runtime_signature_helpers_cover_constructor_variants():
         def __init__(self, model_path, **kwargs):
             pass
 
+    class InitKwargsCallRestrictedLlama:
+        def __init__(self, model_path, **kwargs):
+            pass
+
+        def __call__(self, model_path):
+            return None
+
     assert manager._llama_constructor_accepts(ExplicitLlama, 'rope_scaling_type') is True
     assert manager._llama_constructor_accepts(KwargsLlama, 'yarn_ext_factor') is True
+    assert manager._llama_constructor_accepts(InitKwargsCallRestrictedLlama, 'future_yarn_kwarg') is True
     assert manager._llama_constructor_accepts(ExplicitLlama, 'yarn_ext_factor') is False
     assert manager._llama_constructor_accepts(42, 'rope_scaling_type') is False
 

@@ -29,7 +29,7 @@ REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
 QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
     'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; '
-    'update or rebuild the desktop runtime'
+    'update or rebuild the runtime'
 )
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -61,8 +61,8 @@ def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
 def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: Any = None) -> tuple[Any, Optional[str]]:
     """Resolve llama-cpp-python's YaRN enum from known safe exports.
 
-    Runtime inspection for the packaged path checks ``inspect.signature(Llama.__init__)``
-    and both top-level and nested ``llama_cpp.llama_cpp`` constants.  Older
+    Runtime inspection checks the supplied Llama callable signature and both
+    top-level and nested ``llama_cpp.llama_cpp`` constants.  Older
     llama-cpp-python builds may not re-export the enum at the top level, while
     newer generated bindings can expose it from the nested ctypes module.
     """
@@ -2277,6 +2277,8 @@ class ModelManager:
         else:
             self.last_yarn_rope_diagnostics = {
                 'supported': False,
+                'active': False,
+                'required': False,
                 'active_context_tier': context_tier,
                 'requested_n_ctx': n_ctx,
                 'missing_reason': 'not_required_for_active_profile_or_tier',

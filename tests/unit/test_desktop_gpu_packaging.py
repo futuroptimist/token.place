@@ -102,6 +102,13 @@ def test_requirement_spec_accepts_underscore_package_name(tmp_path):
     assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.2.90"
 
 
+def test_server_llama_cpp_pin_matches_root_requirements():
+    root_spec = llama_cpp_requirement_spec(ROOT / "requirements.txt")
+    server_spec = llama_cpp_requirement_spec(ROOT / "config" / "requirements_server.txt")
+
+    assert server_spec == root_spec
+
+
 def test_requirement_spec_raises_when_pin_missing(tmp_path):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("numpy==2.0.0\n", encoding="utf-8")

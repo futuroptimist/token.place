@@ -4555,6 +4555,8 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
     assert manager.last_compute_diagnostics['chat_template_mode'] == 'gguf-jinja'
     assert manager.last_compute_diagnostics['thinking_mode_disabled'] is True
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
+    assert manager.last_yarn_rope_diagnostics['active'] is False
+    assert manager.last_yarn_rope_diagnostics['required'] is False
 
 
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):

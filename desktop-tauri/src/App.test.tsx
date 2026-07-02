@@ -1675,6 +1675,140 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(contextSelect.disabled).toBe(expectedDisabled));
   });
 
+  it('re-enables context tier and relay URL controls after successful Stop Operator without waiting for event', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      configured_relay_urls: ['https://token.place'],
+      relay_statuses: [
+        { relay_url: 'https://token.place', registered: true, relay_runtime_state: 'ready', last_error: null, last_request_id: null },
+      ],
+      registered_relay_count: 1,
+      registered_relay_urls: ['https://token.place'],
+      active_relay_urls: ['https://token.place'],
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    const addButton = (await screen.findByText('Add new relay URL')) as HTMLButtonElement;
+    const stopButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+    expect(relayInput.disabled).toBe(true);
+    expect(addButton.disabled).toBe(true);
+
+    fireEvent.click(stopButton);
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(relayInput.disabled).toBe(false);
+    expect(addButton.disabled).toBe(false);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+
+    fireEvent.change(contextSelect, { target: { value: '64k-full' } });
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === 'start_compute_node' &&
+            args?.request?.context_tier === '64k-full'
+        )
+      ).toBe(true)
+    );
+  });
+
+  it('treats stopped events with omitted fields as terminal stopped state', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+      operator_session_id: 'session-1',
+      sequence: 1,
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
+  });
+
+  it('re-enables context tier after pre-registration failure event', async () => {
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        warm_load_state: 'failed',
+        worker_state: 'failed',
+        worker_alive: false,
+        last_error: 'warm-load failed before registration',
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(screen.getByText(/Last error:/).textContent).toContain('warm-load failed before registration');
+  });
+
+  it('keeps running UI state when Stop Operator command fails', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      worker_state: 'ready',
+      worker_alive: true,
+    });
+    const initialImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((command: string, args?: unknown) => {
+      if (command === 'stop_compute_node') {
+        return Promise.reject(new Error('stop failed safely'));
+      }
+      return initialImplementation?.(command, args);
+    });
+
+    render(<App />);
+    const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    await waitFor(() => expect(contextSelect.disabled).toBe(true));
+
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+
+    await waitFor(() => expect(screen.getByText(/Error:/).textContent).toContain('stop failed safely'));
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(contextSelect.disabled).toBe(true);
+  });
+
   it('renders worker lifecycle fields and ignores stale worker generations', async () => {
     render(<App />);
     const computeHandler = eventHandlers.get('compute_node_event');

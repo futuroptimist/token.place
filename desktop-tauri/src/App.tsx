@@ -155,8 +155,12 @@ function displayStatusValue(value: string | null | undefined, fallback: string):
   return value && value.trim() ? value : fallback;
 }
 
-function isStoppedOrIdleOperatorStatus(status: ComputeNodeStatus, isStarting: boolean): boolean {
-  if (isStarting || status.running) {
+function isStoppedOrIdleOperatorStatus(
+  status: ComputeNodeStatus,
+  isStarting: boolean,
+  isStopping: boolean
+): boolean {
+  if (isStarting || isStopping || status.running) {
     return false;
   }
   const workerState = status.worker_state?.trim().toLowerCase() || 'stopped';
@@ -302,6 +306,24 @@ export function removeRelayUrl(config: DesktopConfig, index: number): DesktopCon
   };
 }
 
+function stoppedComputeStatus(prev: ComputeNodeStatus, lastError: string | null = null): ComputeNodeStatus {
+  return {
+    ...prev,
+    running: false,
+    registered: false,
+    active_relay_url: '',
+    relay_statuses: [],
+    registered_relay_count: 0,
+    registered_relay_urls: [],
+    active_relay_urls: [],
+    relay_runtime_state: 'stopped',
+    warm_load_state: 'stopped',
+    worker_state: 'stopped',
+    worker_alive: false,
+    last_error: lastError,
+  };
+}
+
 function mergeComputeStatusEvent(
   prev: ComputeNodeStatus,
   payload: Record<string, unknown>
@@ -341,23 +363,28 @@ function mergeComputeStatusEvent(
     return prev;
   }
 
+  const terminalStopped = payload.type === 'stopped';
+  const terminalFailed = payload.type === 'error';
+
   return {
     running:
       typeof payload.running === 'boolean'
         ? payload.running
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? false
           : prev.running,
     registered:
       typeof payload.registered === 'boolean'
         ? payload.registered
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? false
           : prev.registered,
     active_relay_url:
       typeof payload.active_relay_url === 'string'
         ? payload.active_relay_url
-        : prev.active_relay_url,
+        : terminalStopped
+          ? ''
+          : prev.active_relay_url,
     configured_relay_urls:
       Array.isArray(payload.configured_relay_urls)
         ? stringArrayPayload(payload.configured_relay_urls)
@@ -365,11 +392,13 @@ function mergeComputeStatusEvent(
     relay_statuses:
       Array.isArray(payload.relay_statuses)
         ? relayStatusesPayload(payload.relay_statuses)
-        : prev.relay_statuses,
+        : terminalStopped
+          ? []
+          : prev.relay_statuses,
     registered_relay_count:
       typeof payload.registered_relay_count === 'number'
         ? payload.registered_relay_count
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? 0
           : prev.registered_relay_count,
     configured_relay_count:
@@ -379,13 +408,13 @@ function mergeComputeStatusEvent(
     registered_relay_urls:
       Array.isArray(payload.registered_relay_urls)
         ? stringArrayPayload(payload.registered_relay_urls)
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? []
           : prev.registered_relay_urls,
     active_relay_urls:
       Array.isArray(payload.active_relay_urls)
         ? stringArrayPayload(payload.active_relay_urls)
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? []
           : prev.active_relay_urls,
     requested_mode:
@@ -414,15 +443,19 @@ function mergeComputeStatusEvent(
         ? payload.relay_runtime_state
         : typeof payload.warm_load_state === 'string'
           ? payload.warm_load_state
-          : payload.type === 'error'
-            ? 'failed'
-            : prev.relay_runtime_state,
+          : terminalStopped
+            ? 'stopped'
+            : terminalFailed
+              ? 'failed'
+              : prev.relay_runtime_state,
     warm_load_state:
       typeof payload.warm_load_state === 'string'
         ? payload.warm_load_state
-        : payload.type === 'error'
-          ? 'failed'
-          : prev.warm_load_state,
+        : terminalStopped
+          ? 'stopped'
+          : terminalFailed
+            ? 'failed'
+            : prev.warm_load_state,
     warm_load_enabled:
       typeof payload.warm_load_enabled === 'boolean'
         ? payload.warm_load_enabled
@@ -439,9 +472,11 @@ function mergeComputeStatusEvent(
     worker_state:
       typeof payload.worker_state === 'string'
         ? payload.worker_state
-        : payload.type === 'error'
-          ? 'failed'
-          : prev.worker_state,
+        : terminalStopped
+          ? 'stopped'
+          : terminalFailed
+            ? 'failed'
+            : prev.worker_state,
     worker_generation:
       typeof payload.worker_generation === 'number' ? payload.worker_generation : prev.worker_generation,
     worker_restart_count:
@@ -449,7 +484,7 @@ function mergeComputeStatusEvent(
     worker_alive:
       typeof payload.worker_alive === 'boolean'
         ? payload.worker_alive
-        : payload.type === 'error'
+        : terminalStopped || terminalFailed
           ? false
           : prev.worker_alive,
     last_worker_error_code:
@@ -524,6 +559,7 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const [isStoppingComputeNode, setIsStoppingComputeNode] = useState(false);
   const [operatorLogText, setOperatorLogText] = useState('');
   const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState =
@@ -605,8 +641,11 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error') {
+      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
         setIsStartingComputeNode(false);
+      }
+      if (payload.type === 'stopped') {
+        setIsStoppingComputeNode(false);
       }
       if (payload.type === 'error') {
         const computeMessage =
@@ -642,12 +681,12 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
-    [config.model_path, computeStatus.running, isStartingComputeNode]
+    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
   const canChangeContextTier = useMemo(
-    () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode),
-    [computeStatus, isStartingComputeNode]
+    () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
+    [computeStatus, isStartingComputeNode, isStoppingComputeNode]
   );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
@@ -794,9 +833,17 @@ export function App() {
 
   const stopComputeNode = async () => {
     try {
+      setIsStoppingComputeNode(true);
+      setError('');
       await invoke('stop_compute_node');
+      setIsStartingComputeNode(false);
+      const stoppedStatus = stoppedComputeStatus(computeStatusRef.current);
+      computeStatusRef.current = stoppedStatus;
+      setComputeStatus(stoppedStatus);
     } catch (e) {
       setError(formatErrorMessage(e));
+    } finally {
+      setIsStoppingComputeNode(false);
     }
   };
 
@@ -915,14 +962,14 @@ export function App() {
 
       <section aria-labelledby="relay-urls-heading" style={{ marginTop: 12 }}>
         <h2 id="relay-urls-heading" style={{ fontSize: 16, marginBottom: 8 }}>Relay URLs</h2>
-        {(computeStatus.running || isStartingComputeNode) && (
+        {(computeStatus.running || isStartingComputeNode || isStoppingComputeNode) && (
           <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>
             Stop the operator to edit relay URLs. Changes apply on next start.
           </p>
         )}
         {config.relay_base_urls.map((relayUrl, index) => {
           const inputId = `relay-url-${index}`;
-          const relayControlsDisabled = computeStatus.running || isStartingComputeNode;
+          const relayControlsDisabled = computeStatus.running || isStartingComputeNode || isStoppingComputeNode;
           return (
             <div key={index} style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
               <label htmlFor={inputId} style={{ minWidth: 92 }}>Relay URL {index + 1}</label>
@@ -949,7 +996,7 @@ export function App() {
         <button
           type="button"
           onClick={() => updateConfig(addRelayUrl(config))}
-          disabled={computeStatus.running || isStartingComputeNode || config.relay_base_urls.length >= MAX_RELAY_BASE_URLS}
+          disabled={computeStatus.running || isStartingComputeNode || isStoppingComputeNode || config.relay_base_urls.length >= MAX_RELAY_BASE_URLS}
           style={{ marginTop: 8 }}
         >
           Add new relay URL
@@ -979,7 +1026,7 @@ export function App() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running}
+            disabled={!computeStatus.running || isStartingComputeNode || isStoppingComputeNode}
             onClick={stopComputeNode}
           >
             Stop operator

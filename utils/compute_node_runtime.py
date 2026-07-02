@@ -410,7 +410,11 @@ class ComputeNodeRuntime:
         diagnostics.update({
             "api_v1_readiness_model_id": getattr(self.model_manager, "api_model_id", None),
             "api_v1_readiness_model_profile_provider": model_profile.get("provider"),
-            "api_v1_readiness_model_profile_id": model_profile.get("id") or model_profile.get("name"),
+            "api_v1_readiness_model_profile_id": (
+                model_profile.get("profile_id")
+                or model_profile.get("id")
+                or model_profile.get("name")
+            ),
             "api_v1_readiness_context_tier": context_tier,
             "api_v1_readiness_context_window_tokens": context_window_tokens,
             "api_v1_readiness_template_mode": model_profile.get("chat_template_policy") or "llama-3",

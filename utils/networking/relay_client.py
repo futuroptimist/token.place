@@ -2190,17 +2190,6 @@ class RelayClient:
         return cleaned, None
 
     @classmethod
-    def _api_v1_qwen_thinking_leaked(
-        cls, model_profile: Dict[str, Any], content: Any
-    ) -> bool:
-        return (
-            cls._api_v1_qwen_non_thinking_required(model_profile)
-            and isinstance(content, str)
-            and cls._api_v1_normalize_qwen_non_thinking_content(model_profile, content)[1]
-            in {"qwen_thinking_output_leaked", "qwen_empty_after_think_wrapper_strip"}
-        )
-
-    @classmethod
     def _api_v1_qwen_reasoning_content_leaked(
         cls, model_profile: Dict[str, Any], payload: Any
     ) -> bool:
@@ -3087,14 +3076,18 @@ class RelayClient:
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-            if message is not None:
+            if (
+                message is not None
+                and isinstance(message.get("content"), str)
+                and message["content"].strip()
+            ):
                 cleaned_content, invalid_reason = self._api_v1_normalize_qwen_non_thinking_content(
-                    model_profile, message.get("content")
+                    model_profile, message["content"]
                 )
                 if invalid_reason is not None:
                     self._last_api_v1_invalid_model_output_reason = invalid_reason
                     return None
-                message = {"role": "assistant", "content": cleaned_content}
+                message = {**message, "content": cleaned_content}
             if message is None:
                 self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message

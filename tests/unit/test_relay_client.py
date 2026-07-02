@@ -5087,6 +5087,67 @@ def test_assistant_message_extraction_strips_empty_qwen_think_wrapper_from_text_
 
     assert message == {"role": "assistant", "content": "final"}
 
+
+def test_assistant_message_extraction_preserves_tool_call_only_message():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+
+    message = client._assistant_message_from_runtime_completion(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls,
+                    }
+                }
+            ]
+        }
+    )
+
+    assert message == {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    assert client._last_api_v1_invalid_model_output_reason is None
+
+
+def test_assistant_message_extraction_preserves_tool_calls_when_normalizing_content():
+    manager = _AdmissionManager(window=128)
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    client = _api_v1_validation_client(manager)
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+
+    message = client._assistant_message_from_runtime_completion(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "<think></think> final",
+                        "tool_calls": tool_calls,
+                    }
+                }
+            ]
+        }
+    )
+
+    assert message == {"role": "assistant", "content": "final", "tool_calls": tool_calls}
+    assert client._last_api_v1_invalid_model_output_reason is None
+
+
 def test_qwen_think_output_is_rejected():
     manager = _AdmissionManager(window=128)
     manager.api_model_id = 'qwen3-8b-instruct'

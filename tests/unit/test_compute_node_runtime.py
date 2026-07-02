@@ -202,7 +202,11 @@ def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridg
 
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
-    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+    }
     model_manager.context_tier = "8k-fast"
     model_manager.context_window_tokens = 8192
     model_manager.api_model_id = "qwen3-8b-instruct"
@@ -376,7 +380,11 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
-    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+    }
     model_manager.context_tier = "8k-fast"
     model_manager.context_window_tokens = 8192
     model_manager.api_model_id = "qwen3-8b-instruct"
@@ -397,8 +405,9 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
+    assert diagnostics["api_v1_readiness_model_profile_id"] == "qwen3-8b-q4-k-m"
     assert llm_runtime.completion_kwargs["stream"] is False
-    assert llm_runtime.completion_kwargs["max_tokens"] >= 32
+    assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
 
@@ -438,7 +447,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "choices_message_content"
-    assert llm_runtime.completion_kwargs["max_tokens"] >= 32
+    assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
 

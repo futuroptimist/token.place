@@ -468,14 +468,22 @@ class ComputeNodeRuntime:
         )
         if admitted and completion_smoke_required:
             try:
+                smoke_max_tokens = 32
+                diagnostics["api_v1_readiness_completion_smoke_max_tokens"] = smoke_max_tokens
                 smoke_completion = create_chat_completion(
                     messages=smoke_messages,
-                    max_tokens=4,
+                    max_tokens=smoke_max_tokens,
                     stream=False,
                 )
-                smoke_message = None
+                smoke_shape = RelayClient._api_v1_runtime_completion_shape_category(
+                    smoke_completion, model_profile
+                )
+                diagnostics["api_v1_readiness_completion_smoke_shape"] = smoke_shape
                 smoke_content = None
-                if (
+                smoke_failure_reason = None
+                if RelayClient._api_v1_qwen_reasoning_content_leaked(model_profile, smoke_completion):
+                    smoke_failure_reason = "runtime_completion_smoke_thinking_leaked"
+                elif (
                     isinstance(smoke_completion, dict)
                     and isinstance(smoke_completion.get("choices"), list)
                     and smoke_completion["choices"]
@@ -487,30 +495,43 @@ class ComputeNodeRuntime:
                         smoke_content = smoke_message.get("content")
                     elif "text" in smoke_choice:
                         smoke_content = smoke_choice.get("text")
-                smoke_ok = (
-                    isinstance(smoke_content, str)
-                    and bool(smoke_content.strip())
-                    and not RelayClient._api_v1_qwen_thinking_leaked(
-                        model_profile, smoke_content
+                    cleaned_smoke_content, normalize_reason = (
+                        RelayClient._api_v1_normalize_qwen_non_thinking_content(
+                            model_profile, smoke_content
+                        )
                     )
-                    and not RelayClient._api_v1_qwen_reasoning_content_leaked(
-                        model_profile, smoke_choice
-                    )
-                )
+                    if normalize_reason == "qwen_empty_after_think_wrapper_strip":
+                        smoke_failure_reason = "runtime_completion_smoke_empty_after_think_strip"
+                    elif normalize_reason == "qwen_thinking_output_leaked":
+                        smoke_failure_reason = "runtime_completion_smoke_thinking_leaked"
+                    elif normalize_reason is not None:
+                        smoke_failure_reason = (
+                            "runtime_completion_smoke_empty_output"
+                            if smoke_shape == "empty_content"
+                            else "runtime_completion_smoke_malformed_completion"
+                        )
+                    elif not cleaned_smoke_content:
+                        smoke_failure_reason = "runtime_completion_smoke_empty_output"
+                else:
+                    smoke_failure_reason = "runtime_completion_smoke_malformed_completion"
+                smoke_ok = smoke_failure_reason is None
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_failure_reason
                 if not smoke_ok:
                     admitted = False
                     admission_error = {
                         "code": "compute_node_context_admission_unavailable",
-                        "internal_reason": "runtime_completion_smoke_failed",
+                        "internal_reason": smoke_failure_reason or "runtime_completion_smoke_failed",
                     }
             except Exception as exc:
                 admitted = False
                 admission_error = {
                     "code": "compute_node_context_admission_unavailable",
-                    "internal_reason": "runtime_completion_smoke_failed",
+                    "internal_reason": "runtime_completion_smoke_exception",
                 }
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = "runtime_completion_smoke_exception"
+                diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
                 diagnostics["api_v1_readiness_completion_smoke_exception_type"] = type(exc).__name__
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"

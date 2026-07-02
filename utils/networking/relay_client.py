@@ -2161,6 +2161,79 @@ class RelayClient:
         )
 
     @classmethod
+    def _api_v1_normalize_qwen_non_thinking_content(
+        cls, model_profile: Dict[str, Any], content: Any
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Strip Qwen's empty leading think artifact while rejecting reasoning.
+
+        Returns ``(cleaned_content, None)`` when the content is valid, otherwise
+        ``(None, safe_internal_reason)``.  The rejected content is never included
+        in the reason so callers can safely surface diagnostics.
+        """
+
+        if not isinstance(content, str):
+            return None, "unsupported_completion_shape"
+        if not cls._api_v1_qwen_non_thinking_required(model_profile):
+            cleaned = content.strip()
+            if not cleaned:
+                return None, "unsupported_completion_shape"
+            return cleaned, None
+
+        remaining = content.lstrip()
+        stripped_empty_wrapper = False
+        empty_wrapper_pattern = re.compile(
+            r"^<\s*think\s*>\s*<\s*/\s*think\s*>",
+            flags=re.IGNORECASE,
+        )
+        while True:
+            match = empty_wrapper_pattern.match(remaining)
+            if not match:
+                break
+            stripped_empty_wrapper = True
+            remaining = remaining[match.end():].lstrip()
+
+        cleaned = remaining.strip()
+        if re.search(r"<\s*think", cleaned, flags=re.IGNORECASE):
+            return None, "qwen_thinking_output_leaked"
+        if not cleaned:
+            return (
+                None,
+                "qwen_empty_after_think_wrapper_strip"
+                if stripped_empty_wrapper
+                else "unsupported_completion_shape",
+            )
+        return cleaned, None
+
+    @classmethod
+    def _api_v1_runtime_completion_shape_category(
+        cls, completion: Any, model_profile: Optional[Dict[str, Any]] = None
+    ) -> str:
+        if not (
+            isinstance(completion, dict)
+            and isinstance(completion.get("choices"), list)
+            and completion["choices"]
+            and isinstance(completion["choices"][0], dict)
+        ):
+            return "missing_choices"
+        choice = completion["choices"][0]
+        if cls._api_v1_qwen_reasoning_content_leaked(model_profile or {}, choice):
+            return "reasoning_field_present"
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return (
+                "choices_message_content"
+                if message.get("content").strip()
+                else "empty_content"
+            )
+        if "text" in choice:
+            return (
+                "choices_text"
+                if isinstance(choice.get("text"), str) and choice.get("text").strip()
+                else "empty_content"
+            )
+        return "missing_choices"
+
+    @classmethod
     def _api_v1_qwen_reasoning_content_leaked(
         cls, model_profile: Dict[str, Any], payload: Any
     ) -> bool:
@@ -3010,7 +3083,7 @@ class RelayClient:
         ):
             choice = completion["choices"][0]
             if self._api_v1_qwen_reasoning_content_leaked(
-                getattr(self.model_manager, "model_profile", {}) or {}, choice
+                getattr(self.model_manager, "model_profile", {}) or {}, completion
             ):
                 # Fail closed before normalizing the runtime choice so hidden
                 # reasoning fields are never forwarded or echoed.
@@ -3025,13 +3098,18 @@ class RelayClient:
                 if isinstance(text, str) and text.strip():
                     message = {"role": "assistant", "content": text}
             model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-            if message is not None and self._api_v1_qwen_thinking_leaked(
-                model_profile, message.get("content")
-            ):
-                # Fail closed instead of stripping so no hidden reasoning can be
-                # partially leaked or mis-accounted in API v1 relay responses.
-                self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
-                return None
+            if message is not None:
+                cleaned_content, invalid_reason = self._api_v1_normalize_qwen_non_thinking_content(
+                    model_profile, message.get("content")
+                )
+                if invalid_reason is not None:
+                    # Fail closed if hidden/visible reasoning appears, but allow
+                    # Qwen's documented empty leading think-wrapper artifact to
+                    # be stripped before any API v1 client-visible response or
+                    # chat-history persistence.
+                    self._last_api_v1_invalid_model_output_reason = invalid_reason
+                    return None
+                message = {**message, "content": cleaned_content}
             if message is None:
                 self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message

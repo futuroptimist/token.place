@@ -71,6 +71,10 @@ def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
 
 
 def _llama_constructor_supports_kwargs(llama_cls: Any, required_kwargs: Iterable[str]) -> Dict[str, bool]:
+    facade_kwargs = getattr(llama_cls, '__token_place_supported_constructor_kwargs__', None)
+    if facade_kwargs is not None:
+        supported = {str(name) for name in facade_kwargs if isinstance(name, str)}
+        return {name: name in supported for name in required_kwargs}
     return {name: _constructor_accepts_kwarg(llama_cls, name) for name in required_kwargs}
 
 
@@ -130,7 +134,12 @@ def _safe_llama_cpp_enum(llama_cpp_module: Any, name: str) -> Any:
     return None
 
 
-def _qwen_64k_memory_profile_kwargs(llama_cpp_module: Any, llama_cls: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def _qwen_64k_memory_profile_kwargs(
+    llama_cpp_module: Any,
+    llama_cls: Any,
+    *,
+    enable_kqv_offload: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
     kwarg_support = _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
     kwargs: Dict[str, Any] = {}
@@ -148,7 +157,8 @@ def _qwen_64k_memory_profile_kwargs(llama_cpp_module: Any, llama_cls: Any) -> tu
             kwargs['type_v'] = q8_type
     if kwarg_support.get('flash_attn'):
         kwargs['flash_attn'] = True
-    if kwarg_support.get('offload_kqv'):
+    diagnostics['kqv_offload_allowed'] = bool(enable_kqv_offload)
+    if enable_kqv_offload and kwarg_support.get('offload_kqv'):
         kwargs['offload_kqv'] = True
     if kwarg_support.get('n_batch'):
         kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
@@ -1213,6 +1223,7 @@ class _SubprocessLlamaCppModule:
         self.__file__ = module_path
         self._timeout_seconds = timeout_seconds
         self.__token_place_subprocess_facade__ = True
+        self.LLAMA_TYPE_Q8_0 = 8
         probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
         backend = str((probe or {}).get('backend') or '').lower()
         self.GGML_USE_CUDA = backend == 'cuda'
@@ -1227,6 +1238,8 @@ class _SubprocessLlamaCppModule:
         module_path_hint = self.__file__
 
         class _ConfiguredSubprocessLlama(_SubprocessLlamaProxy):
+            __token_place_supported_constructor_kwargs__ = ()
+
             def __init__(self, *args, **kwargs):
                 super().__init__(
                     *args,
@@ -1256,7 +1269,16 @@ def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
 def _sanitize_error_summary(message):
-    return '<redacted>'
+    text = str(message or '').lower()
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
+        return type(message).__name__ + ':metal_memory_allocation'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+        return type(message).__name__ + ':kv_cache_allocation'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
+        return type(message).__name__ + ':rope_yarn_eval_failure'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(message or '')):
+        return type(message).__name__ + ':unsupported_kwarg'
+    return type(message).__name__ + ':redacted'
 
 def _classify_generation_exception(exc):
     text = str(exc or '').lower()
@@ -2395,7 +2417,11 @@ class ModelManager:
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
             )
-            memory_kwargs, memory_diagnostics = _qwen_64k_memory_profile_kwargs(llama_module, llama_cls)
+            memory_kwargs, memory_diagnostics = _qwen_64k_memory_profile_kwargs(
+                llama_module,
+                llama_cls,
+                enable_kqv_offload=n_gpu_layers > 0,
+            )
             kwargs.update(memory_kwargs)
             self.last_qwen_64k_memory_profile_diagnostics = memory_diagnostics
         else:

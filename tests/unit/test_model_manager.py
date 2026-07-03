@@ -3185,7 +3185,7 @@ def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(reques
         'method': 'create_chat_completion',
         'stream': False,
         'exception_type': 'RuntimeError',
-        'sanitized_error_summary': '<redacted>',
+        'sanitized_error_summary': 'RuntimeError:redacted',
         'generation_exception_category': 'unknown_generation_exception',
     }
 
@@ -4972,7 +4972,7 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
     assert captured['type_k'] == 8
     assert captured['type_v'] == 8
     assert captured['flash_attn'] is True
-    assert captured['offload_kqv'] is True
+    assert 'offload_kqv' not in captured
     assert captured['n_batch'] == 256
     assert captured['n_ubatch'] == 128
     assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
@@ -5011,3 +5011,58 @@ def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path)
 
     assert 'type_k' not in captured
     assert manager.last_compute_diagnostics.get('kv_cache_mode') == {}
+
+
+def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert facade.LLAMA_TYPE_Q8_0 == 8
+    assert kwargs == {}
+    assert diagnostics['kv_cache_type_name'] == 'LLAMA_TYPE_Q8_0'
+    assert diagnostics['constructor_kwarg_support']['type_k'] is False
+
+
+def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, type_k, type_v, flash_attn, offload_kqv, n_batch, n_ubatch):
+            self.kwargs = {
+                'type_k': type_k,
+                'type_v': type_v,
+                'flash_attn': flash_attn,
+                'offload_kqv': offload_kqv,
+                'n_batch': n_batch,
+                'n_ubatch': n_ubatch,
+            }
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        SimpleNamespace(LLAMA_TYPE_Q8_0=8),
+        FakeLlama,
+        enable_kqv_offload=False,
+    )
+
+    assert kwargs['type_k'] == 8
+    assert kwargs['type_v'] == 8
+    assert kwargs['flash_attn'] is True
+    assert 'offload_kqv' not in kwargs
+    assert diagnostics['kqv_offload_allowed'] is False
+
+
+def test_subprocess_worker_error_summary_keeps_safe_category_hint():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
+
+    assert summary == 'RuntimeError:metal_memory_allocation'

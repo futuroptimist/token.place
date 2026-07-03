@@ -230,7 +230,10 @@ def _resolve_ggml_kv_cache_type(
         diagnostics.update({'source': 'worker_probe', 'name': capability_key, 'value': capability_value})
         return capability_value, diagnostics
 
-    numeric_fallbacks = {'f16': 1, 'q4': 2, 'q8': 18}
+    # llama.cpp GGML enum fallback values. These are only used after the
+    # constructor is verified to support type_k/type_v, so a runtime that cannot
+    # accept KV-cache enum kwargs never receives guessed numeric values.
+    numeric_fallbacks = {'f16': 1, 'q4': 2, 'q8': 8}
     support = kwarg_support or _llama_constructor_supports_kwargs(llama_cls, ('type_k', 'type_v'))
     if precision in numeric_fallbacks and (support.get('type_k') or support.get('type_v')):
         diagnostics.update({
@@ -338,6 +341,8 @@ def _build_qwen_64k_runtime_profiles(
                 kwargs.pop('type_v', None)
                 if 'type_k' not in kwargs:
                     omitted['profile'] = 'no_supported_quantized_kv_kwargs'
+        if 'type_k' not in kwargs and 'type_v' not in kwargs:
+            omitted['profile'] = omitted.get('profile') or 'no_applied_quantized_kv_kwargs'
         if enable_kqv_offload and support.get('offload_kqv'):
             kwargs['offload_kqv'] = True
         elif enable_kqv_offload:
@@ -391,9 +396,37 @@ def _redact_paths_from_text(text: Any, *, limit: int = 2000) -> str:
     redacted = str(text or '')
     path_chars = r'[^\n\r\t<>|*?";]+'
     redacted = re.sub(rf'(?<!\w)(?:[A-Za-z]:)?[/\\]{path_chars}(?:[/\\]{path_chars})+', '<path>', redacted)
-    redacted = re.sub(r'\b(?:[A-Za-z]:)?(?:[A-Za-z0-9_. -]+[/\\]){2,}[A-Za-z0-9_. -]+', '<path>', redacted)
+    redacted = re.sub(r'\b[A-Za-z]:\\[^\n\r\t<>|*?";]+(?:\\[^\n\r\t<>|*?";]+)+', '<path>', redacted)
     return redacted[-limit:].strip()
 
+
+_CHILD_DIAGNOSTIC_ALLOWLIST = re.compile(
+    r'(llama|llama_context|ggml|metal|kv|cache|alloc|memory|oom|buffer|rope|yarn|'
+    r'flash_attn|type_k|type_v|n_ctx|context|unsupported|keyword|argument|failed)',
+    re.IGNORECASE,
+)
+
+
+def _sanitize_child_diagnostic_text(text: Any, *, limit: int = 1200) -> str:
+    redacted = _redact_paths_from_text(text, limit=limit * 2)
+    safe_lines = []
+    for line in redacted.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _CHILD_DIAGNOSTIC_ALLOWLIST.search(stripped):
+            safe_lines.append(stripped[:300])
+        if len('\n'.join(safe_lines)) >= limit:
+            break
+    return '\n'.join(safe_lines)[-limit:].strip()
+
+
+def _safe_parent_exception_message(error: Any, *, child_stderr: str = '') -> str:
+    category = _classify_runtime_context_create_error(error, child_stderr)
+    return (
+        f"{type(error).__name__ if isinstance(error, BaseException) else 'RuntimeError'}; "
+        f"safe_error_category={category}"
+    )
 
 
 def _qwen_64k_memory_profile_kwargs(
@@ -1363,14 +1396,19 @@ def _read_llama_subprocess_message(
     if message.get('status') == 'transport_error':
         raise LlamaCppWorkerEOFError(str(message.get('error') or f'{stage} worker exited before response'))
     if message.get('status') == 'error':
-        error = str(message.get('error') or f'{stage} failed')
+        raw_error = str(message.get('error') or f'{stage} failed')
+        error = raw_error
         if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize'} and message.get('request_error'):
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
+        category = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
+        error = f'{stage} failed; child_exception_type={message.get("exception_type") or "RuntimeError"}; safe_error_category={category}'
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
-            error = f"{error}; child_traceback_tail={_redact_paths_from_text(traceback_text)}"
+            safe_tail = _sanitize_child_diagnostic_text(traceback_text)
+            if safe_tail:
+                error = f"{error}; child_traceback_tail={safe_tail}"
         raise RuntimeError(error)
     return message
 
@@ -1446,12 +1484,12 @@ class _SubprocessLlamaProxy:
             self.close()
             raise
         except Exception as exc:
-            stderr_tail = _redact_paths_from_text(_llama_subprocess_tail(self._process, '_token_place_stderr_tail'))
+            stderr_tail = _sanitize_child_diagnostic_text(_llama_subprocess_tail(self._process, '_token_place_stderr_tail'))
             category = _classify_runtime_context_create_error(exc, stderr_tail)
             if isinstance(exc, LlamaCppWorkerEOFError):
                 safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
             else:
-                safe_exc = _redact_paths_from_text(exc)
+                safe_exc = _safe_parent_exception_message(exc, child_stderr=stderr_tail)
             self.close()
             raise RuntimeError(
                 f"{safe_exc}; child_exception_type={type(exc).__name__}; "
@@ -3211,11 +3249,28 @@ class ModelManager:
                                     category = _classify_runtime_context_create_error(init_exc)
                                     safe_failure = {
                                         'profile_id': profile_id,
+                                        'model_profile_id': self.profile_id,
                                         'safe_error_category': category,
                                         'exception_type': type(init_exc).__name__,
                                         'context_tier': getattr(self, 'context_tier', '8k-fast'),
                                         'n_ctx': runtime_kwargs.get('n_ctx'),
                                         'backend': compute_plan.get('backend_used'),
+                                        'llama_cpp_python_version': (
+                                            profile_diag.get('llama_cpp_python_version')
+                                            if isinstance(profile_diag, dict) else None
+                                        ),
+                                        'yarn_resolver_source': (
+                                            getattr(self, 'last_yarn_rope_diagnostics', {}) or {}
+                                        ).get('yarn_resolver_source'),
+                                        'kv_cache_settings': (
+                                            profile_diag.get('applied')
+                                            if isinstance(profile_diag, dict) else {}
+                                        ),
+                                        'memory_estimate': (
+                                            profile_diag.get('memory_estimate')
+                                            if isinstance(profile_diag, dict) else {}
+                                        ),
+                                        'child_stderr_tail': _sanitize_child_diagnostic_text(init_exc),
                                         'attempted_runtime_kwargs': {
                                             key: runtime_kwargs.get(key)
                                             for key in ('n_ctx', 'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch', 'rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
@@ -3324,7 +3379,7 @@ class ModelManager:
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.llm = None
-                            self.last_runtime_init_error = str(e)
+                            self.last_runtime_init_error = _redact_paths_from_text(e, limit=12000)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)
                             self.worker_state = 'failed'

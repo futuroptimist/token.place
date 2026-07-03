@@ -3138,7 +3138,7 @@ def test_subprocess_llama_proxy_initialization_failure_still_terminates_worker(t
         )
 
     message = str(exc_info.value)
-    assert 'init failed clearly' in message
+    assert 'safe_error_category=' in message
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
@@ -3161,7 +3161,10 @@ def test_llama_subprocess_request_error_is_typed_only_for_inference_stage():
             stage='llama_cpp_init',
         )
 
-    assert str(exc_info.value) == 'init failed'
+    assert str(exc_info.value) == (
+        'llama_cpp_init failed; child_exception_type=RuntimeError; '
+        'safe_error_category=runtime_init_unclassified'
+    )
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
@@ -5050,7 +5053,7 @@ def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
             'constructor_kwarg_support': support,
-            'q8_kv_cache_type_value': 18,
+            'q8_kv_cache_type_value': 8,
             'capability_source': 'worker_probe',
         },
     )
@@ -5408,8 +5411,8 @@ def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
         enable_kqv_offload=False,
     )
 
-    assert kwargs['type_k'] == 18
-    assert kwargs['type_v'] == 18
+    assert kwargs['type_k'] == 8
+    assert kwargs['type_v'] == 8
     assert 'flash_attn' not in kwargs
     assert 'offload_kqv' not in kwargs
     assert diagnostics['kqv_offload_allowed'] is False
@@ -5434,7 +5437,7 @@ def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
             'constructor_kwarg_support': support,
-            'q8_kv_cache_type_value': 18,
+            'q8_kv_cache_type_value': 8,
             'capability_source': 'worker_probe',
         },
     )
@@ -5445,11 +5448,57 @@ def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
         enable_kqv_offload=True,
     )
 
-    assert kwargs['type_k'] == 18
-    assert kwargs['type_v'] == 18
+    assert kwargs['type_k'] == 8
+    assert kwargs['type_v'] == 8
     assert kwargs['flash_attn'] is True
     assert kwargs['offload_kqv'] is True
     assert diagnostics['capability_source'] == 'worker_probe'
+
+
+def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile():
+    from utils.llm import model_manager as model_manager_module
+
+    class NoKvEnumLlama:
+        __token_place_supported_constructor_kwargs__ = ('flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        SimpleNamespace(),
+        NoKvEnumLlama,
+        model_path='model.gguf',
+        n_ctx=65536,
+    )
+
+    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_default']
+    skipped = profiles[0]['diagnostics']['skipped_profiles']
+    assert skipped
+    assert all(not item['enabled'] for item in skipped)
+    assert all('flash_attn' not in item['applied'] for item in skipped)
+    assert all('type_k' not in item['applied'] and 'type_v' not in item['applied'] for item in skipped)
+
+
+def test_child_diagnostics_drop_payloads_keys_and_arbitrary_stderr():
+    from utils.llm import model_manager as model_manager_module
+
+    text = """
+prompt: reveal SECRET_PROMPT_123
+assistant: SECRET_ASSISTANT_456
+ciphertext_body=abc123 key=sk-token decrypted payload
+random child stderr snippet survives?
+/Users/Alice/Application Support/token.place/model.gguf
+ggml_metal: KV cache allocation failed for llama_context
+"""
+
+    sanitized = model_manager_module._sanitize_child_diagnostic_text(text)
+
+    assert 'SECRET_PROMPT_123' not in sanitized
+    assert 'SECRET_ASSISTANT_456' not in sanitized
+    assert 'ciphertext_body' not in sanitized
+    assert 'decrypted payload' not in sanitized
+    assert 'sk-token' not in sanitized
+    assert 'random child stderr snippet' not in sanitized
+    assert '/Users/Alice' not in sanitized
+    assert 'Application Support' not in sanitized
+    assert 'KV cache allocation failed' in sanitized
 
 
 def test_qwen_64k_memory_profile_omits_kwargs_when_worker_probe_lacks_support():
@@ -5532,7 +5581,7 @@ def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     fake_llama_cpp = SimpleNamespace(
         Llama=FakeLlama,
         LLAMA_ROPE_SCALING_TYPE_YARN=2,
-        GGML_TYPE_Q8_0=18,
+        GGML_TYPE_Q8_0=8,
         __file__='/opt/token.place/llama_cpp/__init__.py',
         __version__='0.3.32',
     )
@@ -5544,8 +5593,8 @@ def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     assert len(attempts) == 2
     assert attempts[0]['n_ctx'] == 65536
     assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 18
-    assert attempts[1]['type_v'] == 18
+    assert attempts[1]['type_k'] == 8
+    assert attempts[1]['type_v'] == 8
     assert attempts[1]['flash_attn'] is True
     assert attempts[1]['offload_kqv'] is True
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
@@ -5580,7 +5629,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     fake_llama_cpp = SimpleNamespace(
         Llama=FakeLlama,
         LLAMA_ROPE_SCALING_TYPE_YARN=2,
-        GGML_TYPE_Q8_0=18,
+        GGML_TYPE_Q8_0=8,
         GGML_TYPE_Q4_0=2,
         __file__='/opt/token.place/llama_cpp/__init__.py',
     )
@@ -5602,7 +5651,7 @@ def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
             pass
 
     top_value, top_diag = model_manager_module._resolve_ggml_kv_cache_type(
-        SimpleNamespace(GGML_TYPE_Q8_0=18), KwargsLlama, 'q8'
+        SimpleNamespace(GGML_TYPE_Q8_0=8), KwargsLlama, 'q8'
     )
     nested_value, nested_diag = model_manager_module._resolve_ggml_kv_cache_type(
         SimpleNamespace(llama_cpp=SimpleNamespace(LLAMA_TYPE_Q4_0=2)), KwargsLlama, 'q4'
@@ -5611,9 +5660,9 @@ def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
         SimpleNamespace(), KwargsLlama, 'q8'
     )
 
-    assert (top_value, top_diag['source']) == (18, 'top_level')
+    assert (top_value, top_diag['source']) == (8, 'top_level')
     assert (nested_value, nested_diag['source']) == (2, 'nested')
-    assert (fallback_value, fallback_diag['source']) == (18, 'verified_numeric_fallback')
+    assert (fallback_value, fallback_diag['source']) == (8, 'verified_numeric_fallback')
 
 
 def test_child_context_create_error_classification_and_stderr_redaction():

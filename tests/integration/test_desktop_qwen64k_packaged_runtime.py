@@ -31,7 +31,7 @@ def _write_fake_llama_cpp_runtime(root: Path) -> None:
 import json, os, sys
 __version__ = '0.3.32-test'
 GGML_USE_METAL = True
-GGML_TYPE_Q8_0 = 18
+GGML_TYPE_Q8_0 = 8
 GGML_TYPE_Q4_0 = 2
 LLAMA_ROPE_SCALING_TYPE_YARN = 2
 
@@ -76,7 +76,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
             },
             'yarn_enum_value': 2,
             'qwen_64k_yarn_support': 'supported',
-            'q8_kv_cache_type_value': 18,
+            'q8_kv_cache_type_value': 8,
             'q4_kv_cache_type_value': 2,
             'llama_cpp_python_version': '0.3.32-test',
         },
@@ -89,7 +89,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
     assert len(attempts) == 2
     assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 18
+    assert attempts[1]['type_k'] == 8
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
 
 
@@ -115,7 +115,7 @@ def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, m
                 'n_batch': True, 'n_ubatch': True,
             },
             'yarn_enum_value': 2, 'qwen_64k_yarn_support': 'supported',
-            'q8_kv_cache_type_value': 18, 'q4_kv_cache_type_value': 2,
+            'q8_kv_cache_type_value': 8, 'q4_kv_cache_type_value': 2,
         },
     )
 

@@ -78,6 +78,18 @@ def _llama_constructor_supports_kwargs(llama_cls: Any, required_kwargs: Iterable
     return {name: _constructor_accepts_kwarg(llama_cls, name) for name in required_kwargs}
 
 
+def _coerce_optional_int_enum(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.isdigit() or (text[0] in {'+', '-'} and text[1:].isdigit())):
+            return int(text, 10)
+    return None
+
+
 def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any]:
     capabilities = getattr(llama_cpp_module, '__token_place_worker_capabilities__', None)
     if not isinstance(capabilities, dict):
@@ -100,11 +112,13 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         'constructor_signature_inspectable',
         'qwen_64k_yarn_support',
         'yarn_resolver_source',
-        'yarn_enum_value',
         'llama_module_path',
     ):
         if field in capabilities:
             payload[field] = capabilities.get(field)
+    yarn_enum_value = _coerce_optional_int_enum(capabilities.get('yarn_enum_value'))
+    if yarn_enum_value is not None:
+        payload['yarn_enum_value'] = yarn_enum_value
     return payload
 
 
@@ -287,7 +301,12 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
     if support_classification not in {'supported', 'unknown', 'unsupported'}:
         support_classification = 'supported' if not missing_reasons else 'unsupported'
     if support_classification == 'unknown':
-        missing_reasons = []
+        if worker_capabilities.get('yarn_enum_value') is not None:
+            missing_reasons = []
+        else:
+            yarn_value = None
+            resolver_source = worker_capabilities.get('yarn_resolver_source') or resolver_source
+            missing_reasons = ['missing concrete YaRN enum value from unknown child probe']
     return {
         'supported': support_classification in {'supported', 'unknown'} and not missing_reasons,
         'support_classification': support_classification,
@@ -2200,8 +2219,9 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         coerced['qwen_64k_yarn_support'] = str(probe.get('qwen_64k_yarn_support'))
     if probe.get('yarn_resolver_source'):
         coerced['yarn_resolver_source'] = str(probe.get('yarn_resolver_source'))
-    if probe.get('yarn_enum_value') is not None:
-        coerced['yarn_enum_value'] = probe.get('yarn_enum_value')
+    yarn_enum_value = _coerce_optional_int_enum(probe.get('yarn_enum_value'))
+    if yarn_enum_value is not None:
+        coerced['yarn_enum_value'] = yarn_enum_value
     return coerced
 
 

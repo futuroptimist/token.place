@@ -5121,7 +5121,35 @@ def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monk
     assert diagnostics['yarn_resolver_source'] == 'numeric_fallback'
 
 
-def test_qwen_64k_subprocess_child_unknown_signature_does_not_fail_parent_facade(monkeypatch):
+def test_qwen_64k_subprocess_child_unknown_signature_with_yarn_value_does_not_fail_parent_facade(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_: {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/real/site/llama_cpp/__init__.py',
+            'constructor_kwarg_support': {},
+            'constructor_has_var_kwargs': False,
+            'constructor_signature_inspectable': False,
+            'yarn_resolver_source': 'numeric_fallback',
+            'yarn_enum_value': 2,
+            'qwen_64k_yarn_support': 'unknown',
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['support_classification'] == 'unknown'
+    assert diagnostics['missing_reason'] is None
+
+
+def test_qwen_64k_subprocess_child_unknown_signature_without_yarn_value_fails_closed(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
@@ -5143,9 +5171,36 @@ def test_qwen_64k_subprocess_child_unknown_signature_does_not_fail_parent_facade
 
     diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
 
-    assert diagnostics['supported'] is True
+    assert diagnostics['supported'] is False
     assert diagnostics['support_classification'] == 'unknown'
-    assert diagnostics['missing_reason'] is None
+    assert diagnostics['yarn_enum_value'] is None
+    assert diagnostics['missing_reason'] == 'missing concrete YaRN enum value from unknown child probe'
+
+
+def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
+    from utils.llm import model_manager as model_manager_module
+
+    coerced = model_manager_module._coerce_desktop_runtime_probe({
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'yarn_enum_value': '2',
+    })
+
+    assert coerced['yarn_enum_value'] == 2
+
+
+def test_desktop_runtime_probe_omits_malformed_yarn_enum_value():
+    from utils.llm import model_manager as model_manager_module
+
+    coerced = model_manager_module._coerce_desktop_runtime_probe({
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'yarn_enum_value': ['2'],
+    })
+
+    assert 'yarn_enum_value' not in coerced
 
 
 def test_qwen_64k_numeric_fallback_not_used_when_child_rejects_rope_scaling(monkeypatch):

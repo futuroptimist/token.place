@@ -4969,13 +4969,14 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is not None
 
-    assert captured['type_k'] == 8
-    assert captured['type_v'] == 8
+    assert 'type_k' not in captured
+    assert 'type_v' not in captured
     assert 'flash_attn' not in captured
     assert 'offload_kqv' not in captured
-    assert captured['n_batch'] == 256
-    assert captured['n_ubatch'] == 128
-    assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
+    assert 'n_batch' not in captured
+    assert 'n_ubatch' not in captured
+    assert manager.last_compute_diagnostics['selected_runtime_profile'] == 'qwen64k_default'
+    assert manager.last_compute_diagnostics.get('kv_cache_mode') == {}
 
 
 def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
@@ -5025,7 +5026,7 @@ def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
 
     assert facade.LLAMA_TYPE_Q8_0 == 8
     assert kwargs == {}
-    assert diagnostics['kv_cache_type_name'] == 'LLAMA_TYPE_Q8_0'
+    assert diagnostics['kv_cache_type_name'] == 'GGML_TYPE_Q8_0'
     assert diagnostics['constructor_kwarg_support']['type_k'] is False
 
 

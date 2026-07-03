@@ -27,7 +27,7 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
-def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
+def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, resolver='unsupported'):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,
         gpu_offload_supported=gpu,
@@ -36,6 +36,12 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
         prefix=sys.prefix,
         llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
         error=error,
+        llama_cpp_python_version='0.3.16',
+        yarn_rope_supported=yarn,
+        yarn_resolver_source=resolver,
+        rope_scaling_type_supported=yarn,
+        yarn_ext_factor_supported=yarn,
+        yarn_orig_ctx_supported=yarn,
     )
 
 
@@ -136,6 +142,49 @@ def test_macos_metal_already_supported_reports_metal_action(monkeypatch):
     assert result['runtime_action'] == 'metal_already_supported'
 
 
+def test_macos_metal_already_supported_requires_yarn_for_qwen_64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal', yarn=False),
+        _probe(backend='metal', gpu=True, device='metal', yarn=True, resolver='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin',
+        backend='metal',
+        package_spec='llama-cpp-python==0.3.32',
+        cmake_args='-DGGML_METAL=on',
+        force_cmake=True,
+        index_url='https://pypi.org/simple',
+        only_binary=False,
+        no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    installs = []
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *args, **kwargs: (installs.append(args) or (True, 'ok')))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='64k-full')
+
+    assert installs
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['yarn_rope_supported'] == 'true'
+    assert result['yarn_resolver_source'] == 'numeric_fallback'
+
+
+def test_macos_metal_already_supported_skips_yarn_probe_for_qwen_8k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='metal', gpu=True, device='metal', yarn=False),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: pytest.fail('unexpected install'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='8k-fast')
+
+    assert result['runtime_action'] == 'metal_already_supported'
+    assert result['yarn_rope_supported'] == 'false'
 
 def test_already_supported_runtime_prepends_dependency_target(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
@@ -196,7 +245,6 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert captured['env']['FORCE_CMAKE'] == '1'
     assert captured['timeout'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
-
 
 
 def test_macos_metal_source_install_clean_cpu_probe_reexecs_auto(monkeypatch):
@@ -315,7 +363,6 @@ def test_macos_metal_install_unsatisfied_cpu_probe_falls_back_to_cpu_in_auto(mon
     assert 'follow-up probe reported backend=cpu' in result['fallback_reason']
     assert 'using CPU runtime' in result['fallback_reason']
     assert desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result) is None
-
 
 
 def test_macos_cpu_fallback_fails_when_follow_up_probe_is_not_importable(monkeypatch):
@@ -464,7 +511,6 @@ def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
     assert desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV in result['fallback_reason']
     assert 'expected_backend=metal' in result['fallback_reason']
     assert invoked['pip'] is False
-
 
 
 def test_macos_bootstrap_disabled_missing_llama_cpp_fails_before_probe_only(monkeypatch):
@@ -965,7 +1011,6 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     assert darwin_plans[2].only_binary is True
 
 
-
 def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     requirements_path = tmp_path / 'requirements.txt'
@@ -1089,7 +1134,6 @@ def test_windows_source_repair_returns_actionable_message_when_requirement_is_in
     assert 'falling back to unpinned source reinstall' in reason
     assert str(invalid_requirements) in reason
     assert 'missing pinned llama-cpp-python requirement' in reason
-
 
 
 def test_install_error_summary_prefers_stderr_tail_when_command_is_long():
@@ -1275,6 +1319,42 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
         'desktop_runtime_setup.py'
     )
+
+
+def test_probe_subprocess_keeps_stdlib_ahead_of_polluted_dependency_target(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'resources'
+    (runtime_root / 'utils').mkdir(parents=True)
+    dependency_target = runtime_root / '.token_place_desktop_site'
+    llama_package = dependency_target / 'llama_cpp'
+    llama_package.mkdir(parents=True)
+    llama_package.joinpath('__init__.py').write_text(
+        '\n'.join(
+            [
+                '__version__ = "0.3.0"',
+                'GGML_METAL = True',
+                'LLAMA_ROPE_SCALING_TYPE_YARN = 2',
+                'def llama_supports_gpu_offload():',
+                '    return True',
+                'class Llama:',
+                '    def __init__(self, rope_scaling_type=None, yarn_ext_factor=None, yarn_orig_ctx=None):',
+                '        pass',
+            ]
+        ),
+        encoding='utf-8',
+    )
+    dependency_target.joinpath('pathlib.py').write_text(
+        'from collections import Sequence\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=runtime_root)
+
+    assert probe.error is None
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.yarn_rope_supported is True
+    assert probe.llama_cpp_python_version == '0.3.0'
 
 
 def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
@@ -1851,3 +1931,141 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert result['install_command_summary'].startswith('python -m pip install')
+
+
+def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    recorded_failures = []
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', recorded_failures.append)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    probes = iter([
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=False),
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=False),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *_args: (True, 'ok'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'failed'
+    assert result['yarn_rope_supported'] == 'false'
+    assert (
+        'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed'
+        in result['fallback_reason']
+    )
+    assert 'resolver=unsupported' in result['fallback_reason']
+    assert 'version=0.3.16' in result['fallback_reason']
+    assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
+    assert 'rope_scaling_type_supported=False' in result['fallback_reason']
+    assert 'yarn_ext_factor_supported=False' in result['fallback_reason']
+    assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
+    assert recorded_failures
+
+
+def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    probes = iter([
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=False),
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *_args: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert result['selected_backend'] == 'cuda'
+    assert result['yarn_rope_supported'] == 'true'
+
+
+def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    dependency_target = tmp_path / 'desktop-site'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (dependency_target, None),
+    )
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal', yarn=False),
+        _probe(backend='metal', gpu=True, device='metal', yarn=False),
+        _probe(backend='metal', gpu=True, device='metal', yarn=True, resolver='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin',
+            backend='metal',
+            package_spec='llama-cpp-python==0.3.31',
+            cmake_args='-DGGML_METAL=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            only_binary=False,
+            no_binary=True,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin',
+            backend='metal',
+            package_spec='llama-cpp-python==0.3.32',
+            cmake_args='-DGGML_METAL=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            only_binary=False,
+            no_binary=True,
+        ),
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    installs = []
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *args, **kwargs: (installs.append(args), 'ok') and (True, 'ok'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert len(installs) == 2
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['yarn_rope_supported'] == 'true'
+
+
+def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='cuda', gpu=True, device='cuda', yarn=False),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'probe_only'
+    assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']

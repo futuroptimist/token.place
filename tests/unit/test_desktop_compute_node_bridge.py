@@ -4735,3 +4735,52 @@ def test_api_v1_unhealthy_result_without_recovery_attempt_sets_terminal_state(
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get('type') == 'status']
     assert status_events[-1]['relay_runtime_state'] == expected_state
+
+
+def test_desktop_runtime_context_shim_does_not_swallow_internal_type_error(monkeypatch):
+    def _runtime_with_internal_type_error(_mode, *, context_tier):
+        raise TypeError('nested helper got unexpected keyword argument')
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        _runtime_with_internal_type_error,
+    )
+
+    with pytest.raises(TypeError, match='nested helper'):
+        compute_node_bridge._ensure_desktop_llama_runtime_for_context('auto', '64k-full')
+
+
+def test_desktop_runtime_context_shim_uses_legacy_signature(monkeypatch):
+    calls = []
+
+    def _legacy_runtime(mode):
+        calls.append(mode)
+        return {'runtime_action': 'legacy'}
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_llama_runtime', _legacy_runtime)
+
+    assert compute_node_bridge._ensure_desktop_llama_runtime_for_context('auto', '64k-full') == {
+        'runtime_action': 'legacy'
+    }
+    assert calls == ['auto']
+
+
+def test_desktop_runtime_context_shim_uses_legacy_call_when_signature_uninspectable(monkeypatch):
+    calls = []
+
+    def _legacy_runtime(mode):
+        calls.append(mode)
+        return {'runtime_action': 'legacy_uninspectable'}
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_llama_runtime', _legacy_runtime)
+    monkeypatch.setattr(
+        compute_node_bridge.inspect,
+        'signature',
+        lambda _target: (_ for _ in ()).throw(ValueError('signature unavailable')),
+    )
+
+    assert compute_node_bridge._ensure_desktop_llama_runtime_for_context('auto', '64k-full') == {
+        'runtime_action': 'legacy_uninspectable'
+    }
+    assert calls == ['auto']

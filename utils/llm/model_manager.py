@@ -36,6 +36,10 @@ QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
 # wheels accept rope_scaling_type as a constructor kwarg but do not export the
 # generated enum symbol, so this is only used after constructor support is verified.
 LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
+QWEN_64K_KV_CACHE_TYPE_NAME = 'LLAMA_TYPE_Q8_0'
+QWEN_64K_BATCH_TOKENS = 256
+QWEN_64K_UBATCH_TOKENS = 128
+QWEN_64K_MEMORY_PROFILE_ID = 'qwen3-64k-q8-kv'
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -114,6 +118,45 @@ def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: 
         'numeric_fallback': 'numeric_fallback',
     }
     return value, legacy_locations.get(source)
+
+
+def _safe_llama_cpp_enum(llama_cpp_module: Any, name: str) -> Any:
+    for owner in (llama_cpp_module, getattr(llama_cpp_module, 'llama_cpp', None)):
+        if owner is None:
+            continue
+        value = getattr(owner, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _qwen_64k_memory_profile_kwargs(llama_cpp_module: Any, llama_cls: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+    kwarg_support = _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    kwargs: Dict[str, Any] = {}
+    diagnostics: Dict[str, Any] = {
+        'profile_id': QWEN_64K_MEMORY_PROFILE_ID,
+        'constructor_kwarg_support': kwarg_support,
+        'applied': {},
+    }
+    q8_type = _safe_llama_cpp_enum(llama_cpp_module, QWEN_64K_KV_CACHE_TYPE_NAME)
+    diagnostics['kv_cache_type_name'] = QWEN_64K_KV_CACHE_TYPE_NAME if q8_type is not None else None
+    if q8_type is not None:
+        if kwarg_support.get('type_k'):
+            kwargs['type_k'] = q8_type
+        if kwarg_support.get('type_v'):
+            kwargs['type_v'] = q8_type
+    if kwarg_support.get('flash_attn'):
+        kwargs['flash_attn'] = True
+    if kwarg_support.get('offload_kqv'):
+        kwargs['offload_kqv'] = True
+    if kwarg_support.get('n_batch'):
+        kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
+    if kwarg_support.get('n_ubatch'):
+        kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
+    diagnostics['applied'] = dict(kwargs)
+    diagnostics['enabled'] = bool(kwargs)
+    return kwargs, diagnostics
 
 def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
     safe_fields = (
@@ -1212,6 +1255,21 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+def _sanitize_error_summary(message):
+    return '<redacted>'
+
+def _classify_generation_exception(exc):
+    text = str(exc or '').lower()
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
+        return 'metal_memory_allocation'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+        return 'kv_cache_allocation'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
+        return 'rope_yarn_eval_failure'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(exc or '')):
+        return 'unsupported_generation_kwarg'
+    return 'unknown_generation_exception'
+
 def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
     if isinstance(extra, dict):
@@ -1229,13 +1287,16 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             diagnostics['stream'] = bool(kwargs.get('stream'))
     if exc is not None:
         diagnostics['exception_type'] = type(exc).__name__
+        diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
+            diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
             message = str(exc)
             match = re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument) [\\'"]?([A-Za-z_][A-Za-z0-9_]*)', message)
             if match:
                 diagnostics['reason'] = 'unsupported_generation_option'
                 diagnostics['code'] = 'compute_node_options_unsupported'
                 diagnostics['rejected_option'] = match.group(1)
+                diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
     return {
         'status': 'error',
         'request_error': True,
@@ -2334,7 +2395,11 @@ class ModelManager:
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
             )
+            memory_kwargs, memory_diagnostics = _qwen_64k_memory_profile_kwargs(llama_module, llama_cls)
+            kwargs.update(memory_kwargs)
+            self.last_qwen_64k_memory_profile_diagnostics = memory_diagnostics
         else:
+            self.last_qwen_64k_memory_profile_diagnostics = {'enabled': False, 'applied': {}}
             self.last_yarn_rope_diagnostics = {
                 'supported': False,
                 'active': False,
@@ -2672,6 +2737,15 @@ class ModelManager:
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
                             })
+                            memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
+                            if isinstance(memory_profile, dict):
+                                compute_plan['qwen_64k_memory_profile'] = dict(memory_profile)
+                                applied_memory = memory_profile.get('applied') if isinstance(memory_profile.get('applied'), dict) else {}
+                                compute_plan['kv_cache_mode'] = {
+                                    key: applied_memory.get(key)
+                                    for key in ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+                                    if key in applied_memory
+                                }
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):
                                 compute_plan['yarn_rope_diagnostics'] = dict(yarn_diagnostics)

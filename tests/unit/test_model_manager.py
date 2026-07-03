@@ -3185,6 +3185,8 @@ def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(reques
         'method': 'create_chat_completion',
         'stream': False,
         'exception_type': 'RuntimeError',
+        'sanitized_error_summary': '<redacted>',
+        'generation_exception_category': 'unknown_generation_exception',
     }
 
     result = proxy.create_chat_completion(messages=[], stream=False)
@@ -4929,3 +4931,83 @@ def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_avail
     assert diagnostics['missing_reason'] is None
     assert diagnostics['missing_required_kwargs'] == []
     assert diagnostics['yarn_resolver_source'] == 'top_level_enum'
+
+
+def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        LLAMA_TYPE_Q8_0=8,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['type_k'] == 8
+    assert captured['type_v'] == 8
+    assert captured['flash_attn'] is True
+    assert captured['offload_kqv'] is True
+    assert captured['n_batch'] == 256
+    assert captured['n_ubatch'] == 128
+    assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
+
+
+def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            captured.update(locals())
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(Llama=FakeLlama, LLAMA_ROPE_SCALING_TYPE_YARN=2, LLAMA_TYPE_Q8_0=8)
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert 'type_k' not in captured
+    assert manager.last_compute_diagnostics.get('kv_cache_mode') == {}

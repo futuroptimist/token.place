@@ -5184,3 +5184,130 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
     summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
 
     assert summary == 'RuntimeError:metal_memory_allocation'
+
+
+def test_qwen_64k_subprocess_facade_uses_child_probe_not_parent_signature(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    support = {
+        'rope_scaling_type': True,
+        'yarn_ext_factor': True,
+        'yarn_orig_ctx': True,
+        'type_k': False,
+        'type_v': False,
+        'flash_attn': False,
+        'offload_kqv': False,
+        'n_batch': False,
+        'n_ubatch': False,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/packaged/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'constructor_kwarg_support': support,
+            'yarn_resolver_source': 'numeric_fallback',
+            'yarn_enum_value': 2,
+            'llama_cpp_python_version': '0.3.32',
+        },
+    )
+
+    with patch('utils.llm.model_manager._SubprocessLlamaProxy', FakeProxy), \
+         patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['n_ctx'] == 65536
+    assert captured['rope_scaling_type'] == 2
+    assert captured['yarn_ext_factor'] == 2.0
+    assert captured['yarn_orig_ctx'] == 32768
+    assert 'missing constructor kwargs' not in (manager.last_runtime_init_error or '')
+    assert manager.last_yarn_rope_diagnostics['yarn_resolver_source'] == 'top_level_enum'
+
+
+def test_qwen_64k_child_unknown_kwargs_attempts_constructor_not_false_failure(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    support = {'rope_scaling_type': 'unknown', 'yarn_ext_factor': 'unknown', 'yarn_orig_ctx': 'unknown'}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/packaged/llama_cpp/__init__.py',
+        desktop_runtime_probe={'backend': 'cpu', 'constructor_kwarg_support': support, 'yarn_resolver_source': 'numeric_fallback', 'yarn_enum_value': 2},
+    )
+
+    with patch('utils.llm.model_manager._SubprocessLlamaProxy', FakeProxy), \
+         patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['rope_scaling_type'] == 2
+    assert manager.last_yarn_rope_diagnostics['constructor_kwarg_support']['rope_scaling_type'] == 'unknown'
+
+
+def test_qwen_64k_numeric_fallback_not_used_when_child_probe_rejects_rope_scaling():
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/packaged/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cpu',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': False,
+                'yarn_ext_factor': True,
+                'yarn_orig_ctx': True,
+            },
+        },
+    )
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['yarn_resolver_source'] == 'unsupported'
+    assert diagnostics['yarn_enum_value'] is None

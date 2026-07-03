@@ -5121,6 +5121,55 @@ def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monk
     assert diagnostics['yarn_resolver_source'] == 'numeric_fallback'
 
 
+def test_qwen_64k_subprocess_facade_unknown_reprobes_real_child(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': {},
+            'constructor_signature_inspectable': False,
+            'qwen_64k_yarn_support': 'unknown',
+            'capability_source': 'parent_facade_signature',
+        },
+    )
+    probe_calls = []
+
+    def fake_child_probe(**kwargs):
+        probe_calls.append(kwargs)
+        return {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/real/site/llama_cpp/__init__.py',
+            'llama_cpp_python_version': '0.3.32',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True,
+                'yarn_ext_factor': True,
+                'yarn_orig_ctx': True,
+            },
+            'constructor_has_var_kwargs': False,
+            'constructor_signature_inspectable': True,
+            'yarn_resolver_source': 'numeric_fallback',
+            'yarn_enum_value': 2,
+            'qwen_64k_yarn_support': 'supported',
+            'capability_source': 'worker_probe',
+        }
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fake_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert probe_calls
+    assert diagnostics['supported'] is True
+    assert diagnostics['capability_source'] == 'worker_probe'
+    assert diagnostics['child_probe_reprobe_attempted'] is True
+    assert diagnostics['llama_module_path'] == '/real/site/llama_cpp/__init__.py'
+    assert diagnostics['constructor_kwarg_support']['rope_scaling_type'] is True
+
+
 def test_qwen_64k_subprocess_child_unknown_signature_with_yarn_value_without_kwargs_fails_closed(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

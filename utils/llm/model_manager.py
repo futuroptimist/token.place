@@ -353,7 +353,13 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             isinstance(kwarg_support, dict)
             and all(bool(kwarg_support.get(name)) for name in ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'))
         )
-        if existing_support not in {'supported', 'unknown'} and not required_supported:
+        has_concrete_yarn_value = capabilities.get('yarn_enum_value') is not None
+        facade_capabilities_complete = (
+            existing_support == 'supported'
+            and required_supported
+            and has_concrete_yarn_value
+        )
+        if not facade_capabilities_complete:
             reprobe_attempted = True
             probe = _probe_llama_cpp_capabilities_in_subprocess(
                 timeout_seconds=getattr(llama_cpp_module, '_timeout_seconds', None)

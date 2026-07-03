@@ -88,10 +88,28 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         payload['constructor_kwarg_support'] = {
             str(name): bool(value) for name, value in support.items() if isinstance(name, str)
         }
+    status = capabilities.get('constructor_kwarg_status')
+    if isinstance(status, dict):
+        payload['constructor_kwarg_status'] = {
+            str(name): str(value) for name, value in status.items() if isinstance(name, str)
+        }
     q8_value = capabilities.get('q8_kv_cache_type_value')
     if isinstance(q8_value, int):
         payload['q8_kv_cache_type_value'] = q8_value
-    for field in ('capability_source', 'backend', 'gpu_offload_supported', 'llama_cpp_python_version'):
+    for field in (
+        'capability_source',
+        'backend',
+        'gpu_offload_supported',
+        'llama_cpp_python_version',
+        'llama_module_path',
+        'module_path',
+        'constructor_has_var_kwargs',
+        'constructor_signature_available',
+        'constructor_signature_classification',
+        'qwen_64k_yarn_support',
+        'yarn_resolver_source',
+        'yarn_enum_value',
+    ):
         if field in capabilities:
             payload[field] = capabilities.get(field)
     return payload
@@ -127,6 +145,12 @@ def _resolve_yarn_rope_scaling_type(llama_cpp_module: Any, llama_cls: Any = None
         if value is not None:
             return value, source
 
+    worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
+    worker_support = worker_capabilities.get('constructor_kwarg_support')
+    if isinstance(worker_support, dict):
+        if worker_support.get('rope_scaling_type'):
+            return LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK, 'numeric_fallback'
+        return None, 'unsupported'
     if _constructor_accepts_kwarg(llama_cls, 'rope_scaling_type'):
         return LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK, 'numeric_fallback'
     return None, 'unsupported'
@@ -243,7 +267,13 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         'rope_freq_base',
         'rope_freq_scale',
     )
-    kwarg_support = _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
+    worker_kwarg_support = worker_capabilities.get('constructor_kwarg_support')
+    if isinstance(worker_kwarg_support, dict):
+        kwarg_support = {name: bool(worker_kwarg_support.get(name)) for name in probe_kwargs}
+    else:
+        kwarg_support = _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    kwarg_status = worker_capabilities.get('constructor_kwarg_status')
     accepted_kwargs = sorted(name for name, supported in kwarg_support.items() if supported)
     yarn_value, resolver_source = _resolve_yarn_rope_scaling_type(llama_cpp_module, llama_cls)
     required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
@@ -265,8 +295,16 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         'constructor_kwarg_support': kwarg_support,
         'missing_required_kwargs': missing_kwargs,
         'missing_reason': '; '.join(missing_reasons) if missing_reasons else None,
-        'llama_module_path': getattr(llama_cpp_module, '__file__', None),
-        'llama_cpp_python_version': _llama_cpp_python_version(llama_cpp_module),
+        'llama_module_path': worker_capabilities.get('llama_module_path') or worker_capabilities.get('module_path') or getattr(llama_cpp_module, '__file__', None),
+        'llama_cpp_python_version': worker_capabilities.get('llama_cpp_python_version') or _llama_cpp_python_version(llama_cpp_module),
+        'constructor_kwarg_status': kwarg_status,
+        'constructor_has_var_kwargs': worker_capabilities.get('constructor_has_var_kwargs'),
+        'constructor_signature_classification': worker_capabilities.get('constructor_signature_classification') or (
+            'child_runtime_probe' if isinstance(worker_kwarg_support, dict) else 'parent_or_local_signature'
+        ),
+        'qwen_64k_yarn_support': worker_capabilities.get('qwen_64k_yarn_support') or (
+            'supported' if not missing_reasons else 'unsupported'
+        ),
     }
 
 
@@ -747,21 +785,55 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
     code = (
         "import importlib, inspect, json, sys\n"
         "llama_cpp = importlib.import_module('llama_cpp')\n"
-        "def _ctor_support(cls, names):\n"
+        "def _ctor_probe(cls, names):\n"
         "    ctor = getattr(cls, '__init__', cls)\n"
         "    try:\n"
         "        params = inspect.signature(ctor).parameters\n"
         "    except (TypeError, ValueError):\n"
-        "        return {name: False for name in names}\n"
+        "        return {\n"
+        "            'support': {name: False for name in names},\n"
+        "            'status': {name: 'unknown' for name in names},\n"
+        "            'has_var_kwargs': False,\n"
+        "            'signature_available': False,\n"
+        "            'classification': 'signature_unavailable',\n"
+        "        }\n"
         "    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())\n"
-        "    return {name: (name in params or accepts_var_kw) for name in names}\n"
+        "    support = {name: (name in params or accepts_var_kw) for name in names}\n"
+        "    status = {\n"
+        "        name: ('accepted_by_var_kwargs' if accepts_var_kw and name not in params else ('explicit' if name in params else 'unsupported'))\n"
+        "        for name in names\n"
+        "    }\n"
+        "    return {\n"
+        "        'support': support,\n"
+        "        'status': status,\n"
+        "        'has_var_kwargs': accepts_var_kw,\n"
+        "        'signature_available': True,\n"
+        "        'classification': 'var_kwargs' if accepts_var_kw else 'explicit_signature',\n"
+        "    }\n"
         "probe_kwargs = (\n"
         "    'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',\n"
         "    'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',\n"
         "    'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',\n"
         ")\n"
         "llama_cls = getattr(llama_cpp, 'Llama', None)\n"
-        "constructor_support = _ctor_support(llama_cls, probe_kwargs)\n"
+        "constructor_probe = _ctor_probe(llama_cls, probe_kwargs)\n"
+        "constructor_support = constructor_probe['support']\n"
+        "yarn_value = getattr(llama_cpp, 'LLAMA_ROPE_SCALING_TYPE_YARN', None)\n"
+        "yarn_source = 'top_level_enum' if yarn_value is not None else 'unsupported'\n"
+        "if yarn_value is None:\n"
+        "    yarn_value = getattr(getattr(llama_cpp, 'llama_cpp', None), 'LLAMA_ROPE_SCALING_TYPE_YARN', None)\n"
+        "    yarn_source = 'nested_enum' if yarn_value is not None else 'unsupported'\n"
+        "if yarn_value is None and constructor_support.get('rope_scaling_type'):\n"
+        "    yarn_value = 2\n"
+        "    yarn_source = 'numeric_fallback'\n"
+        "qwen_yarn_support = 'supported' if (\n"
+        "    yarn_source != 'unsupported'\n"
+        "    and constructor_support.get('rope_scaling_type')\n"
+        "    and constructor_support.get('yarn_ext_factor')\n"
+        "    and constructor_support.get('yarn_orig_ctx')\n"
+        ") else 'unsupported'\n"
+        "if not constructor_probe['signature_available']:\n"
+        "    qwen_yarn_support = 'unknown'\n"
         "q8_value = getattr(llama_cpp, 'LLAMA_TYPE_Q8_0', None)\n"
         "if q8_value is None:\n"
         "    q8_value = getattr(getattr(llama_cpp, 'llama_cpp', None), 'LLAMA_TYPE_Q8_0', None)\n"
@@ -787,7 +859,15 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
         "    'interpreter': sys.executable,\n"
         "    'prefix': sys.prefix,\n"
         "    'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),\n"
+        "    'module_path': getattr(llama_cpp, '__file__', 'unknown'),\n"
         "    'constructor_kwarg_support': constructor_support,\n"
+        "    'constructor_kwarg_status': constructor_probe['status'],\n"
+        "    'constructor_has_var_kwargs': constructor_probe['has_var_kwargs'],\n"
+        "    'constructor_signature_available': constructor_probe['signature_available'],\n"
+        "    'constructor_signature_classification': constructor_probe['classification'],\n"
+        "    'yarn_resolver_source': yarn_source,\n"
+        "    'yarn_enum_value': yarn_value if isinstance(yarn_value, int) else None,\n"
+        "    'qwen_64k_yarn_support': qwen_yarn_support,\n"
         "    'q8_kv_cache_type_value': q8_value if isinstance(q8_value, int) else None,\n"
         "    'capability_source': 'worker_probe',\n"
         "    'llama_cpp_python_version': getattr(llama_cpp, '__version__', None),\n"
@@ -1295,6 +1375,15 @@ class _SubprocessLlamaCppModule:
         self.__token_place_subprocess_facade__ = True
         self.LLAMA_TYPE_Q8_0 = 8
         probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
+        if not probe:
+            try:
+                probe = _probe_llama_cpp_capabilities_in_subprocess(timeout_seconds=timeout_seconds)
+            except Exception as exc:
+                probe = {
+                    'capability_source': 'worker_probe_failed',
+                    'error': type(exc).__name__,
+                    'llama_module_path': module_path,
+                }
         self.__token_place_worker_capabilities__ = dict(probe or {})
         if 'constructor_kwarg_support' in self.__token_place_worker_capabilities__:
             self.__token_place_worker_capabilities__['capability_source'] = 'worker_probe'
@@ -1304,6 +1393,11 @@ class _SubprocessLlamaCppModule:
         q8_value = self.__token_place_worker_capabilities__.get('q8_kv_cache_type_value')
         if isinstance(q8_value, int):
             self.LLAMA_TYPE_Q8_0 = q8_value
+        yarn_value = self.__token_place_worker_capabilities__.get('yarn_enum_value')
+        if isinstance(yarn_value, int) and self.__token_place_worker_capabilities__.get('yarn_resolver_source') == 'top_level_enum':
+            self.LLAMA_ROPE_SCALING_TYPE_YARN = yarn_value
+        elif self.__token_place_worker_capabilities__.get('yarn_resolver_source') == 'nested_enum' and isinstance(yarn_value, int):
+            self.llama_cpp = type('_NestedLlamaCppEnums', (), {'LLAMA_ROPE_SCALING_TYPE_YARN': yarn_value})()
 
     def llama_supports_gpu_offload(self) -> bool:
         return bool(self.GGML_USE_CUDA or self.GGML_USE_METAL)
@@ -2116,10 +2210,26 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
     q8_value = probe.get('q8_kv_cache_type_value')
     if isinstance(q8_value, int):
         coerced['q8_kv_cache_type_value'] = q8_value
-    if probe.get('capability_source'):
-        coerced['capability_source'] = str(probe.get('capability_source'))
-    if probe.get('llama_cpp_python_version'):
-        coerced['llama_cpp_python_version'] = str(probe.get('llama_cpp_python_version'))
+    status = probe.get('constructor_kwarg_status')
+    if isinstance(status, dict):
+        coerced['constructor_kwarg_status'] = {
+            str(name): str(value) for name, value in status.items() if isinstance(name, str)
+        }
+    for field in (
+        'capability_source',
+        'llama_cpp_python_version',
+        'constructor_signature_classification',
+        'qwen_64k_yarn_support',
+        'yarn_resolver_source',
+    ):
+        if probe.get(field):
+            coerced[field] = str(probe.get(field))
+    for field in ('constructor_has_var_kwargs', 'constructor_signature_available'):
+        if field in probe:
+            coerced[field] = bool(probe.get(field))
+    yarn_value = probe.get('yarn_enum_value')
+    if isinstance(yarn_value, int):
+        coerced['yarn_enum_value'] = yarn_value
     return coerced
 
 
@@ -2499,6 +2609,12 @@ class ModelManager:
                 'llama_module_path': yarn_probe['llama_module_path'],
                 'llama_cpp_python_version': yarn_probe['llama_cpp_python_version'],
                 'missing_reason': yarn_probe['missing_reason'],
+                'constructor_kwarg_status': yarn_probe.get('constructor_kwarg_status'),
+                'constructor_has_var_kwargs': yarn_probe.get('constructor_has_var_kwargs'),
+                'constructor_signature_classification': yarn_probe.get('constructor_signature_classification'),
+                'qwen_64k_yarn_support': yarn_probe.get('qwen_64k_yarn_support'),
+                'parent_facade_type': type(llama_module).__name__ if llama_module is not None else 'unknown',
+                'constructor_kwargs_attempted': ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'],
             }
             if not yarn_probe['supported']:
                 safe_diagnostics = _format_qwen_yarn_unsupported_diagnostics(

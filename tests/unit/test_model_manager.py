@@ -5016,7 +5016,21 @@ def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path)
 def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
     from utils.llm import model_manager as model_manager_module
 
-    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'constructor_kwarg_support': {
+                'type_k': False,
+                'type_v': False,
+                'flash_attn': False,
+                'offload_kqv': False,
+                'n_batch': False,
+                'n_ubatch': False,
+            }
+        },
+    )
     kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
         facade,
         facade.Llama,

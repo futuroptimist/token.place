@@ -2000,6 +2000,60 @@ def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(m
     assert result['yarn_rope_supported'] == 'true'
 
 
+def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    dependency_target = tmp_path / 'desktop-site'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (dependency_target, None),
+    )
+    probes = iter([
+        _probe(backend='metal', gpu=True, device='metal', yarn=False),
+        _probe(backend='metal', gpu=True, device='metal', yarn=False),
+        _probe(backend='metal', gpu=True, device='metal', yarn=True, resolver='numeric_fallback'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin',
+            backend='metal',
+            package_spec='llama-cpp-python==0.3.31',
+            cmake_args='-DGGML_METAL=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            only_binary=False,
+            no_binary=True,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin',
+            backend='metal',
+            package_spec='llama-cpp-python==0.3.32',
+            cmake_args='-DGGML_METAL=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            only_binary=False,
+            no_binary=True,
+        ),
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    installs = []
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *args, **kwargs: (installs.append(args), 'ok') and (True, 'ok'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert len(installs) == 2
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['yarn_rope_supported'] == 'true'
+
+
 def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)

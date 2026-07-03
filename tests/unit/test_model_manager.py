@@ -4911,3 +4911,21 @@ def test_qwen_64k_missing_reason_does_not_repeat_rope_scaling_type():
     assert diagnostics['supported'] is False
     assert diagnostics['missing_reason'].count('rope_scaling_type') == 1
     assert 'missing constructor kwargs: yarn_ext_factor, yarn_orig_ctx' in diagnostics['missing_reason']
+
+
+def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_available():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            pass
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
+        SimpleNamespace(LLAMA_ROPE_SCALING_TYPE_YARN='yarn', Llama=FakeLlama),
+        FakeLlama,
+    )
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['missing_reason'] is None
+    assert diagnostics['missing_required_kwargs'] == []
+    assert diagnostics['yarn_resolver_source'] == 'top_level_enum'

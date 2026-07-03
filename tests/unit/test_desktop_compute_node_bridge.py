@@ -4764,3 +4764,23 @@ def test_desktop_runtime_context_shim_uses_legacy_signature(monkeypatch):
         'runtime_action': 'legacy'
     }
     assert calls == ['auto']
+
+
+def test_desktop_runtime_context_shim_uses_legacy_call_when_signature_uninspectable(monkeypatch):
+    calls = []
+
+    def _legacy_runtime(mode):
+        calls.append(mode)
+        return {'runtime_action': 'legacy_uninspectable'}
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_llama_runtime', _legacy_runtime)
+    monkeypatch.setattr(
+        compute_node_bridge.inspect,
+        'signature',
+        lambda _target: (_ for _ in ()).throw(ValueError('signature unavailable')),
+    )
+
+    assert compute_node_bridge._ensure_desktop_llama_runtime_for_context('auto', '64k-full') == {
+        'runtime_action': 'legacy_uninspectable'
+    }
+    assert calls == ['auto']

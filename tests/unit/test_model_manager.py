@@ -4969,13 +4969,9 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is not None
 
-    assert captured['type_k'] == 8
-    assert captured['type_v'] == 8
-    assert 'flash_attn' not in captured
-    assert 'offload_kqv' not in captured
-    assert captured['n_batch'] == 256
-    assert captured['n_ubatch'] == 128
-    assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
+    assert 'type_k' not in captured
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_default'
+    assert manager.last_compute_diagnostics.get('kv_cache_mode') == {}
 
 
 def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
@@ -5025,7 +5021,7 @@ def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
 
     assert facade.LLAMA_TYPE_Q8_0 == 8
     assert kwargs == {}
-    assert diagnostics['kv_cache_type_name'] == 'LLAMA_TYPE_Q8_0'
+    assert diagnostics['kv_cache_type_name'] == 'GGML_TYPE_Q8_0'
     assert diagnostics['constructor_kwarg_support']['type_k'] is False
 
 
@@ -5499,3 +5495,87 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
     summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
 
     assert summary == 'RuntimeError:metal_memory_allocation'
+
+
+def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+    attempts = []
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if 'type_k' not in kwargs:
+                raise ValueError('Failed to create llama_context')
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=6,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert len(attempts) == 2
+    assert 'type_k' not in attempts[0]
+    assert attempts[1]['type_k'] == 8
+    assert manager.last_compute_diagnostics['selected_runtime_profile'] == 'qwen64k_kv_q8'
+
+
+def test_qwen_64k_context_create_profile_exhaustion_fails_closed(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            raise ValueError('Failed to create llama_context: Metal failed to allocate KV cache')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=6,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert manager.llm is None
+    assert 'profile exhaustion before registration' in manager.last_runtime_init_error
+    assert 'runtime_context_create_kv_cache_allocation' in manager.last_runtime_init_error

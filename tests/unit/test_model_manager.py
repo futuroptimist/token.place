@@ -4971,7 +4971,7 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
 
     assert captured['type_k'] == 8
     assert captured['type_v'] == 8
-    assert captured['flash_attn'] is True
+    assert 'flash_attn' not in captured
     assert 'offload_kqv' not in captured
     assert captured['n_batch'] == 256
     assert captured['n_ubatch'] == 128
@@ -5051,9 +5051,83 @@ def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
 
     assert kwargs['type_k'] == 8
     assert kwargs['type_v'] == 8
-    assert kwargs['flash_attn'] is True
+    assert 'flash_attn' not in kwargs
     assert 'offload_kqv' not in kwargs
     assert diagnostics['kqv_offload_allowed'] is False
+    assert diagnostics['omitted']['flash_attn'] == 'gpu_offload_disabled'
+
+
+def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
+    from utils.llm import model_manager as model_manager_module
+
+    support = {
+        'type_k': True,
+        'type_v': True,
+        'flash_attn': True,
+        'offload_kqv': True,
+        'n_batch': True,
+        'n_ubatch': True,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': support,
+            'q8_kv_cache_type_value': 18,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert kwargs['type_k'] == 18
+    assert kwargs['type_v'] == 18
+    assert kwargs['flash_attn'] is True
+    assert kwargs['offload_kqv'] is True
+    assert diagnostics['capability_source'] == 'worker_probe'
+
+
+def test_qwen_64k_memory_profile_omits_kwargs_when_worker_probe_lacks_support():
+    from utils.llm import model_manager as model_manager_module
+
+    class LocalFacadeAcceptsKwargs:
+        __token_place_supported_constructor_kwargs__ = ()
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    facade = SimpleNamespace(
+        LLAMA_TYPE_Q8_0=8,
+        __token_place_worker_capabilities__={
+            'constructor_kwarg_support': {
+                'type_k': False,
+                'type_v': False,
+                'flash_attn': False,
+                'offload_kqv': False,
+                'n_batch': False,
+                'n_ubatch': False,
+            },
+            'q8_kv_cache_type_value': 8,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        LocalFacadeAcceptsKwargs,
+        enable_kqv_offload=True,
+    )
+
+    assert kwargs == {}
+    assert diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
+    assert diagnostics['omitted']['n_batch'] == 'worker_capability_unsupported'
+    assert diagnostics['capability_source'] == 'worker_probe'
 
 
 def test_subprocess_worker_error_summary_keeps_safe_category_hint():

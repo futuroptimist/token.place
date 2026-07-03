@@ -78,6 +78,25 @@ def _llama_constructor_supports_kwargs(llama_cls: Any, required_kwargs: Iterable
     return {name: _constructor_accepts_kwarg(llama_cls, name) for name in required_kwargs}
 
 
+def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any]:
+    capabilities = getattr(llama_cpp_module, '__token_place_worker_capabilities__', None)
+    if not isinstance(capabilities, dict):
+        return {}
+    payload: Dict[str, Any] = {}
+    support = capabilities.get('constructor_kwarg_support')
+    if isinstance(support, dict):
+        payload['constructor_kwarg_support'] = {
+            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
+        }
+    q8_value = capabilities.get('q8_kv_cache_type_value')
+    if isinstance(q8_value, int):
+        payload['q8_kv_cache_type_value'] = q8_value
+    for field in ('capability_source', 'backend', 'gpu_offload_supported', 'llama_cpp_python_version'):
+        if field in capabilities:
+            payload[field] = capabilities.get(field)
+    return payload
+
+
 def _llama_cpp_python_version(llama_cpp_module: Any) -> Optional[str]:
     module_version = getattr(llama_cpp_module, '__version__', None)
     if module_version:
@@ -141,32 +160,61 @@ def _qwen_64k_memory_profile_kwargs(
     enable_kqv_offload: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
-    kwarg_support = _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
+    worker_kwarg_support = worker_capabilities.get('constructor_kwarg_support')
+    kwarg_support = (
+        {name: bool(worker_kwarg_support.get(name)) for name in probe_kwargs}
+        if isinstance(worker_kwarg_support, dict)
+        else _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    )
     kwargs: Dict[str, Any] = {}
     diagnostics: Dict[str, Any] = {
         'profile_id': QWEN_64K_MEMORY_PROFILE_ID,
         'constructor_kwarg_support': kwarg_support,
+        'capability_source': worker_capabilities.get('capability_source') or (
+            'worker_probe' if isinstance(worker_kwarg_support, dict) else 'local_constructor_signature'
+        ),
         'applied': {},
+        'omitted': {},
     }
-    q8_type = _safe_llama_cpp_enum(llama_cpp_module, QWEN_64K_KV_CACHE_TYPE_NAME)
+    q8_type = worker_capabilities.get('q8_kv_cache_type_value')
+    if q8_type is None:
+        q8_type = _safe_llama_cpp_enum(llama_cpp_module, QWEN_64K_KV_CACHE_TYPE_NAME)
     diagnostics['kv_cache_type_name'] = QWEN_64K_KV_CACHE_TYPE_NAME if q8_type is not None else None
+    omitted: Dict[str, str] = {}
     if q8_type is not None:
         if kwarg_support.get('type_k'):
             kwargs['type_k'] = q8_type
+        else:
+            omitted['type_k'] = 'worker_capability_unsupported'
         if kwarg_support.get('type_v'):
             kwargs['type_v'] = q8_type
-    if kwarg_support.get('flash_attn'):
+        else:
+            omitted['type_v'] = 'worker_capability_unsupported'
+    else:
+        omitted['type_k'] = 'q8_enum_unavailable'
+        omitted['type_v'] = 'q8_enum_unavailable'
+    if enable_kqv_offload and kwarg_support.get('flash_attn'):
         kwargs['flash_attn'] = True
+    else:
+        omitted['flash_attn'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
     diagnostics['kqv_offload_allowed'] = bool(enable_kqv_offload)
     if enable_kqv_offload and kwarg_support.get('offload_kqv'):
         kwargs['offload_kqv'] = True
+    else:
+        omitted['offload_kqv'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
     if kwarg_support.get('n_batch'):
         kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
     if kwarg_support.get('n_ubatch'):
         kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
+    for name in ('n_batch', 'n_ubatch'):
+        if name not in kwargs and not kwarg_support.get(name):
+            omitted[name] = 'worker_capability_unsupported'
     diagnostics['applied'] = dict(kwargs)
+    diagnostics['omitted'] = omitted
     diagnostics['enabled'] = bool(kwargs)
     return kwargs, diagnostics
+
 
 def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
     safe_fields = (
@@ -697,8 +745,22 @@ def _find_llama_cpp_spec_in_subprocess(*, timeout_seconds: Optional[float] = Non
 
 def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     code = (
-        "import importlib, json, sys\n"
+        "import importlib, inspect, json, sys\n"
         "llama_cpp = importlib.import_module('llama_cpp')\n"
+        "def _ctor_support(cls, names):\n"
+        "    ctor = getattr(cls, '__init__', cls)\n"
+        "    try:\n"
+        "        params = inspect.signature(ctor).parameters\n"
+        "    except (TypeError, ValueError):\n"
+        "        return {name: False for name in names}\n"
+        "    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())\n"
+        "    return {name: (name in params or accepts_var_kw) for name in names}\n"
+        "probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')\n"
+        "llama_cls = getattr(llama_cpp, 'Llama', None)\n"
+        "constructor_support = _ctor_support(llama_cls, probe_kwargs)\n"
+        "q8_value = getattr(llama_cpp, 'LLAMA_TYPE_Q8_0', None)\n"
+        "if q8_value is None:\n"
+        "    q8_value = getattr(getattr(llama_cpp, 'llama_cpp', None), 'LLAMA_TYPE_Q8_0', None)\n"
         "cuda_markers = ('GGML_USE_CUDA', 'GGML_CUDA', 'LLAMA_CUDA', 'GGML_USE_CUBLAS', 'LLAMA_CUBLAS')\n"
         "metal_markers = ('GGML_USE_METAL', 'GGML_METAL', 'LLAMA_METAL')\n"
         "backend = 'cpu'\n"
@@ -721,6 +783,10 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
         "    'interpreter': sys.executable,\n"
         "    'prefix': sys.prefix,\n"
         "    'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),\n"
+        "    'constructor_kwarg_support': constructor_support,\n"
+        "    'q8_kv_cache_type_value': q8_value if isinstance(q8_value, int) else None,\n"
+        "    'capability_source': 'worker_probe',\n"
+        "    'llama_cpp_python_version': getattr(llama_cpp, '__version__', None),\n"
         "    'error': None,\n"
         "}))\n"
     )
@@ -1225,9 +1291,15 @@ class _SubprocessLlamaCppModule:
         self.__token_place_subprocess_facade__ = True
         self.LLAMA_TYPE_Q8_0 = 8
         probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
+        self.__token_place_worker_capabilities__ = dict(probe or {})
+        if 'constructor_kwarg_support' in self.__token_place_worker_capabilities__:
+            self.__token_place_worker_capabilities__['capability_source'] = 'worker_probe'
         backend = str((probe or {}).get('backend') or '').lower()
         self.GGML_USE_CUDA = backend == 'cuda'
         self.GGML_USE_METAL = backend == 'metal'
+        q8_value = self.__token_place_worker_capabilities__.get('q8_kv_cache_type_value')
+        if isinstance(q8_value, int):
+            self.LLAMA_TYPE_Q8_0 = q8_value
 
     def llama_supports_gpu_offload(self) -> bool:
         return bool(self.GGML_USE_CUDA or self.GGML_USE_METAL)
@@ -1237,8 +1309,16 @@ class _SubprocessLlamaCppModule:
         timeout_seconds = self._timeout_seconds
         module_path_hint = self.__file__
 
+        worker_capabilities = _safe_constructor_capability_payload(self)
+        supported_kwargs = tuple(
+            sorted(
+                name for name, supported in (worker_capabilities.get('constructor_kwarg_support') or {}).items()
+                if supported
+            )
+        )
+
         class _ConfiguredSubprocessLlama(_SubprocessLlamaProxy):
-            __token_place_supported_constructor_kwargs__ = ()
+            __token_place_supported_constructor_kwargs__ = supported_kwargs
 
             def __init__(self, *args, **kwargs):
                 super().__init__(
@@ -2014,7 +2094,7 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         return None
     if error and action not in {'already_supported', 'metal_already_supported'}:
         return None
-    return {
+    coerced = {
         'backend': backend,
         'gpu_offload_supported': gpu_supported,
         'detected_device': str(probe.get('detected_device') or probe.get('device') or backend),
@@ -2024,6 +2104,19 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         'error': None,
         'runtime_action': action or 'unknown',
     }
+    support = probe.get('constructor_kwarg_support')
+    if isinstance(support, dict):
+        coerced['constructor_kwarg_support'] = {
+            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
+        }
+    q8_value = probe.get('q8_kv_cache_type_value')
+    if isinstance(q8_value, int):
+        coerced['q8_kv_cache_type_value'] = q8_value
+    if probe.get('capability_source'):
+        coerced['capability_source'] = str(probe.get('capability_source'))
+    if probe.get('llama_cpp_python_version'):
+        coerced['llama_cpp_python_version'] = str(probe.get('llama_cpp_python_version'))
+    return coerced
 
 
 def llama_cpp_verbose_logging_enabled() -> bool:

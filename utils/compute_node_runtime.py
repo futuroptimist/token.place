@@ -54,6 +54,85 @@ class ComputeNodeRuntimeConfig:
     relay_urls: Tuple[str, ...] = ()
 
 
+
+_RUNTIME_SMOKE_CATEGORY_REASON = {
+    "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+    "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
+    "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
+    "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "worker_timeout": "runtime_completion_smoke_worker_timeout",
+    "worker_dead": "runtime_completion_smoke_worker_dead",
+    "worker_eof": "runtime_completion_smoke_worker_dead",
+    "worker_broken_pipe": "runtime_completion_smoke_worker_dead",
+    "unknown_generation_exception": "runtime_completion_smoke_exception",
+}
+
+
+def _bounded_safe_exception_summary(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    if not text:
+        text = type(exc).__name__
+    # Keep only operationally useful native-runtime terms; never preserve prompts.
+    lowered = text.lower()
+    safe_terms = [
+        "metal", "malloc", "allocation", "alloc", "kv", "cache", "rope",
+        "yarn", "unexpected keyword argument", "timeout", "dead", "eof",
+        "broken pipe", "out of memory", "oom", "kqv", "flash_attn",
+    ]
+    if not any(term in lowered for term in safe_terms):
+        return type(exc).__name__
+    for marker in ("/users/", "/home/", "/workspace/", "\\users\\"):
+        lowered = lowered.replace(marker, "<path>/")
+        text = text.replace(marker, "<path>/")
+    return text[:240]
+
+
+def _completion_smoke_failure_category(exc: BaseException) -> str:
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        for key in ("category", "safe_category", "failure_class"):
+            value = diagnostics.get(key)
+            if isinstance(value, str) and value in _RUNTIME_SMOKE_CATEGORY_REASON:
+                return value
+        reason = str(diagnostics.get("reason") or diagnostics.get("code") or "").lower()
+        if "unsupported_generation" in reason or "unsupported_generation_option" in reason:
+            return "unsupported_generation_kwarg"
+    name = type(exc).__name__
+    text = f"{name} {str(exc)}".lower()
+    if "timeout" in text:
+        return "worker_timeout"
+    if "workerdead" in name.lower() or "worker dead" in text or "liveness" in text:
+        return "worker_dead"
+    if "eof" in text or "broken pipe" in text:
+        return "worker_dead"
+    if "unexpected keyword argument" in text or "got an unexpected keyword" in text:
+        return "unsupported_generation_kwarg"
+    if "yarn" in text or ("rope" in text and ("eval" in text or "scaling" in text)):
+        return "rope_yarn_eval_failure"
+    if "metal" in text and ("alloc" in text or "memory" in text or "oom" in text):
+        return "metal_memory_allocation"
+    if "kv" in text and ("alloc" in text or "cache" in text or "memory" in text or "oom" in text):
+        return "kv_cache_allocation"
+    if "out of memory" in text or "malloc" in text:
+        return "metal_memory_allocation"
+    return "unknown_generation_exception"
+
+
+def _completion_smoke_failure_diagnostics(exc: BaseException) -> Dict[str, Any]:
+    diagnostics = getattr(exc, "diagnostics", None)
+    safe_worker_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    category = _completion_smoke_failure_category(exc)
+    payload: Dict[str, Any] = {
+        "exception_type": type(exc).__name__,
+        "exception_category": category,
+        "safe_summary": _bounded_safe_exception_summary(exc),
+    }
+    for key in ("reason", "code", "rejected_option", "method", "stream", "stderr_tail", "llama_cpp_python_version"):
+        value = safe_worker_diagnostics.get(key)
+        if isinstance(value, (str, bool, int, float, type(None))):
+            payload[f"worker_{key}"] = value if not isinstance(value, str) else value[:240]
+    return payload
+
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
 
 
@@ -440,6 +519,15 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
+            "api_v1_readiness_yarn_rope_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
+            "api_v1_readiness_llama_cpp_python_version": (
+                diagnostics.get("llama_cpp_python_version")
+                or yarn_diagnostics.get("llama_cpp_python_version")
+            ),
+            "api_v1_readiness_kv_cache_profile": diagnostics.get("kv_cache_profile"),
+            "api_v1_readiness_backend_used": (
+                diagnostics.get("backend_used") or diagnostics.get("device_backend")
+            ),
         })
 
         yarn_required_for_active_tier = (
@@ -561,14 +649,26 @@ class ComputeNodeRuntime:
                     }
             except Exception as exc:
                 admitted = False
+                smoke_failure = _completion_smoke_failure_diagnostics(exc)
+                smoke_category = str(smoke_failure["exception_category"])
+                smoke_reason = _RUNTIME_SMOKE_CATEGORY_REASON.get(
+                    smoke_category, "runtime_completion_smoke_exception"
+                )
                 admission_error = {
                     "code": "compute_node_context_admission_unavailable",
-                    "internal_reason": "runtime_completion_smoke_exception",
+                    "internal_reason": smoke_reason,
                 }
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
-                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = "runtime_completion_smoke_exception"
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_reason
                 diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
-                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = type(exc).__name__
+                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = smoke_failure["exception_type"]
+                diagnostics["api_v1_readiness_completion_smoke_exception_category"] = smoke_category
+                diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = smoke_failure["safe_summary"]
+                diagnostics["api_v1_readiness_completion_smoke_repair_attempted"] = False
+                diagnostics["api_v1_readiness_completion_smoke_recovery_succeeded"] = False
+                for key, value in smoke_failure.items():
+                    if key.startswith("worker_"):
+                        diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = value
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
             diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None

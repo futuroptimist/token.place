@@ -835,6 +835,91 @@ def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(
     assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
     assert "prompt text" not in str(diagnostics)
 
+def test_compute_node_runtime_qwen_64k_classifies_metal_smoke_failure(monkeypatch):
+    class MetalFailRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 42}
+
+        def create_chat_completion(self, **_kwargs):
+            raise RuntimeError("llama.cpp Metal malloc failed while allocating KV cache")
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {"kv_cache_profile": {"type_k": "q8_0", "type_v": "q8_0"}}
+    model_manager.last_yarn_rope_diagnostics = {"supported": True, "yarn_resolver_source": "top_level_enum", "missing_reason": None}
+    model_manager.get_llm_instance.return_value = MetalFailRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(_api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 42)),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_metal_memory_allocation"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "metal_memory_allocation"
+    assert diagnostics["api_v1_readiness_completion_smoke_repair_attempted"] is False
+    assert "prompt text" not in json.dumps(diagnostics).lower()
+
+
+def test_compute_node_runtime_qwen_64k_classifies_rope_eval_failure():
+    class RopeFailRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 42}
+
+        def create_chat_completion(self, **_kwargs):
+            raise RuntimeError("YaRN RoPE scaling accepted by constructor but failed during eval")
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {"supported": True, "yarn_resolver_source": "numeric_fallback", "missing_reason": None}
+    model_manager.get_llm_instance.return_value = RopeFailRuntime()
+    runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None), model_manager=model_manager, relay_client=_ready_relay_client(), crypto_manager=MagicMock())
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_rope_yarn_eval_failure"
+
+
+def test_compute_node_runtime_qwen_64k_classifies_unsupported_internal_generation_kwarg():
+    class KwargFailRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 42}
+
+        def create_chat_completion(self, **_kwargs):
+            raise TypeError("create_chat_completion() got an unexpected keyword argument 'stream'")
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {}
+    model_manager.get_llm_instance.return_value = KwargFailRuntime()
+    runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None), model_manager=model_manager, relay_client=_ready_relay_client(), crypto_manager=MagicMock())
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_unsupported_generation_kwarg"
+
 @pytest.mark.parametrize(
     "llm_instance,getter,expected",
     [

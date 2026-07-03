@@ -28,6 +28,15 @@ logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+QWEN_64K_KV_CACHE_PROFILE = {
+    'type_k': 'q8_0',
+    'type_v': 'q8_0',
+    'flash_attn': True,
+    'offload_kqv': True,
+    'n_batch': 512,
+    'n_ubatch': 128,
+}
+
 QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
     'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; '
     'update or rebuild the runtime'
@@ -2304,7 +2313,12 @@ class ModelManager:
             and context_tier == rope_policy.get('required_for_tier')
             and n_ctx > native_context
         )
+        kv_cache_profile: Dict[str, Any] = {}
         if needs_yarn:
+            for cache_kwarg, cache_value in QWEN_64K_KV_CACHE_PROFILE.items():
+                if self._llama_constructor_accepts(llama_cls, cache_kwarg):
+                    kwargs[cache_kwarg] = cache_value
+                    kv_cache_profile[cache_kwarg] = cache_value
             llama_module = llama_cpp_module or inspect.getmodule(llama_cls)
             yarn_probe = _runtime_supports_qwen_yarn_rope(llama_module, llama_cls)
             self.last_yarn_rope_diagnostics = {
@@ -2318,6 +2332,7 @@ class ModelManager:
                 'requested_n_ctx': n_ctx,
                 'llama_module_path': yarn_probe['llama_module_path'],
                 'llama_cpp_python_version': yarn_probe['llama_cpp_python_version'],
+                'kv_cache_profile': dict(kv_cache_profile),
                 'missing_reason': yarn_probe['missing_reason'],
             }
             if not yarn_probe['supported']:
@@ -2671,6 +2686,8 @@ class ModelManager:
                                 'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
+                                'kv_cache_profile': {key: runtime_kwargs.get(key) for key in QWEN_64K_KV_CACHE_PROFILE if key in runtime_kwargs},
+                                'llama_cpp_python_version': getattr(llama_cpp, '__version__', None),
                             })
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):

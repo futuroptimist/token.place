@@ -5073,6 +5073,110 @@ def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
     assert memory_diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
 
 
+def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': False,
+                'yarn_ext_factor': False,
+                'yarn_orig_ctx': False,
+            },
+            'capability_source': 'parent_facade_signature',
+        },
+    )
+
+    def fake_child_probe(**_kwargs):
+        return {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/real/site/llama_cpp/__init__.py',
+            'llama_cpp_python_version': '0.3.32',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True,
+                'yarn_ext_factor': True,
+                'yarn_orig_ctx': True,
+            },
+            'constructor_has_var_kwargs': False,
+            'constructor_signature_inspectable': True,
+            'yarn_resolver_source': 'numeric_fallback',
+            'yarn_enum_value': 2,
+            'qwen_64k_yarn_support': 'supported',
+            'capability_source': 'worker_probe',
+        }
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fake_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['capability_source'] == 'worker_probe'
+    assert diagnostics['llama_module_path'] == '/real/site/llama_cpp/__init__.py'
+    assert diagnostics['constructor_kwarg_support']['rope_scaling_type'] is True
+    assert diagnostics['yarn_resolver_source'] == 'numeric_fallback'
+
+
+def test_qwen_64k_subprocess_child_unknown_signature_does_not_fail_parent_facade(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_: {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/real/site/llama_cpp/__init__.py',
+            'constructor_kwarg_support': {},
+            'constructor_has_var_kwargs': False,
+            'constructor_signature_inspectable': False,
+            'yarn_resolver_source': 'unsupported',
+            'qwen_64k_yarn_support': 'unknown',
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['support_classification'] == 'unknown'
+    assert diagnostics['missing_reason'] is None
+
+
+def test_qwen_64k_numeric_fallback_not_used_when_child_rejects_rope_scaling(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_: {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'constructor_kwarg_support': {
+                'rope_scaling_type': False,
+                'yarn_ext_factor': True,
+                'yarn_orig_ctx': True,
+            },
+            'constructor_signature_inspectable': True,
+            'yarn_resolver_source': 'unsupported',
+            'qwen_64k_yarn_support': 'unsupported',
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['yarn_resolver_source'] == 'unsupported'
+    assert diagnostics['yarn_enum_value'] is None
+
+
 def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
     from utils.llm import model_manager as model_manager_module
 

@@ -1,8 +1,5 @@
 import json
-import os
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from utils.context_profiles import apply_context_profile

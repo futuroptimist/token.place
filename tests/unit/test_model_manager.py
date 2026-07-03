@@ -5403,13 +5403,13 @@ def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
             }
 
     kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
-        SimpleNamespace(LLAMA_TYPE_Q8_0=8),
+        SimpleNamespace(),
         FakeLlama,
         enable_kqv_offload=False,
     )
 
-    assert kwargs['type_k'] == 8
-    assert kwargs['type_v'] == 8
+    assert kwargs['type_k'] == 18
+    assert kwargs['type_v'] == 18
     assert 'flash_attn' not in kwargs
     assert 'offload_kqv' not in kwargs
     assert diagnostics['kqv_offload_allowed'] is False
@@ -5613,7 +5613,7 @@ def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
 
     assert (top_value, top_diag['source']) == (18, 'top_level')
     assert (nested_value, nested_diag['source']) == (2, 'nested')
-    assert (fallback_value, fallback_diag['source']) == (8, 'verified_numeric_fallback')
+    assert (fallback_value, fallback_diag['source']) == (18, 'verified_numeric_fallback')
 
 
 def test_child_context_create_error_classification_and_stderr_redaction():
@@ -5625,4 +5625,41 @@ def test_child_context_create_error_classification_and_stderr_redaction():
     ) == 'runtime_context_create_kv_cache_allocation'
     redacted = model_manager_module._redact_paths_from_text(stderr)
     assert '/Users/alice' not in redacted
+    assert '<path>' in redacted
+
+
+def test_safe_constructor_capability_payload_rejects_bool_kv_values():
+    from utils.llm import model_manager as model_manager_module
+
+    module = SimpleNamespace(__token_place_worker_capabilities__={
+        'constructor_kwarg_support': {'type_k': True},
+        'q8_kv_cache_type_value': True,
+        'q4_kv_cache_type_value': 2,
+    })
+
+    payload = model_manager_module._safe_constructor_capability_payload(module)
+
+    assert 'q8_kv_cache_type_value' not in payload
+    assert payload['q4_kv_cache_type_value'] == 2
+
+
+def test_unrecognized_init_failure_is_not_context_create_retryable():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        RuntimeError('invalid gguf header: missing tensor metadata')
+    )
+
+    assert category == 'runtime_init_unclassified'
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_path_redaction_handles_spaces_and_traceback_paths():
+    from utils.llm import model_manager as model_manager_module
+
+    text = 'File "/Users/Alice/Application Support/token.place/model.gguf", line 10, in <module>'
+    redacted = model_manager_module._redact_paths_from_text(text)
+
+    assert '/Users/Alice' not in redacted
+    assert 'Application Support' not in redacted
     assert '<path>' in redacted

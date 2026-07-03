@@ -51,7 +51,6 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
-    'runtime_context_create_failed',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -115,7 +114,7 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         }
     for key in ('q8_kv_cache_type_value', 'q4_kv_cache_type_value', 'f16_kv_cache_type_value'):
         value = capabilities.get(key)
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool):
             payload[key] = value
     for field in (
         'capability_source',
@@ -231,7 +230,7 @@ def _resolve_ggml_kv_cache_type(
         diagnostics.update({'source': 'worker_probe', 'name': capability_key, 'value': capability_value})
         return capability_value, diagnostics
 
-    numeric_fallbacks = {'f16': 1, 'q4': 2, 'q8': 8}
+    numeric_fallbacks = {'f16': 1, 'q4': 2, 'q8': 18}
     support = kwarg_support or _llama_constructor_supports_kwargs(llama_cls, ('type_k', 'type_v'))
     if precision in numeric_fallbacks and (support.get('type_k') or support.get('type_v')):
         diagnostics.update({
@@ -385,13 +384,14 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_metal_memory'
     if 'failed to create llama_context' in text or 'llamacontext' in text:
         return 'runtime_context_create_failed'
-    return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
 
 
 def _redact_paths_from_text(text: Any, *, limit: int = 2000) -> str:
     redacted = str(text or '')
-    redacted = re.sub(r'([A-Za-z]:)?[/\\][^\s:;]+(?:[/\\][^\s:;]+)+', '<path>', redacted)
-    redacted = re.sub(r'\b(?:[A-Za-z]:)?(?:[A-Za-z0-9_.-]+[/\\]){2,}[A-Za-z0-9_.-]+', '<path>', redacted)
+    path_chars = r'[^\n\r\t<>|*?";]+'
+    redacted = re.sub(rf'(?<!\w)(?:[A-Za-z]:)?[/\\]{path_chars}(?:[/\\]{path_chars})+', '<path>', redacted)
+    redacted = re.sub(r'\b(?:[A-Za-z]:)?(?:[A-Za-z0-9_. -]+[/\\]){2,}[A-Za-z0-9_. -]+', '<path>', redacted)
     return redacted[-limit:].strip()
 
 
@@ -1370,7 +1370,7 @@ def _read_llama_subprocess_message(
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
-            error = f"{error}; child_traceback_tail={traceback_text[-2000:]}"
+            error = f"{error}; child_traceback_tail={_redact_paths_from_text(traceback_text)}"
         raise RuntimeError(error)
     return message
 
@@ -1432,6 +1432,7 @@ class _SubprocessLlamaProxy:
         try:
             self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
         except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
+            self.close()
             raise RuntimeError(
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
             ) from exc
@@ -1442,12 +1443,18 @@ class _SubprocessLlamaProxy:
                 stage='llama_cpp_import',
             )
         except LlamaCppRuntimeStageTimeout:
+            self.close()
             raise
         except Exception as exc:
             stderr_tail = _redact_paths_from_text(_llama_subprocess_tail(self._process, '_token_place_stderr_tail'))
             category = _classify_runtime_context_create_error(exc, stderr_tail)
+            if isinstance(exc, LlamaCppWorkerEOFError):
+                safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+            else:
+                safe_exc = _redact_paths_from_text(exc)
+            self.close()
             raise RuntimeError(
-                f"{exc}; child_exception_type={type(exc).__name__}; "
+                f"{safe_exc}; child_exception_type={type(exc).__name__}; "
                 f"safe_error_category={category}; child_stderr_tail={stderr_tail or '<empty>'}"
             ) from exc
 
@@ -3178,6 +3185,8 @@ class ModelManager:
                                 and int(self.config.get('model.context_size', 8192)) == 65536
                             )
                             if is_qwen_64k:
+                                _runtime_supports_qwen_yarn_rope(llama_cpp, Llama)
+                                Llama = llama_cpp.Llama
                                 runtime_profiles = _build_qwen_64k_runtime_profiles(
                                     llama_cpp,
                                     Llama,

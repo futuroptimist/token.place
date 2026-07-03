@@ -3185,6 +3185,8 @@ def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(reques
         'method': 'create_chat_completion',
         'stream': False,
         'exception_type': 'RuntimeError',
+        'sanitized_error_summary': 'RuntimeError:redacted',
+        'generation_exception_category': 'unknown_generation_exception',
     }
 
     result = proxy.create_chat_completion(messages=[], stream=False)
@@ -4929,3 +4931,256 @@ def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_avail
     assert diagnostics['missing_reason'] is None
     assert diagnostics['missing_required_kwargs'] == []
     assert diagnostics['yarn_resolver_source'] == 'top_level_enum'
+
+
+def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        LLAMA_TYPE_Q8_0=8,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['type_k'] == 8
+    assert captured['type_v'] == 8
+    assert 'flash_attn' not in captured
+    assert 'offload_kqv' not in captured
+    assert captured['n_batch'] == 256
+    assert captured['n_ubatch'] == 128
+    assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
+
+
+def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+            captured.update(locals())
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(Llama=FakeLlama, LLAMA_ROPE_SCALING_TYPE_YARN=2, LLAMA_TYPE_Q8_0=8)
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert 'type_k' not in captured
+    assert manager.last_compute_diagnostics.get('kv_cache_mode') == {}
+
+
+def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert facade.LLAMA_TYPE_Q8_0 == 8
+    assert kwargs == {}
+    assert diagnostics['kv_cache_type_name'] == 'LLAMA_TYPE_Q8_0'
+    assert diagnostics['constructor_kwarg_support']['type_k'] is False
+
+
+def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
+    from utils.llm import model_manager as model_manager_module
+
+    support = {
+        'rope_scaling_type': True,
+        'yarn_ext_factor': True,
+        'yarn_orig_ctx': True,
+        'type_k': False,
+        'type_v': False,
+        'flash_attn': False,
+        'offload_kqv': False,
+        'n_batch': False,
+        'n_ubatch': False,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': support,
+            'q8_kv_cache_type_value': 18,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
+        facade,
+        facade.Llama,
+    )
+    memory_kwargs, memory_diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['constructor_kwarg_support']['rope_scaling_type'] is True
+    assert diagnostics['constructor_kwarg_support']['yarn_ext_factor'] is True
+    assert diagnostics['constructor_kwarg_support']['yarn_orig_ctx'] is True
+    assert memory_kwargs == {}
+    assert memory_diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
+
+
+def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, type_k, type_v, flash_attn, offload_kqv, n_batch, n_ubatch):
+            self.kwargs = {
+                'type_k': type_k,
+                'type_v': type_v,
+                'flash_attn': flash_attn,
+                'offload_kqv': offload_kqv,
+                'n_batch': n_batch,
+                'n_ubatch': n_ubatch,
+            }
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        SimpleNamespace(LLAMA_TYPE_Q8_0=8),
+        FakeLlama,
+        enable_kqv_offload=False,
+    )
+
+    assert kwargs['type_k'] == 8
+    assert kwargs['type_v'] == 8
+    assert 'flash_attn' not in kwargs
+    assert 'offload_kqv' not in kwargs
+    assert diagnostics['kqv_offload_allowed'] is False
+    assert diagnostics['omitted']['flash_attn'] == 'gpu_offload_disabled'
+
+
+def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
+    from utils.llm import model_manager as model_manager_module
+
+    support = {
+        'type_k': True,
+        'type_v': True,
+        'flash_attn': True,
+        'offload_kqv': True,
+        'n_batch': True,
+        'n_ubatch': True,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': support,
+            'q8_kv_cache_type_value': 18,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert kwargs['type_k'] == 18
+    assert kwargs['type_v'] == 18
+    assert kwargs['flash_attn'] is True
+    assert kwargs['offload_kqv'] is True
+    assert diagnostics['capability_source'] == 'worker_probe'
+
+
+def test_qwen_64k_memory_profile_omits_kwargs_when_worker_probe_lacks_support():
+    from utils.llm import model_manager as model_manager_module
+
+    class LocalFacadeAcceptsKwargs:
+        __token_place_supported_constructor_kwargs__ = ()
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    facade = SimpleNamespace(
+        LLAMA_TYPE_Q8_0=8,
+        __token_place_worker_capabilities__={
+            'constructor_kwarg_support': {
+                'type_k': False,
+                'type_v': False,
+                'flash_attn': False,
+                'offload_kqv': False,
+                'n_batch': False,
+                'n_ubatch': False,
+            },
+            'q8_kv_cache_type_value': 8,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        LocalFacadeAcceptsKwargs,
+        enable_kqv_offload=True,
+    )
+
+    assert kwargs == {}
+    assert diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
+    assert diagnostics['omitted']['n_batch'] == 'worker_capability_unsupported'
+    assert diagnostics['capability_source'] == 'worker_probe'
+
+
+def test_subprocess_worker_error_summary_keeps_safe_category_hint():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
+
+    assert summary == 'RuntimeError:metal_memory_allocation'

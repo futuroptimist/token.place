@@ -36,6 +36,10 @@ QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
 # wheels accept rope_scaling_type as a constructor kwarg but do not export the
 # generated enum symbol, so this is only used after constructor support is verified.
 LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
+QWEN_64K_KV_CACHE_TYPE_NAME = 'LLAMA_TYPE_Q8_0'
+QWEN_64K_BATCH_TOKENS = 256
+QWEN_64K_UBATCH_TOKENS = 128
+QWEN_64K_MEMORY_PROFILE_ID = 'qwen3-64k-q8-kv'
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -67,7 +71,30 @@ def _constructor_accepts_kwarg(callable_obj: Any, kwarg: str) -> bool:
 
 
 def _llama_constructor_supports_kwargs(llama_cls: Any, required_kwargs: Iterable[str]) -> Dict[str, bool]:
+    facade_kwargs = getattr(llama_cls, '__token_place_supported_constructor_kwargs__', None)
+    if facade_kwargs is not None:
+        supported = {str(name) for name in facade_kwargs if isinstance(name, str)}
+        return {name: name in supported for name in required_kwargs}
     return {name: _constructor_accepts_kwarg(llama_cls, name) for name in required_kwargs}
+
+
+def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any]:
+    capabilities = getattr(llama_cpp_module, '__token_place_worker_capabilities__', None)
+    if not isinstance(capabilities, dict):
+        return {}
+    payload: Dict[str, Any] = {}
+    support = capabilities.get('constructor_kwarg_support')
+    if isinstance(support, dict):
+        payload['constructor_kwarg_support'] = {
+            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
+        }
+    q8_value = capabilities.get('q8_kv_cache_type_value')
+    if isinstance(q8_value, int):
+        payload['q8_kv_cache_type_value'] = q8_value
+    for field in ('capability_source', 'backend', 'gpu_offload_supported', 'llama_cpp_python_version'):
+        if field in capabilities:
+            payload[field] = capabilities.get(field)
+    return payload
 
 
 def _llama_cpp_python_version(llama_cpp_module: Any) -> Optional[str]:
@@ -114,6 +141,80 @@ def _resolve_llama_cpp_rope_scaling_type_yarn(llama_cpp_module: Any, llama_cls: 
         'numeric_fallback': 'numeric_fallback',
     }
     return value, legacy_locations.get(source)
+
+
+def _safe_llama_cpp_enum(llama_cpp_module: Any, name: str) -> Any:
+    for owner in (llama_cpp_module, getattr(llama_cpp_module, 'llama_cpp', None)):
+        if owner is None:
+            continue
+        value = getattr(owner, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _qwen_64k_memory_profile_kwargs(
+    llama_cpp_module: Any,
+    llama_cls: Any,
+    *,
+    enable_kqv_offload: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+    worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
+    worker_kwarg_support = worker_capabilities.get('constructor_kwarg_support')
+    kwarg_support = (
+        {name: bool(worker_kwarg_support.get(name)) for name in probe_kwargs}
+        if isinstance(worker_kwarg_support, dict)
+        else _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
+    )
+    kwargs: Dict[str, Any] = {}
+    diagnostics: Dict[str, Any] = {
+        'profile_id': QWEN_64K_MEMORY_PROFILE_ID,
+        'constructor_kwarg_support': kwarg_support,
+        'capability_source': worker_capabilities.get('capability_source') or (
+            'worker_probe' if isinstance(worker_kwarg_support, dict) else 'local_constructor_signature'
+        ),
+        'applied': {},
+        'omitted': {},
+    }
+    q8_type = worker_capabilities.get('q8_kv_cache_type_value')
+    if q8_type is None:
+        q8_type = _safe_llama_cpp_enum(llama_cpp_module, QWEN_64K_KV_CACHE_TYPE_NAME)
+    diagnostics['kv_cache_type_name'] = QWEN_64K_KV_CACHE_TYPE_NAME if q8_type is not None else None
+    omitted: Dict[str, str] = {}
+    if q8_type is not None:
+        if kwarg_support.get('type_k'):
+            kwargs['type_k'] = q8_type
+        else:
+            omitted['type_k'] = 'worker_capability_unsupported'
+        if kwarg_support.get('type_v'):
+            kwargs['type_v'] = q8_type
+        else:
+            omitted['type_v'] = 'worker_capability_unsupported'
+    else:
+        omitted['type_k'] = 'q8_enum_unavailable'
+        omitted['type_v'] = 'q8_enum_unavailable'
+    if enable_kqv_offload and kwarg_support.get('flash_attn'):
+        kwargs['flash_attn'] = True
+    else:
+        omitted['flash_attn'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
+    diagnostics['kqv_offload_allowed'] = bool(enable_kqv_offload)
+    if enable_kqv_offload and kwarg_support.get('offload_kqv'):
+        kwargs['offload_kqv'] = True
+    else:
+        omitted['offload_kqv'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
+    if kwarg_support.get('n_batch'):
+        kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
+    if kwarg_support.get('n_ubatch'):
+        kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
+    for name in ('n_batch', 'n_ubatch'):
+        if name not in kwargs and not kwarg_support.get(name):
+            omitted[name] = 'worker_capability_unsupported'
+    diagnostics['applied'] = dict(kwargs)
+    diagnostics['omitted'] = omitted
+    diagnostics['enabled'] = bool(kwargs)
+    return kwargs, diagnostics
+
 
 def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
     safe_fields = (
@@ -644,8 +745,26 @@ def _find_llama_cpp_spec_in_subprocess(*, timeout_seconds: Optional[float] = Non
 
 def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     code = (
-        "import importlib, json, sys\n"
+        "import importlib, inspect, json, sys\n"
         "llama_cpp = importlib.import_module('llama_cpp')\n"
+        "def _ctor_support(cls, names):\n"
+        "    ctor = getattr(cls, '__init__', cls)\n"
+        "    try:\n"
+        "        params = inspect.signature(ctor).parameters\n"
+        "    except (TypeError, ValueError):\n"
+        "        return {name: False for name in names}\n"
+        "    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())\n"
+        "    return {name: (name in params or accepts_var_kw) for name in names}\n"
+        "probe_kwargs = (\n"
+        "    'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',\n"
+        "    'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',\n"
+        "    'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',\n"
+        ")\n"
+        "llama_cls = getattr(llama_cpp, 'Llama', None)\n"
+        "constructor_support = _ctor_support(llama_cls, probe_kwargs)\n"
+        "q8_value = getattr(llama_cpp, 'LLAMA_TYPE_Q8_0', None)\n"
+        "if q8_value is None:\n"
+        "    q8_value = getattr(getattr(llama_cpp, 'llama_cpp', None), 'LLAMA_TYPE_Q8_0', None)\n"
         "cuda_markers = ('GGML_USE_CUDA', 'GGML_CUDA', 'LLAMA_CUDA', 'GGML_USE_CUBLAS', 'LLAMA_CUBLAS')\n"
         "metal_markers = ('GGML_USE_METAL', 'GGML_METAL', 'LLAMA_METAL')\n"
         "backend = 'cpu'\n"
@@ -668,6 +787,10 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
         "    'interpreter': sys.executable,\n"
         "    'prefix': sys.prefix,\n"
         "    'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),\n"
+        "    'constructor_kwarg_support': constructor_support,\n"
+        "    'q8_kv_cache_type_value': q8_value if isinstance(q8_value, int) else None,\n"
+        "    'capability_source': 'worker_probe',\n"
+        "    'llama_cpp_python_version': getattr(llama_cpp, '__version__', None),\n"
         "    'error': None,\n"
         "}))\n"
     )
@@ -1170,10 +1293,17 @@ class _SubprocessLlamaCppModule:
         self.__file__ = module_path
         self._timeout_seconds = timeout_seconds
         self.__token_place_subprocess_facade__ = True
+        self.LLAMA_TYPE_Q8_0 = 8
         probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
+        self.__token_place_worker_capabilities__ = dict(probe or {})
+        if 'constructor_kwarg_support' in self.__token_place_worker_capabilities__:
+            self.__token_place_worker_capabilities__['capability_source'] = 'worker_probe'
         backend = str((probe or {}).get('backend') or '').lower()
         self.GGML_USE_CUDA = backend == 'cuda'
         self.GGML_USE_METAL = backend == 'metal'
+        q8_value = self.__token_place_worker_capabilities__.get('q8_kv_cache_type_value')
+        if isinstance(q8_value, int):
+            self.LLAMA_TYPE_Q8_0 = q8_value
 
     def llama_supports_gpu_offload(self) -> bool:
         return bool(self.GGML_USE_CUDA or self.GGML_USE_METAL)
@@ -1183,7 +1313,17 @@ class _SubprocessLlamaCppModule:
         timeout_seconds = self._timeout_seconds
         module_path_hint = self.__file__
 
+        worker_capabilities = _safe_constructor_capability_payload(self)
+        supported_kwargs = tuple(
+            sorted(
+                name for name, supported in (worker_capabilities.get('constructor_kwarg_support') or {}).items()
+                if supported
+            )
+        )
+
         class _ConfiguredSubprocessLlama(_SubprocessLlamaProxy):
+            __token_place_supported_constructor_kwargs__ = supported_kwargs
+
             def __init__(self, *args, **kwargs):
                 super().__init__(
                     *args,
@@ -1212,6 +1352,30 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+def _sanitize_error_summary(message):
+    text = str(message or '').lower()
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
+        return type(message).__name__ + ':metal_memory_allocation'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+        return type(message).__name__ + ':kv_cache_allocation'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
+        return type(message).__name__ + ':rope_yarn_eval_failure'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(message or '')):
+        return type(message).__name__ + ':unsupported_kwarg'
+    return type(message).__name__ + ':redacted'
+
+def _classify_generation_exception(exc):
+    text = str(exc or '').lower()
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
+        return 'metal_memory_allocation'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+        return 'kv_cache_allocation'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
+        return 'rope_yarn_eval_failure'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(exc or '')):
+        return 'unsupported_generation_kwarg'
+    return 'unknown_generation_exception'
+
 def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
     if isinstance(extra, dict):
@@ -1229,13 +1393,16 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             diagnostics['stream'] = bool(kwargs.get('stream'))
     if exc is not None:
         diagnostics['exception_type'] = type(exc).__name__
+        diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
+            diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
             message = str(exc)
             match = re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument) [\\'"]?([A-Za-z_][A-Za-z0-9_]*)', message)
             if match:
                 diagnostics['reason'] = 'unsupported_generation_option'
                 diagnostics['code'] = 'compute_node_options_unsupported'
                 diagnostics['rejected_option'] = match.group(1)
+                diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
     return {
         'status': 'error',
         'request_error': True,
@@ -1931,7 +2098,7 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         return None
     if error and action not in {'already_supported', 'metal_already_supported'}:
         return None
-    return {
+    coerced = {
         'backend': backend,
         'gpu_offload_supported': gpu_supported,
         'detected_device': str(probe.get('detected_device') or probe.get('device') or backend),
@@ -1941,6 +2108,19 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         'error': None,
         'runtime_action': action or 'unknown',
     }
+    support = probe.get('constructor_kwarg_support')
+    if isinstance(support, dict):
+        coerced['constructor_kwarg_support'] = {
+            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
+        }
+    q8_value = probe.get('q8_kv_cache_type_value')
+    if isinstance(q8_value, int):
+        coerced['q8_kv_cache_type_value'] = q8_value
+    if probe.get('capability_source'):
+        coerced['capability_source'] = str(probe.get('capability_source'))
+    if probe.get('llama_cpp_python_version'):
+        coerced['llama_cpp_python_version'] = str(probe.get('llama_cpp_python_version'))
+    return coerced
 
 
 def llama_cpp_verbose_logging_enabled() -> bool:
@@ -2334,7 +2514,15 @@ class ModelManager:
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
             )
+            memory_kwargs, memory_diagnostics = _qwen_64k_memory_profile_kwargs(
+                llama_module,
+                llama_cls,
+                enable_kqv_offload=n_gpu_layers > 0,
+            )
+            kwargs.update(memory_kwargs)
+            self.last_qwen_64k_memory_profile_diagnostics = memory_diagnostics
         else:
+            self.last_qwen_64k_memory_profile_diagnostics = {'enabled': False, 'applied': {}}
             self.last_yarn_rope_diagnostics = {
                 'supported': False,
                 'active': False,
@@ -2672,6 +2860,15 @@ class ModelManager:
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
                             })
+                            memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
+                            if isinstance(memory_profile, dict):
+                                compute_plan['qwen_64k_memory_profile'] = dict(memory_profile)
+                                applied_memory = memory_profile.get('applied') if isinstance(memory_profile.get('applied'), dict) else {}
+                                compute_plan['kv_cache_mode'] = {
+                                    key: applied_memory.get(key)
+                                    for key in ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+                                    if key in applied_memory
+                                }
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):
                                 compute_plan['yarn_rope_diagnostics'] = dict(yarn_diagnostics)

@@ -5029,6 +5029,50 @@ def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
     assert diagnostics['constructor_kwarg_support']['type_k'] is False
 
 
+def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
+    from utils.llm import model_manager as model_manager_module
+
+    support = {
+        'rope_scaling_type': True,
+        'yarn_ext_factor': True,
+        'yarn_orig_ctx': True,
+        'type_k': False,
+        'type_v': False,
+        'flash_attn': False,
+        'offload_kqv': False,
+        'n_batch': False,
+        'n_ubatch': False,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'constructor_kwarg_support': support,
+            'q8_kv_cache_type_value': 18,
+            'capability_source': 'worker_probe',
+        },
+    )
+
+    diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
+        facade,
+        facade.Llama,
+    )
+    memory_kwargs, memory_diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        facade,
+        facade.Llama,
+        enable_kqv_offload=True,
+    )
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['constructor_kwarg_support']['rope_scaling_type'] is True
+    assert diagnostics['constructor_kwarg_support']['yarn_ext_factor'] is True
+    assert diagnostics['constructor_kwarg_support']['yarn_orig_ctx'] is True
+    assert memory_kwargs == {}
+    assert memory_diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
+
+
 def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
     from utils.llm import model_manager as model_manager_module
 

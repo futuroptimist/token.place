@@ -20,6 +20,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
+from utils.llm import model_manager as model_manager_module
 from utils.llm.model_manager import ModelManager
 
 
@@ -4929,3 +4930,103 @@ def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_avail
     assert diagnostics['missing_reason'] is None
     assert diagnostics['missing_required_kwargs'] == []
     assert diagnostics['yarn_resolver_source'] == 'top_level_enum'
+
+
+def test_qwen_64k_runtime_applies_conservative_kv_cache_profile(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    captured = {}
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx, type_k, type_v, flash_attn, offload_kqv, n_batch, n_ubatch):
+            captured.update({
+                'type_k': type_k,
+                'type_v': type_v,
+                'flash_attn': flash_attn,
+                'offload_kqv': offload_kqv,
+                'n_batch': n_batch,
+                'n_ubatch': n_ubatch,
+                'n_ctx': n_ctx,
+            })
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['n_ctx'] == 65536
+    assert captured['type_k'] == 'q8_0'
+    assert captured['type_v'] == 'q8_0'
+    assert captured['flash_attn'] is True
+    assert manager.last_compute_diagnostics['qwen_64k_kv_cache_profile']['type_k'] == 'q8_0'
+    assert manager.last_compute_diagnostics['qwen_64k_kv_cache_profile_active'] is True
+
+
+def test_qwen_8k_runtime_does_not_apply_64k_kv_cache_profile(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert 'type_k' not in llm.kwargs
+    assert manager.last_compute_diagnostics['qwen_64k_kv_cache_profile'] == {}
+    assert manager.last_compute_diagnostics['qwen_64k_kv_cache_profile_active'] is False
+
+
+def test_generation_exception_classifier_detects_unsupported_internal_kwarg():
+    exc = model_manager_module.LlamaCppInferenceRequestError(
+        'llama_cpp request failed',
+        diagnostics={
+            'reason': 'unsupported_generation_option',
+            'category': 'unsupported_generation_kwarg',
+            'exception_type': 'TypeError',
+            'rejected_option': 'stream',
+            'error_summary': "got an unexpected keyword argument 'stream'",
+        },
+    )
+
+    diagnostics = model_manager_module.classify_generation_exception(exc)
+
+    assert diagnostics['category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['rejected_option'] == 'stream'
+    assert model_manager_module.runtime_completion_smoke_reason_for_category(diagnostics['category']) == 'runtime_completion_smoke_unsupported_generation_kwarg'

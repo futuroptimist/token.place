@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol,
 from urllib.parse import urlparse
 
 from utils.processing_result import RelayProcessingResult
+from utils.llm.model_manager import classify_generation_exception, runtime_completion_smoke_reason_for_category
 
 if TYPE_CHECKING:
     from utils.networking.relay_client import RelayClient
@@ -440,6 +441,11 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
+            "api_v1_readiness_yarn_rope_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
+            "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
+            "api_v1_readiness_kv_cache_profile": diagnostics.get("qwen_64k_kv_cache_profile"),
+            "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+            "api_v1_readiness_backend_offload_mode": diagnostics.get("effective_mode"),
         })
 
         yarn_required_for_active_tier = (
@@ -561,14 +567,21 @@ class ComputeNodeRuntime:
                     }
             except Exception as exc:
                 admitted = False
+                safe_exception = classify_generation_exception(exc)
+                smoke_reason = runtime_completion_smoke_reason_for_category(safe_exception.get("category"))
                 admission_error = {
                     "code": "compute_node_context_admission_unavailable",
-                    "internal_reason": "runtime_completion_smoke_exception",
+                    "internal_reason": smoke_reason,
                 }
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
-                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = "runtime_completion_smoke_exception"
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_reason
                 diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
-                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = type(exc).__name__
+                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = safe_exception.get("exception_type")
+                diagnostics["api_v1_readiness_completion_smoke_exception_category"] = safe_exception.get("category")
+                diagnostics["api_v1_readiness_completion_smoke_safe_error_summary"] = safe_exception.get("safe_error_summary")
+                diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = safe_exception
+                diagnostics["api_v1_readiness_repair_attempted"] = False
+                diagnostics["api_v1_readiness_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
             diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None

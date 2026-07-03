@@ -6,6 +6,7 @@ import time
 import logging
 from utils.networking.http_requests_compat import requests
 import json
+import re
 import sys
 import importlib
 import importlib.metadata
@@ -36,6 +37,91 @@ QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
 # wheels accept rope_scaling_type as a constructor kwarg but do not export the
 # generated enum symbol, so this is only used after constructor support is verified.
 LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
+
+QWEN_64K_KV_CACHE_PROFILE = {
+    'type_k': 'q8_0',
+    'type_v': 'q8_0',
+    'flash_attn': True,
+    'offload_kqv': True,
+    'n_batch': 512,
+    'n_ubatch': 128,
+}
+QWEN_64K_KV_CACHE_CAPABILITY_KWARGS = tuple(QWEN_64K_KV_CACHE_PROFILE)
+
+
+def _safe_bounded_error_summary(value: Any, *, limit: int = 240) -> str:
+    text = str(value or '').replace('\n', ' ').replace('\r', ' ')
+    text = re.sub(r'(/[^\s:]+)+', '<path>', text)
+    text = re.sub(r'([A-Za-z]:\\[^\s:]+)+', '<path>', text)
+    text = re.sub(r'(?i)(prompt|message|content|response|ciphertext|key|secret)=[^\s,;]+', r'\1=<redacted>', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:limit]
+
+
+def classify_generation_exception(exc: BaseException) -> Dict[str, Any]:
+    diagnostics = getattr(exc, 'diagnostics', None)
+    source = diagnostics if isinstance(diagnostics, dict) else {}
+    combined = ' '.join(
+        str(value or '')
+        for value in (
+            type(exc).__name__,
+            str(exc),
+            source.get('reason'),
+            source.get('exception_type'),
+            source.get('stderr_tail'),
+            source.get('error_summary'),
+            source.get('rejected_option'),
+        )
+    ).lower()
+    if isinstance(exc, LlamaCppRuntimeStageTimeout):
+        category = 'worker_timeout'
+    elif isinstance(exc, LlamaCppWorkerDeadError):
+        category = 'worker_dead'
+    elif isinstance(exc, (LlamaCppWorkerEOFError, LlamaCppWorkerBrokenPipeError)):
+        category = 'worker_dead'
+    elif source.get('category') in {
+        'metal_memory_allocation', 'kv_cache_allocation', 'rope_yarn_eval_failure',
+        'unsupported_generation_kwarg', 'worker_dead', 'worker_timeout',
+        'unknown_generation_exception',
+    }:
+        category = str(source.get('category'))
+    elif source.get('reason') in {'unsupported_generation_option', 'unsupported_generation_kwarg'} or source.get('rejected_option'):
+        category = 'unsupported_generation_kwarg'
+    elif 'timeout' in combined:
+        category = 'worker_timeout'
+    elif 'broken pipe' in combined or 'eof' in combined or 'exited before' in combined or 'worker_dead' in combined:
+        category = 'worker_dead'
+    elif 'metal' in combined and ('alloc' in combined or 'out of memory' in combined or 'failed to allocate' in combined):
+        category = 'metal_memory_allocation'
+    elif ('kv' in combined or 'cache' in combined) and ('alloc' in combined or 'out of memory' in combined or 'failed to allocate' in combined):
+        category = 'kv_cache_allocation'
+    elif ('yarn' in combined or 'rope' in combined) and ('eval' in combined or 'invalid' in combined or 'failed' in combined):
+        category = 'rope_yarn_eval_failure'
+    elif 'unexpected keyword argument' in combined or 'unsupported' in combined and 'kwarg' in combined:
+        category = 'unsupported_generation_kwarg'
+    else:
+        category = 'unknown_generation_exception'
+    result = {
+        'category': category,
+        'exception_type': source.get('exception_type') or type(exc).__name__,
+        'safe_error_summary': _safe_bounded_error_summary(source.get('error_summary') or ('request failed' if category == 'unknown_generation_exception' else str(exc))),
+    }
+    for key in ('reason', 'method', 'stream', 'rejected_option', 'stderr_tail'):
+        if key in source and source.get(key) is not None:
+            result[key] = _safe_bounded_error_summary(source[key]) if isinstance(source[key], str) else source[key]
+    return result
+
+
+def runtime_completion_smoke_reason_for_category(category: Any) -> str:
+    mapping = {
+        'metal_memory_allocation': 'runtime_completion_smoke_metal_memory_allocation',
+        'kv_cache_allocation': 'runtime_completion_smoke_kv_cache_allocation',
+        'rope_yarn_eval_failure': 'runtime_completion_smoke_rope_yarn_eval_failure',
+        'unsupported_generation_kwarg': 'runtime_completion_smoke_unsupported_generation_kwarg',
+        'worker_timeout': 'runtime_completion_smoke_worker_timeout',
+        'worker_dead': 'runtime_completion_smoke_worker_dead',
+    }
+    return mapping.get(str(category or ''), 'runtime_completion_smoke_exception')
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -938,6 +1024,10 @@ def _read_llama_subprocess_message(
         if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize'} and message.get('request_error'):
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+            stderr_tail = _safe_bounded_error_summary(_llama_subprocess_tail(process, '_token_place_stderr_tail'), limit=800)
+            if stderr_tail:
+                safe_diagnostics = dict(safe_diagnostics)
+                safe_diagnostics['stderr_tail'] = stderr_tail
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
@@ -2270,6 +2360,29 @@ class ModelManager:
     def _qwen_non_thinking_required(self) -> bool:
         return self.model_profile.get('provider') == 'qwen' and self.model_profile.get('thinking_mode') == 'disabled'
 
+    def _qwen_64k_kv_cache_profile(self, llama_cls: Any) -> Dict[str, Any]:
+        """Return conservative Qwen 64K-only llama.cpp KV/cache kwargs supported by runtime."""
+
+        context_tier = getattr(self, 'context_tier', '8k-fast')
+        if self.model_profile.get('provider') != 'qwen' or context_tier != '64k-full':
+            return {}
+        supported = {
+            key: _constructor_accepts_kwarg(llama_cls, key)
+            for key in QWEN_64K_KV_CACHE_CAPABILITY_KWARGS
+        }
+        profile = {
+            key: value
+            for key, value in QWEN_64K_KV_CACHE_PROFILE.items()
+            if supported.get(key)
+        }
+        self.last_qwen_64k_memory_profile_diagnostics = {
+            'active': True,
+            'attempted_profile': dict(QWEN_64K_KV_CACHE_PROFILE),
+            'constructor_kwarg_support': supported,
+            'applied_profile': dict(profile),
+        }
+        return profile
+
     def _runtime_init_kwargs(self, llama_cls: Any, n_gpu_layers: int, llama_cpp_module: Any = None) -> Dict[str, Any]:
         """Build verified llama-cpp-python runtime kwargs for the selected profile.
 
@@ -2292,6 +2405,7 @@ class ModelManager:
         if self.model_profile.get('provider') == 'qwen':
             if self._chat_template_mode() != 'gguf-jinja':
                 raise RuntimeError('Qwen runtime requires GGUF/Jinja chat template policy')
+            kwargs.update(self._qwen_64k_kv_cache_profile(llama_cls))
         else:
             kwargs['chat_format'] = self.config.get('model.chat_format', 'llama-3')
 
@@ -2671,6 +2785,8 @@ class ModelManager:
                                 'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
+                                'qwen_64k_kv_cache_profile': {key: runtime_kwargs.get(key) for key in QWEN_64K_KV_CACHE_CAPABILITY_KWARGS if key in runtime_kwargs},
+                                'qwen_64k_kv_cache_profile_active': bool({key: runtime_kwargs.get(key) for key in QWEN_64K_KV_CACHE_CAPABILITY_KWARGS if key in runtime_kwargs}),
                             })
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):

@@ -4,6 +4,7 @@ from unittest.mock import call, MagicMock
 
 import pytest
 
+from utils.llm.model_manager import LlamaCppInferenceRequestError
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
     apply_compute_mode,
@@ -833,7 +834,106 @@ def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_exception"
     assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "unknown_generation_exception"
     assert "prompt text" not in str(diagnostics)
+
+
+def test_compute_node_runtime_qwen_64k_smoke_classifies_worker_kv_failure(monkeypatch):
+    class RaisingRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 42}
+
+        def create_chat_completion(self, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "reason": "inference_exception",
+                    "category": "kv_cache_allocation",
+                    "exception_type": "RuntimeError",
+                    "error_summary": "llama_kv_cache_init failed to allocate cache",
+                },
+            )
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+        "native_context_tokens": 32768,
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "required_for_tier": "64k-full",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {
+        "qwen_64k_kv_cache_profile": {"type_k": "q8_0", "type_v": "q8_0", "flash_attn": True},
+        "backend_used": "metal",
+    }
+    model_manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "yarn_resolver_source": "top_level_enum",
+        "llama_cpp_python_version": "0.3.32",
+        "missing_reason": None,
+    }
+    model_manager.get_llm_instance.return_value = RaisingRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 42)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_prompt_tokens"] == 42
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_kv_cache_allocation"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "kv_cache_allocation"
+    assert diagnostics["api_v1_readiness_kv_cache_profile"]["type_k"] == "q8_0"
+
+
+def test_compute_node_runtime_qwen_64k_smoke_classifies_yarn_eval_failure(monkeypatch):
+    class RaisingRuntime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 42}
+
+        def create_chat_completion(self, **_kwargs):
+            raise RuntimeError("RoPE YaRN eval failed before token generation")
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
+    }
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.last_yarn_rope_diagnostics = {"supported": True, "yarn_resolver_source": "numeric_fallback"}
+    model_manager.get_llm_instance.return_value = RaisingRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(_api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 42)),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_rope_yarn_eval_failure"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "rope_yarn_eval_failure"
+
 
 @pytest.mark.parametrize(
     "llm_instance,getter,expected",

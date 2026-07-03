@@ -260,6 +260,9 @@ def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> st
         'missing_reason',
         'yarn_resolver_source',
         'constructor_kwarg_support',
+        'parent_facade_type',
+        'child_probe_reprobe_attempted',
+        'constructor_kwargs_attempted',
     )
     return ', '.join(
         f'{field}={diagnostics.get(field) or "unknown"}'
@@ -307,8 +310,9 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
             yarn_value = None
             resolver_source = worker_capabilities.get('yarn_resolver_source') or resolver_source
             missing_reasons = ['missing concrete YaRN enum value from unknown child probe']
+    supported = support_classification in {'supported', 'unknown'} and not missing_reasons
     return {
-        'supported': support_classification in {'supported', 'unknown'} and not missing_reasons,
+        'supported': supported,
         'support_classification': support_classification,
         'yarn_enum_value': yarn_value,
         'yarn_enum_location': resolver_source,
@@ -324,10 +328,16 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         'capability_source': worker_capabilities.get('capability_source') or (
             'worker_probe' if isinstance(worker_kwarg_support, dict) else 'local_constructor_signature'
         ),
+        'parent_facade_type': type(llama_cpp_module).__name__ if getattr(llama_cpp_module, '__token_place_subprocess_facade__', False) else None,
+        'child_probe_reprobe_attempted': bool(worker_capabilities.get('child_probe_reprobe_attempted', False)),
+        'constructor_kwargs_attempted': worker_capabilities.get('constructor_kwargs_attempted') or (
+            list(required_kwargs) if supported else []
+        ),
     }
 
 
 def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
+    reprobe_attempted = False
     if getattr(llama_cpp_module, '__token_place_subprocess_facade__', False):
         capabilities = _safe_constructor_capability_payload(llama_cpp_module)
         existing_support = capabilities.get('qwen_64k_yarn_support')
@@ -337,12 +347,18 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             and all(bool(kwarg_support.get(name)) for name in ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'))
         )
         if existing_support not in {'supported', 'unknown'} and not required_supported:
+            reprobe_attempted = True
             probe = _probe_llama_cpp_capabilities_in_subprocess(
                 timeout_seconds=getattr(llama_cpp_module, '_timeout_seconds', None)
             )
             if isinstance(probe, dict):
-                llama_cpp_module.__token_place_worker_capabilities__ = dict(probe)
-    return _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
+                probe = dict(probe)
+                probe['child_probe_reprobe_attempted'] = True
+                llama_cpp_module.__token_place_worker_capabilities__ = probe
+    diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
+    if reprobe_attempted:
+        diagnostics['child_probe_reprobe_attempted'] = True
+    return diagnostics
 
 def _is_site_packages_path(path_text: Any) -> bool:
     normalized = str(path_text).replace('\\', '/').lower()
@@ -2605,6 +2621,12 @@ class ModelManager:
                 'support_classification': yarn_probe.get('support_classification'),
                 'constructor_signature_inspectable': yarn_probe.get('constructor_signature_inspectable'),
                 'constructor_has_var_kwargs': yarn_probe.get('constructor_has_var_kwargs'),
+                'parent_facade_type': yarn_probe.get('parent_facade_type'),
+                'child_probe_reprobe_attempted': yarn_probe.get('child_probe_reprobe_attempted'),
+                'constructor_kwargs_attempted': (
+                    ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx']
+                    if yarn_probe.get('supported') else []
+                ),
             }
             if not yarn_probe['supported']:
                 safe_diagnostics = _format_qwen_yarn_unsupported_diagnostics(

@@ -291,7 +291,12 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
     accepted_kwargs = sorted(name for name, supported in kwarg_support.items() if supported)
     yarn_value, resolver_source = _resolve_yarn_rope_scaling_type(llama_cpp_module, llama_cls)
     required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
-    missing_kwargs = [name for name in required_kwargs if not kwarg_support.get(name)]
+    constructor_has_var_kwargs = worker_capabilities.get('constructor_has_var_kwargs') is True
+    missing_kwargs = (
+        []
+        if constructor_has_var_kwargs
+        else [name for name in required_kwargs if not kwarg_support.get(name)]
+    )
     missing_reasons = []
     if resolver_source == 'unsupported':
         missing_reasons.append('missing LLAMA_ROPE_SCALING_TYPE_YARN enum constant and rope_scaling_type constructor support')
@@ -304,13 +309,15 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
     if support_classification not in {'supported', 'unknown', 'unsupported'}:
         support_classification = 'supported' if not missing_reasons else 'unsupported'
     if support_classification == 'unknown':
-        if worker_capabilities.get('yarn_enum_value') is not None:
-            missing_reasons = []
-        else:
+        unknown_missing_reasons = []
+        if worker_capabilities.get('yarn_enum_value') is None or resolver_source == 'unsupported':
             yarn_value = None
             resolver_source = worker_capabilities.get('yarn_resolver_source') or resolver_source
-            missing_reasons = ['missing concrete YaRN enum value from unknown child probe']
-    supported = support_classification in {'supported', 'unknown'} and not missing_reasons
+            unknown_missing_reasons.append('missing concrete YaRN enum value from unknown child probe')
+        if missing_kwargs:
+            unknown_missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs)}')
+        missing_reasons = unknown_missing_reasons
+    supported = support_classification in {'supported', 'unknown'} and not missing_reasons and yarn_value is not None
     return {
         'supported': supported,
         'support_classification': support_classification,
@@ -323,7 +330,7 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         'missing_reason': '; '.join(missing_reasons) if missing_reasons else None,
         'llama_module_path': worker_capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None),
         'llama_cpp_python_version': worker_capabilities.get('llama_cpp_python_version') or _llama_cpp_python_version(llama_cpp_module),
-        'constructor_has_var_kwargs': worker_capabilities.get('constructor_has_var_kwargs'),
+        'constructor_has_var_kwargs': constructor_has_var_kwargs,
         'constructor_signature_inspectable': worker_capabilities.get('constructor_signature_inspectable'),
         'capability_source': worker_capabilities.get('capability_source') or (
             'worker_probe' if isinstance(worker_kwarg_support, dict) else 'local_constructor_signature'
@@ -2629,6 +2636,15 @@ class ModelManager:
                 ),
             }
             if not yarn_probe['supported']:
+                safe_diagnostics = _format_qwen_yarn_unsupported_diagnostics(
+                    self.last_yarn_rope_diagnostics
+                )
+                raise RuntimeError(
+                    f'{QWEN_64K_YARN_UNSUPPORTED_MESSAGE}; {safe_diagnostics}'
+                )
+            if yarn_probe.get('yarn_enum_value') is None:
+                self.last_yarn_rope_diagnostics['supported'] = False
+                self.last_yarn_rope_diagnostics['missing_reason'] = 'missing concrete YaRN enum value from supported child probe'
                 safe_diagnostics = _format_qwen_yarn_unsupported_diagnostics(
                     self.last_yarn_rope_diagnostics
                 )

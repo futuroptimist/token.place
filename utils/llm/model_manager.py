@@ -6,6 +6,7 @@ import time
 import logging
 from utils.networking.http_requests_compat import requests
 import json
+import re
 import sys
 import importlib
 import importlib.metadata
@@ -36,10 +37,15 @@ QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
 # wheels accept rope_scaling_type as a constructor kwarg but do not export the
 # generated enum symbol, so this is only used after constructor support is verified.
 LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
-QWEN_64K_KV_CACHE_TYPE_NAME = 'LLAMA_TYPE_Q8_0'
+QWEN_64K_KV_CACHE_TYPE_NAMES = {
+    'f16': ('GGML_TYPE_F16', 'LLAMA_TYPE_F16'),
+    'q8': ('GGML_TYPE_Q8_0', 'LLAMA_TYPE_Q8_0'),
+    'q4': ('GGML_TYPE_Q4_0', 'LLAMA_TYPE_Q4_0'),
+}
+QWEN_64K_KV_NUMERIC_FALLBACKS = {'f16': 1, 'q4': 2, 'q8': 8}
 QWEN_64K_BATCH_TOKENS = 256
 QWEN_64K_UBATCH_TOKENS = 128
-QWEN_64K_MEMORY_PROFILE_ID = 'qwen3-64k-q8-kv'
+QWEN_64K_MEMORY_PROFILE_ID = 'qwen64k_kv_q8'
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -51,6 +57,40 @@ CRITICAL_STDLIB_IMPORT_MODULES = (
     'pathlib',
 )
 
+
+
+
+def _sanitize_runtime_diagnostic_text(value: Any, *, limit: int = 2000) -> str:
+    text = str(value or '')[-limit:]
+    # Redact absolute-looking paths while preserving safe basename context.
+    text = re.sub(r'(?i)(?:[A-Z]:)?[\\/](?:[^\s:;]+[\\/])+([^\s:;]+)', r'<path>/\1', text)
+    return text.strip()
+
+
+def _classify_context_create_failure(exc: BaseException, *, child_stderr_tail: str = '') -> str:
+    text = f'{type(exc).__name__}: {exc} {child_stderr_tail}'.lower()
+    if re.search(r'(unexpected keyword argument|got an unexpected keyword argument|unsupported.*(?:type_k|type_v|flash_attn|offload_kqv|yarn|rope))', text):
+        return 'runtime_context_create_unsupported_kwarg'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'orig', 'ext'))):
+        return 'runtime_context_create_rope_yarn_config'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'failed', 'oom', 'out of memory')):
+        return 'runtime_context_create_kv_cache_allocation'
+    if 'metal' in text and any(term in text for term in ('buffer', 'graph', 'maximum', 'too large')):
+        return 'runtime_context_create_metal_buffer_limit'
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed')):
+        return 'runtime_context_create_metal_memory'
+    if 'failed to create llama_context' in text or 'llamacontext' in text:
+        return 'runtime_context_create_failed'
+    return 'runtime_context_create_failed'
+
+
+def _is_retryable_qwen64k_context_create_failure(category: str) -> bool:
+    return category in {
+        'runtime_context_create_metal_memory',
+        'runtime_context_create_kv_cache_allocation',
+        'runtime_context_create_metal_buffer_limit',
+        'runtime_context_create_failed',
+    }
 
 def _safe_signature_parameters(callable_obj: Any) -> Dict[str, inspect.Parameter]:
     try:
@@ -188,11 +228,36 @@ def _safe_llama_cpp_enum(llama_cpp_module: Any, name: str) -> Any:
     return None
 
 
+def _resolve_ggml_kv_cache_type(
+    llama_cpp_module: Any,
+    llama_cls: Any,
+    precision: str,
+    kwarg_support: Optional[Dict[str, bool]] = None,
+) -> tuple[Optional[int], str]:
+    precision_key = str(precision).lower()
+    worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
+    capability_key = f'{precision_key}_kv_cache_type_value'
+    value = worker_capabilities.get(capability_key)
+    if isinstance(value, int):
+        return value, 'worker_probe'
+    for name in QWEN_64K_KV_CACHE_TYPE_NAMES.get(precision_key, ()):
+        resolved = _safe_llama_cpp_enum(llama_cpp_module, name)
+        coerced = _coerce_optional_int_enum(resolved)
+        if coerced is not None:
+            return coerced, name
+    if precision_key in QWEN_64K_KV_NUMERIC_FALLBACKS:
+        support = kwarg_support or _llama_constructor_supports_kwargs(llama_cls, ('type_k', 'type_v'))
+        if support.get('type_k') or support.get('type_v'):
+            return QWEN_64K_KV_NUMERIC_FALLBACKS[precision_key], 'verified_numeric_fallback'
+    return None, 'unavailable'
+
+
 def _qwen_64k_memory_profile_kwargs(
     llama_cpp_module: Any,
     llama_cls: Any,
     *,
     enable_kqv_offload: bool = True,
+    profile_name: str = QWEN_64K_MEMORY_PROFILE_ID,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     probe_kwargs = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
     worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
@@ -203,36 +268,49 @@ def _qwen_64k_memory_profile_kwargs(
         else _llama_constructor_supports_kwargs(llama_cls, probe_kwargs)
     )
     kwargs: Dict[str, Any] = {}
+    omitted: Dict[str, str] = {}
     diagnostics: Dict[str, Any] = {
-        'profile_id': QWEN_64K_MEMORY_PROFILE_ID,
+        'profile_id': profile_name,
         'constructor_kwarg_support': kwarg_support,
         'capability_source': worker_capabilities.get('capability_source') or (
             'worker_probe' if isinstance(worker_kwarg_support, dict) else 'local_constructor_signature'
         ),
         'applied': {},
-        'omitted': {},
+        'omitted': omitted,
     }
-    q8_type = worker_capabilities.get('q8_kv_cache_type_value')
-    if q8_type is None:
-        q8_type = _safe_llama_cpp_enum(llama_cpp_module, QWEN_64K_KV_CACHE_TYPE_NAME)
-    diagnostics['kv_cache_type_name'] = QWEN_64K_KV_CACHE_TYPE_NAME if q8_type is not None else None
-    omitted: Dict[str, str] = {}
-    if q8_type is not None:
+    if profile_name == 'qwen64k_default':
+        diagnostics['enabled'] = True
+        return kwargs, diagnostics
+
+    precision = 'q4' if profile_name == 'qwen64k_kv_q4' else 'q8'
+    kv_type, kv_source = _resolve_ggml_kv_cache_type(llama_cpp_module, llama_cls, precision, kwarg_support)
+    diagnostics['kv_cache_type_name'] = precision.upper()
+    diagnostics['kv_cache_type_source'] = kv_source
+    if kv_type is None:
+        omitted['type_k'] = f'{precision}_enum_unavailable'
+        omitted['type_v'] = f'{precision}_enum_unavailable'
+    else:
         if kwarg_support.get('type_k'):
-            kwargs['type_k'] = q8_type
+            kwargs['type_k'] = kv_type
         else:
             omitted['type_k'] = 'worker_capability_unsupported'
         if kwarg_support.get('type_v'):
-            kwargs['type_v'] = q8_type
+            kwargs['type_v'] = kv_type
         else:
             omitted['type_v'] = 'worker_capability_unsupported'
-    else:
-        omitted['type_k'] = 'q8_enum_unavailable'
-        omitted['type_v'] = 'q8_enum_unavailable'
-    if enable_kqv_offload and kwarg_support.get('flash_attn'):
-        kwargs['flash_attn'] = True
-    else:
-        omitted['flash_attn'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
+    type_v_quantized = 'type_v' in kwargs and precision in {'q8', 'q4'}
+    if enable_kqv_offload and (type_v_quantized or precision in {'q8', 'q4'}):
+        if kwarg_support.get('flash_attn'):
+            kwargs['flash_attn'] = True
+        elif type_v_quantized:
+            # Some llama.cpp builds require flash attention for quantized V cache; do not risk it.
+            kwargs.pop('type_v', None)
+            omitted['type_v'] = 'flash_attn_required_but_unsupported'
+            omitted['flash_attn'] = 'worker_capability_unsupported'
+        else:
+            omitted['flash_attn'] = 'worker_capability_unsupported'
+    elif not enable_kqv_offload:
+        omitted['flash_attn'] = 'gpu_offload_disabled'
     diagnostics['kqv_offload_allowed'] = bool(enable_kqv_offload)
     if enable_kqv_offload and kwarg_support.get('offload_kqv'):
         kwargs['offload_kqv'] = True
@@ -240,13 +318,13 @@ def _qwen_64k_memory_profile_kwargs(
         omitted['offload_kqv'] = 'gpu_offload_disabled' if not enable_kqv_offload else 'worker_capability_unsupported'
     if kwarg_support.get('n_batch'):
         kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
+    else:
+        omitted['n_batch'] = 'worker_capability_unsupported'
     if kwarg_support.get('n_ubatch'):
         kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
-    for name in ('n_batch', 'n_ubatch'):
-        if name not in kwargs and not kwarg_support.get(name):
-            omitted[name] = 'worker_capability_unsupported'
+    else:
+        omitted['n_ubatch'] = 'worker_capability_unsupported'
     diagnostics['applied'] = dict(kwargs)
-    diagnostics['omitted'] = omitted
     diagnostics['enabled'] = bool(kwargs)
     return kwargs, diagnostics
 
@@ -1183,9 +1261,14 @@ def _read_llama_subprocess_message(
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         traceback_text = str(message.get('traceback') or '').strip()
+        stderr_tail = _sanitize_runtime_diagnostic_text(_llama_subprocess_tail(process, '_token_place_stderr_tail'))
         if traceback_text:
-            error = f"{error}; child_traceback_tail={traceback_text[-2000:]}"
-        raise RuntimeError(error)
+            error = f"{error}; child_traceback_tail={_sanitize_runtime_diagnostic_text(traceback_text)}"
+        if stderr_tail:
+            error = f"{error}; child_stderr_tail={stderr_tail}"
+        exc = RuntimeError(error)
+        setattr(exc, '_token_place_process', process)
+        raise exc
     return message
 
 
@@ -2581,7 +2664,7 @@ class ModelManager:
     def _qwen_non_thinking_required(self) -> bool:
         return self.model_profile.get('provider') == 'qwen' and self.model_profile.get('thinking_mode') == 'disabled'
 
-    def _runtime_init_kwargs(self, llama_cls: Any, n_gpu_layers: int, llama_cpp_module: Any = None) -> Dict[str, Any]:
+    def _runtime_init_kwargs(self, llama_cls: Any, n_gpu_layers: int, llama_cpp_module: Any = None, *, runtime_profile_name: Optional[str] = None) -> Dict[str, Any]:
         """Build verified llama-cpp-python runtime kwargs for the selected profile.
 
         llama-cpp-python uses the GGUF/Jinja chat template when ``chat_format`` is
@@ -2667,7 +2750,8 @@ class ModelManager:
             memory_kwargs, memory_diagnostics = _qwen_64k_memory_profile_kwargs(
                 llama_module,
                 llama_cls,
-                enable_kqv_offload=n_gpu_layers > 0,
+                enable_kqv_offload=n_gpu_layers != 0,
+                profile_name=runtime_profile_name or 'qwen64k_default',
             )
             kwargs.update(memory_kwargs)
             self.last_qwen_64k_memory_profile_diagnostics = memory_diagnostics
@@ -2845,6 +2929,83 @@ class ModelManager:
             self.log_info(f"Model file {self.file_name} already exists.")
             return True
 
+    def _qwen64k_runtime_profile_ladder(self, llama_cpp_module: Any, llama_cls: Any, n_gpu_layers: int) -> list[str]:
+        context_tier = getattr(self, 'context_tier', '8k-fast')
+        if self.model_profile.get('provider') != 'qwen' or context_tier != '64k-full':
+            return ['default']
+        return ['qwen64k_default', 'qwen64k_kv_q8', 'qwen64k_kv_q4']
+
+    def _safe_runtime_kwargs_diagnostics(self, runtime_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        safe_names = (
+            'n_ctx', 'n_gpu_layers', 'verbose', 'rope_scaling_type', 'yarn_ext_factor',
+            'yarn_orig_ctx', 'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch'
+        )
+        return {name: runtime_kwargs.get(name) for name in safe_names if name in runtime_kwargs}
+
+    def _instantiate_llama_with_qwen64k_retry(self, Llama: Any, n_gpu_layers: int, llama_cpp: Any) -> tuple[Any, Dict[str, Any], list[Dict[str, Any]]]:
+        attempts: list[Dict[str, Any]] = []
+        ladder = self._qwen64k_runtime_profile_ladder(llama_cpp, Llama, n_gpu_layers)
+        last_exc: Optional[BaseException] = None
+        for profile_name in ladder:
+            effective_profile = None if profile_name == 'default' else profile_name
+            runtime_kwargs = self._runtime_init_kwargs(
+                Llama,
+                n_gpu_layers,
+                llama_cpp,
+                runtime_profile_name=effective_profile,
+            )
+            diagnostics = {
+                'attempted_runtime_profile': profile_name,
+                'attempted_runtime_kwargs': self._safe_runtime_kwargs_diagnostics(runtime_kwargs),
+                'model_profile_id': self.profile_id,
+                'context_tier': getattr(self, 'context_tier', '8k-fast'),
+                'n_ctx': runtime_kwargs.get('n_ctx'),
+                'llama_cpp_python_version': _llama_cpp_python_version(llama_cpp),
+                'yarn_resolver_source': (getattr(self, 'last_yarn_rope_diagnostics', {}) or {}).get('yarn_resolver_source'),
+            }
+            try:
+                instance = Llama(**runtime_kwargs)
+                diagnostics['status'] = 'ok'
+                self.selected_runtime_profile = profile_name
+                self.last_runtime_init_attempts = attempts + [diagnostics]
+                if isinstance(getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None), dict):
+                    self.last_qwen_64k_memory_profile_diagnostics['selected_runtime_profile'] = profile_name
+                return instance, runtime_kwargs, attempts + [diagnostics]
+            except Exception as exc:
+                last_exc = exc
+                child_stderr = ''
+                proc = getattr(exc, '_token_place_process', None)
+                if proc is not None:
+                    child_stderr = _llama_subprocess_tail(proc, '_token_place_stderr_tail')
+                child_stderr = _sanitize_runtime_diagnostic_text(child_stderr or str(exc))
+                category = _classify_context_create_failure(exc, child_stderr_tail=child_stderr)
+                diagnostics.update({
+                    'status': 'failed',
+                    'exception_type': type(exc).__name__,
+                    'safe_error_category': category,
+                    'child_stderr_tail': child_stderr,
+                    'backend': 'metal' if getattr(llama_cpp, 'GGML_USE_METAL', False) else ('cuda' if getattr(llama_cpp, 'GGML_USE_CUDA', False) else 'cpu'),
+                })
+                attempts.append(diagnostics)
+                close = getattr(locals().get('instance', None), 'close', None)
+                if callable(close):
+                    close()
+                if not (
+                    self.model_profile.get('provider') == 'qwen'
+                    and getattr(self, 'context_tier', '8k-fast') == '64k-full'
+                    and _is_retryable_qwen64k_context_create_failure(category)
+                ):
+                    self.last_runtime_init_attempts = attempts
+                    raise
+                if profile_name == ladder[-1]:
+                    break
+        self.last_runtime_init_attempts = attempts
+        reason = attempts[-1].get('safe_error_category') if attempts else 'runtime_context_create_failed'
+        raise RuntimeError(
+            f'Qwen 64K runtime memory/KV/cache profile exhaustion before registration; '
+            f'last_category={reason}; attempts={len(attempts)}'
+        ) from last_exc
+
     def get_llm_instance(self):
         """
         Gets the Llama instance, initializing it if necessary (thread-safe),
@@ -2965,8 +3126,9 @@ class ModelManager:
 
                             self.log_info(f"About to instantiate Llama model from {self.model_path}...")
                             self.log_info(f"Llama init started for {self.model_path}.")
-                            runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers, llama_cpp)
-                            llm_instance = Llama(**runtime_kwargs)
+                            llm_instance, runtime_kwargs, init_attempts = self._instantiate_llama_with_qwen64k_retry(
+                                Llama, n_gpu_layers, llama_cpp
+                            )
                             if self.model_profile.get('provider') == 'qwen':
                                 llm_type_module = type(llm_instance).__module__
                                 is_unit_test_fake = llm_type_module.startswith('tests.') and not os.path.basename(str(self.model_path)).startswith('Qwen3-')
@@ -3013,6 +3175,8 @@ class ModelManager:
                             memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
                             if isinstance(memory_profile, dict):
                                 compute_plan['qwen_64k_memory_profile'] = dict(memory_profile)
+                                compute_plan['runtime_init_attempts'] = list(getattr(self, 'last_runtime_init_attempts', []))
+                                compute_plan['selected_runtime_profile'] = getattr(self, 'selected_runtime_profile', None)
                                 applied_memory = memory_profile.get('applied') if isinstance(memory_profile.get('applied'), dict) else {}
                                 compute_plan['kv_cache_mode'] = {
                                     key: applied_memory.get(key)

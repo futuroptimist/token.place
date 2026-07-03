@@ -36,6 +36,19 @@ QWEN_64K_YARN_UNSUPPORTED_MESSAGE = (
 # wheels accept rope_scaling_type as a constructor kwarg but do not export the
 # generated enum symbol, so this is only used after constructor support is verified.
 LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK = 2
+QWEN_64K_KV_CACHE_TYPE = 'q8_0'
+QWEN_64K_FLASH_ATTN = True
+QWEN_64K_OFFLOAD_KQV = True
+QWEN_64K_N_BATCH = 512
+QWEN_64K_N_UBATCH = 128
+QWEN_64K_MEMORY_PROFILE_KWARGS = {
+    'type_k': QWEN_64K_KV_CACHE_TYPE,
+    'type_v': QWEN_64K_KV_CACHE_TYPE,
+    'flash_attn': QWEN_64K_FLASH_ATTN,
+    'offload_kqv': QWEN_64K_OFFLOAD_KQV,
+    'n_batch': QWEN_64K_N_BATCH,
+    'n_ubatch': QWEN_64K_N_UBATCH,
+}
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
     'collections',
@@ -171,6 +184,23 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
 
 def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
     return _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
+
+
+def _qwen_64k_memory_profile(llama_cls: Any) -> Dict[str, Any]:
+    """Return conservative 64K-only llama.cpp cache kwargs supported by the runtime."""
+
+    support = _llama_constructor_supports_kwargs(llama_cls, QWEN_64K_MEMORY_PROFILE_KWARGS)
+    applied = {
+        name: value
+        for name, value in QWEN_64K_MEMORY_PROFILE_KWARGS.items()
+        if support.get(name)
+    }
+    return {
+        'id': 'qwen3_64k_q8_kv_cache',
+        'attempted': dict(QWEN_64K_MEMORY_PROFILE_KWARGS),
+        'applied': applied,
+        'constructor_kwarg_support': support,
+    }
 
 def _is_site_packages_path(path_text: Any) -> bool:
     normalized = str(path_text).replace('\\', '/').lower()
@@ -2334,7 +2364,20 @@ class ModelManager:
                     'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
                 }
             )
+            memory_profile = _qwen_64k_memory_profile(llama_cls)
+            kwargs.update(memory_profile['applied'])
+            self.last_qwen_64k_memory_profile_diagnostics = {
+                'active': True,
+                'profile_id': memory_profile['id'],
+                'attempted': memory_profile['attempted'],
+                'applied': memory_profile['applied'],
+                'constructor_kwarg_support': memory_profile['constructor_kwarg_support'],
+            }
         else:
+            self.last_qwen_64k_memory_profile_diagnostics = {
+                'active': False,
+                'missing_reason': 'not_required_for_active_profile_or_tier',
+            }
             self.last_yarn_rope_diagnostics = {
                 'supported': False,
                 'active': False,
@@ -2671,6 +2714,14 @@ class ModelManager:
                                 'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
                                 'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
+                                'llama_cpp_python_version': _llama_cpp_python_version(llama_cpp),
+                                'qwen_64k_kv_cache_profile': getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None),
+                                'type_k': runtime_kwargs.get('type_k'),
+                                'type_v': runtime_kwargs.get('type_v'),
+                                'flash_attn': runtime_kwargs.get('flash_attn'),
+                                'offload_kqv': runtime_kwargs.get('offload_kqv'),
+                                'n_batch': runtime_kwargs.get('n_batch'),
+                                'n_ubatch': runtime_kwargs.get('n_ubatch'),
                             })
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):

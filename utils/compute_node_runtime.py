@@ -44,6 +44,59 @@ def _log_warning(message: str, *, exc_info: bool = False) -> None:
         logger.warning(message, exc_info=exc_info)
 
 
+_RUNTIME_SMOKE_REASON_BY_CATEGORY = {
+    "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+    "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
+    "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
+    "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "worker_timeout": "runtime_completion_smoke_worker_timeout",
+    "worker_dead": "runtime_completion_smoke_worker_dead",
+    "unknown_generation_exception": "runtime_completion_smoke_exception",
+}
+
+
+def _bounded_safe_error_summary(exc: BaseException, *, limit: int = 240) -> str:
+    text = str(exc)
+    for marker in ("/Users/", "/home/", "/workspace/", "\\Users\\"):
+        text = text.replace(marker, "<path>/")
+    lowered = text.lower()
+    if any(secretish in lowered for secretish in ("prompt", "message", "response", "content", "cipher", "key")):
+        return "<redacted_request_content>"
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def classify_completion_smoke_exception(exc: BaseException) -> Dict[str, Any]:
+    diagnostics = getattr(exc, "diagnostics", None)
+    safe_diag = diagnostics if isinstance(diagnostics, dict) else {}
+    text = f"{type(exc).__name__} {_bounded_safe_error_summary(exc)} {safe_diag}".lower()
+    category = "unknown_generation_exception"
+    rejected_option = safe_diag.get("rejected_option")
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        category = "worker_timeout"
+    elif "worker_dead" in text or "worker exited" in text or "broken pipe" in text or "eof" in text:
+        category = "worker_dead"
+    elif safe_diag.get("reason") in {"unsupported_generation_option", "unsupported_generation_kwarg"} or rejected_option:
+        category = "unsupported_generation_kwarg"
+    elif "kv cache" in text or "kv_cache" in text or "llama_kv_cache" in text:
+        category = "kv_cache_allocation"
+    elif "metal" in text and ("alloc" in text or "out of memory" in text or "oom" in text):
+        category = "metal_memory_allocation"
+    elif "yarn" in text or "rope" in text:
+        category = "rope_yarn_eval_failure"
+    return {
+        "category": category,
+        "safe_reason": _RUNTIME_SMOKE_REASON_BY_CATEGORY[category],
+        "exception_type": type(exc).__name__,
+        "safe_error_summary": _bounded_safe_error_summary(exc),
+        "worker_diagnostics": {
+            key: value for key, value in safe_diag.items()
+            if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None)))
+            and key not in {"prompt", "messages", "content", "response", "ciphertext", "key"}
+        },
+    }
+
+
 @dataclass(frozen=True)
 class ComputeNodeRuntimeConfig:
     """Runtime configuration shared by all compute-node hosts."""
@@ -440,6 +493,14 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
+            "api_v1_readiness_yarn_rope_resolver_source": yarn_diagnostics.get("yarn_resolver_source") or yarn_diagnostics.get("yarn_enum_location"),
+            "api_v1_readiness_qwen_64k_kv_cache_profile": diagnostics.get("qwen_64k_kv_cache_profile"),
+            "api_v1_readiness_kv_type_k": diagnostics.get("type_k"),
+            "api_v1_readiness_kv_type_v": diagnostics.get("type_v"),
+            "api_v1_readiness_flash_attn": diagnostics.get("flash_attn"),
+            "api_v1_readiness_offload_kqv": diagnostics.get("offload_kqv"),
+            "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+            "api_v1_readiness_llama_cpp_python_version": diagnostics.get("llama_cpp_python_version") or yarn_diagnostics.get("llama_cpp_python_version"),
         })
 
         yarn_required_for_active_tier = (
@@ -561,14 +622,21 @@ class ComputeNodeRuntime:
                     }
             except Exception as exc:
                 admitted = False
+                smoke_exception = classify_completion_smoke_exception(exc)
+                safe_reason = smoke_exception["safe_reason"]
                 admission_error = {
                     "code": "compute_node_context_admission_unavailable",
-                    "internal_reason": "runtime_completion_smoke_exception",
+                    "internal_reason": safe_reason,
                 }
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
-                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = "runtime_completion_smoke_exception"
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = safe_reason
                 diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
-                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = type(exc).__name__
+                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = smoke_exception["exception_type"]
+                diagnostics["api_v1_readiness_completion_smoke_exception_category"] = smoke_exception["category"]
+                diagnostics["api_v1_readiness_completion_smoke_safe_error_summary"] = smoke_exception["safe_error_summary"]
+                diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = smoke_exception["worker_diagnostics"]
+                diagnostics["api_v1_readiness_completion_smoke_repair_attempted"] = False
+                diagnostics["api_v1_readiness_completion_smoke_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
             diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None

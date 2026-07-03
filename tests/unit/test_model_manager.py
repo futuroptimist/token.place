@@ -4929,3 +4929,76 @@ def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_avail
     assert diagnostics['missing_reason'] is None
     assert diagnostics['missing_required_kwargs'] == []
     assert diagnostics['yarn_resolver_source'] == 'top_level_enum'
+
+
+def test_qwen_64k_runtime_kwargs_apply_memory_profile_only_to_64k():
+    class Qwen64KLlama:
+        def __init__(
+            self,
+            model_path,
+            n_gpu_layers,
+            n_ctx,
+            verbose,
+            rope_scaling_type=None,
+            yarn_ext_factor=None,
+            yarn_orig_ctx=None,
+            type_k=None,
+            type_v=None,
+            flash_attn=None,
+            offload_kqv=None,
+            n_batch=None,
+            n_ubatch=None,
+        ):
+            self.kwargs = {
+                "model_path": model_path,
+                "n_gpu_layers": n_gpu_layers,
+                "n_ctx": n_ctx,
+                "verbose": verbose,
+                "rope_scaling_type": rope_scaling_type,
+                "yarn_ext_factor": yarn_ext_factor,
+                "yarn_orig_ctx": yarn_orig_ctx,
+                "type_k": type_k,
+                "type_v": type_v,
+                "flash_attn": flash_attn,
+                "offload_kqv": offload_kqv,
+                "n_batch": n_batch,
+                "n_ubatch": n_ubatch,
+            }
+
+    llama_cpp_module = SimpleNamespace(
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        __version__="0.3.32",
+        __file__="/safe/site-packages/llama_cpp/__init__.py",
+    )
+    manager = ModelManager(MagicMock())
+    manager.model_profile = {
+        "provider": "qwen",
+        "chat_template_policy": "gguf-jinja",
+        "native_context_tokens": 32768,
+        "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
+    }
+    manager.profile_id = "qwen3-8b-q4-k-m"
+    manager.model_path = "/models/Qwen3-8B-Q4_K_M.gguf"
+    manager.config = {"model.context_size": 65536}
+    manager.context_tier = "64k-full"
+
+    kwargs = manager._runtime_init_kwargs(Qwen64KLlama, -1, llama_cpp_module)
+
+    assert kwargs["n_ctx"] == 65536
+    assert kwargs["rope_scaling_type"] == 2
+    assert kwargs["yarn_ext_factor"] == 2.0
+    assert kwargs["yarn_orig_ctx"] == 32768
+    assert kwargs["type_k"] == "q8_0"
+    assert kwargs["type_v"] == "q8_0"
+    assert kwargs["flash_attn"] is True
+    assert kwargs["offload_kqv"] is True
+    assert kwargs["n_batch"] == 512
+    assert kwargs["n_ubatch"] == 128
+    assert manager.last_qwen_64k_memory_profile_diagnostics["active"] is True
+
+    manager.config = {"model.context_size": 8192}
+    manager.context_tier = "8k-fast"
+    kwargs = manager._runtime_init_kwargs(Qwen64KLlama, -1, llama_cpp_module)
+    assert "rope_scaling_type" not in kwargs
+    assert "type_k" not in kwargs
+    assert manager.last_qwen_64k_memory_profile_diagnostics["active"] is False

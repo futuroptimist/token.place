@@ -5207,6 +5207,65 @@ def test_qwen_64k_subprocess_child_unknown_signature_without_yarn_value_fails_cl
     assert 'missing constructor kwargs' in diagnostics['missing_reason']
 
 
+def test_qwen_64k_runtime_init_guard_rejects_supported_probe_without_yarn_value(tmp_path, monkeypatch):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            pass
+
+    fake_llama_cpp = SimpleNamespace(Llama=FakeLlama, __file__='/runtime/llama_cpp/__init__.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_runtime_supports_qwen_yarn_rope',
+        lambda _module, _cls: {
+            'supported': True,
+            'support_classification': 'supported',
+            'yarn_enum_value': None,
+            'yarn_enum_location': 'worker_probe',
+            'yarn_resolver_source': 'top_level_enum',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True,
+                'yarn_ext_factor': True,
+                'yarn_orig_ctx': True,
+            },
+            'missing_reason': None,
+            'llama_module_path': '/runtime/llama_cpp/__init__.py',
+            'llama_cpp_python_version': '0.3.32',
+            'accepted_constructor_kwargs': ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'],
+            'missing_required_kwargs': [],
+            'capability_source': 'worker_probe',
+            'constructor_signature_inspectable': True,
+            'constructor_has_var_kwargs': False,
+            'parent_facade_type': None,
+            'child_probe_reprobe_attempted': False,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match='missing concrete YaRN enum value from supported child probe'):
+        manager._runtime_init_kwargs(FakeLlama, 0, fake_llama_cpp)
+
+    assert manager.last_yarn_rope_diagnostics['supported'] is False
+    assert manager.last_yarn_rope_diagnostics['missing_reason'] == (
+        'missing concrete YaRN enum value from supported child probe'
+    )
+
+
 def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
     from utils.llm import model_manager as model_manager_module
 
@@ -5214,10 +5273,28 @@ def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
         'backend': 'metal',
         'gpu_offload_supported': True,
         'runtime_action': 'already_supported',
+        'llama_cpp_python_version': '0.3.32',
+        'constructor_has_var_kwargs': 1,
+        'constructor_signature_inspectable': 0,
+        'qwen_64k_yarn_support': 'unknown',
+        'yarn_resolver_source': 'numeric_fallback',
         'yarn_enum_value': '2',
     })
 
     assert coerced['yarn_enum_value'] == 2
+    assert coerced['llama_cpp_python_version'] == '0.3.32'
+    assert coerced['constructor_has_var_kwargs'] is True
+    assert coerced['constructor_signature_inspectable'] is False
+    assert coerced['qwen_64k_yarn_support'] == 'unknown'
+    assert coerced['yarn_resolver_source'] == 'numeric_fallback'
+
+
+def test_optional_int_enum_coercion_rejects_bool_none_and_accepts_signed_string():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._coerce_optional_int_enum(True) is None
+    assert model_manager_module._coerce_optional_int_enum(None) is None
+    assert model_manager_module._coerce_optional_int_enum('-2') == -2
 
 
 def test_desktop_runtime_probe_omits_malformed_yarn_enum_value():

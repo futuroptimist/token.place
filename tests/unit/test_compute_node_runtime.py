@@ -20,6 +20,7 @@ from utils.compute_node_runtime import (
     resolve_relay_url,
     _classify_completion_smoke_exception,
     _completion_smoke_reason_from_api_v1_error,
+    _readiness_smoke_model_id,
     _safe_completion_smoke_worker_diagnostics,
 )
 
@@ -155,6 +156,72 @@ def test_classify_completion_smoke_exception_uses_safe_specific_reasons(exc, exp
     assert diagnostics["sanitized_error_summary"] == f"{type(exc).__name__}:redacted"
     assert "prompt text" not in json.dumps(diagnostics)
 
+
+
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_rejected_value_types_and_unknown_keys():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "retryable": {"nested": "not allowed"},
+            "unallowlisted": "safe-looking-but-not-allowed",
+            "stderr_tail": "llama kv cache allocation failed " + "x" * 1300,
+            "profile_id": "profile id with spaces",
+            "exception_type": "RuntimeError",
+        }
+    )
+
+    assert safe == {"exception_type": "RuntimeError"}
+
+
+class _SmokeDiagnosticsError(RuntimeError):
+    def __init__(self, diagnostics):
+        super().__init__("worker diagnostics should drive smoke reason")
+        self.diagnostics = diagnostics
+
+
+def test_classify_completion_smoke_exception_uses_safe_worker_category_and_reason():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        _SmokeDiagnosticsError(
+            {
+                "generation_exception_category": "worker_dead",
+                "reason": "unsupported_generation_option",
+                "prompt": "Reply with exactly: ok",
+            }
+        )
+    )
+
+    assert category == "worker_dead"
+    assert reason == "runtime_completion_smoke_worker_dead"
+    assert diagnostics["worker_diagnostics"] == {
+        "generation_exception_category": "worker_dead",
+        "reason": "unsupported_generation_option",
+    }
+    assert "Reply with exactly" not in json.dumps(diagnostics)
+
+
+def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason_without_category():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        _SmokeDiagnosticsError({"reason": "unsupported_generation_option"})
+    )
+
+    assert category == "unsupported_generation_kwarg"
+    assert reason == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
+
+
+def test_classify_completion_smoke_exception_detects_rope_scaling_text():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        RuntimeError("RoPE scaling failure before eval")
+    )
+
+    assert category == "rope_yarn_eval_failure"
+    assert reason == "runtime_completion_smoke_rope_yarn_eval_failure"
+    assert diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
+
+
+def test_readiness_smoke_model_id_falls_back_to_model_path_basename_and_empty():
+    manager = SimpleNamespace(api_model_id="  ", model_id=None, file_name="", model_path="/models/Qwen3-8B.gguf")
+    assert _readiness_smoke_model_id(manager) == "Qwen3-8B.gguf"
+    assert _readiness_smoke_model_id(SimpleNamespace()) == ""
 
 def test_compute_node_runtime_ensure_model_ready_download_success():
     model_manager = MagicMock()
@@ -734,6 +801,37 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_invalid_shared_envelope(monkeypatch):
+    class EnvelopeRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            return {"api_v1_response": {"message": {"role": "tool", "content": "not assistant"}}}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=EnvelopeRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "invalid_api_v1_envelope"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content(monkeypatch):

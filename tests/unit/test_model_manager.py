@@ -2634,8 +2634,8 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
     fake_pkg.mkdir(parents=True)
     (fake_pkg / '__init__.py').write_text(
         "import sys\n"
-        "print('stdout clue before exit')\n"
-        "print('stderr clue before exit', file=sys.stderr)\n"
+        "print('stdout llama_context clue before exit')\n"
+        "print('stderr llama_context clue before exit', file=sys.stderr)\n"
         "sys.exit(7)\n",
         encoding='utf-8',
     )
@@ -2649,10 +2649,10 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
     assert 'llama_cpp_import subprocess exited before JSON handshake' in message
     assert 'llama_cpp_import subprocess ended' not in message
     assert 'exit_code=7' in message
-    assert 'stdout clue before exit' in message
-    assert 'stderr clue before exit' in message
-    assert 'import_root=C:' in message
-    assert 'token.place desktop' in message
+    assert 'stdout llama_context clue before exit' in message
+    assert 'stderr llama_context clue before exit' in message
+    assert 'import_root=<path>' in message
+    assert 'token.place desktop' not in message
 
 
 def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monkeypatch):
@@ -2678,7 +2678,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","prompt":"secret prompt","chunk":"generated text"}\n',
                 'native loader clue\n',
             ]
-            self._token_place_stderr_tail = ['stderr clue\n']
+            self._token_place_stderr_tail = ['stderr llama_context clue\n']
 
         def poll(self):
             return 9
@@ -2708,6 +2708,8 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
     assert 'TOKEN_PLACE_LLAMA_CPP_JSON' not in message
     assert 'secret prompt' not in message
     assert 'generated text' not in message
+    assert 'native loader clue' not in message
+    assert 'stderr_tail=' in message
     assert created
 
 
@@ -3138,7 +3140,7 @@ def test_subprocess_llama_proxy_initialization_failure_still_terminates_worker(t
         )
 
     message = str(exc_info.value)
-    assert 'init failed clearly' in message
+    assert 'safe_error_category=' in message
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
@@ -3161,7 +3163,10 @@ def test_llama_subprocess_request_error_is_typed_only_for_inference_stage():
             stage='llama_cpp_init',
         )
 
-    assert str(exc_info.value) == 'init failed'
+    assert str(exc_info.value) == (
+        'llama_cpp_init failed; child_exception_type=RuntimeError; '
+        'safe_error_category=runtime_init_unclassified'
+    )
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
@@ -3573,6 +3578,37 @@ def test_llama_subprocess_transport_error_payload_raises_restartable_eof():
             stage='llama_cpp_inference',
         )
 
+
+def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
+    from utils.llm import model_manager as model_manager_module
+
+    class _Stdout:
+        def __iter__(self):
+            return iter((
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"transport_error","error":"prompt=SECRET_PROMPT authorization=Bearer SECRET_TOKEN"}\n',
+            ))
+
+    process = SimpleNamespace(
+        stdout=_Stdout(),
+        stderr=None,
+        wait=MagicMock(return_value=7),
+        poll=lambda: None,
+        returncode=None,
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=0.2,
+            stage='llama_cpp_import',
+        )
+
+    error = str(exc_info.value)
+    assert 'unsafe child diagnostic omitted' in error
+    assert 'SECRET_PROMPT' not in error
+    assert 'SECRET_TOKEN' not in error
+    assert 'authorization' not in error
 
 def test_subprocess_llama_proxy_liveness_and_close_edge_cases():
     from utils.llm import model_manager as model_manager_module
@@ -4969,13 +5005,13 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is not None
 
-    assert captured['type_k'] == 8
-    assert captured['type_v'] == 8
+    assert 'type_k' not in captured
+    assert 'type_v' not in captured
     assert 'flash_attn' not in captured
     assert 'offload_kqv' not in captured
-    assert captured['n_batch'] == 256
-    assert captured['n_ubatch'] == 128
-    assert manager.last_compute_diagnostics['kv_cache_mode']['type_k'] == 8
+    assert 'n_batch' not in captured
+    assert 'n_ubatch' not in captured
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_default'
 
 
 def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
@@ -5025,7 +5061,7 @@ def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
 
     assert facade.LLAMA_TYPE_Q8_0 == 8
     assert kwargs == {}
-    assert diagnostics['kv_cache_type_name'] == 'LLAMA_TYPE_Q8_0'
+    assert diagnostics['kv_precision'] == 'q8'
     assert diagnostics['constructor_kwarg_support']['type_k'] is False
 
 
@@ -5050,7 +5086,7 @@ def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
             'constructor_kwarg_support': support,
-            'q8_kv_cache_type_value': 18,
+            'q8_kv_cache_type_value': 8,
             'capability_source': 'worker_probe',
         },
     )
@@ -5403,7 +5439,7 @@ def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
             }
 
     kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
-        SimpleNamespace(LLAMA_TYPE_Q8_0=8),
+        SimpleNamespace(),
         FakeLlama,
         enable_kqv_offload=False,
     )
@@ -5434,7 +5470,7 @@ def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
             'constructor_kwarg_support': support,
-            'q8_kv_cache_type_value': 18,
+            'q8_kv_cache_type_value': 8,
             'capability_source': 'worker_probe',
         },
     )
@@ -5445,11 +5481,57 @@ def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
         enable_kqv_offload=True,
     )
 
-    assert kwargs['type_k'] == 18
-    assert kwargs['type_v'] == 18
+    assert kwargs['type_k'] == 8
+    assert kwargs['type_v'] == 8
     assert kwargs['flash_attn'] is True
     assert kwargs['offload_kqv'] is True
     assert diagnostics['capability_source'] == 'worker_probe'
+
+
+def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile():
+    from utils.llm import model_manager as model_manager_module
+
+    class NoKvEnumLlama:
+        __token_place_supported_constructor_kwargs__ = ('flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        SimpleNamespace(),
+        NoKvEnumLlama,
+        model_path='model.gguf',
+        n_ctx=65536,
+    )
+
+    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_default']
+    skipped = profiles[0]['diagnostics']['skipped_profiles']
+    assert skipped
+    assert all(not item['enabled'] for item in skipped)
+    assert all('flash_attn' not in item['applied'] for item in skipped)
+    assert all('type_k' not in item['applied'] and 'type_v' not in item['applied'] for item in skipped)
+
+
+def test_child_diagnostics_drop_payloads_keys_and_arbitrary_stderr():
+    from utils.llm import model_manager as model_manager_module
+
+    text = """
+prompt: reveal SECRET_PROMPT_123
+assistant: SECRET_ASSISTANT_456
+ciphertext_body=abc123 key=sk-token decrypted payload
+random child stderr snippet survives?
+/Users/Alice/Application Support/token.place/model.gguf
+ggml_metal: KV cache allocation failed for llama_context
+"""
+
+    sanitized = model_manager_module._sanitize_child_diagnostic_text(text)
+
+    assert 'SECRET_PROMPT_123' not in sanitized
+    assert 'SECRET_ASSISTANT_456' not in sanitized
+    assert 'ciphertext_body' not in sanitized
+    assert 'decrypted payload' not in sanitized
+    assert 'sk-token' not in sanitized
+    assert 'random child stderr snippet' not in sanitized
+    assert '/Users/Alice' not in sanitized
+    assert 'Application Support' not in sanitized
+    assert 'KV cache allocation failed' in sanitized
 
 
 def test_qwen_64k_memory_profile_omits_kwargs_when_worker_probe_lacks_support():
@@ -5499,3 +5581,208 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
     summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
 
     assert summary == 'RuntimeError:metal_memory_allocation'
+
+def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if 'type_k' not in kwargs:
+                raise ValueError('Failed to create llama_context: Metal KV cache allocation failed')
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert len(attempts) == 2
+    assert attempts[0]['n_ctx'] == 65536
+    assert 'type_k' not in attempts[0]
+    assert attempts[1]['type_k'] == 8
+    assert attempts[1]['type_v'] == 8
+    assert attempts[1]['flash_attn'] is True
+    assert attempts[1]['offload_kqv'] is True
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
+
+
+def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            raise ValueError('Failed to create llama_context: Metal buffer size too large')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 3
+    assert manager.llm is None
+    assert 'Qwen 64K memory/KV/cache profile exhaustion before registration' in manager.last_runtime_init_error
+    assert 'runtime_context_create_metal_buffer_limit' in manager.last_runtime_init_error
+
+
+def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
+    from utils.llm import model_manager as model_manager_module
+
+    class KwargsLlama:
+        def __init__(self, **kwargs):
+            pass
+
+    top_value, top_diag = model_manager_module._resolve_ggml_kv_cache_type(
+        SimpleNamespace(GGML_TYPE_Q8_0=8), KwargsLlama, 'q8'
+    )
+    nested_value, nested_diag = model_manager_module._resolve_ggml_kv_cache_type(
+        SimpleNamespace(llama_cpp=SimpleNamespace(LLAMA_TYPE_Q4_0=2)), KwargsLlama, 'q4'
+    )
+    fallback_value, fallback_diag = model_manager_module._resolve_ggml_kv_cache_type(
+        SimpleNamespace(), KwargsLlama, 'q8'
+    )
+
+    assert (top_value, top_diag['source']) == (8, 'top_level')
+    assert (nested_value, nested_diag['source']) == (2, 'nested')
+    assert (fallback_value, fallback_diag['source']) == (8, 'verified_numeric_fallback')
+
+
+def test_child_context_create_error_classification_and_stderr_redaction():
+    from utils.llm import model_manager as model_manager_module
+
+    stderr = '/Users/alice/app/model.gguf ggml_metal: failed to allocate KV cache buffer'
+    assert model_manager_module._classify_runtime_context_create_error(
+        ValueError('Failed to create llama_context'), stderr
+    ) == 'runtime_context_create_kv_cache_allocation'
+    redacted = model_manager_module._redact_paths_from_text(stderr)
+    assert '/Users/alice' not in redacted
+    assert '<path>' in redacted
+
+
+def test_safe_constructor_capability_payload_rejects_bool_kv_values():
+    from utils.llm import model_manager as model_manager_module
+
+    module = SimpleNamespace(__token_place_worker_capabilities__={
+        'constructor_kwarg_support': {'type_k': True},
+        'q8_kv_cache_type_value': True,
+        'q4_kv_cache_type_value': 2,
+    })
+
+    payload = model_manager_module._safe_constructor_capability_payload(module)
+
+    assert 'q8_kv_cache_type_value' not in payload
+    assert payload['q4_kv_cache_type_value'] == 2
+
+
+def test_unrecognized_init_failure_is_not_context_create_retryable():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        RuntimeError('invalid gguf header: missing tensor metadata')
+    )
+
+    assert category == 'runtime_init_unclassified'
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_buffer_evidence():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        ValueError('Failed to create llama_context')
+    )
+
+    assert category == 'runtime_context_create_failed'
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines():
+    from utils.llm import model_manager as model_manager_module
+
+    raw = (
+        'ggml_metal: KV cache allocation failed; prompt=SECRET_PROMPT assistant=SECRET_ASSISTANT '
+        'ciphertext=CIPHERTEXT_BODY key=API_KEY_VALUE token=TOKEN_VALUE user_token=SK_LIVE_VALUE\n'
+        'llama_context failed with decrypted_payload=PLAINTEXT_PAYLOAD and arbitrary SECRET_SNIPPET\n'
+    )
+
+    sanitized = model_manager_module._sanitize_child_diagnostic_text(raw)
+
+    assert 'ggml_metal' in sanitized
+    assert 'KV cache allocation failed' in sanitized
+    assert 'llama_context failed' in sanitized
+    for leaked in (
+        'SECRET_PROMPT',
+        'SECRET_ASSISTANT',
+        'CIPHERTEXT_BODY',
+        'API_KEY_VALUE',
+        'TOKEN_VALUE',
+        'PLAINTEXT_PAYLOAD',
+        'SECRET_SNIPPET',
+        'SK_LIVE_VALUE',
+    ):
+        assert leaked not in sanitized
+    assert 'prompt=<redacted>' in sanitized
+    assert 'ciphertext=<redacted>' in sanitized
+    assert 'decrypted_payload=<redacted>' in sanitized
+    assert 'user_token=<redacted>' in sanitized
+
+def test_path_redaction_handles_spaces_and_traceback_paths():
+    from utils.llm import model_manager as model_manager_module
+
+    text = 'File "/Users/Alice/Application Support/token.place/model.gguf", line 10, in <module>'
+    redacted = model_manager_module._redact_paths_from_text(text)
+
+    assert '/Users/Alice' not in redacted
+    assert 'Application Support' not in redacted
+    assert '<path>' in redacted

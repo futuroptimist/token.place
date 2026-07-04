@@ -833,8 +833,8 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
     fake_init = fake_pkg / "__init__.py"
     fake_init.write_text(
         "import sys\n"
-        "print('facade stdout clue before exit')\n"
-        "print('facade stderr clue before exit', file=sys.stderr)\n"
+        "print('llama_context facade stdout clue before exit')\n"
+        "print('llama_context facade stderr clue before exit', file=sys.stderr)\n"
         "sys.exit(7)\n",
         encoding="utf-8",
     )
@@ -879,7 +879,8 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
     assert "facade stdout clue before exit" in combined, combined
     assert "facade stderr clue before exit" in combined, combined
     assert "import_root=" in combined, combined
-    assert str(fake_init) in combined, combined
+    assert str(fake_init) not in combined, combined
+    assert "module_path_hint=<path>" in combined, combined
 
 
 def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(

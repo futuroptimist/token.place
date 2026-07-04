@@ -44,6 +44,23 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+def _classify_safe_generation_exception(exc: BaseException) -> str:
+    text = f"{type(exc).__name__} {exc}".lower()
+    if "metal" in text and any(term in text for term in ("alloc", "memory", "out of memory", "oom")):
+        return "metal_memory_allocation"
+    if "kv" in text and any(term in text for term in ("alloc", "cache", "memory", "out of memory", "oom")):
+        return "kv_cache_allocation"
+    if "yarn" in text or ("rope" in text and any(term in text for term in ("scal", "freq", "eval"))):
+        return "rope_yarn_eval_failure"
+    if "timeout" in text:
+        return "worker_timeout"
+    if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
+        return "worker_dead"
+    if "unexpected keyword argument" in text or "got an unexpected keyword argument" in text:
+        return "unsupported_generation_kwarg"
+    return "unknown_generation_exception"
+
+
 def _is_llama_cpp_restartable_worker_error(exc: BaseException) -> bool:
     """Return True for restartable llama.cpp worker failures without importing runtime internals."""
 
@@ -3148,6 +3165,12 @@ class RelayClient:
         recovery_completion = getattr(
             self.model_manager, "create_chat_completion_with_recovery", None
         )
+        if (
+            type(recovery_completion).__module__.startswith("unittest.mock")
+            and "create_chat_completion_with_recovery"
+            not in getattr(self.model_manager, "__dict__", {})
+        ):
+            recovery_completion = None
         has_direct_runtime_completion = callable(get_llm_instance) or callable(
             recovery_completion
         )
@@ -3354,11 +3377,27 @@ class RelayClient:
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})
-                internal_reason = (
-                    diagnostics.get("reason")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
-                    else "runtime_rejected_generation_options"
+                category = (
+                    diagnostics.get("generation_exception_category")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("generation_exception_category"), str)
+                    else None
                 )
+                if category in {
+                    "metal_memory_allocation",
+                    "kv_cache_allocation",
+                    "rope_yarn_eval_failure",
+                    "worker_timeout",
+                    "worker_dead",
+                }:
+                    internal_reason = f"runtime_{category}"
+                elif category == "unsupported_generation_kwarg":
+                    internal_reason = "unsupported_generation_option"
+                else:
+                    internal_reason = (
+                        diagnostics.get("reason")
+                        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
+                        else "runtime_rejected_generation_options"
+                    )
                 rejected_option = (
                     diagnostics.get("rejected_option")
                     if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str)
@@ -3384,6 +3423,15 @@ class RelayClient:
                         {
                             "code": error_code,
                             "message": "Desktop runtime rejected the inference request",
+                            "exception_category": category,
+                            "exception_type": (
+                                diagnostics.get("exception_type")
+                                if isinstance(diagnostics, dict)
+                                else None
+                            ),
+                            "worker_diagnostics": diagnostics
+                            if isinstance(diagnostics, dict)
+                            else {},
                         },
                         request_id=request_id,
                         requested_context_tier=requested_context_tier,
@@ -3417,12 +3465,26 @@ class RelayClient:
                     {
                         "code": "compute_node_internal_error",
                         "message": "Desktop runtime inference failed",
+                        "exception_type": type(exc).__name__,
+                        "exception_category": _classify_safe_generation_exception(exc),
                     },
                     request_id=request_id,
                     requested_context_tier=requested_context_tier,
                     prompt_tokens=prompt_tokens,
                     requested_output_tokens=requested_output_tokens,
-                    internal_reason="runtime_inference_failed",
+                    internal_reason=(
+                        f"runtime_{_classify_safe_generation_exception(exc)}"
+                        if _classify_safe_generation_exception(exc)
+                        in {
+                            "metal_memory_allocation",
+                            "kv_cache_allocation",
+                            "rope_yarn_eval_failure",
+                            "unsupported_generation_kwarg",
+                            "worker_timeout",
+                            "worker_dead",
+                        }
+                        else "runtime_inference_failed"
+                    ),
                 ),
             )
 

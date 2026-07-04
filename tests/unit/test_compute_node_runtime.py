@@ -527,7 +527,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
     assert runtime.ensure_api_v1_runtime_ready() is True
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
-    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "choices_message_content"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "api_v1_assistant_message"
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
@@ -591,8 +591,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_empty_output(mo
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_empty_output"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_empty_output"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape(monkeypatch):
@@ -624,8 +624,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content(monkeypatch):
@@ -657,8 +657,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
@@ -766,7 +766,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
-    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "reasoning_field_present"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "api_v1_error"
     assert "secret hidden reasoning" not in json.dumps(diagnostics)
 
 

@@ -5614,6 +5614,67 @@ def test_api_v1_runtime_rejected_generation_option_is_safe_options_error():
     assert error["recovery_succeeded"] is False
 
 
+def test_api_v1_runtime_rejected_generation_option_filters_worker_diagnostics():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+        "unexpected keyword argument 'top_k'",
+        diagnostics={
+            "code": "compute_node_options_unsupported",
+            "reason": "unsupported_generation_option",
+            "rejected_option": "top_k",
+            "generation_exception_category": "unsupported_generation_kwarg",
+            "exception_type": "TypeError",
+            "method": "create_chat_completion",
+            "unsafe_prompt": "SECRET prompt text",
+            "long_summary": "x" * 1000,
+            "nested": {"prompt": "SECRET"},
+        },
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-option-rejected-safe",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["worker_diagnostics"] == {
+        "code": "compute_node_options_unsupported",
+        "reason": "unsupported_generation_option",
+        "rejected_option": "top_k",
+        "generation_exception_category": "unsupported_generation_kwarg",
+        "exception_type": "TypeError",
+        "method": "create_chat_completion",
+    }
+    assert "SECRET" not in json.dumps(error)
+
+
+def test_api_v1_generic_unsupported_generation_kwarg_uses_options_error():
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = TypeError(
+        "create_chat_completion() got an unexpected keyword argument 'top_k'"
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-generic-option-rejected",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["exception_category"] == "unsupported_generation_kwarg"
+
+
 def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_callable():
     class RuntimeWithoutCompletion:
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):

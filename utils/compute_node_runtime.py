@@ -102,7 +102,11 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_thinking_leaked"
     if internal_reason == "qwen_empty_after_think_wrapper_strip":
         return "runtime_completion_smoke_empty_after_think_strip"
-    if internal_reason in {"unsupported_generation_option", "runtime_rejected_generation_options"}:
+    if internal_reason in {
+        "unsupported_generation_option",
+        "runtime_rejected_generation_options",
+        "runtime_unsupported_generation_kwarg",
+    }:
         return "runtime_completion_smoke_unsupported_generation_kwarg"
     if internal_reason in {"rope_yarn_eval_failure", "runtime_rope_yarn_eval_failure"}:
         return "runtime_completion_smoke_rope_yarn_eval_failure"
@@ -119,6 +123,24 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
     if error.get("code") == "compute_node_options_unsupported":
         return "runtime_completion_smoke_unsupported_generation_kwarg"
     return "runtime_completion_smoke_exception"
+
+
+def _readiness_smoke_model_id(model_manager: Any) -> str:
+    """Choose the best configured model id for the API v1 readiness smoke."""
+
+    for value in (
+        getattr(model_manager, "api_model_id", None),
+        getattr(model_manager, "model_id", None),
+        getattr(model_manager, "file_name", None),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    model_path = getattr(model_manager, "model_path", None)
+    if isinstance(model_path, str) and model_path.strip():
+        basename = os.path.basename(model_path.strip())
+        if basename:
+            return basename
+    return ""
 
 
 @dataclass(frozen=True)
@@ -604,7 +626,7 @@ class ComputeNodeRuntime:
                     )
                 smoke_envelope = generation_client._generate_api_v1_response_with_runtime_model(
                     request_id="api-v1-readiness-smoke",
-                    model_id=str(getattr(self.model_manager, "api_model_id", None) or ""),
+                    model_id=_readiness_smoke_model_id(self.model_manager),
                     messages=smoke_messages,
                     options={"max_tokens": smoke_max_tokens, "stream": False},
                     requested_context_tier=str(context_tier),

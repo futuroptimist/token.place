@@ -802,6 +802,45 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_text_choice(mon
     assert diagnostics["api_v1_readiness_result"] == "passed"
 
 
+def test_compute_node_runtime_readiness_smoke_uses_configured_model_id_fallback(monkeypatch):
+    observed = {}
+
+    def generate(**kwargs):
+        observed.update(kwargs)
+        return {
+            "api_v1_response": {
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        }
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = None
+    model_manager.model_id = "configured-runtime-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = SimpleNamespace(
+        create_chat_completion=lambda **_kwargs: {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        }
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2),
+            _generate_api_v1_response_with_runtime_model=generate,
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert observed["model_id"] == "configured-runtime-model"
+
+
 def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(monkeypatch):
     class RaisingRuntime:
         def render_and_tokenize_chat(self, *_args, **_kwargs):

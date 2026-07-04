@@ -61,6 +61,33 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
     return "unknown_generation_exception"
 
 
+_SAFE_WORKER_DIAGNOSTIC_KEYS = {
+    "code",
+    "reason",
+    "generation_exception_category",
+    "exception_type",
+    "rejected_option",
+    "method",
+    "retryable",
+}
+
+
+def _safe_worker_diagnostics(diagnostics: Any) -> Dict[str, Any]:
+    """Return an allowlisted, bounded subset of worker-owned diagnostics."""
+
+    if not isinstance(diagnostics, dict):
+        return {}
+    safe: Dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        if (
+            key in _SAFE_WORKER_DIAGNOSTIC_KEYS
+            and isinstance(key, str)
+            and isinstance(value, (str, bool, int, float, type(None)))
+        ):
+            safe[key] = value[:256] if isinstance(value, str) else value
+    return safe
+
+
 def _is_llama_cpp_restartable_worker_error(exc: BaseException) -> bool:
     """Return True for restartable llama.cpp worker failures without importing runtime internals."""
 
@@ -3167,6 +3194,9 @@ class RelayClient:
         )
         if (
             type(recovery_completion).__module__.startswith("unittest.mock")
+            and not callable(
+                getattr(type(self.model_manager), "create_chat_completion_with_recovery", None)
+            )
             and "create_chat_completion_with_recovery"
             not in getattr(self.model_manager, "__dict__", {})
         ):
@@ -3377,9 +3407,10 @@ class RelayClient:
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})
+                safe_worker_diagnostics = _safe_worker_diagnostics(diagnostics)
                 category = (
-                    diagnostics.get("generation_exception_category")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("generation_exception_category"), str)
+                    safe_worker_diagnostics.get("generation_exception_category")
+                    if isinstance(safe_worker_diagnostics.get("generation_exception_category"), str)
                     else None
                 )
                 if category in {
@@ -3394,18 +3425,21 @@ class RelayClient:
                     internal_reason = "unsupported_generation_option"
                 else:
                     internal_reason = (
-                        diagnostics.get("reason")
-                        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
+                        safe_worker_diagnostics.get("reason")
+                        if isinstance(safe_worker_diagnostics.get("reason"), str)
                         else "runtime_rejected_generation_options"
                     )
                 rejected_option = (
-                    diagnostics.get("rejected_option")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str)
+                    safe_worker_diagnostics.get("rejected_option")
+                    if isinstance(safe_worker_diagnostics.get("rejected_option"), str)
                     else None
                 )
                 error_code = (
-                    diagnostics.get("code")
-                    if isinstance(diagnostics, dict) and diagnostics.get("code") == "compute_node_options_unsupported"
+                    "compute_node_options_unsupported"
+                    if (
+                        safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
+                        or internal_reason == "unsupported_generation_option"
+                    )
                     else "compute_node_internal_error"
                 )
                 self._last_api_v1_runtime_health = {
@@ -3425,13 +3459,11 @@ class RelayClient:
                             "message": "Desktop runtime rejected the inference request",
                             "exception_category": category,
                             "exception_type": (
-                                diagnostics.get("exception_type")
-                                if isinstance(diagnostics, dict)
+                                safe_worker_diagnostics.get("exception_type")
+                                if isinstance(safe_worker_diagnostics, dict)
                                 else None
                             ),
-                            "worker_diagnostics": diagnostics
-                            if isinstance(diagnostics, dict)
-                            else {},
+                            "worker_diagnostics": safe_worker_diagnostics,
                         },
                         request_id=request_id,
                         requested_context_tier=requested_context_tier,
@@ -3459,27 +3491,35 @@ class RelayClient:
                 "Desktop runtime inference failed for API v1 relay request",
                 exc_info=True,
             )
+            exception_category = _classify_safe_generation_exception(exc)
+            unsupported_generation_kwarg = (
+                exception_category == "unsupported_generation_kwarg"
+            )
             return self._api_v1_response_envelope(
                 request_id,
                 error=self._api_v1_enrich_safe_error(
                     {
-                        "code": "compute_node_internal_error",
+                        "code": (
+                            "compute_node_options_unsupported"
+                            if unsupported_generation_kwarg
+                            else "compute_node_internal_error"
+                        ),
                         "message": "Desktop runtime inference failed",
                         "exception_type": type(exc).__name__,
-                        "exception_category": _classify_safe_generation_exception(exc),
+                        "exception_category": exception_category,
                     },
                     request_id=request_id,
                     requested_context_tier=requested_context_tier,
                     prompt_tokens=prompt_tokens,
                     requested_output_tokens=requested_output_tokens,
                     internal_reason=(
-                        f"runtime_{_classify_safe_generation_exception(exc)}"
-                        if _classify_safe_generation_exception(exc)
-                        in {
+                        "unsupported_generation_option"
+                        if unsupported_generation_kwarg
+                        else f"runtime_{exception_category}"
+                        if exception_category in {
                             "metal_memory_allocation",
                             "kv_cache_allocation",
                             "rope_yarn_eval_failure",
-                            "unsupported_generation_kwarg",
                             "worker_timeout",
                             "worker_dead",
                         }

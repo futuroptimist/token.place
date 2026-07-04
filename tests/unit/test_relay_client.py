@@ -5658,6 +5658,39 @@ def test_api_v1_runtime_rejected_generation_option_filters_worker_diagnostics():
     assert "SECRET" not in json.dumps(error)
 
 
+def test_api_v1_runtime_rejected_generation_option_drops_unsafe_allowed_values():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+        "worker rejected request",
+        diagnostics={
+            "generation_exception_category": "kv_cache_allocation",
+            "exception_type": "RuntimeError",
+            "reason": "SECRET prompt in an allowed key",
+            "method": "SECRET assistant output in an allowed key",
+            "stderr_tail": "SECRET stderr with prompt text",
+            "sanitized_error_summary": "SECRET summary with assistant text",
+        },
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-unsafe-allowed-values",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["internal_reason"] == "runtime_kv_cache_allocation"
+    assert error["worker_diagnostics"] == {
+        "generation_exception_category": "kv_cache_allocation",
+        "exception_type": "RuntimeError",
+    }
+    assert "SECRET" not in json.dumps(error)
+
+
 def test_api_v1_generic_unsupported_generation_kwarg_uses_options_error():
     manager = _ApiV1RuntimeManager()
     manager.runtime.create_chat_completion.side_effect = TypeError(

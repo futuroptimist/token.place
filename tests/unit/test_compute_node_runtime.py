@@ -1738,8 +1738,10 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
                 diagnostics={
                     "generation_exception_category": "metal_memory_allocation",
                     "exception_type": "RuntimeError",
-                    "sanitized_error_summary": "Metal failed to allocate KV cache",
+                    "sanitized_error_summary": "RuntimeError:redacted",
                     "method": "create_chat_completion",
+                    "reason": "SECRET prompt in allowed reason",
+                    "stderr_tail": "SECRET prompt in allowed stderr",
                 },
             )
 
@@ -1756,7 +1758,12 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_metal_memory_allocation"
     assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_metal_memory_allocation"
     assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "metal_memory_allocation"
-    assert diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]["method"] == "create_chat_completion"
+    worker_diagnostics = diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]
+    assert worker_diagnostics["method"] == "create_chat_completion"
+    assert worker_diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
+    assert "reason" not in worker_diagnostics
+    assert "stderr_tail" not in worker_diagnostics
+    assert "SECRET" not in json.dumps(diagnostics)
 
 
 def test_qwen_64k_yarn_eval_exception_fails_closed_before_registration():

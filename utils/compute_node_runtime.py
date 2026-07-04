@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -79,17 +80,67 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
 }
 
 
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
+    "code": {
+        "compute_node_internal_error",
+        "compute_node_options_unsupported",
+        "compute_node_runtime_unavailable",
+    },
+    "reason": {
+        "unsupported_generation_option",
+        "runtime_chat_template_metadata_missing",
+        "runtime_chat_template_renderer_unavailable",
+        "runtime_template_tokenizer_bridge_unavailable",
+    },
+    "generation_exception_category": {
+        "metal_memory_allocation",
+        "kv_cache_allocation",
+        "rope_yarn_eval_failure",
+        "unsupported_generation_kwarg",
+        "worker_timeout",
+        "worker_dead",
+        "unknown_generation_exception",
+    },
+    "method": {
+        "apply_chat_template",
+        "create_chat_completion",
+        "create_chat_completion_with_recovery",
+        "render_and_tokenize_chat",
+        "tokenize",
+    },
+    "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
+}
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
+
+
+def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if not isinstance(value, str):
+        return None
+    bounded = value[:256]
+    enum_values = _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES.get(key)
+    if enum_values is not None:
+        return bounded if bounded in enum_values else None
+    if key == "exception_type":
+        return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
+    if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
+        return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key in {"stderr_tail", "child_stderr_tail", "sanitized_error_summary"}:
+        return bounded if "redacted" in bounded.lower() else None
+    return None
+
+
 def _safe_completion_smoke_worker_diagnostics(diagnostics: Any) -> Dict[str, Any]:
     if not isinstance(diagnostics, dict):
         return {}
     safe: Dict[str, Any] = {}
     for key, value in diagnostics.items():
-        if (
-            key in _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS
-            and isinstance(key, str)
-            and isinstance(value, (str, bool, int, float, type(None)))
-        ):
-            safe[key] = value[:256] if isinstance(value, str) else value
+        if key in _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS and isinstance(key, str):
+            safe_value = _safe_completion_smoke_worker_diagnostic_value(key, value)
+            if safe_value is not None or value is None:
+                safe[key] = safe_value
     return safe
 
 

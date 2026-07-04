@@ -1442,9 +1442,9 @@ def _read_llama_subprocess_message(
     if not isinstance(message, dict):
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'transport_error':
-        safe_error = _sanitize_child_diagnostic_text(message.get('error')) or _redact_paths_from_text(
-            message.get('error') or f'{stage} worker exited before response'
-        )
+        safe_error = _sanitize_child_diagnostic_text(message.get('error'))
+        if not safe_error:
+            safe_error = f'{stage} worker transport error; unsafe child diagnostic omitted'
         raise LlamaCppWorkerEOFError(safe_error)
     if message.get('status') == 'error':
         raw_error = str(message.get('error') or f'{stage} failed')

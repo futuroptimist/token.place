@@ -3579,6 +3579,37 @@ def test_llama_subprocess_transport_error_payload_raises_restartable_eof():
         )
 
 
+def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
+    from utils.llm import model_manager as model_manager_module
+
+    class _Stdout:
+        def __iter__(self):
+            return iter((
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"transport_error","error":"prompt=SECRET_PROMPT authorization=Bearer SECRET_TOKEN"}\n',
+            ))
+
+    process = SimpleNamespace(
+        stdout=_Stdout(),
+        stderr=None,
+        wait=MagicMock(return_value=7),
+        poll=lambda: None,
+        returncode=None,
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=0.2,
+            stage='llama_cpp_import',
+        )
+
+    error = str(exc_info.value)
+    assert 'unsafe child diagnostic omitted' in error
+    assert 'SECRET_PROMPT' not in error
+    assert 'SECRET_TOKEN' not in error
+    assert 'authorization' not in error
+
 def test_subprocess_llama_proxy_liveness_and_close_edge_cases():
     from utils.llm import model_manager as model_manager_module
 

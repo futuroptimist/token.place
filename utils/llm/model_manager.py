@@ -405,17 +405,40 @@ _CHILD_DIAGNOSTIC_ALLOWLIST = re.compile(
     r'flash_attn|type_k|type_v|n_ctx|context|unsupported|keyword|argument|failed)',
     re.IGNORECASE,
 )
+_CHILD_DIAGNOSTIC_SENSITIVE_FIELD_RE = re.compile(
+    r'(?i)(?<![\w-])('
+    r'prompt|assistant|message|content|(?:decrypted[_-]?)?payload|ciphertext|plaintext|decrypted|secret|'
+    r'key|token|authorization|api[_-]?key'
+    r')(?![\w-])\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s,;]+)'
+)
+_CHILD_DIAGNOSTIC_SENSITIVE_TOKEN_RE = re.compile(
+    r'(?i)\b(?!(?:secret|ciphertext|plaintext|decrypted|(?:decrypted[_-]?)?payload|'
+    r'key|token|api[_-]?key)\b)[^\s,;:=]*(?:secret|ciphertext|plaintext|decrypted|payload|'
+    r'api[_-]?key)[^\s,;:=]*\b'
+)
+_CHILD_DIAGNOSTIC_PROTOCOL_PREFIXES = (
+    'TOKEN_PLACE_LLAMA_CPP_JSON:',
+)
+
+
+def _sanitize_child_diagnostic_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(_CHILD_DIAGNOSTIC_PROTOCOL_PREFIXES):
+        return ''
+    if not _CHILD_DIAGNOSTIC_ALLOWLIST.search(stripped):
+        return ''
+    sanitized = _CHILD_DIAGNOSTIC_SENSITIVE_FIELD_RE.sub(lambda match: f'{match.group(1)}=<redacted>', stripped)
+    sanitized = _CHILD_DIAGNOSTIC_SENSITIVE_TOKEN_RE.sub('<redacted>', sanitized)
+    return sanitized[:300]
 
 
 def _sanitize_child_diagnostic_text(text: Any, *, limit: int = 1200) -> str:
     redacted = _redact_paths_from_text(text, limit=limit * 2)
     safe_lines = []
     for line in redacted.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _CHILD_DIAGNOSTIC_ALLOWLIST.search(stripped):
-            safe_lines.append(stripped[:300])
+        sanitized = _sanitize_child_diagnostic_line(line)
+        if sanitized:
+            safe_lines.append(sanitized)
         if len('\n'.join(safe_lines)) >= limit:
             break
     return '\n'.join(safe_lines)[-limit:].strip()

@@ -5716,6 +5716,34 @@ def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_bu
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
+def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines():
+    from utils.llm import model_manager as model_manager_module
+
+    raw = (
+        'ggml_metal: KV cache allocation failed; prompt=SECRET_PROMPT assistant=SECRET_ASSISTANT '
+        'ciphertext=CIPHERTEXT_BODY key=API_KEY_VALUE token=TOKEN_VALUE\n'
+        'llama_context failed with decrypted_payload=PLAINTEXT_PAYLOAD and arbitrary SECRET_SNIPPET\n'
+    )
+
+    sanitized = model_manager_module._sanitize_child_diagnostic_text(raw)
+
+    assert 'ggml_metal' in sanitized
+    assert 'KV cache allocation failed' in sanitized
+    assert 'llama_context failed' in sanitized
+    for leaked in (
+        'SECRET_PROMPT',
+        'SECRET_ASSISTANT',
+        'CIPHERTEXT_BODY',
+        'API_KEY_VALUE',
+        'TOKEN_VALUE',
+        'PLAINTEXT_PAYLOAD',
+        'SECRET_SNIPPET',
+    ):
+        assert leaked not in sanitized
+    assert 'prompt=<redacted>' in sanitized
+    assert 'ciphertext=<redacted>' in sanitized
+    assert 'decrypted_payload=<redacted>' in sanitized
+
 def test_path_redaction_handles_spaces_and_traceback_paths():
     from utils.llm import model_manager as model_manager_module
 

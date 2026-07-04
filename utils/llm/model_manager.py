@@ -51,6 +51,7 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
+    'runtime_context_create_failed',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -1330,13 +1331,22 @@ def _format_llama_subprocess_early_exit_detail(process: subprocess.Popen, *, sta
     cwd = getattr(process, '_token_place_cwd', None)
     import_root = getattr(process, '_token_place_import_root', None)
     module_path_hint = getattr(process, '_token_place_module_path_hint', None)
+    stdout_tail = _sanitize_child_diagnostic_text(_llama_subprocess_tail(process, '_token_place_stdout_tail'))
+    stderr_tail = _sanitize_child_diagnostic_text(_llama_subprocess_tail(process, '_token_place_stderr_tail'))
+    safe_command = (
+        [_redact_paths_from_text(part) for part in command]
+        if isinstance(command, list)
+        else _redact_paths_from_text(command or 'unknown')
+    )
     return (
         f"{stage} subprocess exited before JSON handshake; "
         f"exit_code={exit_code if exit_code is not None else 'running'} "
-        f"program={sys.executable} command={command or 'unknown'} cwd={cwd or 'unknown'} "
-        f"import_root={import_root or 'unknown'} module_path_hint={module_path_hint or 'unknown'} "
-        f"stage={stage} stdout_tail={_llama_subprocess_tail(process, '_token_place_stdout_tail') or '<empty>'} "
-        f"stderr_tail={_llama_subprocess_tail(process, '_token_place_stderr_tail') or '<empty>'}"
+        f"program={_redact_paths_from_text(sys.executable)} command={safe_command} "
+        f"cwd={_redact_paths_from_text(cwd or 'unknown')} "
+        f"import_root={_redact_paths_from_text(import_root or 'unknown')} "
+        f"module_path_hint={_redact_paths_from_text(module_path_hint or 'unknown')} "
+        f"stage={stage} stdout_tail={stdout_tail or '<empty>'} "
+        f"stderr_tail={stderr_tail or '<empty>'}"
     )
 
 
@@ -1394,7 +1404,10 @@ def _read_llama_subprocess_message(
     if not isinstance(message, dict):
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'transport_error':
-        raise LlamaCppWorkerEOFError(str(message.get('error') or f'{stage} worker exited before response'))
+        safe_error = _sanitize_child_diagnostic_text(message.get('error')) or _redact_paths_from_text(
+            message.get('error') or f'{stage} worker exited before response'
+        )
+        raise LlamaCppWorkerEOFError(safe_error)
     if message.get('status') == 'error':
         raw_error = str(message.get('error') or f'{stage} failed')
         error = raw_error

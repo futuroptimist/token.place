@@ -2634,8 +2634,8 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
     fake_pkg.mkdir(parents=True)
     (fake_pkg / '__init__.py').write_text(
         "import sys\n"
-        "print('stdout clue before exit')\n"
-        "print('stderr clue before exit', file=sys.stderr)\n"
+        "print('stdout llama_context clue before exit')\n"
+        "print('stderr llama_context clue before exit', file=sys.stderr)\n"
         "sys.exit(7)\n",
         encoding='utf-8',
     )
@@ -2649,10 +2649,10 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
     assert 'llama_cpp_import subprocess exited before JSON handshake' in message
     assert 'llama_cpp_import subprocess ended' not in message
     assert 'exit_code=7' in message
-    assert 'stdout clue before exit' in message
-    assert 'stderr clue before exit' in message
-    assert 'import_root=C:' in message
-    assert 'token.place desktop' in message
+    assert 'stdout llama_context clue before exit' in message
+    assert 'stderr llama_context clue before exit' in message
+    assert 'import_root=<path>' in message
+    assert 'token.place desktop' not in message
 
 
 def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monkeypatch):
@@ -2678,7 +2678,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","prompt":"secret prompt","chunk":"generated text"}\n',
                 'native loader clue\n',
             ]
-            self._token_place_stderr_tail = ['stderr clue\n']
+            self._token_place_stderr_tail = ['stderr llama_context clue\n']
 
         def poll(self):
             return 9
@@ -2708,6 +2708,8 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
     assert 'TOKEN_PLACE_LLAMA_CPP_JSON' not in message
     assert 'secret prompt' not in message
     assert 'generated text' not in message
+    assert 'native loader clue' not in message
+    assert 'stderr_tail=' in message
     assert created
 
 
@@ -5701,6 +5703,17 @@ def test_unrecognized_init_failure_is_not_context_create_retryable():
 
     assert category == 'runtime_init_unclassified'
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_generic_context_create_failure_is_retryable():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        ValueError('Failed to create llama_context')
+    )
+
+    assert category == 'runtime_context_create_failed'
+    assert category in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
 def test_path_redaction_handles_spaces_and_traceback_paths():

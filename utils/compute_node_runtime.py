@@ -54,6 +54,44 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
 
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
+    "code",
+    "reason",
+    "generation_exception_category",
+    "exception_type",
+    "rejected_option",
+    "method",
+    "stream",
+    "retryable",
+    "runtime_healthy",
+    "recovery_attempted",
+    "recovery_succeeded",
+    "profile_id",
+    "context_tier",
+    "context_window_tokens",
+    "n_ctx",
+    "kv_cache_mode",
+    "type_k",
+    "type_v",
+    "stderr_tail",
+    "child_stderr_tail",
+    "sanitized_error_summary",
+}
+
+
+def _safe_completion_smoke_worker_diagnostics(diagnostics: Any) -> Dict[str, Any]:
+    if not isinstance(diagnostics, dict):
+        return {}
+    safe: Dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        if (
+            key in _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS
+            and isinstance(key, str)
+            and isinstance(value, (str, bool, int, float, type(None)))
+        ):
+            safe[key] = value[:256] if isinstance(value, str) else value
+    return safe
+
 
 def _bounded_safe_error_summary(exc: BaseException) -> str:
     return f"{type(exc).__name__}:redacted"
@@ -66,11 +104,7 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     }
     worker_diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(worker_diagnostics, dict):
-        safe_worker = {
-            key: value
-            for key, value in worker_diagnostics.items()
-            if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None)))
-        }
+        safe_worker = _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
         diagnostics["worker_diagnostics"] = safe_worker
         category = safe_worker.get("generation_exception_category")
         if category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
@@ -670,12 +704,9 @@ class ComputeNodeRuntime:
                         diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
                     worker_diagnostics = smoke_error.get("worker_diagnostics")
                     if isinstance(worker_diagnostics, dict):
-                        diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = {
-                            key: value
-                            for key, value in worker_diagnostics.items()
-                            if isinstance(key, str)
-                            and isinstance(value, (str, bool, int, float, type(None)))
-                        }
+                        diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = (
+                            _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
+                        )
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",

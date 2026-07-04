@@ -5627,9 +5627,12 @@ def test_api_v1_runtime_rejected_generation_option_filters_worker_diagnostics():
             "generation_exception_category": "unsupported_generation_kwarg",
             "exception_type": "TypeError",
             "method": "create_chat_completion",
+            "prompt": "SECRET prompt text",
+            "raw_message": "SECRET raw message",
+            "assistant_text": "SECRET assistant text",
             "unsafe_prompt": "SECRET prompt text",
             "long_summary": "x" * 1000,
-            "nested": {"prompt": "SECRET"},
+            "nested": {"rendered_prompt": "SECRET rendered prompt"},
         },
     )
     client = _api_v1_validation_client(manager)

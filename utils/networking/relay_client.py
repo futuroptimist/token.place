@@ -68,7 +68,21 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "exception_type",
     "rejected_option",
     "method",
+    "stream",
     "retryable",
+    "runtime_healthy",
+    "recovery_attempted",
+    "recovery_succeeded",
+    "profile_id",
+    "context_tier",
+    "context_window_tokens",
+    "n_ctx",
+    "kv_cache_mode",
+    "type_k",
+    "type_v",
+    "stderr_tail",
+    "child_stderr_tail",
+    "sanitized_error_summary",
 }
 
 

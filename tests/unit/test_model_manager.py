@@ -5705,7 +5705,7 @@ def test_unrecognized_init_failure_is_not_context_create_retryable():
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
-def test_generic_context_create_failure_is_retryable():
+def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_buffer_evidence():
     from utils.llm import model_manager as model_manager_module
 
     category = model_manager_module._classify_runtime_context_create_error(
@@ -5713,7 +5713,7 @@ def test_generic_context_create_failure_is_retryable():
     )
 
     assert category == 'runtime_context_create_failed'
-    assert category in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
 def test_path_redaction_handles_spaces_and_traceback_paths():

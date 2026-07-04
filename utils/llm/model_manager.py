@@ -51,7 +51,6 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
-    'runtime_context_create_failed',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (

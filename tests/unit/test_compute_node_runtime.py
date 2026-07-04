@@ -18,6 +18,10 @@ from utils.compute_node_runtime import (
     normalize_compute_mode,
     resolve_relay_port,
     resolve_relay_url,
+    _classify_completion_smoke_exception,
+    _completion_smoke_reason_from_api_v1_error,
+    _readiness_smoke_model_id,
+    _safe_completion_smoke_worker_diagnostics,
 )
 
 
@@ -47,6 +51,177 @@ def test_first_env_skips_blank_values(monkeypatch):
 
     assert first_env(["TOKENPLACE_RELAY_URL", "TOKEN_PLACE_RELAY_URL"]) == "https://fallback.example"
 
+
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "retryable": True,
+            "runtime_healthy": False,
+            "stream": None,
+            "context_window_tokens": 65536,
+            "recovery_attempted": 1,
+            "exception_type": "RuntimeError",
+            "rejected_option": "temperature",
+            "profile_id": "qwen3-8b-q4-k-m",
+            "context_tier": "64k-full",
+            "type_k": "q8_0",
+            "type_v": "q8_0",
+            "sanitized_error_summary": "RuntimeError:kv_cache_allocation",
+            "stderr_tail": "llama_context kv cache allocation failed redacted",
+            "child_stderr_tail": "worker exception redacted",
+            "method": "create_chat_completion",
+            "reason": "unsupported_generation_option",
+            "generation_exception_category": "kv_cache_allocation",
+            "unsafe_prompt": "Reply with exactly: ok",
+            "nested": {"rendered_prompt": "secret"},
+            "content": "assistant output",
+        }
+    )
+
+    assert safe == {
+        "retryable": True,
+        "runtime_healthy": False,
+        "stream": None,
+        "context_window_tokens": 65536,
+        "recovery_attempted": 1,
+        "exception_type": "RuntimeError",
+        "rejected_option": "temperature",
+        "profile_id": "qwen3-8b-q4-k-m",
+        "context_tier": "64k-full",
+        "type_k": "q8_0",
+        "type_v": "q8_0",
+        "sanitized_error_summary": "RuntimeError:kv_cache_allocation",
+        "stderr_tail": "llama_context kv cache allocation failed redacted",
+        "child_stderr_tail": "worker exception redacted",
+        "method": "create_chat_completion",
+        "reason": "unsupported_generation_option",
+        "generation_exception_category": "kv_cache_allocation",
+    }
+    assert "Reply with exactly" not in json.dumps(safe)
+    assert "assistant output" not in json.dumps(safe)
+
+
+def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
+    unsafe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "exception_type": "RuntimeError with spaces",
+            "rejected_option": "temperature secret prompt text!",
+            "sanitized_error_summary": "RuntimeError:redacted prompt Reply with exactly ok",
+            "stderr_tail": "",
+            "child_stderr_tail": "redacted prompt assistant output",
+            "method": "create_chat_completion Reply with exactly ok",
+            "reason": "prompt leaked in reason",
+            "generation_exception_category": "prompt_text",
+            "worker_diagnostics": {"rendered_prompt": "Reply with exactly ok"},
+        }
+    )
+
+    assert unsafe == {}
+    assert _safe_completion_smoke_worker_diagnostics("not-a-dict") == {}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    [
+        ({"internal_reason": "runtime_unsupported_generation_kwarg"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ({"internal_reason": "runtime_rope_yarn_eval_failure"}, "runtime_completion_smoke_rope_yarn_eval_failure"),
+        ({"internal_reason": "runtime_metal_memory_allocation"}, "runtime_completion_smoke_metal_memory_allocation"),
+        ({"internal_reason": "runtime_kv_cache_allocation"}, "runtime_completion_smoke_kv_cache_allocation"),
+        ({"internal_reason": "runtime_worker_timeout"}, "runtime_completion_smoke_worker_timeout"),
+        ({"internal_reason": "runtime_worker_dead"}, "runtime_completion_smoke_worker_dead"),
+        ({"code": "compute_node_options_unsupported"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+    ],
+)
+def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, expected_reason):
+    assert _completion_smoke_reason_from_api_v1_error(error) == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_category", "expected_reason"),
+    [
+        (TimeoutError("worker timeout"), "worker_timeout", "runtime_completion_smoke_worker_timeout"),
+        (RuntimeError("worker dead: broken pipe"), "worker_dead", "runtime_completion_smoke_worker_dead"),
+        (RuntimeError("Metal buffer allocation out of memory"), "metal_memory_allocation", "runtime_completion_smoke_metal_memory_allocation"),
+        (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
+        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
+    ],
+)
+def test_classify_completion_smoke_exception_uses_safe_specific_reasons(exc, expected_category, expected_reason):
+    category, reason, diagnostics = _classify_completion_smoke_exception(exc)
+
+    assert category == expected_category
+    assert reason == expected_reason
+    assert diagnostics["exception_type"] == type(exc).__name__
+    assert diagnostics["sanitized_error_summary"] == f"{type(exc).__name__}:redacted"
+    assert "prompt text" not in json.dumps(diagnostics)
+
+
+
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_rejected_value_types_and_unknown_keys():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "retryable": {"nested": "not allowed"},
+            "unallowlisted": "safe-looking-but-not-allowed",
+            "stderr_tail": "llama kv cache allocation failed " + "x" * 1300,
+            "profile_id": "profile id with spaces",
+            "exception_type": "RuntimeError",
+        }
+    )
+
+    assert safe == {"exception_type": "RuntimeError"}
+
+
+class _SmokeDiagnosticsError(RuntimeError):
+    def __init__(self, diagnostics):
+        super().__init__("worker diagnostics should drive smoke reason")
+        self.diagnostics = diagnostics
+
+
+def test_classify_completion_smoke_exception_uses_safe_worker_category_and_reason():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        _SmokeDiagnosticsError(
+            {
+                "generation_exception_category": "worker_dead",
+                "reason": "unsupported_generation_option",
+                "prompt": "Reply with exactly: ok",
+            }
+        )
+    )
+
+    assert category == "worker_dead"
+    assert reason == "runtime_completion_smoke_worker_dead"
+    assert diagnostics["worker_diagnostics"] == {
+        "generation_exception_category": "worker_dead",
+        "reason": "unsupported_generation_option",
+    }
+    assert "Reply with exactly" not in json.dumps(diagnostics)
+
+
+def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason_without_category():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        _SmokeDiagnosticsError({"reason": "unsupported_generation_option"})
+    )
+
+    assert category == "unsupported_generation_kwarg"
+    assert reason == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
+
+
+def test_classify_completion_smoke_exception_detects_rope_scaling_text():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        RuntimeError("RoPE scaling failure before eval")
+    )
+
+    assert category == "rope_yarn_eval_failure"
+    assert reason == "runtime_completion_smoke_rope_yarn_eval_failure"
+    assert diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
+
+
+def test_readiness_smoke_model_id_falls_back_to_model_path_basename_and_empty():
+    manager = SimpleNamespace(api_model_id="  ", model_id=None, file_name="", model_path="/models/Qwen3-8B.gguf")
+    assert _readiness_smoke_model_id(manager) == "Qwen3-8B.gguf"
+    assert _readiness_smoke_model_id(SimpleNamespace()) == ""
 
 def test_compute_node_runtime_ensure_model_ready_download_success():
     model_manager = MagicMock()
@@ -527,7 +702,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
     assert runtime.ensure_api_v1_runtime_ready() is True
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
-    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "choices_message_content"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "api_v1_assistant_message"
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
@@ -591,8 +766,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_empty_output(mo
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_empty_output"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_empty_output"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape(monkeypatch):
@@ -624,8 +799,39 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
+
+
+def test_compute_node_runtime_readiness_smoke_completion_rejects_invalid_shared_envelope(monkeypatch):
+    class EnvelopeRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            return {"api_v1_response": {"message": {"role": "tool", "content": "not assistant"}}}
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=EnvelopeRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "invalid_api_v1_envelope"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content(monkeypatch):
@@ -657,8 +863,8 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
@@ -766,7 +972,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
     assert diagnostics["api_v1_readiness_result"] == "failed"
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_thinking_leaked"
-    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "reasoning_field_present"
+    assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "api_v1_error"
     assert "secret hidden reasoning" not in json.dumps(diagnostics)
 
 
@@ -800,6 +1006,45 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_text_choice(mon
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
+
+
+def test_compute_node_runtime_readiness_smoke_uses_configured_model_id_fallback(monkeypatch):
+    observed = {}
+
+    def generate(**kwargs):
+        observed.update(kwargs)
+        return {
+            "api_v1_response": {
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        }
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = None
+    model_manager.model_id = "configured-runtime-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = SimpleNamespace(
+        create_chat_completion=lambda **_kwargs: {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        }
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2),
+            _generate_api_v1_response_with_runtime_model=generate,
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert observed["model_id"] == "configured-runtime-model"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(monkeypatch):
@@ -1699,8 +1944,11 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
                 diagnostics={
                     "generation_exception_category": "metal_memory_allocation",
                     "exception_type": "RuntimeError",
-                    "sanitized_error_summary": "Metal failed to allocate KV cache",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                    "child_stderr_tail": "llama_context: kv cache allocation failed <redacted>",
                     "method": "create_chat_completion",
+                    "reason": "SECRET prompt in allowed reason",
+                    "stderr_tail": "redacted SECRET prompt in allowed stderr",
                 },
             )
 
@@ -1717,7 +1965,13 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_metal_memory_allocation"
     assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_metal_memory_allocation"
     assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "metal_memory_allocation"
-    assert diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]["method"] == "create_chat_completion"
+    worker_diagnostics = diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]
+    assert worker_diagnostics["method"] == "create_chat_completion"
+    assert worker_diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
+    assert worker_diagnostics["child_stderr_tail"] == "llama_context: kv cache allocation failed <redacted>"
+    assert "reason" not in worker_diagnostics
+    assert "stderr_tail" not in worker_diagnostics
+    assert "SECRET" not in json.dumps(diagnostics)
 
 
 def test_qwen_64k_yarn_eval_exception_fails_closed_before_registration():

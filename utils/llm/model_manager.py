@@ -411,6 +411,12 @@ _CHILD_DIAGNOSTIC_SENSITIVE_FIELD_RE = re.compile(
     r'key|token|authorization|api[_-]?key'
     r')(?![\w-])\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s,;]+)'
 )
+_CHILD_DIAGNOSTIC_SENSITIVE_PREFIXED_FIELD_RE = re.compile(
+    r'(?i)(?<![\w-])('
+    r'[A-Za-z0-9_-]*(?:secret|ciphertext|plaintext|decrypted|payload|token|authorization|'
+    r'api[_-]?key|[_-]key|key[_-])[A-Za-z0-9_-]*'
+    r')\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s,;]+)'
+)
 _CHILD_DIAGNOSTIC_SENSITIVE_TOKEN_RE = re.compile(
     r'(?i)\b(?!(?:secret|ciphertext|plaintext|decrypted|(?:decrypted[_-]?)?payload|'
     r'key|token|api[_-]?key)\b)[^\s,;:=]*(?:secret|ciphertext|plaintext|decrypted|payload|'
@@ -428,6 +434,10 @@ def _sanitize_child_diagnostic_line(line: str) -> str:
     if not _CHILD_DIAGNOSTIC_ALLOWLIST.search(stripped):
         return ''
     sanitized = _CHILD_DIAGNOSTIC_SENSITIVE_FIELD_RE.sub(lambda match: f'{match.group(1)}=<redacted>', stripped)
+    sanitized = _CHILD_DIAGNOSTIC_SENSITIVE_PREFIXED_FIELD_RE.sub(
+        lambda match: f'{match.group(1)}=<redacted>',
+        sanitized,
+    )
     sanitized = _CHILD_DIAGNOSTIC_SENSITIVE_TOKEN_RE.sub('<redacted>', sanitized)
     return sanitized[:300]
 

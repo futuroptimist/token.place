@@ -5721,7 +5721,7 @@ def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines()
 
     raw = (
         'ggml_metal: KV cache allocation failed; prompt=SECRET_PROMPT assistant=SECRET_ASSISTANT '
-        'ciphertext=CIPHERTEXT_BODY key=API_KEY_VALUE token=TOKEN_VALUE\n'
+        'ciphertext=CIPHERTEXT_BODY key=API_KEY_VALUE token=TOKEN_VALUE user_token=SK_LIVE_VALUE\n'
         'llama_context failed with decrypted_payload=PLAINTEXT_PAYLOAD and arbitrary SECRET_SNIPPET\n'
     )
 
@@ -5738,11 +5738,13 @@ def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines()
         'TOKEN_VALUE',
         'PLAINTEXT_PAYLOAD',
         'SECRET_SNIPPET',
+        'SK_LIVE_VALUE',
     ):
         assert leaked not in sanitized
     assert 'prompt=<redacted>' in sanitized
     assert 'ciphertext=<redacted>' in sanitized
     assert 'decrypted_payload=<redacted>' in sanitized
+    assert 'user_token=<redacted>' in sanitized
 
 def test_path_redaction_handles_spaces_and_traceback_paths():
     from utils.llm import model_manager as model_manager_module

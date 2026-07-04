@@ -47,6 +47,12 @@ QWEN_64K_UBATCH_TOKENS = 128
 QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_default'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4'
+# Only retry context-create failures backed by safe Metal/KV/cache/buffer
+# evidence. A bare ``Failed to create llama_context`` remains classified as
+# ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
+# GGUF/runtime/ABI init causes are not masked as memory-profile exhaustion. The
+# packaged-runtime retry regression supplies sanitized ggml_metal/KV stderr
+# diagnostics, which exercises the intended bounded recovery path.
 QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',

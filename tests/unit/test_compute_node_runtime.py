@@ -4,6 +4,8 @@ from unittest.mock import call, MagicMock
 
 import pytest
 
+from utils.networking.relay_client import RelayClient
+
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
     apply_compute_mode,
@@ -21,10 +23,47 @@ from utils.compute_node_runtime import (
 )
 
 
-def _ready_relay_client():
-    return SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 3)
+class _ReadinessRelayClient(RelayClient):
+    def __init__(self, model_manager, admission):
+        self.model_manager = model_manager
+        if not callable(getattr(model_manager, "get_llm_instance", None)):
+            model_manager.get_llm_instance = lambda: _ReadyRuntime()
+        if isinstance(getattr(model_manager, "create_chat_completion_with_recovery", None), MagicMock):
+            model_manager.create_chat_completion_with_recovery = None
+        self._admission = admission
+
+    def _api_v1_authoritative_context_admission(self, **kwargs):
+        return self._admission(**kwargs)
+
+    def _runtime_model_can_satisfy(self, _model_id):
+        return True
+
+    def _prepare_api_v1_runtime_messages(self, _model_id, messages):
+        return messages
+
+    def _api_v1_response_envelope(self, request_id, *, message=None, error=None):
+        response = {"id": request_id, "object": "chat.completion"}
+        if message is not None:
+            response["message"] = message
+        if error is not None:
+            response["error"] = error
+        return {"api_v1_response": response}
+
+
+def _ready_relay_client(model_manager=None):
+    manager = model_manager or SimpleNamespace(
+        model_profile={},
+        context_tier="8k-fast",
+        context_window_tokens=8192,
+        get_llm_instance=lambda: _ReadyRuntime(),
     )
+    return _ReadinessRelayClient(
+        manager, lambda **_kwargs: (True, None, 3)
+    )
+
+
+def _relay_client_with_admission(model_manager, admission):
+    return _ReadinessRelayClient(model_manager, admission)
 
 
 class _ReadyRuntime:
@@ -99,7 +138,7 @@ def test_compute_node_runtime_warmup_logs_model_instantiation_stages(caplog):
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -182,7 +221,7 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
     assert runtime.ensure_api_v1_runtime_ready() is True
@@ -212,9 +251,7 @@ def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridg
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
     model_manager.get_llm_instance.return_value = BridgeRuntime()
-    relay_client = SimpleNamespace(
-        _api_v1_authoritative_context_admission=_raise_admission_error
-    )
+    relay_client = _relay_client_with_admission(model_manager, _raise_admission_error)
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
@@ -225,10 +262,10 @@ def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridg
     assert runtime.ensure_api_v1_runtime_ready() is False
     assert model_manager.last_runtime_init_error == (
         "API v1 context admission readiness failed: "
-        "compute_node_context_admission_unavailable reason=unknown"
+        "compute_node_context_admission_unavailable reason=runtime_completion_smoke_worker_timeout"
     )
     diagnostics = model_manager.last_compute_diagnostics
-    assert diagnostics["api_v1_readiness_exception_type"] == "TimeoutError"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_worker_timeout"
     assert diagnostics["api_v1_readiness_packaged_bridge_available"] is True
     assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is False
 
@@ -250,15 +287,16 @@ def test_compute_node_runtime_qwen_blocks_registration_when_admission_bridge_mis
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
     model_manager.get_llm_instance.return_value = MissingBridgeRuntime()
-    relay_client = SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+    relay_client = _relay_client_with_admission(
+        model_manager,
+        lambda **_kwargs: (
             False,
             {
                 "code": "compute_node_context_admission_unavailable",
                 "internal_reason": "runtime_template_tokenizer_bridge_unavailable",
             },
             None,
-        )
+        ),
     )
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
@@ -296,15 +334,16 @@ def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason()
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
     model_manager.get_llm_instance.return_value = BridgeRuntime()
-    relay_client = SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+    relay_client = _relay_client_with_admission(
+        model_manager,
+        lambda **_kwargs: (
             False,
             {
                 "code": "compute_node_context_tier_unsupported",
                 "reason": "requested_tier_not_active",
             },
             8,
-        )
+        ),
     )
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
@@ -316,7 +355,7 @@ def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason()
     assert runtime.ensure_api_v1_runtime_ready() is False
     assert model_manager.last_runtime_init_error == (
         "API v1 context admission readiness failed: "
-        "compute_node_context_tier_unsupported reason=requested_tier_not_active"
+        "compute_node_context_admission_unavailable reason=requested_tier_not_active"
     )
     assert model_manager.last_compute_diagnostics["api_v1_readiness_error_reason"] == (
         "requested_tier_not_active"
@@ -348,9 +387,7 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     model_manager.last_compute_diagnostics = {}
     model_manager.last_yarn_rope_diagnostics = {"supported": True, "missing_reason": None}
     model_manager.get_llm_instance.return_value = ReadyRuntime()
-    relay_client = SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-    )
+    relay_client = _relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2))
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
@@ -398,7 +435,7 @@ def test_compute_node_runtime_qwen_64k_readiness_rejects_missing_yarn_rope():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -437,7 +474,7 @@ def test_compute_node_runtime_qwen_8k_readiness_ignores_missing_yarn_rope_suppor
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -472,9 +509,7 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     model_manager.last_compute_diagnostics = {}
     llm_runtime = SmokeRuntime()
     model_manager.get_llm_instance.return_value = llm_runtime
-    relay_client = SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-    )
+    relay_client = _relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2))
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
@@ -518,9 +553,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -551,9 +584,7 @@ def test_compute_node_runtime_readiness_smoke_completion_empty_after_strip(monke
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -582,9 +613,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_empty_output(mo
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -615,17 +644,15 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_malformed_shape
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content(monkeypatch):
@@ -648,17 +675,15 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
-    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_malformed_completion"
-    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_malformed_completion"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
@@ -681,9 +706,7 @@ def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_withou
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -713,9 +736,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(mo
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -755,9 +776,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -790,9 +809,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_text_choice(mon
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -822,9 +839,7 @@ def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=SimpleNamespace(
-            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
-        ),
+        relay_client=_relay_client_with_admission(model_manager, lambda **_kwargs: (True, None, 2)),
         crypto_manager=MagicMock(),
     )
 
@@ -887,7 +902,7 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_without_diagnostics_di
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -1708,7 +1723,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -1729,7 +1744,7 @@ def test_qwen_64k_yarn_eval_exception_fails_closed_before_registration():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -1743,7 +1758,7 @@ def test_qwen_64k_completion_smoke_passes_with_yarn_and_kv_diagnostics():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 
@@ -1769,7 +1784,7 @@ def test_qwen_8k_readiness_still_passes_without_yarn():
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
-        relay_client=_ready_relay_client(),
+        relay_client=_ready_relay_client(model_manager),
         crypto_manager=MagicMock(),
     )
 

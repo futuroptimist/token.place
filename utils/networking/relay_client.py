@@ -2996,6 +2996,7 @@ class RelayClient:
         internal_reason: Optional[str] = None,
         rejected_option: Optional[str] = None,
         retryable: Optional[bool] = None,
+        safe_extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Attach request-scoped, non-sensitive API v1 diagnostics to an error."""
 
@@ -3045,6 +3046,10 @@ class RelayClient:
         enriched.setdefault(
             "recovery_succeeded", bool(runtime_health.get("recovery_succeeded", False))
         )
+        if isinstance(safe_extra, dict):
+            for key, value in safe_extra.items():
+                if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None), dict)):
+                    enriched.setdefault(key, value)
         return enriched
 
     def _assistant_message_from_runtime_completion(
@@ -3087,7 +3092,10 @@ class RelayClient:
                     return None
                 message = {**message, "content": cleaned_content}
             if message is None:
-                self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
+                if isinstance(raw_message, dict) and isinstance(raw_message.get("content"), str) and not raw_message.get("content", "").strip():
+                    self._last_api_v1_invalid_model_output_reason = "empty_output"
+                else:
+                    self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
             return message
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
@@ -3133,6 +3141,12 @@ class RelayClient:
             "runtime_healthy": True,
             "recovery_attempted": False,
             "recovery_succeeded": False,
+        }
+        self._last_api_v1_generation_diagnostics = {
+            "path": "shared_api_v1_generation",
+            "request_id": request_id,
+            "requested_context_tier": requested_context_tier,
+            "model_id": model_id,
         }
         self._last_api_v1_invalid_model_output_reason = None
 
@@ -3271,12 +3285,25 @@ class RelayClient:
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
+            self._last_api_v1_generation_diagnostics.update({
+                "completion_kwargs_normalized": True,
+                "requested_output_tokens": requested_output_tokens,
+            })
             admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
                 messages=runtime_messages,
                 requested_output_tokens=requested_output_tokens,
                 requested_context_tier=requested_context_tier,
             )
+            self._last_api_v1_generation_diagnostics.update({
+                "admission_result": "admitted" if admitted else "rejected",
+                "prompt_tokens": prompt_tokens,
+                "admission_error_code": (admission_error or {}).get("code") if isinstance(admission_error, dict) else None,
+                "admission_error_reason": (
+                    (admission_error or {}).get("internal_reason")
+                    or (admission_error or {}).get("reason")
+                ) if isinstance(admission_error, dict) else None,
+            })
             if not admitted:
                 return self._api_v1_response_envelope(
                     request_id,
@@ -3324,12 +3351,21 @@ class RelayClient:
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
                 )
+                self._last_api_v1_generation_diagnostics.update({
+                    "completion_shape": self._api_v1_safe_completion_shape(completion),
+                    "completion_shape_category": self._api_v1_completion_shape_category(model_profile, completion),
+                    "assistant_message_valid": assistant_message is not None,
+                })
 
             if assistant_message is None:
                 invalid_reason = (
                     getattr(self, "_last_api_v1_invalid_model_output_reason", None)
                     or "unsupported_completion_shape"
                 )
+                self._last_api_v1_generation_diagnostics.update({
+                    "assistant_message_valid": False,
+                    "invalid_model_output_reason": invalid_reason,
+                })
                 log_error(
                     "Desktop runtime returned invalid API v1 assistant output reason={} shape={}",
                     invalid_reason,
@@ -3350,6 +3386,12 @@ class RelayClient:
                     ),
                 )
 
+            self._last_api_v1_generation_diagnostics.update({
+                "assistant_message_valid": True,
+                "runtime_healthy": self._last_api_v1_runtime_health.get("runtime_healthy", True),
+                "recovery_attempted": self._last_api_v1_runtime_health.get("recovery_attempted", False),
+                "recovery_succeeded": self._last_api_v1_runtime_health.get("recovery_succeeded", False),
+            })
             return self._api_v1_response_envelope(request_id, message=assistant_message)
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
@@ -3364,6 +3406,27 @@ class RelayClient:
                     if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str)
                     else None
                 )
+                generation_exception_category = (
+                    diagnostics.get("generation_exception_category")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("generation_exception_category"), str)
+                    else None
+                )
+                exception_type = (
+                    diagnostics.get("exception_type")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("exception_type"), str)
+                    else None
+                )
+                sanitized_error_summary = (
+                    diagnostics.get("sanitized_error_summary")
+                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("sanitized_error_summary"), str)
+                    else None
+                )
+                self._last_api_v1_generation_diagnostics.update({
+                    "generation_exception_category": generation_exception_category,
+                    "exception_type": exception_type,
+                    "sanitized_error_summary": sanitized_error_summary,
+                    "worker_diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
+                })
                 error_code = (
                     diagnostics.get("code")
                     if isinstance(diagnostics, dict) and diagnostics.get("code") == "compute_node_options_unsupported"
@@ -3391,8 +3454,26 @@ class RelayClient:
                         requested_output_tokens=requested_output_tokens,
                         internal_reason=internal_reason,
                         rejected_option=rejected_option,
+                        safe_extra={
+                            "generation_exception_category": generation_exception_category,
+                            "exception_type": exception_type,
+                            "sanitized_error_summary": sanitized_error_summary,
+                            "worker_diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
+                        },
                     ),
                 )
+            exception_category = None
+            try:
+                from utils.compute_node_runtime import _classify_completion_smoke_exception
+
+                exception_category, _, exception_diagnostics = _classify_completion_smoke_exception(exc)
+            except Exception:
+                exception_diagnostics = {"exception_type": type(exc).__name__}
+            self._last_api_v1_generation_diagnostics.update({
+                "generation_exception_category": exception_category,
+                "exception_type": exception_diagnostics.get("exception_type"),
+                "sanitized_error_summary": exception_diagnostics.get("sanitized_error_summary"),
+            })
             recovery_attempted = (
                 "replacement" in str(exc).lower()
                 or "restart" in str(exc).lower()
@@ -3422,7 +3503,23 @@ class RelayClient:
                     requested_context_tier=requested_context_tier,
                     prompt_tokens=prompt_tokens,
                     requested_output_tokens=requested_output_tokens,
-                    internal_reason="runtime_inference_failed",
+                    internal_reason=(
+                        str(exception_category)
+                        if exception_category in {
+                            "metal_memory_allocation",
+                            "kv_cache_allocation",
+                            "rope_yarn_eval_failure",
+                            "unsupported_generation_kwarg",
+                            "worker_timeout",
+                            "worker_dead",
+                        }
+                        else "runtime_inference_failed"
+                    ),
+                    safe_extra={
+                        "generation_exception_category": exception_category,
+                        "exception_type": exception_diagnostics.get("exception_type"),
+                        "sanitized_error_summary": exception_diagnostics.get("sanitized_error_summary"),
+                    },
                 ),
             )
 

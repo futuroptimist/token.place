@@ -5669,8 +5669,8 @@ def test_api_v1_runtime_rejected_generation_option_drops_unsafe_allowed_values()
             "exception_type": "RuntimeError",
             "reason": "SECRET prompt in an allowed key",
             "method": "SECRET assistant output in an allowed key",
-            "stderr_tail": "SECRET stderr with prompt text",
-            "sanitized_error_summary": "SECRET summary with assistant text",
+            "stderr_tail": "redacted SECRET prompt in stderr tail",
+            "sanitized_error_summary": "RuntimeError:redacted SECRET assistant text",
         },
     )
     client = _api_v1_validation_client(manager)

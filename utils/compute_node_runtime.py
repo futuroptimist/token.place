@@ -112,6 +112,25 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
 }
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
+    r"rope_yarn_eval_failure|unsupported_kwarg)$"
+)
+_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
+    "llama", "llama_context", "ggml", "metal", "kv", "cache", "alloc", "allocation",
+    "memory", "oom", "buffer", "rope", "yarn", "flash_attn", "type_k", "type_v",
+    "n_ctx", "context", "unsupported", "keyword", "argument", "failed", "error",
+    "runtime", "worker", "exception", "redacted", "path", "out", "of", "to", "create",
+}
+
+
+def _is_controlled_redacted_completion_smoke_diagnostic_tail(value: str) -> bool:
+    if len(value) > 1200 or not value.strip():
+        return False
+    words = re.findall(r"[A-Za-z_]+", value.lower())
+    return bool(words) and all(
+        word in _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_TAIL_WORDS for word in words
+    )
 
 
 def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
@@ -127,8 +146,14 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
     if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
-    if key in {"stderr_tail", "child_stderr_tail", "sanitized_error_summary"}:
-        return bounded if "redacted" in bounded.lower() else None
+    if key == "sanitized_error_summary":
+        return (
+            bounded
+            if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(bounded)
+            else None
+        )
+    if key in {"stderr_tail", "child_stderr_tail"}:
+        return bounded if _is_controlled_redacted_completion_smoke_diagnostic_tail(bounded) else None
     return None
 
 

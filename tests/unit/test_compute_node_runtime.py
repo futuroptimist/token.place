@@ -1739,9 +1739,10 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
                     "generation_exception_category": "metal_memory_allocation",
                     "exception_type": "RuntimeError",
                     "sanitized_error_summary": "RuntimeError:redacted",
+                    "child_stderr_tail": "llama_context: kv cache allocation failed <redacted>",
                     "method": "create_chat_completion",
                     "reason": "SECRET prompt in allowed reason",
-                    "stderr_tail": "SECRET prompt in allowed stderr",
+                    "stderr_tail": "redacted SECRET prompt in allowed stderr",
                 },
             )
 
@@ -1761,6 +1762,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     worker_diagnostics = diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]
     assert worker_diagnostics["method"] == "create_chat_completion"
     assert worker_diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
+    assert worker_diagnostics["child_stderr_tail"] == "llama_context: kv cache allocation failed <redacted>"
     assert "reason" not in worker_diagnostics
     assert "stderr_tail" not in worker_diagnostics
     assert "SECRET" not in json.dumps(diagnostics)

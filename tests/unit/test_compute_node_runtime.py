@@ -18,6 +18,9 @@ from utils.compute_node_runtime import (
     normalize_compute_mode,
     resolve_relay_port,
     resolve_relay_url,
+    _classify_completion_smoke_exception,
+    _completion_smoke_reason_from_api_v1_error,
+    _safe_completion_smoke_worker_diagnostics,
 )
 
 
@@ -46,6 +49,111 @@ def test_first_env_skips_blank_values(monkeypatch):
     monkeypatch.setenv("TOKEN_PLACE_RELAY_URL", "https://fallback.example")
 
     assert first_env(["TOKENPLACE_RELAY_URL", "TOKEN_PLACE_RELAY_URL"]) == "https://fallback.example"
+
+
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "retryable": True,
+            "runtime_healthy": False,
+            "stream": None,
+            "context_window_tokens": 65536,
+            "recovery_attempted": 1,
+            "exception_type": "RuntimeError",
+            "rejected_option": "temperature",
+            "profile_id": "qwen3-8b-q4-k-m",
+            "context_tier": "64k-full",
+            "type_k": "q8_0",
+            "type_v": "q8_0",
+            "sanitized_error_summary": "RuntimeError:kv_cache_allocation",
+            "stderr_tail": "llama_context kv cache allocation failed redacted",
+            "child_stderr_tail": "worker exception redacted",
+            "method": "create_chat_completion",
+            "reason": "unsupported_generation_option",
+            "generation_exception_category": "kv_cache_allocation",
+            "unsafe_prompt": "Reply with exactly: ok",
+            "nested": {"rendered_prompt": "secret"},
+            "content": "assistant output",
+        }
+    )
+
+    assert safe == {
+        "retryable": True,
+        "runtime_healthy": False,
+        "stream": None,
+        "context_window_tokens": 65536,
+        "recovery_attempted": 1,
+        "exception_type": "RuntimeError",
+        "rejected_option": "temperature",
+        "profile_id": "qwen3-8b-q4-k-m",
+        "context_tier": "64k-full",
+        "type_k": "q8_0",
+        "type_v": "q8_0",
+        "sanitized_error_summary": "RuntimeError:kv_cache_allocation",
+        "stderr_tail": "llama_context kv cache allocation failed redacted",
+        "child_stderr_tail": "worker exception redacted",
+        "method": "create_chat_completion",
+        "reason": "unsupported_generation_option",
+        "generation_exception_category": "kv_cache_allocation",
+    }
+    assert "Reply with exactly" not in json.dumps(safe)
+    assert "assistant output" not in json.dumps(safe)
+
+
+def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
+    unsafe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "exception_type": "RuntimeError with spaces",
+            "rejected_option": "temperature secret prompt text!",
+            "sanitized_error_summary": "RuntimeError:redacted prompt Reply with exactly ok",
+            "stderr_tail": "",
+            "child_stderr_tail": "redacted prompt assistant output",
+            "method": "create_chat_completion Reply with exactly ok",
+            "reason": "prompt leaked in reason",
+            "generation_exception_category": "prompt_text",
+            "worker_diagnostics": {"rendered_prompt": "Reply with exactly ok"},
+        }
+    )
+
+    assert unsafe == {}
+    assert _safe_completion_smoke_worker_diagnostics("not-a-dict") == {}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    [
+        ({"internal_reason": "runtime_unsupported_generation_kwarg"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ({"internal_reason": "runtime_rope_yarn_eval_failure"}, "runtime_completion_smoke_rope_yarn_eval_failure"),
+        ({"internal_reason": "runtime_metal_memory_allocation"}, "runtime_completion_smoke_metal_memory_allocation"),
+        ({"internal_reason": "runtime_kv_cache_allocation"}, "runtime_completion_smoke_kv_cache_allocation"),
+        ({"internal_reason": "runtime_worker_timeout"}, "runtime_completion_smoke_worker_timeout"),
+        ({"internal_reason": "runtime_worker_dead"}, "runtime_completion_smoke_worker_dead"),
+        ({"code": "compute_node_options_unsupported"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+    ],
+)
+def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, expected_reason):
+    assert _completion_smoke_reason_from_api_v1_error(error) == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_category", "expected_reason"),
+    [
+        (TimeoutError("worker timeout"), "worker_timeout", "runtime_completion_smoke_worker_timeout"),
+        (RuntimeError("worker dead: broken pipe"), "worker_dead", "runtime_completion_smoke_worker_dead"),
+        (RuntimeError("Metal buffer allocation out of memory"), "metal_memory_allocation", "runtime_completion_smoke_metal_memory_allocation"),
+        (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
+        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
+    ],
+)
+def test_classify_completion_smoke_exception_uses_safe_specific_reasons(exc, expected_category, expected_reason):
+    category, reason, diagnostics = _classify_completion_smoke_exception(exc)
+
+    assert category == expected_category
+    assert reason == expected_reason
+    assert diagnostics["exception_type"] == type(exc).__name__
+    assert diagnostics["sanitized_error_summary"] == f"{type(exc).__name__}:redacted"
+    assert "prompt text" not in json.dumps(diagnostics)
 
 
 def test_compute_node_runtime_ensure_model_ready_download_success():

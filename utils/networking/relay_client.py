@@ -2996,6 +2996,7 @@ class RelayClient:
         internal_reason: Optional[str] = None,
         rejected_option: Optional[str] = None,
         retryable: Optional[bool] = None,
+        safe_runtime_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Attach request-scoped, non-sensitive API v1 diagnostics to an error."""
 
@@ -3033,6 +3034,20 @@ class RelayClient:
             enriched.setdefault("rejected_option", rejected_option)
         if retryable is not None:
             enriched.setdefault("retryable", retryable)
+        if isinstance(safe_runtime_diagnostics, dict):
+            for key in (
+                "exception_type",
+                "generation_exception_category",
+                "sanitized_stderr_tail",
+                "sanitized_error_summary",
+                "method",
+                "stream",
+                "code",
+                "completion_shape",
+            ):
+                value = safe_runtime_diagnostics.get(key)
+                if isinstance(value, (str, bool, int, float, type(None))):
+                    enriched.setdefault(key, value)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}
@@ -3347,6 +3362,16 @@ class RelayClient:
                         prompt_tokens=prompt_tokens,
                         requested_output_tokens=requested_output_tokens,
                         internal_reason=invalid_reason,
+                        safe_runtime_diagnostics=(
+                            None
+                            if invalid_reason == "qwen_thinking_output_leaked"
+                            else {
+                                "completion_shape": json.dumps(
+                                    self._api_v1_safe_completion_shape(completion),
+                                    sort_keys=True,
+                                ),
+                            }
+                        ),
                     ),
                 )
 
@@ -3354,10 +3379,27 @@ class RelayClient:
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})
+                generation_category = (
+                    diagnostics.get("generation_exception_category")
+                    if isinstance(diagnostics, dict)
+                    and isinstance(diagnostics.get("generation_exception_category"), str)
+                    else None
+                )
+                category_reason_map = {
+                    "metal_memory_allocation": "metal_memory_allocation",
+                    "kv_cache_allocation": "kv_cache_allocation",
+                    "rope_yarn_eval_failure": "rope_yarn_eval_failure",
+                    "unsupported_generation_kwarg": "unsupported_generation_option",
+                    "worker_timeout": "worker_timeout",
+                    "worker_dead": "worker_dead",
+                }
                 internal_reason = (
-                    diagnostics.get("reason")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
-                    else "runtime_rejected_generation_options"
+                    category_reason_map.get(generation_category)
+                    or (
+                        diagnostics.get("reason")
+                        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
+                        else "runtime_rejected_generation_options"
+                    )
                 )
                 rejected_option = (
                     diagnostics.get("rejected_option")
@@ -3391,6 +3433,7 @@ class RelayClient:
                         requested_output_tokens=requested_output_tokens,
                         internal_reason=internal_reason,
                         rejected_option=rejected_option,
+                        safe_runtime_diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
                     ),
                 )
             recovery_attempted = (
@@ -3411,6 +3454,24 @@ class RelayClient:
                 "Desktop runtime inference failed for API v1 relay request",
                 exc_info=True,
             )
+            text = f"{type(exc).__name__} {exc}".lower()
+            if "timeout" in text:
+                internal_reason = "worker_timeout"
+            elif any(token in text for token in ("worker dead", "broken pipe", "eof")):
+                internal_reason = "worker_dead"
+            elif "metal" in text and any(token in text for token in ("alloc", "memory", "oom", "out of memory")):
+                internal_reason = "metal_memory_allocation"
+            elif "kv" in text and any(token in text for token in ("alloc", "cache", "memory", "oom", "out of memory")):
+                internal_reason = "kv_cache_allocation"
+            elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):
+                internal_reason = "rope_yarn_eval_failure"
+            elif "unexpected keyword argument" in text:
+                internal_reason = "unsupported_generation_option"
+            else:
+                internal_reason = "runtime_inference_failed"
+            generation_category = internal_reason
+            if internal_reason == "unsupported_generation_option":
+                generation_category = "unsupported_generation_kwarg"
             return self._api_v1_response_envelope(
                 request_id,
                 error=self._api_v1_enrich_safe_error(
@@ -3422,7 +3483,11 @@ class RelayClient:
                     requested_context_tier=requested_context_tier,
                     prompt_tokens=prompt_tokens,
                     requested_output_tokens=requested_output_tokens,
-                    internal_reason="runtime_inference_failed",
+                    internal_reason=internal_reason,
+                    safe_runtime_diagnostics={
+                        "exception_type": type(exc).__name__,
+                        "generation_exception_category": generation_category,
+                    },
                 ),
             )
 

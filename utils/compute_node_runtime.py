@@ -96,6 +96,81 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     return category, _COMPLETION_SMOKE_REASON_BY_CATEGORY.get(category, "runtime_completion_smoke_exception"), diagnostics
 
 
+_API_V1_ERROR_REASON_TO_COMPLETION_SMOKE_REASON = {
+    "qwen_thinking_output_leaked": "runtime_completion_smoke_thinking_leaked",
+    "runtime_completion_smoke_thinking_leaked": "runtime_completion_smoke_thinking_leaked",
+    "qwen_empty_after_think_wrapper_strip": "runtime_completion_smoke_empty_after_think_strip",
+    "unsupported_completion_shape": "runtime_completion_smoke_invalid_model_output",
+    "runtime_completion_smoke_invalid_model_output": "runtime_completion_smoke_invalid_model_output",
+    "runtime_rejected_generation_options": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "unsupported_generation_option": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+    "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
+    "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
+    "worker_timeout": "runtime_completion_smoke_worker_timeout",
+    "worker_dead": "runtime_completion_smoke_worker_dead",
+}
+
+
+def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
+    code = error.get("code")
+    internal_reason = error.get("internal_reason") or error.get("reason")
+    worker_category = error.get("generation_exception_category")
+    if isinstance(worker_category, str) and worker_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
+        return _COMPLETION_SMOKE_REASON_BY_CATEGORY[worker_category]
+    if isinstance(internal_reason, str):
+        if internal_reason.startswith("runtime_completion_smoke_"):
+            return internal_reason
+        mapped = _API_V1_ERROR_REASON_TO_COMPLETION_SMOKE_REASON.get(internal_reason)
+        if mapped:
+            return mapped
+    if code == "compute_node_options_unsupported":
+        return "runtime_completion_smoke_unsupported_generation_kwarg"
+    if code == "compute_node_invalid_model_output":
+        return "runtime_completion_smoke_invalid_model_output"
+    return "runtime_completion_smoke_exception"
+
+
+def _copy_safe_smoke_error_diagnostics(
+    diagnostics: Dict[str, Any], error: Dict[str, Any]
+) -> None:
+    safe_keys = (
+        "exception_type",
+        "generation_exception_category",
+        "sanitized_stderr_tail",
+        "sanitized_error_summary",
+        "runtime_profile_id",
+        "runtime_profile_selected",
+        "active_context_tier",
+        "configured_context_tokens",
+        "recovery_attempted",
+        "recovery_succeeded",
+        "runtime_healthy",
+        "rejected_option",
+        "completion_shape",
+        "method",
+        "stream",
+    )
+    for key in safe_keys:
+        value = error.get(key)
+        if isinstance(value, (str, bool, int, float, type(None))):
+            diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = value
+    category = error.get("generation_exception_category")
+    if isinstance(category, str):
+        diagnostics["api_v1_readiness_completion_smoke_exception_category"] = category
+    exception_type = error.get("exception_type")
+    if isinstance(exception_type, str):
+        diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
+    worker = {
+        key: error.get(key)
+        for key in ("method", "stream", "exception_type", "generation_exception_category")
+        if isinstance(error.get(key), (str, bool, int, float, type(None)))
+    }
+    if worker:
+        diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = worker
+
+
+
 @dataclass(frozen=True)
 class ComputeNodeRuntimeConfig:
     """Runtime configuration shared by all compute-node hosts."""
@@ -562,59 +637,73 @@ class ComputeNodeRuntime:
         if admitted and completion_smoke_required:
             smoke_max_tokens = 64 if qwen_non_thinking_enforced else 4
             diagnostics["api_v1_readiness_completion_smoke_max_tokens"] = smoke_max_tokens
+            diagnostics["api_v1_readiness_completion_smoke_path"] = "shared_api_v1_runtime_generation"
             try:
-                smoke_completion = create_chat_completion(
-                    messages=smoke_messages,
-                    max_tokens=smoke_max_tokens,
-                    stream=False,
+                shared_generation_client = self._api_v1_readiness_generation_client()
+                smoke_envelope = shared_generation_client._generate_api_v1_response_with_runtime_model(
+                    request_id="readiness-smoke",
+                    model_id=str(getattr(self.model_manager, "api_model_id", None) or ""),
+                    messages=[
+                        {"role": "system", "content": "You are a concise assistant."},
+                        {"role": "user", "content": "Reply with exactly: ok"},
+                    ],
+                    options={"max_tokens": smoke_max_tokens, "stream": False},
+                    requested_context_tier=str(context_tier),
                 )
-                shape_category = RelayClient._api_v1_completion_shape_category(
-                    model_profile, smoke_completion
-                )
-                diagnostics["api_v1_readiness_completion_smoke_shape"] = shape_category
-                smoke_content = None
-                smoke_invalid_reason: Optional[str] = None
-                if shape_category == "reasoning_field_present":
-                    smoke_invalid_reason = "runtime_completion_smoke_thinking_leaked"
-                elif (
-                    isinstance(smoke_completion, dict)
-                    and isinstance(smoke_completion.get("choices"), list)
-                    and smoke_completion["choices"]
-                    and isinstance(smoke_completion["choices"][0], dict)
-                ):
-                    smoke_choice = smoke_completion["choices"][0]
-                    smoke_message = smoke_choice.get("message")
-                    if isinstance(smoke_message, dict):
-                        smoke_content = smoke_message.get("content")
-                    elif "text" in smoke_choice:
-                        smoke_content = smoke_choice.get("text")
-                    cleaned_content, normalize_reason = (
-                        RelayClient._api_v1_normalize_qwen_non_thinking_content(
-                            model_profile, smoke_content
-                        )
-                    )
-                    if cleaned_content:
-                        smoke_content = cleaned_content
-                    elif normalize_reason == "qwen_empty_after_think_wrapper_strip":
-                        smoke_invalid_reason = "runtime_completion_smoke_empty_after_think_strip"
-                    elif normalize_reason == "qwen_thinking_output_leaked":
-                        smoke_invalid_reason = "runtime_completion_smoke_thinking_leaked"
-                    elif isinstance(smoke_content, str) and not smoke_content.strip():
-                        smoke_invalid_reason = "runtime_completion_smoke_empty_output"
-                    else:
-                        smoke_invalid_reason = "runtime_completion_smoke_malformed_completion"
-                else:
-                    smoke_invalid_reason = "runtime_completion_smoke_malformed_completion"
-
-                smoke_ok = smoke_invalid_reason is None and isinstance(smoke_content, str) and bool(smoke_content.strip())
-                diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
-                if not smoke_ok:
+                api_response = smoke_envelope.get("api_v1_response") if isinstance(smoke_envelope, dict) else None
+                smoke_error = api_response.get("error") if isinstance(api_response, dict) else None
+                smoke_message = api_response.get("message") if isinstance(api_response, dict) else None
+                if isinstance(smoke_error, dict):
                     admitted = False
-                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_invalid_reason
+                    production_reason = (
+                        smoke_error.get("internal_reason")
+                        or smoke_error.get("reason")
+                        or smoke_error.get("code")
+                        or "runtime_completion_smoke_exception"
+                    )
+                    smoke_invalid_reason = _completion_smoke_reason_from_api_v1_error(smoke_error)
+                    if smoke_invalid_reason == "runtime_completion_smoke_invalid_model_output":
+                        shape_text = str(smoke_error.get("completion_shape") or "")
+                        if '"message_content_type": "str"' in shape_text:
+                            smoke_invalid_reason = "runtime_completion_smoke_empty_output"
+                        elif '"choices_count": 0' in shape_text or '"message_content_type": "NoneType"' in shape_text:
+                            smoke_invalid_reason = "runtime_completion_smoke_malformed_completion"
                     admission_error = {
                         "code": "compute_node_context_admission_unavailable",
-                        "internal_reason": smoke_invalid_reason or "runtime_completion_smoke_malformed_completion",
+                        "internal_reason": smoke_invalid_reason,
                     }
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_invalid_reason
+                    diagnostics["api_v1_readiness_completion_smoke_api_v1_error_code"] = smoke_error.get("code")
+                    diagnostics["api_v1_readiness_completion_smoke_api_v1_internal_reason"] = production_reason
+                    _copy_safe_smoke_error_diagnostics(diagnostics, smoke_error)
+                    if smoke_invalid_reason == "runtime_completion_smoke_thinking_leaked":
+                        diagnostics.setdefault(
+                            "api_v1_readiness_completion_smoke_shape",
+                            "reasoning_field_present"
+                            if smoke_error.get("internal_reason") == "qwen_thinking_output_leaked"
+                            else "thinking_leaked"
+                        )
+                    elif smoke_invalid_reason == "runtime_completion_smoke_invalid_model_output":
+                        diagnostics.setdefault("api_v1_readiness_completion_smoke_shape", "invalid_model_output")
+                elif (
+                    isinstance(smoke_message, dict)
+                    and smoke_message.get("role") == "assistant"
+                    and isinstance(smoke_message.get("content"), str)
+                    and smoke_message["content"].strip()
+                ):
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "passed"
+                    diagnostics["api_v1_readiness_completion_smoke_shape"] = "choices_message_content"
+                else:
+                    admitted = False
+                    smoke_invalid_reason = "runtime_completion_smoke_invalid_model_output"
+                    admission_error = {
+                        "code": "compute_node_context_admission_unavailable",
+                        "internal_reason": smoke_invalid_reason,
+                    }
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_invalid_reason
+                    diagnostics["api_v1_readiness_completion_smoke_shape"] = "invalid_api_v1_envelope"
             except Exception as exc:
                 admitted = False
                 exception_category, safe_reason, exception_diagnostics = (
@@ -679,6 +768,68 @@ class ComputeNodeRuntime:
 
         setattr(self.model_manager, 'last_runtime_init_error', None)
         return True
+
+
+    def _api_v1_readiness_generation_client(self) -> "RelayClient":
+        """Return a relay client object that runs the production API v1 generator."""
+
+        generation = getattr(
+            self.relay_client,
+            "_generate_api_v1_response_with_runtime_model",
+            None,
+        )
+        if callable(generation):
+            return self.relay_client
+
+        from types import MethodType
+        from utils.networking.relay_client import RelayClient
+
+        adapter = RelayClient.__new__(RelayClient)
+        from types import SimpleNamespace
+
+        manager = self.model_manager
+        recovery_completion = getattr(manager, "create_chat_completion_with_recovery", None)
+        if (
+            recovery_completion is not None
+            and not callable(getattr(type(manager), "create_chat_completion_with_recovery", None))
+            and "create_chat_completion_with_recovery" not in getattr(manager, "__dict__", {})
+        ):
+            recovery_completion = None
+        manager_proxy = SimpleNamespace(
+            get_llm_instance=getattr(manager, "get_llm_instance", None),
+            get_llm_instance_with_recovery=getattr(manager, "get_llm_instance_with_recovery", None),
+            create_chat_completion_with_recovery=recovery_completion,
+            model_profile=getattr(manager, "model_profile", {}) or {},
+            context_tier=getattr(manager, "context_tier", None),
+            context_window_tokens=getattr(manager, "context_window_tokens", None),
+            api_model_id=getattr(manager, "api_model_id", None),
+            model_id=getattr(manager, "model_id", None),
+            use_mock_llm=getattr(manager, "use_mock_llm", False),
+        )
+        supports_api_v1_model = getattr(manager, "supports_api_v1_model", None)
+        if callable(supports_api_v1_model):
+            manager_proxy.supports_api_v1_model = supports_api_v1_model
+        adapter.model_manager = manager_proxy
+        adapter._relay_url = getattr(self.relay_client, "relay_url", self.config.relay_url)
+        adapter._last_api_v1_runtime_health = {
+            "runtime_healthy": True,
+            "recovery_attempted": False,
+            "recovery_succeeded": False,
+        }
+        adapter._last_api_v1_invalid_model_output_reason = None
+        adapter._api_v1_registered_relays = set()
+        adapter._last_api_v1_work_relay_url = None
+        admission = getattr(
+            self.relay_client,
+            "_api_v1_authoritative_context_admission",
+            None,
+        )
+        if callable(admission):
+            adapter._api_v1_authoritative_context_admission = MethodType(
+                lambda _self, **kwargs: admission(**kwargs),
+                adapter,
+            )
+        return adapter
 
     def start_relay_polling(self) -> threading.Thread:
         """Start relay polling in a background thread and return the thread."""

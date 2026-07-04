@@ -1,11 +1,22 @@
 """Shared compute-node runtime used by server.py and future desktop bridge code."""
+
 from __future__ import annotations
 
 import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from urllib.parse import urlparse
 
@@ -44,7 +55,6 @@ def _log_warning(message: str, *, exc_info: bool = False) -> None:
         logger.warning(message, exc_info=exc_info)
 
 
-
 _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
@@ -59,7 +69,9 @@ def _bounded_safe_error_summary(exc: BaseException) -> str:
     return f"{type(exc).__name__}:redacted"
 
 
-def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, Dict[str, Any]]:
+def _classify_completion_smoke_exception(
+    exc: BaseException,
+) -> Tuple[str, str, Dict[str, Any]]:
     diagnostics: Dict[str, Any] = {
         "exception_type": type(exc).__name__,
         "sanitized_error_summary": _bounded_safe_error_summary(exc),
@@ -69,31 +81,61 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
         safe_worker = {
             key: value
             for key, value in worker_diagnostics.items()
-            if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None)))
+            if isinstance(key, str)
+            and isinstance(value, (str, bool, int, float, type(None)))
         }
         diagnostics["worker_diagnostics"] = safe_worker
         category = safe_worker.get("generation_exception_category")
         if category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
-            return str(category), _COMPLETION_SMOKE_REASON_BY_CATEGORY[str(category)], diagnostics
+            return (
+                str(category),
+                _COMPLETION_SMOKE_REASON_BY_CATEGORY[str(category)],
+                diagnostics,
+            )
         if safe_worker.get("reason") == "unsupported_generation_option":
-            return "unsupported_generation_kwarg", _COMPLETION_SMOKE_REASON_BY_CATEGORY["unsupported_generation_kwarg"], diagnostics
+            return (
+                "unsupported_generation_kwarg",
+                _COMPLETION_SMOKE_REASON_BY_CATEGORY["unsupported_generation_kwarg"],
+                diagnostics,
+            )
     name = type(exc).__name__
     text = f"{name} {exc}".lower()
     if "timeout" in text:
         category = "worker_timeout"
-    elif any(token in text for token in ("workerdead", "worker dead", "eof", "broken pipe", "exited before")):
+    elif any(
+        token in text
+        for token in (
+            "workerdead",
+            "worker dead",
+            "eof",
+            "broken pipe",
+            "exited before",
+        )
+    ):
         category = "worker_dead"
-    elif "metal" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom")):
+    elif "metal" in text and any(
+        token in text for token in ("alloc", "memory", "out of memory", "oom")
+    ):
         category = "metal_memory_allocation"
-    elif "kv" in text and any(token in text for token in ("alloc", "cache", "memory", "out of memory", "oom")):
+    elif "kv" in text and any(
+        token in text for token in ("alloc", "cache", "memory", "out of memory", "oom")
+    ):
         category = "kv_cache_allocation"
-    elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):
+    elif "yarn" in text or (
+        "rope" in text and any(token in text for token in ("eval", "scal", "freq"))
+    ):
         category = "rope_yarn_eval_failure"
     elif "unexpected keyword argument" in text:
         category = "unsupported_generation_kwarg"
     else:
         category = "unknown_generation_exception"
-    return category, _COMPLETION_SMOKE_REASON_BY_CATEGORY.get(category, "runtime_completion_smoke_exception"), diagnostics
+    return (
+        category,
+        _COMPLETION_SMOKE_REASON_BY_CATEGORY.get(
+            category, "runtime_completion_smoke_exception"
+        ),
+        diagnostics,
+    )
 
 
 @dataclass(frozen=True)
@@ -106,7 +148,9 @@ class ComputeNodeRuntimeConfig:
     relay_urls: Tuple[str, ...] = ()
 
 
-LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
+LEGACY_RELAY_REQUIRED_FIELDS = frozenset(
+    {"client_public_key", "chat_history", "cipherkey", "iv"}
+)
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
@@ -114,7 +158,10 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
     if not isinstance(payload, dict):
         return False
-    if payload.get("protocol") == "tokenplace_api_v1_relay_e2ee" or payload.get("e2ee_v1") is True:
+    if (
+        payload.get("protocol") == "tokenplace_api_v1_relay_e2ee"
+        or payload.get("e2ee_v1") is True
+    ):
         return False
     return LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
 
@@ -124,7 +171,13 @@ def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
 
     if not isinstance(payload, dict):
         return False
-    required_string_fields = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+    required_string_fields = (
+        "request_id",
+        "client_public_key",
+        "chat_history",
+        "cipherkey",
+        "iv",
+    )
     if payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
         return False
     if payload.get("version") != 1:
@@ -231,7 +284,9 @@ def resolve_relay_port(
     if prefer_cli and cli_default is not None:
         return cli_default
 
-    env_port = first_env(["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"])
+    env_port = first_env(
+        ["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"]
+    )
 
     if env_port is not None:
         try:
@@ -301,7 +356,9 @@ def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
 def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
     """Return compute-mode diagnostics from manager state for bridge/UI status payloads."""
 
-    requested = normalize_compute_mode(getattr(manager, "requested_compute_mode", "auto"))
+    requested = normalize_compute_mode(
+        getattr(manager, "requested_compute_mode", "auto")
+    )
     runtime = getattr(manager, "last_compute_diagnostics", None)
     if isinstance(runtime, dict) and runtime.get("requested_mode") == requested:
         return dict(runtime)
@@ -385,12 +442,12 @@ class ComputeNodeRuntime:
     def ensure_api_v1_runtime_ready(self) -> bool:
         """Warm and validate API v1 non-streaming runtime before polling."""
 
-        setattr(self.model_manager, 'last_runtime_init_error', None)
+        setattr(self.model_manager, "last_runtime_init_error", None)
         if not self.ensure_model_ready():
             setattr(
                 self.model_manager,
-                'last_runtime_init_error',
-                'model_file_preflight_failed',
+                "last_runtime_init_error",
+                "model_file_preflight_failed",
             )
             return False
 
@@ -398,10 +455,12 @@ class ComputeNodeRuntime:
         if not callable(get_llm_instance):
             setattr(
                 self.model_manager,
-                'last_runtime_init_error',
-                'model_manager_missing_get_llm_instance',
+                "last_runtime_init_error",
+                "model_manager_missing_get_llm_instance",
             )
-            _log_error("Model manager missing get_llm_instance required for API v1 warmup")
+            _log_error(
+                "Model manager missing get_llm_instance required for API v1 warmup"
+            )
             return False
 
         model_path = getattr(self.model_manager, "model_path", "unknown")
@@ -409,20 +468,22 @@ class ComputeNodeRuntime:
         try:
             llm_runtime = get_llm_instance()
         except Exception as exc:
-            setattr(self.model_manager, 'last_runtime_init_error', str(exc))
-            _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
+            setattr(self.model_manager, "last_runtime_init_error", str(exc))
+            _log_error(
+                "Failed to initialize API v1 runtime for compute node", exc_info=True
+            )
             return False
 
         if llm_runtime is None:
-            detail = getattr(self.model_manager, 'last_runtime_init_error', None)
+            detail = getattr(self.model_manager, "last_runtime_init_error", None)
             message = "API v1 runtime warmup failed: get_llm_instance returned None"
             if detail:
                 message = f"{message} ({detail})"
             else:
                 setattr(
                     self.model_manager,
-                    'last_runtime_init_error',
-                    'get_llm_instance_returned_none',
+                    "last_runtime_init_error",
+                    "get_llm_instance_returned_none",
                 )
             _log_error(message)
             return False
@@ -431,8 +492,8 @@ class ComputeNodeRuntime:
         if not callable(create_chat_completion):
             setattr(
                 self.model_manager,
-                'last_runtime_init_error',
-                'runtime_missing_create_chat_completion',
+                "last_runtime_init_error",
+                "runtime_missing_create_chat_completion",
             )
             _log_error(
                 "API v1 runtime warmup failed: runtime missing callable create_chat_completion"
@@ -446,12 +507,16 @@ class ComputeNodeRuntime:
             diagnostics = {}
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
         context_tier = getattr(self.model_manager, "context_tier", "8k-fast")
-        context_window_tokens = getattr(self.model_manager, "context_window_tokens", None)
+        context_window_tokens = getattr(
+            self.model_manager, "context_window_tokens", None
+        )
         rope_policy = model_profile.get("rope_scaling_policy") or {}
         packaged_render_tokenize_bridge_available = callable(
             getattr(llm_runtime, "render_and_tokenize_chat", None)
         )
-        legacy_template_available = callable(getattr(llm_runtime, "apply_chat_template", None))
+        legacy_template_available = callable(
+            getattr(llm_runtime, "apply_chat_template", None)
+        )
         legacy_tokenizer_available = callable(getattr(llm_runtime, "tokenize", None))
         from utils.networking.relay_client import RelayClient
 
@@ -459,70 +524,101 @@ class ComputeNodeRuntime:
             model_profile
         )
 
-        yarn_diagnostics = getattr(self.model_manager, "last_yarn_rope_diagnostics", None)
+        yarn_diagnostics = getattr(
+            self.model_manager, "last_yarn_rope_diagnostics", None
+        )
         if not isinstance(yarn_diagnostics, dict):
             yarn_diagnostics = {}
 
-        diagnostics.update({
-            "api_v1_readiness_model_id": getattr(self.model_manager, "api_model_id", None),
-            "api_v1_readiness_model_profile_provider": model_profile.get("provider"),
-            "api_v1_readiness_model_profile_id": (
-                model_profile.get("profile_id")
-                or model_profile.get("id")
-                or model_profile.get("name")
-            ),
-            "api_v1_readiness_context_tier": context_tier,
-            "api_v1_readiness_context_window_tokens": context_window_tokens,
-            "api_v1_readiness_template_mode": model_profile.get("chat_template_policy") or "llama-3",
-            "api_v1_readiness_packaged_bridge_available": packaged_render_tokenize_bridge_available,
-            "api_v1_readiness_legacy_template_available": legacy_template_available,
-            "api_v1_readiness_legacy_tokenizer_available": legacy_tokenizer_available,
-            "api_v1_readiness_tokenizer_render_bridge_capability_available": (
-                packaged_render_tokenize_bridge_available
-                or (legacy_template_available and legacy_tokenizer_available)
-            ),
-            "api_v1_readiness_tokenizer_render_bridge_available": False,
-            "api_v1_readiness_non_thinking_enforced": qwen_non_thinking_enforced,
-            "api_v1_readiness_yarn_rope_enabled": bool(
-                rope_policy.get("type") == "yarn" and yarn_diagnostics.get("supported") is True
-            ),
-            "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get("supported"),
-            "api_v1_readiness_yarn_rope_missing_reason": yarn_diagnostics.get("missing_reason"),
-            "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
-            "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
-                "original_context_tokens"
-            ),
-            "api_v1_readiness_yarn_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
-            "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
-            "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
-            "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
-        })
+        diagnostics.update(
+            {
+                "api_v1_readiness_model_id": getattr(
+                    self.model_manager, "api_model_id", None
+                ),
+                "api_v1_readiness_model_profile_provider": model_profile.get(
+                    "provider"
+                ),
+                "api_v1_readiness_model_profile_id": (
+                    model_profile.get("profile_id")
+                    or model_profile.get("id")
+                    or model_profile.get("name")
+                ),
+                "api_v1_readiness_context_tier": context_tier,
+                "api_v1_readiness_context_window_tokens": context_window_tokens,
+                "api_v1_readiness_template_mode": model_profile.get(
+                    "chat_template_policy"
+                )
+                or "llama-3",
+                "api_v1_readiness_packaged_bridge_available": packaged_render_tokenize_bridge_available,
+                "api_v1_readiness_legacy_template_available": legacy_template_available,
+                "api_v1_readiness_legacy_tokenizer_available": legacy_tokenizer_available,
+                "api_v1_readiness_tokenizer_render_bridge_capability_available": (
+                    packaged_render_tokenize_bridge_available
+                    or (legacy_template_available and legacy_tokenizer_available)
+                ),
+                "api_v1_readiness_tokenizer_render_bridge_available": False,
+                "api_v1_readiness_non_thinking_enforced": qwen_non_thinking_enforced,
+                "api_v1_readiness_yarn_rope_enabled": bool(
+                    rope_policy.get("type") == "yarn"
+                    and yarn_diagnostics.get("supported") is True
+                ),
+                "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get(
+                    "supported"
+                ),
+                "api_v1_readiness_yarn_rope_missing_reason": yarn_diagnostics.get(
+                    "missing_reason"
+                ),
+                "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
+                "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
+                    "original_context_tokens"
+                ),
+                "api_v1_readiness_yarn_resolver_source": yarn_diagnostics.get(
+                    "yarn_resolver_source"
+                ),
+                "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
+                "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get(
+                    "llama_cpp_python_version"
+                ),
+                "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+            }
+        )
 
         yarn_required_for_active_tier = (
             model_profile.get("provider") == "qwen"
             and rope_policy.get("type") == "yarn"
             and context_tier == rope_policy.get("required_for_tier", "64k-full")
         )
-        if yarn_required_for_active_tier and yarn_diagnostics.get("supported") is not True:
-            diagnostics.update({
-                "api_v1_runtime_ready": False,
-                "api_v1_readiness_result": "failed",
-                "api_v1_readiness_error_code": "compute_node_yarn_rope_unsupported",
-                "api_v1_readiness_error_reason": (
-                    yarn_diagnostics.get("missing_reason") or "missing_yarn_rope_runtime_support"
-                ),
-            })
+        if (
+            yarn_required_for_active_tier
+            and yarn_diagnostics.get("supported") is not True
+        ):
+            diagnostics.update(
+                {
+                    "api_v1_runtime_ready": False,
+                    "api_v1_readiness_result": "failed",
+                    "api_v1_readiness_error_code": "compute_node_yarn_rope_unsupported",
+                    "api_v1_readiness_error_reason": (
+                        yarn_diagnostics.get("missing_reason")
+                        or "missing_yarn_rope_runtime_support"
+                    ),
+                }
+            )
             self.model_manager.last_compute_diagnostics = diagnostics
             setattr(
                 self.model_manager,
-                'last_runtime_init_error',
+                "last_runtime_init_error",
                 "API v1 runtime readiness failed: Qwen 64K YaRN/RoPE support missing",
             )
-            _log_error("API v1 runtime readiness failed: Qwen 64K YaRN/RoPE support missing")
+            _log_error(
+                "API v1 runtime readiness failed: Qwen 64K YaRN/RoPE support missing"
+            )
             return False
 
         try:
-            smoke_messages = [{"role": "system", "content": "ok"}, {"role": "user", "content": "hi"}]
+            smoke_messages = [
+                {"role": "system", "content": "ok"},
+                {"role": "user", "content": "hi"},
+            ]
             smoke_messages = RelayClient._api_v1_prepare_qwen_non_thinking_messages(
                 smoke_messages, model_profile
             )
@@ -541,19 +637,27 @@ class ComputeNodeRuntime:
             diagnostics["api_v1_readiness_exception_type"] = type(exc).__name__
 
         prompt_tokens_available = isinstance(prompt_tokens, int) and prompt_tokens > 0
-        diagnostics.update({
-            "api_v1_runtime_ready": bool(admitted),
-            "api_v1_readiness_result": "passed" if admitted else "failed",
-            "api_v1_readiness_prompt_tokens": prompt_tokens,
-            "api_v1_readiness_tokenizer_render_bridge_available": bool(
-                admitted and prompt_tokens_available
-            ),
-            "api_v1_readiness_error_code": (admission_error or {}).get("code") if not admitted else None,
-            "api_v1_readiness_error_reason": (
-                (admission_error or {}).get("internal_reason")
-                or (admission_error or {}).get("reason")
-            ) if not admitted else None,
-        })
+        diagnostics.update(
+            {
+                "api_v1_runtime_ready": bool(admitted),
+                "api_v1_readiness_result": "passed" if admitted else "failed",
+                "api_v1_readiness_prompt_tokens": prompt_tokens,
+                "api_v1_readiness_tokenizer_render_bridge_available": bool(
+                    admitted and prompt_tokens_available
+                ),
+                "api_v1_readiness_error_code": (
+                    (admission_error or {}).get("code") if not admitted else None
+                ),
+                "api_v1_readiness_error_reason": (
+                    (
+                        (admission_error or {}).get("internal_reason")
+                        or (admission_error or {}).get("reason")
+                    )
+                    if not admitted
+                    else None
+                ),
+            }
+        )
         self.model_manager.last_compute_diagnostics = diagnostics
         completion_smoke_required = bool(
             diagnostics["api_v1_readiness_non_thinking_enforced"]
@@ -561,60 +665,200 @@ class ComputeNodeRuntime:
         )
         if admitted and completion_smoke_required:
             smoke_max_tokens = 64 if qwen_non_thinking_enforced else 4
-            diagnostics["api_v1_readiness_completion_smoke_max_tokens"] = smoke_max_tokens
+            diagnostics["api_v1_readiness_completion_smoke_max_tokens"] = (
+                smoke_max_tokens
+            )
+            diagnostics["api_v1_readiness_completion_smoke_path"] = (
+                "shared_api_v1_runtime_generation"
+            )
             try:
-                smoke_completion = create_chat_completion(
-                    messages=smoke_messages,
-                    max_tokens=smoke_max_tokens,
-                    stream=False,
-                )
-                shape_category = RelayClient._api_v1_completion_shape_category(
-                    model_profile, smoke_completion
-                )
-                diagnostics["api_v1_readiness_completion_smoke_shape"] = shape_category
-                smoke_content = None
-                smoke_invalid_reason: Optional[str] = None
-                if shape_category == "reasoning_field_present":
-                    smoke_invalid_reason = "runtime_completion_smoke_thinking_leaked"
-                elif (
-                    isinstance(smoke_completion, dict)
-                    and isinstance(smoke_completion.get("choices"), list)
-                    and smoke_completion["choices"]
-                    and isinstance(smoke_completion["choices"][0], dict)
+                shared_generation_client = self.relay_client
+                if not callable(
+                    getattr(
+                        shared_generation_client,
+                        "_generate_api_v1_response_with_runtime_model",
+                        None,
+                    )
                 ):
-                    smoke_choice = smoke_completion["choices"][0]
-                    smoke_message = smoke_choice.get("message")
-                    if isinstance(smoke_message, dict):
-                        smoke_content = smoke_message.get("content")
-                    elif "text" in smoke_choice:
-                        smoke_content = smoke_choice.get("text")
-                    cleaned_content, normalize_reason = (
-                        RelayClient._api_v1_normalize_qwen_non_thinking_content(
-                            model_profile, smoke_content
+                    shared_generation_client = object.__new__(RelayClient)
+                    shared_generation_client.model_manager = self.model_manager
+                    if not callable(
+                        getattr(
+                            type(self.model_manager),
+                            "create_chat_completion_with_recovery",
+                            None,
+                        )
+                    ):
+                        try:
+                            self.model_manager.create_chat_completion_with_recovery = (
+                                None
+                            )
+                        except Exception:
+                            pass
+                    shared_generation_client._request_timeout = 10
+                    shared_generation_client._last_api_v1_runtime_health = {}
+                    shared_generation_client._last_api_v1_invalid_model_output_reason = (
+                        None
+                    )
+                    shared_generation_client._api_v1_registered_relays = set()
+                    shared_generation_client._api_v1_last_heartbeat_at = {}
+                    shared_generation_client._registration_token = None
+                    shared_generation_client.crypto_manager = self.crypto_manager
+                    admission = getattr(
+                        self.relay_client,
+                        "_api_v1_authoritative_context_admission",
+                        None,
+                    )
+                    if callable(admission):
+                        shared_generation_client._api_v1_authoritative_context_admission = (
+                            admission
+                        )
+                smoke_envelope = shared_generation_client._generate_api_v1_response_with_runtime_model(
+                    request_id="readiness-smoke",
+                    model_id=str(
+                        getattr(self.model_manager, "api_model_id", None)
+                        or getattr(self.model_manager, "model_id", None)
+                        or ""
+                    ),
+                    messages=[
+                        {"role": "system", "content": "You are a concise assistant."},
+                        {"role": "user", "content": "Reply with exactly: ok"},
+                    ],
+                    options={"max_tokens": smoke_max_tokens, "stream": False},
+                    requested_context_tier=str(context_tier),
+                )
+                api_v1_response = (
+                    smoke_envelope.get("api_v1_response")
+                    if isinstance(smoke_envelope, dict)
+                    else None
+                )
+                smoke_error = (
+                    api_v1_response.get("error")
+                    if isinstance(api_v1_response, dict)
+                    else None
+                )
+                smoke_message = (
+                    api_v1_response.get("message")
+                    if isinstance(api_v1_response, dict)
+                    else None
+                )
+                if isinstance(smoke_error, dict):
+                    admitted = False
+                    error_code = str(
+                        smoke_error.get("code")
+                        or "compute_node_context_admission_unavailable"
+                    )
+                    internal_reason = str(
+                        smoke_error.get("internal_reason")
+                        or smoke_error.get("reason")
+                        or (
+                            "runtime_completion_smoke_invalid_model_output"
+                            if error_code == "compute_node_invalid_model_output"
+                            else "runtime_completion_smoke_exception"
                         )
                     )
-                    if cleaned_content:
-                        smoke_content = cleaned_content
-                    elif normalize_reason == "qwen_empty_after_think_wrapper_strip":
-                        smoke_invalid_reason = "runtime_completion_smoke_empty_after_think_strip"
-                    elif normalize_reason == "qwen_thinking_output_leaked":
-                        smoke_invalid_reason = "runtime_completion_smoke_thinking_leaked"
-                    elif isinstance(smoke_content, str) and not smoke_content.strip():
-                        smoke_invalid_reason = "runtime_completion_smoke_empty_output"
-                    else:
-                        smoke_invalid_reason = "runtime_completion_smoke_malformed_completion"
-                else:
-                    smoke_invalid_reason = "runtime_completion_smoke_malformed_completion"
-
-                smoke_ok = smoke_invalid_reason is None and isinstance(smoke_content, str) and bool(smoke_content.strip())
-                diagnostics["api_v1_readiness_completion_smoke_result"] = "passed" if smoke_ok else "failed"
-                if not smoke_ok:
-                    admitted = False
-                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = smoke_invalid_reason
+                    if error_code == "compute_node_invalid_model_output":
+                        raw_invalid_reason = internal_reason
+                        if internal_reason == "qwen_thinking_output_leaked":
+                            internal_reason = "runtime_completion_smoke_thinking_leaked"
+                            diagnostics["api_v1_readiness_completion_smoke_shape"] = (
+                                "reasoning_field_present"
+                            )
+                        elif internal_reason == "qwen_empty_after_think_wrapper_strip":
+                            internal_reason = (
+                                "runtime_completion_smoke_empty_after_think_strip"
+                            )
+                        elif internal_reason == "unsupported_completion_shape":
+                            if (
+                                smoke_error.get("completion_shape_category")
+                                == "empty_content"
+                            ):
+                                internal_reason = (
+                                    "runtime_completion_smoke_empty_output"
+                                )
+                            else:
+                                internal_reason = (
+                                    "runtime_completion_smoke_malformed_completion"
+                                )
+                        elif not internal_reason.startswith(
+                            "runtime_completion_smoke_"
+                        ):
+                            internal_reason = (
+                                "runtime_completion_smoke_invalid_model_output"
+                            )
+                        diagnostics[
+                            "api_v1_readiness_completion_smoke_invalid_model_output_reason"
+                        ] = raw_invalid_reason
+                    elif internal_reason in {
+                        "unsupported_generation_option",
+                        "runtime_rejected_generation_options",
+                    }:
+                        internal_reason = (
+                            "runtime_completion_smoke_unsupported_generation_kwarg"
+                        )
+                    elif not internal_reason.startswith("runtime_completion_smoke_"):
+                        internal_reason = "runtime_completion_smoke_exception"
                     admission_error = {
                         "code": "compute_node_context_admission_unavailable",
-                        "internal_reason": smoke_invalid_reason or "runtime_completion_smoke_malformed_completion",
+                        "internal_reason": internal_reason,
                     }
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = (
+                        internal_reason
+                    )
+                    diagnostics["api_v1_readiness_completion_smoke_error_code"] = (
+                        error_code
+                    )
+                    if isinstance(smoke_error.get("exception_type"), str):
+                        diagnostics[
+                            "api_v1_readiness_completion_smoke_exception_type"
+                        ] = smoke_error["exception_type"]
+                    if isinstance(
+                        smoke_error.get("generation_exception_category"), str
+                    ):
+                        diagnostics[
+                            "api_v1_readiness_completion_smoke_exception_category"
+                        ] = smoke_error["generation_exception_category"]
+                    if isinstance(smoke_error.get("worker_diagnostics"), dict):
+                        diagnostics[
+                            "api_v1_readiness_completion_smoke_worker_diagnostics"
+                        ] = smoke_error["worker_diagnostics"]
+                    for key in (
+                        "active_context_tier",
+                        "configured_context_tokens",
+                        "requested_context_tier",
+                        "prompt_tokens",
+                        "requested_output_tokens",
+                        "runtime_healthy",
+                        "recovery_attempted",
+                        "recovery_succeeded",
+                        "rejected_option",
+                    ):
+                        if key in smoke_error:
+                            diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = (
+                                smoke_error[key]
+                            )
+                elif (
+                    RelayClient._valid_api_v1_assistant_message(smoke_message)
+                    is not None
+                ):
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "passed"
+                    diagnostics["api_v1_readiness_completion_smoke_shape"] = (
+                        "choices_message_content"
+                    )
+                else:
+                    admitted = False
+                    admission_error = {
+                        "code": "compute_node_context_admission_unavailable",
+                        "internal_reason": "runtime_completion_smoke_invalid_model_output",
+                    }
+                    diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
+                    diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = (
+                        "runtime_completion_smoke_invalid_model_output"
+                    )
+                    diagnostics["api_v1_readiness_completion_smoke_shape"] = (
+                        "invalid_api_v1_envelope"
+                    )
             except Exception as exc:
                 admitted = False
                 exception_category, safe_reason, exception_diagnostics = (
@@ -625,22 +869,38 @@ class ComputeNodeRuntime:
                     "internal_reason": safe_reason,
                 }
                 diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
-                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = safe_reason
-                diagnostics["api_v1_readiness_completion_smoke_exception_category"] = exception_category
+                diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = (
+                    safe_reason
+                )
+                diagnostics["api_v1_readiness_completion_smoke_exception_category"] = (
+                    exception_category
+                )
                 diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
-                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_diagnostics.get("exception_type")
-                diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = exception_diagnostics.get("sanitized_error_summary")
+                diagnostics["api_v1_readiness_completion_smoke_exception_type"] = (
+                    exception_diagnostics.get("exception_type")
+                )
+                diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                    exception_diagnostics.get("sanitized_error_summary")
+                )
                 if "worker_diagnostics" in exception_diagnostics:
-                    diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = exception_diagnostics["worker_diagnostics"]
+                    diagnostics[
+                        "api_v1_readiness_completion_smoke_worker_diagnostics"
+                    ] = exception_diagnostics["worker_diagnostics"]
                 diagnostics["api_v1_readiness_repair_retry_attempted"] = False
                 diagnostics["api_v1_readiness_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
-            diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None
+            diagnostics["api_v1_readiness_error_code"] = (
+                (admission_error or {}).get("code") if not admitted else None
+            )
             diagnostics["api_v1_readiness_error_reason"] = (
-                (admission_error or {}).get("internal_reason")
-                or (admission_error or {}).get("reason")
-            ) if not admitted else None
+                (
+                    (admission_error or {}).get("internal_reason")
+                    or (admission_error or {}).get("reason")
+                )
+                if not admitted
+                else None
+            )
             self.model_manager.last_compute_diagnostics = diagnostics
 
         if not admitted:
@@ -673,11 +933,11 @@ class ComputeNodeRuntime:
                     f"{admission_code} reason={admission_reason}"
                 )
             )
-            setattr(self.model_manager, 'last_runtime_init_error', message)
+            setattr(self.model_manager, "last_runtime_init_error", message)
             _log_error(message)
             return False
 
-        setattr(self.model_manager, 'last_runtime_init_error', None)
+        setattr(self.model_manager, "last_runtime_init_error", None)
         return True
 
     def start_relay_polling(self) -> threading.Thread:
@@ -697,11 +957,15 @@ class ComputeNodeRuntime:
             daemon=True,
         )
         relay_thread.start()
-        relay_target = format_relay_target(self.config.relay_url, self.config.relay_port)
+        relay_target = format_relay_target(
+            self.config.relay_url, self.config.relay_port
+        )
         _log_info(f"Started relay polling thread for {relay_target}")
         return relay_thread
 
-    def process_relay_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+    def process_relay_request_result(
+        self, request_data: Dict[str, Any]
+    ) -> RelayProcessingResult:
         """Process relay payloads via registered protocol adapters."""
 
         for adapter in self.request_adapters:
@@ -711,7 +975,9 @@ class ComputeNodeRuntime:
         _log_error(
             f"No relay request adapter matched payload keys: {sorted(request_data.keys())}"
         )
-        return RelayProcessingResult.submission_failed(safe_error_code="unsupported_relay_payload")
+        return RelayProcessingResult.submission_failed(
+            safe_error_code="unsupported_relay_payload"
+        )
 
     def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
         """Compatibility wrapper; True means encrypted response/error submission succeeded."""
@@ -745,14 +1011,20 @@ class ComputeNodeRuntime:
         """Stop relay polling and network activity."""
         try:
             self.relay_client.stop()
-            registered_relays = getattr(self.relay_client, "_api_v1_registered_relays", set())
-            should_unregister = isinstance(registered_relays, set) and bool(registered_relays)
+            registered_relays = getattr(
+                self.relay_client, "_api_v1_registered_relays", set()
+            )
+            should_unregister = isinstance(registered_relays, set) and bool(
+                registered_relays
+            )
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn) and should_unregister:
                 if not unregister_fn():
                     _log_warning("Relay unregister request failed during shutdown")
             elif callable(unregister_fn):
-                _log_info("Skipping relay unregister because no API v1 registration succeeded")
+                _log_info(
+                    "Skipping relay unregister because no API v1 registration succeeded"
+                )
         except Exception:
             _log_warning(
                 "Relay unregister request raised during shutdown; continuing stop",

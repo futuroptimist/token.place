@@ -1,4 +1,5 @@
 """Relay client module for managing communication with relay servers."""
+
 from __future__ import annotations
 
 import base64
@@ -20,11 +21,15 @@ from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
-from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
+from utils.context_profiles import (
+    DEFAULT_CONTEXT_TIER,
+    get_context_profile,
+    normalize_context_tier,
+)
 from utils.llm.model_profiles import build_model_aliases
 
 # Configure logging
-logger = logging.getLogger('relay_client')
+logger = logging.getLogger("relay_client")
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
@@ -47,7 +52,10 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
 def _is_llama_cpp_restartable_worker_error(exc: BaseException) -> bool:
     """Return True for restartable llama.cpp worker failures without importing runtime internals."""
 
-    return exc.__class__.__name__.startswith("LlamaCpp") and "Worker" in exc.__class__.__name__
+    return (
+        exc.__class__.__name__.startswith("LlamaCpp")
+        and "Worker" in exc.__class__.__name__
+    )
 
 
 def _load_jsonschema():
@@ -106,7 +114,9 @@ def _validate_with_fallback(instance: Dict[str, Any], schema: Dict[str, Any]) ->
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
     from config import get_config
+
     return get_config()
+
 
 # Define JSON schema for messages
 MESSAGE_SCHEMA = {
@@ -116,8 +126,8 @@ MESSAGE_SCHEMA = {
         "client_public_key": {"type": "string"},
         "chat_history": {"type": "string"},
         "cipherkey": {"type": "string"},
-        "iv": {"type": "string"}
-    }
+        "iv": {"type": "string"},
+    },
 }
 
 # Define relay response schema
@@ -131,8 +141,8 @@ RELAY_RESPONSE_SCHEMA = {
         "cipherkey": {"type": "string"},
         "iv": {"type": "string"},
         "api_v1_request": {"type": "object"},
-        "error": {"type": "string"}
-    }
+        "error": {"type": "string"},
+    },
 }
 
 
@@ -215,7 +225,9 @@ def _sanitize_api_v1_json_body(value: Any, *, secrets: Tuple[str, ...] = ()) -> 
                 sanitized[key_text] = _sanitize_api_v1_json_body(item, secrets=secrets)
         return sanitized
     if isinstance(value, list):
-        return [_sanitize_api_v1_json_body(item, secrets=secrets) for item in value[:10]]
+        return [
+            _sanitize_api_v1_json_body(item, secrets=secrets) for item in value[:10]
+        ]
     if isinstance(value, str):
         return _redact_sensitive_text(value, secrets=secrets)
     return value
@@ -314,6 +326,7 @@ def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
 
     return None
 
+
 def _log(level: str, message: str, *args, exc_info: Optional[bool] = None) -> None:
     """Log a message with environment-aware behaviour.
 
@@ -405,10 +418,14 @@ def _extract_chat_history_and_validate_key_binding(
         bound_client_key = decrypted_payload.get("client_public_key")
         if bound_client_key is not None:
             if not isinstance(bound_client_key, str):
-                log_error("Invalid encrypted payload: client_public_key binding must be a string")
+                log_error(
+                    "Invalid encrypted payload: client_public_key binding must be a string"
+                )
                 return None
             if bound_client_key != expected_client_public_key_b64:
-                log_error("Rejected request: relay client key does not match encrypted key binding")
+                log_error(
+                    "Rejected request: relay client key does not match encrypted key binding"
+                )
                 return None
         else:
             # Legacy clients may still send unbound payloads; continue to accept for compatibility.
@@ -420,7 +437,9 @@ def _extract_chat_history_and_validate_key_binding(
 
         chat_history = decrypted_payload.get("chat_history")
         if not _is_valid_chat_history(chat_history):
-            log_error("Invalid encrypted payload: chat_history must be a list of role/content message objects")
+            log_error(
+                "Invalid encrypted payload: chat_history must be a list of role/content message objects"
+            )
             return None
 
         return chat_history
@@ -428,7 +447,9 @@ def _extract_chat_history_and_validate_key_binding(
     if _is_valid_chat_history(decrypted_payload):
         return decrypted_payload
 
-    log_error("Invalid encrypted payload: expected chat_history list or payload containing chat_history")
+    log_error(
+        "Invalid encrypted payload: expected chat_history list or payload containing chat_history"
+    )
     return None
 
 
@@ -446,7 +467,9 @@ def _extract_api_v1_request_payload(
 
     bound_client_key = decrypted_payload.get("client_public_key")
     if bound_client_key != expected_client_public_key_b64:
-        log_error("Rejected API v1 relay payload: encrypted client key binding mismatch")
+        log_error(
+            "Rejected API v1 relay payload: encrypted client key binding mismatch"
+        )
         return None
 
     request_id = decrypted_payload.get("request_id")
@@ -477,9 +500,16 @@ def _extract_api_v1_request_payload(
         log_error("Rejected API v1 relay payload: routing must be an object")
         return None
     raw_context_tier = routing.get("context_tier")
-    normalized_raw_context_tier = raw_context_tier.strip() if isinstance(raw_context_tier, str) else raw_context_tier
+    normalized_raw_context_tier = (
+        raw_context_tier.strip()
+        if isinstance(raw_context_tier, str)
+        else raw_context_tier
+    )
     context_tier = normalize_context_tier(normalized_raw_context_tier)
-    if normalized_raw_context_tier is not None and context_tier != normalized_raw_context_tier:
+    if (
+        normalized_raw_context_tier is not None
+        and context_tier != normalized_raw_context_tier
+    ):
         log_error("Rejected API v1 relay payload: routing.context_tier is unsupported")
         return None
 
@@ -578,66 +608,70 @@ class RelayClient:
 
         try:
             config = get_config_lazy()
-            self._request_timeout = config.get('relay.request_timeout', 10)
+            self._request_timeout = config.get("relay.request_timeout", 10)
 
             if include_configured_servers:
-                configured_servers = list(config.get('relay.additional_servers', []) or [])
+                configured_servers = list(
+                    config.get("relay.additional_servers", []) or []
+                )
 
-                cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
+                cf_fallbacks = config.get("relay.cloudflare_fallback_urls", []) or []
                 for entry in cf_fallbacks:
                     if entry not in configured_servers:
                         configured_servers.append(entry)
 
-                pool_secondary = config.get('relay.server_pool_secondary', []) or []
+                pool_secondary = config.get("relay.server_pool_secondary", []) or []
                 for entry in pool_secondary:
                     if entry not in configured_servers:
                         configured_servers.append(entry)
 
-                primary_config_url = config.get('relay.server_url', '')
+                primary_config_url = config.get("relay.server_url", "")
                 if primary_config_url and primary_config_url not in configured_servers:
                     configured_servers.insert(0, primary_config_url)
 
             if include_configured_servers:
-                cluster_only_value = config.get('relay.cluster_only', False)
+                cluster_only_value = config.get("relay.cluster_only", False)
                 parsed_cluster_only = _coerce_optional_bool(cluster_only_value)
                 if parsed_cluster_only is not None:
                     self._cluster_only = parsed_cluster_only
                 elif isinstance(cluster_only_value, bool):
                     self._cluster_only = cluster_only_value
 
-            token_value = config.get('relay.server_registration_token', None)
+            token_value = config.get("relay.server_registration_token", None)
             if not token_value:
-                token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                token_value = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKEN")
             self._registration_token = _normalise_registration_token(token_value)
 
         except Exception:
             self._request_timeout = 10  # Fallback default
             if include_configured_servers:
-                cluster_env = _coerce_optional_bool(os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY'))
+                cluster_env = _coerce_optional_bool(
+                    os.environ.get("TOKEN_PLACE_RELAY_CLUSTER_ONLY")
+                )
                 self._cluster_only = cluster_env if cluster_env is not None else False
 
             if include_configured_servers:
-                upstreams_raw = os.environ.get('TOKEN_PLACE_RELAY_UPSTREAMS', '')
+                upstreams_raw = os.environ.get("TOKEN_PLACE_RELAY_UPSTREAMS", "")
                 if upstreams_raw:
-                    normalised = upstreams_raw.replace('\n', ',')
+                    normalised = upstreams_raw.replace("\n", ",")
                     configured_servers.extend(
                         entry.strip()
-                        for entry in normalised.split(',')
+                        for entry in normalised.split(",")
                         if entry and entry.strip()
                     )
 
-                cf_raw = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URLS', '')
-                cf_single = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', '')
-                combined = ','.join(part for part in (cf_raw, cf_single) if part)
+                cf_raw = os.environ.get("TOKEN_PLACE_RELAY_CLOUDFLARE_URLS", "")
+                cf_single = os.environ.get("TOKEN_PLACE_RELAY_CLOUDFLARE_URL", "")
+                combined = ",".join(part for part in (cf_raw, cf_single) if part)
                 if combined:
                     entries: List[str] = []
                     try:
                         loaded = json.loads(combined)
                     except json.JSONDecodeError:
-                        normalised_cf = combined.replace('\n', ',')
+                        normalised_cf = combined.replace("\n", ",")
                         entries.extend(
                             segment.strip()
-                            for segment in normalised_cf.split(',')
+                            for segment in normalised_cf.split(",")
                             if segment.strip()
                         )
                     else:
@@ -652,12 +686,16 @@ class RelayClient:
                             configured_servers.append(entry)
 
             self._registration_token = _normalise_registration_token(
-                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKEN")
             )
 
         if explicit_relay_urls:
             for entry in explicit_relay_urls:
-                if isinstance(entry, str) and entry.strip() and entry not in configured_servers:
+                if (
+                    isinstance(entry, str)
+                    and entry.strip()
+                    and entry not in configured_servers
+                ):
                     configured_servers.append(entry)
 
         self._relay_urls = self._build_relay_targets(
@@ -677,7 +715,6 @@ class RelayClient:
         self._api_v1_heartbeat_stop = threading.Event()
         self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
         self._api_v1_heartbeat_stopping = False
-
 
     def _api_v1_start_heartbeat_worker(self) -> None:
         """Start an independent API v1 lease refresher for long inferences."""
@@ -714,8 +751,14 @@ class RelayClient:
             self._api_v1_heartbeat_stopping = True
             stop_event.set()
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            join_timeout = max(float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0)
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            join_timeout = max(
+                float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0
+            )
             thread.join(timeout=join_timeout)
         with lock:
             if getattr(self, "_api_v1_heartbeat_thread", None) is thread and (
@@ -734,7 +777,9 @@ class RelayClient:
             if not isinstance(relay_wait_hints, dict):
                 relay_wait_hints = {}
                 self._api_v1_relay_wait_hints = relay_wait_hints
-            for candidate_url in list(getattr(self, "_api_v1_registered_relays", set())):
+            for candidate_url in list(
+                getattr(self, "_api_v1_registered_relays", set())
+            ):
                 if self._api_v1_heartbeat_stop.is_set():
                     break
                 hints = relay_wait_hints.get(candidate_url, {})
@@ -771,7 +816,9 @@ class RelayClient:
                         "server.heartbeat.background relay={} lease_seconds={} key_fingerprint={}",
                         _sanitize_relay_target(candidate_url),
                         refreshed_lease,
-                        self._api_v1_public_key_fingerprint(self.crypto_manager.public_key_b64),
+                        self._api_v1_public_key_fingerprint(
+                            self.crypto_manager.public_key_b64
+                        ),
                     )
         with self._api_v1_heartbeat_lock:
             if self._api_v1_heartbeat_thread is threading.current_thread():
@@ -810,7 +857,9 @@ class RelayClient:
         last_heartbeat_at = self._api_v1_last_heartbeat_at.get(candidate_url)
         if not isinstance(last_heartbeat_at, (int, float)):
             return False
-        lease_seconds = hints.get("next_ping_in_x_seconds", DEFAULT_API_V1_LEASE_SECONDS)
+        lease_seconds = hints.get(
+            "next_ping_in_x_seconds", DEFAULT_API_V1_LEASE_SECONDS
+        )
         try:
             lease = float(lease_seconds)
         except (TypeError, ValueError):
@@ -823,25 +872,29 @@ class RelayClient:
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
         """Normalise relay targets into canonical URLs."""
 
-        base = (base_url or '').strip()
+        base = (base_url or "").strip()
         if not base:
-            return ''
-        base = base.rstrip('/')
+            return ""
+        base = base.rstrip("/")
 
-        parsed = urlparse(base if '://' in base else f'http://{base}')
-        scheme = parsed.scheme or 'http'
+        parsed = urlparse(base if "://" in base else f"http://{base}")
+        scheme = parsed.scheme or "http"
         netloc = parsed.netloc or parsed.path
-        path = parsed.path if parsed.netloc else ''
+        path = parsed.path if parsed.netloc else ""
 
         should_inject_port = parsed.port is None and port is not None
 
         if should_inject_port:
-            hostname = parsed.hostname or ''
+            hostname = parsed.hostname or ""
             host_for_netloc = hostname or (parsed.netloc or parsed.path or netloc)
-            if host_for_netloc and ':' in host_for_netloc and not host_for_netloc.startswith('['):
+            if (
+                host_for_netloc
+                and ":" in host_for_netloc
+                and not host_for_netloc.startswith("[")
+            ):
                 host_for_netloc = f"[{host_for_netloc}]"
 
-            userinfo = ''
+            userinfo = ""
             if parsed.username:
                 userinfo = parsed.username
                 if parsed.password:
@@ -850,7 +903,7 @@ class RelayClient:
 
             netloc = f"{userinfo}{host_for_netloc}:{int(port)}"
 
-        return urlunparse((scheme, netloc, path, '', '', '')).rstrip('/')
+        return urlunparse((scheme, netloc, path, "", "", "")).rstrip("/")
 
     @classmethod
     def _build_relay_targets(
@@ -885,8 +938,8 @@ class RelayClient:
             if isinstance(entry, str):
                 _append(entry)
             elif isinstance(entry, dict):
-                base = entry.get('base_url') or entry.get('url') or entry.get('host')
-                port = entry.get('port')
+                base = entry.get("base_url") or entry.get("url") or entry.get("host")
+                port = entry.get("port")
                 if base:
                     _append(base, port)
 
@@ -899,16 +952,16 @@ class RelayClient:
     def _is_local_url(url: str) -> bool:
         """Determine whether the given URL resolves to a localhost target."""
 
-        parsed = urlparse(url if '://' in url else f'http://{url}')
-        hostname = (parsed.hostname or '').strip().lower()
+        parsed = urlparse(url if "://" in url else f"http://{url}")
+        hostname = (parsed.hostname or "").strip().lower()
 
         if not hostname:
             return True
 
-        if hostname in {'localhost', '::1', '::'}:
+        if hostname in {"localhost", "::1", "::"}:
             return True
 
-        normalised = hostname.strip('[]')
+        normalised = hostname.strip("[]")
 
         try:
             candidate_ip = ipaddress.ip_address(normalised)
@@ -967,7 +1020,9 @@ class RelayClient:
         log_info(
             "Starting relay polling relay={} key_fingerprint={} registration_reset={}",
             _sanitize_relay_target(self.relay_url),
-            self._api_v1_public_key_fingerprint(getattr(self.crypto_manager, "public_key_b64", None)),
+            self._api_v1_public_key_fingerprint(
+                getattr(self.crypto_manager, "public_key_b64", None)
+            ),
             clear_registration,
         )
 
@@ -993,7 +1048,9 @@ class RelayClient:
             and getattr(self, "_unregister_complete", False)
             and not registered_relays
         ):
-            log_info("Compute node unregister already completed; skipping duplicate request")
+            log_info(
+                "Compute node unregister already completed; skipping duplicate request"
+            )
             return True
 
         self._unregister_attempted = True
@@ -1005,38 +1062,46 @@ class RelayClient:
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
         self._api_v1_relay_wait_hints = relay_wait_hints
         if not registered_relays:
-            log_info("Compute node was not registered with an API v1 relay; skipping unregister")
+            log_info(
+                "Compute node was not registered with an API v1 relay; skipping unregister"
+            )
             self._unregister_complete = True
             return True
 
         ordered_relay_urls = [
-            self._relay_urls[(self._active_relay_index + offset) % len(self._relay_urls)]
+            self._relay_urls[
+                (self._active_relay_index + offset) % len(self._relay_urls)
+            ]
             for offset in range(len(self._relay_urls))
         ]
         target_urls = [url for url in ordered_relay_urls if url in registered_relays]
-        target_urls.extend(sorted(url for url in registered_relays if url not in set(target_urls)))
+        target_urls.extend(
+            sorted(url for url in registered_relays if url not in set(target_urls))
+        )
 
         relay_index_by_url = {url: index for index, url in enumerate(self._relay_urls)}
 
         for candidate_url in target_urls:
             try:
                 request_kwargs = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    "json": {"server_public_key": self.crypto_manager.public_key_b64},
                 }
                 headers = self._auth_headers()
                 if headers:
-                    request_kwargs['headers'] = headers
+                    request_kwargs["headers"] = headers
 
-                unregister_url = self._build_api_v1_url(candidate_url, "/relay/servers/unregister")
+                unregister_url = self._build_api_v1_url(
+                    candidate_url, "/relay/servers/unregister"
+                )
                 response = requests.post(
                     unregister_url,
                     timeout=self._request_timeout,
                     **request_kwargs,
                 )
                 if response.status_code == 404:
-                    legacy_base_url = candidate_url.rstrip('/')
-                    if legacy_base_url.endswith('/api/v1'):
-                        legacy_base_url = legacy_base_url[: -len('/api/v1')]
+                    legacy_base_url = candidate_url.rstrip("/")
+                    if legacy_base_url.endswith("/api/v1"):
+                        legacy_base_url = legacy_base_url[: -len("/api/v1")]
                     legacy_url = f"{legacy_base_url}/unregister"
                     response = requests.post(
                         legacy_url,
@@ -1088,7 +1153,9 @@ class RelayClient:
         if failed_relays:
             self._unregister_complete = False
             if last_error:
-                log_error("Unable to unregister compute node from relay: {}", last_error)
+                log_error(
+                    "Unable to unregister compute node from relay: {}", last_error
+                )
             return False
 
         self._unregister_complete = True
@@ -1129,16 +1196,16 @@ class RelayClient:
                 )
 
                 request_kwargs = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
+                    "json": {"server_public_key": self.crypto_manager.public_key_b64},
+                    "timeout": self._request_timeout,
                 }
                 headers = self._auth_headers()
                 if headers:
-                    request_kwargs['headers'] = headers
+                    request_kwargs["headers"] = headers
 
-                timeout = request_kwargs.pop('timeout', self._request_timeout)
+                timeout = request_kwargs.pop("timeout", self._request_timeout)
                 response = requests.post(
-                    f'{candidate_url}/sink',
+                    f"{candidate_url}/sink",
                     timeout=timeout,
                     **request_kwargs,
                 )
@@ -1150,8 +1217,8 @@ class RelayClient:
                         len(response.text),
                     )
                     last_error = {
-                        'error': f"HTTP {response.status_code}",
-                        'next_ping_in_x_seconds': self._request_timeout,
+                        "error": f"HTTP {response.status_code}",
+                        "next_ping_in_x_seconds": self._request_timeout,
                     }
                     encountered_error = True
                     continue
@@ -1162,8 +1229,8 @@ class RelayClient:
                 except ValueError as exc:
                     log_error("Invalid relay response format: {}", str(exc))
                     last_error = {
-                        'error': f"Invalid response format: {str(exc)}",
-                        'next_ping_in_x_seconds': self._request_timeout,
+                        "error": f"Invalid response format: {str(exc)}",
+                        "next_ping_in_x_seconds": self._request_timeout,
                     }
                     encountered_error = True
                     continue
@@ -1179,28 +1246,47 @@ class RelayClient:
                 # Connection failures are expected during relay failover/startup probing.
                 # Keep this log concise to avoid runaway traceback noise in long-running loops.
                 log_error("Connection error when pinging relay: {}", str(exc))
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
                 encountered_error = True
             except requests.Timeout as exc:
                 log_error("Request timeout when pinging relay: {}", str(exc))
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
                 encountered_error = True
             except requests.RequestException as exc:
                 log_error("Request exception when pinging relay: {}", str(exc))
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
                 encountered_error = True
             except json.JSONDecodeError as exc:
-                log_error("Invalid JSON response from relay: {}", str(exc), exc_info=True)
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                log_error(
+                    "Invalid JSON response from relay: {}", str(exc), exc_info=True
+                )
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
                 encountered_error = True
             except Exception as exc:  # pragma: no cover - unexpected edge cases
-                log_error("Unexpected error when pinging relay: {}", str(exc), exc_info=True)
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                log_error(
+                    "Unexpected error when pinging relay: {}", str(exc), exc_info=True
+                )
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
                 encountered_error = True
 
         return last_error or {
-            'error': 'No relay targets responded',
-            'next_ping_in_x_seconds': self._request_timeout,
+            "error": "No relay targets responded",
+            "next_ping_in_x_seconds": self._request_timeout,
         }
 
     def _api_v1_non_200_diagnostic(
@@ -1259,7 +1345,9 @@ class RelayClient:
             "/api/v1/relay/responses",
         }
         route_class = (
-            "compute_node_control_plane" if path in control_plane_paths else "api_v1_relay"
+            "compute_node_control_plane"
+            if path in control_plane_paths
+            else "api_v1_relay"
         )
         diagnostic = {
             "method": method.upper(),
@@ -1321,29 +1409,34 @@ class RelayClient:
             token_sent=token_sent,
         )
         return {
-            'error': f'HTTP {diagnostic["status_code"]}',
-            'next_ping_in_x_seconds': next_ping_in_x_seconds,
-            'http_status': diagnostic["status_code"],
-            'relay_error_kind': diagnostic["error_kind"],
-            'relay_error': diagnostic["relay_error"],
-            'relay_http_diagnostic': diagnostic,
+            "error": f'HTTP {diagnostic["status_code"]}',
+            "next_ping_in_x_seconds": next_ping_in_x_seconds,
+            "http_status": diagnostic["status_code"],
+            "relay_error_kind": diagnostic["error_kind"],
+            "relay_error": diagnostic["relay_error"],
+            "relay_http_diagnostic": diagnostic,
         }
 
-    def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
+    def register_api_v1_compute_node(
+        self, relay_url: Optional[str] = None
+    ) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
         payload = {
-            'server_public_key': self.crypto_manager.public_key_b64,
-            'capabilities': self._api_v1_compute_node_capabilities(),
+            "server_public_key": self.crypto_manager.public_key_b64,
+            "capabilities": self._api_v1_compute_node_capabilities(),
         }
-        request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
+        request_kwargs: Dict[str, Any] = {
+            "json": payload,
+            "timeout": self._request_timeout,
+        }
         headers = self._auth_headers()
         if headers:
-            request_kwargs['headers'] = headers
+            request_kwargs["headers"] = headers
         register_url = self._build_api_v1_url(target_url, "/relay/servers/register")
         token_sent = bool(headers)
         response = requests.post(
             register_url,
-            timeout=request_kwargs.pop('timeout'),
+            timeout=request_kwargs.pop("timeout"),
             **request_kwargs,
         )
         if response.status_code != 200:
@@ -1376,21 +1469,28 @@ class RelayClient:
             requested_profile = get_context_profile(requested_context_tier)
         except Exception:
             return False
-        return active_profile.total_context_tokens >= requested_profile.total_context_tokens
+        return (
+            active_profile.total_context_tokens
+            >= requested_profile.total_context_tokens
+        )
 
     def _api_v1_supported_model_ids(self) -> List[str]:
         configured = [
             getattr(self.model_manager, "api_model_id", None),
             getattr(self.model_manager, "model_id", None),
             getattr(self.model_manager, "file_name", None),
-            self._api_v1_model_path_basename(getattr(self.model_manager, "model_path", None)),
+            self._api_v1_model_path_basename(
+                getattr(self.model_manager, "model_path", None)
+            ),
         ]
         model_ids = {
             str(value).strip().lower()
             for value in configured
             if isinstance(value, str) and value.strip()
         }
-        supports_api_v1_model = getattr(self.model_manager, "supports_api_v1_model", None)
+        supports_api_v1_model = getattr(
+            self.model_manager, "supports_api_v1_model", None
+        )
         manager_defines_supports_model = callable(
             getattr(type(self.model_manager), "supports_api_v1_model", None)
         )
@@ -1404,21 +1504,31 @@ class RelayClient:
                 if supports_api_v1_model(model_id) is True
             }
         else:
-            model_ids.update(self._api_v1_catalogue_ids_for_configured_runtime(model_ids))
-        return sorted(model_id for model_id in model_ids if not model_id.endswith(".gguf"))
+            model_ids.update(
+                self._api_v1_catalogue_ids_for_configured_runtime(model_ids)
+            )
+        return sorted(
+            model_id for model_id in model_ids if not model_id.endswith(".gguf")
+        )
 
     def _api_v1_compute_node_capabilities(self) -> Dict[str, Any]:
-        context_tier = normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
+        context_tier = normalize_context_tier(
+            getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
+        )
         profile = get_context_profile(context_tier)
         diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
         backend_class = "unknown"
         if isinstance(diagnostics, dict):
-            backend_class = str(
-                diagnostics.get("backend_used")
-                or diagnostics.get("backend_selected")
-                or diagnostics.get("backend_available")
-                or "unknown"
-            ).strip().lower()
+            backend_class = (
+                str(
+                    diagnostics.get("backend_used")
+                    or diagnostics.get("backend_selected")
+                    or diagnostics.get("backend_available")
+                    or "unknown"
+                )
+                .strip()
+                .lower()
+            )
         if backend_class not in {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}:
             backend_class = "unknown"
         return {
@@ -1483,9 +1593,9 @@ class RelayClient:
 
         if getattr(self, "_polling_stopped_by_request", False):
             return {
-                'error': 'Relay polling stopped',
-                'next_ping_in_x_seconds': 0,
-                'poll_wait_seconds': 0,
+                "error": "Relay polling stopped",
+                "next_ping_in_x_seconds": 0,
+                "poll_wait_seconds": 0,
             }
 
         last_error: Optional[Dict[str, Any]] = None
@@ -1499,13 +1609,13 @@ class RelayClient:
             try:
                 cached_hints = relay_wait_hints.get(candidate_url, {})
                 register_wait = self._normalise_positive_seconds(
-                    cached_hints.get('next_ping_in_x_seconds'),
+                    cached_hints.get("next_ping_in_x_seconds"),
                     self._request_timeout,
                 )
-                poll_wait = cached_hints.get('poll_wait_seconds', register_wait)
+                poll_wait = cached_hints.get("poll_wait_seconds", register_wait)
                 poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                 current_public_key = self.crypto_manager.public_key_b64
-                registered_public_key = cached_hints.get('server_public_key')
+                registered_public_key = cached_hints.get("server_public_key")
                 requires_register = candidate_url not in self._api_v1_registered_relays
                 reregister_reason: Optional[str] = None
                 if requires_register:
@@ -1518,29 +1628,34 @@ class RelayClient:
                     requires_register = True
                     reregister_reason = "public_key_changed"
                 if not requires_register:
-                    last_heartbeat_at = self._api_v1_last_heartbeat_at.get(candidate_url)
-                    refresh_threshold = self._api_v1_refresh_threshold_seconds(register_wait)
+                    last_heartbeat_at = self._api_v1_last_heartbeat_at.get(
+                        candidate_url
+                    )
+                    refresh_threshold = self._api_v1_refresh_threshold_seconds(
+                        register_wait
+                    )
                     if (
                         not isinstance(last_heartbeat_at, (int, float))
                         or refresh_threshold <= 0
-                        or time.monotonic() - float(last_heartbeat_at) >= refresh_threshold
+                        or time.monotonic() - float(last_heartbeat_at)
+                        >= refresh_threshold
                     ):
                         requires_register = True
                         reregister_reason = "lease_expiry_risk"
 
                 if getattr(self, "_polling_stopped_by_request", False):
                     return {
-                        'error': 'Relay polling stopped',
-                        'next_ping_in_x_seconds': 0,
-                        'poll_wait_seconds': 0,
+                        "error": "Relay polling stopped",
+                        "next_ping_in_x_seconds": 0,
+                        "poll_wait_seconds": 0,
                     }
 
                 if requires_register:
                     if getattr(self, "_polling_stopped_by_request", False):
                         return {
-                            'error': 'Relay polling stopped',
-                            'next_ping_in_x_seconds': 0,
-                            'poll_wait_seconds': 0,
+                            "error": "Relay polling stopped",
+                            "next_ping_in_x_seconds": 0,
+                            "poll_wait_seconds": 0,
                         }
                     if reregister_reason and reregister_reason != "not_registered":
                         log_info(
@@ -1552,24 +1667,26 @@ class RelayClient:
                     register_response = self.register_api_v1_compute_node(candidate_url)
                     if not isinstance(register_response, dict):
                         last_error = {
-                            'error': 'Invalid register response format: expected object payload',
-                            'next_ping_in_x_seconds': self._request_timeout,
+                            "error": "Invalid register response format: expected object payload",
+                            "next_ping_in_x_seconds": self._request_timeout,
                         }
                         continue
                     register_wait = self._normalise_positive_seconds(
-                        register_response.get('next_ping_in_x_seconds'),
+                        register_response.get("next_ping_in_x_seconds"),
                         self._request_timeout,
                     )
-                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
+                    poll_wait = register_response.get(
+                        "poll_wait_seconds", register_wait
+                    )
                     poll_wait = self._normalise_poll_wait_seconds(poll_wait)
-                    if register_response.get('error'):
+                    if register_response.get("error"):
                         last_error = dict(register_response)
-                        last_error.setdefault('next_ping_in_x_seconds', register_wait)
+                        last_error.setdefault("next_ping_in_x_seconds", register_wait)
                         continue
                     relay_wait_hints[candidate_url] = {
-                        'next_ping_in_x_seconds': register_wait,
-                        'poll_wait_seconds': poll_wait,
-                        'server_public_key': current_public_key,
+                        "next_ping_in_x_seconds": register_wait,
+                        "poll_wait_seconds": poll_wait,
+                        "server_public_key": current_public_key,
                     }
                     self._api_v1_registered_relays.add(candidate_url)
                     self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
@@ -1577,9 +1694,9 @@ class RelayClient:
                     if getattr(self, "_polling_stopped_by_request", False):
                         self.unregister_from_relay()
                         return {
-                            'error': 'Relay polling stopped',
-                            'next_ping_in_x_seconds': 0,
-                            'poll_wait_seconds': 0,
+                            "error": "Relay polling stopped",
+                            "next_ping_in_x_seconds": 0,
+                            "poll_wait_seconds": 0,
                         }
                     next_refresh = self._api_v1_refresh_threshold_seconds(register_wait)
                     log_info(
@@ -1591,30 +1708,30 @@ class RelayClient:
                     )
 
                 request_kwargs: Dict[str, Any] = {
-                    'json': {
-                        'server_public_key': self.crypto_manager.public_key_b64,
-                        'capabilities': self._api_v1_compute_node_capabilities(),
+                    "json": {
+                        "server_public_key": self.crypto_manager.public_key_b64,
+                        "capabilities": self._api_v1_compute_node_capabilities(),
                     },
-                    'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
+                    "timeout": self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 log_info(
                     "api_v1.poll_timeout relay={} poll_wait_seconds={} timeout_seconds={}",
                     candidate_url,
                     poll_wait,
-                    request_kwargs['timeout'],
+                    request_kwargs["timeout"],
                 )
                 headers = self._auth_headers()
                 if headers:
-                    request_kwargs['headers'] = headers
+                    request_kwargs["headers"] = headers
 
                 if getattr(self, "_polling_stopped_by_request", False):
                     return {
-                        'error': 'Relay polling stopped',
-                        'next_ping_in_x_seconds': 0,
-                        'poll_wait_seconds': 0,
+                        "error": "Relay polling stopped",
+                        "next_ping_in_x_seconds": 0,
+                        "poll_wait_seconds": 0,
                     }
 
-                poll_timeout_seconds = float(request_kwargs.pop('timeout'))
+                poll_timeout_seconds = float(request_kwargs.pop("timeout"))
                 poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
                 token_sent = bool(headers)
                 poll_started = time.monotonic()
@@ -1626,10 +1743,9 @@ class RelayClient:
                     )
                 except Exception as exc:
                     elapsed_seconds = time.monotonic() - poll_started
-                    timeout_exception = (
-                        isinstance(exc, requests.Timeout)
-                        or "Read timed out" in str(exc)
-                    )
+                    timeout_exception = isinstance(
+                        exc, requests.Timeout
+                    ) or "Read timed out" in str(exc)
                     can_try_another_relay = len(self._relay_urls) > 1
                     reached_server_long_poll = (
                         timeout_exception
@@ -1638,14 +1754,19 @@ class RelayClient:
                         and float(poll_wait) > 0
                         and elapsed_seconds >= max(0.0, float(poll_wait) - 0.5)
                     )
-                    if reached_server_long_poll and candidate_url in self._api_v1_registered_relays:
+                    if (
+                        reached_server_long_poll
+                        and candidate_url in self._api_v1_registered_relays
+                    ):
                         self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                         relay_wait_hints[candidate_url] = {
-                            'next_ping_in_x_seconds': register_wait,
-                            'poll_wait_seconds': poll_wait,
-                            'server_public_key': current_public_key,
+                            "next_ping_in_x_seconds": register_wait,
+                            "poll_wait_seconds": poll_wait,
+                            "server_public_key": current_public_key,
                         }
-                        next_refresh = self._api_v1_refresh_threshold_seconds(register_wait)
+                        next_refresh = self._api_v1_refresh_threshold_seconds(
+                            register_wait
+                        )
                         log_info(
                             "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} "
                             "lease_seconds={} next_refresh_seconds={} key_fingerprint={} error={}",
@@ -1658,9 +1779,11 @@ class RelayClient:
                             str(exc),
                         )
                         return {
-                            'message': 'No requests available',
-                            'next_ping_in_x_seconds': 0 if poll_wait > 0 else register_wait,
-                            'poll_wait_seconds': poll_wait,
+                            "message": "No requests available",
+                            "next_ping_in_x_seconds": (
+                                0 if poll_wait > 0 else register_wait
+                            ),
+                            "poll_wait_seconds": poll_wait,
                         }
                     raise
                 if response.status_code != 200:
@@ -1678,36 +1801,41 @@ class RelayClient:
                         method="POST",
                         url=poll_url,
                         token_sent=token_sent,
-                        next_ping_in_x_seconds=0 if response.status_code == 404 else register_wait,
+                        next_ping_in_x_seconds=(
+                            0 if response.status_code == 404 else register_wait
+                        ),
                     )
                     continue
                 payload = response.json()
                 if not isinstance(payload, dict):
                     last_error = {
-                        'error': 'Invalid response format: expected object payload',
-                        'next_ping_in_x_seconds': register_wait,
+                        "error": "Invalid response format: expected object payload",
+                        "next_ping_in_x_seconds": register_wait,
                     }
                     continue
-                payload_wait = payload.get('next_ping_in_x_seconds')
+                payload_wait = payload.get("next_ping_in_x_seconds")
                 normalised_payload_wait: Optional[float] = None
                 if not isinstance(payload_wait, bool):
                     try:
                         candidate_payload_wait = float(payload_wait)
                     except (TypeError, ValueError):
                         candidate_payload_wait = math.nan
-                    if math.isfinite(candidate_payload_wait) and candidate_payload_wait > 0:
+                    if (
+                        math.isfinite(candidate_payload_wait)
+                        and candidate_payload_wait > 0
+                    ):
                         normalised_payload_wait = candidate_payload_wait
                 if normalised_payload_wait is None:
-                    payload.setdefault('next_ping_in_x_seconds', register_wait)
+                    payload.setdefault("next_ping_in_x_seconds", register_wait)
                 else:
                     register_wait = normalised_payload_wait
-                    payload['next_ping_in_x_seconds'] = normalised_payload_wait
-                payload_poll_wait = payload.get('poll_wait_seconds', poll_wait)
+                    payload["next_ping_in_x_seconds"] = normalised_payload_wait
+                payload_poll_wait = payload.get("poll_wait_seconds", poll_wait)
                 poll_wait = self._normalise_poll_wait_seconds(payload_poll_wait)
                 relay_wait_hints[candidate_url] = {
-                    'next_ping_in_x_seconds': register_wait,
-                    'poll_wait_seconds': poll_wait,
-                    'server_public_key': current_public_key,
+                    "next_ping_in_x_seconds": register_wait,
+                    "poll_wait_seconds": poll_wait,
+                    "server_public_key": current_public_key,
                 }
                 self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                 self._active_relay_index = index
@@ -1722,20 +1850,28 @@ class RelayClient:
                 )
                 log_info(
                     "API v1 relay poll route=/api/v1/relay/servers/poll api_v1_payload={} request_id={}",
-                    payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee',
-                    payload.get('request_id', 'none'),
+                    payload.get("protocol") == "tokenplace_api_v1_relay_e2ee",
+                    payload.get("request_id", "none"),
                 )
                 return payload
             except Exception as exc:
-                log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
+                log_error(
+                    "API v1 relay poll failed for {}: {}",
+                    candidate_url,
+                    str(exc),
+                    exc_info=True,
+                )
                 self._api_v1_registered_relays.discard(candidate_url)
                 self._api_v1_last_heartbeat_at.pop(candidate_url, None)
                 relay_wait_hints.pop(candidate_url, None)
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {
+                    "error": str(exc),
+                    "next_ping_in_x_seconds": self._request_timeout,
+                }
 
         return last_error or {
-            'error': 'No relay targets responded',
-            'next_ping_in_x_seconds': self._request_timeout,
+            "error": "No relay targets responded",
+            "next_ping_in_x_seconds": self._request_timeout,
         }
 
     def _api_v1_response_relay_url(self) -> str:
@@ -1839,7 +1975,6 @@ class RelayClient:
             )
             return False
 
-
     def submit_api_v1_error_response(
         self,
         request_data: Dict[str, Any],
@@ -1849,25 +1984,40 @@ class RelayClient:
     ) -> bool:
         """Submit a structured encrypted API v1 error response for an unprocessed work item."""
 
-        required_string_fields = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+        required_string_fields = (
+            "request_id",
+            "client_public_key",
+            "chat_history",
+            "cipherkey",
+            "iv",
+        )
         if (
             not isinstance(request_data, dict)
             or request_data.get("protocol") != "tokenplace_api_v1_relay_e2ee"
             or request_data.get("version") != 1
-            or not all(isinstance(request_data.get(field), str) for field in required_string_fields)
+            or not all(
+                isinstance(request_data.get(field), str)
+                for field in required_string_fields
+            )
         ):
             log_error("Cannot submit API v1 error response for invalid relay payload")
             return False
 
-        client_pub_key_b64 = _normalize_client_public_key_b64(request_data.get("client_public_key"))
+        client_pub_key_b64 = _normalize_client_public_key_b64(
+            request_data.get("client_public_key")
+        )
         if client_pub_key_b64 is None:
-            log_error("Cannot submit API v1 error response: invalid client_public_key metadata")
+            log_error(
+                "Cannot submit API v1 error response: invalid client_public_key metadata"
+            )
             return False
 
         try:
             client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
         except (AttributeError, binascii.Error, ValueError):
-            log_error("Cannot submit API v1 error response: invalid client_public_key encoding")
+            log_error(
+                "Cannot submit API v1 error response: invalid client_public_key encoding"
+            )
             return False
 
         response_envelope = self._api_v1_response_envelope(
@@ -1899,7 +2049,9 @@ class RelayClient:
         return cls._validate_api_v1_chat_messages(messages).valid
 
     @classmethod
-    def _validate_api_v1_chat_messages(cls, messages: Any) -> _ApiV1ChatValidationResult:
+    def _validate_api_v1_chat_messages(
+        cls, messages: Any
+    ) -> _ApiV1ChatValidationResult:
         if (
             not isinstance(messages, list)
             or not messages
@@ -2109,7 +2261,9 @@ class RelayClient:
         return prepared
 
     @classmethod
-    def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _api_v1_qwen_no_think_messages(
+        cls, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """Inject Qwen's template-supported non-thinking control into user text."""
 
         message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
@@ -2122,13 +2276,18 @@ class RelayClient:
                 prepared[index]["content"] = f"{message_control}\n{content}"
                 return prepared
             if isinstance(content, list):
-                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
+                copied_blocks = [
+                    dict(block) if isinstance(block, dict) else block
+                    for block in content
+                ]
                 for block in copied_blocks:
                     if isinstance(block, dict) and isinstance(block.get("text"), str):
                         block["text"] = f"{message_control}\n{block['text']}"
                         prepared[index]["content"] = copied_blocks
                         return prepared
-                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
+                copied_blocks.insert(
+                    0, {"type": "text", "text": f"{message_control}\n"}
+                )
                 prepared[index]["content"] = copied_blocks
                 return prepared
         return prepared
@@ -2175,15 +2334,17 @@ class RelayClient:
             if not match:
                 break
             stripped_any = True
-            cleaned = cleaned[match.end():].lstrip()
+            cleaned = cleaned[match.end() :].lstrip()
 
         cleaned = cleaned.strip()
         if not cleaned:
             return (
                 None,
-                "qwen_empty_after_think_wrapper_strip"
-                if stripped_any
-                else "unsupported_completion_shape",
+                (
+                    "qwen_empty_after_think_wrapper_strip"
+                    if stripped_any
+                    else "unsupported_completion_shape"
+                ),
             )
         if re.search(r"<\s*/?\s*think\b", cleaned, flags=re.IGNORECASE):
             return None, "qwen_thinking_output_leaked"
@@ -2213,7 +2374,6 @@ class RelayClient:
             )
         return False
 
-
     @classmethod
     def _api_v1_completion_shape_category(
         cls, model_profile: Dict[str, Any], completion: Any
@@ -2230,7 +2390,11 @@ class RelayClient:
         choice = completion["choices"][0]
         message = choice.get("message")
         if isinstance(message, dict) and isinstance(message.get("content"), str):
-            return "choices_message_content" if message.get("content", "").strip() else "empty_content"
+            return (
+                "choices_message_content"
+                if message.get("content", "").strip()
+                else "empty_content"
+            )
         if isinstance(choice.get("text"), str):
             return "choices_text" if choice.get("text", "").strip() else "empty_content"
         return "missing_choices"
@@ -2344,7 +2508,9 @@ class RelayClient:
         if not normalized_model:
             return False
 
-        supports_api_v1_model = getattr(self.model_manager, "supports_api_v1_model", None)
+        supports_api_v1_model = getattr(
+            self.model_manager, "supports_api_v1_model", None
+        )
         manager_defines_supports_model = callable(
             getattr(type(self.model_manager), "supports_api_v1_model", None)
         )
@@ -2364,7 +2530,9 @@ class RelayClient:
                 getattr(self.model_manager, "api_model_id", None),
                 getattr(self.model_manager, "model_id", None),
                 getattr(self.model_manager, "file_name", None),
-                self._api_v1_model_path_basename(getattr(self.model_manager, "model_path", None)),
+                self._api_v1_model_path_basename(
+                    getattr(self.model_manager, "model_path", None)
+                ),
             )
             if value
         }
@@ -2376,7 +2544,9 @@ class RelayClient:
         if requested_ids & local_ids:
             return True
 
-        catalogue_ids = self._api_v1_catalogue_ids_for_configured_runtime(configured_ids)
+        catalogue_ids = self._api_v1_catalogue_ids_for_configured_runtime(
+            configured_ids
+        )
         if requested_ids & catalogue_ids:
             return True
 
@@ -2422,7 +2592,11 @@ class RelayClient:
             return False, None
         normalised = []
         for item in value:
-            if not isinstance(item, str) or not item or len(item) > cls._API_V1_MAX_STOP_CHARS:
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item) > cls._API_V1_MAX_STOP_CHARS
+            ):
                 return False, None
             normalised.append(item)
         return True, normalised
@@ -2545,7 +2719,6 @@ class RelayClient:
             total += len(text)
         return total
 
-
     @staticmethod
     def _api_v1_render_and_tokenize_chat_prompt(
         llm_instance: Any,
@@ -2561,12 +2734,19 @@ class RelayClient:
             return None
         kwargs = {"tokenize": False, "add_generation_prompt": True}
         model_manager = getattr(llm_instance, "model_manager", None)
-        profile = model_profile or getattr(model_manager, "model_profile", None) or getattr(llm_instance, "model_profile", None) or {}
+        profile = (
+            model_profile
+            or getattr(model_manager, "model_profile", None)
+            or getattr(llm_instance, "model_profile", None)
+            or {}
+        )
         if isinstance(profile, dict):
             if profile.get("provider"):
                 kwargs["token_place_provider"] = profile.get("provider")
             if profile.get("chat_template_policy"):
-                kwargs["token_place_template_policy"] = profile.get("chat_template_policy")
+                kwargs["token_place_template_policy"] = profile.get(
+                    "chat_template_policy"
+                )
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
         try:
@@ -2585,9 +2765,13 @@ class RelayClient:
                 if isinstance(diagnostics, dict):
                     safe_diagnostics = {}
                     for key, value in diagnostics.items():
-                        if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
+                        if isinstance(key, str) and isinstance(
+                            value, (str, bool, int, float, type(None))
+                        ):
                             safe_diagnostics[key] = value
-                    llm_instance._token_place_last_render_tokenize_error = safe_diagnostics
+                    llm_instance._token_place_last_render_tokenize_error = (
+                        safe_diagnostics
+                    )
                 else:
                     llm_instance._token_place_last_render_tokenize_error = {}
             return None
@@ -2602,7 +2786,9 @@ class RelayClient:
         return None
 
     @staticmethod
-    def _api_v1_tokenize_rendered_prompt(llm_instance: Any, rendered_prompt: str) -> Optional[int]:
+    def _api_v1_tokenize_rendered_prompt(
+        llm_instance: Any, rendered_prompt: str
+    ) -> Optional[int]:
         """Count prompt tokens with the active llama.cpp runtime tokenizer."""
 
         tokenize = getattr(llm_instance, "tokenize", None)
@@ -2686,7 +2872,9 @@ class RelayClient:
             chat_format_module = RelayClient._api_v1_llama_chat_format_module()
             formatter_key = str(chat_format).replace("-", "_")
             formatter_name = (
-                "format_llama2" if formatter_key == "llama_2" else "format_" + formatter_key
+                "format_llama2"
+                if formatter_key == "llama_2"
+                else "format_" + formatter_key
             )
             if formatter_name == "format_llama_3":
                 formatter_name = "format_llama3"
@@ -2719,7 +2907,8 @@ class RelayClient:
             ):
                 sys.modules.pop("llama_cpp", None)
             sys.path = [
-                entry for entry in sys.path
+                entry
+                for entry in sys.path
                 if entry and os.path.abspath(entry) != repo_root
             ]
             return importlib.import_module("llama_cpp.llama_chat_format")
@@ -2806,7 +2995,8 @@ class RelayClient:
             if (
                 required_total <= full_profile.total_context_tokens
                 and configured_context_tokens < full_profile.total_context_tokens
-                and requested_profile.total_context_tokens <= full_profile.total_context_tokens
+                and requested_profile.total_context_tokens
+                <= full_profile.total_context_tokens
             ):
                 recommended_context_tier = "64k-full"
                 retryable = True
@@ -2848,9 +3038,7 @@ class RelayClient:
             or active_profile.total_context_tokens
         )
         model_profile = getattr(self.model_manager, "model_profile", {}) or {}
-        is_qwen_non_thinking = (
-            self._api_v1_qwen_non_thinking_required(model_profile)
-        )
+        is_qwen_non_thinking = self._api_v1_qwen_non_thinking_required(model_profile)
         # Prefer a packaged-runtime bridge that renders and tokenizes inside the
         # loaded worker process. This keeps Qwen admission aligned with the same
         # GGUF/Jinja template surface used by generation and avoids returning or
@@ -2880,20 +3068,30 @@ class RelayClient:
                 else None
             )
         if prompt_tokens is None:
-            worker_diagnostics = getattr(llm_instance, "_token_place_last_render_tokenize_error", None)
+            worker_diagnostics = getattr(
+                llm_instance, "_token_place_last_render_tokenize_error", None
+            )
             internal_reason = "runtime_template_tokenizer_bridge_unavailable"
-            if isinstance(worker_diagnostics, dict) and isinstance(worker_diagnostics.get("reason"), str):
+            if isinstance(worker_diagnostics, dict) and isinstance(
+                worker_diagnostics.get("reason"), str
+            ):
                 internal_reason = worker_diagnostics["reason"]
             safe_diagnostics = {
                 "active_model_id": getattr(self.model_manager, "api_model_id", None),
-                "active_profile_id": model_profile.get("id") or model_profile.get("model_id"),
+                "active_profile_id": model_profile.get("id")
+                or model_profile.get("model_id"),
                 "context_tier": active_context_tier,
-                "template_policy": model_profile.get("chat_template_policy") or "llama-3",
+                "template_policy": model_profile.get("chat_template_policy")
+                or "llama-3",
                 "non_thinking_mode": is_qwen_non_thinking,
                 "runtime_facade_type": type(llm_instance).__name__,
-                "direct_apply_chat_template_available": callable(getattr(llm_instance, "apply_chat_template", None)),
-                "metadata_template_available": internal_reason != "runtime_chat_template_metadata_missing",
-                "jinja_renderer_available": internal_reason != "runtime_chat_template_renderer_unavailable",
+                "direct_apply_chat_template_available": callable(
+                    getattr(llm_instance, "apply_chat_template", None)
+                ),
+                "metadata_template_available": internal_reason
+                != "runtime_chat_template_metadata_missing",
+                "jinja_renderer_available": internal_reason
+                != "runtime_chat_template_renderer_unavailable",
             }
             log_error(
                 "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={} model_id={} profile_id={} template_policy={} non_thinking={} runtime_facade={} direct_apply_chat_template_available={} metadata_template_available={} jinja_renderer_available={}",
@@ -2976,9 +3174,9 @@ class RelayClient:
             "stop": configured("model.stop_tokens", []),
             "stream": False,
         }
-        profile_defaults = (
-            getattr(self.model_manager, "model_profile", {}) or {}
-        ).get("generation_defaults") or {}
+        profile_defaults = (getattr(self.model_manager, "model_profile", {}) or {}).get(
+            "generation_defaults"
+        ) or {}
         for key in ("temperature", "top_p", "top_k"):
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
@@ -3063,11 +3261,17 @@ class RelayClient:
             if self._api_v1_qwen_reasoning_content_leaked(model_profile, completion):
                 # Fail closed before normalizing the runtime completion so hidden
                 # reasoning fields anywhere in the response are never forwarded or echoed.
-                self._last_api_v1_invalid_model_output_reason = "qwen_thinking_output_leaked"
+                self._last_api_v1_invalid_model_output_reason = (
+                    "qwen_thinking_output_leaked"
+                )
                 return None
             choice = completion["choices"][0]
             raw_message = choice.get("message")
-            if isinstance(raw_message, dict) and "role" not in raw_message and "content" in raw_message:
+            if (
+                isinstance(raw_message, dict)
+                and "role" not in raw_message
+                and "content" in raw_message
+            ):
                 raw_message = {**raw_message, "role": "assistant"}
             message = self._valid_api_v1_assistant_message(raw_message)
             if message is None and "text" in choice and "message" not in choice:
@@ -3079,15 +3283,19 @@ class RelayClient:
                 and isinstance(message.get("content"), str)
                 and message["content"].strip()
             ):
-                cleaned_content, invalid_reason = self._api_v1_normalize_qwen_non_thinking_content(
-                    model_profile, message["content"]
+                cleaned_content, invalid_reason = (
+                    self._api_v1_normalize_qwen_non_thinking_content(
+                        model_profile, message["content"]
+                    )
                 )
                 if invalid_reason is not None:
                     self._last_api_v1_invalid_model_output_reason = invalid_reason
                     return None
                 message = {**message, "content": cleaned_content}
             if message is None:
-                self._last_api_v1_invalid_model_output_reason = "unsupported_completion_shape"
+                self._last_api_v1_invalid_model_output_reason = (
+                    "unsupported_completion_shape"
+                )
             return message
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
@@ -3108,10 +3316,14 @@ class RelayClient:
                 shape["choices_count"] = len(choices)
                 if choices and isinstance(choices[0], dict):
                     choice = choices[0]
-                    shape["choice_keys"] = sorted(str(key) for key in choice.keys())[:10]
+                    shape["choice_keys"] = sorted(str(key) for key in choice.keys())[
+                        :10
+                    ]
                     message = choice.get("message")
                     if isinstance(message, dict):
-                        shape["message_keys"] = sorted(str(key) for key in message.keys())[:10]
+                        shape["message_keys"] = sorted(
+                            str(key) for key in message.keys()
+                        )[:10]
                         content = message.get("content")
                         shape["message_content_type"] = type(content).__name__
                     if "text" in choice:
@@ -3255,7 +3467,9 @@ class RelayClient:
                     "recovery_attempted": False,
                     "recovery_succeeded": False,
                 }
-                log_error("Desktop runtime LLM initialization failed for API v1 relay request")
+                log_error(
+                    "Desktop runtime LLM initialization failed for API v1 relay request"
+                )
                 return self._api_v1_response_envelope(
                     request_id,
                     error=self._api_v1_enrich_safe_error(
@@ -3271,17 +3485,20 @@ class RelayClient:
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
-            admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
-                llm_instance=llm_instance,
-                messages=runtime_messages,
-                requested_output_tokens=requested_output_tokens,
-                requested_context_tier=requested_context_tier,
+            admitted, admission_error, prompt_tokens = (
+                self._api_v1_authoritative_context_admission(
+                    llm_instance=llm_instance,
+                    messages=runtime_messages,
+                    requested_output_tokens=requested_output_tokens,
+                    requested_context_tier=requested_context_tier,
+                )
             )
             if not admitted:
                 return self._api_v1_response_envelope(
                     request_id,
                     error=self._api_v1_enrich_safe_error(
-                        admission_error or {
+                        admission_error
+                        or {
                             "code": "compute_node_context_admission_unavailable",
                             "message": "Desktop runtime context admission failed",
                         },
@@ -3294,7 +3511,9 @@ class RelayClient:
 
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
-                create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+                create_chat_completion = getattr(
+                    llm_instance, "create_chat_completion", None
+                )
 
             if callable(create_chat_completion):
                 log_info(
@@ -3316,7 +3535,11 @@ class RelayClient:
                 inference_duration = time.monotonic() - started
                 log_info(
                     "api_v1.inference_complete active_tier={} prompt_tokens={} output_reservation={} admission_result=admitted inference_duration_seconds={} safe_error_code=none",
-                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+                    normalize_context_tier(
+                        getattr(
+                            self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER
+                        )
+                    ),
                     prompt_tokens if prompt_tokens is not None else "unknown",
                     completion_kwargs["max_tokens"],
                     round(inference_duration, 3),
@@ -3341,6 +3564,15 @@ class RelayClient:
                         {
                             "code": "compute_node_invalid_model_output",
                             "message": "Desktop runtime returned invalid assistant output",
+                            "completion_shape_category": (
+                                "thinking_field_present"
+                                if invalid_reason == "qwen_thinking_output_leaked"
+                                else self._api_v1_completion_shape_category(
+                                    getattr(self.model_manager, "model_profile", {})
+                                    or {},
+                                    completion,
+                                )
+                            ),
                         },
                         request_id=request_id,
                         requested_context_tier=requested_context_tier,
@@ -3354,19 +3586,40 @@ class RelayClient:
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})
+                generation_reason_by_category = {
+                    "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+                    "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
+                    "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
+                    "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+                    "worker_timeout": "runtime_completion_smoke_worker_timeout",
+                    "worker_dead": "runtime_completion_smoke_worker_dead",
+                }
+                generation_category = (
+                    diagnostics.get("generation_exception_category")
+                    if isinstance(diagnostics, dict)
+                    else None
+                )
                 internal_reason = (
-                    diagnostics.get("reason")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("reason"), str)
-                    else "runtime_rejected_generation_options"
+                    generation_reason_by_category[generation_category]
+                    if isinstance(generation_category, str)
+                    and generation_category in generation_reason_by_category
+                    else (
+                        diagnostics.get("reason")
+                        if isinstance(diagnostics, dict)
+                        and isinstance(diagnostics.get("reason"), str)
+                        else "runtime_rejected_generation_options"
+                    )
                 )
                 rejected_option = (
                     diagnostics.get("rejected_option")
-                    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str)
+                    if isinstance(diagnostics, dict)
+                    and isinstance(diagnostics.get("rejected_option"), str)
                     else None
                 )
                 error_code = (
                     diagnostics.get("code")
-                    if isinstance(diagnostics, dict) and diagnostics.get("code") == "compute_node_options_unsupported"
+                    if isinstance(diagnostics, dict)
+                    and diagnostics.get("code") == "compute_node_options_unsupported"
                     else "compute_node_internal_error"
                 )
                 self._last_api_v1_runtime_health = {
@@ -3384,6 +3637,24 @@ class RelayClient:
                         {
                             "code": error_code,
                             "message": "Desktop runtime rejected the inference request",
+                            "exception_type": (
+                                diagnostics.get("exception_type")
+                                if isinstance(diagnostics, dict)
+                                else None
+                            ),
+                            "generation_exception_category": generation_category,
+                            "worker_diagnostics": (
+                                {
+                                    str(key): value
+                                    for key, value in diagnostics.items()
+                                    if isinstance(key, str)
+                                    and isinstance(
+                                        value, (str, bool, int, float, type(None))
+                                    )
+                                }
+                                if isinstance(diagnostics, dict)
+                                else {}
+                            ),
                         },
                         request_id=request_id,
                         requested_context_tier=requested_context_tier,
@@ -3417,41 +3688,76 @@ class RelayClient:
                     {
                         "code": "compute_node_internal_error",
                         "message": "Desktop runtime inference failed",
+                        "exception_type": type(exc).__name__,
                     },
                     request_id=request_id,
                     requested_context_tier=requested_context_tier,
                     prompt_tokens=prompt_tokens,
                     requested_output_tokens=requested_output_tokens,
-                    internal_reason="runtime_inference_failed",
+                    internal_reason=(
+                        "runtime_completion_smoke_rope_yarn_eval_failure"
+                        if ("yarn" in str(exc).lower() or "rope" in str(exc).lower())
+                        else (
+                            "runtime_completion_smoke_metal_memory_allocation"
+                            if "metal" in str(exc).lower()
+                            and any(
+                                term in str(exc).lower()
+                                for term in ("alloc", "memory", "oom")
+                            )
+                            else (
+                                "runtime_completion_smoke_kv_cache_allocation"
+                                if "kv" in str(exc).lower()
+                                and any(
+                                    term in str(exc).lower()
+                                    for term in ("alloc", "cache", "memory", "oom")
+                                )
+                                else "runtime_inference_failed"
+                            )
+                        )
+                    ),
                 ),
             )
 
-    def process_client_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
+    def process_client_request_result(
+        self, request_data: Dict[str, Any]
+    ) -> RelayProcessingResult:
         """Process a client request and return a typed, privacy-safe outcome."""
         try:
             try:
                 _validate_with_fallback(request_data, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid request data format: {}", str(e))
-                return RelayProcessingResult.submission_failed(safe_error_code="invalid_relay_payload")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="invalid_relay_payload"
+                )
 
-            client_pub_key_b64 = _normalize_client_public_key_b64(request_data['client_public_key'])
+            client_pub_key_b64 = _normalize_client_public_key_b64(
+                request_data["client_public_key"]
+            )
             if client_pub_key_b64 is None:
                 log_error("Invalid client_public_key format in relay request metadata")
-                return RelayProcessingResult.submission_failed(safe_error_code="invalid_relay_payload")
-            stream_requested = request_data.get('stream') is True
-            stream_session_id = request_data.get('stream_session_id')
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="invalid_relay_payload"
+                )
+            stream_requested = request_data.get("stream") is True
+            stream_session_id = request_data.get("stream_session_id")
             try:
                 client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
             except (AttributeError, binascii.Error, ValueError):
-                log_error("Invalid client_public_key encoding in relay request metadata")
-                return RelayProcessingResult.submission_failed(safe_error_code="invalid_relay_payload")
+                log_error(
+                    "Invalid client_public_key encoding in relay request metadata"
+                )
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="invalid_relay_payload"
+                )
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
             if decrypted_chat_history is None:
                 log_info("Decryption failed. Skipping.")
-                return RelayProcessingResult.submission_failed(safe_error_code="decrypt_failed")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="decrypt_failed"
+                )
 
             log_info("Decrypted client request")
             api_v1_request_payload = _extract_api_v1_request_payload(
@@ -3462,20 +3768,34 @@ class RelayClient:
                 try:
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    response_envelope = self._generate_api_v1_response_with_runtime_model(
-                        request_id=api_v1_request_payload["request_id"],
-                        model_id=api_v1_request_payload["model"],
-                        messages=api_v1_request_payload["messages"],
-                        options=dict(api_v1_request_payload["options"]),
-                        requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
+                    response_envelope = (
+                        self._generate_api_v1_response_with_runtime_model(
+                            request_id=api_v1_request_payload["request_id"],
+                            model_id=api_v1_request_payload["model"],
+                            messages=api_v1_request_payload["messages"],
+                            options=dict(api_v1_request_payload["options"]),
+                            requested_context_tier=api_v1_request_payload["routing"][
+                                "context_tier"
+                            ],
+                        )
                     )
                     api_v1_response = response_envelope.get("api_v1_response", {})
-                    error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
-                    safe_error_code = error.get("code") if isinstance(error, dict) else None
+                    error = (
+                        api_v1_response.get("error")
+                        if isinstance(api_v1_response, dict)
+                        else None
+                    )
+                    safe_error_code = (
+                        error.get("code") if isinstance(error, dict) else None
+                    )
                     runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
                     runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
-                    recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
-                    recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
+                    recovery_attempted = bool(
+                        runtime_health.get("recovery_attempted", False)
+                    )
+                    recovery_succeeded = bool(
+                        runtime_health.get("recovery_succeeded", False)
+                    )
                     if safe_error_code not in {
                         "compute_node_internal_error",
                         "compute_node_process_failed",
@@ -3502,38 +3822,56 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if chat_history is None:
-                return RelayProcessingResult.submission_failed(safe_error_code="invalid_relay_payload")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="invalid_relay_payload"
+                )
 
-            if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
-                log_info("Processing streaming relay request for session {}", stream_session_id)
-                response_history = self.model_manager.llama_cpp_get_response(chat_history)
-                encrypted_response = self.crypto_manager.encrypt_message(response_history, client_pub_key)
+            if (
+                stream_requested
+                and isinstance(stream_session_id, str)
+                and stream_session_id.strip()
+            ):
+                log_info(
+                    "Processing streaming relay request for session {}",
+                    stream_session_id,
+                )
+                response_history = self.model_manager.llama_cpp_get_response(
+                    chat_history
+                )
+                encrypted_response = self.crypto_manager.encrypt_message(
+                    response_history, client_pub_key
+                )
                 chunk_payload = {
-                    'session_id': stream_session_id,
-                    'chunk': {
-                        'client_public_key': client_pub_key_b64,
+                    "session_id": stream_session_id,
+                    "chunk": {
+                        "client_public_key": client_pub_key_b64,
                         **encrypted_response,
                     },
-                    'final': True,
+                    "final": True,
                 }
 
                 request_kwargs = {
-                    'json': chunk_payload,
-                    'timeout': self._request_timeout,
+                    "json": chunk_payload,
+                    "timeout": self._request_timeout,
                 }
                 headers = self._auth_headers()
                 if headers:
-                    request_kwargs['headers'] = headers
+                    request_kwargs["headers"] = headers
 
-                timeout = request_kwargs.pop('timeout', self._request_timeout)
+                timeout = request_kwargs.pop("timeout", self._request_timeout)
                 stream_response = requests.post(
-                    f'{self.relay_url}/stream/source',
+                    f"{self.relay_url}/stream/source",
                     timeout=timeout,
                     **request_kwargs,
                 )
                 if stream_response.status_code != 200:
-                    log_error("Error status from /stream/source: {}", stream_response.status_code)
-                    return RelayProcessingResult.submission_failed(safe_error_code="stream_submission_failed")
+                    log_error(
+                        "Error status from /stream/source: {}",
+                        stream_response.status_code,
+                    )
+                    return RelayProcessingResult.submission_failed(
+                        safe_error_code="stream_submission_failed"
+                    )
                 return RelayProcessingResult(inference_succeeded=True, submitted=True)
 
             log_info("Getting response from LLM...")
@@ -3542,67 +3880,94 @@ class RelayClient:
 
             log_info("Encrypting response for client...")
             encrypted_response = self.crypto_manager.encrypt_message(
-                response_history,
-                client_pub_key
+                response_history, client_pub_key
             )
 
             source_payload = {
-                'client_public_key': client_pub_key_b64,
-                **encrypted_response
+                "client_public_key": client_pub_key_b64,
+                **encrypted_response,
             }
 
             try:
                 _validate_with_fallback(source_payload, MESSAGE_SCHEMA)
             except ValueError as e:
                 log_error("Invalid response payload format: {}", str(e))
-                return RelayProcessingResult.submission_failed(safe_error_code="invalid_response_payload")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="invalid_response_payload"
+                )
 
-            log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
+            log_info(
+                "Posting response to {}/source. Payload keys: {}",
+                self.relay_url,
+                list(source_payload.keys()),
+            )
 
             request_kwargs = {
-                'json': source_payload,
-                'timeout': self._request_timeout,
+                "json": source_payload,
+                "timeout": self._request_timeout,
             }
             headers = self._auth_headers()
             if headers:
-                request_kwargs['headers'] = headers
+                request_kwargs["headers"] = headers
 
-            timeout = request_kwargs.pop('timeout', self._request_timeout)
+            timeout = request_kwargs.pop("timeout", self._request_timeout)
             source_response = requests.post(
-                f'{self.relay_url}/source',
-                timeout=timeout,
-                **request_kwargs
+                f"{self.relay_url}/source", timeout=timeout, **request_kwargs
             )
 
             log_info(
                 "Response sent to /source. Status: {}, body length: {}",
                 source_response.status_code,
-                len(source_response.text)
+                len(source_response.text),
             )
 
             if source_response.status_code != 200:
                 log_error("Error status from /source: {}", source_response.status_code)
-                return RelayProcessingResult.submission_failed(safe_error_code="response_submission_failed")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="response_submission_failed"
+                )
 
             response_content = source_response.text.strip()
             if not response_content:
                 log_error("Empty response from /source")
-                return RelayProcessingResult.submission_failed(safe_error_code="empty_relay_response")
+                return RelayProcessingResult.submission_failed(
+                    safe_error_code="empty_relay_response"
+                )
 
             return RelayProcessingResult(inference_succeeded=True, submitted=True)
 
         except requests.ConnectionError as e:
-            log_error("Connection error when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return RelayProcessingResult.submission_failed(safe_error_code="relay_connection_error")
+            log_error(
+                "Connection error when posting to relay source endpoint: {}",
+                str(e),
+                exc_info=True,
+            )
+            return RelayProcessingResult.submission_failed(
+                safe_error_code="relay_connection_error"
+            )
         except requests.Timeout as e:
-            log_error("Request timeout when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return RelayProcessingResult.submission_failed(safe_error_code="relay_timeout")
+            log_error(
+                "Request timeout when posting to relay source endpoint: {}",
+                str(e),
+                exc_info=True,
+            )
+            return RelayProcessingResult.submission_failed(
+                safe_error_code="relay_timeout"
+            )
         except requests.RequestException as e:
-            log_error("Request exception when posting to relay source endpoint: {}", str(e), exc_info=True)
-            return RelayProcessingResult.submission_failed(safe_error_code="relay_request_exception")
+            log_error(
+                "Request exception when posting to relay source endpoint: {}",
+                str(e),
+                exc_info=True,
+            )
+            return RelayProcessingResult.submission_failed(
+                safe_error_code="relay_request_exception"
+            )
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
-            return RelayProcessingResult.submission_failed(safe_error_code="compute_node_internal_error", runtime_healthy=False)
+            return RelayProcessingResult.submission_failed(
+                safe_error_code="compute_node_internal_error", runtime_healthy=False
+            )
 
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """Compatibility wrapper; True means encrypted response/error submission succeeded."""
@@ -3640,7 +4005,10 @@ class RelayClient:
                 relay_response = self.poll_api_v1_encrypted_work()
                 if not isinstance(relay_response, dict):
                     consecutive_failures += 1
-                    if max_failures is not None and consecutive_failures >= max_failures:
+                    if (
+                        max_failures is not None
+                        and consecutive_failures >= max_failures
+                    ):
                         log_error(
                             "Stopping API v1 E2EE relay polling after {} consecutive invalid responses.",
                             consecutive_failures,
@@ -3650,13 +4018,18 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                wait_seconds = relay_response.get(
+                    "next_ping_in_x_seconds", self._request_timeout
+                )
                 wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
-                relay_error = relay_response.get('error')
+                relay_error = relay_response.get("error")
                 if relay_error:
                     consecutive_failures += 1
                     log_error("Error from API v1 E2EE relay poll: {}", relay_error)
-                    if max_failures is not None and consecutive_failures >= max_failures:
+                    if (
+                        max_failures is not None
+                        and consecutive_failures >= max_failures
+                    ):
                         log_error(
                             "Stopping API v1 E2EE relay polling after {} consecutive relay errors.",
                             consecutive_failures,
@@ -3667,12 +4040,16 @@ class RelayClient:
                     continue
 
                 consecutive_failures = 0
-                if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                if relay_response.get("protocol") == "tokenplace_api_v1_relay_e2ee":
                     self.process_client_request(relay_response)
                 time.sleep(wait_seconds)
             except Exception as e:
                 consecutive_failures += 1
-                log_error("Exception during API v1 E2EE polling loop: {}", str(e), exc_info=True)
+                log_error(
+                    "Exception during API v1 E2EE polling loop: {}",
+                    str(e),
+                    exc_info=True,
+                )
                 if max_failures is not None and consecutive_failures >= max_failures:
                     log_error(
                         "Stopping API v1 E2EE relay polling after {} consecutive failures.",
@@ -3723,7 +4100,10 @@ class RelayClient:
                 if not isinstance(relay_response, dict):
                     log_error("Invalid relay response type: {}", type(relay_response))
                     consecutive_failures += 1
-                    if max_failures is not None and consecutive_failures >= max_failures:
+                    if (
+                        max_failures is not None
+                        and consecutive_failures >= max_failures
+                    ):
                         log_error(
                             "Stopping relay polling after {} consecutive invalid responses.",
                             consecutive_failures,
@@ -3733,10 +4113,13 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                if 'next_ping_in_x_seconds' not in relay_response:
+                if "next_ping_in_x_seconds" not in relay_response:
                     log_error("Missing 'next_ping_in_x_seconds' in relay response")
                     consecutive_failures += 1
-                    if max_failures is not None and consecutive_failures >= max_failures:
+                    if (
+                        max_failures is not None
+                        and consecutive_failures >= max_failures
+                    ):
                         log_error(
                             "Stopping relay polling after {} consecutive malformed responses.",
                             consecutive_failures,
@@ -3746,11 +4129,14 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                relay_error = relay_response.get('error')
+                relay_error = relay_response.get("error")
                 if relay_error:
                     log_error("Error from relay: {}", relay_error)
                     consecutive_failures += 1
-                    if max_failures is not None and consecutive_failures >= max_failures:
+                    if (
+                        max_failures is not None
+                        and consecutive_failures >= max_failures
+                    ):
                         log_error(
                             "Stopping relay polling after {} consecutive relay errors.",
                             consecutive_failures,
@@ -3763,11 +4149,16 @@ class RelayClient:
                     # Only log the top-level keys present in the relay response.
                     log_info(
                         "Received data from relay with keys: {}",
-                        list(relay_response.keys())
+                        list(relay_response.keys()),
                     )
 
                     # Check if there's a client request to process
-                    required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']
+                    required_fields = [
+                        "client_public_key",
+                        "chat_history",
+                        "cipherkey",
+                        "iv",
+                    ]
                     if all(field in relay_response for field in required_fields):
                         log_info("Processing client request...")
                         self.process_client_request(relay_response)
@@ -3775,7 +4166,9 @@ class RelayClient:
                         log_info("No client request data in sink response.")
 
                 # Sleep before the next ping
-                sleep_duration = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                sleep_duration = relay_response.get(
+                    "next_ping_in_x_seconds", self._request_timeout
+                )
                 log_info("Sleeping for {} seconds...", sleep_duration)
                 time.sleep(sleep_duration)
 

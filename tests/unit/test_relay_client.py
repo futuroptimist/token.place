@@ -4175,6 +4175,11 @@ class _ApiV1RuntimeManager:
         self.runtime.create_chat_completion.return_value = {
             "choices": [{"message": {"role": "assistant", "content": "ok"}}]
         }
+        self.runtime.create_chat_completion_from_rendered_prompt.side_effect = (
+            lambda messages, **kwargs: self.runtime.create_chat_completion(
+                messages=messages, **kwargs
+            )
+        )
         self.runtime.apply_chat_template.side_effect = (
             lambda messages, tokenize=False, add_generation_prompt=True: "".join(
                 f"<{message['role']}>{message['content']}" for message in messages
@@ -4223,6 +4228,35 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
     assert messages[-1]["content"].startswith("/no_think\n")
 
 
+
+
+
+@pytest.mark.parametrize("context_tier", ["8k-fast", "64k-full"])
+def test_api_v1_qwen_missing_render_complete_bridge_fails_closed_without_chat_fallback(context_tier):
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+    }
+    manager.context_tier = context_tier
+    manager.context_window_tokens = 65536 if context_tier == "64k-full" else 8192
+    manager.runtime.create_chat_completion.side_effect = AssertionError("chat path must not be used for qwen")
+    manager.runtime.create_chat_completion_from_rendered_prompt = None
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id=f"req-qwen-missing-render-{context_tier}",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64, "stream": False},
+        requested_context_tier=context_tier,
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_runtime_unavailable"
+    assert error["internal_reason"] == "qwen_render_complete_bridge_unavailable"
+    manager.runtime.create_chat_completion.assert_not_called()
 
 def test_api_v1_qwen_render_then_complete_preserves_seed_option():
     manager = _ApiV1RuntimeManager()
@@ -4276,6 +4310,43 @@ def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
     assert calls[0].kwargs["enable_thinking"] is False
     assert "enable_thinking" not in calls[1].kwargs
     assert "enable_thinking" in client._api_v1_generation_kwargs_filtered
+
+
+
+def test_api_v1_qwen_render_then_complete_retries_rejected_top_k_without_resending():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    render_complete = MagicMock(side_effect=[
+        LlamaCppInferenceRequestError(
+            "unexpected keyword argument 'top_k'",
+            diagnostics={
+                "code": "compute_node_options_unsupported",
+                "reason": "unsupported_generation_option",
+                "rejected_option": "top_k",
+                "generation_exception_category": "unsupported_generation_kwarg",
+                "method": "create_chat_completion_from_rendered_prompt",
+            },
+        ),
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    ])
+
+    completion, diagnostics = client._api_v1_create_completion_from_rendered_prompt_filtered(
+        render_complete,
+        messages=[{"role": "user", "content": "hi"}],
+        safe_options={"max_tokens": 64, "top_k": 20},
+        model_profile={"provider": "qwen", "thinking_mode": "disabled"},
+        client_option_names=set(),
+    )
+
+    assert completion["choices"][0]["message"]["content"] == "ok"
+    calls = render_complete.call_args_list
+    assert calls[0].kwargs["top_k"] == 20
+    assert "top_k" not in calls[1].kwargs
+    assert "top_k" in diagnostics["filtered_generation_kwargs"]
+    assert "top_k" in client._api_v1_generation_kwargs_filtered
+
 
 def test_api_v1_qwen_render_then_complete_empty_think_wrapper_is_cleaned():
     manager = _ApiV1RuntimeManager()
@@ -4612,6 +4683,9 @@ class _AdmissionRuntime:
     def create_chat_completion(self, **kwargs):
         self.calls.append(kwargs)
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+        return self.create_chat_completion(messages=messages, **kwargs)
 
 
 class _AdmissionManager:
@@ -5922,6 +5996,9 @@ class _RejectingAdmissionRuntime(_AdmissionRuntime):
                 self.rejected_sequence.remove(rejected)
                 raise TypeError(f"got an unexpected keyword argument '{rejected}'")
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+        return self.create_chat_completion(messages=messages, **kwargs)
 
 
 class _RejectingAdmissionManager(_AdmissionManager):

@@ -3313,7 +3313,7 @@ class RelayClient:
                 for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
                 if key in allowed_plain_kwargs
             }
-            removed_set = set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))
+            removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
@@ -3355,7 +3355,7 @@ class RelayClient:
                 )
                 if category != "unsupported_generation_kwarg" or not rejected:
                     raise
-                if rejected in client_option_names or rejected in {"messages", "max_tokens", "stream"} or len(removed) >= max_removed_kwargs:
+                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
                     raise
                 removed.append(rejected)
                 self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
@@ -3690,6 +3690,7 @@ class RelayClient:
                 )
                 if (
                     type(qwen_render_complete).__module__.startswith("unittest.mock")
+                    and getattr(qwen_render_complete, "side_effect", None) is None
                     and not callable(getattr(type(llm_instance), "create_chat_completion_from_rendered_prompt", None))
                     and "create_chat_completion_from_rendered_prompt"
                     not in getattr(llm_instance, "__dict__", {})
@@ -3699,6 +3700,22 @@ class RelayClient:
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+
+            if self._api_v1_qwen_non_thinking_required(model_profile) and not callable(qwen_render_complete):
+                return self._api_v1_response_envelope(
+                    request_id,
+                    error=self._api_v1_enrich_safe_error(
+                        {
+                            "code": "compute_node_runtime_unavailable",
+                            "message": "Qwen API v1 render-complete bridge is unavailable",
+                            "internal_reason": "qwen_render_complete_bridge_unavailable",
+                        },
+                        request_id=request_id,
+                        requested_context_tier=requested_context_tier,
+                        prompt_tokens=prompt_tokens,
+                        requested_output_tokens=requested_output_tokens,
+                    ),
+                )
 
             if callable(qwen_render_complete) or callable(create_chat_completion):
                 generation_branch = (

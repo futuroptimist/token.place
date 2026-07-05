@@ -61,6 +61,8 @@ class Llama:
     def tokenize(self, payload, add_bos=False):
         return [1] * 42
     def create_chat_completion(self, **kwargs):
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'legacy'}}]}
+    def create_completion(self, prompt, **kwargs):
 """
         + completion_branch,
         encoding='utf-8',
@@ -153,7 +155,12 @@ class _Qwen64kFakeRuntime:
         return "<redacted-test-template>"
 
     def create_chat_completion(self, **_kwargs):
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        raise LlamaCppInferenceRequestError("chat path should not be used")
+
+    def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+        self.last_render_complete_messages = messages
+        self.last_render_complete_kwargs = dict(kwargs)
+        return {"choices": [{"text": "ok"}]}
 
 
 def _model_manager(runtime):
@@ -206,13 +213,13 @@ def _runtime_for(fake_runtime):
 )
 def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_reason(category, reason):
     class FailingRuntime(_Qwen64kFakeRuntime):
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, *_args, **_kwargs):
             raise LlamaCppInferenceRequestError(
                 "llama_cpp request failed",
                 diagnostics={
                     "generation_exception_category": category,
                     "exception_type": "RuntimeError",
-                    "method": "create_chat_completion",
+                    "method": "create_completion_from_rendered_prompt",
                 },
             )
 
@@ -225,6 +232,62 @@ def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_re
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
 
 
+
+def test_qwen64k_packaged_fake_runtime_chat_completion_fails_but_render_complete_passes():
+    class ChatFailsRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion(self, **_kwargs):
+            raise LlamaCppInferenceRequestError("legacy chat failed")
+
+    fake = ChatFailsRuntime()
+    runtime, manager = _runtime_for(fake)
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_result"] == "passed"
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert fake.last_render_complete_kwargs["stream"] is False
+    assert fake.last_render_complete_kwargs["max_tokens"] == 64
+    assert "SECRET_PROMPT" not in str(diagnostics)
+
+
+def test_qwen64k_packaged_fake_runtime_empty_render_complete_output_fails_precisely():
+    class EmptyRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, *_args, **_kwargs):
+            return {"choices": [{"text": "   "}]}
+
+    runtime, manager = _runtime_for(EmptyRuntime())
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] in {
+        "runtime_completion_smoke_render_complete_malformed_output",
+        "runtime_completion_smoke_invalid_model_output",
+    }
+
+
+def test_qwen64k_packaged_fake_runtime_empty_think_wrapper_is_cleaned():
+    class EmptyThinkRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, *_args, **_kwargs):
+            return {"choices": [{"text": "<think>\n\n</think>\n\nok<|im_end|>"}]}
+
+    runtime, manager = _runtime_for(EmptyThinkRuntime())
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert manager.last_compute_diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+
+
+def test_qwen64k_packaged_fake_runtime_non_empty_thinking_fails():
+    class ThinkingRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, *_args, **_kwargs):
+            return {"choices": [{"text": "<think>reasoning</think>\nok"}]}
+
+    runtime, manager = _runtime_for(ThinkingRuntime())
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_thinking_leaked"
+
 def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'runtime'
     _write_fake_llama_cpp_runtime(runtime_root, completion_error='kv')
@@ -235,8 +298,8 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
     try:
         assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
-            proxy.create_chat_completion(messages=[{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
-        assert exc_info.value.diagnostics['method'] == 'create_chat_completion'
+            proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
+        assert exc_info.value.diagnostics['method'] == 'create_completion_from_rendered_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
         assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
 
@@ -266,7 +329,7 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
             self.calls = []
             self.rejected = False
 
-        def create_chat_completion(self, **kwargs):
+        def create_chat_completion_from_rendered_prompt(self, _messages, **kwargs):
             self.calls.append(dict(kwargs))
             if "top_k" in kwargs and not self.rejected:
                 self.rejected = True

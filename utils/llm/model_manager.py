@@ -1603,6 +1603,20 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
+    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
     def apply_chat_template(self, *args, **kwargs):
         with self._lock:
             self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
@@ -1812,8 +1826,8 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
                 diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
-        if method == 'create_chat_completion':
-            diagnostics['method'] = method
+        if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
+            diagnostics['method'] = 'create_completion_from_rendered_prompt' if method == 'create_chat_completion_from_rendered_prompt' else method
         elif method is not None:
             diagnostics['method'] = 'unsupported'
         kwargs = request.get('kwargs')
@@ -2093,7 +2107,7 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_request'))
             continue
         method = request.get('method')
-        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
+        if method not in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
@@ -2181,6 +2195,44 @@ for line in sys.stdin:
                 else:
                     tokenize_args.append(arg)
             _emit({'status': 'ok', 'result': tokenize(*tokenize_args, **kwargs)})
+            continue
+        if method == 'create_chat_completion_from_rendered_prompt':
+            completion_kwargs = {key: value for key, value in kwargs.items() if key in {
+                'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
+                'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'stream'
+            }}
+            completion_kwargs['stream'] = False
+            render_kwargs = {
+                'tokenize': False,
+                'add_generation_prompt': bool(kwargs.get('add_generation_prompt', True)),
+                'enable_thinking': kwargs.get('enable_thinking'),
+                'token_place_provider': kwargs.get('token_place_provider'),
+                'token_place_template_policy': kwargs.get('token_place_template_policy'),
+            }
+            rendered_prompt, render_diagnostics = _render_chat_with_runtime_template(
+                llama, request.get('args', []), render_kwargs
+            )
+            if not isinstance(rendered_prompt, str) or not rendered_prompt:
+                _emit(_safe_request_error('prompt_render_unavailable', request=request, extra=render_diagnostics))
+                continue
+            create_completion = getattr(llama, 'create_completion', None)
+            if not callable(create_completion):
+                _emit(_safe_request_error('plain_completion_unavailable', request=request, extra=render_diagnostics))
+                continue
+            try:
+                result = create_completion(prompt=rendered_prompt, **completion_kwargs)
+            except Exception as exc:
+                safe_request = {'method': method, 'kwargs': completion_kwargs}
+                _emit(_safe_request_error('inference_exception', request=safe_request, exc=exc, extra=render_diagnostics))
+                continue
+            if not isinstance(result, dict):
+                _emit(_safe_request_error('malformed_completion_output', request=request, extra={'output_shape_category': type(result).__name__}))
+                continue
+            _emit({'status': 'ok', 'result': result, 'metadata': {
+                'method': 'create_completion_from_rendered_prompt',
+                'render_path_metadata': render_diagnostics,
+                'attempted_generation_kwargs': sorted(str(key) for key in completion_kwargs),
+            }})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

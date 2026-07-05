@@ -51,6 +51,8 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
     "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "render_complete_unsupported_kwarg": "runtime_completion_smoke_render_complete_unsupported_kwarg",
+    "render_complete_request_rejected": "runtime_completion_smoke_render_complete_request_rejected",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -91,6 +93,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "plain_completion_unavailable",
+        "malformed_completion_output",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -100,12 +104,16 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "render_complete_unsupported_kwarg",
+        "render_complete_request_rejected",
     },
     "method": {
         "apply_chat_template",
         "create_chat_completion",
         "create_chat_completion_with_recovery",
         "render_and_tokenize_chat",
+        "create_completion_from_rendered_prompt",
+        "create_chat_completion_from_rendered_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -213,8 +221,17 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
     if internal_reason == "qwen_empty_after_think_wrapper_strip":
         return "runtime_completion_smoke_empty_after_think_strip"
     if internal_reason in {
-        "unsupported_generation_option",
+        "render_complete_unsupported_kwarg",
+        "runtime_render_complete_unsupported_kwarg",
+    }:
+        return "runtime_completion_smoke_render_complete_unsupported_kwarg"
+    if internal_reason in {
+        "render_complete_request_rejected",
         "runtime_rejected_generation_options",
+    }:
+        return "runtime_completion_smoke_render_complete_request_rejected"
+    if internal_reason in {
+        "unsupported_generation_option",
         "runtime_unsupported_generation_kwarg",
     }:
         return "runtime_completion_smoke_unsupported_generation_kwarg"
@@ -584,8 +601,12 @@ class ComputeNodeRuntime:
             _log_error(message)
             return False
 
+        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+        from utils.networking.relay_client import RelayClient
+        qwen_non_thinking_enforced = RelayClient._api_v1_qwen_non_thinking_required(model_profile)
         create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
-        if not callable(create_chat_completion):
+        create_rendered_completion = getattr(llm_runtime, "create_chat_completion_from_rendered_prompt", None)
+        if not qwen_non_thinking_enforced and not callable(create_chat_completion):
             setattr(
                 self.model_manager,
                 'last_runtime_init_error',
@@ -601,7 +622,6 @@ class ComputeNodeRuntime:
         diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
         if not isinstance(diagnostics, dict):
             diagnostics = {}
-        model_profile = getattr(self.model_manager, "model_profile", {}) or {}
         context_tier = getattr(self.model_manager, "context_tier", "8k-fast")
         context_window_tokens = getattr(self.model_manager, "context_window_tokens", None)
         rope_policy = model_profile.get("rope_scaling_policy") or {}
@@ -610,12 +630,6 @@ class ComputeNodeRuntime:
         )
         legacy_template_available = callable(getattr(llm_runtime, "apply_chat_template", None))
         legacy_tokenizer_available = callable(getattr(llm_runtime, "tokenize", None))
-        from utils.networking.relay_client import RelayClient
-
-        qwen_non_thinking_enforced = RelayClient._api_v1_qwen_non_thinking_required(
-            model_profile
-        )
-
         yarn_diagnostics = getattr(self.model_manager, "last_yarn_rope_diagnostics", None)
         if not isinstance(yarn_diagnostics, dict):
             yarn_diagnostics = {}

@@ -1821,6 +1821,8 @@ def _classify_generation_exception(exc):
 
 def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
+    if reason == 'malformed_completion_output':
+        diagnostics['generation_exception_category'] = 'malformed_completion_output'
     if isinstance(extra, dict):
         for key, value in extra.items():
             if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
@@ -2206,14 +2208,25 @@ for line in sys.stdin:
                 'token_place_template_policy': kwargs.pop('token_place_template_policy', None),
             }
             render_kwargs = {key: value for key, value in render_kwargs.items() if value is not None}
-            rendered_prompt, render_diagnostics = _render_chat_with_runtime_template(
-                llama, request.get('args', []), render_kwargs
-            )
+            try:
+                rendered_prompt, render_diagnostics = _render_chat_with_runtime_template(
+                    llama, request.get('args', []), render_kwargs
+                )
+            except Exception as exc:
+                reason = str(exc) if str(exc) in {
+                    'runtime_chat_template_metadata_missing',
+                    'runtime_chat_template_renderer_unavailable',
+                    'runtime_template_tokenizer_bridge_unavailable',
+                    'runtime_chat_template_render_exception',
+                    'runtime_chat_template_qwen_evidence_missing',
+                } else 'runtime_chat_template_render_exception'
+                _emit(_safe_request_error(reason, request=request, exc=exc))
+                continue
             completion_kwargs = {
                 key: kwargs[key]
                 for key in (
                     'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
-                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'stream'
+                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'seed', 'stream'
                 )
                 if key in kwargs
             }

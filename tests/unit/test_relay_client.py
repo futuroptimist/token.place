@@ -4223,6 +4223,60 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
     assert messages[-1]["content"].startswith("/no_think\n")
 
 
+
+def test_api_v1_qwen_render_then_complete_preserves_seed_option():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+    })
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-seed",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64, "seed": 7},
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
+    assert kwargs["seed"] == 7
+
+
+def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(side_effect=[
+        LlamaCppInferenceRequestError(
+            "unexpected keyword argument 'enable_thinking'",
+            diagnostics={
+                "code": "compute_node_options_unsupported",
+                "reason": "unsupported_generation_option",
+                "rejected_option": "enable_thinking",
+                "generation_exception_category": "unsupported_generation_kwarg",
+                "method": "create_chat_completion_from_rendered_prompt",
+            },
+        ),
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    ])
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-retry-rejected-option",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64},
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    calls = manager.runtime.create_chat_completion_from_rendered_prompt.call_args_list
+    assert calls[0].kwargs["enable_thinking"] is False
+    assert "enable_thinking" not in calls[1].kwargs
+    assert "enable_thinking" in client._api_v1_generation_kwargs_filtered
+
 def test_api_v1_qwen_render_then_complete_empty_think_wrapper_is_cleaned():
     manager = _ApiV1RuntimeManager()
     manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}

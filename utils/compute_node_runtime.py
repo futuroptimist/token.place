@@ -91,6 +91,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "malformed_completion_output",
     },
     "generation_exception_category": {
         "metal_memory_allocation",

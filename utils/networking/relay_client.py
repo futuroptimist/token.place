@@ -148,8 +148,6 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "create_chat_completion_from_rendered_prompt",
         "create_completion_from_rendered_prompt",
         "render_and_tokenize_chat",
-        "create_chat_completion_from_rendered_prompt",
-        "create_completion_from_rendered_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -3305,7 +3303,7 @@ class RelayClient:
 
         allowed_plain_kwargs = {
             "max_tokens", "temperature", "top_p", "top_k", "min_p", "stop",
-            "presence_penalty", "frequency_penalty", "repeat_penalty", "stream",
+            "presence_penalty", "frequency_penalty", "repeat_penalty", "seed", "stream",
         }
         removed: List[str] = []
         attempted_names: List[str] = []
@@ -3315,12 +3313,17 @@ class RelayClient:
                 for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
                 if key in allowed_plain_kwargs
             }
-            completion_kwargs["stream"] = False
-            if model_profile.get("provider"):
+            removed_set = set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))
+            completion_kwargs = {
+                key: value for key, value in completion_kwargs.items() if key not in removed_set
+            }
+            if "stream" not in removed_set:
+                completion_kwargs["stream"] = False
+            if model_profile.get("provider") and "token_place_provider" not in removed_set:
                 completion_kwargs["token_place_provider"] = model_profile.get("provider")
-            if model_profile.get("chat_template_policy"):
+            if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:
                 completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
-            if self._api_v1_qwen_non_thinking_required(model_profile):
+            if self._api_v1_qwen_non_thinking_required(model_profile) and "enable_thinking" not in removed_set:
                 completion_kwargs["enable_thinking"] = False
             attempted_names = sorted(str(key) for key in completion_kwargs)
             try:
@@ -3336,11 +3339,13 @@ class RelayClient:
             except Exception as exc:
                 diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
                 safe_worker = _safe_worker_diagnostics(diagnostics)
-                rejected = (
-                    safe_worker.get("rejected_generation_kwarg")
-                    if isinstance(safe_worker.get("rejected_generation_kwarg"), str)
-                    else _extract_unsupported_generation_kwarg(exc, attempted_names)
-                )
+                rejected = None
+                if isinstance(safe_worker.get("rejected_generation_kwarg"), str):
+                    rejected = safe_worker["rejected_generation_kwarg"]
+                elif isinstance(safe_worker.get("rejected_option"), str):
+                    rejected = safe_worker["rejected_option"]
+                else:
+                    rejected = _extract_unsupported_generation_kwarg(exc, attempted_names)
                 if rejected not in set(attempted_names):
                     rejected = None
                 category = (

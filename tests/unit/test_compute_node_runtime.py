@@ -73,8 +73,8 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
             "stderr_tail": "llama_context kv cache allocation failed redacted",
             "child_stderr_tail": "worker exception redacted",
             "method": "create_chat_completion",
-            "reason": "unsupported_generation_option",
-            "generation_exception_category": "kv_cache_allocation",
+            "reason": "malformed_completion_output",
+            "generation_exception_category": "malformed_completion_output",
             "unsafe_prompt": "Reply with exactly: ok",
             "nested": {"rendered_prompt": "secret"},
             "content": "assistant output",
@@ -97,8 +97,8 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
         "stderr_tail": "llama_context kv cache allocation failed redacted",
         "child_stderr_tail": "worker exception redacted",
         "method": "create_chat_completion",
-        "reason": "unsupported_generation_option",
-        "generation_exception_category": "kv_cache_allocation",
+        "reason": "malformed_completion_output",
+        "generation_exception_category": "malformed_completion_output",
     }
     assert "Reply with exactly" not in json.dumps(safe)
     assert "assistant output" not in json.dumps(safe)

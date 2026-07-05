@@ -5691,18 +5691,43 @@ def test_api_v1_runtime_rejected_generation_option_drops_unsafe_allowed_values()
     assert "SECRET" not in json.dumps(error)
 
 
-def test_api_v1_generic_unsupported_generation_kwarg_uses_options_error():
+def test_api_v1_internal_unsupported_generation_kwarg_is_filtered_and_retried():
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = [
+        TypeError("create_chat_completion() got an unexpected keyword argument 'top_k'"),
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    ]
+    manager.model_profile = {"generation_defaults": {"top_k": 40}}
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-generic-option-retried",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.create_chat_completion.call_count == 2
+    first = manager.runtime.create_chat_completion.call_args_list[0].kwargs
+    second = manager.runtime.create_chat_completion.call_args_list[1].kwargs
+    assert "top_k" in first
+    assert "top_k" not in second
+    assert manager.api_v1_generation_kwargs_filtered == ["top_k"]
+
+
+def test_api_v1_client_supplied_unsupported_runtime_kwarg_still_fails():
     manager = _ApiV1RuntimeManager()
     manager.runtime.create_chat_completion.side_effect = TypeError(
-        "create_chat_completion() got an unexpected keyword argument 'top_k'"
+        "create_chat_completion() got an unexpected keyword argument 'temperature'"
     )
     client = _api_v1_validation_client(manager)
 
     envelope = client._generate_api_v1_response_with_runtime_model(
-        request_id="req-generic-option-rejected",
+        request_id="req-client-option-rejected",
         model_id="llama-3-8b-instruct",
         messages=[{"role": "user", "content": "hi"}],
-        options={},
+        options={"temperature": 0.2},
     )
 
     error = envelope["api_v1_response"]["error"]

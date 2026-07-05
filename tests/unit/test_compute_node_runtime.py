@@ -2029,3 +2029,63 @@ def test_qwen_8k_readiness_still_passes_without_yarn():
 
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager.last_compute_diagnostics["api_v1_readiness_yarn_rope_enabled"] is False
+
+
+def test_qwen_64k_completion_smoke_filters_internal_top_k_and_registers():
+    class RejectTopKOnceRuntime(_Qwen64kRuntime):
+        def __init__(self):
+            self.calls = []
+
+        def create_chat_completion(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "top_k" in kwargs:
+                raise TypeError("create_chat_completion() got an unexpected keyword argument 'top_k'")
+            return {"choices": [{"message": {"role": "assistant", "content": "<think></think>\n\nok"}}]}
+
+    llm_runtime = RejectTopKOnceRuntime()
+    model_manager = _qwen_64k_model_manager(llm_runtime)
+    model_manager.model_profile["generation_defaults"] = {"top_k": 40, "temperature": 0.6, "top_p": 0.9}
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert len(llm_runtime.calls) == 2
+    assert "top_k" in llm_runtime.calls[0]
+    assert "top_k" not in llm_runtime.calls[1]
+    assert model_manager.api_v1_generation_kwargs_filtered == ["top_k"]
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_readiness_error_reason"] is None
+
+
+def test_qwen_64k_completion_smoke_bounded_retry_fails_closed():
+    class RejectManyRuntime(_Qwen64kRuntime):
+        rejected = ["top_k", "stop", "temperature", "top_p"]
+
+        def __init__(self):
+            self.calls = 0
+
+        def create_chat_completion(self, **kwargs):
+            name = self.rejected[min(self.calls, len(self.rejected) - 1)]
+            self.calls += 1
+            raise TypeError(f"create_chat_completion() got an unexpected keyword argument '{name}'")
+
+    llm_runtime = RejectManyRuntime()
+    model_manager = _qwen_64k_model_manager(llm_runtime)
+    model_manager.model_profile["generation_defaults"] = {"top_k": 40, "temperature": 0.6, "top_p": 0.9}
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert llm_runtime.calls == 4
+    assert "SECRET" not in json.dumps(diagnostics)

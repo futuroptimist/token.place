@@ -56,7 +56,7 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
         return "worker_timeout"
     if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
         return "worker_dead"
-    if "unexpected keyword argument" in text or "got an unexpected keyword argument" in text:
+    if re.search(r"(?:unexpected keyword argument|got an unexpected keyword argument|unsupported option|invalid keyword)", text):
         return "unsupported_generation_kwarg"
     return "unknown_generation_exception"
 
@@ -67,6 +67,8 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwarg",
+    "attempted_generation_kwargs",
     "method",
     "stream",
     "retryable",
@@ -148,8 +150,11 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key == "attempted_generation_kwargs":
+        names = [name for name in bounded.split(",") if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(name)]
+        return ",".join(names[:32]) if names else None
     if key == "sanitized_error_summary":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(bounded) else None
     if key in {"stderr_tail", "child_stderr_tail"}:
@@ -3112,7 +3117,79 @@ class RelayClient:
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
         completion_kwargs.update(safe_options)
-        return completion_kwargs
+        return self._api_v1_filter_cached_internal_generation_kwargs(
+            completion_kwargs, client_option_names=set(safe_options)
+        )
+
+    @staticmethod
+    def _api_v1_rejected_generation_kwarg_from_error(error: BaseException) -> Optional[str]:
+        text = str(error or "")
+        patterns = (
+            r"(?:got an )?unexpected keyword argument [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"unsupported option [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"invalid keyword [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    def _api_v1_filter_cached_internal_generation_kwargs(
+        self, completion_kwargs: Dict[str, Any], *, client_option_names: Set[str]
+    ) -> Dict[str, Any]:
+        required = {"max_tokens", "stream"}
+        unsupported = getattr(self.model_manager, "_api_v1_unsupported_internal_generation_kwargs", set())
+        if not isinstance(unsupported, set):
+            unsupported = set(unsupported or [])
+        filtered = {
+            key: value for key, value in completion_kwargs.items()
+            if key in required or key in client_option_names or key not in unsupported
+        }
+        if filtered.get("stop") == [] and "stop" not in client_option_names and "stop" in unsupported:
+            filtered.pop("stop", None)
+        return filtered
+
+    def _api_v1_record_generation_kwarg_filter_result(
+        self, attempted: Dict[str, Any], rejected: Sequence[str]
+    ) -> None:
+        rejected_set = {name for name in rejected if isinstance(name, str)}
+        manager_set = getattr(self.model_manager, "_api_v1_unsupported_internal_generation_kwargs", set())
+        if not isinstance(manager_set, set):
+            manager_set = set(manager_set or [])
+        manager_set.update(rejected_set)
+        setattr(self.model_manager, "_api_v1_unsupported_internal_generation_kwargs", manager_set)
+        setattr(self.model_manager, "api_v1_generation_kwargs_supported", sorted(set(attempted) - manager_set))
+        setattr(self.model_manager, "api_v1_generation_kwargs_filtered", sorted(manager_set))
+
+    def _api_v1_create_chat_completion_filtered(
+        self, create_chat_completion: Any, *, messages: List[Dict[str, Any]],
+        completion_kwargs: Dict[str, Any], client_option_names: Set[str], max_removed_kwargs: int = 3
+    ) -> Tuple[Any, Dict[str, Any], List[str]]:
+        rejected: List[str] = []
+        current = self._api_v1_filter_cached_internal_generation_kwargs(
+            dict(completion_kwargs), client_option_names=client_option_names
+        )
+        while True:
+            try:
+                completion = create_chat_completion(messages=messages, **current)
+                self._api_v1_record_generation_kwarg_filter_result(current, rejected)
+                return completion, current, rejected
+            except Exception as exc:
+                rejected_kwarg = self._api_v1_rejected_generation_kwarg_from_error(exc)
+                if (
+                    not rejected_kwarg
+                    or rejected_kwarg in client_option_names
+                    or rejected_kwarg in {"messages", "max_tokens", "stream"}
+                    or rejected_kwarg not in current
+                    or len(rejected) >= max_removed_kwargs
+                ):
+                    setattr(exc, "token_place_rejected_generation_kwargs", list(rejected) + ([rejected_kwarg] if rejected_kwarg else []))
+                    setattr(exc, "token_place_attempted_generation_kwargs", sorted(current))
+                    raise
+                rejected.append(rejected_kwarg)
+                current.pop(rejected_kwarg, None)
+                self._api_v1_record_generation_kwarg_filter_result(current, rejected)
 
     def _api_v1_enrich_safe_error(
         self,
@@ -3447,17 +3524,23 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 started = time.monotonic()
-                completion = create_chat_completion(
-                    messages=runtime_messages,
-                    **completion_kwargs,
+                completion, completion_kwargs, rejected_generation_kwargs = (
+                    self._api_v1_create_chat_completion_filtered(
+                        create_chat_completion,
+                        messages=runtime_messages,
+                        completion_kwargs=completion_kwargs,
+                        client_option_names=set(safe_options),
+                    )
                 )
                 inference_duration = time.monotonic() - started
                 log_info(
-                    "api_v1.inference_complete active_tier={} prompt_tokens={} output_reservation={} admission_result=admitted inference_duration_seconds={} safe_error_code=none",
+                    "api_v1.inference_complete active_tier={} prompt_tokens={} output_reservation={} admission_result=admitted inference_duration_seconds={} safe_error_code=none generation_kwargs_supported={} generation_kwargs_filtered={}",
                     normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
                     prompt_tokens if prompt_tokens is not None else "unknown",
                     completion_kwargs["max_tokens"],
                     round(inference_duration, 3),
+                    sorted(completion_kwargs),
+                    rejected_generation_kwargs,
                 )
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
@@ -3592,6 +3675,8 @@ class RelayClient:
                         "message": "Desktop runtime inference failed",
                         "exception_type": type(exc).__name__,
                         "exception_category": exception_category,
+                    "rejected_generation_kwargs": getattr(exc, "token_place_rejected_generation_kwargs", None),
+                    "attempted_generation_kwargs": getattr(exc, "token_place_attempted_generation_kwargs", None),
                     },
                     request_id=request_id,
                     requested_context_tier=requested_context_tier,

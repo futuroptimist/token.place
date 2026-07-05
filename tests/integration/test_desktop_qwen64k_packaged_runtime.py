@@ -258,3 +258,29 @@ def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+
+
+def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_before_registration():
+    class RejectTopKOnceRuntime(_Qwen64kFakeRuntime):
+        def __init__(self):
+            self.calls = []
+
+        def create_chat_completion(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "top_k" in kwargs:
+                raise TypeError("create_chat_completion() got an unexpected keyword argument 'top_k'")
+            return {"choices": [{"message": {"role": "assistant", "content": "<think></think>\n\nok"}}]}
+
+    fake_runtime = RejectTopKOnceRuntime()
+    runtime, manager = _runtime_for(fake_runtime)
+    manager.model_profile["generation_defaults"] = {"top_k": 40, "temperature": 0.6, "top_p": 0.9}
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+    assert len(fake_runtime.calls) == 2
+    assert "top_k" in fake_runtime.calls[0]
+    assert "top_k" not in fake_runtime.calls[1]
+    assert manager.api_v1_generation_kwargs_filtered == ["top_k"]
+    assert "SECRET" not in json.dumps(diagnostics)

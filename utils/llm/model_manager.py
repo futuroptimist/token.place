@@ -1603,6 +1603,21 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
+    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+
     def apply_chat_template(self, *args, **kwargs):
         with self._lock:
             self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
@@ -1748,7 +1763,7 @@ class _SubprocessLlamaCppModule:
 
 
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
-import importlib, json, re, sys, traceback
+import importlib, json, os, re, sys, traceback
 
 def _jsonable(value):
     if hasattr(value, 'model_dump'):
@@ -1806,13 +1821,15 @@ def _classify_generation_exception(exc):
 
 def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
+    if reason == 'malformed_completion_output':
+        diagnostics['generation_exception_category'] = 'malformed_completion_output'
     if isinstance(extra, dict):
         for key, value in extra.items():
             if isinstance(key, str) and isinstance(value, (str, bool, int, float, type(None))):
                 diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
-        if method == 'create_chat_completion':
+        if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
             diagnostics['method'] = method
         elif method is not None:
             diagnostics['method'] = 'unsupported'
@@ -2073,13 +2090,39 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
         'qwen_evidence': True,
     }
 
+def _testing_render_template_fallback_allowed(model_path):
+    if os.environ.get('TOKEN_PLACE_ENV') != 'testing':
+        return False
+    basename = os.path.basename(str(model_path or '')).lower()
+    return basename in {'mock.gguf'} or 'stories15m' in basename
+
+def _render_testing_chat_template_fallback(args, kwargs):
+    messages = args[0] if args else kwargs.get('messages')
+    if not isinstance(messages, list):
+        raise RuntimeError('runtime_chat_template_render_exception')
+    rendered_parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise RuntimeError('runtime_chat_template_render_exception')
+        role = str(message.get('role') or 'user')
+        content = str(message.get('content') or '')
+        rendered_parts.append('<|im_start|>' + role + '\\n' + content + '<|im_end|>')
+    if bool(kwargs.get('add_generation_prompt', True)):
+        rendered_parts.append('<|im_start|>assistant\\n')
+    return '\\n'.join(rendered_parts)
+
 try:
     init_line = sys.stdin.readline()
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
     llama_cpp = importlib.import_module('llama_cpp')
-    llama = llama_cpp.Llama(*init_payload.get('args', []), **init_payload.get('kwargs', {}))
+    init_args = init_payload.get('args', [])
+    llama = llama_cpp.Llama(*init_args, **init_payload.get('kwargs', {}))
+    init_kwargs = init_payload.get('kwargs', {})
+    _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
+    if _token_place_model_path is None and isinstance(init_kwargs, dict):
+        _token_place_model_path = init_kwargs.get('model_path')
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
 except Exception as exc:
     _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_generation_exception(exc), 'traceback': traceback.format_exc()})
@@ -2093,7 +2136,7 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_request'))
             continue
         method = request.get('method')
-        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
+        if method not in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
@@ -2181,6 +2224,79 @@ for line in sys.stdin:
                 else:
                     tokenize_args.append(arg)
             _emit({'status': 'ok', 'result': tokenize(*tokenize_args, **kwargs)})
+            continue
+        if method == 'create_chat_completion_from_rendered_prompt':
+            render_kwargs = {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': kwargs.pop('enable_thinking', None),
+                'token_place_provider': kwargs.pop('token_place_provider', None),
+                'token_place_template_policy': kwargs.pop('token_place_template_policy', None),
+            }
+            render_kwargs = {key: value for key, value in render_kwargs.items() if value is not None}
+            try:
+                rendered_prompt, render_diagnostics = _render_chat_with_runtime_template(
+                    llama, request.get('args', []), render_kwargs
+                )
+            except Exception as exc:
+                reason = str(exc) if str(exc) in {
+                    'runtime_chat_template_metadata_missing',
+                    'runtime_chat_template_renderer_unavailable',
+                    'runtime_template_tokenizer_bridge_unavailable',
+                    'runtime_chat_template_render_exception',
+                    'runtime_chat_template_qwen_evidence_missing',
+                } else 'runtime_chat_template_render_exception'
+                if (
+                    reason == 'runtime_chat_template_metadata_missing'
+                    and _testing_render_template_fallback_allowed(_token_place_model_path)
+                ):
+                    try:
+                        rendered_prompt = _render_testing_chat_template_fallback(
+                            request.get('args', []), render_kwargs
+                        )
+                        render_diagnostics = {
+                            'direct_apply_chat_template': False,
+                            'metadata_template': False,
+                            'jinja_renderer': False,
+                            'testing_template_fallback': True,
+                        }
+                    except Exception as fallback_exc:
+                        _emit(_safe_request_error(reason, request=request, exc=fallback_exc))
+                        continue
+                else:
+                    _emit(_safe_request_error(reason, request=request, exc=exc))
+                    continue
+            completion_kwargs = {
+                key: kwargs[key]
+                for key in (
+                    'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
+                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'seed', 'stream'
+                )
+                if key in kwargs
+            }
+            completion_kwargs['stream'] = False
+            stop = completion_kwargs.get('stop')
+            if stop is None:
+                stop_values = ['<|im_end|>']
+            elif isinstance(stop, list):
+                stop_values = list(stop)
+                if '<|im_end|>' not in stop_values:
+                    stop_values.append('<|im_end|>')
+            else:
+                stop_values = [stop, '<|im_end|>'] if stop != '<|im_end|>' else [stop]
+            completion_kwargs['stop'] = stop_values
+            result = llama.create_completion(prompt=rendered_prompt, **completion_kwargs)
+            if not isinstance(result, dict):
+                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+                continue
+            choices = result.get('choices')
+            text = None
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                text = choices[0].get('text')
+            if not isinstance(text, str):
+                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+                continue
+            _emit({'status': 'ok', 'result': {'choices': [{'message': {'role': 'assistant', 'content': text}}]}})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):
@@ -3237,6 +3353,13 @@ class ModelManager:
                 ]
             }
             mock_llama_instance.create_chat_completion.return_value = mock_response
+
+            def _mock_create_chat_completion_from_rendered_prompt(messages, **kwargs):
+                return mock_response
+
+            mock_llama_instance.create_chat_completion_from_rendered_prompt = (
+                _mock_create_chat_completion_from_rendered_prompt
+            )
             return mock_llama_instance
 
         # Quick check without lock

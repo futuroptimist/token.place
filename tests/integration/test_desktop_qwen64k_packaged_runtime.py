@@ -60,7 +60,7 @@ class Llama:
         return '<qwen>'
     def tokenize(self, payload, add_bos=False):
         return [1] * 42
-    def create_chat_completion(self, **kwargs):
+    def create_completion(self, prompt, **kwargs):
 """
         + completion_branch,
         encoding='utf-8',
@@ -155,6 +155,9 @@ class _Qwen64kFakeRuntime:
     def create_chat_completion(self, **_kwargs):
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
+    def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
 
 def _model_manager(runtime):
     manager = MagicMock()
@@ -206,13 +209,13 @@ def _runtime_for(fake_runtime):
 )
 def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_reason(category, reason):
     class FailingRuntime(_Qwen64kFakeRuntime):
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             raise LlamaCppInferenceRequestError(
                 "llama_cpp request failed",
                 diagnostics={
                     "generation_exception_category": category,
                     "exception_type": "RuntimeError",
-                    "method": "create_chat_completion",
+                    "method": "create_chat_completion_from_rendered_prompt",
                 },
             )
 
@@ -235,8 +238,8 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
     try:
         assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
-            proxy.create_chat_completion(messages=[{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
-        assert exc_info.value.diagnostics['method'] == 'create_chat_completion'
+            proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
+        assert exc_info.value.diagnostics['method'] == 'create_chat_completion_from_rendered_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
         assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
 
@@ -266,7 +269,7 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
             self.calls = []
             self.rejected = False
 
-        def create_chat_completion(self, **kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
             self.calls.append(dict(kwargs))
             if "top_k" in kwargs and not self.rejected:
                 self.rejected = True

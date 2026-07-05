@@ -152,6 +152,10 @@ class TestModelManager:
         )
         tokens = llm.tokenize(rendered.encode('utf-8'), add_bos=False)
         bos_tokens = llm.tokenize(rendered, add_bos=True)
+        render_complete = llm.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            max_tokens=8,
+        )
 
         assert isinstance(rendered, str)
         assert '<|user|>' in rendered
@@ -163,6 +167,7 @@ class TestModelManager:
         assert len(tokens) > 0
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
+        assert render_complete['choices'][0]['message']['content'].startswith('Mock Response:')
 
     def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
         """API v1 admission is limited to the active profile/runtime identifiers."""
@@ -3170,6 +3175,163 @@ def test_llama_subprocess_request_error_is_typed_only_for_inference_stage():
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
 
+def test_llama_worker_render_complete_allows_testing_stories_model_without_metadata(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'stories fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.completion_prompts = []\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        self.completion_prompts.append(prompt)\n"
+        "        return {'choices': [{'text': 'short safe response'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'stories15M-q4_0.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        try:
+            result = proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+        except model_manager_module.LlamaCppInferenceRequestError as exc:
+            pytest.fail(f"unexpected request error diagnostics={exc.diagnostics!r}")
+    finally:
+        proxy.close()
+
+    assert result == {
+        'choices': [{'message': {'role': 'assistant', 'content': 'short safe response'}}]
+    }
+
+
+def test_llama_worker_render_complete_denies_testing_fallback_outside_testing_env(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'stories fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        raise AssertionError('testing fallback should not render outside testing')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'development')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'stories15M-q4_0.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert 'secret prompt text' not in json.dumps(diagnostics)
+
+
+def test_llama_worker_render_complete_testing_fallback_keeps_bad_messages_safe(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'stories fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        raise AssertionError('malformed fallback messages should not complete')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'stories15M-q4_0.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                ['secret prompt text'],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert 'secret prompt text' not in json.dumps(diagnostics)
+
+
+def test_llama_worker_render_complete_testing_mock_keyword_model_path_without_metadata(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'mock keyword fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.init_kwargs = kwargs\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'mock keyword response'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        try:
+            result = proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+        except model_manager_module.LlamaCppInferenceRequestError as exc:
+            pytest.fail(f"unexpected request error diagnostics={exc.diagnostics!r}")
+    finally:
+        proxy.close()
+
+    assert result == {
+        'choices': [{'message': {'role': 'assistant', 'content': 'mock keyword response'}}]
+    }
+
+
 def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(request_scoped_llama_proxy):
     from utils.llm import model_manager as model_manager_module
 
@@ -4066,6 +4228,11 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     proxy._closed = False
     with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
         proxy.tokenize(b'hello', add_bos=False)
+    assert proxy._closed is True
+
+    proxy._closed = False
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.create_chat_completion_from_rendered_prompt([], max_tokens=1)
     assert proxy._closed is True
 
 

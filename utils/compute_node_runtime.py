@@ -91,6 +91,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "malformed_completion_output",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -100,12 +101,15 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "malformed_completion_output",
     },
     "method": {
         "apply_chat_template",
         "create_chat_completion",
         "create_chat_completion_with_recovery",
         "render_and_tokenize_chat",
+        "create_chat_completion_from_rendered_prompt",
+        "create_completion_from_rendered_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},

@@ -3287,6 +3287,46 @@ def test_llama_worker_render_complete_testing_fallback_keeps_bad_messages_safe(t
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
+def test_llama_worker_render_complete_testing_mock_keyword_model_path_without_metadata(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'mock keyword fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.init_kwargs = kwargs\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'mock keyword response'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        try:
+            result = proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+        except model_manager_module.LlamaCppInferenceRequestError as exc:
+            pytest.fail(f"unexpected request error diagnostics={exc.diagnostics!r}")
+    finally:
+        proxy.close()
+
+    assert result == {
+        'choices': [{'message': {'role': 'assistant', 'content': 'mock keyword response'}}]
+    }
+
+
 def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(request_scoped_llama_proxy):
     from utils.llm import model_manager as model_manager_module
 

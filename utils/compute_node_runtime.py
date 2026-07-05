@@ -77,6 +77,11 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "attempted_generation_kwargs",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
 }
 
 
@@ -146,6 +151,11 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
     if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key == "attempted_generation_kwargs":
+        names = bounded.split(",") if bounded else []
+        if all(_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(name) for name in names):
+            return bounded
+        return None
     if key == "sanitized_error_summary":
         return (
             bounded
@@ -799,6 +809,12 @@ class ComputeNodeRuntime:
                 ):
                     diagnostics["api_v1_readiness_completion_smoke_result"] = "passed"
                     diagnostics["api_v1_readiness_completion_smoke_shape"] = "api_v1_assistant_message"
+                    supported_kwargs = getattr(self.model_manager, "api_v1_generation_kwargs_supported", None)
+                    filtered_kwargs = getattr(self.model_manager, "api_v1_generation_kwargs_filtered", None)
+                    if isinstance(supported_kwargs, list):
+                        diagnostics["api_v1_generation_kwargs_supported"] = supported_kwargs
+                    if isinstance(filtered_kwargs, list):
+                        diagnostics["api_v1_generation_kwargs_filtered"] = filtered_kwargs
                 else:
                     admitted = False
                     admission_error = {

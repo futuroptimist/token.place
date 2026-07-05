@@ -5396,8 +5396,9 @@ def test_qwen_profile_generation_defaults_include_top_k():
     manager.model_profile = {'generation_defaults': {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20}}
     client = _api_v1_validation_client(manager)
 
-    kwargs = client._api_v1_runtime_completion_kwargs({})
+    kwargs, internal_names = client._api_v1_runtime_completion_kwargs({})
 
+    assert {'temperature', 'top_p', 'top_k'} <= internal_names
     assert kwargs['temperature'] == 0.7
     assert kwargs['top_p'] == 0.8
     assert kwargs['top_k'] == 20
@@ -5740,3 +5741,109 @@ def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_calla
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_model_output"
     assert error["internal_reason"] == "unsupported_completion_shape"
+
+
+def _runtime_filter_client(runtime):
+    manager = SimpleNamespace(
+        config=SimpleNamespace(get=lambda key, default=None: {
+            "model.max_tokens": 16,
+            "model.temperature": 0.7,
+            "model.top_p": 0.9,
+            "model.stop_tokens": [],
+        }.get(key, default)),
+        model_profile={"generation_defaults": {"top_k": 40}},
+        last_compute_diagnostics={},
+    )
+    client = RelayClient("http://relay.test", 80, MagicMock(), manager, include_configured_servers=False)
+    return client, manager
+
+
+def test_api_v1_generation_filters_unsupported_internal_top_k_and_caches():
+    calls = []
+
+    def runtime(**kwargs):
+        calls.append(sorted(kwargs))
+        if "top_k" in kwargs:
+            raise TypeError("create_chat_completion() got an unexpected keyword argument 'top_k'")
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    client, manager = _runtime_filter_client(runtime)
+    kwargs, internal = client._api_v1_runtime_completion_kwargs({})
+    result = client._api_v1_call_runtime_completion_filtered(
+        runtime,
+        messages=[{"role": "user", "content": "secret prompt must not be logged"}],
+        completion_kwargs=kwargs,
+        internal_kwarg_names=internal,
+    )
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert "top_k" in calls[0]
+    assert "top_k" not in calls[1]
+    assert manager.api_v1_generation_kwargs_filtered == ["top_k"]
+
+    kwargs2, internal2 = client._api_v1_runtime_completion_kwargs({})
+    assert "top_k" not in kwargs2
+    client._api_v1_call_runtime_completion_filtered(
+        runtime,
+        messages=[{"role": "user", "content": "secret prompt must not be logged"}],
+        completion_kwargs=kwargs2,
+        internal_kwarg_names=internal2,
+    )
+    assert "top_k" not in calls[-1]
+
+
+def test_api_v1_generation_filters_empty_internal_stop():
+    calls = []
+
+    def runtime(**kwargs):
+        calls.append(sorted(kwargs))
+        if "stop" in kwargs:
+            raise ValueError("unsupported option 'stop'")
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    client, manager = _runtime_filter_client(runtime)
+    kwargs, internal = client._api_v1_runtime_completion_kwargs({})
+    client._api_v1_call_runtime_completion_filtered(
+        runtime,
+        messages=[{"role": "user", "content": "secret prompt must not be logged"}],
+        completion_kwargs=kwargs,
+        internal_kwarg_names=internal,
+    )
+    assert "stop" in calls[0]
+    assert "stop" not in calls[1]
+    assert manager.api_v1_generation_kwargs_filtered == ["stop"]
+
+
+def test_api_v1_generation_does_not_drop_client_supplied_unsupported_runtime_option():
+    def runtime(**kwargs):
+        assert "temperature" in kwargs
+        raise TypeError("unexpected keyword argument 'temperature'")
+
+    client, _manager = _runtime_filter_client(runtime)
+    kwargs, internal = client._api_v1_runtime_completion_kwargs({"temperature": 0.2})
+    with pytest.raises(TypeError, match="temperature"):
+        client._api_v1_call_runtime_completion_filtered(
+            runtime,
+            messages=[{"role": "user", "content": "secret prompt must not be logged"}],
+            completion_kwargs=kwargs,
+            internal_kwarg_names=internal,
+        )
+
+
+def test_api_v1_generation_bounded_retry_fails_closed_after_three_internal_kwargs():
+    rejected = iter(["top_k", "stop", "temperature", "top_p"])
+
+    def runtime(**_kwargs):
+        key = next(rejected)
+        raise TypeError(f"unexpected keyword argument '{key}'")
+
+    client, manager = _runtime_filter_client(runtime)
+    kwargs, internal = client._api_v1_runtime_completion_kwargs({})
+    with pytest.raises(TypeError, match="top_p"):
+        client._api_v1_call_runtime_completion_filtered(
+            runtime,
+            messages=[{"role": "user", "content": "secret prompt must not be logged"}],
+            completion_kwargs=kwargs,
+            internal_kwarg_names=internal,
+            max_removed_kwargs=3,
+        )
+    assert manager.api_v1_generation_kwargs_filtered == ["stop", "temperature", "top_k"]

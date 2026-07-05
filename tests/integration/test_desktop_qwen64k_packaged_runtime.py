@@ -258,3 +258,38 @@ def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+
+
+def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_kwarg_then_registers():
+    class RejectTopKOnceRuntime(_Qwen64kFakeRuntime):
+        def __init__(self):
+            self.calls = []
+
+        def create_chat_completion(self, **kwargs):
+            self.calls.append(sorted(kwargs))
+            if "top_k" in kwargs:
+                raise LlamaCppInferenceRequestError(
+                    "llama_cpp request failed",
+                    diagnostics={
+                        "reason": "unsupported_generation_option",
+                        "code": "compute_node_options_unsupported",
+                        "generation_exception_category": "unsupported_generation_kwarg",
+                        "exception_type": "TypeError",
+                        "method": "create_chat_completion",
+                        "rejected_option": "top_k",
+                        "attempted_generation_kwargs": "max_tokens,messages,stream,temperature,top_k,top_p",
+                    },
+                )
+            return {"choices": [{"message": {"content": "<think>\n\n</think>\n\nok"}}]}
+
+    fake = RejectTopKOnceRuntime()
+    runtime, manager = _runtime_for(fake)
+    manager.model_profile["generation_defaults"] = {"top_k": 40}
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_result"] == "passed"
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_generation_kwargs_filtered"] == ["top_k"]
+    assert "top_k" in fake.calls[0]
+    assert "top_k" not in fake.calls[1]

@@ -3192,6 +3192,7 @@ def test_subprocess_llama_proxy_nonstreaming_error_does_not_poison_worker(reques
         'exception_type': 'RuntimeError',
         'sanitized_error_summary': 'RuntimeError:redacted',
         'generation_exception_category': 'unknown_generation_exception',
+        'attempted_generation_kwargs': 'stream',
     }
 
     result = proxy.create_chat_completion(messages=[], stream=False)

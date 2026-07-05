@@ -56,7 +56,12 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
         return "worker_timeout"
     if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
         return "worker_dead"
-    if "unexpected keyword argument" in text or "got an unexpected keyword argument" in text:
+    if any(pattern in text for pattern in (
+        "unexpected keyword argument",
+        "got an unexpected keyword argument",
+        "unsupported option",
+        "invalid keyword",
+    )):
         return "unsupported_generation_kwarg"
     return "unknown_generation_exception"
 
@@ -83,6 +88,11 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "attempted_generation_kwargs",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
 }
 
 
@@ -150,6 +160,11 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
     if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key == "attempted_generation_kwargs":
+        names = bounded.split(",") if bounded else []
+        if all(_SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(name) for name in names):
+            return bounded
+        return None
     if key == "sanitized_error_summary":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(bounded) else None
     if key in {"stderr_tail", "child_stderr_tail"}:
@@ -3087,8 +3102,13 @@ class RelayClient:
 
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Merge API v1 options with model-manager defaults for direct completions."""
+    ) -> Tuple[Dict[str, Any], Set[str]]:
+        """Merge API v1 options with model-manager defaults for direct completions.
+
+        Returns the kwargs plus the names that came from internal defaults.
+        Internal names may be dropped after probing the real packaged runtime;
+        client supplied safe_options must never be silently removed.
+        """
 
         config = getattr(self.model_manager, "config", None)
         config_get = getattr(config, "get", None)
@@ -3111,8 +3131,100 @@ class RelayClient:
         for key in ("temperature", "top_p", "top_k"):
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
+        internal_names = set(completion_kwargs)
         completion_kwargs.update(safe_options)
-        return completion_kwargs
+        internal_names.difference_update(safe_options)
+        rejected_cached = getattr(self.model_manager, "_api_v1_generation_kwargs_rejected", set())
+        if not isinstance(rejected_cached, set):
+            rejected_cached = set(rejected_cached) if isinstance(rejected_cached, (list, tuple)) else set()
+        for key in list(rejected_cached):
+            if key in internal_names and key not in {"max_tokens", "stream"}:
+                completion_kwargs.pop(key, None)
+        if completion_kwargs.get("stop") == [] and "stop" in internal_names and "stop" in rejected_cached:
+            completion_kwargs.pop("stop", None)
+        return completion_kwargs, internal_names
+
+    @staticmethod
+    def _api_v1_rejected_generation_kwarg_from_exception(exc: BaseException) -> Optional[str]:
+        diagnostics = getattr(exc, "diagnostics", None)
+        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("rejected_option"), str):
+            return diagnostics["rejected_option"]
+        text = str(exc or "")
+        patterns = (
+            r"(?:unexpected keyword argument|got an unexpected keyword argument) [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"unsupported option [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"invalid keyword [\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    def _api_v1_record_generation_kwargs_capability(
+        self, *, attempted: Set[str], rejected: Set[str]
+    ) -> None:
+        existing = getattr(self.model_manager, "_api_v1_generation_kwargs_rejected", set())
+        if not isinstance(existing, set):
+            existing = set(existing) if isinstance(existing, (list, tuple)) else set()
+        existing.update(rejected)
+        setattr(self.model_manager, "_api_v1_generation_kwargs_rejected", existing)
+        supported = sorted(name for name in attempted if name not in existing)
+        filtered = sorted(existing)
+        setattr(self.model_manager, "api_v1_generation_kwargs_supported", supported)
+        setattr(self.model_manager, "api_v1_generation_kwargs_filtered", filtered)
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["api_v1_generation_kwargs_supported"] = supported
+            diagnostics["api_v1_generation_kwargs_filtered"] = filtered
+
+    def _api_v1_call_runtime_completion_filtered(
+        self,
+        create_chat_completion: Any,
+        *,
+        messages: List[Dict[str, Any]],
+        completion_kwargs: Dict[str, Any],
+        internal_kwarg_names: Set[str],
+        max_removed_kwargs: int = 3,
+    ) -> Any:
+        """Call create_chat_completion, dropping only rejected internal defaults."""
+
+        kwargs = dict(completion_kwargs)
+        attempted = set(kwargs) | {"messages"}
+        removed: Set[str] = set()
+        while True:
+            try:
+                result = create_chat_completion(messages=messages, **kwargs)
+                self._api_v1_record_generation_kwargs_capability(
+                    attempted=set(kwargs) | {"messages"}, rejected=removed
+                )
+                return result
+            except Exception as exc:
+                rejected = self._api_v1_rejected_generation_kwarg_from_exception(exc)
+                if (
+                    rejected
+                    and rejected in internal_kwarg_names
+                    and rejected not in {"messages", "max_tokens", "stream"}
+                    and rejected in kwargs
+                    and len(removed) < max_removed_kwargs
+                ):
+                    kwargs.pop(rejected, None)
+                    removed.add(rejected)
+                    self._api_v1_record_generation_kwargs_capability(
+                        attempted=attempted, rejected=removed
+                    )
+                    log_info(
+                        "api_v1.generation_kwargs_filtered rejected_generation_kwarg={} filtered_generation_kwargs={} attempted_generation_kwargs={}",
+                        rejected,
+                        sorted(removed),
+                        sorted(attempted),
+                    )
+                    continue
+                if removed:
+                    self._api_v1_record_generation_kwargs_capability(
+                        attempted=attempted, rejected=removed
+                    )
+                raise
 
     def _api_v1_enrich_safe_error(
         self,
@@ -3407,7 +3519,7 @@ class RelayClient:
                     ),
                 )
 
-            completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            completion_kwargs, internal_kwarg_names = self._api_v1_runtime_completion_kwargs(safe_options)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
             admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
@@ -3447,9 +3559,11 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 started = time.monotonic()
-                completion = create_chat_completion(
+                completion = self._api_v1_call_runtime_completion_filtered(
+                    create_chat_completion,
                     messages=runtime_messages,
-                    **completion_kwargs,
+                    completion_kwargs=completion_kwargs,
+                    internal_kwarg_names=internal_kwarg_names,
                 )
                 inference_duration = time.monotonic() - started
                 log_info(

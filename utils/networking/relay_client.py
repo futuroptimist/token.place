@@ -45,19 +45,28 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
 
 
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
-    re.compile(r"unexpected keyword argument [\'\"]?([A-Za-z_][A-Za-z0-9_]*)"),
-    re.compile(r"got an unexpected keyword argument [\'\"]?([A-Za-z_][A-Za-z0-9_]*)"),
-    re.compile(r"unsupported option [\'\"]?([A-Za-z_][A-Za-z0-9_]*)"),
-    re.compile(r"invalid keyword [\'\"]?([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"unsupported option(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),
+    re.compile(r"invalid keyword(?: argument)? [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"invalid keyword\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"),
 )
 
 
-def _extract_unsupported_generation_kwarg(value: Any) -> Optional[str]:
+def _extract_unsupported_generation_kwarg(
+    value: Any, attempted_generation_kwargs: Optional[Sequence[str]] = None
+) -> Optional[str]:
     text = str(value or "")
+    attempted = (
+        {str(key) for key in attempted_generation_kwargs}
+        if attempted_generation_kwargs is not None
+        else None
+    )
     for pattern in _UNSUPPORTED_GENERATION_KWARG_PATTERNS:
         match = pattern.search(text)
         if match:
-            return match.group(1)
+            rejected = next((group for group in match.groups() if group), None)
+            if rejected and (attempted is None or rejected in attempted):
+                return rejected
     return None
 
 
@@ -73,14 +82,7 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
         return "worker_timeout"
     if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
         return "worker_dead"
-    if _extract_unsupported_generation_kwarg(exc) or any(
-        marker in text for marker in (
-            "unexpected keyword argument",
-            "got an unexpected keyword argument",
-            "unsupported option",
-            "invalid keyword",
-        )
-    ):
+    if _extract_unsupported_generation_kwarg(exc):
         return "unsupported_generation_kwarg"
     return "unknown_generation_exception"
 
@@ -734,8 +736,7 @@ class RelayClient:
         self.port = port
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
-        self._api_v1_generation_kwargs_filtered: Set[str] = set()
-        self._api_v1_generation_kwargs_supported: Set[str] = set()
+        self._api_v1_generation_kwarg_cache: Dict[Tuple[Any, ...], Dict[str, Set[str]]] = {}
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
         self._registration_token: Optional[str] = None
@@ -3148,13 +3149,64 @@ class RelayClient:
         for key in ("temperature", "top_p", "top_k", "stop"):
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
-        filtered = set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())
+        filtered = self._api_v1_generation_kwarg_cache_entry()["filtered"]
         for key in list(filtered):
             if key not in safe_options and key not in {"messages", "max_tokens", "stream"}:
                 completion_kwargs.pop(key, None)
         completion_kwargs.update(safe_options)
         completion_kwargs["stream"] = False
         return completion_kwargs
+
+    def _api_v1_generation_kwarg_cache_key(self) -> Tuple[Any, ...]:
+        config = getattr(self.model_manager, "config", None)
+        config_get = getattr(config, "get", None)
+
+        def configured(key: str, default: Any) -> Any:
+            if callable(config_get):
+                return config_get(key, default)
+            return default
+
+        profile = getattr(self.model_manager, "model_profile", {}) or {}
+        generation_defaults = profile.get("generation_defaults") or {}
+        try:
+            generation_signature = json.dumps(
+                {
+                    "config": {
+                        "max_tokens": configured("model.max_tokens", 512),
+                        "temperature": configured("model.temperature", 0.7),
+                        "top_p": configured("model.top_p", 0.9),
+                        "stop": configured("model.stop_tokens", []),
+                    },
+                    "profile_defaults": generation_defaults,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        except TypeError:
+            generation_signature = repr((configured("model.max_tokens", 512), generation_defaults))
+        runtime = getattr(self.model_manager, "runtime", None) or getattr(self.model_manager, "llm", None)
+        return (
+            id(runtime),
+            getattr(self.model_manager, "api_model_id", None),
+            getattr(self.model_manager, "model_id", None),
+            normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+            profile.get("id") or profile.get("profile_id") or profile.get("name"),
+            generation_signature,
+        )
+
+    def _api_v1_generation_kwarg_cache_entry(self) -> Dict[str, Set[str]]:
+        return self._api_v1_generation_kwarg_cache.setdefault(
+            self._api_v1_generation_kwarg_cache_key(),
+            {"filtered": set(), "supported": set()},
+        )
+
+    @property
+    def _api_v1_generation_kwargs_filtered(self) -> Set[str]:
+        return self._api_v1_generation_kwarg_cache_entry()["filtered"]
+
+    @property
+    def _api_v1_generation_kwargs_supported(self) -> Set[str]:
+        return self._api_v1_generation_kwarg_cache_entry()["supported"]
 
     @staticmethod
     def _api_v1_attempted_generation_kwargs(kwargs: Dict[str, Any]) -> List[str]:
@@ -3163,10 +3215,11 @@ class RelayClient:
     def _api_v1_remember_generation_kwargs(
         self, *, attempted: List[str], rejected: Optional[str] = None
     ) -> None:
+        cache_entry = self._api_v1_generation_kwarg_cache_entry()
         if rejected:
-            self._api_v1_generation_kwargs_filtered.add(rejected)
-        supported = set(attempted) - self._api_v1_generation_kwargs_filtered
-        self._api_v1_generation_kwargs_supported.update(supported)
+            cache_entry["filtered"].add(rejected)
+        supported = set(attempted) - cache_entry["filtered"]
+        cache_entry["supported"].update(supported)
 
     def _api_v1_create_chat_completion_filtered(
         self,
@@ -3202,7 +3255,9 @@ class RelayClient:
                 elif isinstance(safe_worker.get("rejected_option"), str):
                     rejected = safe_worker["rejected_option"]
                 else:
-                    rejected = _extract_unsupported_generation_kwarg(exc)
+                    rejected = _extract_unsupported_generation_kwarg(exc, attempted_names)
+                if rejected not in set(attempted_names):
+                    rejected = None
                 category = (
                     safe_worker.get("generation_exception_category")
                     if isinstance(safe_worker.get("generation_exception_category"), str)

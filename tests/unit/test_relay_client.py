@@ -5711,6 +5711,50 @@ def test_api_v1_generic_unsupported_generation_kwarg_uses_options_error():
     assert error["exception_category"] == "unsupported_generation_kwarg"
 
 
+def test_extract_unsupported_generation_kwarg_requires_attempted_name():
+    from utils.networking.relay_client import _extract_unsupported_generation_kwarg
+
+    attempted = ["temperature", "top_k", "top_p", "stop"]
+    assert _extract_unsupported_generation_kwarg("unexpected keyword argument 'top_k'", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("got an unexpected keyword argument 'top_k'", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("unsupported option 'top_k'", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("unsupported option: top_k", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("invalid keyword 'top_k'", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("invalid keyword=top_k", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("invalid keyword argument 'top_k'", attempted) == "top_k"
+    assert _extract_unsupported_generation_kwarg("unsupported option in model configuration", attempted) is None
+    assert _extract_unsupported_generation_kwarg("unsupported option 'mirostat'", attempted) is None
+
+
+def test_api_v1_cached_internal_filter_does_not_drop_later_explicit_client_option():
+    manager = _RejectingAdmissionManager(["temperature", "temperature"], window=256)
+    manager.model_profile["generation_defaults"] = {"temperature": 0.3}
+    client = _api_v1_validation_client(manager)
+
+    first = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-filter-internal-temperature",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+    assert first["api_v1_response"]["message"]["content"] == "ok"
+
+    second = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-explicit-temperature",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False, "temperature": 0.3},
+        requested_context_tier="8k-fast",
+    )
+
+    error = second["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["rejected_option"] == "temperature"
+    assert manager.runtime.calls[-1]["temperature"] == 0.3
+
+
 def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_callable():
     class RuntimeWithoutCompletion:
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):

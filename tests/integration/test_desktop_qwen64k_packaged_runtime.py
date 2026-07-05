@@ -283,4 +283,4 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert fake.calls[0]["top_k"] == 20
     assert "top_k" not in fake.calls[1]
-    assert "top_k" in manager.api_v1_generation_kwargs_filtered
+    assert "top_k" in diagnostics["api_v1_generation_kwargs_filtered"]

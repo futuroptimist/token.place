@@ -5768,7 +5768,7 @@ class _RejectingAdmissionManager(_AdmissionManager):
         self.api_model_id = "qwen3-8b-instruct"
 
 
-def test_api_v1_internal_top_k_default_is_filtered_and_cached_after_runtime_rejection():
+def test_api_v1_internal_top_k_default_is_filtered_and_cached_per_client_after_runtime_rejection():
     manager = _RejectingAdmissionManager(["top_k"], window=256)
     client = _api_v1_validation_client(manager)
 
@@ -5792,7 +5792,20 @@ def test_api_v1_internal_top_k_default_is_filtered_and_cached_after_runtime_reje
     assert manager.runtime.calls[0]["top_k"] == 20
     assert "top_k" not in manager.runtime.calls[1]
     assert "top_k" not in manager.runtime.calls[-1]
-    assert "top_k" in manager.api_v1_generation_kwargs_filtered
+    assert "top_k" in client._api_v1_generation_kwargs_filtered
+
+    fresh_client = _api_v1_validation_client(manager)
+    third = fresh_client._generate_api_v1_response_with_runtime_model(
+        request_id="req-filter-top-k-fresh-client",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+
+    assert third["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.calls[-1]["top_k"] == 20
+    assert not hasattr(manager, "api_v1_generation_kwargs_filtered")
 
 
 def test_api_v1_internal_empty_stop_default_is_filtered_after_runtime_rejection():

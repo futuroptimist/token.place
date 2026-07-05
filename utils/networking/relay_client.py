@@ -736,7 +736,6 @@ class RelayClient:
         self.model_manager = model_manager
         self._api_v1_generation_kwargs_filtered: Set[str] = set()
         self._api_v1_generation_kwargs_supported: Set[str] = set()
-        self._api_v1_last_rejected_generation_kwargs: List[str] = []
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
         self._registration_token: Optional[str] = None
@@ -3149,8 +3148,7 @@ class RelayClient:
         for key in ("temperature", "top_p", "top_k", "stop"):
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
-        filtered = set(getattr(self.model_manager, "api_v1_generation_kwargs_filtered", set()) or set())
-        filtered.update(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())
+        filtered = set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())
         for key in list(filtered):
             if key not in safe_options and key not in {"messages", "max_tokens", "stream"}:
                 completion_kwargs.pop(key, None)
@@ -3165,15 +3163,10 @@ class RelayClient:
     def _api_v1_remember_generation_kwargs(
         self, *, attempted: List[str], rejected: Optional[str] = None
     ) -> None:
-        filtered = set(getattr(self.model_manager, "api_v1_generation_kwargs_filtered", set()) or set())
         if rejected:
-            filtered.add(rejected)
             self._api_v1_generation_kwargs_filtered.add(rejected)
-            self._api_v1_last_rejected_generation_kwargs.append(rejected)
-        supported = set(attempted) - filtered
+        supported = set(attempted) - self._api_v1_generation_kwargs_filtered
         self._api_v1_generation_kwargs_supported.update(supported)
-        setattr(self.model_manager, "api_v1_generation_kwargs_filtered", filtered)
-        setattr(self.model_manager, "api_v1_generation_kwargs_supported", set(self._api_v1_generation_kwargs_supported))
 
     def _api_v1_create_chat_completion_filtered(
         self,
@@ -3198,7 +3191,7 @@ class RelayClient:
                     "completion_kwargs": completion_kwargs,
                     "attempted_generation_kwargs": attempted_names,
                     "filtered_generation_kwargs": sorted(set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))),
-                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self.model_manager, "api_v1_generation_kwargs_filtered", set()) or set())),
+                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())),
                 }
             except Exception as exc:
                 diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
@@ -3729,9 +3722,6 @@ class RelayClient:
                         "message": "Desktop runtime inference failed",
                         "exception_type": type(exc).__name__,
                         "exception_category": exception_category,
-                        "rejected_generation_kwargs": (
-                            [rejected_generation_kwarg] if rejected_generation_kwarg else None
-                        ),
                     },
                     request_id=request_id,
                     requested_context_tier=requested_context_tier,

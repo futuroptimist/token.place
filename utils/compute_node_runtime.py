@@ -799,6 +799,18 @@ class ComputeNodeRuntime:
                 ):
                     diagnostics["api_v1_readiness_completion_smoke_result"] = "passed"
                     diagnostics["api_v1_readiness_completion_smoke_shape"] = "api_v1_assistant_message"
+                    supported_generation_kwargs = getattr(
+                        self.model_manager, "api_v1_generation_kwargs_supported", set()
+                    )
+                    filtered_generation_kwargs = getattr(
+                        self.model_manager, "api_v1_generation_kwargs_filtered", set()
+                    )
+                    diagnostics["api_v1_generation_kwargs_supported"] = sorted(
+                        str(name) for name in supported_generation_kwargs
+                    )
+                    diagnostics["api_v1_generation_kwargs_filtered"] = sorted(
+                        str(name) for name in filtered_generation_kwargs
+                    )
                 else:
                     admitted = False
                     admission_error = {

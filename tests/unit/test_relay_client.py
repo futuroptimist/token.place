@@ -5740,3 +5740,125 @@ def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_calla
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_model_output"
     assert error["internal_reason"] == "unsupported_completion_shape"
+
+
+class _RejectingAdmissionRuntime(_AdmissionRuntime):
+    def __init__(self, rejected_sequence):
+        super().__init__()
+        self.rejected_sequence = list(rejected_sequence)
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        for rejected in list(self.rejected_sequence):
+            if rejected in kwargs:
+                self.rejected_sequence.remove(rejected)
+                raise TypeError(f"got an unexpected keyword argument '{rejected}'")
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class _RejectingAdmissionManager(_AdmissionManager):
+    def __init__(self, rejected_sequence, **kwargs):
+        super().__init__(**kwargs)
+        self.runtime = _RejectingAdmissionRuntime(rejected_sequence)
+        self.model_profile = {
+            "provider": "qwen",
+            "thinking_mode": "disabled",
+            "generation_defaults": {"top_k": 20},
+        }
+        self.api_model_id = "qwen3-8b-instruct"
+
+
+def test_api_v1_internal_top_k_default_is_filtered_and_cached_after_runtime_rejection():
+    manager = _RejectingAdmissionManager(["top_k"], window=256)
+    client = _api_v1_validation_client(manager)
+
+    first = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-filter-top-k",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+    second = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-filter-top-k-cached",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+
+    assert first["api_v1_response"]["message"]["content"] == "ok"
+    assert second["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.calls[0]["top_k"] == 20
+    assert "top_k" not in manager.runtime.calls[1]
+    assert "top_k" not in manager.runtime.calls[-1]
+    assert "top_k" in manager.api_v1_generation_kwargs_filtered
+
+
+def test_api_v1_internal_empty_stop_default_is_filtered_after_runtime_rejection():
+    manager = _RejectingAdmissionManager(["stop"], window=256)
+    manager.model_profile["generation_defaults"] = {}
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-filter-stop",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.calls[0]["stop"] == []
+    assert "stop" not in manager.runtime.calls[1]
+
+
+def test_api_v1_client_supplied_runtime_unsupported_option_is_not_silently_dropped():
+    manager = _RejectingAdmissionManager(["temperature"], window=256)
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-client-temperature",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False, "temperature": 0.2},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["rejected_option"] == "temperature"
+
+
+def test_api_v1_generation_kwarg_filtering_stops_after_bounded_internal_retries():
+    manager = _RejectingAdmissionManager(["top_k", "temperature", "top_p", "stop"], window=256)
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-bounded-filtering",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] in {"compute_node_options_unsupported", "compute_node_internal_error"}
+    assert error["rejected_option"] == "stop"
+    assert len(manager.runtime.calls) == 4
+
+
+def test_api_v1_qwen_no_think_survives_generation_kwarg_filtering():
+    manager = _RejectingAdmissionManager(["top_k"], window=256)
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-no-think-filtered",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5, "stream": False},
+        requested_context_tier="8k-fast",
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert manager.runtime.calls[-1]["messages"][-1]["content"].startswith("/no_think")

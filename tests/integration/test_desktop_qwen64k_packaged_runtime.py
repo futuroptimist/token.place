@@ -201,7 +201,7 @@ def _runtime_for(fake_runtime):
     ("category", "reason"),
     [
         ("kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        ("unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ("unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         ("rope_yarn_eval_failure", "runtime_completion_smoke_rope_yarn_eval_failure"),
         ("worker_timeout", "runtime_completion_smoke_worker_timeout"),
         ("worker_dead", "runtime_completion_smoke_worker_dead"),
@@ -239,7 +239,7 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
             proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
-        assert exc_info.value.diagnostics['method'] == 'create_chat_completion_from_rendered_prompt'
+        assert exc_info.value.diagnostics['method'] == 'create_completion_keyword_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
         assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
 
@@ -263,27 +263,24 @@ def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
 
 
-def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_registers():
-    class TopKRejectingRuntime(_Qwen64kFakeRuntime):
+def test_qwen64k_packaged_fake_runtime_readiness_uses_minimal_plain_completion_kwargs():
+    class RecordingRuntime(_Qwen64kFakeRuntime):
         def __init__(self):
             self.calls = []
-            self.rejected = False
 
         def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
             self.calls.append(dict(kwargs))
-            if "top_k" in kwargs and not self.rejected:
-                self.rejected = True
-                raise TypeError("got an unexpected keyword argument 'top_k'")
+            for forbidden in ("stream", "stop", "temperature", "top_p", "top_k"):
+                if forbidden in kwargs:
+                    raise TypeError(f"got an unexpected keyword argument '{forbidden}'")
             return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
-    fake = TopKRejectingRuntime()
+    fake = RecordingRuntime()
     runtime, manager = _runtime_for(fake)
-    manager.model_profile["generation_defaults"] = {"top_k": 20}
+    manager.model_profile["generation_defaults"] = {"top_k": 20, "temperature": 0.1}
 
     assert runtime.ensure_api_v1_runtime_ready() is True
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
-    assert fake.calls[0]["top_k"] == 20
-    assert "top_k" not in fake.calls[1]
-    assert "top_k" in diagnostics["api_v1_generation_kwargs_filtered"]
+    assert set(fake.calls[0]) == {"max_tokens", "token_place_provider", "token_place_template_policy", "enable_thinking"}

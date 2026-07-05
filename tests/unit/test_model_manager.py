@@ -5953,3 +5953,137 @@ def test_path_redaction_handles_spaces_and_traceback_paths():
     assert '/Users/Alice' not in redacted
     assert 'Application Support' not in redacted
     assert '<path>' in redacted
+
+
+def test_llama_worker_render_complete_minimal_kwargs_omits_stream_stop_temperature(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'minimal fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    attempts = tmp_path / 'attempts.jsonl'
+    (fake_pkg / '__init__.py').write_text(
+        "import json, os\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        with open(os.environ['TOKEN_PLACE_ATTEMPTS_JSONL'], 'a', encoding='utf-8') as handle:\n"
+        "            handle.write(json.dumps(sorted(kwargs)) + '\\\\n')\n"
+        "        for key in ('stream', 'stop', 'temperature'):\n"
+        "            if key in kwargs: raise TypeError(f\"got an unexpected keyword argument '{key}'\")\n"
+        "        return {'choices': [{'text': 'minimal ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            stream=False,
+            stop=[],
+            temperature=0.7,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'minimal ok'}}]}
+    assert json.loads(attempts.read_text().replace('\\n', '').splitlines()[0]) == ['max_tokens']
+
+
+def test_llama_worker_render_complete_falls_back_from_prompt_keyword_to_positional(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'prompt' in kwargs: raise TypeError(\"got an unexpected keyword argument 'prompt'\")\n"
+        "        if len(args) != 1: raise TypeError('missing required positional argument')\n"
+        "        return {'choices': [{'text': 'positional ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}], max_tokens=4,
+            token_place_provider='qwen', token_place_template_policy='gguf-jinja'
+        )
+    finally:
+        proxy.close()
+    assert result['choices'][0]['message']['content'] == 'positional ok'
+
+
+def test_llama_worker_render_complete_falls_back_to_callable_llama(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'callable fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'callable ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}], max_tokens=4,
+            token_place_provider='qwen', token_place_template_policy='gguf-jinja'
+        )
+    finally:
+        proxy.close()
+    assert result['choices'][0]['message']['content'] == 'callable ok'
+
+
+def test_llama_worker_render_complete_empty_output_safe_diagnostics(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'empty fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': ''}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'SECRET_PROMPT'}], max_tokens=4,
+                token_place_provider='qwen', token_place_template_policy='gguf-jinja'
+            )
+    finally:
+        proxy.close()
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'empty_completion_output'
+    assert diagnostics['method'] == 'create_completion_keyword_prompt'
+    assert 'SECRET_PROMPT' not in json.dumps(diagnostics)

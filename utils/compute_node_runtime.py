@@ -50,7 +50,15 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
-    "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "unsupported_generation_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unexpected_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_prompt_kwarg": "runtime_completion_smoke_plain_completion_method_shape",
+    "unsupported_stream_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_stop_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "method_shape": "runtime_completion_smoke_plain_completion_method_shape",
+    "malformed_completion_output": "runtime_completion_smoke_plain_completion_malformed_output",
+    "empty_completion_output": "runtime_completion_smoke_plain_completion_empty_output",
+    "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -61,6 +69,11 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwarg",
+    "attempted_generation_kwargs",
+    "attempted_methods",
+    "attempted_kwarg_names",
+    "result_shape",
     "method",
     "stream",
     "retryable",
@@ -92,6 +105,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -102,6 +122,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_dead",
         "unknown_generation_exception",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
     },
     "method": {
         "apply_chat_template",
@@ -110,6 +137,9 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "render_and_tokenize_chat",
         "create_chat_completion_from_rendered_prompt",
         "create_completion_from_rendered_prompt",
+        "create_completion_keyword_prompt",
+        "create_completion_positional_prompt",
+        "llama_call_positional_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -146,6 +176,11 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
     enum_values = _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES.get(key)
     if enum_values is not None:
         return bounded if bounded in enum_values else None
+    if key in {"attempted_generation_kwargs", "attempted_methods", "attempted_kwarg_names"}:
+        parts = [part for part in bounded.split(",") if part]
+        return bounded if parts and all(_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(part) for part in parts) else None
+    if key == "result_shape":
+        return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
     if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
@@ -221,7 +256,7 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         "runtime_rejected_generation_options",
         "runtime_unsupported_generation_kwarg",
     }:
-        return "runtime_completion_smoke_unsupported_generation_kwarg"
+        return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     if internal_reason in {"rope_yarn_eval_failure", "runtime_rope_yarn_eval_failure"}:
         return "runtime_completion_smoke_rope_yarn_eval_failure"
     if internal_reason in {"metal_memory_allocation", "runtime_metal_memory_allocation"}:
@@ -235,7 +270,7 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":
-        return "runtime_completion_smoke_unsupported_generation_kwarg"
+        return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     return "runtime_completion_smoke_exception"
 
 

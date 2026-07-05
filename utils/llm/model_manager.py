@@ -1786,7 +1786,9 @@ def _extract_unsupported_generation_kwarg(message, attempted=None):
         r'(?:got an )?unexpected keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
         r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'invalid keyword argument\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)',
         r'invalid keyword\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'got multiple values for keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
     ):
         match = re.search(pattern, str(message or ''))
         if match:
@@ -1830,9 +1832,9 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     if isinstance(request, dict):
         method = request.get('method')
         if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
-            diagnostics['method'] = method
+            diagnostics.setdefault('method', method)
         elif method is not None:
-            diagnostics['method'] = 'unsupported'
+            diagnostics.setdefault('method', 'unsupported')
         kwargs = request.get('kwargs')
         if isinstance(kwargs, dict):
             diagnostics['stream'] = bool(kwargs.get('stream'))
@@ -1844,7 +1846,7 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
         diagnostics['exception_type'] = type(exc).__name__
         diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
-            diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
+            diagnostics.setdefault('generation_exception_category', _classify_generation_exception(exc))
             message = str(exc)
             attempted = None
             if isinstance(request, dict) and isinstance(request.get('kwargs'), dict):
@@ -2266,35 +2268,122 @@ for line in sys.stdin:
                 else:
                     _emit(_safe_request_error(reason, request=request, exc=exc))
                     continue
-            completion_kwargs = {
-                key: kwargs[key]
-                for key in (
-                    'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
-                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'seed', 'stream'
-                )
-                if key in kwargs
-            }
-            completion_kwargs['stream'] = False
-            stop = completion_kwargs.get('stop')
-            if stop is None:
-                stop_values = ['<|im_end|>']
-            elif isinstance(stop, list):
-                stop_values = list(stop)
-                if '<|im_end|>' not in stop_values:
-                    stop_values.append('<|im_end|>')
-            else:
-                stop_values = [stop, '<|im_end|>'] if stop != '<|im_end|>' else [stop]
-            completion_kwargs['stop'] = stop_values
-            result = llama.create_completion(prompt=rendered_prompt, **completion_kwargs)
-            if not isinstance(result, dict):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+            plain_kwargs = {'max_tokens': kwargs.get('max_tokens', 64)}
+            attempted = []
+            def _shape(value):
+                if isinstance(value, dict):
+                    choices = value.get('choices')
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        first = choices[0]
+                        if isinstance(first.get('text'), str):
+                            return 'choices_text'
+                        message = first.get('message')
+                        if isinstance(message, dict) and isinstance(message.get('content'), str):
+                            return 'choices_message_content'
+                    return 'dict'
+                if isinstance(value, str):
+                    return 'string'
+                return type(value).__name__
+            def _normalize_plain(value):
+                if isinstance(value, str):
+                    return value
+                if not isinstance(value, dict):
+                    raise RuntimeError('malformed_completion_output')
+                choices = value.get('choices')
+                if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+                    raise RuntimeError('malformed_completion_output')
+                first = choices[0]
+                if isinstance(first.get('text'), str):
+                    return first.get('text')
+                message = first.get('message')
+                if isinstance(message, dict) and isinstance(message.get('content'), str):
+                    return message.get('content')
+                raise RuntimeError('malformed_completion_output')
+            def _attempt_error(method_name, exc, kwarg_names):
+                rejected = _extract_unsupported_generation_kwarg(str(exc), kwarg_names)
+                text_lower = str(exc).lower()
+                category = 'worker_exception'
+                if 'kv' in text_lower and any(term in text_lower for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+                    category = 'kv_cache_allocation'
+                elif 'metal' in text_lower and any(term in text_lower for term in ('alloc', 'memory', 'out of memory', 'oom')):
+                    category = 'metal_memory_allocation'
+                elif 'yarn' in text_lower or ('rope' in text_lower and any(term in text_lower for term in ('scal', 'freq', 'eval'))):
+                    category = 'rope_yarn_eval_failure'
+                elif rejected == 'prompt':
+                    category = 'unsupported_prompt_kwarg'
+                elif rejected == 'stream':
+                    category = 'unsupported_stream_kwarg'
+                elif rejected == 'stop':
+                    category = 'unsupported_stop_kwarg'
+                elif rejected:
+                    category = 'unexpected_kwarg'
+                elif 'positional argument' in str(exc).lower() or 'required positional argument' in str(exc).lower():
+                    category = 'method_shape'
+                attempted.append({
+                    'method': method_name,
+                    'exception_type': type(exc).__name__,
+                    'exception_category': category,
+                    'rejected_kwarg': rejected,
+                    'attempted_kwarg_names': ','.join(sorted(kwarg_names)),
+                })
+                return category, rejected
+            result = None
+            result_shape = None
+            method_used = None
+            create_completion = getattr(llama, 'create_completion', None)
+            if callable(create_completion):
+                try:
+                    method_used = 'create_completion_keyword_prompt'
+                    result = create_completion(prompt=rendered_prompt, **plain_kwargs)
+                    result_shape = _shape(result)
+                except Exception as exc:
+                    category, rejected = _attempt_error('create_completion_keyword_prompt', exc, ['prompt'] + list(plain_kwargs))
+                    if category != 'unsupported_prompt_kwarg':
+                        extra = dict(render_diagnostics or {})
+                        extra.update({'method': 'create_completion_keyword_prompt', 'generation_exception_category': category, 'rejected_generation_kwarg': rejected, 'attempted_generation_kwargs': 'max_tokens,prompt', 'result_shape': result_shape})
+                        _emit(_safe_request_error('inference_exception', request=request, exc=exc, extra=extra))
+                        continue
+                    result = None
+                if result is None:
+                    try:
+                        method_used = 'create_completion_positional_prompt'
+                        result = create_completion(rendered_prompt, **plain_kwargs)
+                        result_shape = _shape(result)
+                    except Exception as exc:
+                        category, rejected = _attempt_error('create_completion_positional_prompt', exc, list(plain_kwargs))
+                        extra = dict(render_diagnostics or {})
+                        extra.update({'method': 'create_completion_positional_prompt', 'generation_exception_category': category, 'rejected_generation_kwarg': rejected, 'attempted_generation_kwargs': 'max_tokens', 'result_shape': result_shape})
+                        if category not in {'method_shape', 'worker_exception'}:
+                            _emit(_safe_request_error('inference_exception', request=request, exc=exc, extra=extra))
+                            continue
+                        result = None
+            if result is None and callable(llama):
+                try:
+                    method_used = 'llama_call_positional_prompt'
+                    result = llama(rendered_prompt, **plain_kwargs)
+                    result_shape = _shape(result)
+                except Exception as exc:
+                    category, rejected = _attempt_error('llama_call_positional_prompt', exc, list(plain_kwargs))
+                    extra = dict(render_diagnostics or {})
+                    extra.update({'method': 'llama_call_positional_prompt', 'generation_exception_category': category, 'rejected_generation_kwarg': rejected, 'attempted_generation_kwargs': 'max_tokens', 'result_shape': result_shape})
+                    _emit(_safe_request_error('inference_exception', request=request, exc=exc, extra=extra))
+                    continue
+            if result is None:
+                extra = dict(render_diagnostics or {})
+                extra.update({'method': 'llama_call_positional_prompt', 'generation_exception_category': 'worker_exception', 'attempted_generation_kwargs': 'max_tokens'})
+                _emit(_safe_request_error('inference_exception', request=request, extra=extra))
                 continue
-            choices = result.get('choices')
-            text = None
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                text = choices[0].get('text')
-            if not isinstance(text, str):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+            try:
+                text = _normalize_plain(result)
+            except Exception as exc:
+                extra = dict(render_diagnostics or {})
+                extra.update({'method': method_used, 'generation_exception_category': 'malformed_completion_output', 'result_shape': _shape(result), 'attempted_generation_kwargs': 'max_tokens'})
+                _emit(_safe_request_error('malformed_completion_output', request=request, exc=exc, extra=extra))
+                continue
+            if not text.strip():
+                extra = dict(render_diagnostics or {})
+                extra.update({'method': method_used, 'generation_exception_category': 'empty_completion_output', 'result_shape': _shape(result), 'attempted_generation_kwargs': 'max_tokens'})
+                _emit(_safe_request_error('empty_completion_output', request=request, extra=extra))
                 continue
             _emit({'status': 'ok', 'result': {'choices': [{'message': {'role': 'assistant', 'content': text}}]}})
             continue

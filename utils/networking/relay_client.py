@@ -48,7 +48,9 @@ _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
     re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
     re.compile(r"unsupported option(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),
     re.compile(r"invalid keyword(?: argument)? [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"invalid keyword argument\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"invalid keyword\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"got multiple values for keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
 )
 
 
@@ -95,6 +97,9 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "rejected_option",
     "rejected_generation_kwarg",
     "attempted_generation_kwargs",
+    "attempted_methods",
+    "attempted_kwarg_names",
+    "result_shape",
     "method",
     "stream",
     "retryable",
@@ -130,6 +135,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -140,6 +152,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_dead",
         "unknown_generation_exception",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
     },
     "method": {
         "apply_chat_template",
@@ -147,6 +166,9 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "create_chat_completion_with_recovery",
         "create_chat_completion_from_rendered_prompt",
         "create_completion_from_rendered_prompt",
+        "create_completion_keyword_prompt",
+        "create_completion_positional_prompt",
+        "llama_call_positional_prompt",
         "render_and_tokenize_chat",
         "tokenize",
     },
@@ -182,6 +204,11 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
     enum_values = _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES.get(key)
     if enum_values is not None:
         return bounded if bounded in enum_values else None
+    if key in {"attempted_generation_kwargs", "attempted_methods", "attempted_kwarg_names"}:
+        parts = [part for part in bounded.split(",") if part]
+        return bounded if parts and all(_SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(part) for part in parts) else None
+    if key == "result_shape":
+        return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
     if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v"}:
@@ -3308,17 +3335,15 @@ class RelayClient:
         removed: List[str] = []
         attempted_names: List[str] = []
         while True:
-            completion_kwargs = {
-                key: value
-                for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
-                if key in allowed_plain_kwargs
-            }
+            runtime_defaults = self._api_v1_runtime_completion_kwargs(safe_options)
+            completion_kwargs = {"max_tokens": runtime_defaults.get("max_tokens", 64)}
+            for key, value in safe_options.items():
+                if key in allowed_plain_kwargs and key != "stream":
+                    completion_kwargs[key] = value
             removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
-            if "stream" not in removed_set:
-                completion_kwargs["stream"] = False
             if model_profile.get("provider") and "token_place_provider" not in removed_set:
                 completion_kwargs["token_place_provider"] = model_profile.get("provider")
             if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:

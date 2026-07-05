@@ -129,6 +129,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "runtime_completion_unavailable",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -143,6 +144,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "apply_chat_template",
         "create_chat_completion",
         "create_chat_completion_with_recovery",
+        "create_completion_from_rendered_prompt",
         "render_and_tokenize_chat",
         "tokenize",
     },
@@ -2345,6 +2347,9 @@ class RelayClient:
             cleaned = cleaned[match.end():].lstrip()
 
         cleaned = cleaned.strip()
+        for marker in ("<|im_end|>",):
+            if cleaned.endswith(marker):
+                cleaned = cleaned[: -len(marker)].rstrip()
         if not cleaned:
             return (
                 None,
@@ -3221,6 +3226,103 @@ class RelayClient:
         supported = set(attempted) - cache_entry["filtered"]
         cache_entry["supported"].update(supported)
 
+
+    def _api_v1_create_completion_from_rendered_prompt_filtered(
+        self,
+        render_complete: Any,
+        *,
+        messages: List[Dict[str, Any]],
+        safe_options: Dict[str, Any],
+        model_profile: Dict[str, Any],
+        client_option_names: Set[str],
+        max_removed_kwargs: int = 3,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Render in the child worker and call plain completion for Qwen API v1."""
+
+        allowed_plain_kwargs = {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "repeat_penalty",
+            "stream",
+        }
+        removed: List[str] = []
+        while True:
+            completion_kwargs = {
+                key: value
+                for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
+                if key in allowed_plain_kwargs
+            }
+            completion_kwargs["stream"] = False
+            stops = completion_kwargs.get("stop")
+            if stops is None:
+                stops_list: List[str] = []
+            elif isinstance(stops, str):
+                stops_list = [stops]
+            elif isinstance(stops, list):
+                stops_list = [item for item in stops if isinstance(item, str)]
+            else:
+                stops_list = []
+            for stop in ("<|im_end|>",):
+                if stop not in stops_list:
+                    stops_list.append(stop)
+            completion_kwargs["stop"] = stops_list
+            attempted_names = self._api_v1_attempted_generation_kwargs(completion_kwargs)
+            try:
+                result = render_complete(
+                    messages=messages,
+                    add_generation_prompt=True,
+                    enable_thinking=None,
+                    token_place_provider=model_profile.get("provider"),
+                    token_place_template_policy=model_profile.get("chat_template_policy"),
+                    completion_kwargs=completion_kwargs,
+                )
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names)
+                return result, {
+                    "completion_kwargs": completion_kwargs,
+                    "attempted_generation_kwargs": attempted_names,
+                    "filtered_generation_kwargs": sorted(set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))),
+                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())),
+                    "generation_method": "create_completion_from_rendered_prompt",
+                }
+            except Exception as exc:
+                diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
+                safe_worker = _safe_worker_diagnostics(diagnostics)
+                rejected = (
+                    safe_worker.get("rejected_generation_kwarg")
+                    if isinstance(safe_worker.get("rejected_generation_kwarg"), str)
+                    else (
+                        safe_worker.get("rejected_option")
+                        if isinstance(safe_worker.get("rejected_option"), str)
+                        else _extract_unsupported_generation_kwarg(exc, attempted_names)
+                    )
+                )
+                if rejected not in set(attempted_names):
+                    rejected = None
+                category = (
+                    safe_worker.get("generation_exception_category")
+                    if isinstance(safe_worker.get("generation_exception_category"), str)
+                    else _classify_safe_generation_exception(exc)
+                )
+                if category != "unsupported_generation_kwarg" or not rejected:
+                    raise
+                if rejected in client_option_names or rejected in {"max_tokens", "stream"} or len(removed) >= max_removed_kwargs:
+                    raise
+                removed.append(rejected)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
+                log_info(
+                    "api_v1.render_complete_generation_kwarg_filtered rejected_kwarg={} attempted_kwargs={} filtered_kwargs={}",
+                    rejected,
+                    ",".join(attempted_names),
+                    ",".join(sorted(set(removed))),
+                )
+                continue
+
     def _api_v1_create_chat_completion_filtered(
         self,
         create_chat_completion: Any,
@@ -3598,8 +3700,40 @@ class RelayClient:
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+            qwen_render_complete = self._api_v1_qwen_non_thinking_required(model_profile)
+            render_complete = (
+                getattr(llm_instance, "create_completion_from_rendered_prompt", None)
+                if llm_instance is not None
+                else None
+            )
+            if (
+                render_complete is not None
+                and type(render_complete).__module__.startswith("unittest.mock")
+                and "create_completion_from_rendered_prompt" not in getattr(llm_instance, "__dict__", {})
+            ):
+                render_complete = None
 
-            if callable(create_chat_completion):
+            if qwen_render_complete and callable(render_complete):
+                log_info(
+                    (
+                        "API v1 runtime generation branch selected: "
+                        "request_id={} model_id={} protocol={} route={} branch={}"
+                    ),
+                    request_id,
+                    model_id,
+                    "tokenplace_api_v1_relay_e2ee",
+                    "/api/v1/relay/responses",
+                    "render_then_complete_non_streaming",
+                )
+                started = time.monotonic()
+                completion, generation_kwarg_diagnostics = self._api_v1_create_completion_from_rendered_prompt_filtered(
+                    render_complete,
+                    messages=runtime_messages,
+                    safe_options=safe_options,
+                    model_profile=model_profile,
+                    client_option_names=set(safe_options),
+                )
+            elif callable(create_chat_completion):
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "
@@ -3618,12 +3752,15 @@ class RelayClient:
                     safe_options=safe_options,
                     client_option_names=set(safe_options),
                 )
+
+            if completion is not None:
                 completion_kwargs = generation_kwarg_diagnostics.get("completion_kwargs", completion_kwargs)
                 inference_duration = time.monotonic() - started
                 log_info(
-                    "api_v1.generation_kwargs active_tier={} model_id={} supported={} filtered={} attempted={}",
+                    "api_v1.generation_kwargs active_tier={} model_id={} method={} supported={} filtered={} attempted={}",
                     normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
                     model_id,
+                    generation_kwarg_diagnostics.get("generation_method", "create_chat_completion"),
                     ",".join(generation_kwarg_diagnostics.get("supported_generation_kwargs", [])),
                     ",".join(generation_kwarg_diagnostics.get("filtered_generation_kwargs", [])),
                     ",".join(generation_kwarg_diagnostics.get("attempted_generation_kwargs", [])),
@@ -3635,9 +3772,7 @@ class RelayClient:
                     completion_kwargs["max_tokens"],
                     round(inference_duration, 3),
                 )
-                assistant_message = self._assistant_message_from_runtime_completion(
-                    completion
-                )
+                assistant_message = self._assistant_message_from_runtime_completion(completion)
 
             if assistant_message is None:
                 invalid_reason = (
@@ -3674,7 +3809,25 @@ class RelayClient:
                     if isinstance(safe_worker_diagnostics.get("generation_exception_category"), str)
                     else None
                 )
-                if category in {
+                render_complete_error = (
+                    safe_worker_diagnostics.get("method") == "create_completion_from_rendered_prompt"
+                )
+                if render_complete_error:
+                    if category == "unsupported_generation_kwarg":
+                        internal_reason = "runtime_completion_smoke_render_complete_unsupported_kwarg"
+                    elif category in {
+                        "metal_memory_allocation",
+                        "kv_cache_allocation",
+                        "rope_yarn_eval_failure",
+                        "worker_timeout",
+                        "worker_dead",
+                    }:
+                        internal_reason = f"runtime_{category}"
+                    elif safe_worker_diagnostics.get("reason") == "runtime_completion_unavailable":
+                        internal_reason = "runtime_completion_smoke_render_complete_worker_error"
+                    else:
+                        internal_reason = "runtime_completion_smoke_render_complete_request_rejected"
+                elif category in {
                     "metal_memory_allocation",
                     "kv_cache_allocation",
                     "rope_yarn_eval_failure",

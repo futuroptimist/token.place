@@ -61,6 +61,8 @@ class Llama:
     def tokenize(self, payload, add_bos=False):
         return [1] * 42
     def create_chat_completion(self, **kwargs):
+        raise RuntimeError('high-level chat path disabled for Qwen test')
+    def create_completion(self, prompt, **kwargs):
 """
         + completion_branch,
         encoding='utf-8',
@@ -153,7 +155,11 @@ class _Qwen64kFakeRuntime:
         return "<redacted-test-template>"
 
     def create_chat_completion(self, **_kwargs):
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        raise AssertionError("Qwen API v1 must not use create_chat_completion")
+
+    def create_completion_from_rendered_prompt(self, **kwargs):
+        self.last_render_complete_kwargs = kwargs
+        return {"choices": [{"text": "ok"}]}
 
 
 def _model_manager(runtime):
@@ -198,7 +204,7 @@ def _runtime_for(fake_runtime):
     ("category", "reason"),
     [
         ("kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        ("unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ("unsupported_generation_kwarg", "runtime_completion_smoke_render_complete_unsupported_kwarg"),
         ("rope_yarn_eval_failure", "runtime_completion_smoke_rope_yarn_eval_failure"),
         ("worker_timeout", "runtime_completion_smoke_worker_timeout"),
         ("worker_dead", "runtime_completion_smoke_worker_dead"),
@@ -206,13 +212,13 @@ def _runtime_for(fake_runtime):
 )
 def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_reason(category, reason):
     class FailingRuntime(_Qwen64kFakeRuntime):
-        def create_chat_completion(self, **_kwargs):
+        def create_completion_from_rendered_prompt(self, **_kwargs):
             raise LlamaCppInferenceRequestError(
                 "llama_cpp request failed",
                 diagnostics={
                     "generation_exception_category": category,
                     "exception_type": "RuntimeError",
-                    "method": "create_chat_completion",
+                    "method": "create_completion_from_rendered_prompt",
                 },
             )
 
@@ -235,8 +241,11 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
     try:
         assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
-            proxy.create_chat_completion(messages=[{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
-        assert exc_info.value.diagnostics['method'] == 'create_chat_completion'
+            proxy.create_completion_from_rendered_prompt(
+                messages=[{'role': 'user', 'content': 'SECRET_PROMPT'}],
+                completion_kwargs={'max_tokens': 64, 'stream': False},
+            )
+        assert exc_info.value.diagnostics['method'] == 'create_completion_from_rendered_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
         assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
 
@@ -258,6 +267,7 @@ def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+    assert manager.get_llm_instance.return_value.last_render_complete_kwargs["completion_kwargs"]["max_tokens"] == 64
 
 
 def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_registers():
@@ -266,12 +276,13 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
             self.calls = []
             self.rejected = False
 
-        def create_chat_completion(self, **kwargs):
-            self.calls.append(dict(kwargs))
-            if "top_k" in kwargs and not self.rejected:
+        def create_completion_from_rendered_prompt(self, **kwargs):
+            completion_kwargs = dict(kwargs.get("completion_kwargs", {}))
+            self.calls.append(completion_kwargs)
+            if "top_k" in completion_kwargs and not self.rejected:
                 self.rejected = True
                 raise TypeError("got an unexpected keyword argument 'top_k'")
-            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+            return {"choices": [{"text": "ok"}]}
 
     fake = TopKRejectingRuntime()
     runtime, manager = _runtime_for(fake)

@@ -212,6 +212,13 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_thinking_leaked"
     if internal_reason == "qwen_empty_after_think_wrapper_strip":
         return "runtime_completion_smoke_empty_after_think_strip"
+    if internal_reason == "runtime_completion_smoke_render_complete_unsupported_kwarg":
+        return "runtime_completion_smoke_render_complete_unsupported_kwarg"
+    if internal_reason in {
+        "runtime_completion_smoke_render_complete_request_rejected",
+        "runtime_completion_smoke_render_complete_worker_error",
+    }:
+        return internal_reason
     if internal_reason in {
         "unsupported_generation_option",
         "runtime_rejected_generation_options",

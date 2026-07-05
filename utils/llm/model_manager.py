@@ -1764,6 +1764,22 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+
+def _extract_unsupported_generation_kwarg(message, attempted=None):
+    attempted_set = set(str(key) for key in attempted) if attempted is not None else None
+    for pattern in (
+        r'(?:got an )?unexpected keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
+        r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'invalid keyword\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*)',
+    ):
+        match = re.search(pattern, str(message or ''))
+        if match:
+            rejected = next((group for group in match.groups() if group), None)
+            if rejected and (attempted_set is None or rejected in attempted_set):
+                return rejected
+    return None
+
 def _sanitize_error_summary(message):
     text = str(message or '').lower()
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
@@ -1772,7 +1788,7 @@ def _sanitize_error_summary(message):
         return type(message).__name__ + ':kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return type(message).__name__ + ':rope_yarn_eval_failure'
-    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(message or '')):
+    if _extract_unsupported_generation_kwarg(str(message or '')) is not None:
         return type(message).__name__ + ':unsupported_kwarg'
     return type(message).__name__ + ':redacted'
 
@@ -1784,7 +1800,7 @@ def _classify_generation_exception(exc):
         return 'kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return 'rope_yarn_eval_failure'
-    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(exc or '')):
+    if _extract_unsupported_generation_kwarg(str(exc or '')) is not None:
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
 
@@ -1803,17 +1819,30 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
         kwargs = request.get('kwargs')
         if isinstance(kwargs, dict):
             diagnostics['stream'] = bool(kwargs.get('stream'))
+            for safe_scalar in ('max_tokens', 'temperature', 'top_p', 'top_k'):
+                value = kwargs.get(safe_scalar)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    diagnostics[safe_scalar] = value
     if exc is not None:
         diagnostics['exception_type'] = type(exc).__name__
         diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
             diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
             message = str(exc)
-            match = re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument) [\\'"]?([A-Za-z_][A-Za-z0-9_]*)', message)
-            if match:
+            attempted = None
+            if isinstance(request, dict) and isinstance(request.get('kwargs'), dict):
+                attempted = sorted(
+                    str(key) for key in request['kwargs']
+                    if isinstance(key, str) and key != 'messages'
+                )
+            rejected = _extract_unsupported_generation_kwarg(message, attempted)
+            if rejected:
                 diagnostics['reason'] = 'unsupported_generation_option'
                 diagnostics['code'] = 'compute_node_options_unsupported'
-                diagnostics['rejected_option'] = match.group(1)
+                diagnostics['rejected_option'] = rejected
+                diagnostics['rejected_generation_kwarg'] = rejected
+                if attempted:
+                    diagnostics['attempted_generation_kwargs'] = ','.join(attempted[:32])
                 diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
     return {
         'status': 'error',

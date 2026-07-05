@@ -44,6 +44,32 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+_UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
+    re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"unsupported option(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),
+    re.compile(r"invalid keyword(?: argument)? [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"invalid keyword\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"),
+)
+
+
+def _extract_unsupported_generation_kwarg(
+    value: Any, attempted_generation_kwargs: Optional[Sequence[str]] = None
+) -> Optional[str]:
+    text = str(value or "")
+    attempted = (
+        {str(key) for key in attempted_generation_kwargs}
+        if attempted_generation_kwargs is not None
+        else None
+    )
+    for pattern in _UNSUPPORTED_GENERATION_KWARG_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            rejected = next((group for group in match.groups() if group), None)
+            if rejected and (attempted is None or rejected in attempted):
+                return rejected
+    return None
+
+
 def _classify_safe_generation_exception(exc: BaseException) -> str:
     text = f"{type(exc).__name__} {exc}".lower()
     if "metal" in text and any(term in text for term in ("alloc", "memory", "out of memory", "oom")):
@@ -56,7 +82,7 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
         return "worker_timeout"
     if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
         return "worker_dead"
-    if "unexpected keyword argument" in text or "got an unexpected keyword argument" in text:
+    if _extract_unsupported_generation_kwarg(exc):
         return "unsupported_generation_kwarg"
     return "unknown_generation_exception"
 
@@ -67,6 +93,8 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwarg",
+    "attempted_generation_kwargs",
     "method",
     "stream",
     "retryable",
@@ -77,6 +105,10 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "context_tier",
     "context_window_tokens",
     "n_ctx",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
     "kv_cache_mode",
     "type_k",
     "type_v",
@@ -148,8 +180,13 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key == "attempted_generation_kwargs":
+        names = [part for part in bounded.split(",") if part]
+        if names and all(_SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(part) for part in names):
+            return ",".join(names[:32])
+        return None
     if key == "sanitized_error_summary":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(bounded) else None
     if key in {"stderr_tail", "child_stderr_tail"}:
@@ -699,6 +736,7 @@ class RelayClient:
         self.port = port
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
+        self._api_v1_generation_kwarg_cache: Dict[Tuple[Any, ...], Dict[str, Set[str]]] = {}
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
         self._registration_token: Optional[str] = None
@@ -3088,7 +3126,7 @@ class RelayClient:
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Merge API v1 options with model-manager defaults for direct completions."""
+        """Merge API v1 options with filtered model-manager defaults for direct completions."""
 
         config = getattr(self.model_manager, "config", None)
         config_get = getattr(config, "get", None)
@@ -3108,11 +3146,138 @@ class RelayClient:
         profile_defaults = (
             getattr(self.model_manager, "model_profile", {}) or {}
         ).get("generation_defaults") or {}
-        for key in ("temperature", "top_p", "top_k"):
+        for key in ("temperature", "top_p", "top_k", "stop"):
             if key in profile_defaults:
                 completion_kwargs[key] = profile_defaults[key]
+        filtered = self._api_v1_generation_kwarg_cache_entry()["filtered"]
+        for key in list(filtered):
+            if key not in safe_options and key not in {"messages", "max_tokens", "stream"}:
+                completion_kwargs.pop(key, None)
         completion_kwargs.update(safe_options)
+        completion_kwargs["stream"] = False
         return completion_kwargs
+
+    def _api_v1_generation_kwarg_cache_key(self) -> Tuple[Any, ...]:
+        config = getattr(self.model_manager, "config", None)
+        config_get = getattr(config, "get", None)
+
+        def configured(key: str, default: Any) -> Any:
+            if callable(config_get):
+                return config_get(key, default)
+            return default
+
+        profile = getattr(self.model_manager, "model_profile", {}) or {}
+        generation_defaults = profile.get("generation_defaults") or {}
+        try:
+            generation_signature = json.dumps(
+                {
+                    "config": {
+                        "max_tokens": configured("model.max_tokens", 512),
+                        "temperature": configured("model.temperature", 0.7),
+                        "top_p": configured("model.top_p", 0.9),
+                        "stop": configured("model.stop_tokens", []),
+                    },
+                    "profile_defaults": generation_defaults,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        except TypeError:
+            generation_signature = repr((configured("model.max_tokens", 512), generation_defaults))
+        runtime = getattr(self.model_manager, "runtime", None) or getattr(self.model_manager, "llm", None)
+        return (
+            id(runtime),
+            getattr(self.model_manager, "api_model_id", None),
+            getattr(self.model_manager, "model_id", None),
+            normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+            profile.get("id") or profile.get("profile_id") or profile.get("name"),
+            generation_signature,
+        )
+
+    def _api_v1_generation_kwarg_cache_entry(self) -> Dict[str, Set[str]]:
+        return self._api_v1_generation_kwarg_cache.setdefault(
+            self._api_v1_generation_kwarg_cache_key(),
+            {"filtered": set(), "supported": set()},
+        )
+
+    @property
+    def _api_v1_generation_kwargs_filtered(self) -> Set[str]:
+        return self._api_v1_generation_kwarg_cache_entry()["filtered"]
+
+    @property
+    def _api_v1_generation_kwargs_supported(self) -> Set[str]:
+        return self._api_v1_generation_kwarg_cache_entry()["supported"]
+
+    @staticmethod
+    def _api_v1_attempted_generation_kwargs(kwargs: Dict[str, Any]) -> List[str]:
+        return sorted(str(key) for key in kwargs if key != "messages")
+
+    def _api_v1_remember_generation_kwargs(
+        self, *, attempted: List[str], rejected: Optional[str] = None
+    ) -> None:
+        cache_entry = self._api_v1_generation_kwarg_cache_entry()
+        if rejected:
+            cache_entry["filtered"].add(rejected)
+        supported = set(attempted) - cache_entry["filtered"]
+        cache_entry["supported"].update(supported)
+
+    def _api_v1_create_chat_completion_filtered(
+        self,
+        create_chat_completion: Any,
+        *,
+        messages: List[Dict[str, Any]],
+        safe_options: Dict[str, Any],
+        client_option_names: Set[str],
+        max_removed_kwargs: int = 3,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Call the real runtime while removing only rejected internal kwargs."""
+
+        removed: List[str] = []
+        attempted_names: List[str] = []
+        while True:
+            completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            attempted_names = self._api_v1_attempted_generation_kwargs({"messages": messages, **completion_kwargs})
+            try:
+                result = create_chat_completion(messages=messages, **completion_kwargs)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names)
+                return result, {
+                    "completion_kwargs": completion_kwargs,
+                    "attempted_generation_kwargs": attempted_names,
+                    "filtered_generation_kwargs": sorted(set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))),
+                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())),
+                }
+            except Exception as exc:
+                diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
+                safe_worker = _safe_worker_diagnostics(diagnostics)
+                rejected = None
+                if isinstance(safe_worker.get("rejected_generation_kwarg"), str):
+                    rejected = safe_worker["rejected_generation_kwarg"]
+                elif isinstance(safe_worker.get("rejected_option"), str):
+                    rejected = safe_worker["rejected_option"]
+                else:
+                    rejected = _extract_unsupported_generation_kwarg(exc, attempted_names)
+                if rejected not in set(attempted_names):
+                    rejected = None
+                category = (
+                    safe_worker.get("generation_exception_category")
+                    if isinstance(safe_worker.get("generation_exception_category"), str)
+                    else _classify_safe_generation_exception(exc)
+                )
+                if category != "unsupported_generation_kwarg" or not rejected:
+                    raise
+                if rejected in client_option_names:
+                    raise
+                if rejected in {"messages", "max_tokens", "stream"} or len(removed) >= max_removed_kwargs:
+                    raise
+                removed.append(rejected)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
+                log_info(
+                    "api_v1.generation_kwarg_filtered rejected_kwarg={} attempted_kwargs={} filtered_kwargs={}",
+                    rejected,
+                    ",".join(attempted_names),
+                    ",".join(sorted(set(removed))),
+                )
+                continue
 
     def _api_v1_enrich_safe_error(
         self,
@@ -3447,11 +3612,22 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 started = time.monotonic()
-                completion = create_chat_completion(
+                completion, generation_kwarg_diagnostics = self._api_v1_create_chat_completion_filtered(
+                    create_chat_completion,
                     messages=runtime_messages,
-                    **completion_kwargs,
+                    safe_options=safe_options,
+                    client_option_names=set(safe_options),
                 )
+                completion_kwargs = generation_kwarg_diagnostics.get("completion_kwargs", completion_kwargs)
                 inference_duration = time.monotonic() - started
+                log_info(
+                    "api_v1.generation_kwargs active_tier={} model_id={} supported={} filtered={} attempted={}",
+                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+                    model_id,
+                    ",".join(generation_kwarg_diagnostics.get("supported_generation_kwargs", [])),
+                    ",".join(generation_kwarg_diagnostics.get("filtered_generation_kwargs", [])),
+                    ",".join(generation_kwarg_diagnostics.get("attempted_generation_kwargs", [])),
+                )
                 log_info(
                     "api_v1.inference_complete active_tier={} prompt_tokens={} output_reservation={} admission_result=admitted inference_duration_seconds={} safe_error_code=none",
                     normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
@@ -3517,7 +3693,11 @@ class RelayClient:
                 rejected_option = (
                     safe_worker_diagnostics.get("rejected_option")
                     if isinstance(safe_worker_diagnostics.get("rejected_option"), str)
-                    else None
+                    else (
+                        safe_worker_diagnostics.get("rejected_generation_kwarg")
+                        if isinstance(safe_worker_diagnostics.get("rejected_generation_kwarg"), str)
+                        else None
+                    )
                 )
                 error_code = (
                     "compute_node_options_unsupported"
@@ -3580,6 +3760,11 @@ class RelayClient:
             unsupported_generation_kwarg = (
                 exception_category == "unsupported_generation_kwarg"
             )
+            rejected_generation_kwarg = (
+                _extract_unsupported_generation_kwarg(exc)
+                if unsupported_generation_kwarg
+                else None
+            )
             return self._api_v1_response_envelope(
                 request_id,
                 error=self._api_v1_enrich_safe_error(
@@ -3610,6 +3795,7 @@ class RelayClient:
                         }
                         else "runtime_inference_failed"
                     ),
+                    rejected_option=rejected_generation_kwarg,
                 ),
             )
 

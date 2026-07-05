@@ -4191,6 +4191,76 @@ class _ApiV1RuntimeManager:
         return self.runtime
 
 
+
+def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled", "profile_id": "qwen3-8b-q4-k-m"}
+    manager.context_tier = "64k-full"
+    manager.context_window_tokens = 65536
+    manager.runtime.create_chat_completion.side_effect = AssertionError("chat path must not be used for qwen")
+    render_complete = MagicMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+    })
+    manager.runtime.create_chat_completion_from_rendered_prompt = render_complete
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-render-complete",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64, "stream": False},
+        requested_context_tier="64k-full",
+    )
+
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
+    manager.runtime.create_chat_completion.assert_not_called()
+    kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
+    assert kwargs["stream"] is False
+    assert kwargs["max_tokens"] == 64
+    assert kwargs["enable_thinking"] is False
+    assert "messages" not in kwargs
+    messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
+    assert messages[-1]["content"].startswith("/no_think\n")
+
+
+def test_api_v1_qwen_render_then_complete_empty_think_wrapper_is_cleaned():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nok<|im_end|>"}}]
+    })
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-clean",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64},
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+
+
+def test_api_v1_qwen_render_then_complete_rejects_non_empty_thinking():
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "<think>reasoning</think>\nok"}}]
+    })
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-leak",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+
+
 @pytest.mark.parametrize(
     ("options", "expected"),
     [

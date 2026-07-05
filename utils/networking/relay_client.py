@@ -129,6 +129,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "malformed_completion_output",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -138,12 +139,17 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "malformed_completion_output",
     },
     "method": {
         "apply_chat_template",
         "create_chat_completion",
         "create_chat_completion_with_recovery",
+        "create_chat_completion_from_rendered_prompt",
+        "create_completion_from_rendered_prompt",
         "render_and_tokenize_chat",
+        "create_chat_completion_from_rendered_prompt",
+        "create_completion_from_rendered_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -2354,6 +2360,11 @@ class RelayClient:
             )
         if re.search(r"<\s*/?\s*think\b", cleaned, flags=re.IGNORECASE):
             return None, "qwen_thinking_output_leaked"
+        for marker in ("<|im_end|>",):
+            if cleaned.endswith(marker):
+                cleaned = cleaned[: -len(marker)].rstrip()
+        if not cleaned:
+            return None, "unsupported_completion_shape"
         return cleaned, None
 
     @classmethod
@@ -3279,6 +3290,78 @@ class RelayClient:
                 )
                 continue
 
+
+    def _api_v1_create_completion_from_rendered_prompt_filtered(
+        self,
+        create_completion_from_rendered_prompt: Any,
+        *,
+        messages: List[Dict[str, Any]],
+        safe_options: Dict[str, Any],
+        model_profile: Dict[str, Any],
+        client_option_names: Set[str],
+        max_removed_kwargs: int = 3,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Call Qwen render-then-plain-completion while filtering rejected kwargs."""
+
+        allowed_plain_kwargs = {
+            "max_tokens", "temperature", "top_p", "top_k", "min_p", "stop",
+            "presence_penalty", "frequency_penalty", "repeat_penalty", "stream",
+        }
+        removed: List[str] = []
+        attempted_names: List[str] = []
+        while True:
+            completion_kwargs = {
+                key: value
+                for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
+                if key in allowed_plain_kwargs
+            }
+            completion_kwargs["stream"] = False
+            if model_profile.get("provider"):
+                completion_kwargs["token_place_provider"] = model_profile.get("provider")
+            if model_profile.get("chat_template_policy"):
+                completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
+            if self._api_v1_qwen_non_thinking_required(model_profile):
+                completion_kwargs["enable_thinking"] = False
+            attempted_names = sorted(str(key) for key in completion_kwargs)
+            try:
+                result = create_completion_from_rendered_prompt(messages, **completion_kwargs)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names)
+                return result, {
+                    "completion_kwargs": completion_kwargs,
+                    "attempted_generation_kwargs": attempted_names,
+                    "filtered_generation_kwargs": sorted(set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))),
+                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())),
+                    "generation_method": "create_completion_from_rendered_prompt",
+                }
+            except Exception as exc:
+                diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
+                safe_worker = _safe_worker_diagnostics(diagnostics)
+                rejected = (
+                    safe_worker.get("rejected_generation_kwarg")
+                    if isinstance(safe_worker.get("rejected_generation_kwarg"), str)
+                    else _extract_unsupported_generation_kwarg(exc, attempted_names)
+                )
+                if rejected not in set(attempted_names):
+                    rejected = None
+                category = (
+                    safe_worker.get("generation_exception_category")
+                    if isinstance(safe_worker.get("generation_exception_category"), str)
+                    else _classify_safe_generation_exception(exc)
+                )
+                if category != "unsupported_generation_kwarg" or not rejected:
+                    raise
+                if rejected in client_option_names or rejected in {"messages", "max_tokens", "stream"} or len(removed) >= max_removed_kwargs:
+                    raise
+                removed.append(rejected)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
+                log_info(
+                    "api_v1.render_complete_generation_kwarg_filtered rejected_kwarg={} attempted_kwargs={} filtered_kwargs={}",
+                    rejected,
+                    ",".join(attempted_names),
+                    ",".join(sorted(set(removed))),
+                )
+                continue
+
     def _api_v1_enrich_safe_error(
         self,
         error: Dict[str, Any],
@@ -3595,11 +3678,29 @@ class RelayClient:
                     ),
                 )
 
+            qwen_render_complete = None
+            if self._api_v1_qwen_non_thinking_required(model_profile) and llm_instance is not None:
+                qwen_render_complete = getattr(
+                    llm_instance, "create_chat_completion_from_rendered_prompt", None
+                )
+                if (
+                    type(qwen_render_complete).__module__.startswith("unittest.mock")
+                    and not callable(getattr(type(llm_instance), "create_chat_completion_from_rendered_prompt", None))
+                    and "create_chat_completion_from_rendered_prompt"
+                    not in getattr(llm_instance, "__dict__", {})
+                ):
+                    qwen_render_complete = None
+
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 
-            if callable(create_chat_completion):
+            if callable(qwen_render_complete) or callable(create_chat_completion):
+                generation_branch = (
+                    "qwen_render_then_plain_completion"
+                    if callable(qwen_render_complete)
+                    else "direct_non_streaming_completion"
+                )
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "
@@ -3609,15 +3710,24 @@ class RelayClient:
                     model_id,
                     "tokenplace_api_v1_relay_e2ee",
                     "/api/v1/relay/responses",
-                    "direct_non_streaming_completion",
+                    generation_branch,
                 )
                 started = time.monotonic()
-                completion, generation_kwarg_diagnostics = self._api_v1_create_chat_completion_filtered(
-                    create_chat_completion,
-                    messages=runtime_messages,
-                    safe_options=safe_options,
-                    client_option_names=set(safe_options),
-                )
+                if callable(qwen_render_complete):
+                    completion, generation_kwarg_diagnostics = self._api_v1_create_completion_from_rendered_prompt_filtered(
+                        qwen_render_complete,
+                        messages=runtime_messages,
+                        safe_options=safe_options,
+                        model_profile=model_profile,
+                        client_option_names=set(safe_options),
+                    )
+                else:
+                    completion, generation_kwarg_diagnostics = self._api_v1_create_chat_completion_filtered(
+                        create_chat_completion,
+                        messages=runtime_messages,
+                        safe_options=safe_options,
+                        client_option_names=set(safe_options),
+                    )
                 completion_kwargs = generation_kwarg_diagnostics.get("completion_kwargs", completion_kwargs)
                 inference_duration = time.monotonic() - started
                 log_info(

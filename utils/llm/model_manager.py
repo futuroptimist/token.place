@@ -1603,6 +1603,21 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
+    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+
     def apply_chat_template(self, *args, **kwargs):
         with self._lock:
             self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
@@ -1812,7 +1827,7 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
                 diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
-        if method == 'create_chat_completion':
+        if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
             diagnostics['method'] = method
         elif method is not None:
             diagnostics['method'] = 'unsupported'
@@ -2093,7 +2108,7 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_request'))
             continue
         method = request.get('method')
-        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
+        if method not in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
@@ -2181,6 +2196,50 @@ for line in sys.stdin:
                 else:
                     tokenize_args.append(arg)
             _emit({'status': 'ok', 'result': tokenize(*tokenize_args, **kwargs)})
+            continue
+        if method == 'create_chat_completion_from_rendered_prompt':
+            render_kwargs = {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': kwargs.pop('enable_thinking', None),
+                'token_place_provider': kwargs.pop('token_place_provider', None),
+                'token_place_template_policy': kwargs.pop('token_place_template_policy', None),
+            }
+            render_kwargs = {key: value for key, value in render_kwargs.items() if value is not None}
+            rendered_prompt, render_diagnostics = _render_chat_with_runtime_template(
+                llama, request.get('args', []), render_kwargs
+            )
+            completion_kwargs = {
+                key: kwargs[key]
+                for key in (
+                    'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
+                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'stream'
+                )
+                if key in kwargs
+            }
+            completion_kwargs['stream'] = False
+            stop = completion_kwargs.get('stop')
+            if stop is None:
+                stop_values = ['<|im_end|>']
+            elif isinstance(stop, list):
+                stop_values = list(stop)
+                if '<|im_end|>' not in stop_values:
+                    stop_values.append('<|im_end|>')
+            else:
+                stop_values = [stop, '<|im_end|>'] if stop != '<|im_end|>' else [stop]
+            completion_kwargs['stop'] = stop_values
+            result = llama.create_completion(prompt=rendered_prompt, **completion_kwargs)
+            if not isinstance(result, dict):
+                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+                continue
+            choices = result.get('choices')
+            text = None
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                text = choices[0].get('text')
+            if not isinstance(text, str):
+                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+                continue
+            _emit({'status': 'ok', 'result': {'choices': [{'message': {'role': 'assistant', 'content': text}}]}})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

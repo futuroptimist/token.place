@@ -44,6 +44,9 @@ class _ReadyRuntime:
     def create_chat_completion(self, **_kwargs):
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
+    def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
 
 def test_first_env_skips_blank_values(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_RELAY_URL", "   ")
@@ -629,9 +632,12 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **kwargs):
-            self.completion_kwargs = kwargs
+        def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+            self.completion_kwargs = {**kwargs, "messages": messages}
             return {"choices": [{"message": {"role": "assistant", "content": "ready"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
     model_manager = MagicMock()
@@ -1938,7 +1944,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 
     class FailingRuntime(_Qwen64kRuntime):
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             raise LlamaCppInferenceRequestError(
                 "llama_cpp request failed",
                 diagnostics={
@@ -1946,7 +1952,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
                     "exception_type": "RuntimeError",
                     "sanitized_error_summary": "RuntimeError:redacted",
                     "child_stderr_tail": "llama_context: kv cache allocation failed <redacted>",
-                    "method": "create_chat_completion",
+                    "method": "create_chat_completion_from_rendered_prompt",
                     "reason": "SECRET prompt in allowed reason",
                     "stderr_tail": "redacted SECRET prompt in allowed stderr",
                 },
@@ -1966,7 +1972,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_metal_memory_allocation"
     assert diagnostics["api_v1_readiness_completion_smoke_exception_category"] == "metal_memory_allocation"
     worker_diagnostics = diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]
-    assert worker_diagnostics["method"] == "create_chat_completion"
+    assert worker_diagnostics["method"] == "create_chat_completion_from_rendered_prompt"
     assert worker_diagnostics["sanitized_error_summary"] == "RuntimeError:redacted"
     assert worker_diagnostics["child_stderr_tail"] == "llama_context: kv cache allocation failed <redacted>"
     assert "reason" not in worker_diagnostics
@@ -1976,7 +1982,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
 
 def test_qwen_64k_yarn_eval_exception_fails_closed_before_registration():
     class FailingRuntime(_Qwen64kRuntime):
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             raise RuntimeError("RoPE YaRN eval failure at n_ctx=65536")
 
     model_manager = _qwen_64k_model_manager(FailingRuntime())

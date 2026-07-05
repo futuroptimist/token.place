@@ -9,6 +9,7 @@ from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeCon
 from utils.context_profiles import apply_context_profile
 from utils.llm import model_manager as model_manager_module
 from utils.llm.model_manager import LlamaCppInferenceRequestError, ModelManager
+from utils.networking.relay_client import RelayClient
 
 
 def _config(tmp_path):
@@ -258,3 +259,83 @@ def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+
+class _RejectInternalKwargOnceRuntime(_Qwen64kFakeRuntime):
+    def __init__(self, rejected):
+        self.rejected = list(rejected)
+        self.calls = []
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(sorted(kwargs))
+        for key in list(self.rejected):
+            if key in kwargs:
+                self.rejected.remove(key)
+                raise TypeError(f"create_chat_completion() got an unexpected keyword argument '{key}'")
+        return {"choices": [{"message": {"content": "<think></think>ok"}}]}
+
+
+def test_qwen64k_readiness_filters_unsupported_internal_top_k_and_caches():
+    fake = _RejectInternalKwargOnceRuntime(["top_k"])
+    runtime, manager = _runtime_for(fake)
+    manager.model_profile["generation_defaults"] = {"top_k": 40, "temperature": 0.6, "top_p": 0.9}
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+    assert diagnostics["api_v1_generation_kwargs_rejected"] == ["top_k"]
+    assert diagnostics["api_v1_generation_kwargs_filtered"] == ["top_k"]
+    assert "top_k" in fake.calls[0]
+    assert "top_k" not in fake.calls[1]
+    assert manager._api_v1_generation_kwargs_capability_cache["rejected"] == {"top_k"}
+
+
+def test_qwen64k_readiness_filters_unsupported_empty_stop_default():
+    fake = _RejectInternalKwargOnceRuntime(["stop"])
+    runtime, manager = _runtime_for(fake)
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_generation_kwargs_rejected"] == ["stop"]
+    assert "stop" in fake.calls[0]
+    assert "stop" not in fake.calls[1]
+
+
+def test_qwen64k_readiness_bounded_retry_fails_closed_after_internal_kwargs_exhaustion():
+    fake = _RejectInternalKwargOnceRuntime(["top_k", "temperature", "top_p", "stop"])
+    runtime, manager = _runtime_for(fake)
+    manager.model_profile["generation_defaults"] = {"top_k": 40, "temperature": 0.6, "top_p": 0.9}
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert sorted(diagnostics["api_v1_generation_kwargs_rejected"]) == ["stop", "temperature", "top_k", "top_p"]
+
+
+def test_qwen64k_real_request_rejects_client_supplied_unsupported_runtime_option():
+    fake = _RejectInternalKwargOnceRuntime(["temperature"])
+    runtime, manager = _runtime_for(fake)
+    client = RelayClient(
+        "https://token.place",
+        None,
+        MagicMock(),
+        manager,
+        include_configured_servers=False,
+    )
+    client._runtime_mode = True
+    manager.model_profile["generation_defaults"] = {}
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="real-request",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"temperature": 0.5, "max_tokens": 4, "stream": False},
+        requested_context_tier="64k-full",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["rejected_option"] == "temperature"

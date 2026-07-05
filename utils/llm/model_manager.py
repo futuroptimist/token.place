@@ -1772,7 +1772,7 @@ def _sanitize_error_summary(message):
         return type(message).__name__ + ':kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return type(message).__name__ + ':rope_yarn_eval_failure'
-    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(message or '')):
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported option|invalid keyword)', str(message or ''), re.IGNORECASE):
         return type(message).__name__ + ':unsupported_kwarg'
     return type(message).__name__ + ':redacted'
 
@@ -1784,7 +1784,7 @@ def _classify_generation_exception(exc):
         return 'kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return 'rope_yarn_eval_failure'
-    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument)', str(exc or '')):
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported option|invalid keyword)', str(exc or ''), re.IGNORECASE):
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
 
@@ -1803,18 +1803,36 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
         kwargs = request.get('kwargs')
         if isinstance(kwargs, dict):
             diagnostics['stream'] = bool(kwargs.get('stream'))
+            if method == 'create_chat_completion':
+                diagnostics['_attempted_generation_kwargs'] = sorted(
+                    str(key) for key in kwargs.keys()
+                    if isinstance(key, str) and key != 'messages'
+                )[:32]
+                for safe_scalar_key in ('max_tokens', 'temperature', 'top_p', 'top_k'):
+                    value = kwargs.get(safe_scalar_key)
+                    if isinstance(value, (bool, int, float)):
+                        diagnostics[safe_scalar_key] = value
     if exc is not None:
         diagnostics['exception_type'] = type(exc).__name__
         diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
             diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
             message = str(exc)
-            match = re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument) [\\'"]?([A-Za-z_][A-Za-z0-9_]*)', message)
+            match = re.search(
+                r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported option|invalid keyword)\\s*[\\'"]?([A-Za-z_][A-Za-z0-9_]*)',
+                message,
+                re.IGNORECASE,
+            )
             if match:
                 diagnostics['reason'] = 'unsupported_generation_option'
                 diagnostics['code'] = 'compute_node_options_unsupported'
                 diagnostics['rejected_option'] = match.group(1)
+                diagnostics['rejected_generation_kwargs'] = [match.group(1)]
+                attempted = diagnostics.pop('_attempted_generation_kwargs', None)
+                if isinstance(attempted, list):
+                    diagnostics['attempted_generation_kwargs'] = attempted
                 diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
+    diagnostics.pop('_attempted_generation_kwargs', None)
     return {
         'status': 'error',
         'request_error': True,

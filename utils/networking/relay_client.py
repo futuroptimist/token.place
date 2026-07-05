@@ -44,6 +44,20 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+_UNSUPPORTED_GENERATION_KWARG_RE = re.compile(
+    r"(?:unexpected keyword argument|got an unexpected keyword argument|unsupported option|invalid keyword)\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_unsupported_generation_kwarg(exc_or_text: Any) -> Optional[str]:
+    text = str(exc_or_text or "")
+    match = _UNSUPPORTED_GENERATION_KWARG_RE.search(text)
+    if not match:
+        return None
+    return match.group(1)
+
+
 def _classify_safe_generation_exception(exc: BaseException) -> str:
     text = f"{type(exc).__name__} {exc}".lower()
     if "metal" in text and any(term in text for term in ("alloc", "memory", "out of memory", "oom")):
@@ -56,7 +70,7 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
         return "worker_timeout"
     if any(term in text for term in ("worker dead", "broken pipe", "eof", "exited before")):
         return "worker_dead"
-    if "unexpected keyword argument" in text or "got an unexpected keyword argument" in text:
+    if _extract_unsupported_generation_kwarg(exc) is not None:
         return "unsupported_generation_kwarg"
     return "unknown_generation_exception"
 
@@ -67,6 +81,8 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwargs",
+    "attempted_generation_kwargs",
     "method",
     "stream",
     "retryable",
@@ -140,6 +156,12 @@ def _is_controlled_redacted_diagnostic_tail(value: str) -> bool:
 def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
     if isinstance(value, (bool, int, float)) or value is None:
         return value
+    if key in {"rejected_generation_kwargs", "attempted_generation_kwargs"} and isinstance(value, list):
+        safe_items = []
+        for item in value[:32]:
+            if isinstance(item, str) and _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(item[:128]):
+                safe_items.append(item[:128])
+        return safe_items
     if not isinstance(value, str):
         return None
     bounded = value[:256]
@@ -3247,6 +3269,98 @@ class RelayClient:
                         shape["text_type"] = type(choice.get("text")).__name__
         return shape
 
+    @staticmethod
+    def _api_v1_completion_rejected_kwarg_from_exception(exc: BaseException) -> Optional[str]:
+        diagnostics = getattr(exc, "diagnostics", None)
+        if isinstance(diagnostics, dict):
+            rejected = diagnostics.get("rejected_option")
+            if isinstance(rejected, str) and _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(rejected):
+                return rejected
+            rejected_list = diagnostics.get("rejected_generation_kwargs")
+            if isinstance(rejected_list, list) and rejected_list and isinstance(rejected_list[0], str):
+                return rejected_list[0]
+        return _extract_unsupported_generation_kwarg(exc)
+
+    def _api_v1_generation_kwargs_cache(self) -> Dict[str, Any]:
+        cache = getattr(self.model_manager, "_api_v1_generation_kwargs_capability_cache", None)
+        if not isinstance(cache, dict):
+            cache = {"rejected": set(), "supported": set(), "filtered": set()}
+            setattr(self.model_manager, "_api_v1_generation_kwargs_capability_cache", cache)
+        for key in ("rejected", "supported", "filtered"):
+            if not isinstance(cache.get(key), set):
+                cache[key] = set(cache.get(key) or [])
+        return cache
+
+    def _api_v1_filter_runtime_completion_kwargs(
+        self, completion_kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        cache = self._api_v1_generation_kwargs_cache()
+        rejected = cache["rejected"]
+        filtered: Dict[str, Any] = {}
+        for key, value in completion_kwargs.items():
+            if key in {"messages", "max_tokens", "stream"}:
+                filtered[key] = value
+                continue
+            if key in rejected:
+                cache["filtered"].add(key)
+                continue
+            if key == "stop" and value in (None, [], (), "") and "stop" in rejected:
+                cache["filtered"].add(key)
+                continue
+            filtered[key] = value
+        return filtered
+
+    def _api_v1_record_generation_kwargs_success(self, kwargs: Dict[str, Any]) -> None:
+        cache = self._api_v1_generation_kwargs_cache()
+        cache["supported"].update(str(key) for key in kwargs if key != "messages")
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["api_v1_generation_kwargs_supported"] = sorted(cache["supported"])
+            diagnostics["api_v1_generation_kwargs_filtered"] = sorted(cache["filtered"])
+            diagnostics["api_v1_generation_kwargs_rejected"] = sorted(cache["rejected"])
+
+    def _api_v1_create_chat_completion_filtered(
+        self,
+        create_chat_completion: Any,
+        *,
+        runtime_messages: List[Dict[str, Any]],
+        completion_kwargs: Dict[str, Any],
+        client_option_names: Set[str],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        cache = self._api_v1_generation_kwargs_cache()
+        last_exc: Optional[BaseException] = None
+        for _attempt in range(4):
+            filtered_kwargs = self._api_v1_filter_runtime_completion_kwargs(completion_kwargs)
+            attempted_names = sorted({"messages", *filtered_kwargs.keys()})
+            try:
+                completion = create_chat_completion(messages=runtime_messages, **filtered_kwargs)
+                self._api_v1_record_generation_kwargs_success(filtered_kwargs)
+                return completion, filtered_kwargs
+            except Exception as exc:
+                rejected = self._api_v1_completion_rejected_kwarg_from_exception(exc)
+                category = _classify_safe_generation_exception(exc)
+                if _is_llama_cpp_inference_request_error(exc):
+                    diagnostics = _safe_worker_diagnostics(getattr(exc, "diagnostics", {}))
+                    category = str(diagnostics.get("generation_exception_category") or category)
+                if category != "unsupported_generation_kwarg" or not rejected:
+                    raise
+                last_exc = exc
+                if rejected in client_option_names:
+                    raise
+                cache["rejected"].add(rejected)
+                cache["filtered"].add(rejected)
+                diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+                if isinstance(diagnostics, dict):
+                    diagnostics["api_v1_generation_kwargs_attempted"] = attempted_names
+                    diagnostics["api_v1_generation_kwargs_rejected"] = sorted(cache["rejected"])
+                    diagnostics["api_v1_generation_kwargs_filtered"] = sorted(cache["filtered"])
+                    diagnostics["api_v1_generation_kwargs_last_exception_category"] = category
+                    diagnostics["api_v1_generation_kwargs_last_exception_type"] = type(exc).__name__
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("runtime_generation_kwargs_filtering_failed")
+
     def _generate_api_v1_response_with_runtime_model(
         self,
         *,
@@ -3408,6 +3522,8 @@ class RelayClient:
                 )
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            client_option_names = set(safe_options.keys())
+            completion_kwargs = self._api_v1_filter_runtime_completion_kwargs(completion_kwargs)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
             admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
@@ -3447,9 +3563,11 @@ class RelayClient:
                     "direct_non_streaming_completion",
                 )
                 started = time.monotonic()
-                completion = create_chat_completion(
-                    messages=runtime_messages,
-                    **completion_kwargs,
+                completion, completion_kwargs = self._api_v1_create_chat_completion_filtered(
+                    create_chat_completion,
+                    runtime_messages=runtime_messages,
+                    completion_kwargs=completion_kwargs,
+                    client_option_names=client_option_names,
                 )
                 inference_duration = time.monotonic() - started
                 log_info(
@@ -3609,6 +3727,11 @@ class RelayClient:
                             "worker_dead",
                         }
                         else "runtime_inference_failed"
+                    ),
+                    rejected_option=(
+                        self._api_v1_completion_rejected_kwarg_from_exception(exc)
+                        if unsupported_generation_kwarg
+                        else None
                     ),
                 ),
             )

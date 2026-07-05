@@ -61,6 +61,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwargs",
+    "attempted_generation_kwargs",
     "method",
     "stream",
     "retryable",
@@ -136,6 +138,12 @@ def _is_controlled_redacted_completion_smoke_diagnostic_tail(value: str) -> bool
 def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
     if isinstance(value, (bool, int, float)) or value is None:
         return value
+    if key in {"rejected_generation_kwargs", "attempted_generation_kwargs"} and isinstance(value, list):
+        safe_items = []
+        for item in value[:32]:
+            if isinstance(item, str) and _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(item[:128]):
+                safe_items.append(item[:128])
+        return safe_items
     if not isinstance(value, str):
         return None
     bounded = value[:256]
@@ -799,6 +807,11 @@ class ComputeNodeRuntime:
                 ):
                     diagnostics["api_v1_readiness_completion_smoke_result"] = "passed"
                     diagnostics["api_v1_readiness_completion_smoke_shape"] = "api_v1_assistant_message"
+                    cache = getattr(self.model_manager, "_api_v1_generation_kwargs_capability_cache", {})
+                    if isinstance(cache, dict):
+                        diagnostics["api_v1_generation_kwargs_supported"] = sorted(cache.get("supported") or [])
+                        diagnostics["api_v1_generation_kwargs_filtered"] = sorted(cache.get("filtered") or [])
+                        diagnostics["api_v1_generation_kwargs_rejected"] = sorted(cache.get("rejected") or [])
                 else:
                     admitted = False
                     admission_error = {

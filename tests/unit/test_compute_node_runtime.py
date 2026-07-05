@@ -503,8 +503,11 @@ def test_compute_node_runtime_qwen_generic_admission_failure_keeps_safe_reason()
 
 def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     class ReadyRuntime:
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             return {"choices": [{"message": {"role": "assistant", "content": "ready"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
@@ -683,9 +686,12 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **kwargs):
-            self.completion_kwargs = kwargs
+        def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+            self.completion_kwargs = {**kwargs, "messages": messages}
             return {"choices": [{"message": {"role": "assistant", "content": "<think>\n\n</think>\n\nok"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
@@ -718,8 +724,11 @@ def test_compute_node_runtime_readiness_smoke_completion_empty_after_strip(monke
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             return {"choices": [{"message": {"role": "assistant", "content": "<think></think>"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
@@ -878,8 +887,11 @@ def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_withou
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             return {"choices": [{"message": {"role": "assistant", "content": "<THINK>no"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     monkeypatch.delenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", raising=False)
     model_manager = MagicMock()
@@ -910,8 +922,11 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_think_output(mo
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             return {"choices": [{"message": {"role": "assistant", "content": "<think>no"}}]}
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
     model_manager = MagicMock()
@@ -943,7 +958,7 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             return {
                 "choices": [
                     {
@@ -955,6 +970,9 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_reasoning_conte
                     }
                 ]
             }
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
@@ -1058,8 +1076,11 @@ def test_compute_node_runtime_readiness_smoke_completion_records_safe_exception(
         def render_and_tokenize_chat(self, *_args, **_kwargs):
             return {"prompt_tokens": 2}
 
-        def create_chat_completion(self, **_kwargs):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
             raise RuntimeError("prompt text must not leak")
+
+        def create_chat_completion(self, **_kwargs):
+            raise AssertionError("Qwen readiness must use render-then-complete")
 
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
     model_manager = MagicMock()

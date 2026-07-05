@@ -3309,6 +3309,13 @@ class ModelManager:
                 ]
             }
             mock_llama_instance.create_chat_completion.return_value = mock_response
+
+            def _mock_create_chat_completion_from_rendered_prompt(messages, **kwargs):
+                return mock_response
+
+            mock_llama_instance.create_chat_completion_from_rendered_prompt = (
+                _mock_create_chat_completion_from_rendered_prompt
+            )
             return mock_llama_instance
 
         # Quick check without lock

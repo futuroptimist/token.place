@@ -5919,3 +5919,122 @@ def test_api_v1_qwen_no_think_survives_generation_kwarg_filtering():
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
     assert manager.runtime.calls[-1]["messages"][-1]["content"].startswith("/no_think")
+
+
+def test_api_v1_qwen_generation_prefers_render_then_complete_over_chat_completion():
+    class Runtime:
+        def __init__(self):
+            self.render_calls = []
+            self.complete_calls = []
+            self.chat_calls = 0
+
+        def render_and_tokenize_chat(self, messages, **kwargs):
+            self.render_calls.append({"messages": messages, "kwargs": kwargs})
+            return {"prompt_tokens": 8}
+
+        def create_chat_completion_from_rendered_prompt(self, **kwargs):
+            self.complete_calls.append(kwargs)
+            return {"choices": [{"text": "<think>\n\n</think>\n\nok<|im_end|>"}]}
+
+        def create_chat_completion(self, **_kwargs):
+            self.chat_calls += 1
+            raise AssertionError("Qwen API v1 must not use create_chat_completion")
+
+    manager = _AdmissionManager(window=128, default_max_tokens=64)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {
+        "id": "qwen3-local",
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "qwen3-no-think",
+    }
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-render-complete",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
+    assert manager.runtime.chat_calls == 0
+    assert len(manager.runtime.render_calls) == 1
+    assert len(manager.runtime.complete_calls) == 1
+    admission_messages = manager.runtime.render_calls[0]["messages"]
+    generation_messages = manager.runtime.complete_calls[0]["messages"]
+    assert admission_messages == generation_messages
+    assert generation_messages[-1]["content"].startswith("/no_think\n")
+    assert manager.runtime.render_calls[0]["kwargs"]["add_generation_prompt"] is True
+    assert manager.runtime.complete_calls[0]["enable_thinking"] is False
+    assert "prompt" not in manager.runtime.complete_calls[0]
+
+
+def test_api_v1_qwen_render_then_complete_filters_rejected_sampling_kwarg():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 8}
+
+        def create_chat_completion_from_rendered_prompt(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "temperature" in kwargs:
+                raise LlamaCppInferenceRequestError(
+                    "llama_cpp request failed",
+                    diagnostics={
+                        "generation_exception_category": "unsupported_generation_kwarg",
+                        "rejected_generation_kwarg": "temperature",
+                        "method": "create_completion_from_rendered_prompt",
+                    },
+                )
+            return {"choices": [{"text": "ok"}]}
+
+    manager = _AdmissionManager(window=128, default_max_tokens=64)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-filter",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 5},
+    )
+
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert "temperature" in manager.runtime.calls[0]
+    assert "temperature" not in manager.runtime.calls[1]
+
+
+def test_api_v1_qwen_render_then_complete_rejects_non_empty_thinking():
+    class Runtime:
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"prompt_tokens": 8}
+
+        def create_chat_completion_from_rendered_prompt(self, **_kwargs):
+            return {"choices": [{"text": "<think>reasoning</think>\nok"}]}
+
+    manager = _AdmissionManager(window=128, default_max_tokens=64)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-leak",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 5},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_model_output"
+    assert error["internal_reason"] == "qwen_thinking_output_leaked"
+    assert "reasoning" not in json.dumps(error)

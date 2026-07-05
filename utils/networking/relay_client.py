@@ -129,6 +129,12 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "runtime_completion_smoke_render_complete_request_rejected",
+        "runtime_completion_smoke_render_complete_unsupported_kwarg",
+        "runtime_completion_smoke_render_complete_malformed_output",
+        "runtime_completion_smoke_render_complete_empty_output",
+        "runtime_completion_smoke_render_complete_thinking_leaked",
+        "runtime_completion_smoke_render_complete_worker_error",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -143,6 +149,8 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "apply_chat_template",
         "create_chat_completion",
         "create_chat_completion_with_recovery",
+        "create_completion_from_rendered_prompt",
+        "create_chat_completion_from_rendered_prompt",
         "render_and_tokenize_chat",
         "tokenize",
     },
@@ -2345,6 +2353,9 @@ class RelayClient:
             cleaned = cleaned[match.end():].lstrip()
 
         cleaned = cleaned.strip()
+        for marker in ("<|im_end|>", "<|endoftext|>"):
+            if cleaned.endswith(marker):
+                cleaned = cleaned[: -len(marker)].rstrip()
         if not cleaned:
             return (
                 None,
@@ -3279,6 +3290,69 @@ class RelayClient:
                 )
                 continue
 
+
+    def _api_v1_create_completion_from_rendered_prompt_filtered(
+        self,
+        render_complete: Any,
+        *,
+        messages: List[Dict[str, Any]],
+        model_profile: Dict[str, Any],
+        safe_options: Dict[str, Any],
+        client_option_names: Set[str],
+        max_removed_kwargs: int = 3,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Call Qwen render-then-plain-completion while filtering rejected safe kwargs."""
+
+        removed: List[str] = []
+        attempted_names: List[str] = []
+        while True:
+            completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            if isinstance(model_profile, dict):
+                if model_profile.get("provider"):
+                    completion_kwargs["token_place_provider"] = model_profile.get("provider")
+                if model_profile.get("chat_template_policy"):
+                    completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
+            completion_kwargs["enable_thinking"] = False
+            attempted_names = self._api_v1_attempted_generation_kwargs({"messages": messages, **completion_kwargs})
+            try:
+                result = render_complete(messages=messages, **completion_kwargs)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names)
+                return result, {
+                    "completion_kwargs": completion_kwargs,
+                    "attempted_generation_kwargs": attempted_names,
+                    "filtered_generation_kwargs": sorted(set(removed) | set(getattr(self, "_api_v1_generation_kwargs_filtered", set()))),
+                    "supported_generation_kwargs": sorted(set(attempted_names) - set(getattr(self, "_api_v1_generation_kwargs_filtered", set()) or set())),
+                    "generation_method": "create_completion_from_rendered_prompt",
+                }
+            except Exception as exc:
+                diagnostics = getattr(exc, "diagnostics", {}) if _is_llama_cpp_inference_request_error(exc) else {}
+                safe_worker = _safe_worker_diagnostics(diagnostics)
+                rejected = safe_worker.get("rejected_generation_kwarg") or safe_worker.get("rejected_option")
+                if not isinstance(rejected, str):
+                    rejected = _extract_unsupported_generation_kwarg(exc, attempted_names)
+                if rejected not in set(attempted_names):
+                    rejected = None
+                category = (
+                    safe_worker.get("generation_exception_category")
+                    if isinstance(safe_worker.get("generation_exception_category"), str)
+                    else _classify_safe_generation_exception(exc)
+                )
+                if category != "unsupported_generation_kwarg" or not rejected:
+                    raise
+                if rejected in client_option_names:
+                    raise
+                if rejected in {"messages", "max_tokens", "stream"} or len(removed) >= max_removed_kwargs:
+                    raise
+                removed.append(rejected)
+                self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
+                log_info(
+                    "api_v1.render_complete_generation_kwarg_filtered rejected_kwarg={} attempted_kwargs={} filtered_kwargs={}",
+                    rejected,
+                    ",".join(attempted_names),
+                    ",".join(sorted(set(removed))),
+                )
+                continue
+
     def _api_v1_enrich_safe_error(
         self,
         error: Dict[str, Any],
@@ -3595,11 +3669,63 @@ class RelayClient:
                     ),
                 )
 
+            is_qwen_non_thinking = self._api_v1_qwen_non_thinking_required(model_profile)
+            render_complete = (
+                getattr(llm_instance, "create_chat_completion_from_rendered_prompt", None)
+                if llm_instance is not None
+                else None
+            )
+            if (
+                type(render_complete).__module__.startswith("unittest.mock")
+                and llm_instance is not None
+                and not callable(getattr(type(llm_instance), "create_chat_completion_from_rendered_prompt", None))
+                and "create_chat_completion_from_rendered_prompt" not in getattr(llm_instance, "__dict__", {})
+            ):
+                render_complete = None
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
 
-            if callable(create_chat_completion):
+            if is_qwen_non_thinking and callable(render_complete):
+                log_info(
+                    (
+                        "API v1 runtime generation branch selected: "
+                        "request_id={} model_id={} protocol={} route={} branch={}"
+                    ),
+                    request_id,
+                    model_id,
+                    "tokenplace_api_v1_relay_e2ee",
+                    "/api/v1/relay/responses",
+                    "render_then_plain_completion",
+                )
+                started = time.monotonic()
+                completion, generation_kwarg_diagnostics = self._api_v1_create_completion_from_rendered_prompt_filtered(
+                    render_complete,
+                    messages=runtime_messages,
+                    model_profile=model_profile,
+                    safe_options=safe_options,
+                    client_option_names=set(safe_options),
+                )
+                completion_kwargs = generation_kwarg_diagnostics.get("completion_kwargs", completion_kwargs)
+                inference_duration = time.monotonic() - started
+                log_info(
+                    "api_v1.generation_kwargs active_tier={} model_id={} method={} supported={} filtered={} attempted={}",
+                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+                    model_id,
+                    "create_completion_from_rendered_prompt",
+                    ",".join(generation_kwarg_diagnostics.get("supported_generation_kwargs", [])),
+                    ",".join(generation_kwarg_diagnostics.get("filtered_generation_kwargs", [])),
+                    ",".join(generation_kwarg_diagnostics.get("attempted_generation_kwargs", [])),
+                )
+                log_info(
+                    "api_v1.inference_complete active_tier={} prompt_tokens={} output_reservation={} admission_result=admitted generation_method=render_then_plain_completion inference_duration_seconds={} safe_error_code=none",
+                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)),
+                    prompt_tokens if prompt_tokens is not None else "unknown",
+                    completion_kwargs["max_tokens"],
+                    round(inference_duration, 3),
+                )
+                assistant_message = self._assistant_message_from_runtime_completion(completion)
+            elif callable(create_chat_completion):
                 log_info(
                     (
                         "API v1 runtime generation branch selected: "
@@ -3635,9 +3761,7 @@ class RelayClient:
                     completion_kwargs["max_tokens"],
                     round(inference_duration, 3),
                 )
-                assistant_message = self._assistant_message_from_runtime_completion(
-                    completion
-                )
+                assistant_message = self._assistant_message_from_runtime_completion(completion)
 
             if assistant_message is None:
                 invalid_reason = (

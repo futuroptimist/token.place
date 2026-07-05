@@ -62,6 +62,8 @@ class Llama:
         return [1] * 42
     def create_chat_completion(self, **kwargs):
 """
+        + completion_branch
+        + "    def create_completion(self, **kwargs):\n"
         + completion_branch,
         encoding='utf-8',
     )

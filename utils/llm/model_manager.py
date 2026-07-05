@@ -1449,7 +1449,7 @@ def _read_llama_subprocess_message(
     if message.get('status') == 'error':
         raw_error = str(message.get('error') or f'{stage} failed')
         error = raw_error
-        if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize'} and message.get('request_error'):
+        if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize', 'llama_cpp_render_complete_inference'} and message.get('request_error'):
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
@@ -1625,6 +1625,20 @@ class _SubprocessLlamaProxy:
                     self._process,
                     timeout_seconds=self._timeout_seconds,
                     stage='llama_cpp_prompt_render_tokenize',
+                )
+            except LlamaCppWorkerEOFError:
+                self._closed = True
+                raise
+        return message.get('result')
+
+    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
+            try:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_render_complete_inference',
                 )
             except LlamaCppWorkerEOFError:
                 self._closed = True
@@ -1812,7 +1826,7 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
                 diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
-        if method == 'create_chat_completion':
+        if method in {'create_chat_completion', 'create_completion_from_rendered_prompt', 'create_chat_completion_from_rendered_prompt'}:
             diagnostics['method'] = method
         elif method is not None:
             diagnostics['method'] = 'unsupported'
@@ -2093,12 +2107,64 @@ for line in sys.stdin:
             _emit(_safe_request_error('malformed_request'))
             continue
         method = request.get('method')
-        if method not in {'create_chat_completion', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
+        if method not in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
             continue
         kwargs = request.get('kwargs', {})
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
+            continue
+        if method == 'create_chat_completion_from_rendered_prompt':
+            _render_diagnostics = None
+            try:
+                completion_kwargs = dict(kwargs)
+                messages = completion_kwargs.pop('messages', request.get('args', [None])[0] if request.get('args') else None)
+                if not isinstance(messages, list):
+                    _emit(_safe_request_error('malformed_messages', request=request))
+                    continue
+                render_kwargs = {
+                    'messages': messages,
+                    'add_generation_prompt': True,
+                    'token_place_provider': completion_kwargs.pop('token_place_provider', ''),
+                    'token_place_template_policy': completion_kwargs.pop('token_place_template_policy', ''),
+                }
+                if 'enable_thinking' in completion_kwargs:
+                    render_kwargs['enable_thinking'] = completion_kwargs.pop('enable_thinking')
+                rendered_prompt, _render_diagnostics = _render_chat_with_runtime_template(llama, [], render_kwargs)
+                if not isinstance(rendered_prompt, str) or not rendered_prompt:
+                    _emit(_safe_request_error('prompt_render_unavailable', request=request, extra=_render_diagnostics))
+                    continue
+                allowed = {'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop', 'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'stream'}
+                plain_kwargs = {key: value for key, value in completion_kwargs.items() if key in allowed}
+                plain_kwargs['stream'] = False
+                stops = plain_kwargs.get('stop')
+                if stops is None:
+                    stop_list = []
+                elif isinstance(stops, str):
+                    stop_list = [stops]
+                elif isinstance(stops, list):
+                    stop_list = list(stops)
+                else:
+                    stop_list = []
+                if '<|im_end|>' not in stop_list:
+                    stop_list.append('<|im_end|>')
+                eos_text = _runtime_token_text(llama, 'eos')
+                if eos_text and eos_text not in stop_list:
+                    stop_list.append(eos_text)
+                plain_kwargs['stop'] = stop_list
+                result = llama.create_completion(prompt=rendered_prompt, **plain_kwargs)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result.setdefault('token_place_render_path', {
+                        'method': 'create_completion_from_rendered_prompt',
+                        'direct_apply_chat_template': bool((_render_diagnostics or {}).get('direct_apply_chat_template')),
+                        'metadata_template': bool((_render_diagnostics or {}).get('metadata_template')),
+                        'jinja_renderer': bool((_render_diagnostics or {}).get('jinja_renderer')),
+                        'add_generation_prompt': True,
+                    })
+                _emit({'status': 'ok', 'result': result})
+            except Exception as exc:
+                _emit(_safe_request_error('inference_exception', request={**request, 'method': 'create_completion_from_rendered_prompt'}, exc=exc, extra=_render_diagnostics if isinstance(locals().get('_render_diagnostics'), dict) else None))
             continue
         if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
             if method == 'render_and_tokenize_chat':

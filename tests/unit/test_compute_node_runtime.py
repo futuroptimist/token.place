@@ -671,7 +671,7 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_model_profile_id"] == "qwen3-8b-q4-k-m"
-    assert llm_runtime.completion_kwargs["stream"] is False
+    assert "stream" not in llm_runtime.completion_kwargs
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 

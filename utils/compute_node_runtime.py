@@ -51,6 +51,15 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
     "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "unexpected_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_prompt_kwarg": "runtime_completion_smoke_plain_completion_method_shape",
+    "unsupported_stream_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_stop_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "method_shape": "runtime_completion_smoke_plain_completion_method_shape",
+    "malformed_completion_output": "runtime_completion_smoke_plain_completion_malformed_output",
+    "empty_completion_output": "runtime_completion_smoke_plain_completion_empty_output",
+    "thinking_output_leaked": "runtime_completion_smoke_plain_completion_thinking_leaked",
+    "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -77,6 +86,11 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "rejected_generation_kwarg",
+    "attempted_generation_kwargs",
+    "plain_completion_method",
+    "attempted_plain_completion_methods",
+    "result_shape",
 }
 
 
@@ -92,6 +106,14 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
+        "thinking_output_leaked",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -102,6 +124,14 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_dead",
         "unknown_generation_exception",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
+        "thinking_output_leaked",
     },
     "method": {
         "apply_chat_template",
@@ -148,7 +178,7 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "plain_completion_method", "attempted_plain_completion_methods", "attempted_generation_kwargs", "result_shape"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "sanitized_error_summary":
         return (
@@ -216,6 +246,18 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_thinking_leaked"
     if internal_reason == "qwen_empty_after_think_wrapper_strip":
         return "runtime_completion_smoke_empty_after_think_strip"
+    if internal_reason in {"runtime_plain_completion_unexpected_kwarg"}:
+        return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
+    if internal_reason in {"runtime_plain_completion_method_shape"}:
+        return "runtime_completion_smoke_plain_completion_method_shape"
+    if internal_reason in {"runtime_plain_completion_malformed_output"}:
+        return "runtime_completion_smoke_plain_completion_malformed_output"
+    if internal_reason in {"runtime_plain_completion_empty_output"}:
+        return "runtime_completion_smoke_plain_completion_empty_output"
+    if internal_reason in {"runtime_plain_completion_thinking_leaked"}:
+        return "runtime_completion_smoke_plain_completion_thinking_leaked"
+    if internal_reason in {"runtime_plain_completion_worker_exception"}:
+        return "runtime_completion_smoke_plain_completion_worker_exception"
     if internal_reason in {
         "unsupported_generation_option",
         "runtime_rejected_generation_options",

@@ -3216,6 +3216,159 @@ def test_llama_worker_render_complete_allows_testing_stories_model_without_metad
     }
 
 
+def test_llama_worker_render_complete_uses_minimal_plain_completion_kwargs(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'minimal fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': 'qwen'}\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        return '<rendered>'\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        assert prompt == '<rendered>'\n"
+        "        assert kwargs == {'max_tokens': 64}\n"
+        "        return {'choices': [{'text': '<think></think>ok<|im_end|>'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='qwen.gguf', timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=64,
+            stream=False,
+            stop=[],
+            temperature=0.7,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+
+def test_llama_worker_render_complete_falls_back_from_prompt_keyword_to_positional(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': 'qwen'}\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        return '<rendered>'\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'prompt' in kwargs:\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'prompt'\")\n"
+        "        assert args == ('<rendered>',)\n"
+        "        assert kwargs == {'max_tokens': 64}\n"
+        "        return {'choices': [{'text': 'positional ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='qwen.gguf', timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=64,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result['choices'][0]['message']['content'] == 'positional ok'
+
+
+def test_llama_worker_render_complete_uses_callable_llama_without_create_completion(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'callable fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': 'qwen'}\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        return '<rendered>'\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        assert prompt == '<rendered>'\n"
+        "        assert kwargs == {'max_tokens': 64}\n"
+        "        return {'choices': [{'text': 'callable ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='qwen.gguf', timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=64,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result['choices'][0]['message']['content'] == 'callable ok'
+
+
+def test_llama_worker_render_complete_empty_output_has_safe_plain_completion_diagnostics(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'empty fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    metadata = {'general.name': 'Qwen3 test', 'tokenizer.chat_template': 'qwen'}\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        return '<rendered SECRET_RENDERED>'\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': '   '}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='qwen.gguf', timeout_seconds=5)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+                max_tokens=64,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'empty_completion_output'
+    assert diagnostics['plain_completion_method'] == 'create_completion_keyword_prompt'
+    assert diagnostics['attempted_generation_kwargs'] == 'max_tokens,prompt'
+    assert diagnostics['result_shape'] == 'choices_text'
+    assert 'SECRET_PROMPT' not in json.dumps(diagnostics)
+    assert 'SECRET_RENDERED' not in json.dumps(diagnostics)
+
 def test_llama_worker_render_complete_denies_testing_fallback_outside_testing_env(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

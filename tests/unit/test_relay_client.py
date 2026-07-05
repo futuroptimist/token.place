@@ -4220,8 +4220,10 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
     assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
     manager.runtime.create_chat_completion.assert_not_called()
     kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
-    assert kwargs["stream"] is False
     assert kwargs["max_tokens"] == 64
+    assert "stream" not in kwargs
+    assert "temperature" not in kwargs
+    assert "stop" not in kwargs
     assert kwargs["enable_thinking"] is False
     assert "messages" not in kwargs
     messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
@@ -4258,7 +4260,7 @@ def test_api_v1_qwen_missing_render_complete_bridge_fails_closed_without_chat_fa
     assert error["internal_reason"] == "qwen_render_complete_bridge_unavailable"
     manager.runtime.create_chat_completion.assert_not_called()
 
-def test_api_v1_qwen_render_then_complete_preserves_seed_option():
+def test_api_v1_qwen_render_then_complete_rejects_unproven_seed_option():
     manager = _ApiV1RuntimeManager()
     manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
     manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(return_value={
@@ -4273,9 +4275,10 @@ def test_api_v1_qwen_render_then_complete_preserves_seed_option():
         options={"max_tokens": 64, "seed": 7},
     )
 
-    assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
-    assert kwargs["seed"] == 7
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_options_unsupported"
+    assert error["rejected_option"] == "seed"
+    manager.runtime.create_chat_completion_from_rendered_prompt.assert_not_called()
 
 
 def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
@@ -4318,19 +4321,9 @@ def test_api_v1_qwen_render_then_complete_retries_rejected_top_k_without_resendi
 
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
-    render_complete = MagicMock(side_effect=[
-        LlamaCppInferenceRequestError(
-            "unexpected keyword argument 'top_k'",
-            diagnostics={
-                "code": "compute_node_options_unsupported",
-                "reason": "unsupported_generation_option",
-                "rejected_option": "top_k",
-                "generation_exception_category": "unsupported_generation_kwarg",
-                "method": "create_chat_completion_from_rendered_prompt",
-            },
-        ),
-        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
-    ])
+    render_complete = MagicMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+    })
 
     completion, diagnostics = client._api_v1_create_completion_from_rendered_prompt_filtered(
         render_complete,
@@ -4342,10 +4335,8 @@ def test_api_v1_qwen_render_then_complete_retries_rejected_top_k_without_resendi
 
     assert completion["choices"][0]["message"]["content"] == "ok"
     calls = render_complete.call_args_list
-    assert calls[0].kwargs["top_k"] == 20
-    assert "top_k" not in calls[1].kwargs
-    assert "top_k" in diagnostics["filtered_generation_kwargs"]
-    assert "top_k" in client._api_v1_generation_kwargs_filtered
+    assert calls[0].kwargs == {"max_tokens": 64, "token_place_provider": "qwen", "enable_thinking": False}
+    assert "top_k" not in diagnostics["attempted_generation_kwargs"]
 
 
 def test_api_v1_qwen_render_then_complete_empty_think_wrapper_is_cleaned():
@@ -5799,7 +5790,7 @@ def test_api_v1_runtime_rejected_generation_option_is_safe_options_error():
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_options_unsupported"
     assert error["request_id"] == "req-option-rejected"
-    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["internal_reason"] in {"unsupported_generation_option", "runtime_plain_completion_unexpected_kwarg"}
     assert error["rejected_option"] == "top_k"
     assert error["active_context_tier"] == "8k-fast"
     assert error["requested_context_tier"] == "8k-fast"
@@ -5948,9 +5939,8 @@ def test_api_v1_cached_internal_filter_does_not_drop_later_explicit_client_optio
 
     error = second["api_v1_response"]["error"]
     assert error["code"] == "compute_node_options_unsupported"
-    assert error["internal_reason"] == "unsupported_generation_option"
+    assert error["internal_reason"] == "runtime_plain_completion_unexpected_kwarg"
     assert error["rejected_option"] == "temperature"
-    assert manager.runtime.calls[-1]["temperature"] == 0.3
 
 
 def test_api_v1_invalid_output_reason_clears_before_unavailable_completion_callable():
@@ -6034,10 +6024,9 @@ def test_api_v1_internal_top_k_default_is_filtered_and_cached_per_client_after_r
 
     assert first["api_v1_response"]["message"]["content"] == "ok"
     assert second["api_v1_response"]["message"]["content"] == "ok"
-    assert manager.runtime.calls[0]["top_k"] == 20
+    assert "top_k" not in manager.runtime.calls[0]
     assert "top_k" not in manager.runtime.calls[1]
-    assert "top_k" not in manager.runtime.calls[-1]
-    assert "top_k" in client._api_v1_generation_kwargs_filtered
+    assert not getattr(client, "_api_v1_generation_kwargs_filtered", set())
 
     fresh_client = _api_v1_validation_client(manager)
     third = fresh_client._generate_api_v1_response_with_runtime_model(
@@ -6049,7 +6038,7 @@ def test_api_v1_internal_top_k_default_is_filtered_and_cached_per_client_after_r
     )
 
     assert third["api_v1_response"]["message"]["content"] == "ok"
-    assert manager.runtime.calls[-1]["top_k"] == 20
+    assert "top_k" not in manager.runtime.calls[-1]
     assert not hasattr(manager, "api_v1_generation_kwargs_filtered")
 
 
@@ -6067,8 +6056,7 @@ def test_api_v1_internal_empty_stop_default_is_filtered_after_runtime_rejection(
     )
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    assert manager.runtime.calls[0]["stop"] == []
-    assert "stop" not in manager.runtime.calls[1]
+    assert "stop" not in manager.runtime.calls[0]
 
 
 def test_api_v1_client_supplied_runtime_unsupported_option_is_not_silently_dropped():
@@ -6100,10 +6088,9 @@ def test_api_v1_generation_kwarg_filtering_stops_after_bounded_internal_retries(
         requested_context_tier="8k-fast",
     )
 
-    error = envelope["api_v1_response"]["error"]
-    assert error["code"] in {"compute_node_options_unsupported", "compute_node_internal_error"}
-    assert error["rejected_option"] == "stop"
-    assert len(manager.runtime.calls) == 4
+    assert envelope["api_v1_response"]["message"]["content"] == "ok"
+    assert len(manager.runtime.calls) == 1
+    assert not ({"top_k", "temperature", "top_p", "stop"} & set(manager.runtime.calls[0]))
 
 
 def test_api_v1_qwen_no_think_survives_generation_kwarg_filtering():

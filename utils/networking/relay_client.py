@@ -46,9 +46,11 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
 
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
     re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"unexpected keyword argument\s*:?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?"),
     re.compile(r"unsupported option(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),
-    re.compile(r"invalid keyword(?: argument)? [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"invalid keyword(?: argument)?(?:\s*:\s*|\s+)[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?"),
     re.compile(r"invalid keyword\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"got multiple values for keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
 )
 
 
@@ -95,6 +97,9 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "rejected_option",
     "rejected_generation_kwarg",
     "attempted_generation_kwargs",
+    "plain_completion_method",
+    "attempted_plain_completion_methods",
+    "result_shape",
     "method",
     "stream",
     "retryable",
@@ -130,6 +135,8 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
         "malformed_completion_output",
+        "empty_completion_output",
+        "thinking_output_leaked",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -140,6 +147,14 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_dead",
         "unknown_generation_exception",
         "malformed_completion_output",
+        "empty_completion_output",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
+        "thinking_output_leaked",
     },
     "method": {
         "apply_chat_template",
@@ -184,7 +199,7 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "plain_completion_method", "attempted_plain_completion_methods", "attempted_generation_kwargs", "result_shape"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "attempted_generation_kwargs":
         names = [part for part in bounded.split(",") if part]
@@ -3308,23 +3323,26 @@ class RelayClient:
         removed: List[str] = []
         attempted_names: List[str] = []
         while True:
-            completion_kwargs = {
-                key: value
-                for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
-                if key in allowed_plain_kwargs
-            }
             removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
-            completion_kwargs = {
-                key: value for key, value in completion_kwargs.items() if key not in removed_set
-            }
-            if "stream" not in removed_set:
-                completion_kwargs["stream"] = False
-            if model_profile.get("provider") and "token_place_provider" not in removed_set:
-                completion_kwargs["token_place_provider"] = model_profile.get("provider")
-            if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:
-                completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
-            if self._api_v1_qwen_non_thinking_required(model_profile) and "enable_thinking" not in removed_set:
-                completion_kwargs["enable_thinking"] = False
+            if self._api_v1_qwen_non_thinking_required(model_profile):
+                completion_kwargs = {"max_tokens": int(safe_options.get("max_tokens") or 64)}
+                if model_profile.get("provider") and "token_place_provider" not in removed_set:
+                    completion_kwargs["token_place_provider"] = model_profile.get("provider")
+                if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:
+                    completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
+                if "enable_thinking" not in removed_set:
+                    completion_kwargs["enable_thinking"] = False
+            else:
+                completion_kwargs = {
+                    key: value
+                    for key, value in self._api_v1_runtime_completion_kwargs(safe_options).items()
+                    if key in allowed_plain_kwargs
+                }
+                completion_kwargs = {
+                    key: value for key, value in completion_kwargs.items() if key not in removed_set
+                }
+                if "stream" not in removed_set:
+                    completion_kwargs["stream"] = False
             attempted_names = sorted(str(key) for key in completion_kwargs)
             try:
                 result = create_completion_from_rendered_prompt(messages, **completion_kwargs)
@@ -3736,6 +3754,26 @@ class RelayClient:
                 )
                 started = time.monotonic()
                 if callable(qwen_render_complete):
+                    unsupported_client_options = sorted(
+                        name for name in set(safe_options)
+                        if name not in {"max_tokens", "stream"}
+                    )
+                    if unsupported_client_options:
+                        return self._api_v1_response_envelope(
+                            request_id,
+                            error=self._api_v1_enrich_safe_error(
+                                {
+                                    "code": "compute_node_options_unsupported",
+                                    "message": "Desktop runtime rejected unsupported generation options",
+                                },
+                                request_id=request_id,
+                                requested_context_tier=requested_context_tier,
+                                prompt_tokens=prompt_tokens,
+                                requested_output_tokens=requested_output_tokens,
+                                internal_reason="runtime_plain_completion_unexpected_kwarg",
+                                rejected_option=unsupported_client_options[0],
+                            ),
+                        )
                     completion, generation_kwarg_diagnostics = self._api_v1_create_completion_from_rendered_prompt_filtered(
                         qwen_render_complete,
                         messages=runtime_messages,
@@ -3814,8 +3852,26 @@ class RelayClient:
                     "worker_dead",
                 }:
                     internal_reason = f"runtime_{category}"
-                elif category == "unsupported_generation_kwarg":
-                    internal_reason = "unsupported_generation_option"
+                elif category in {"unsupported_generation_kwarg", "unexpected_kwarg", "unsupported_stream_kwarg", "unsupported_stop_kwarg"}:
+                    internal_reason = (
+                        "runtime_plain_completion_unexpected_kwarg"
+                        if generation_branch == "qwen_render_then_plain_completion"
+                        else "unsupported_generation_option"
+                    )
+                elif category in {"unsupported_prompt_kwarg", "method_shape"}:
+                    internal_reason = (
+                        "runtime_plain_completion_method_shape"
+                        if generation_branch == "qwen_render_then_plain_completion"
+                        else "unsupported_generation_option"
+                    )
+                elif category == "malformed_completion_output":
+                    internal_reason = "runtime_plain_completion_malformed_output"
+                elif category == "empty_completion_output":
+                    internal_reason = "runtime_plain_completion_empty_output"
+                elif category == "thinking_output_leaked":
+                    internal_reason = "runtime_plain_completion_thinking_leaked"
+                elif category == "worker_exception":
+                    internal_reason = "runtime_plain_completion_worker_exception"
                 else:
                     internal_reason = (
                         safe_worker_diagnostics.get("reason")
@@ -3835,7 +3891,7 @@ class RelayClient:
                     "compute_node_options_unsupported"
                     if (
                         safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
-                        or internal_reason == "unsupported_generation_option"
+                        or internal_reason in {"unsupported_generation_option", "runtime_plain_completion_unexpected_kwarg"}
                     )
                     else "compute_node_internal_error"
                 )

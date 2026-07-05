@@ -152,6 +152,10 @@ class TestModelManager:
         )
         tokens = llm.tokenize(rendered.encode('utf-8'), add_bos=False)
         bos_tokens = llm.tokenize(rendered, add_bos=True)
+        render_complete = llm.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            max_tokens=8,
+        )
 
         assert isinstance(rendered, str)
         assert '<|user|>' in rendered
@@ -163,6 +167,7 @@ class TestModelManager:
         assert len(tokens) > 0
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
+        assert render_complete['choices'][0]['message']['content'].startswith('Mock Response:')
 
     def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
         """API v1 admission is limited to the active profile/runtime identifiers."""
@@ -4223,6 +4228,11 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     proxy._closed = False
     with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
         proxy.tokenize(b'hello', add_bos=False)
+    assert proxy._closed is True
+
+    proxy._closed = False
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        proxy.create_chat_completion_from_rendered_prompt([], max_tokens=1)
     assert proxy._closed is True
 
 

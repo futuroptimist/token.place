@@ -1509,7 +1509,10 @@ class _SubprocessLlamaProxy:
                 f.write(code)
             self._worker_tmpfile = tmppath
             command = [sys.executable, '-u', tmppath]
-        except Exception:
+        except OSError:
+            # Temp file creation failed (e.g. disk full, permissions); fall back
+            # to the -c form which may exceed Windows' 32767-char limit but is
+            # better than not launching at all.
             self._worker_tmpfile = None
             command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
@@ -1526,6 +1529,8 @@ class _SubprocessLlamaProxy:
                 bufsize=1,
             )
         except OSError:
+            # Popen failed; clean up the temp file if one was created (when
+            # self._worker_tmpfile is None we were already using the -c fallback).
             if self._worker_tmpfile:
                 try:
                     os.unlink(self._worker_tmpfile)

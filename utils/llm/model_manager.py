@@ -1787,6 +1787,10 @@ def _extract_unsupported_generation_kwarg(message, attempted=None):
         r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
         r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'invalid keyword\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'unexpected keyword argument\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'invalid keyword argument\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'got multiple values for keyword argument [\\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\\'"]',
+        r'missing .*required positional argument:? [\\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\\'"]',
     ):
         match = re.search(pattern, str(message or ''))
         if match:
@@ -1794,6 +1798,70 @@ def _extract_unsupported_generation_kwarg(message, attempted=None):
             if rejected and (attempted_set is None or rejected in attempted_set):
                 return rejected
     return None
+
+
+def _plain_completion_exception_category(exc, attempted=None):
+    rejected = _extract_unsupported_generation_kwarg(str(exc or ''), attempted)
+    if rejected == 'prompt':
+        return 'unsupported_prompt_kwarg'
+    if rejected == 'stream':
+        return 'unsupported_stream_kwarg'
+    if rejected == 'stop':
+        return 'unsupported_stop_kwarg'
+    if rejected:
+        return 'unexpected_kwarg'
+    text = str(exc or '').lower()
+    if 'positional argument' in text or 'required positional argument' in text or 'not callable' in text:
+        return 'method_shape'
+    return 'worker_exception'
+
+def _completion_result_shape(result):
+    if isinstance(result, dict):
+        choices = result.get('choices')
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if isinstance(choice, dict):
+                if isinstance(choice.get('text'), str):
+                    return 'choices_text'
+                message = choice.get('message')
+                if isinstance(message, dict) and isinstance(message.get('content'), str):
+                    return 'choices_message_content'
+                return 'choices_malformed'
+            return 'choices_non_dict'
+        return 'dict_without_choices'
+    if isinstance(result, str):
+        return 'direct_string'
+    return type(result).__name__
+
+def _normalize_plain_completion_result(result):
+    if isinstance(result, str):
+        text = result
+    elif isinstance(result, dict):
+        choices = result.get('choices')
+        if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+            raise ValueError('malformed_completion_output')
+        choice = choices[0]
+        text = choice.get('text')
+        if text is None and isinstance(choice.get('message'), dict):
+            text = choice['message'].get('content')
+    else:
+        raise ValueError('malformed_completion_output')
+    if not isinstance(text, str):
+        raise ValueError('malformed_completion_output')
+    cleaned = text.lstrip()
+    while True:
+        match = re.match(r'^<\\s*think\\s*>\\s*<\\s*/\\s*think\\s*>', cleaned, flags=re.IGNORECASE)
+        if not match:
+            break
+        cleaned = cleaned[match.end():].lstrip()
+    cleaned = cleaned.strip()
+    if re.search(r'<\\s*/?\\s*think\\b', cleaned, flags=re.IGNORECASE):
+        raise ValueError('thinking_leaked')
+    if cleaned.endswith('<|im_end|>'):
+        cleaned = cleaned[:-len('<|im_end|>')].rstrip()
+    if not cleaned:
+        raise ValueError('empty_completion_output')
+    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}
 
 def _sanitize_error_summary(message):
     text = str(message or '').lower()
@@ -2266,37 +2334,82 @@ for line in sys.stdin:
                 else:
                     _emit(_safe_request_error(reason, request=request, exc=exc))
                     continue
-            completion_kwargs = {
-                key: kwargs[key]
-                for key in (
-                    'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
-                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'seed', 'stream'
-                )
-                if key in kwargs
-            }
-            completion_kwargs['stream'] = False
-            stop = completion_kwargs.get('stop')
-            if stop is None:
-                stop_values = ['<|im_end|>']
-            elif isinstance(stop, list):
-                stop_values = list(stop)
-                if '<|im_end|>' not in stop_values:
-                    stop_values.append('<|im_end|>')
+            max_tokens = kwargs.get('max_tokens', 64)
+            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+                max_tokens = 64
+            base_kwargs = {'max_tokens': max_tokens}
+            attempts = []
+            last_exc = None
+            last_shape = None
+            create_completion = getattr(llama, 'create_completion', None)
+            if callable(create_completion):
+                attempts.append(('create_completion_keyword_prompt', lambda: create_completion(prompt=rendered_prompt, **base_kwargs), ['prompt', 'max_tokens']))
+                attempts.append(('create_completion_positional_prompt', lambda: create_completion(rendered_prompt, **base_kwargs), ['max_tokens']))
+            if callable(llama):
+                attempts.append(('llama_call_positional_prompt', lambda: llama(rendered_prompt, **base_kwargs), ['max_tokens']))
+            attempted_methods = []
+            attempted_kwarg_names = []
+            for attempt_method, invoke, kwarg_names in attempts:
+                attempted_methods.append(attempt_method)
+                attempted_kwarg_names.extend(kwarg_names)
+                try:
+                    result = invoke()
+                    last_shape = _completion_result_shape(result)
+                    normalized = _normalize_plain_completion_result(result)
+                    _emit({'status': 'ok', 'result': normalized})
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if str(exc) in {'malformed_completion_output', 'empty_completion_output', 'thinking_leaked'}:
+                        category = str(exc)
+                        extra = dict(render_diagnostics)
+                        extra.update({
+                            'method': attempt_method,
+                            'attempted_methods': ','.join(attempted_methods),
+                            'attempted_generation_kwargs': ','.join(dict.fromkeys(attempted_kwarg_names)),
+                            'generation_exception_category': category,
+                            'result_shape': last_shape,
+                        })
+                        _emit(_safe_request_error(str(exc), request=request, exc=exc, extra=extra))
+                        break
+                    category = _plain_completion_exception_category(exc, kwarg_names)
+                    rejected = _extract_unsupported_generation_kwarg(str(exc or ''), kwarg_names)
+                    if attempt_method == 'create_completion_keyword_prompt' and category == 'unsupported_prompt_kwarg':
+                        continue
+                    if category in {'unsupported_stream_kwarg', 'unsupported_stop_kwarg', 'unexpected_kwarg'}:
+                        continue
+                    if category == 'method_shape' and attempt_method != 'llama_call_positional_prompt':
+                        continue
+                    continue
             else:
-                stop_values = [stop, '<|im_end|>'] if stop != '<|im_end|>' else [stop]
-            completion_kwargs['stop'] = stop_values
-            result = llama.create_completion(prompt=rendered_prompt, **completion_kwargs)
-            if not isinstance(result, dict):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
-                continue
-            choices = result.get('choices')
-            text = None
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                text = choices[0].get('text')
-            if not isinstance(text, str):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
-                continue
-            _emit({'status': 'ok', 'result': {'choices': [{'message': {'role': 'assistant', 'content': text}}]}})
+                if last_exc is None:
+                    last_exc = RuntimeError('plain completion method unavailable')
+                attempted_csv = ','.join(dict.fromkeys(attempted_kwarg_names))
+                methods_csv = ','.join(attempted_methods)
+                category = _plain_completion_exception_category(last_exc, attempted_kwarg_names)
+                reason = 'inference_exception'
+                if str(last_exc) == 'malformed_completion_output':
+                    category = 'malformed_completion_output'
+                    reason = 'malformed_completion_output'
+                elif str(last_exc) == 'empty_completion_output':
+                    category = 'empty_completion_output'
+                    reason = 'empty_completion_output'
+                elif str(last_exc) == 'thinking_leaked':
+                    category = 'thinking_leaked'
+                    reason = 'thinking_leaked'
+                extra = dict(render_diagnostics)
+                extra.update({
+                    'method': attempted_methods[-1] if attempted_methods else 'create_completion_from_rendered_prompt',
+                    'attempted_methods': methods_csv,
+                    'attempted_generation_kwargs': attempted_csv,
+                    'generation_exception_category': category,
+                    'result_shape': last_shape,
+                })
+                rejected = _extract_unsupported_generation_kwarg(str(last_exc or ''), attempted_kwarg_names)
+                if rejected:
+                    extra['rejected_option'] = rejected
+                    extra['rejected_generation_kwarg'] = rejected
+                _emit(_safe_request_error(reason, request=request, exc=last_exc, extra=extra))
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

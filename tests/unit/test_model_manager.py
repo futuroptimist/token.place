@@ -5953,3 +5953,111 @@ def test_path_redaction_handles_spaces_and_traceback_paths():
     assert '/Users/Alice' not in redacted
     assert 'Application Support' not in redacted
     assert '<path>' in redacted
+
+
+def test_llama_worker_render_complete_uses_minimal_plain_completion_kwargs(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'minimal fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        forbidden = {'stream', 'stop', 'temperature', 'top_p', 'top_k'} & set(kwargs)\n"
+        "        if forbidden:\n"
+        "            raise TypeError(\"unexpected keyword argument '%s'\" % sorted(forbidden)[0])\n"
+        "        if set(kwargs) != {'max_tokens'}:\n"
+        "            raise TypeError('unexpected keyword argument: extra')\n"
+        "        return {'choices': [{'text': 'minimal ok<|im_end|>'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+            max_tokens=64,
+            stream=False,
+            stop=[],
+            temperature=0.7,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'minimal ok'}}]}
+
+
+def test_llama_worker_render_complete_falls_back_to_positional_prompt(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'prompt' in kwargs:\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'prompt'\")\n"
+        "        if len(args) != 1:\n"
+        "            raise TypeError('missing required positional argument: prompt')\n"
+        "        return {'choices': [{'text': 'positional ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+            max_tokens=64,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+    assert result['choices'][0]['message']['content'] == 'positional ok'
+
+
+def test_llama_worker_render_complete_falls_back_to_callable_llama(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'callable fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'callable ok'}}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+            max_tokens=64,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+    assert result['choices'][0]['message']['content'] == 'callable ok'

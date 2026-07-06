@@ -824,22 +824,26 @@ class ComputeNodeRuntime:
                     if isinstance(exception_type, str):
                         diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
                     worker_diagnostics = smoke_error.get("worker_diagnostics")
+                    safe_worker_diagnostics: Dict[str, Any] = {}
                     if isinstance(worker_diagnostics, dict):
+                        safe_worker_diagnostics = _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
                         diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = (
-                            _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
+                            safe_worker_diagnostics
                         )
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",
                         "recovery_succeeded",
                         "rejected_option",
-    "rejected_generation_kwarg",
-    "attempted_generation_kwargs",
-    "attempted_plain_completion_methods",
-    "result_shape",
+                        "rejected_generation_kwarg",
+                        "attempted_generation_kwargs",
+                        "attempted_plain_completion_methods",
+                        "result_shape",
                     ):
                         if key in smoke_error:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]
+                        elif key in safe_worker_diagnostics:
+                            diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
                 elif (
                     smoke_message is not None
                     and smoke_message.get("role") == "assistant"

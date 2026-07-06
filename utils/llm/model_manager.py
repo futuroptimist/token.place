@@ -2365,9 +2365,10 @@ for line in sys.stdin:
                             rejected = _extract_unsupported_generation_kwarg(str(positional_exc), attempted_kwargs)
                             attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'exception_type': type(positional_exc).__name__, 'generation_exception_category': category, 'rejected_generation_kwarg': rejected or ''})
                             completion_error = positional_exc
-            if result is None and completion_error is not None and not (attempts and attempts[-1].get('method') == 'create_completion_keyword_prompt'):
-                pass
-            if result is None and callable(llama):
+            if result is None and callable(llama) and (
+                not attempts
+                or attempts[-1].get('generation_exception_category') != 'worker_exception'
+            ):
                 try:
                     result = llama(rendered_prompt, max_tokens=max_tokens)
                     completion_error = None

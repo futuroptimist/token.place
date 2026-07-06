@@ -1862,7 +1862,7 @@ def _plain_completion_method_shape_category(exc):
         return 'unsupported_stream_kwarg'
     if rejected == 'stop':
         return 'unsupported_stop_kwarg'
-    if 'positional argument' in text or 'were given' in text or 'missing required positional argument' in text:
+    if 'positional argument' in text or 'positional-only argument' in text or 'were given' in text or 'missing required positional argument' in text:
         return 'method_shape'
     if rejected is not None:
         return 'unexpected_kwarg'

@@ -144,6 +144,7 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         ({"worker_diagnostics": {"generation_exception_category": "unsupported_prompt_kwarg"}}, "runtime_completion_smoke_plain_completion_method_shape"),
         ({"worker_diagnostics": {"generation_exception_category": "empty_completion_output"}}, "runtime_completion_smoke_plain_completion_empty_output"),
         ({"worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_thinking_leaked"),
+        ({"worker_diagnostics": {"generation_exception_category": "malformed_completion_output"}}, "runtime_completion_smoke_plain_completion_malformed_output"),
         # Top-level takes precedence over nested.
         ({"generation_exception_category": "empty_completion_output", "worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_empty_output"),
     ],

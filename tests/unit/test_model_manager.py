@@ -5749,6 +5749,58 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
 
     assert summary == 'RuntimeError:metal_memory_allocation'
 
+
+def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    normalize = namespace['_normalize_plain_completion_result']
+    result_shape = namespace['_completion_result_shape']
+    classify_shape = namespace['_plain_completion_method_shape_category']
+    extract_rejected = namespace['_extract_unsupported_generation_kwarg']
+
+    normalized, invalid_reason = normalize({'choices': [{'text': ' ok <|im_end|>'}]})
+    assert invalid_reason is None
+    assert normalized == {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    normalized, invalid_reason = normalize({'choices': [{'message': {'content': 'message ok'}}]})
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'message ok'
+    normalized, invalid_reason = normalize('direct ok')
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'direct ok'
+    normalized, invalid_reason = normalize('<think></think> wrapper ok')
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'wrapper ok'
+
+    assert normalize({'choices': []}) == (None, 'malformed_completion_output')
+    assert normalize({'choices': [{'text': '<think>secret</think> visible'}]}) == (
+        None,
+        'thinking_leaked',
+    )
+    assert normalize('<think>unterminated') == (None, 'thinking_leaked')
+    assert normalize('visible </think>') == (None, 'thinking_leaked')
+    assert normalize('<think></think><|im_end|>') == (None, 'empty_completion_output')
+
+    assert result_shape('text') == 'direct_string'
+    assert result_shape({'choices': [{'text': 'text'}]}) == 'choices_text'
+    assert result_shape({'choices': [{'message': {'content': 'text'}}]}) == 'choices_message'
+    assert result_shape({'choices': []}) == 'dict_malformed'
+    assert result_shape(['not', 'supported']) == 'list'
+
+    assert extract_rejected("unsupported option: mirostat", ['mirostat']) == 'mirostat'
+    assert extract_rejected("invalid keyword=temperature", ['temperature']) == 'temperature'
+    assert extract_rejected("unexpected keyword argument 'prompt'", ['max_tokens']) is None
+    assert classify_shape(TypeError("got an unexpected keyword argument 'prompt'")) == 'unsupported_prompt_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
+    assert classify_shape(TypeError("got some positional-only arguments passed as keyword arguments: 'prompt'")) == 'method_shape'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+
+
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 

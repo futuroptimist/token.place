@@ -50,7 +50,16 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
-    "unsupported_generation_kwarg": "runtime_completion_smoke_unsupported_generation_kwarg",
+    "unsupported_generation_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unexpected_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_prompt_kwarg": "runtime_completion_smoke_plain_completion_method_shape",
+    "unsupported_stream_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "unsupported_stop_kwarg": "runtime_completion_smoke_plain_completion_unexpected_kwarg",
+    "method_shape": "runtime_completion_smoke_plain_completion_method_shape",
+    "malformed_completion_output": "runtime_completion_smoke_plain_completion_malformed_output",
+    "empty_completion_output": "runtime_completion_smoke_plain_completion_empty_output",
+    "thinking_leaked": "runtime_completion_smoke_plain_completion_thinking_leaked",
+    "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -61,6 +70,10 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "generation_exception_category",
     "exception_type",
     "rejected_option",
+    "rejected_generation_kwarg",
+    "attempted_generation_kwargs",
+    "attempted_plain_completion_methods",
+    "result_shape",
     "method",
     "stream",
     "retryable",
@@ -92,16 +105,28 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
         "malformed_completion_output",
+        "empty_completion_output",
+        "thinking_leaked",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
+        "unexpected_kwarg",
+        "unsupported_prompt_kwarg",
+        "unsupported_stream_kwarg",
+        "unsupported_stop_kwarg",
+        "method_shape",
+        "worker_exception",
+        "empty_completion_output",
+        "thinking_leaked",
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
         "malformed_completion_output",
+        "empty_completion_output",
+        "thinking_leaked",
     },
     "method": {
         "apply_chat_template",
@@ -110,6 +135,9 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "render_and_tokenize_chat",
         "create_chat_completion_from_rendered_prompt",
         "create_completion_from_rendered_prompt",
+        "create_completion_keyword_prompt",
+        "create_completion_positional_prompt",
+        "llama_call_positional_prompt",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -148,8 +176,13 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "profile_id", "context_tier", "type_k", "type_v"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
+    if key in {"attempted_generation_kwargs", "attempted_plain_completion_methods"}:
+        names = [part for part in bounded.split(",") if part]
+        if names and all(_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(part) for part in names):
+            return ",".join(names[:32])
+        return None
     if key == "sanitized_error_summary":
         return (
             bounded
@@ -232,6 +265,16 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_worker_timeout"
     if internal_reason in {"worker_dead", "runtime_worker_dead"}:
         return "runtime_completion_smoke_worker_dead"
+    # Map plain-completion diagnostic categories surfaced by the subprocess worker.
+    # Check both the top-level error dict and nested worker_diagnostics, since the
+    # relay path carries child-worker details inside worker_diagnostics.
+    generation_exception_category = error.get("generation_exception_category")
+    if not generation_exception_category:
+        worker_diag = error.get("worker_diagnostics")
+        if isinstance(worker_diag, dict):
+            generation_exception_category = worker_diag.get("generation_exception_category")
+    if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
+        return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":
@@ -783,18 +826,26 @@ class ComputeNodeRuntime:
                     if isinstance(exception_type, str):
                         diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
                     worker_diagnostics = smoke_error.get("worker_diagnostics")
+                    safe_worker_diagnostics: Dict[str, Any] = {}
                     if isinstance(worker_diagnostics, dict):
+                        safe_worker_diagnostics = _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
                         diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = (
-                            _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
+                            safe_worker_diagnostics
                         )
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",
                         "recovery_succeeded",
                         "rejected_option",
+                        "rejected_generation_kwarg",
+                        "attempted_generation_kwargs",
+                        "attempted_plain_completion_methods",
+                        "result_shape",
                     ):
                         if key in smoke_error:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]
+                        elif key in safe_worker_diagnostics:
+                            diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
                 elif (
                     smoke_message is not None
                     and smoke_message.get("role") == "assistant"

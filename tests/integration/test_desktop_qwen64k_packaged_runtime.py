@@ -239,8 +239,9 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
             proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
-        assert exc_info.value.diagnostics['method'] == 'create_chat_completion_from_rendered_prompt'
+        assert exc_info.value.diagnostics['method'] == 'create_completion_keyword_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
+        assert exc_info.value.diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
         assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
 
         runtime, manager = _runtime_for(proxy)
@@ -284,6 +285,5 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
-    assert fake.calls[0]["top_k"] == 20
-    assert "top_k" not in fake.calls[1]
-    assert "top_k" in diagnostics["api_v1_generation_kwargs_filtered"]
+    assert "top_k" not in fake.calls[0]
+    assert diagnostics.get("api_v1_generation_kwargs_filtered", []) == []

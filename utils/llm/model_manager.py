@@ -12,6 +12,7 @@ import importlib
 import importlib.metadata
 import inspect
 import subprocess
+import tempfile
 import queue
 import signal
 import threading
@@ -1498,20 +1499,46 @@ class _SubprocessLlamaProxy:
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._lock = Lock()
         self._closed = False
-        command = [sys.executable, '-u', '-c', _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)]
+        self._worker_tmpfile: Optional[str] = None
+        code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
+        # Write worker code to a temp file to avoid Windows command-line length
+        # limit (CreateProcess caps at 32767 chars; the code is ~36KB).
+        try:
+            fd, tmppath = tempfile.mkstemp(suffix='.py', prefix='_token_place_worker_')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(code)
+            self._worker_tmpfile = tmppath
+            command = [sys.executable, '-u', tmppath]
+        except OSError:
+            # Temp file creation failed (e.g. disk full, permissions); fall back
+            # to the -c form which may exceed Windows' 32767-char limit but is
+            # better than not launching at all.
+            self._worker_tmpfile = None
+            command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
-        self._process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            cwd=cwd,
-            bufsize=1,
-        )
-        self._process._token_place_command = [command[0], command[1], '<runtime-worker-code>']  # type: ignore[attr-defined]
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=cwd,
+                bufsize=1,
+            )
+        except OSError:
+            # Popen failed; clean up the temp file if one was created (when
+            # self._worker_tmpfile is None we were already using the -c fallback).
+            if self._worker_tmpfile:
+                try:
+                    os.unlink(self._worker_tmpfile)
+                except Exception:
+                    pass
+                self._worker_tmpfile = None
+            raise
+        self._process._token_place_command = [command[0], '<runtime-worker-script>' if self._worker_tmpfile else '<runtime-worker-code>']  # type: ignore[attr-defined]
         self._process._token_place_cwd = cwd  # type: ignore[attr-defined]
         self._process._token_place_import_root = env.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '')  # type: ignore[attr-defined]
         self._process._token_place_module_path_hint = module_path_hint or ''  # type: ignore[attr-defined]
@@ -1701,6 +1728,13 @@ class _SubprocessLlamaProxy:
                     self._process.kill()
                 except Exception:
                     pass
+        tmpfile = getattr(self, '_worker_tmpfile', None)
+        if tmpfile:
+            try:
+                os.unlink(tmpfile)
+            except Exception:
+                pass
+            self._worker_tmpfile = None
 
     def __del__(self) -> None:
         try:
@@ -1783,6 +1817,8 @@ def _emit(payload):
 def _extract_unsupported_generation_kwarg(message, attempted=None):
     attempted_set = set(str(key) for key in attempted) if attempted is not None else None
     for pattern in (
+        r'positional-only (?:arguments?|keyword arguments?).*keyword arguments?:\\s*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'positional-only (?:arguments?|keyword arguments?).*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'(?:got an )?unexpected keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
         r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
@@ -1819,6 +1855,73 @@ def _classify_generation_exception(exc):
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
 
+def _plain_completion_method_shape_category(exc):
+    text = str(exc or '').lower()
+    rejected = _extract_unsupported_generation_kwarg(text)
+    if rejected == 'prompt':
+        return 'unsupported_prompt_kwarg'
+    if rejected == 'stream':
+        return 'unsupported_stream_kwarg'
+    if rejected == 'stop':
+        return 'unsupported_stop_kwarg'
+    if 'positional argument' in text or 'positional-only argument' in text or 'were given' in text or 'missing required positional argument' in text:
+        return 'method_shape'
+    if rejected is not None:
+        return 'unexpected_kwarg'
+    return 'worker_exception'
+
+def _completion_result_shape(result):
+    if isinstance(result, str):
+        return 'direct_string'
+    if isinstance(result, dict):
+        choices = result.get('choices')
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            if isinstance(choice.get('text'), str):
+                return 'choices_text'
+            message = choice.get('message')
+            if isinstance(message, dict):
+                return 'choices_message'
+        return 'dict_malformed'
+    return type(result).__name__
+
+def _normalize_plain_completion_result(result):
+    text = None
+    if isinstance(result, str):
+        text = result
+    elif isinstance(result, dict):
+        choices = result.get('choices')
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            message = choice.get('message')
+            if isinstance(choice.get('text'), str):
+                text = choice.get('text')
+            elif isinstance(message, dict):
+                content = message.get('content')
+                if isinstance(content, str):
+                    text = content
+    if not isinstance(text, str):
+        return None, 'malformed_completion_output'
+    cleaned = text.strip()
+    lower_cleaned = cleaned.lower()
+    if lower_cleaned.startswith('<think>'):
+        end = lower_cleaned.find('</think>')
+        if end >= 0:
+            think_body = cleaned[len('<think>'):end].strip()
+            if think_body:
+                return None, 'thinking_leaked'
+            cleaned = cleaned[end + len('</think>'):].lstrip()
+            lower_cleaned = cleaned.lower()
+        else:
+            return None, 'thinking_leaked'
+    if '<think>' in lower_cleaned or '</think>' in lower_cleaned:
+        return None, 'thinking_leaked'
+    if cleaned.endswith('<|im_end|>'):
+        cleaned = cleaned[:-len('<|im_end|>')].rstrip()
+    if not cleaned:
+        return None, 'empty_completion_output'
+    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}, None
+
 def _safe_request_error(reason, *, request=None, exc=None, extra=None):
     diagnostics = {'reason': reason}
     if reason == 'malformed_completion_output':
@@ -1829,10 +1932,11 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
                 diagnostics[key] = value
     if isinstance(request, dict):
         method = request.get('method')
-        if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
-            diagnostics['method'] = method
-        elif method is not None:
-            diagnostics['method'] = 'unsupported'
+        if 'method' not in diagnostics:
+            if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
+                diagnostics['method'] = method
+            elif method is not None:
+                diagnostics['method'] = 'unsupported'
         kwargs = request.get('kwargs')
         if isinstance(kwargs, dict):
             diagnostics['stream'] = bool(kwargs.get('stream'))
@@ -2266,37 +2370,72 @@ for line in sys.stdin:
                 else:
                     _emit(_safe_request_error(reason, request=request, exc=exc))
                     continue
-            completion_kwargs = {
-                key: kwargs[key]
-                for key in (
-                    'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'stop',
-                    'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'seed', 'stream'
-                )
-                if key in kwargs
-            }
-            completion_kwargs['stream'] = False
-            stop = completion_kwargs.get('stop')
-            if stop is None:
-                stop_values = ['<|im_end|>']
-            elif isinstance(stop, list):
-                stop_values = list(stop)
-                if '<|im_end|>' not in stop_values:
-                    stop_values.append('<|im_end|>')
-            else:
-                stop_values = [stop, '<|im_end|>'] if stop != '<|im_end|>' else [stop]
-            completion_kwargs['stop'] = stop_values
-            result = llama.create_completion(prompt=rendered_prompt, **completion_kwargs)
-            if not isinstance(result, dict):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+            max_tokens = kwargs.get('max_tokens', 64)
+            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+                max_tokens = 64
+            attempts = []
+            result = None
+            completion_error = None
+            create_completion = getattr(llama, 'create_completion', None)
+            if callable(create_completion):
+                attempt_method = 'create_completion_keyword_prompt'
+                attempted_kwargs = ['max_tokens', 'prompt']
+                try:
+                    result = create_completion(prompt=rendered_prompt, max_tokens=max_tokens)
+                    completion_error = None
+                    attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'result_shape': _completion_result_shape(result)})
+                except Exception as exc:
+                    category = _plain_completion_method_shape_category(exc)
+                    rejected = _extract_unsupported_generation_kwarg(str(exc), attempted_kwargs)
+                    attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'exception_type': type(exc).__name__, 'generation_exception_category': category, 'rejected_generation_kwarg': rejected or ''})
+                    completion_error = exc
+                    if category == 'unsupported_prompt_kwarg' or rejected == 'prompt':
+                        attempt_method = 'create_completion_positional_prompt'
+                        attempted_kwargs = ['max_tokens']
+                        try:
+                            result = create_completion(rendered_prompt, max_tokens=max_tokens)
+                            completion_error = None
+                            attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'result_shape': _completion_result_shape(result)})
+                        except Exception as positional_exc:
+                            category = _plain_completion_method_shape_category(positional_exc)
+                            rejected = _extract_unsupported_generation_kwarg(str(positional_exc), attempted_kwargs)
+                            attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'exception_type': type(positional_exc).__name__, 'generation_exception_category': category, 'rejected_generation_kwarg': rejected or ''})
+                            completion_error = positional_exc
+            if result is None and callable(llama) and (
+                not attempts
+                or attempts[-1].get('generation_exception_category') != 'worker_exception'
+            ):
+                try:
+                    result = llama(rendered_prompt, max_tokens=max_tokens)
+                    completion_error = None
+                    attempts.append({'method': 'llama_call_positional_prompt', 'attempted_kwarg_names': 'max_tokens', 'result_shape': _completion_result_shape(result)})
+                except Exception as exc:
+                    attempts.append({'method': 'llama_call_positional_prompt', 'attempted_kwarg_names': 'max_tokens', 'exception_type': type(exc).__name__, 'generation_exception_category': _plain_completion_method_shape_category(exc), 'rejected_generation_kwarg': _extract_unsupported_generation_kwarg(str(exc), ['max_tokens']) or ''})
+                    completion_error = exc
+            if result is None:
+                extra = dict(render_diagnostics)
+                extra.update({
+                    'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
+                    'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),
+                    'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
+                    'generation_exception_category': attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception',
+                    'rejected_generation_kwarg': attempts[-1].get('rejected_generation_kwarg', '') if attempts else '',
+                })
+                _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))
                 continue
-            choices = result.get('choices')
-            text = None
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                text = choices[0].get('text')
-            if not isinstance(text, str):
-                _emit(_safe_request_error('malformed_completion_output', request=request, extra=render_diagnostics))
+            normalized, invalid_reason = _normalize_plain_completion_result(result)
+            if invalid_reason is not None:
+                extra = dict(render_diagnostics)
+                extra.update({
+                    'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
+                    'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),
+                    'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
+                    'generation_exception_category': invalid_reason,
+                    'result_shape': _completion_result_shape(result),
+                })
+                _emit(_safe_request_error(invalid_reason, request=request, extra=extra))
                 continue
-            _emit({'status': 'ok', 'result': {'choices': [{'message': {'role': 'assistant', 'content': text}}]}})
+            _emit({'status': 'ok', 'result': normalized})
             continue
         result = llama.create_chat_completion(*request.get('args', []), **kwargs)
         if kwargs.get('stream'):

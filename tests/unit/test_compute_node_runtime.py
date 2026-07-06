@@ -133,6 +133,20 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         ({"internal_reason": "runtime_worker_timeout"}, "runtime_completion_smoke_worker_timeout"),
         ({"internal_reason": "runtime_worker_dead"}, "runtime_completion_smoke_worker_dead"),
         ({"code": "compute_node_options_unsupported"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+        # Top-level generation_exception_category checks.
+        ({"generation_exception_category": "empty_completion_output"}, "runtime_completion_smoke_plain_completion_empty_output"),
+        ({"generation_exception_category": "thinking_leaked"}, "runtime_completion_smoke_plain_completion_thinking_leaked"),
+        ({"generation_exception_category": "malformed_completion_output"}, "runtime_completion_smoke_plain_completion_malformed_output"),
+        ({"generation_exception_category": "method_shape"}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"generation_exception_category": "unsupported_prompt_kwarg"}, "runtime_completion_smoke_plain_completion_method_shape"),
+        # Relay path: generation_exception_category nested inside worker_diagnostics.
+        ({"worker_diagnostics": {"generation_exception_category": "method_shape"}}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"worker_diagnostics": {"generation_exception_category": "unsupported_prompt_kwarg"}}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"worker_diagnostics": {"generation_exception_category": "empty_completion_output"}}, "runtime_completion_smoke_plain_completion_empty_output"),
+        ({"worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_thinking_leaked"),
+        ({"worker_diagnostics": {"generation_exception_category": "malformed_completion_output"}}, "runtime_completion_smoke_plain_completion_malformed_output"),
+        # Top-level takes precedence over nested.
+        ({"generation_exception_category": "empty_completion_output", "worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_empty_output"),
     ],
 )
 def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, expected_reason):
@@ -146,7 +160,7 @@ def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, e
         (RuntimeError("worker dead: broken pipe"), "worker_dead", "runtime_completion_smoke_worker_dead"),
         (RuntimeError("Metal buffer allocation out of memory"), "metal_memory_allocation", "runtime_completion_smoke_metal_memory_allocation"),
         (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
     ],
 )
@@ -207,7 +221,7 @@ def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason
     )
 
     assert category == "unsupported_generation_kwarg"
-    assert reason == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert reason == "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
 
 
@@ -671,8 +685,9 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_model_profile_id"] == "qwen3-8b-q4-k-m"
-    assert llm_runtime.completion_kwargs["stream"] is False
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
+    assert "stream" not in llm_runtime.completion_kwargs
+    assert "stop" not in llm_runtime.completion_kwargs
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
 
@@ -881,6 +896,55 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert diagnostics["api_v1_readiness_completion_smoke_failure_reason"] == "runtime_completion_smoke_invalid_model_output"
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
+
+def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readiness_fields(monkeypatch):
+    class NestedWorkerDiagnosticRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            return {
+                "api_v1_response": {
+                    "error": {
+                        "code": "compute_node_internal_error",
+                        "worker_diagnostics": {
+                            "rejected_generation_kwarg": "stream",
+                            "attempted_generation_kwargs": "max_tokens,stream",
+                            "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                            "result_shape": "dict_malformed",
+                        },
+                    }
+                }
+            }
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=NestedWorkerDiagnosticRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] == {
+        "rejected_generation_kwarg": "stream",
+        "attempted_generation_kwargs": "max_tokens,stream",
+        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+        "result_shape": "dict_malformed",
+    }
+    assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "stream"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,stream"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_result_shape"] == "dict_malformed"
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
     class ThinkRuntime:

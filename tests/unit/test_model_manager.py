@@ -5749,6 +5749,291 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
 
     assert summary == 'RuntimeError:metal_memory_allocation'
 
+
+def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    normalize = namespace['_normalize_plain_completion_result']
+    result_shape = namespace['_completion_result_shape']
+    classify_shape = namespace['_plain_completion_method_shape_category']
+    extract_rejected = namespace['_extract_unsupported_generation_kwarg']
+
+    normalized, invalid_reason = normalize({'choices': [{'text': ' ok <|im_end|>'}]})
+    assert invalid_reason is None
+    assert normalized == {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    normalized, invalid_reason = normalize({'choices': [{'message': {'content': 'message ok'}}]})
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'message ok'
+    normalized, invalid_reason = normalize('direct ok')
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'direct ok'
+    normalized, invalid_reason = normalize('<think></think> wrapper ok')
+    assert invalid_reason is None
+    assert normalized['choices'][0]['message']['content'] == 'wrapper ok'
+
+    assert normalize({'choices': []}) == (None, 'malformed_completion_output')
+    assert normalize({'choices': [{'text': '<think>secret</think> visible'}]}) == (
+        None,
+        'thinking_leaked',
+    )
+    assert normalize('<think>unterminated') == (None, 'thinking_leaked')
+    assert normalize('visible </think>') == (None, 'thinking_leaked')
+    assert normalize('<think></think><|im_end|>') == (None, 'empty_completion_output')
+
+    assert result_shape('text') == 'direct_string'
+    assert result_shape({'choices': [{'text': 'text'}]}) == 'choices_text'
+    assert result_shape({'choices': [{'message': {'content': 'text'}}]}) == 'choices_message'
+    assert result_shape({'choices': []}) == 'dict_malformed'
+    assert result_shape(['not', 'supported']) == 'list'
+
+    assert extract_rejected("unsupported option: mirostat", ['mirostat']) == 'mirostat'
+    assert extract_rejected("invalid keyword=temperature", ['temperature']) == 'temperature'
+    assert extract_rejected("unexpected keyword argument 'prompt'", ['max_tokens']) is None
+    assert (
+        extract_rejected(
+            "got some positional-only arguments passed as keyword arguments: 'prompt'",
+            ['max_tokens', 'prompt'],
+        )
+        == 'prompt'
+    )
+    assert classify_shape(TypeError("got an unexpected keyword argument 'prompt'")) == 'unsupported_prompt_kwarg'
+    assert classify_shape(
+        TypeError("got some positional-only arguments passed as keyword arguments: 'prompt'")
+    ) == 'unsupported_prompt_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
+    assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+
+
+
+def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    popen_calls = []
+
+    class FakeStdin:
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def write(self, value):
+            self.writes.append(value)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.kwargs = kwargs
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = []
+            self.terminated = False
+            self.waited = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    def fake_popen(command, **kwargs):
+        process = FakeProcess(command, **kwargs)
+        popen_calls.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+    tmpfile = proxy._worker_tmpfile
+
+    assert tmpfile
+    assert os.path.exists(tmpfile)
+    assert popen_calls[0].command == [sys.executable, '-u', tmpfile]
+    assert popen_calls[0]._token_place_command == [sys.executable, '<runtime-worker-script>']
+    assert '"method": "__init__"' in popen_calls[0].stdin.writes[0]
+
+    proxy.close()
+
+    assert popen_calls[0].stdin.closed is True
+    assert popen_calls[0].terminated is True
+    assert popen_calls[0].waited is True
+    assert not os.path.exists(tmpfile)
+    assert proxy._worker_tmpfile is None
+
+
+def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    popen_commands = []
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        process = FakeProcess()
+        popen_commands.append(command)
+        return process
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no tmp')))
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+
+    assert proxy._worker_tmpfile is None
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+    assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created_tmpfiles = []
+    real_mkstemp = model_manager_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        created_tmpfiles.append(path)
+        return fd, path
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', tracking_mkstemp)
+    monkeypatch.setattr(
+        model_manager_module.subprocess,
+        'Popen',
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError('spawn failed')),
+    )
+
+    with pytest.raises(OSError, match='spawn failed'):
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+
+    assert created_tmpfiles
+    assert not os.path.exists(created_tmpfiles[0])
+
+
+def test_subprocess_proxy_stream_marks_closed_on_eof(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = object()
+
+    sent_payloads = []
+
+    def fake_send(payload, *, check_health=True):
+        sent_payloads.append(payload)
+
+    monkeypatch.setattr(proxy, "_send", fake_send)
+    monkeypatch.setattr(
+        model_manager_module,
+        "_read_llama_subprocess_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(model_manager_module.LlamaCppWorkerEOFError("eof")),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert sent_payloads[0]["method"] == "create_chat_completion"
+
+
+def test_subprocess_proxy_ignores_unlink_failure_when_popen_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    unlink_calls = []
+    real_mkstemp = model_manager_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        return real_mkstemp(*args, **kwargs)
+
+    def failing_unlink(path):
+        unlink_calls.append(path)
+        raise PermissionError("busy temp worker")
+
+    monkeypatch.setattr(model_manager_module.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(model_manager_module.os, "unlink", failing_unlink)
+    monkeypatch.setattr(
+        model_manager_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        model_manager_module._SubprocessLlamaProxy(model_path="model.gguf")
+
+    assert unlink_calls
+
+
+def test_subprocess_proxy_close_ignores_temp_worker_unlink_failure(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+        def poll(self):
+            return 0
+
+    unlink_calls = []
+
+    def failing_unlink(path):
+        unlink_calls.append(path)
+        raise PermissionError("busy temp worker")
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._process = FakeProcess()
+    proxy._worker_tmpfile = "/tmp/token-place-worker.py"
+    monkeypatch.setattr(model_manager_module.os, "unlink", failing_unlink)
+
+    proxy.close()
+
+    assert unlink_calls == ["/tmp/token-place-worker.py"]
+    assert proxy._worker_tmpfile is None
+
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 
@@ -5953,3 +6238,243 @@ def test_path_redaction_handles_spaces_and_traceback_paths():
     assert '/Users/Alice' not in redacted
     assert 'Application Support' not in redacted
     assert '<path>' in redacted
+
+
+def test_llama_worker_render_complete_minimal_kwargs_omit_sampling_and_stop(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'minimal fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        forbidden = {'stream', 'stop', 'temperature', 'top_p', 'top_k', 'min_p', 'seed'} & set(kwargs)\n"
+        "        if forbidden:\n"
+        "            raise TypeError(f\"got an unexpected keyword argument '{sorted(forbidden)[0]}'\")\n"
+        "        if set(kwargs) != {'max_tokens'}:\n"
+        "            raise TypeError('unexpected keyword argument: extra')\n"
+        "        return {'choices': [{'text': 'minimal ok<|im_end|>'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            temperature=0.5,
+            stop=[],
+            stream=False,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'minimal ok'}}]}
+
+
+def test_llama_worker_render_complete_falls_back_to_positional_prompt(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'prompt' in kwargs:\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'prompt'\")\n"
+        "        if len(args) != 1 or set(kwargs) != {'max_tokens'}:\n"
+        "            raise TypeError('bad method shape')\n"
+        "        return {'choices': [{'text': 'positional ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'positional ok'}}]}
+
+
+def test_llama_worker_render_complete_falls_back_for_positional_only_prompt(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional only fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, prompt, /, max_tokens=None):\n"
+        "        if len(prompt) <= 0 or max_tokens != 4:\n"
+        "            raise TypeError('bad method shape')\n"
+        "        return {'choices': [{'text': 'positional only ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'positional only ok'}}]}
+
+
+def test_llama_worker_render_complete_falls_back_to_callable_llama(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'callable fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if set(kwargs) != {'max_tokens'}:\n"
+        "            raise TypeError('bad callable kwargs')\n"
+        "        return {'choices': [{'message': {'content': 'callable ok'}}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'callable ok'}}]}
+
+
+def test_llama_worker_render_complete_runtime_failure_does_not_fall_back_to_callable(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'runtime failure fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        raise RuntimeError('KV cache allocation failed during completion')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'callable should not run'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'kv_cache_allocation'
+    assert diagnostics['method'] == 'create_completion_keyword_prompt'
+    assert diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+    assert diagnostics['sanitized_error_summary'] == 'RuntimeError:kv_cache_allocation'
+
+
+def test_llama_worker_render_complete_empty_and_thinking_fail_safely(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'unsafe output fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        if 'empty' in prompt:\n"
+        "            return {'choices': [{'text': ''}]}\n"
+        "        return {'choices': [{'text': '<think>secret reasoning</think> visible'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as empty_exc:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'empty'}], max_tokens=4,
+                token_place_provider='qwen', token_place_template_policy='gguf-jinja', enable_thinking=False,
+            )
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as think_exc:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'think'}], max_tokens=4,
+                token_place_provider='qwen', token_place_template_policy='gguf-jinja', enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    assert empty_exc.value.diagnostics['generation_exception_category'] == 'empty_completion_output'
+    assert think_exc.value.diagnostics['generation_exception_category'] == 'thinking_leaked'
+    assert 'secret reasoning' not in json.dumps(think_exc.value.diagnostics)

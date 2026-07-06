@@ -201,7 +201,7 @@ def _runtime_for(fake_runtime):
     ("category", "reason"),
     [
         ("kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        ("unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ("unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         ("rope_yarn_eval_failure", "runtime_completion_smoke_rope_yarn_eval_failure"),
         ("worker_timeout", "runtime_completion_smoke_worker_timeout"),
         ("worker_dead", "runtime_completion_smoke_worker_dead"),
@@ -226,6 +226,40 @@ def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_re
     assert diagnostics["api_v1_readiness_error_reason"] == reason
     assert diagnostics["api_v1_readiness_error_reason"] != "runtime_completion_smoke_exception"
     assert diagnostics["api_v1_readiness_completion_smoke_path"] == "shared_api_v1_generation"
+
+
+def test_qwen64k_packaged_runtime_readiness_surfaces_safe_rejected_kwarg_fields():
+    class FailingRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "generation_exception_category": "unsupported_generation_kwarg",
+                    "exception_type": "TypeError",
+                    "method": "create_completion_keyword_prompt",
+                    "rejected_generation_kwarg": "max_tokens",
+                    "attempted_generation_kwargs": "max_tokens,prompt",
+                    "attempted_plain_completion_methods": (
+                        "create_completion_keyword_prompt,"
+                        "create_completion_positional_prompt,"
+                        "llama_call_positional_prompt"
+                    ),
+                    "result_shape": "dict_malformed",
+                },
+            )
+
+    runtime, manager = _runtime_for(FailingRuntime())
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == (
+        "runtime_completion_smoke_plain_completion_unexpected_kwarg"
+    )
+    assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "max_tokens"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_method"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_result_shape"] == "dict_malformed"
+    assert "Reply with exactly" not in json.dumps(diagnostics)
 
 
 def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics(tmp_path, monkeypatch):

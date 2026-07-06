@@ -6478,3 +6478,91 @@ def test_llama_worker_render_complete_empty_and_thinking_fail_safely(tmp_path, m
     assert empty_exc.value.diagnostics['generation_exception_category'] == 'empty_completion_output'
     assert think_exc.value.diagnostics['generation_exception_category'] == 'thinking_leaked'
     assert 'secret reasoning' not in json.dumps(think_exc.value.diagnostics)
+
+
+def test_llama_worker_render_complete_falls_back_to_qwen_jinja_when_render_kwarg_rejected(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'render kwarg fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    metadata = {\n"
+        "        'general.name': 'Qwen3 test',\n"
+        "        'tokenizer.chat_template': \"{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\\n{% endfor %}{% if enable_thinking == false %}/no_think\\n{% endif %}{% if add_generation_prompt %}assistant:{% endif %}\",\n"
+        "    }\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        if 'tokenize' in kwargs:\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'tokenize'\")\n"
+        "        return 'unsafe direct render'\n"
+        "    def create_completion(self, prompt, **kwargs):\n"
+        "        if '/no_think' not in prompt:\n"
+        "            return {'choices': [{'text': '<think>leaked</think> unsafe'}]}\n"
+        "        return {'choices': [{'text': 'ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'Qwen3-8B-Q4_K_M.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result['choices'][0]['message']['content'] == 'ok'
+
+
+def test_llama_worker_render_complete_reports_safe_render_kwarg_diagnostics(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'render kwarg failure fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        if 'add_generation_prompt' in kwargs:\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'add_generation_prompt'\")\n"
+        "        return 'unsafe direct render'\n"
+        "    def create_completion(self, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'should not run'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'Qwen3-8B-Q4_K_M.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['rejected_generation_kwarg'] == 'add_generation_prompt'
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,enable_thinking,tokenize'
+    assert diagnostics['method'] == 'apply_chat_template'
+    assert 'secret prompt text' not in json.dumps(diagnostics)

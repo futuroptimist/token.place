@@ -244,6 +244,18 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
 
 
 def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
+    # Prefer precise worker diagnostics from the packaged llama-cpp bridge over
+    # the parent relay's generic ``unsupported_generation_option`` internal
+    # reason.  The parent reason is intentionally coarse, while the worker
+    # category distinguishes plain-completion shape/kwarg/template failures.
+    generation_exception_category = error.get("generation_exception_category")
+    worker_diag = error.get("worker_diagnostics")
+    if isinstance(worker_diag, dict):
+        worker_category = worker_diag.get("generation_exception_category")
+        if worker_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
+            generation_exception_category = worker_category
+    if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
+        return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
     internal_reason = error.get("internal_reason")
     if internal_reason == "qwen_thinking_output_leaked":
         return "runtime_completion_smoke_thinking_leaked"
@@ -265,16 +277,6 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_worker_timeout"
     if internal_reason in {"worker_dead", "runtime_worker_dead"}:
         return "runtime_completion_smoke_worker_dead"
-    # Map plain-completion diagnostic categories surfaced by the subprocess worker.
-    # Check both the top-level error dict and nested worker_diagnostics, since the
-    # relay path carries child-worker details inside worker_diagnostics.
-    generation_exception_category = error.get("generation_exception_category")
-    if not generation_exception_category:
-        worker_diag = error.get("worker_diagnostics")
-        if isinstance(worker_diag, dict):
-            generation_exception_category = worker_diag.get("generation_exception_category")
-    if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
-        return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":
@@ -841,6 +843,8 @@ class ComputeNodeRuntime:
                         "attempted_generation_kwargs",
                         "attempted_plain_completion_methods",
                         "result_shape",
+                        "method",
+                        "generation_exception_category",
                     ):
                         if key in smoke_error:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]

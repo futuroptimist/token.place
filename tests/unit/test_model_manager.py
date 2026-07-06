@@ -5811,6 +5811,84 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
 
 
 
+def test_subprocess_worker_render_template_retries_tokenize_with_qwen_jinja_metadata():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class RejectingRuntime:
+        metadata = {
+            'general.name': 'Qwen3 packaged test',
+            'tokenizer.chat_template': (
+                '{% for message in messages %}<|im_start|>{{ message.role }}\n'
+                '{{ message.content }}<|im_end|>\n{% endfor %}'
+                '{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}'
+            ),
+        }
+
+        def apply_chat_template(self, _messages, **kwargs):
+            if 'tokenize' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'tokenize'")
+            raise AssertionError('metadata renderer should be preferred after tokenize rejection')
+
+    messages = [{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]
+    rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
+        RejectingRuntime(),
+        [messages],
+        {
+            'tokenize': False,
+            'add_generation_prompt': True,
+            'enable_thinking': False,
+            'token_place_provider': 'qwen',
+        },
+    )
+
+    assert '<|im_start|>assistant' in rendered
+    assert diagnostics['metadata_template'] is True
+    assert diagnostics['jinja_renderer'] is True
+    assert diagnostics['rejected_generation_kwarg'] == 'tokenize'
+    assert diagnostics['method'] == 'apply_chat_template'
+    assert 'plaintext prompt' not in json.dumps(diagnostics)
+
+
+def test_subprocess_worker_render_template_fails_closed_with_safe_rejected_kwarg_diagnostics():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    request = {
+        'method': 'create_chat_completion_from_rendered_prompt',
+        'kwargs': {'max_tokens': 64, 'enable_thinking': False},
+    }
+    response = namespace['_safe_request_error'](
+        'inference_exception',
+        request=request,
+        exc=TypeError("got an unexpected keyword argument 'max_tokens'"),
+        extra={
+            'method': 'create_completion_keyword_prompt',
+            'attempted_plain_completion_methods': 'create_completion_keyword_prompt',
+            'attempted_generation_kwargs': 'max_tokens,prompt',
+            'generation_exception_category': 'unsupported_generation_kwarg',
+            'rejected_generation_kwarg': 'max_tokens',
+            'result_shape': 'dict_malformed',
+            'prompt': 'plaintext prompt must not appear',
+        },
+    )
+
+    diagnostics = response['diagnostics']
+    assert diagnostics['reason'] == 'unsupported_generation_option'
+    assert diagnostics['rejected_generation_kwarg'] == 'max_tokens'
+    assert diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+    assert diagnostics['attempted_generation_kwargs'] == 'max_tokens,prompt'
+    assert diagnostics['method'] == 'create_completion_keyword_prompt'
+    assert diagnostics['result_shape'] == 'dict_malformed'
+    assert 'plaintext prompt' not in json.dumps(diagnostics)
+
+
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

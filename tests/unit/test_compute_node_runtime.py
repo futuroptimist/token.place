@@ -225,6 +225,33 @@ def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason
     assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
 
 
+def test_completion_smoke_reason_prefers_nested_worker_specific_category_over_generic_internal_reason():
+    error = {
+        'internal_reason': 'unsupported_generation_option',
+        'worker_diagnostics': {
+            'generation_exception_category': 'unsupported_prompt_kwarg',
+            'rejected_generation_kwarg': 'prompt',
+            'attempted_generation_kwargs': 'max_tokens,prompt',
+            'attempted_plain_completion_methods': 'create_completion_keyword_prompt',
+            'method': 'create_completion_keyword_prompt',
+            'prompt': 'plaintext prompt must not appear',
+        },
+    }
+
+    reason = _completion_smoke_reason_from_api_v1_error(error)
+    safe = _safe_completion_smoke_worker_diagnostics(error['worker_diagnostics'])
+
+    assert reason == 'runtime_completion_smoke_plain_completion_method_shape'
+    assert safe == {
+        'generation_exception_category': 'unsupported_prompt_kwarg',
+        'rejected_generation_kwarg': 'prompt',
+        'attempted_generation_kwargs': 'max_tokens,prompt',
+        'attempted_plain_completion_methods': 'create_completion_keyword_prompt',
+        'method': 'create_completion_keyword_prompt',
+    }
+    assert 'plaintext prompt' not in json.dumps(safe)
+
+
 def test_classify_completion_smoke_exception_detects_rope_scaling_text():
     category, reason, diagnostics = _classify_completion_smoke_exception(
         RuntimeError("RoPE scaling failure before eval")

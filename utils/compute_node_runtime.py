@@ -268,10 +268,11 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
     # Map plain-completion diagnostic categories surfaced by the subprocess worker.
     # Check both the top-level error dict and nested worker_diagnostics, since the
     # relay path carries child-worker details inside worker_diagnostics.
-    nested = error.get("worker_diagnostics") or {}
-    generation_exception_category = error.get("generation_exception_category") or (
-        nested.get("generation_exception_category") if isinstance(nested, dict) else None
-    )
+    generation_exception_category = error.get("generation_exception_category")
+    if not generation_exception_category:
+        worker_diag = error.get("worker_diagnostics")
+        if isinstance(worker_diag, dict):
+            generation_exception_category = worker_diag.get("generation_exception_category")
     if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
         return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
     if error.get("code") == "compute_node_invalid_model_output":

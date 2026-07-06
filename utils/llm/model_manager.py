@@ -12,6 +12,7 @@ import importlib
 import importlib.metadata
 import inspect
 import subprocess
+import tempfile
 import queue
 import signal
 import threading
@@ -1498,20 +1499,41 @@ class _SubprocessLlamaProxy:
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._lock = Lock()
         self._closed = False
-        command = [sys.executable, '-u', '-c', _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)]
+        self._worker_tmpfile: Optional[str] = None
+        code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
+        # Write worker code to a temp file to avoid Windows command-line length
+        # limit (CreateProcess caps at 32767 chars; the code is ~36KB).
+        try:
+            fd, tmppath = tempfile.mkstemp(suffix='.py', prefix='_token_place_worker_')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(code)
+            self._worker_tmpfile = tmppath
+            command = [sys.executable, '-u', tmppath]
+        except Exception:
+            self._worker_tmpfile = None
+            command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
-        self._process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            cwd=cwd,
-            bufsize=1,
-        )
-        self._process._token_place_command = [command[0], command[1], '<runtime-worker-code>']  # type: ignore[attr-defined]
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=cwd,
+                bufsize=1,
+            )
+        except OSError:
+            if self._worker_tmpfile:
+                try:
+                    os.unlink(self._worker_tmpfile)
+                except Exception:
+                    pass
+                self._worker_tmpfile = None
+            raise
+        self._process._token_place_command = [command[0], '<runtime-worker-script>' if self._worker_tmpfile else '<runtime-worker-code>']  # type: ignore[attr-defined]
         self._process._token_place_cwd = cwd  # type: ignore[attr-defined]
         self._process._token_place_import_root = env.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '')  # type: ignore[attr-defined]
         self._process._token_place_module_path_hint = module_path_hint or ''  # type: ignore[attr-defined]
@@ -1701,6 +1723,13 @@ class _SubprocessLlamaProxy:
                     self._process.kill()
                 except Exception:
                     pass
+        tmpfile = getattr(self, '_worker_tmpfile', None)
+        if tmpfile:
+            try:
+                os.unlink(tmpfile)
+            except Exception:
+                pass
+            self._worker_tmpfile = None
 
     def __del__(self) -> None:
         try:

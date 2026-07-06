@@ -133,6 +133,19 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         ({"internal_reason": "runtime_worker_timeout"}, "runtime_completion_smoke_worker_timeout"),
         ({"internal_reason": "runtime_worker_dead"}, "runtime_completion_smoke_worker_dead"),
         ({"code": "compute_node_options_unsupported"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
+        # Top-level generation_exception_category checks.
+        ({"generation_exception_category": "empty_completion_output"}, "runtime_completion_smoke_plain_completion_empty_output"),
+        ({"generation_exception_category": "thinking_leaked"}, "runtime_completion_smoke_plain_completion_thinking_leaked"),
+        ({"generation_exception_category": "malformed_completion_output"}, "runtime_completion_smoke_plain_completion_malformed_output"),
+        ({"generation_exception_category": "method_shape"}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"generation_exception_category": "unsupported_prompt_kwarg"}, "runtime_completion_smoke_plain_completion_method_shape"),
+        # Relay path: generation_exception_category nested inside worker_diagnostics.
+        ({"worker_diagnostics": {"generation_exception_category": "method_shape"}}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"worker_diagnostics": {"generation_exception_category": "unsupported_prompt_kwarg"}}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"worker_diagnostics": {"generation_exception_category": "empty_completion_output"}}, "runtime_completion_smoke_plain_completion_empty_output"),
+        ({"worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_thinking_leaked"),
+        # Top-level takes precedence over nested.
+        ({"generation_exception_category": "empty_completion_output", "worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_empty_output"),
     ],
 )
 def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, expected_reason):

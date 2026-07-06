@@ -265,14 +265,15 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_worker_timeout"
     if internal_reason in {"worker_dead", "runtime_worker_dead"}:
         return "runtime_completion_smoke_worker_dead"
-    # Map new plain-completion diagnostic categories surfaced by the subprocess worker.
-    generation_exception_category = error.get("generation_exception_category")
-    if generation_exception_category == "empty_completion_output":
-        return "runtime_completion_smoke_plain_completion_empty_output"
-    if generation_exception_category == "thinking_leaked":
-        return "runtime_completion_smoke_plain_completion_thinking_leaked"
-    if generation_exception_category == "malformed_completion_output":
-        return "runtime_completion_smoke_plain_completion_malformed_output"
+    # Map plain-completion diagnostic categories surfaced by the subprocess worker.
+    # Check both the top-level error dict and nested worker_diagnostics, since the
+    # relay path carries child-worker details inside worker_diagnostics.
+    nested = error.get("worker_diagnostics") or {}
+    generation_exception_category = error.get("generation_exception_category") or (
+        nested.get("generation_exception_category") if isinstance(nested, dict) else None
+    )
+    if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
+        return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":

@@ -146,7 +146,7 @@ def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, e
         (RuntimeError("worker dead: broken pipe"), "worker_dead", "runtime_completion_smoke_worker_dead"),
         (RuntimeError("Metal buffer allocation out of memory"), "metal_memory_allocation", "runtime_completion_smoke_metal_memory_allocation"),
         (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
     ],
 )
@@ -207,7 +207,7 @@ def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason
     )
 
     assert category == "unsupported_generation_kwarg"
-    assert reason == "runtime_completion_smoke_unsupported_generation_kwarg"
+    assert reason == "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
 
 
@@ -671,8 +671,9 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_result"] == "passed"
     assert diagnostics["api_v1_readiness_model_profile_id"] == "qwen3-8b-q4-k-m"
-    assert llm_runtime.completion_kwargs["stream"] is False
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
+    assert "stream" not in llm_runtime.completion_kwargs
+    assert "stop" not in llm_runtime.completion_kwargs
     assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
 
 

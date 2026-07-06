@@ -1817,6 +1817,8 @@ def _emit(payload):
 def _extract_unsupported_generation_kwarg(message, attempted=None):
     attempted_set = set(str(key) for key in attempted) if attempted is not None else None
     for pattern in (
+        r'positional-only (?:arguments?|keyword arguments?).*keyword arguments?:\\s*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'positional-only (?:arguments?|keyword arguments?).*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'(?:got an )?unexpected keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
         r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',

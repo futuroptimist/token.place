@@ -5793,11 +5793,20 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert extract_rejected("unsupported option: mirostat", ['mirostat']) == 'mirostat'
     assert extract_rejected("invalid keyword=temperature", ['temperature']) == 'temperature'
     assert extract_rejected("unexpected keyword argument 'prompt'", ['max_tokens']) is None
+    assert (
+        extract_rejected(
+            "got some positional-only arguments passed as keyword arguments: 'prompt'",
+            ['max_tokens', 'prompt'],
+        )
+        == 'prompt'
+    )
     assert classify_shape(TypeError("got an unexpected keyword argument 'prompt'")) == 'unsupported_prompt_kwarg'
+    assert classify_shape(
+        TypeError("got some positional-only arguments passed as keyword arguments: 'prompt'")
+    ) == 'unsupported_prompt_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
-    assert classify_shape(TypeError("got some positional-only arguments passed as keyword arguments: 'prompt'")) == 'method_shape'
     assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
 
 
@@ -6313,6 +6322,43 @@ def test_llama_worker_render_complete_falls_back_to_positional_prompt(tmp_path, 
     assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'positional ok'}}]}
 
 
+def test_llama_worker_render_complete_falls_back_for_positional_only_prompt(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'positional only fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, prompt, /, max_tokens=None):\n"
+        "        if len(prompt) <= 0 or max_tokens != 4:\n"
+        "            raise TypeError('bad method shape')\n"
+        "        return {'choices': [{'text': 'positional only ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'positional only ok'}}]}
+
+
 def test_llama_worker_render_complete_falls_back_to_callable_llama(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -6348,6 +6394,48 @@ def test_llama_worker_render_complete_falls_back_to_callable_llama(tmp_path, mon
         proxy.close()
 
     assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'callable ok'}}]}
+
+
+def test_llama_worker_render_complete_runtime_failure_does_not_fall_back_to_callable(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'runtime failure fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        raise RuntimeError('KV cache allocation failed during completion')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        return {'choices': [{'text': 'callable should not run'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'kv_cache_allocation'
+    assert diagnostics['method'] == 'create_completion_keyword_prompt'
+    assert diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+    assert diagnostics['sanitized_error_summary'] == 'RuntimeError:kv_cache_allocation'
 
 
 def test_llama_worker_render_complete_empty_and_thinking_fail_safely(tmp_path, monkeypatch):

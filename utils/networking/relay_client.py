@@ -46,6 +46,7 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
 
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
     re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
+    re.compile(r"(?:got an )?unexpected keyword argument\s+([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"unexpected keyword argument\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"unsupported option(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),
     re.compile(r"invalid keyword(?: argument)?(?:\s+[\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]|\s*:\s*([A-Za-z_][A-Za-z0-9_]*))"),

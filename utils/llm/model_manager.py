@@ -1820,6 +1820,7 @@ def _extract_unsupported_generation_kwarg(message, attempted=None):
         r'positional-only (?:arguments?|keyword arguments?).*keyword arguments?:\\s*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'positional-only (?:arguments?|keyword arguments?).*[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'(?:got an )?unexpected keyword argument [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
+        r'(?:got an )?unexpected keyword argument\\s+([A-Za-z_][A-Za-z0-9_]*)',
         r'unsupported option(?:\\s+[\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]|\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))',
         r'invalid keyword(?: argument)? [\\'"]([A-Za-z_][A-Za-z0-9_]*)[\\'"]',
         r'invalid keyword\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*)',
@@ -2142,6 +2143,33 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
     provider_hint = str(kwargs.pop('token_place_provider', '') or '').lower()
     policy_hint = str(kwargs.pop('token_place_template_policy', '') or '').lower()
+    template, metadata_qwen_evidence = _runtime_chat_template(llama)
+    qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
+
+    def _render_with_metadata_template():
+        if not isinstance(template, str) or not template.strip():
+            raise RuntimeError('runtime_chat_template_metadata_missing')
+        if not qwen_safe:
+            raise RuntimeError('runtime_chat_template_qwen_evidence_missing')
+        if not _jinja_renderer_available():
+            raise RuntimeError('runtime_chat_template_renderer_unavailable')
+        messages = args[0] if args else kwargs.get('messages')
+        if not isinstance(messages, list):
+            raise RuntimeError('runtime_chat_template_render_exception')
+        rendered = _render_gguf_jinja_chat_template(
+            template,
+            messages,
+            llama,
+            add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
+            enable_thinking=kwargs.get('enable_thinking'),
+        )
+        return rendered, {
+            'direct_apply_chat_template': False,
+            'metadata_template': True,
+            'jinja_renderer': True,
+            'qwen_evidence': True,
+        }
+
     render = getattr(llama, 'apply_chat_template', None)
     direct_apply_available = callable(render)
     if not direct_apply_available:
@@ -2160,39 +2188,24 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'jinja_renderer': False,
             }
         except TypeError as exc:
-            if 'enable_thinking' not in kwargs or not _type_error_is_unexpected_keyword(exc, 'enable_thinking'):
+            rejected = _extract_unsupported_generation_kwarg(
+                str(exc),
+                [key for key in ('enable_thinking', 'tokenize', 'add_generation_prompt') if key in kwargs],
+            )
+            if rejected not in {'enable_thinking', 'tokenize', 'add_generation_prompt'}:
                 raise
+            if qwen_safe and isinstance(template, str) and template.strip() and _jinja_renderer_available():
+                return _render_with_metadata_template()
             compatibility_kwargs = dict(kwargs)
-            compatibility_kwargs.pop('enable_thinking', None)
+            compatibility_kwargs.pop(rejected, None)
             return render(*args, **compatibility_kwargs), {
                 'direct_apply_chat_template': direct_apply_available,
                 'metadata_template': False,
                 'jinja_renderer': False,
+                'rejected_generation_kwarg': rejected,
+                'generation_exception_category': 'unsupported_generation_kwarg',
             }
-    template, metadata_qwen_evidence = _runtime_chat_template(llama)
-    if not isinstance(template, str) or not template.strip():
-        raise RuntimeError('runtime_chat_template_metadata_missing')
-    qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
-    if not qwen_safe:
-        raise RuntimeError('runtime_chat_template_qwen_evidence_missing')
-    if not _jinja_renderer_available():
-        raise RuntimeError('runtime_chat_template_renderer_unavailable')
-    messages = args[0] if args else kwargs.get('messages')
-    if not isinstance(messages, list):
-        raise RuntimeError('runtime_chat_template_render_exception')
-    rendered = _render_gguf_jinja_chat_template(
-        template,
-        messages,
-        llama,
-        add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
-        enable_thinking=kwargs.get('enable_thinking'),
-    )
-    return rendered, {
-        'direct_apply_chat_template': False,
-        'metadata_template': True,
-        'jinja_renderer': True,
-        'qwen_evidence': True,
-    }
+    return _render_with_metadata_template()
 
 def _testing_render_template_fallback_allowed(model_path):
     if os.environ.get('TOKEN_PLACE_ENV') != 'testing':
@@ -2343,6 +2356,18 @@ for line in sys.stdin:
                     llama, request.get('args', []), render_kwargs
                 )
             except Exception as exc:
+                rejected = _extract_unsupported_generation_kwarg(
+                    str(exc),
+                    [key for key in ('enable_thinking', 'tokenize', 'add_generation_prompt') if key in render_kwargs],
+                )
+                render_extra = None
+                if rejected:
+                    render_extra = {
+                        'method': 'apply_chat_template',
+                        'generation_exception_category': 'unsupported_generation_kwarg',
+                        'rejected_generation_kwarg': rejected,
+                        'attempted_generation_kwargs': ','.join(sorted(render_kwargs)),
+                    }
                 reason = str(exc) if str(exc) in {
                     'runtime_chat_template_metadata_missing',
                     'runtime_chat_template_renderer_unavailable',
@@ -2368,7 +2393,7 @@ for line in sys.stdin:
                         _emit(_safe_request_error(reason, request=request, exc=fallback_exc))
                         continue
                 else:
-                    _emit(_safe_request_error(reason, request=request, exc=exc))
+                    _emit(_safe_request_error(reason, request=request, exc=exc, extra=render_extra))
                     continue
             max_tokens = kwargs.get('max_tokens', 64)
             if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:

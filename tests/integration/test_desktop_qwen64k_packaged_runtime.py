@@ -201,7 +201,7 @@ def _runtime_for(fake_runtime):
     ("category", "reason"),
     [
         ("kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        ("unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ("unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         ("rope_yarn_eval_failure", "runtime_completion_smoke_rope_yarn_eval_failure"),
         ("worker_timeout", "runtime_completion_smoke_worker_timeout"),
         ("worker_dead", "runtime_completion_smoke_worker_dead"),

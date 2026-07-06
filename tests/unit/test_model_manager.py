@@ -5811,6 +5811,95 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
 
 
 
+
+
+def test_llama_worker_render_complete_prefers_qwen_jinja_when_direct_template_rejects_enable_thinking(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'render reject fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        """
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.metadata = {
+            'general.name': 'Qwen3 test',
+            'tokenizer.chat_template': "{% for message in messages %}<|im_start|>{{ message['role'] }}\\n{{ message['content'] }}<|im_end|>{% endfor %}{% if enable_thinking == false %}<|im_start|>assistant\\n/no_think\\n{% endif %}",
+        }
+    def apply_chat_template(self, messages, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+        return 'unsafe direct template'
+    def create_completion(self, prompt, **kwargs):
+        if '/no_think' not in prompt:
+            return {'choices': [{'text': '<think>unsafe</think> visible'}]}
+        return {'choices': [{'text': 'safe ok'}]}
+""",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'Qwen3-8B-Q4_K_M.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result['choices'][0]['message']['content'] == 'safe ok'
+
+
+def test_llama_worker_render_complete_reports_safe_render_kwarg_rejection(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'render failure fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        """
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise TypeError("got an unexpected keyword argument 'tokenize' for SECRET_PROMPT")
+    def create_completion(self, prompt, **kwargs):
+        return {'choices': [{'text': 'should not run'}]}
+""",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'Qwen3-8B-Q4_K_M.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['rejected_generation_kwarg'] == 'tokenize'
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,enable_thinking,token_place_provider,token_place_template_policy,tokenize'
+    assert 'SECRET_PROMPT' not in json.dumps(diagnostics)
+
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

@@ -897,6 +897,55 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
+def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readiness_fields(monkeypatch):
+    class NestedWorkerDiagnosticRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            return {
+                "api_v1_response": {
+                    "error": {
+                        "code": "compute_node_internal_error",
+                        "worker_diagnostics": {
+                            "rejected_generation_kwarg": "stream",
+                            "attempted_generation_kwargs": "max_tokens,stream",
+                            "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                            "result_shape": "dict_malformed",
+                        },
+                    }
+                }
+            }
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=NestedWorkerDiagnosticRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] == {
+        "rejected_generation_kwarg": "stream",
+        "attempted_generation_kwargs": "max_tokens,stream",
+        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+        "result_shape": "dict_malformed",
+    }
+    assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "stream"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,stream"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_result_shape"] == "dict_malformed"
+
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
     class ThinkRuntime:
         def render_and_tokenize_chat(self, *_args, **_kwargs):

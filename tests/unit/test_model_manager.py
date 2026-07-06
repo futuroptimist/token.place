@@ -5940,6 +5940,91 @@ def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatc
     assert created_tmpfiles
     assert not os.path.exists(created_tmpfiles[0])
 
+
+def test_subprocess_proxy_stream_marks_closed_on_eof(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = object()
+
+    sent_payloads = []
+
+    def fake_send(payload, *, check_health=True):
+        sent_payloads.append(payload)
+
+    monkeypatch.setattr(proxy, "_send", fake_send)
+    monkeypatch.setattr(
+        model_manager_module,
+        "_read_llama_subprocess_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(model_manager_module.LlamaCppWorkerEOFError("eof")),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert sent_payloads[0]["method"] == "create_chat_completion"
+
+
+def test_subprocess_proxy_ignores_unlink_failure_when_popen_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    unlink_calls = []
+    real_mkstemp = model_manager_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        return real_mkstemp(*args, **kwargs)
+
+    def failing_unlink(path):
+        unlink_calls.append(path)
+        raise PermissionError("busy temp worker")
+
+    monkeypatch.setattr(model_manager_module.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(model_manager_module.os, "unlink", failing_unlink)
+    monkeypatch.setattr(
+        model_manager_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        model_manager_module._SubprocessLlamaProxy(model_path="model.gguf")
+
+    assert unlink_calls
+
+
+def test_subprocess_proxy_close_ignores_temp_worker_unlink_failure(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+        def poll(self):
+            return 0
+
+    unlink_calls = []
+
+    def failing_unlink(path):
+        unlink_calls.append(path)
+        raise PermissionError("busy temp worker")
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._process = FakeProcess()
+    proxy._worker_tmpfile = "/tmp/token-place-worker.py"
+    monkeypatch.setattr(model_manager_module.os, "unlink", failing_unlink)
+
+    proxy.close()
+
+    assert unlink_calls == ["/tmp/token-place-worker.py"]
+    assert proxy._worker_tmpfile is None
+
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 

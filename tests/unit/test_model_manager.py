@@ -5801,6 +5801,145 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
 
 
+
+def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    popen_calls = []
+
+    class FakeStdin:
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def write(self, value):
+            self.writes.append(value)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.kwargs = kwargs
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = []
+            self.terminated = False
+            self.waited = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    def fake_popen(command, **kwargs):
+        process = FakeProcess(command, **kwargs)
+        popen_calls.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+    tmpfile = proxy._worker_tmpfile
+
+    assert tmpfile
+    assert os.path.exists(tmpfile)
+    assert popen_calls[0].command == [sys.executable, '-u', tmpfile]
+    assert popen_calls[0]._token_place_command == [sys.executable, '<runtime-worker-script>']
+    assert '"method": "__init__"' in popen_calls[0].stdin.writes[0]
+
+    proxy.close()
+
+    assert popen_calls[0].stdin.closed is True
+    assert popen_calls[0].terminated is True
+    assert popen_calls[0].waited is True
+    assert not os.path.exists(tmpfile)
+    assert proxy._worker_tmpfile is None
+
+
+def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    popen_commands = []
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        process = FakeProcess()
+        popen_commands.append(command)
+        return process
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no tmp')))
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+
+    assert proxy._worker_tmpfile is None
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+    assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    created_tmpfiles = []
+    real_mkstemp = model_manager_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        created_tmpfiles.append(path)
+        return fd, path
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', tracking_mkstemp)
+    monkeypatch.setattr(
+        model_manager_module.subprocess,
+        'Popen',
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError('spawn failed')),
+    )
+
+    with pytest.raises(OSError, match='spawn failed'):
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+
+    assert created_tmpfiles
+    assert not os.path.exists(created_tmpfiles[0])
+
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 

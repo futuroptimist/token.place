@@ -2142,6 +2142,8 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
     provider_hint = str(kwargs.pop('token_place_provider', '') or '').lower()
     policy_hint = str(kwargs.pop('token_place_template_policy', '') or '').lower()
+    template, metadata_qwen_evidence = _runtime_chat_template(llama)
+    qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
     render = getattr(llama, 'apply_chat_template', None)
     direct_apply_available = callable(render)
     if not direct_apply_available:
@@ -2160,19 +2162,50 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'jinja_renderer': False,
             }
         except TypeError as exc:
-            if 'enable_thinking' not in kwargs or not _type_error_is_unexpected_keyword(exc, 'enable_thinking'):
+            rejected_render_kwarg = None
+            for candidate in ('enable_thinking', 'tokenize', 'add_generation_prompt'):
+                if candidate in kwargs and _type_error_is_unexpected_keyword(exc, candidate):
+                    rejected_render_kwarg = candidate
+                    break
+            if rejected_render_kwarg is None:
+                raise
+            attempted_render_kwargs = ','.join(sorted(str(key) for key in kwargs))
+            if qwen_safe and isinstance(template, str) and template.strip() and _jinja_renderer_available():
+                messages = args[0] if args else kwargs.get('messages')
+                if not isinstance(messages, list):
+                    raise RuntimeError('runtime_chat_template_render_exception')
+                rendered = _render_gguf_jinja_chat_template(
+                    template,
+                    messages,
+                    llama,
+                    add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
+                    enable_thinking=kwargs.get('enable_thinking'),
+                )
+                return rendered, {
+                    'direct_apply_chat_template': direct_apply_available,
+                    'metadata_template': True,
+                    'jinja_renderer': True,
+                    'qwen_evidence': True,
+                    'method': 'apply_chat_template',
+                    'generation_exception_category': 'unsupported_generation_kwarg',
+                    'rejected_generation_kwarg': rejected_render_kwarg,
+                    'attempted_generation_kwargs': attempted_render_kwargs,
+                }
+            if rejected_render_kwarg == 'enable_thinking' and qwen_safe:
                 raise
             compatibility_kwargs = dict(kwargs)
-            compatibility_kwargs.pop('enable_thinking', None)
+            compatibility_kwargs.pop(rejected_render_kwarg, None)
             return render(*args, **compatibility_kwargs), {
                 'direct_apply_chat_template': direct_apply_available,
                 'metadata_template': False,
                 'jinja_renderer': False,
+                'method': 'apply_chat_template',
+                'generation_exception_category': 'unsupported_generation_kwarg',
+                'rejected_generation_kwarg': rejected_render_kwarg,
+                'attempted_generation_kwargs': attempted_render_kwargs,
             }
-    template, metadata_qwen_evidence = _runtime_chat_template(llama)
     if not isinstance(template, str) or not template.strip():
         raise RuntimeError('runtime_chat_template_metadata_missing')
-    qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
     if not qwen_safe:
         raise RuntimeError('runtime_chat_template_qwen_evidence_missing')
     if not _jinja_renderer_available():

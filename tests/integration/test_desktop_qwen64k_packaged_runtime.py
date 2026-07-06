@@ -56,11 +56,22 @@ class Llama:
         if os.environ.get('TOKEN_PLACE_FAIL_ALL_PROFILES') == '1' or 'type_k' not in kwargs:
             print('ggml_metal: KV cache allocation failed while creating llama_context', file=sys.stderr, flush=True)
             raise ValueError('Failed to create llama_context')
+    metadata = {'tokenizer.chat_template': r'''{{ bos_token }}{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}'''}
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+        rejected = os.environ.get('TOKEN_PLACE_RENDER_REJECT_KWARG')
+        if rejected in {'tokenize', 'add_generation_prompt', 'enable_thinking'}:
+            raise TypeError(f"got an unexpected keyword argument '{rejected}'")
         return '<qwen>'
     def tokenize(self, payload, add_bos=False):
         return [1] * 42
-    def create_completion(self, prompt, **kwargs):
+    def create_completion(self, *args, **kwargs):
+        rejected = os.environ.get('TOKEN_PLACE_PLAIN_REJECT_KWARG')
+        if rejected == 'prompt' and 'prompt' in kwargs:
+            raise TypeError("got an unexpected keyword argument 'prompt'")
+        if rejected == 'max_tokens' and 'max_tokens' in kwargs:
+            raise TypeError("got an unexpected keyword argument 'max_tokens'")
+        if not args and 'prompt' not in kwargs:
+            raise TypeError("missing required positional argument 'prompt'")
 """
         + completion_branch,
         encoding='utf-8',
@@ -201,7 +212,7 @@ def _runtime_for(fake_runtime):
     ("category", "reason"),
     [
         ("kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
-        ("unsupported_generation_kwarg", "runtime_completion_smoke_unsupported_generation_kwarg"),
+        ("unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         ("rope_yarn_eval_failure", "runtime_completion_smoke_rope_yarn_eval_failure"),
         ("worker_timeout", "runtime_completion_smoke_worker_timeout"),
         ("worker_dead", "runtime_completion_smoke_worker_dead"),
@@ -253,6 +264,48 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
     finally:
         proxy.close()
 
+
+
+def test_qwen64k_packaged_subprocess_render_kwarg_rejection_uses_safe_jinja_fallback(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_RENDER_REJECT_KWARG', 'tokenize')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='Qwen3-8B-Q4_K_M.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], max_tokens=1, enable_thinking=False, token_place_provider='qwen')
+        assert result['choices'][0]['message']['content'] == 'ok'
+        assert 'SECRET_PROMPT' not in str(getattr(proxy, 'last_diagnostics', {}))
+    finally:
+        proxy.close()
+
+
+def test_qwen64k_packaged_subprocess_plain_completion_max_tokens_rejection_is_precise_safe(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_PLAIN_REJECT_KWARG', 'max_tokens')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='Qwen3-8B-Q4_K_M.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], max_tokens=1, enable_thinking=False, token_place_provider='qwen')
+        diagnostics = exc_info.value.diagnostics
+        assert diagnostics['generation_exception_category'] in {'unexpected_kwarg', 'unsupported_generation_kwarg'}
+        assert diagnostics['rejected_generation_kwarg'] == 'max_tokens'
+        assert diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+        assert 'SECRET_PROMPT' not in str(diagnostics)
+
+        runtime, manager = _runtime_for(proxy)
+        assert runtime.ensure_api_v1_runtime_ready() is False
+        ready_diagnostics = manager.last_compute_diagnostics
+        assert ready_diagnostics['api_v1_readiness_error_reason'] == 'runtime_completion_smoke_plain_completion_unexpected_kwarg'
+        assert ready_diagnostics['api_v1_readiness_completion_smoke_rejected_generation_kwarg'] == 'max_tokens'
+        assert ready_diagnostics['api_v1_readiness_completion_smoke_attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+        assert 'SECRET_PROMPT' not in str(ready_diagnostics)
+    finally:
+        proxy.close()
 
 def test_qwen64k_packaged_fake_runtime_valid_generation_passes_readiness():
     runtime, manager = _runtime_for(_Qwen64kFakeRuntime())

@@ -151,14 +151,9 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
-        "empty_completion_output",
-        "thinking_leaked",
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
-        "malformed_completion_output",
-        "empty_completion_output",
-        "thinking_leaked",
     },
     "method": {
         "apply_chat_template",
@@ -3323,10 +3318,6 @@ class RelayClient:
     ) -> Tuple[Any, Dict[str, Any]]:
         """Call Qwen render-then-plain-completion while filtering rejected kwargs."""
 
-        allowed_plain_kwargs = {
-            "max_tokens", "temperature", "top_p", "top_k", "min_p", "stop",
-            "presence_penalty", "frequency_penalty", "repeat_penalty", "seed", "stream",
-        }
         removed: List[str] = []
         attempted_names: List[str] = []
         while True:
@@ -3492,7 +3483,14 @@ class RelayClient:
             return message
 
         if isinstance(completion, str) and completion.strip():
-            return {"role": "assistant", "content": completion}
+            model_profile = getattr(self.model_manager, "model_profile", {}) or {}
+            cleaned_content, invalid_reason = self._api_v1_normalize_qwen_non_thinking_content(
+                model_profile, completion
+            )
+            if invalid_reason is not None:
+                self._last_api_v1_invalid_model_output_reason = invalid_reason
+                return None
+            return {"role": "assistant", "content": cleaned_content}
 
         # API v1 relay inference is explicitly non-streaming; runtimes must return
         # a complete chat completion object for this path.

@@ -265,6 +265,14 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         return "runtime_completion_smoke_worker_timeout"
     if internal_reason in {"worker_dead", "runtime_worker_dead"}:
         return "runtime_completion_smoke_worker_dead"
+    # Map new plain-completion diagnostic categories surfaced by the subprocess worker.
+    generation_exception_category = error.get("generation_exception_category")
+    if generation_exception_category == "empty_completion_output":
+        return "runtime_completion_smoke_plain_completion_empty_output"
+    if generation_exception_category == "thinking_leaked":
+        return "runtime_completion_smoke_plain_completion_thinking_leaked"
+    if generation_exception_category == "malformed_completion_output":
+        return "runtime_completion_smoke_plain_completion_malformed_output"
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":

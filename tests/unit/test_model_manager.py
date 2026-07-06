@@ -5853,6 +5853,94 @@ def test_subprocess_worker_render_template_retries_tokenize_with_qwen_jinja_meta
     assert 'plaintext prompt' not in json.dumps(diagnostics)
 
 
+def test_subprocess_worker_render_template_retries_rejected_kwarg_without_metadata():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class RejectingRuntime:
+        metadata = {}
+
+        def apply_chat_template(self, _messages, **kwargs):
+            if 'tokenize' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'tokenize'")
+            return '<|im_start|>assistant\n'
+
+    rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
+        RejectingRuntime(),
+        [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
+        {'tokenize': False, 'add_generation_prompt': True},
+    )
+
+    assert rendered == '<|im_start|>assistant\n'
+    assert diagnostics['render_rejected_generation_kwarg'] == 'tokenize'
+    assert diagnostics['rejected_generation_kwarg'] == 'tokenize'
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,tokenize'
+    assert 'plaintext prompt' not in json.dumps(diagnostics)
+
+
+def test_subprocess_worker_render_template_retries_after_metadata_renderer_failure():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class RejectingRuntime:
+        metadata = {
+            'general.name': 'Qwen3 packaged test',
+            'tokenizer.chat_template': "{{ raise_exception('broken metadata template') }}",
+        }
+
+        def apply_chat_template(self, _messages, **kwargs):
+            if 'enable_thinking' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+            return '<|im_start|>assistant\n'
+
+    rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
+        RejectingRuntime(),
+        [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
+        {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+    )
+
+    assert rendered == '<|im_start|>assistant\n'
+    assert diagnostics['render_rejected_generation_kwarg'] == 'enable_thinking'
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,enable_thinking,tokenize'
+    assert 'plaintext prompt' not in json.dumps(diagnostics)
+
+
+def test_subprocess_worker_render_template_failure_carries_safe_rejected_kwarg_diagnostics():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class RejectingRuntime:
+        metadata = {}
+
+        def apply_chat_template(self, _messages, **kwargs):
+            if 'add_generation_prompt' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'add_generation_prompt'")
+            raise RuntimeError('fallback renderer is unavailable')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        namespace['_render_chat_with_runtime_template'](
+            RejectingRuntime(),
+            [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
+            {'tokenize': False, 'add_generation_prompt': True},
+        )
+
+    assert str(excinfo.value) == 'runtime_chat_template_metadata_missing'
+    diagnostics = excinfo.value.diagnostics
+    assert diagnostics['render_rejected_generation_kwarg'] == 'add_generation_prompt'
+    assert diagnostics['rejected_generation_kwarg'] == 'add_generation_prompt'
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,tokenize'
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert 'plaintext prompt' not in json.dumps(diagnostics)
+
 def test_subprocess_worker_render_template_fails_closed_with_safe_rejected_kwarg_diagnostics():
     from utils.llm import model_manager as model_manager_module
 

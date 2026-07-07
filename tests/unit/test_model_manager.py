@@ -4706,6 +4706,33 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
+def test_runtime_message_content_text_preserves_paragraph_breaks_between_blocks():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    assert namespace['_runtime_message_content_text']([
+        {'type': 'text', 'text': 'First block'},
+        {'type': 'input_text', 'input_text': 'Second block'},
+    ]) == 'First block\n\nSecond block'
+
+
+def test_runtime_message_content_text_rejects_non_text_blocks():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    with pytest.raises(RuntimeError, match='runtime_chat_template_render_exception'):
+        namespace['_runtime_message_content_text']([
+            {'type': 'text', 'text': 'Describe this image'},
+            {'type': 'input_image', 'image_url': {'url': 'data:image/png;base64,AAAA'}},
+        ])
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()

@@ -5169,6 +5169,10 @@ def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
     assert envelope['api_v1_response']['message']['content'] == 'ok'
     assert manager.runtime.calls[0]['bridge'] == 'render_and_tokenize_chat'
     assert manager.runtime.calls[0]['messages'][-1]['content'] == 'hello'
+    assert manager.runtime.calls[0]['template_kwargs'] == {
+        'token_place_provider': 'qwen',
+        'enable_thinking': False,
+    }
 
 
 def test_qwen_no_think_messages_preserves_content_blocks_without_injection():

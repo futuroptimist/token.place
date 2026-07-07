@@ -44,6 +44,14 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+def _new_llama_cpp_inference_request_error(
+    message: str, *, diagnostics: Optional[Dict[str, Any]] = None
+) -> RuntimeError:
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    return LlamaCppInferenceRequestError(message, diagnostics=diagnostics)
+
+
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
     re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
     re.compile(r"unexpected keyword argument\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"),
@@ -2332,9 +2340,6 @@ class RelayClient:
     def _api_v1_prepare_qwen_non_thinking_messages(
         cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        if cls._api_v1_qwen_non_thinking_required(model_profile):
-            # Preserve user content exactly; do not inject /no_think.
-            return [dict(message) for message in messages]
         return [dict(message) for message in messages]
 
     @classmethod
@@ -3043,6 +3048,7 @@ class RelayClient:
         is_qwen_non_thinking = (
             self._api_v1_qwen_non_thinking_required(model_profile)
         )
+        admission_enable_thinking = False if is_qwen_non_thinking else None
         # Prefer a packaged-runtime bridge that renders and tokenizes inside the
         # loaded worker process. This keeps Qwen admission aligned with the same
         # GGUF/Jinja template surface used by generation and avoids returning or
@@ -3050,19 +3056,13 @@ class RelayClient:
         prompt_tokens = self._api_v1_render_and_tokenize_chat_prompt(
             llm_instance,
             messages,
-            enable_thinking=None,
+            enable_thinking=admission_enable_thinking,
             model_profile=model_profile,
         )
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
                 messages,
-                # Qwen generation below is controlled by the message-level
-                # ``/no_think`` directive because llama-cpp-python's
-                # ``create_chat_completion`` API does not expose template kwargs.
-                # Admission must render the same message shape, rather than adding
-                # an admission-only ``enable_thinking=False`` assistant prefix that
-                # over-counts near-limit requests.
                 enable_thinking=None,
                 allow_chat_format_fallback=not is_qwen_non_thinking,
             )
@@ -3364,16 +3364,17 @@ class RelayClient:
                     else _classify_safe_generation_exception(exc)
                 )
                 if self._api_v1_qwen_non_thinking_required(model_profile) and rejected == "enable_thinking":
-                    error = type("LlamaCppInferenceRequestError", (RuntimeError,), {})("runtime_qwen_non_thinking_hard_switch_unavailable")
-                    error.diagnostics = {
-                        "code": "compute_node_runtime_unavailable",
-                        "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
-                        "internal_reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
-                        "rejected_generation_kwarg": "enable_thinking",
-                        "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
-                        "retryable": False,
-                    }
-                    raise error
+                    raise _new_llama_cpp_inference_request_error(
+                        "runtime_qwen_non_thinking_hard_switch_unavailable",
+                        diagnostics={
+                            "code": "compute_node_runtime_unavailable",
+                            "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                            "internal_reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                            "rejected_generation_kwarg": "enable_thinking",
+                            "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                            "retryable": False,
+                        },
+                    )
                 if category not in {"unsupported_generation_kwarg", "unsupported_render_kwarg"} or not rejected:
                     raise
                 if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed", "enable_thinking"} or len(removed) >= max_removed_kwargs:

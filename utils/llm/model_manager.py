@@ -2209,9 +2209,11 @@ def _runtime_message_content_text(content):
         malformed_text_block = False
         for block in content:
             if not isinstance(block, dict):
+                malformed_text_block = True
                 continue
             block_type = block.get('type')
             if block_type not in {'text', 'input_text'}:
+                malformed_text_block = True
                 continue
             text = block.get('text')
             if text is None and block_type == 'input_text':
@@ -2220,10 +2222,10 @@ def _runtime_message_content_text(content):
                 malformed_text_block = True
                 continue
             parts.append(text)
-        if parts:
-            return ''.join(parts)
         if malformed_text_block:
             raise RuntimeError('runtime_chat_template_render_exception')
+        if parts:
+            return '\\n\\n'.join(parts)
     raise RuntimeError('runtime_chat_template_render_exception')
 
 def _render_qwen_api_v1_non_thinking_template(messages, llama, *, add_generation_prompt=True):

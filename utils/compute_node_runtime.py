@@ -262,9 +262,9 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
             generation_exception_category = worker_category
     if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
         return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
-    # Render-template surface failures (admission/context-token stage) are checked
-    # before generic generation/kwarg reasons since their internal_reason values are
-    # disjoint from the completion-path values below.
+    # Render-template surface failures (admission/context-token stage) use distinct
+    # internal_reason values (runtime_chat_template_*) that do not overlap with the
+    # completion-path values checked in the blocks below.
     if internal_reason in {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",

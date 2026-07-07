@@ -3859,12 +3859,11 @@ class RelayClient:
                     "rope_yarn_eval_failure",
                     "worker_timeout",
                     "worker_dead",
+                    "unsupported_render_kwarg",
                 }:
                     internal_reason = f"runtime_{category}"
                 elif category == "unsupported_generation_kwarg":
                     internal_reason = "unsupported_generation_option"
-                elif category == "unsupported_render_kwarg":
-                    internal_reason = "unsupported_render_kwarg"
                 else:
                     internal_reason = (
                         safe_worker_diagnostics.get("reason")

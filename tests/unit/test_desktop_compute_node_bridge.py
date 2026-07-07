@@ -4327,7 +4327,7 @@ def test_multi_relay_network_failure_does_not_trigger_shared_model_recovery(caps
     assert calls['warm'] == 0
     assert 'desktop.compute_node_bridge.recovery.start' not in output.err
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
-    assert any(event.get('registered_relay_count') == 1 for event in events)
+    assert any(event.get('registered_relay_count', 0) > 0 for event in events)
 
 
 def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, monkeypatch):

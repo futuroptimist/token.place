@@ -130,6 +130,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     },
     "reason": {
         "unsupported_generation_option",
+        "unsupported_render_kwarg",
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
@@ -142,6 +143,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
+        "unsupported_render_kwarg",
         "unexpected_kwarg",
         "unsupported_prompt_kwarg",
         "unsupported_stream_kwarg",
@@ -3857,6 +3859,7 @@ class RelayClient:
                     "rope_yarn_eval_failure",
                     "worker_timeout",
                     "worker_dead",
+                    "unsupported_render_kwarg",
                 }:
                     internal_reason = f"runtime_{category}"
                 elif category == "unsupported_generation_kwarg":
@@ -3893,20 +3896,32 @@ class RelayClient:
                     "Desktop runtime rejected API v1 relay inference request",
                     exc_info=True,
                 )
+                safe_error = {
+                    "code": error_code,
+                    "message": "Desktop runtime rejected the inference request",
+                    "exception_category": category,
+                    "exception_type": (
+                        safe_worker_diagnostics.get("exception_type")
+                        if isinstance(safe_worker_diagnostics, dict)
+                        else None
+                    ),
+                    "worker_diagnostics": safe_worker_diagnostics,
+                }
+                for safe_key in (
+                    "rejected_generation_kwarg",
+                    "attempted_generation_kwargs",
+                    "attempted_plain_completion_methods",
+                    "method",
+                    "generation_exception_category",
+                    "result_shape",
+                ):
+                    safe_value = safe_worker_diagnostics.get(safe_key)
+                    if safe_value is not None:
+                        safe_error[safe_key] = safe_value
                 return self._api_v1_response_envelope(
                     request_id,
                     error=self._api_v1_enrich_safe_error(
-                        {
-                            "code": error_code,
-                            "message": "Desktop runtime rejected the inference request",
-                            "exception_category": category,
-                            "exception_type": (
-                                safe_worker_diagnostics.get("exception_type")
-                                if isinstance(safe_worker_diagnostics, dict)
-                                else None
-                            ),
-                            "worker_diagnostics": safe_worker_diagnostics,
-                        },
+                        safe_error,
                         request_id=request_id,
                         requested_context_tier=requested_context_tier,
                         prompt_tokens=prompt_tokens,

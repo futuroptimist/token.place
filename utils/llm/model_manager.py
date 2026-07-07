@@ -1857,6 +1857,10 @@ def _classify_generation_exception(exc):
 
 def _plain_completion_method_shape_category(exc):
     text = str(exc or '').lower()
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
+        return 'kv_cache_allocation'
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
+        return 'metal_memory_allocation'
     rejected = _extract_unsupported_generation_kwarg(text)
     if rejected == 'prompt':
         return 'unsupported_prompt_kwarg'
@@ -1985,6 +1989,13 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             'qwen_evidence',
             'testing_template_fallback',
             'render_rejected_generation_kwarg',
+            'plain_completion_create_completion_callable',
+            'plain_completion_llama_call_callable',
+            'plain_completion_signature_inspectable',
+            'plain_completion_accepts_prompt_kwarg',
+            'plain_completion_accepts_max_tokens_kwarg',
+            'plain_completion_accepts_var_kwargs',
+            'qwen_api_v1_non_thinking_template_fallback',
         }
         for key, value in extra.items():
             if (
@@ -2016,7 +2027,7 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
         diagnostics['exception_type'] = type(exc).__name__
         diagnostics['sanitized_error_summary'] = _sanitize_error_summary(exc)
         if reason == 'inference_exception':
-            diagnostics['generation_exception_category'] = _classify_generation_exception(exc)
+            diagnostics.setdefault('generation_exception_category', _classify_generation_exception(exc))
             message = str(exc)
             attempted = None
             if isinstance(request, dict) and isinstance(request.get('kwargs'), dict):
@@ -2142,6 +2153,41 @@ def _runtime_token_text(llama, token_name):
             pass
     return ''
 
+def _collapse_qwen_template_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                raise RuntimeError('runtime_chat_template_render_exception')
+            block_type = block.get('type')
+            if block_type in {'text', 'input_text'} and isinstance(block.get('text'), str):
+                parts.append(block.get('text'))
+        return ''.join(parts)
+    raise RuntimeError('runtime_chat_template_render_exception')
+
+def _render_qwen_api_v1_non_thinking_template(messages, llama, *, add_generation_prompt=True):
+    if not isinstance(messages, list):
+        raise RuntimeError('runtime_chat_template_render_exception')
+    bos_token = _runtime_token_text(llama, 'bos') or ''
+    rendered_parts = [bos_token] if bos_token else []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise RuntimeError('runtime_chat_template_render_exception')
+        role = message.get('role')
+        if role not in {'system', 'user', 'assistant'}:
+            raise RuntimeError('runtime_chat_template_render_exception')
+        if 'content' not in message:
+            raise RuntimeError('runtime_chat_template_render_exception')
+        content = _collapse_qwen_template_content(message.get('content'))
+        if not isinstance(content, str):
+            raise RuntimeError('runtime_chat_template_render_exception')
+        rendered_parts.append('<|im_start|>' + role + '\\n' + content + '<|im_end|>\\n')
+    if add_generation_prompt:
+        rendered_parts.append('<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n')
+    return ''.join(rendered_parts)
+
 def _render_gguf_jinja_chat_template(template, messages, llama, *, add_generation_prompt=True, enable_thinking=None):
     chat_format_module = None
     try:
@@ -2164,13 +2210,7 @@ def _render_gguf_jinja_chat_template(template, messages, llama, *, add_generatio
                 }
                 if enable_thinking is not None:
                     formatter_kwargs['enable_thinking'] = enable_thinking
-                try:
-                    rendered = formatter(**formatter_kwargs)
-                except TypeError as exc:
-                    if not _type_error_is_unexpected_keyword(exc, 'enable_thinking'):
-                        raise
-                    formatter_kwargs.pop('enable_thinking', None)
-                    rendered = formatter(**formatter_kwargs)
+                rendered = formatter(**formatter_kwargs)
                 prompt = getattr(rendered, 'prompt', rendered)
                 if isinstance(prompt, str):
                     return prompt
@@ -2208,52 +2248,20 @@ def _type_error_is_unexpected_keyword(exc, keyword):
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
-
-    def _rejection_diagnostics(rejected_kwarg, *, include_generation_category=True):
-        diagnostics = {
-            'direct_apply_chat_template': direct_apply_available,
-            'metadata_template': False,
-            'jinja_renderer': False,
-        }
-        if rejected_kwarg:
-            diagnostics.update({
-                'render_rejected_generation_kwarg': rejected_kwarg,
-                'rejected_generation_kwarg': rejected_kwarg,
-                'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
-                'method': 'apply_chat_template',
-            })
-        if rejected_kwarg and include_generation_category:
-            diagnostics['generation_exception_category'] = 'unsupported_render_kwarg'
-        return {key: value for key, value in diagnostics.items() if value is not None}
-
-    def _retry_without_rejected_kwarg(rejected_kwarg):
-        if not rejected_kwarg or not callable(render):
-            return None
-        # enable_thinking must never be removed as a compatibility retry.
-        # Dropping it would silently re-enable thinking on the non-thinking path.
-        # If apply_chat_template rejects enable_thinking, the caller must fall
-        # through to the GGUF/Jinja renderer (which honours enable_thinking) or
-        # fail closed with safe diagnostics.
-        if rejected_kwarg not in {'tokenize', 'add_generation_prompt'}:
-            return None
-        compatibility_kwargs = dict(kwargs)
-        compatibility_kwargs.pop(rejected_kwarg, None)
-        rendered = render(*args, **compatibility_kwargs)
-        return rendered, _rejection_diagnostics(rejected_kwarg)
-
-    def _raise_template_error(reason, rejected_kwarg=None):
-        try:
-            retry_result = _retry_without_rejected_kwarg(rejected_kwarg)
-        except Exception:
-            retry_result = None
-        if retry_result is not None:
-            return retry_result
-        raise _RuntimeTemplateRenderError(
-            reason,
-            _rejection_diagnostics(rejected_kwarg, include_generation_category=False),
-        )
     provider_hint = str(kwargs.pop('token_place_provider', '') or '').lower()
     policy_hint = str(kwargs.pop('token_place_template_policy', '') or '').lower()
+    qwen_policy = provider_hint == 'qwen' and 'qwen' in policy_hint
+    if 'enable_thinking' in kwargs and kwargs.get('enable_thinking') is not False:
+        raise _RuntimeTemplateRenderError('runtime_chat_template_render_exception', {
+            'generation_exception_category': 'qwen_non_thinking_hard_switch_unavailable',
+            'method': 'apply_chat_template',
+        })
+    if qwen_policy and 'enable_thinking' not in kwargs:
+        raise _RuntimeTemplateRenderError('runtime_qwen_non_thinking_hard_switch_missing', {
+            'generation_exception_category': 'qwen_non_thinking_hard_switch_unavailable',
+            'method': 'apply_chat_template',
+        })
+
     render = getattr(llama, 'apply_chat_template', None)
     direct_apply_available = callable(render)
     if not direct_apply_available:
@@ -2264,70 +2272,108 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             except Exception:
                 tokenizer = None
         render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
-    render_exc = None
     rejected_render_kwarg = None
+    attempted_render_kwargs = sorted(str(key) for key in kwargs)
+
+    def _diag(**extra):
+        diagnostics = {
+            'direct_apply_chat_template': direct_apply_available,
+            'metadata_template': False,
+            'jinja_renderer': False,
+            'qwen_evidence': bool(qwen_policy),
+        }
+        diagnostics.update({k: v for k, v in extra.items() if v is not None})
+        return diagnostics
+
     if callable(render):
         try:
-            return render(*args, **kwargs), {
-                'direct_apply_chat_template': direct_apply_available,
-                'metadata_template': False,
-                'jinja_renderer': False,
-            }
+            return render(*args, **kwargs), _diag()
         except TypeError as exc:
-            render_exc = exc
-            attempted_render_kwargs = sorted(str(key) for key in kwargs)
             rejected_render_kwarg = _extract_unsupported_generation_kwarg(str(exc), attempted_render_kwargs)
             if rejected_render_kwarg is None:
                 for candidate in ('enable_thinking', 'tokenize', 'add_generation_prompt'):
                     if candidate in kwargs and _type_error_is_unexpected_keyword(exc, candidate):
                         rejected_render_kwarg = candidate
                         break
-            if rejected_render_kwarg not in {'enable_thinking', 'tokenize', 'add_generation_prompt'}:
+            if rejected_render_kwarg in {'tokenize', 'add_generation_prompt'}:
+                compatibility_kwargs = dict(kwargs)
+                compatibility_kwargs.pop(rejected_render_kwarg, None)
+                try:
+                    return render(*args, **compatibility_kwargs), _diag(
+                        render_rejected_generation_kwarg=rejected_render_kwarg,
+                        rejected_generation_kwarg=rejected_render_kwarg,
+                        attempted_generation_kwargs=_safe_kwarg_names_csv(kwargs),
+                        generation_exception_category='unsupported_render_kwarg',
+                        method='apply_chat_template',
+                    )
+                except Exception:
+                    pass
+            elif rejected_render_kwarg not in {'enable_thinking'}:
                 raise
+
     template, metadata_qwen_evidence = _runtime_chat_template(llama)
-    if not isinstance(template, str) or not template.strip():
-        retry_result = _raise_template_error('runtime_chat_template_metadata_missing', rejected_render_kwarg)
-        if retry_result is not None:
-            return retry_result
     qwen_safe = metadata_qwen_evidence or provider_hint == 'qwen' or 'qwen' in policy_hint
-    if not qwen_safe:
-        retry_result = _raise_template_error('runtime_chat_template_qwen_evidence_missing', rejected_render_kwarg)
-        if retry_result is not None:
-            return retry_result
-    if not _jinja_renderer_available():
-        retry_result = _raise_template_error('runtime_chat_template_renderer_unavailable', rejected_render_kwarg)
-        if retry_result is not None:
-            return retry_result
     messages = args[0] if args else kwargs.get('messages')
     if not isinstance(messages, list):
         raise RuntimeError('runtime_chat_template_render_exception')
-    try:
-        rendered = _render_gguf_jinja_chat_template(
-            template,
+    if isinstance(template, str) and template.strip() and qwen_safe and _jinja_renderer_available():
+        try:
+            rendered = _render_gguf_jinja_chat_template(
+                template,
+                messages,
+                llama,
+                add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
+                enable_thinking=kwargs.get('enable_thinking'),
+            )
+            return rendered, {
+                'direct_apply_chat_template': False,
+                'metadata_template': True,
+                'jinja_renderer': True,
+                'qwen_evidence': True,
+                **({
+                    'render_rejected_generation_kwarg': rejected_render_kwarg,
+                    'rejected_generation_kwarg': rejected_render_kwarg,
+                    'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
+                    'generation_exception_category': 'unsupported_render_kwarg',
+                    'method': 'apply_chat_template',
+                } if rejected_render_kwarg else {}),
+            }
+        except Exception:
+            pass
+    if qwen_policy and qwen_safe:
+        rendered = _render_qwen_api_v1_non_thinking_template(
             messages,
             llama,
             add_generation_prompt=bool(kwargs.get('add_generation_prompt', True)),
-            enable_thinking=kwargs.get('enable_thinking'),
         )
-    except Exception:
-        retry_result = _raise_template_error('runtime_chat_template_render_exception', rejected_render_kwarg)
-        if retry_result is not None:
-            return retry_result
-    diagnostics = {
-        'direct_apply_chat_template': False,
-        'metadata_template': True,
-        'jinja_renderer': True,
-        'qwen_evidence': True,
-    }
-    if rejected_render_kwarg:
-        diagnostics.update({
-            'render_rejected_generation_kwarg': rejected_render_kwarg,
-            'rejected_generation_kwarg': rejected_render_kwarg,
-            'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
-            'generation_exception_category': 'unsupported_render_kwarg',
-            'method': 'apply_chat_template',
-        })
-    return rendered, diagnostics
+        return rendered, {
+            'direct_apply_chat_template': False,
+            'metadata_template': bool(isinstance(template, str) and template.strip()),
+            'jinja_renderer': False,
+            'qwen_evidence': True,
+            'qwen_api_v1_non_thinking_template_fallback': True,
+            **({
+                'render_rejected_generation_kwarg': rejected_render_kwarg,
+                'rejected_generation_kwarg': rejected_render_kwarg,
+                'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
+                'generation_exception_category': 'unsupported_render_kwarg',
+                'method': 'apply_chat_template',
+            } if rejected_render_kwarg else {}),
+        }
+    reason = 'runtime_chat_template_metadata_missing'
+    if isinstance(template, str) and template.strip():
+        if not qwen_safe:
+            reason = 'runtime_chat_template_qwen_evidence_missing'
+        elif not _jinja_renderer_available():
+            reason = 'runtime_chat_template_renderer_unavailable'
+        else:
+            reason = 'runtime_chat_template_render_exception'
+    raise _RuntimeTemplateRenderError(reason, _diag(
+        render_rejected_generation_kwarg=rejected_render_kwarg,
+        rejected_generation_kwarg=rejected_render_kwarg,
+        attempted_generation_kwargs=_safe_kwarg_names_csv(kwargs) if rejected_render_kwarg else None,
+        method='apply_chat_template' if rejected_render_kwarg else None,
+    ))
 
 def _testing_render_template_fallback_allowed(model_path):
     if os.environ.get('TOKEN_PLACE_ENV') != 'testing':
@@ -2409,6 +2455,7 @@ for line in sys.stdin:
                         'runtime_template_tokenizer_bridge_unavailable',
                         'runtime_chat_template_render_exception',
                         'runtime_chat_template_qwen_evidence_missing',
+                        'runtime_qwen_non_thinking_hard_switch_missing',
                     } else 'runtime_chat_template_render_exception'
                     _emit(_safe_request_error(reason, request=request, exc=exc, extra=getattr(exc, 'diagnostics', None) if isinstance(getattr(exc, 'diagnostics', None), dict) else (_render_diagnostics if isinstance(locals().get('_render_diagnostics'), dict) else None)))
                 continue
@@ -2484,6 +2531,7 @@ for line in sys.stdin:
                     'runtime_template_tokenizer_bridge_unavailable',
                     'runtime_chat_template_render_exception',
                     'runtime_chat_template_qwen_evidence_missing',
+                    'runtime_qwen_non_thinking_hard_switch_missing',
                 } else 'runtime_chat_template_render_exception'
                 if (
                     reason == 'runtime_chat_template_metadata_missing'
@@ -2512,6 +2560,24 @@ for line in sys.stdin:
             result = None
             completion_error = None
             create_completion = getattr(llama, 'create_completion', None)
+            plain_capabilities = {
+                'plain_completion_create_completion_callable': callable(create_completion),
+                'plain_completion_llama_call_callable': callable(llama),
+                'plain_completion_signature_inspectable': False,
+                'plain_completion_accepts_prompt_kwarg': None,
+                'plain_completion_accepts_max_tokens_kwarg': None,
+                'plain_completion_accepts_var_kwargs': None,
+            }
+            if callable(create_completion):
+                try:
+                    sig = inspect.signature(create_completion)
+                    plain_capabilities['plain_completion_signature_inspectable'] = True
+                    params = sig.parameters
+                    plain_capabilities['plain_completion_accepts_prompt_kwarg'] = 'prompt' in params
+                    plain_capabilities['plain_completion_accepts_max_tokens_kwarg'] = 'max_tokens' in params
+                    plain_capabilities['plain_completion_accepts_var_kwargs'] = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                except Exception:
+                    pass
             if callable(create_completion):
                 attempt_method = 'create_completion_keyword_prompt'
                 attempted_kwargs = ['max_tokens', 'prompt']
@@ -2538,7 +2604,7 @@ for line in sys.stdin:
                             completion_error = positional_exc
             if result is None and callable(llama) and (
                 not attempts
-                or attempts[-1].get('generation_exception_category') != 'worker_exception'
+                or attempts[-1].get('generation_exception_category') in {'unsupported_prompt_kwarg', 'unsupported_generation_kwarg', 'method_shape'}
             ):
                 try:
                     result = llama(rendered_prompt, max_tokens=max_tokens)
@@ -2549,6 +2615,7 @@ for line in sys.stdin:
                     completion_error = exc
             if result is None:
                 extra = dict(render_diagnostics)
+                extra.update(plain_capabilities)
                 extra.update({
                     'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
                     'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),
@@ -2561,6 +2628,7 @@ for line in sys.stdin:
             normalized, invalid_reason = _normalize_plain_completion_result(result)
             if invalid_reason is not None:
                 extra = dict(render_diagnostics)
+                extra.update(plain_capabilities)
                 extra.update({
                     'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
                     'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),

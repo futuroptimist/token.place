@@ -5854,7 +5854,7 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
-    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'kv_cache_allocation'
 
 
 

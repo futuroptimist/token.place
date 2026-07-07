@@ -63,6 +63,7 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
+    "qwen_non_thinking_hard_switch_unavailable": "runtime_qwen_non_thinking_hard_switch_missing",
 }
 
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
@@ -91,6 +92,18 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "direct_apply_chat_template",
+    "metadata_template",
+    "jinja_renderer",
+    "qwen_evidence",
+    "render_rejected_generation_kwarg",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
 }
 
 
@@ -109,6 +122,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
+        "runtime_qwen_non_thinking_hard_switch_missing",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -127,6 +141,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "qwen_non_thinking_hard_switch_unavailable",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -179,7 +194,7 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "render_rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key in {"attempted_generation_kwargs", "attempted_plain_completion_methods"}:
         names = [part for part in bounded.split(",") if part]
@@ -277,6 +292,16 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
         "runtime_rejected_generation_options",
         "runtime_unsupported_generation_kwarg",
     }:
+        method = error.get("method")
+        rejected = error.get("rejected_generation_kwarg")
+        if not rejected and isinstance(worker_diag, dict):
+            rejected = worker_diag.get("rejected_generation_kwarg")
+            method = method or worker_diag.get("method")
+        if rejected:
+            if method == "apply_chat_template":
+                return "runtime_completion_smoke_render_template_unexpected_kwarg"
+            if isinstance(method, str) and (method.startswith("create_completion") or method == "llama_call_positional_prompt"):
+                return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
         return "runtime_completion_smoke_unsupported_generation_kwarg"
     if internal_reason in {"rope_yarn_eval_failure", "runtime_rope_yarn_eval_failure"}:
         return "runtime_completion_smoke_rope_yarn_eval_failure"
@@ -291,6 +316,16 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
     if error.get("code") == "compute_node_invalid_model_output":
         return "runtime_completion_smoke_invalid_model_output"
     if error.get("code") == "compute_node_options_unsupported":
+        method = error.get("method")
+        rejected = error.get("rejected_generation_kwarg")
+        if not rejected and isinstance(worker_diag, dict):
+            rejected = worker_diag.get("rejected_generation_kwarg")
+            method = method or worker_diag.get("method")
+        if rejected:
+            if method == "apply_chat_template":
+                return "runtime_completion_smoke_render_template_unexpected_kwarg"
+            if isinstance(method, str) and (method.startswith("create_completion") or method == "llama_call_positional_prompt"):
+                return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
         return "runtime_completion_smoke_unsupported_generation_kwarg"
     return "runtime_completion_smoke_exception"
 
@@ -856,6 +891,13 @@ class ComputeNodeRuntime:
                         "result_shape",
                         "method",
                         "generation_exception_category",
+                        "plain_completion_create_completion_callable",
+                        "plain_completion_llama_call_callable",
+                        "plain_completion_signature_inspectable",
+                        "plain_completion_accepts_prompt_kwarg",
+                        "plain_completion_accepts_max_tokens_kwarg",
+                        "plain_completion_accepts_var_kwargs",
+                        "qwen_api_v1_non_thinking_template_fallback",
                     ):
                         if key in smoke_error:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]

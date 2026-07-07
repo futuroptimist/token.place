@@ -119,7 +119,20 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "direct_apply_chat_template",
+    "metadata_template",
+    "jinja_renderer",
+    "qwen_evidence",
+    "render_rejected_generation_kwarg",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
 }
+
 
 
 _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
@@ -137,6 +150,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
+        "runtime_qwen_non_thinking_hard_switch_missing",
     },
     "generation_exception_category": {
         "metal_memory_allocation",
@@ -156,6 +170,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "qwen_non_thinking_hard_switch_unavailable",
     },
     "method": {
         "apply_chat_template",
@@ -203,7 +218,7 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "render_rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key in {"attempted_generation_kwargs", "attempted_plain_completion_methods"}:
         names = [part for part in bounded.split(",") if part]
@@ -720,13 +735,12 @@ class RelayClient:
     _API_V1_MAX_TOKENS_LIMIT = 8192
     _API_V1_MAX_SEED = 2**32 - 1
     # Single source of truth for API v1 Qwen behavior. API v1 is a
-    # non-reasoning chat-completions surface: Qwen thinking is disabled via the
-    # documented message-level /no_think control because the packaged
-    # llama-cpp-python create_chat_completion path used here does not reliably
-    # expose chat-template kwargs such as enable_thinking/template_kwargs.
+    # non-reasoning chat-completions surface: Qwen thinking is disabled only by
+    # hard render/template controls (enable_thinking=False or the internal
+    # non-thinking Qwen template fallback), never by mutating user messages with
+    # hidden /no_think control text.
     _API_V1_QWEN_NON_THINKING_POLICY = {
         "thinking_mode": "disabled",
-        "message_control": "/no_think",
         "visible_think_output_forbidden": True,
         "reasoning_content_forbidden": True,
     }
@@ -2300,28 +2314,9 @@ class RelayClient:
 
     @classmethod
     def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Inject Qwen's template-supported non-thinking control into user text."""
+        """Deprecated compatibility shim: copy messages without control injection."""
 
-        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
-        prepared = [dict(message) for message in messages]
-        for index in range(len(prepared) - 1, -1, -1):
-            if prepared[index].get("role") != "user":
-                continue
-            content = prepared[index].get("content")
-            if isinstance(content, str):
-                prepared[index]["content"] = f"{message_control}\n{content}"
-                return prepared
-            if isinstance(content, list):
-                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
-                for block in copied_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = f"{message_control}\n{block['text']}"
-                        prepared[index]["content"] = copied_blocks
-                        return prepared
-                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
-                prepared[index]["content"] = copied_blocks
-                return prepared
-        return prepared
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
@@ -2336,9 +2331,11 @@ class RelayClient:
     def _api_v1_prepare_qwen_non_thinking_messages(
         cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        if cls._api_v1_qwen_non_thinking_required(model_profile):
-            return cls._api_v1_qwen_no_think_messages(messages)
-        return messages
+        # API v1 Qwen non-thinking is enforced by hard runtime render/template
+        # controls.  Do not mutate user/system/assistant content with hidden
+        # /no_think message controls; user-provided literal /no_think remains
+        # ordinary text and is preserved by the normalizer.
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_normalize_qwen_non_thinking_content(
@@ -3325,7 +3322,10 @@ class RelayClient:
         while True:
             runtime_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             completion_kwargs = {"max_tokens": int(runtime_kwargs.get("max_tokens", 64) or 64)}
-            removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
+            never_filter = {"messages", "max_tokens", "stream", "seed"}
+            if self._api_v1_qwen_non_thinking_required(model_profile):
+                never_filter.add("enable_thinking")
+            removed_set = (set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))) - never_filter
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
@@ -3335,7 +3335,7 @@ class RelayClient:
                 completion_kwargs["token_place_provider"] = model_profile.get("provider")
             if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:
                 completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
-            if self._api_v1_qwen_non_thinking_required(model_profile) and "enable_thinking" not in removed_set:
+            if self._api_v1_qwen_non_thinking_required(model_profile):
                 completion_kwargs["enable_thinking"] = False
             attempted_names = sorted(str(key) for key in completion_kwargs)
             try:
@@ -3365,9 +3365,17 @@ class RelayClient:
                     if isinstance(safe_worker.get("generation_exception_category"), str)
                     else _classify_safe_generation_exception(exc)
                 )
+                if self._api_v1_qwen_non_thinking_required(model_profile) and rejected == "enable_thinking":
+                    safe_worker["code"] = "compute_node_runtime_unavailable"
+                    safe_worker["reason"] = "runtime_qwen_non_thinking_hard_switch_missing"
+                    safe_worker["generation_exception_category"] = "qwen_non_thinking_hard_switch_unavailable"
+                    safe_worker["rejected_generation_kwarg"] = "enable_thinking"
+                    safe_worker["retryable"] = False
+                    setattr(exc, "diagnostics", safe_worker)
+                    raise
                 if category != "unsupported_generation_kwarg" or not rejected:
                     raise
-                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
+                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed", "enable_thinking"} or len(removed) >= max_removed_kwargs:
                     raise
                 removed.append(rejected)
                 self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
@@ -3914,6 +3922,7 @@ class RelayClient:
                     "method",
                     "generation_exception_category",
                     "result_shape",
+                    "retryable",
                 ):
                     safe_value = safe_worker_diagnostics.get(safe_key)
                     if safe_value is not None:

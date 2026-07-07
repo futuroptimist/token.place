@@ -4226,7 +4226,7 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
         "enable_thinking": False,
     }
     messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
-    assert messages[-1]["content"].startswith("/no_think\n")
+    assert not messages[-1]["content"].startswith("/no_think\n")
 
 
 
@@ -4307,11 +4307,13 @@ def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
         options={"max_tokens": 64},
     )
 
-    assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    calls = manager.runtime.create_chat_completion_from_rendered_prompt.call_args_list
-    assert calls[0].kwargs["enable_thinking"] is False
-    assert "enable_thinking" not in calls[1].kwargs
-    assert "enable_thinking" in client._api_v1_generation_kwargs_filtered
+    error = envelope["api_v1_response"]["error"]
+    assert error["internal_reason"] == "runtime_qwen_non_thinking_hard_switch_missing"
+    assert error["rejected_generation_kwarg"] == "enable_thinking"
+    assert error["retryable"] is False
+    assert manager.runtime.create_chat_completion_from_rendered_prompt.call_count == 1
+    assert manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs["enable_thinking"] is False
+    assert "enable_thinking" not in client._api_v1_generation_kwargs_filtered
 
 
 
@@ -5131,8 +5133,8 @@ def test_qwen_context_admission_uses_generation_aligned_no_think_messages_withou
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
     assert manager.runtime.calls[0]['template_kwargs'] == {}
-    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
-    assert manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
+    assert not manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
+    assert not manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
 
 
 def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
@@ -5166,16 +5168,17 @@ def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
     assert manager.runtime.calls[0]['bridge'] == 'render_and_tokenize_chat'
-    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
+    assert not manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
 
 
-def test_qwen_no_think_messages_injects_text_block_when_user_content_list_has_no_text():
-    prepared = RelayClient._api_v1_qwen_no_think_messages([
+def test_qwen_no_think_messages_preserves_content_blocks_without_internal_control():
+    original = [
         {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}]},
-    ])
+    ]
+    prepared = RelayClient._api_v1_qwen_no_think_messages(original)
 
-    assert prepared[0]['content'][0] == {'type': 'text', 'text': '/no_think\n'}
-    assert prepared[0]['content'][1]['type'] == 'image_url'
+    assert prepared == original
+    assert prepared is not original
 
 
 def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_control():
@@ -5573,7 +5576,7 @@ def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():
     policy = RelayClient._API_V1_QWEN_NON_THINKING_POLICY
 
     assert policy["thinking_mode"] == "disabled"
-    assert policy["message_control"] == "/no_think"
+    assert "message_control" not in policy
     assert policy["visible_think_output_forbidden"] is True
     assert policy["reasoning_content_forbidden"] is True
     assert RelayClient._api_v1_qwen_non_thinking_required(
@@ -6107,4 +6110,4 @@ def test_api_v1_qwen_no_think_survives_generation_kwarg_filtering():
     )
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    assert manager.runtime.calls[-1]["messages"][-1]["content"].startswith("/no_think")
+    assert not manager.runtime.calls[-1]["messages"][-1]["content"].startswith("/no_think")

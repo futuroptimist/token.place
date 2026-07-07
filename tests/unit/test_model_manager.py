@@ -3254,6 +3254,59 @@ def test_llama_worker_render_complete_denies_testing_fallback_outside_testing_en
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
+@pytest.mark.parametrize('rejected_kwarg', ['tokenize', 'add_generation_prompt'])
+def test_llama_worker_render_complete_preserves_rejected_render_kwarg_without_metadata(
+    tmp_path, monkeypatch, rejected_kwarg
+):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'reject render fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "REJECTED_KWARG = " + repr(rejected_kwarg) + "\n"
+        "class Llama:\n"
+        "    metadata = {}\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, **kwargs):\n"
+        "        if REJECTED_KWARG in kwargs:\n"
+        "            raise TypeError(f\"got an unexpected keyword argument '{REJECTED_KWARG}'\")\n"
+        "        raise AssertionError('unsafe render retry should not run without metadata fallback')\n"
+        "    def create_completion(self, *, prompt, **kwargs):\n"
+        "        raise AssertionError('completion should not run after unsafe render rejection')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'development')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'qwen-no-metadata.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert diagnostics['method'] == 'apply_chat_template'
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['rejected_generation_kwarg'] == rejected_kwarg
+    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,enable_thinking,tokenize'
+    assert 'secret prompt text' not in json.dumps(diagnostics)
+    assert 'rendered_prompt' not in diagnostics
+    assert 'model_output' not in diagnostics
+
+
 def test_llama_worker_render_complete_testing_fallback_keeps_bad_messages_safe(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -5853,7 +5906,8 @@ def test_subprocess_worker_render_template_retries_tokenize_with_qwen_jinja_meta
     assert 'plaintext prompt' not in json.dumps(diagnostics)
 
 
-def test_subprocess_worker_render_template_retries_rejected_kwarg_without_metadata():
+@pytest.mark.parametrize('rejected_kwarg', ['tokenize', 'add_generation_prompt'])
+def test_subprocess_worker_render_template_fails_closed_for_rejected_render_kwarg_without_metadata(rejected_kwarg):
     from utils.llm import model_manager as model_manager_module
 
     namespace = {}
@@ -5864,19 +5918,23 @@ def test_subprocess_worker_render_template_retries_rejected_kwarg_without_metada
         metadata = {}
 
         def apply_chat_template(self, _messages, **kwargs):
-            if 'tokenize' in kwargs:
-                raise TypeError("got an unexpected keyword argument 'tokenize'")
-            return '<|im_start|>assistant\n'
+            if rejected_kwarg in kwargs:
+                raise TypeError(f"got an unexpected keyword argument '{rejected_kwarg}'")
+            raise AssertionError('unsafe render retry should not run without metadata fallback')
 
-    rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
-        RejectingRuntime(),
-        [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
-        {'tokenize': False, 'add_generation_prompt': True},
-    )
+    with pytest.raises(RuntimeError) as excinfo:
+        namespace['_render_chat_with_runtime_template'](
+            RejectingRuntime(),
+            [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
+            {'tokenize': False, 'add_generation_prompt': True},
+        )
 
-    assert rendered == '<|im_start|>assistant\n'
-    assert diagnostics['render_rejected_generation_kwarg'] == 'tokenize'
-    assert diagnostics['rejected_generation_kwarg'] == 'tokenize'
+    assert str(excinfo.value) == 'runtime_chat_template_metadata_missing'
+    diagnostics = excinfo.value.diagnostics
+    assert diagnostics['method'] == 'apply_chat_template'
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['render_rejected_generation_kwarg'] == rejected_kwarg
+    assert diagnostics['rejected_generation_kwarg'] == rejected_kwarg
     assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,tokenize'
     assert 'plaintext prompt' not in json.dumps(diagnostics)
 

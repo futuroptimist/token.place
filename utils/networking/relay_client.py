@@ -119,6 +119,18 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
+    "direct_apply_chat_template",
+    "metadata_template",
+    "jinja_renderer",
+    "qwen_evidence",
+    "render_rejected_generation_kwarg",
 }
 
 
@@ -134,6 +146,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "runtime_qwen_non_thinking_hard_switch_unavailable",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -156,6 +169,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "qwen_non_thinking_hard_switch_unavailable",
     },
     "method": {
         "apply_chat_template",
@@ -720,13 +734,12 @@ class RelayClient:
     _API_V1_MAX_TOKENS_LIMIT = 8192
     _API_V1_MAX_SEED = 2**32 - 1
     # Single source of truth for API v1 Qwen behavior. API v1 is a
-    # non-reasoning chat-completions surface: Qwen thinking is disabled via the
-    # documented message-level /no_think control because the packaged
-    # llama-cpp-python create_chat_completion path used here does not reliably
-    # expose chat-template kwargs such as enable_thinking/template_kwargs.
+    # non-reasoning chat-completions surface: Qwen thinking is disabled only by
+    # hard render/template controls (enable_thinking=False or the internal
+    # non-thinking template fallback). User messages are never mutated with
+    # hidden /no_think control text.
     _API_V1_QWEN_NON_THINKING_POLICY = {
         "thinking_mode": "disabled",
-        "message_control": "/no_think",
         "visible_think_output_forbidden": True,
         "reasoning_content_forbidden": True,
     }
@@ -2299,31 +2312,6 @@ class RelayClient:
         return prepared
 
     @classmethod
-    def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Inject Qwen's template-supported non-thinking control into user text."""
-
-        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
-        prepared = [dict(message) for message in messages]
-        for index in range(len(prepared) - 1, -1, -1):
-            if prepared[index].get("role") != "user":
-                continue
-            content = prepared[index].get("content")
-            if isinstance(content, str):
-                prepared[index]["content"] = f"{message_control}\n{content}"
-                return prepared
-            if isinstance(content, list):
-                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
-                for block in copied_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = f"{message_control}\n{block['text']}"
-                        prepared[index]["content"] = copied_blocks
-                        return prepared
-                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
-                prepared[index]["content"] = copied_blocks
-                return prepared
-        return prepared
-
-    @classmethod
     def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
         return (
             isinstance(model_profile, dict)
@@ -2336,9 +2324,11 @@ class RelayClient:
     def _api_v1_prepare_qwen_non_thinking_messages(
         cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        if cls._api_v1_qwen_non_thinking_required(model_profile):
-            return cls._api_v1_qwen_no_think_messages(messages)
-        return messages
+        # API v1 Qwen non-thinking is enforced by hard render/template controls,
+        # never by injecting hidden /no_think message text. Return a normalized,
+        # copied message list unchanged so explicit user-provided /no_think text
+        # remains ordinary user content.
+        return cls._normalise_api_v1_chat_messages(messages)
 
     @classmethod
     def _api_v1_normalize_qwen_non_thinking_content(
@@ -3324,8 +3314,12 @@ class RelayClient:
         attempted_names: List[str] = []
         while True:
             runtime_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+            qwen_non_thinking_required = self._api_v1_qwen_non_thinking_required(model_profile)
+            never_filter = {"enable_thinking"} if qwen_non_thinking_required else set()
             completion_kwargs = {"max_tokens": int(runtime_kwargs.get("max_tokens", 64) or 64)}
-            removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
+            if qwen_non_thinking_required:
+                completion_kwargs["enable_thinking"] = False
+            removed_set = (set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))) - never_filter
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
@@ -3335,8 +3329,6 @@ class RelayClient:
                 completion_kwargs["token_place_provider"] = model_profile.get("provider")
             if model_profile.get("chat_template_policy") and "token_place_template_policy" not in removed_set:
                 completion_kwargs["token_place_template_policy"] = model_profile.get("chat_template_policy")
-            if self._api_v1_qwen_non_thinking_required(model_profile) and "enable_thinking" not in removed_set:
-                completion_kwargs["enable_thinking"] = False
             attempted_names = sorted(str(key) for key in completion_kwargs)
             try:
                 result = create_completion_from_rendered_prompt(messages, **completion_kwargs)
@@ -3365,9 +3357,19 @@ class RelayClient:
                     if isinstance(safe_worker.get("generation_exception_category"), str)
                     else _classify_safe_generation_exception(exc)
                 )
+                if qwen_non_thinking_required and rejected == "enable_thinking":
+                    fail_closed = RuntimeError("runtime_qwen_non_thinking_hard_switch_unavailable")
+                    fail_closed.diagnostics = {
+                        "code": "compute_node_runtime_unavailable",
+                        "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                        "rejected_generation_kwarg": "enable_thinking",
+                        "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                        "retryable": False,
+                    }
+                    raise fail_closed
                 if category != "unsupported_generation_kwarg" or not rejected:
                     raise
-                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
+                if rejected in never_filter or (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
                     raise
                 removed.append(rejected)
                 self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
@@ -3930,6 +3932,33 @@ class RelayClient:
                         rejected_option=rejected_option,
                     ),
                 )
+            exc_diagnostics = getattr(exc, "diagnostics", None)
+            if isinstance(exc_diagnostics, dict):
+                safe_worker_diagnostics = _safe_worker_diagnostics(exc_diagnostics)
+                if (
+                    safe_worker_diagnostics.get("reason") == "runtime_qwen_non_thinking_hard_switch_unavailable"
+                    or safe_worker_diagnostics.get("generation_exception_category") == "qwen_non_thinking_hard_switch_unavailable"
+                ):
+                    return self._api_v1_response_envelope(
+                        request_id,
+                        error=self._api_v1_enrich_safe_error(
+                            {
+                                "code": "compute_node_runtime_unavailable",
+                                "message": "Desktop runtime cannot guarantee Qwen non-thinking mode",
+                                "exception_category": safe_worker_diagnostics.get("generation_exception_category"),
+                                "worker_diagnostics": safe_worker_diagnostics,
+                                "rejected_generation_kwarg": safe_worker_diagnostics.get("rejected_generation_kwarg"),
+                                "generation_exception_category": safe_worker_diagnostics.get("generation_exception_category"),
+                            },
+                            request_id=request_id,
+                            requested_context_tier=requested_context_tier,
+                            prompt_tokens=prompt_tokens,
+                            requested_output_tokens=requested_output_tokens,
+                            internal_reason="runtime_qwen_non_thinking_hard_switch_unavailable",
+                            rejected_option="enable_thinking",
+                            retryable=False,
+                        ),
+                    )
             recovery_attempted = (
                 "replacement" in str(exc).lower()
                 or "restart" in str(exc).lower()

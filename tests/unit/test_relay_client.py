@@ -4226,7 +4226,8 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
         "enable_thinking": False,
     }
     messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
-    assert messages[-1]["content"].startswith("/no_think\n")
+    assert messages[-1]["content"] == "hi"
+    assert not messages[-1]["content"].startswith("/no_think")
 
 
 
@@ -4280,24 +4281,22 @@ def test_api_v1_qwen_render_then_complete_rejects_unproven_seed_option():
     manager.runtime.create_chat_completion_from_rendered_prompt.assert_not_called()
 
 
-def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
+def test_api_v1_qwen_render_then_complete_fails_closed_on_enable_thinking_rejection():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 
     manager = _ApiV1RuntimeManager()
     manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
-    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(side_effect=[
-        LlamaCppInferenceRequestError(
-            "unexpected keyword argument 'enable_thinking'",
-            diagnostics={
-                "code": "compute_node_options_unsupported",
-                "reason": "unsupported_generation_option",
-                "rejected_option": "enable_thinking",
-                "generation_exception_category": "unsupported_generation_kwarg",
-                "method": "create_chat_completion_from_rendered_prompt",
-            },
-        ),
-        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
-    ])
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(side_effect=LlamaCppInferenceRequestError(
+        "unexpected keyword argument 'enable_thinking'",
+        diagnostics={
+            "code": "compute_node_options_unsupported",
+            "reason": "unsupported_generation_option",
+            "rejected_option": "enable_thinking",
+            "rejected_generation_kwarg": "enable_thinking",
+            "generation_exception_category": "unsupported_generation_kwarg",
+            "method": "create_chat_completion_from_rendered_prompt",
+        },
+    ))
     client = _api_v1_validation_client(manager)
 
     envelope = client._generate_api_v1_response_with_runtime_model(
@@ -4307,11 +4306,13 @@ def test_api_v1_qwen_render_then_complete_retries_rejected_option_once():
         options={"max_tokens": 64},
     )
 
-    assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    calls = manager.runtime.create_chat_completion_from_rendered_prompt.call_args_list
-    assert calls[0].kwargs["enable_thinking"] is False
-    assert "enable_thinking" not in calls[1].kwargs
-    assert "enable_thinking" in client._api_v1_generation_kwargs_filtered
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] in {"compute_node_runtime_unavailable", "compute_node_internal_error"}
+    assert error["internal_reason"] == "runtime_qwen_non_thinking_hard_switch_unavailable"
+    assert error["rejected_generation_kwarg"] == "enable_thinking"
+    manager.runtime.create_chat_completion_from_rendered_prompt.assert_called_once()
+    assert manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs["enable_thinking"] is False
+    assert "enable_thinking" not in client._api_v1_generation_kwargs_filtered
 
 
 
@@ -5110,7 +5111,7 @@ def test_api_v1_stop_unregister_terminates_heartbeat_cleanly():
     assert relay_client._api_v1_heartbeat_thread is None
 
 
-def test_qwen_context_admission_uses_generation_aligned_no_think_messages_without_llama_fallback():
+def test_qwen_context_admission_preserves_messages_without_no_think_injection():
     class Runtime(_AdmissionRuntime):
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
             self.calls.append({'template_kwargs': kwargs, 'messages': messages})
@@ -5131,8 +5132,8 @@ def test_qwen_context_admission_uses_generation_aligned_no_think_messages_withou
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
     assert manager.runtime.calls[0]['template_kwargs'] == {}
-    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
-    assert manager.runtime.calls[-1]['messages'][-1]['content'].startswith('/no_think\n')
+    assert manager.runtime.calls[0]['messages'][-1]['content'] == 'hello'
+    assert manager.runtime.calls[-1]['messages'][-1]['content'] == 'hello'
 
 
 def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
@@ -5166,16 +5167,17 @@ def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
     assert manager.runtime.calls[0]['bridge'] == 'render_and_tokenize_chat'
-    assert manager.runtime.calls[0]['messages'][-1]['content'].startswith('/no_think\n')
+    assert manager.runtime.calls[0]['messages'][-1]['content'] == 'hello'
 
 
-def test_qwen_no_think_messages_injects_text_block_when_user_content_list_has_no_text():
-    prepared = RelayClient._api_v1_qwen_no_think_messages([
-        {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}]},
-    ])
+def test_qwen_prepare_non_thinking_messages_preserves_user_literal_no_think():
+    model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    prepared = RelayClient._api_v1_prepare_qwen_non_thinking_messages(
+        [{"role": "user", "content": "/no_think\nuser typed this"}],
+        model_profile,
+    )
 
-    assert prepared[0]['content'][0] == {'type': 'text', 'text': '/no_think\n'}
-    assert prepared[0]['content'][1]['type'] == 'image_url'
+    assert prepared == [{"role": "user", "content": "/no_think\nuser typed this"}]
 
 
 def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_control():
@@ -5573,7 +5575,7 @@ def test_api_v1_qwen_non_thinking_policy_is_single_source_of_truth():
     policy = RelayClient._API_V1_QWEN_NON_THINKING_POLICY
 
     assert policy["thinking_mode"] == "disabled"
-    assert policy["message_control"] == "/no_think"
+    assert "message_control" not in policy
     assert policy["visible_think_output_forbidden"] is True
     assert policy["reasoning_content_forbidden"] is True
     assert RelayClient._api_v1_qwen_non_thinking_required(
@@ -6107,4 +6109,5 @@ def test_api_v1_qwen_no_think_survives_generation_kwarg_filtering():
     )
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
-    assert manager.runtime.calls[-1]["messages"][-1]["content"].startswith("/no_think")
+    assert manager.runtime.calls[-1]["messages"][-1]["content"] == "hello"
+    assert manager.runtime.calls[-1]["enable_thinking"] is False

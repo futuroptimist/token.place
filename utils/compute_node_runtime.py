@@ -91,6 +91,18 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "stderr_tail",
     "child_stderr_tail",
     "sanitized_error_summary",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
+    "direct_apply_chat_template",
+    "metadata_template",
+    "jinja_renderer",
+    "qwen_evidence",
+    "render_rejected_generation_kwarg",
 }
 
 
@@ -262,6 +274,16 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
             generation_exception_category = worker_category
     if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
         return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
+    rejected_kwarg = error.get("rejected_generation_kwarg")
+    method = error.get("method")
+    if not rejected_kwarg and isinstance(worker_diag, dict):
+        rejected_kwarg = worker_diag.get("rejected_generation_kwarg")
+        method = method or worker_diag.get("method")
+    if isinstance(rejected_kwarg, str) and rejected_kwarg:
+        if method == "apply_chat_template":
+            return "runtime_completion_smoke_render_template_unexpected_kwarg"
+        if isinstance(method, str) and (method.startswith("create_completion") or method == "llama_call_positional_prompt"):
+            return "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     # Render-template surface failures (admission/context-token stage) use distinct
     # internal_reason values (runtime_chat_template_*) that do not overlap with the
     # completion-path values checked in the blocks below.
@@ -856,6 +878,13 @@ class ComputeNodeRuntime:
                         "result_shape",
                         "method",
                         "generation_exception_category",
+                        "plain_completion_create_completion_callable",
+                        "plain_completion_llama_call_callable",
+                        "plain_completion_signature_inspectable",
+                        "plain_completion_accepts_prompt_kwarg",
+                        "plain_completion_accepts_max_tokens_kwarg",
+                        "plain_completion_accepts_var_kwargs",
+                        "qwen_api_v1_non_thinking_template_fallback",
                     ):
                         if key in smoke_error:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]

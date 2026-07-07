@@ -2229,7 +2229,7 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
     def _retry_without_rejected_kwarg(rejected_kwarg):
         if not rejected_kwarg or not callable(render):
             return None
-        if rejected_kwarg != 'enable_thinking':
+        if rejected_kwarg not in {'enable_thinking', 'tokenize', 'add_generation_prompt'}:
             return None
         compatibility_kwargs = dict(kwargs)
         compatibility_kwargs.pop(rejected_kwarg, None)

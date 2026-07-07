@@ -4355,11 +4355,10 @@ def test_llama_worker_render_and_tokenize_chat_fails_closed_when_enable_thinking
         llama_body="""
 class Llama:
     def __init__(self, *args, **kwargs):
-        self.calls = []
+        pass
     def apply_chat_template(self, messages, **kwargs):
         if not kwargs.get('enable_thinking', True):
             # First call: enable_thinking=False is present – reject it
-            self.calls.append('with_enable_thinking')
             raise TypeError('unexpected keyword argument enable_thinking')
         # If called a second time without enable_thinking, fail loudly to catch
         # the old retry-without-enable_thinking behaviour.
@@ -6053,8 +6052,6 @@ def test_subprocess_worker_render_template_uses_gguf_jinja_when_enable_thinking_
     namespace = {}
     worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
     exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
-
-    jinja_calls = []
 
     class QwenRuntime:
         metadata = {

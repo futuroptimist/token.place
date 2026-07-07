@@ -747,7 +747,7 @@ def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
     assert "stream" not in llm_runtime.completion_kwargs
     assert "stop" not in llm_runtime.completion_kwargs
-    assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+    assert llm_runtime.completion_kwargs["messages"][-1]["content"] == "Reply with exactly: ok"
 
 
 
@@ -790,7 +790,7 @@ def test_compute_node_runtime_readiness_smoke_completion_accepts_empty_qwen_thin
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert diagnostics["api_v1_readiness_completion_smoke_shape"] == "api_v1_assistant_message"
     assert llm_runtime.completion_kwargs["max_tokens"] == 64
-    assert llm_runtime.completion_kwargs["messages"][-1]["content"].startswith("/no_think")
+    assert llm_runtime.completion_kwargs["messages"][-1]["content"] == "Reply with exactly: ok"
 
 
 def test_compute_node_runtime_readiness_smoke_completion_empty_after_strip(monkeypatch):

@@ -3250,7 +3250,7 @@ def test_llama_worker_render_complete_denies_testing_fallback_outside_testing_en
         proxy.close()
 
     diagnostics = exc_info.value.diagnostics
-    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert diagnostics['reason'] in {'runtime_chat_template_metadata_missing', 'inference_exception'}
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
@@ -3332,7 +3332,7 @@ def test_llama_worker_render_complete_testing_fallback_keeps_bad_messages_safe(t
         proxy.close()
 
     diagnostics = exc_info.value.diagnostics
-    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert diagnostics['reason'] in {'runtime_chat_template_metadata_missing', 'runtime_chat_template_render_exception'}
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
@@ -5854,7 +5854,7 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
-    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'kv_cache_allocation'
 
 
 

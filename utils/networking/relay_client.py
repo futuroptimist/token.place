@@ -98,6 +98,13 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "rejected_generation_kwarg",
     "attempted_generation_kwargs",
     "attempted_plain_completion_methods",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
     "stream",
@@ -134,6 +141,8 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "runtime_qwen_non_thinking_hard_switch_missing",
+        "runtime_qwen_non_thinking_hard_switch_unavailable",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -144,6 +153,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
         "unsupported_render_kwarg",
+        "qwen_non_thinking_hard_switch_unavailable",
         "unexpected_kwarg",
         "unsupported_prompt_kwarg",
         "unsupported_stream_kwarg",
@@ -2300,28 +2310,14 @@ class RelayClient:
 
     @classmethod
     def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Inject Qwen's template-supported non-thinking control into user text."""
+        """Return a defensive copy without injecting Qwen text controls.
 
-        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
-        prepared = [dict(message) for message in messages]
-        for index in range(len(prepared) - 1, -1, -1):
-            if prepared[index].get("role") != "user":
-                continue
-            content = prepared[index].get("content")
-            if isinstance(content, str):
-                prepared[index]["content"] = f"{message_control}\n{content}"
-                return prepared
-            if isinstance(content, list):
-                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
-                for block in copied_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = f"{message_control}\n{block['text']}"
-                        prepared[index]["content"] = copied_blocks
-                        return prepared
-                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
-                prepared[index]["content"] = copied_blocks
-                return prepared
-        return prepared
+        API v1 Qwen non-thinking is enforced by hard render/template controls
+        (enable_thinking=False or the internal non-thinking template), never by
+        mutating user messages with /no_think.
+        """
+
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
@@ -2337,8 +2333,9 @@ class RelayClient:
         cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         if cls._api_v1_qwen_non_thinking_required(model_profile):
-            return cls._api_v1_qwen_no_think_messages(messages)
-        return messages
+            # Preserve user content exactly; do not inject /no_think.
+            return [dict(message) for message in messages]
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_normalize_qwen_non_thinking_content(
@@ -3325,7 +3322,8 @@ class RelayClient:
         while True:
             runtime_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             completion_kwargs = {"max_tokens": int(runtime_kwargs.get("max_tokens", 64) or 64)}
-            removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
+            never_filter = {"enable_thinking"} if self._api_v1_qwen_non_thinking_required(model_profile) else set()
+            removed_set = (set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))) - never_filter
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
@@ -3365,9 +3363,20 @@ class RelayClient:
                     if isinstance(safe_worker.get("generation_exception_category"), str)
                     else _classify_safe_generation_exception(exc)
                 )
-                if category != "unsupported_generation_kwarg" or not rejected:
+                if self._api_v1_qwen_non_thinking_required(model_profile) and rejected == "enable_thinking":
+                    error = type("LlamaCppInferenceRequestError", (RuntimeError,), {})("runtime_qwen_non_thinking_hard_switch_unavailable")
+                    error.diagnostics = {
+                        "code": "compute_node_runtime_unavailable",
+                        "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                        "internal_reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                        "rejected_generation_kwarg": "enable_thinking",
+                        "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                        "retryable": False,
+                    }
+                    raise error
+                if category not in {"unsupported_generation_kwarg", "unsupported_render_kwarg"} or not rejected:
                     raise
-                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
+                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed", "enable_thinking"} or len(removed) >= max_removed_kwargs:
                     raise
                 removed.append(rejected)
                 self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)

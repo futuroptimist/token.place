@@ -5854,7 +5854,7 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
-    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'kv_cache_allocation'
 
 
 
@@ -6004,7 +6004,7 @@ def test_subprocess_worker_render_template_failure_carries_safe_rejected_kwarg_d
     assert diagnostics['render_rejected_generation_kwarg'] == 'add_generation_prompt'
     assert diagnostics['rejected_generation_kwarg'] == 'add_generation_prompt'
     assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,tokenize'
-    assert 'generation_exception_category' not in diagnostics
+    assert diagnostics['generation_exception_category'] == 'unsupported_render_kwarg'
     assert 'plaintext prompt' not in json.dumps(diagnostics)
 
 def test_subprocess_worker_render_template_fails_closed_with_safe_rejected_kwarg_diagnostics():

@@ -5924,7 +5924,7 @@ def test_subprocess_worker_render_template_retries_rejected_render_kwarg_without
 
     assert rendered == '<|im_start|>assistant\n'
     assert diagnostics['method'] == 'apply_chat_template'
-    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['generation_exception_category'] == 'unsupported_render_kwarg'
     assert diagnostics['render_rejected_generation_kwarg'] == rejected_kwarg
     assert diagnostics['rejected_generation_kwarg'] == rejected_kwarg
     assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,tokenize'

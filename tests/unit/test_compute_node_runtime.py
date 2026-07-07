@@ -147,6 +147,15 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         ({"worker_diagnostics": {"generation_exception_category": "malformed_completion_output"}}, "runtime_completion_smoke_plain_completion_malformed_output"),
         # Top-level takes precedence over nested.
         ({"generation_exception_category": "empty_completion_output", "worker_diagnostics": {"generation_exception_category": "thinking_leaked"}}, "runtime_completion_smoke_plain_completion_empty_output"),
+        # Render-path kwarg rejections map to the render-specific reason.
+        ({"generation_exception_category": "unsupported_render_kwarg"}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
+        ({"worker_diagnostics": {"generation_exception_category": "unsupported_render_kwarg"}}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
+        ({"internal_reason": "unsupported_render_kwarg"}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
+        # Template-path internal_reason values map to the render-exception reason.
+        ({"internal_reason": "runtime_chat_template_metadata_missing"}, "runtime_completion_smoke_render_template_exception"),
+        ({"internal_reason": "runtime_chat_template_renderer_unavailable"}, "runtime_completion_smoke_render_template_exception"),
+        ({"internal_reason": "runtime_chat_template_qwen_evidence_missing"}, "runtime_completion_smoke_render_template_exception"),
+        ({"internal_reason": "runtime_chat_template_render_exception"}, "runtime_completion_smoke_render_template_exception"),
     ],
 )
 def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, expected_reason):
@@ -223,6 +232,27 @@ def test_classify_completion_smoke_exception_uses_safe_worker_unsupported_reason
     assert category == "unsupported_generation_kwarg"
     assert reason == "runtime_completion_smoke_plain_completion_unexpected_kwarg"
     assert diagnostics["worker_diagnostics"] == {"reason": "unsupported_generation_option"}
+
+
+def test_classify_completion_smoke_exception_uses_unsupported_render_kwarg_worker_category():
+    """Worker diagnostics with unsupported_render_kwarg category maps to render-specific reason."""
+    exc = _SmokeDiagnosticsError(
+        {
+            "generation_exception_category": "unsupported_render_kwarg",
+            "rejected_generation_kwarg": "tokenize",
+            "method": "apply_chat_template",
+            "prompt": "plaintext prompt must not appear",
+        }
+    )
+    category, reason, diagnostics = _classify_completion_smoke_exception(exc)
+
+    assert category == "unsupported_render_kwarg"
+    assert reason == "runtime_completion_smoke_render_template_unexpected_kwarg"
+    safe_worker = diagnostics["worker_diagnostics"]
+    assert safe_worker["generation_exception_category"] == "unsupported_render_kwarg"
+    assert safe_worker["rejected_generation_kwarg"] == "tokenize"
+    assert safe_worker["method"] == "apply_chat_template"
+    assert "plaintext prompt" not in json.dumps(diagnostics)
 
 
 def test_completion_smoke_reason_prefers_nested_worker_specific_category_over_generic_internal_reason():

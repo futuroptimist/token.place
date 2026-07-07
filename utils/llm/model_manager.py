@@ -2223,7 +2223,7 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'method': 'apply_chat_template',
             })
         if rejected_kwarg and include_generation_category:
-            diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
+            diagnostics['generation_exception_category'] = 'unsupported_render_kwarg'
         return {key: value for key, value in diagnostics.items() if value is not None}
 
     def _retry_without_rejected_kwarg(rejected_kwarg):
@@ -2324,7 +2324,7 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             'render_rejected_generation_kwarg': rejected_render_kwarg,
             'rejected_generation_kwarg': rejected_render_kwarg,
             'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
-            'generation_exception_category': 'unsupported_generation_kwarg',
+            'generation_exception_category': 'unsupported_render_kwarg',
             'method': 'apply_chat_template',
         })
     return rendered, diagnostics

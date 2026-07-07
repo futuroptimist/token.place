@@ -130,6 +130,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     },
     "reason": {
         "unsupported_generation_option",
+        "unsupported_render_kwarg",
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
@@ -142,6 +143,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
+        "unsupported_render_kwarg",
         "unexpected_kwarg",
         "unsupported_prompt_kwarg",
         "unsupported_stream_kwarg",
@@ -3861,6 +3863,8 @@ class RelayClient:
                     internal_reason = f"runtime_{category}"
                 elif category == "unsupported_generation_kwarg":
                     internal_reason = "unsupported_generation_option"
+                elif category == "unsupported_render_kwarg":
+                    internal_reason = "unsupported_render_kwarg"
                 else:
                     internal_reason = (
                         safe_worker_diagnostics.get("reason")

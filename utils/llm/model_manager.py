@@ -2225,7 +2225,7 @@ def _runtime_message_content_text(content):
         if malformed_text_block:
             raise RuntimeError('runtime_chat_template_render_exception')
         if parts:
-            return ('\\n' '\\n').join(parts)
+            return ('\\n' * 2).join(parts)
     raise RuntimeError('runtime_chat_template_render_exception')
 
 def _render_qwen_api_v1_non_thinking_template(messages, llama, *, add_generation_prompt=True):

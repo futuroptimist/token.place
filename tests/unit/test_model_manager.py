@@ -4337,7 +4337,10 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
-def test_llama_worker_render_and_tokenize_chat_retries_without_enable_thinking(tmp_path):
+def test_llama_worker_render_and_tokenize_chat_fails_closed_when_enable_thinking_rejected_without_metadata(tmp_path):
+    # When apply_chat_template rejects enable_thinking and no GGUF/Jinja metadata
+    # is available, the worker must fail closed rather than retry without
+    # enable_thinking (which would silently re-enable thinking on the non-thinking path).
     response = _run_llama_worker_request(
         tmp_path,
         {
@@ -4354,19 +4357,20 @@ class Llama:
     def __init__(self, *args, **kwargs):
         self.calls = []
     def apply_chat_template(self, messages, **kwargs):
-        self.calls.append(kwargs)
-        if 'enable_thinking' in kwargs:
+        if not kwargs.get('enable_thinking', True):
+            # First call: enable_thinking=False is present – reject it
+            self.calls.append('with_enable_thinking')
             raise TypeError('unexpected keyword argument enable_thinking')
-        return 'rendered fallback prompt'
+        # If called a second time without enable_thinking, fail loudly to catch
+        # the old retry-without-enable_thinking behaviour.
+        raise AssertionError('apply_chat_template must not be retried without enable_thinking')
     def tokenize(self, prompt, add_bos=False):
-        assert prompt == b'rendered fallback prompt'
-        return [1, 2]
+        raise AssertionError('tokenize must not be called when render fails')
 """,
     )
 
-    assert response == {'status': 'ok', 'result': {'prompt_tokens': 2}}
+    assert response['status'] == 'error'
     assert 'secret prompt' not in json.dumps(response)
-    assert 'rendered fallback prompt' not in json.dumps(response)
 
 
 def test_llama_worker_render_and_tokenize_chat_uses_gguf_jinja_metadata(tmp_path):
@@ -5928,12 +5932,17 @@ def test_subprocess_worker_render_template_retries_rejected_render_kwarg_without
     assert 'plaintext prompt' not in json.dumps(diagnostics)
 
 
-def test_subprocess_worker_render_template_retries_after_metadata_renderer_failure():
+def test_subprocess_worker_render_template_fails_closed_when_enable_thinking_rejected_and_jinja_broken():
+    # Previously the worker retried apply_chat_template without enable_thinking when
+    # the GGUF/Jinja renderer failed.  That retry silently re-enables thinking.
+    # With the fix the worker must fail closed with safe diagnostics instead.
     from utils.llm import model_manager as model_manager_module
 
     namespace = {}
     worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
     exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    direct_render_calls = []
 
     class RejectingRuntime:
         metadata = {
@@ -5942,20 +5951,31 @@ def test_subprocess_worker_render_template_retries_after_metadata_renderer_failu
         }
 
         def apply_chat_template(self, _messages, **kwargs):
+            direct_render_calls.append(dict(kwargs))
             if 'enable_thinking' in kwargs:
                 raise TypeError("got an unexpected keyword argument 'enable_thinking'")
-            return '<|im_start|>assistant\n'
+            # Must not be called a second time without enable_thinking.
+            raise AssertionError('apply_chat_template must not be retried without enable_thinking')
 
-    rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
-        RejectingRuntime(),
-        [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
-        {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
-    )
+    with pytest.raises(RuntimeError) as excinfo:
+        namespace['_render_chat_with_runtime_template'](
+            RejectingRuntime(),
+            [[{'role': 'user', 'content': 'plaintext prompt must not appear in diagnostics'}]],
+            {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        )
 
-    assert rendered == '<|im_start|>assistant\n'
-    assert diagnostics['render_rejected_generation_kwarg'] == 'enable_thinking'
-    assert diagnostics['attempted_generation_kwargs'] == 'add_generation_prompt,enable_thinking,tokenize'
-    assert 'plaintext prompt' not in json.dumps(diagnostics)
+    # Should have been called exactly once (with enable_thinking present).
+    assert len(direct_render_calls) == 1
+    assert 'enable_thinking' in direct_render_calls[0]
+    # Raised a safe render error – the exact reason depends on Jinja availability.
+    assert str(excinfo.value) in {
+        'runtime_chat_template_render_exception',
+        'runtime_chat_template_renderer_unavailable',
+    }
+    diagnostics = excinfo.value.diagnostics
+    assert diagnostics.get('render_rejected_generation_kwarg') == 'enable_thinking'
+    assert diagnostics.get('rejected_generation_kwarg') == 'enable_thinking'
+    assert 'plaintext prompt' not in str(diagnostics)
 
 
 def test_subprocess_worker_render_template_failure_carries_safe_rejected_kwarg_diagnostics():
@@ -6022,6 +6042,130 @@ def test_subprocess_worker_render_template_fails_closed_with_safe_rejected_kwarg
     assert diagnostics['method'] == 'create_completion_keyword_prompt'
     assert diagnostics['result_shape'] == 'dict_malformed'
     assert 'plaintext prompt' not in json.dumps(diagnostics)
+
+
+def test_subprocess_worker_render_template_uses_gguf_jinja_when_enable_thinking_rejected_and_metadata_available():
+    # When apply_chat_template rejects enable_thinking but valid Qwen GGUF/Jinja
+    # metadata is available, the GGUF/Jinja renderer should be used and
+    # enable_thinking=False must be preserved (never silently dropped or set True).
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    jinja_calls = []
+
+    class QwenRuntime:
+        metadata = {
+            'general.name': 'Qwen3-8B',
+            'tokenizer.chat_template': (
+                "{% for m in messages %}<|im_start|>{{ m['role'] }}\n"
+                "{{ m['content'] }}<|im_end|>\n{% endfor %}"
+                "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+                "{% if enable_thinking == false %}<|no_think|>{% endif %}"
+            ),
+        }
+
+        def apply_chat_template(self, _messages, **kwargs):
+            # Record the call; raise if enable_thinking is present so Jinja path is taken.
+            if 'enable_thinking' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+            # Must not be called a second time without enable_thinking.
+            raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+
+    messages = [{'role': 'user', 'content': '/no_think\nhello'}]
+    try:
+        rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
+            QwenRuntime(),
+            [messages],
+            {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        )
+    except RuntimeError as exc:
+        if str(exc) == 'runtime_chat_template_renderer_unavailable':
+            pytest.skip('jinja2.sandbox not available in this environment')
+        raise
+
+    # GGUF/Jinja path used: enable_thinking=False was honoured (no-think marker present).
+    assert '<|no_think|>' in rendered
+    assert diagnostics.get('render_rejected_generation_kwarg') == 'enable_thinking'
+    assert diagnostics.get('jinja_renderer') is True
+    assert '/no_think\nhello' not in str(diagnostics)
+
+
+def test_subprocess_worker_enable_thinking_true_never_passed_to_renderer():
+    # Verify that the Qwen API v1 render path only ever passes enable_thinking=False,
+    # never True.  A renderer that receives enable_thinking=True must raise so the
+    # test fails immediately.
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class StrictQwenRuntime:
+        metadata = {
+            'general.name': 'Qwen3-8B',
+            'tokenizer.chat_template': (
+                "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+                "{% if enable_thinking == false %}<|no_think|>{% endif %}"
+            ),
+        }
+
+        def apply_chat_template(self, _messages, **kwargs):
+            et = kwargs.get('enable_thinking')
+            if et is True:
+                raise AssertionError('enable_thinking must never be True on the API v1 non-thinking path')
+            raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+
+    messages = [{'role': 'user', 'content': 'hi'}]
+    try:
+        rendered, diagnostics = namespace['_render_chat_with_runtime_template'](
+            StrictQwenRuntime(),
+            [messages],
+            {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        )
+    except RuntimeError as exc:
+        if str(exc) == 'runtime_chat_template_renderer_unavailable':
+            pytest.skip('jinja2.sandbox not available in this environment')
+        # Any other failure (not AssertionError about True) is acceptable.
+        assert str(exc) != 'enable_thinking must never be True on the API v1 non-thinking path'
+        return
+
+    # If we got here, the GGUF/Jinja path rendered successfully.
+    # The no-think marker must be present, confirming enable_thinking=False was honoured.
+    assert '<|no_think|>' in rendered
+
+
+def test_subprocess_worker_enable_thinking_rejected_no_metadata_fails_closed_with_diagnostics():
+    # When apply_chat_template rejects enable_thinking and no GGUF metadata is
+    # available, the worker must fail closed and surface safe scalar diagnostics
+    # that name the rejected kwarg.
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    class MinimalRuntime:
+        # No metadata attribute → GGUF path unavailable.
+        def apply_chat_template(self, _messages, **kwargs):
+            if 'enable_thinking' in kwargs:
+                raise TypeError("got an unexpected keyword argument 'enable_thinking'")
+            raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        namespace['_render_chat_with_runtime_template'](
+            MinimalRuntime(),
+            [[{'role': 'user', 'content': 'plaintext must not appear'}]],
+            {'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False},
+        )
+
+    assert str(excinfo.value) == 'runtime_chat_template_metadata_missing'
+    diag = excinfo.value.diagnostics
+    assert diag.get('render_rejected_generation_kwarg') == 'enable_thinking'
+    assert diag.get('rejected_generation_kwarg') == 'enable_thinking'
+    assert 'plaintext must not appear' not in str(diag)
 
 
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):

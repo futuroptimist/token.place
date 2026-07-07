@@ -2229,7 +2229,12 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
     def _retry_without_rejected_kwarg(rejected_kwarg):
         if not rejected_kwarg or not callable(render):
             return None
-        if rejected_kwarg not in {'enable_thinking', 'tokenize', 'add_generation_prompt'}:
+        # enable_thinking must never be removed as a compatibility retry.
+        # Dropping it would silently re-enable thinking on the non-thinking path.
+        # If apply_chat_template rejects enable_thinking, the caller must fall
+        # through to the GGUF/Jinja renderer (which honours enable_thinking) or
+        # fail closed with safe diagnostics.
+        if rejected_kwarg not in {'tokenize', 'add_generation_prompt'}:
             return None
         compatibility_kwargs = dict(kwargs)
         compatibility_kwargs.pop(rejected_kwarg, None)

@@ -2209,7 +2209,7 @@ def _type_error_is_unexpected_keyword(exc, keyword):
 def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
 
-    def _rejection_diagnostics(rejected_kwarg):
+    def _rejection_diagnostics(rejected_kwarg, *, include_generation_category=True):
         diagnostics = {
             'direct_apply_chat_template': direct_apply_available,
             'metadata_template': False,
@@ -2220,9 +2220,10 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 'render_rejected_generation_kwarg': rejected_kwarg,
                 'rejected_generation_kwarg': rejected_kwarg,
                 'attempted_generation_kwargs': _safe_kwarg_names_csv(kwargs),
-                'generation_exception_category': 'unsupported_generation_kwarg',
                 'method': 'apply_chat_template',
             })
+        if rejected_kwarg and include_generation_category:
+            diagnostics['generation_exception_category'] = 'unsupported_generation_kwarg'
         return {key: value for key, value in diagnostics.items() if value is not None}
 
     def _retry_without_rejected_kwarg(rejected_kwarg):
@@ -2242,7 +2243,10 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             retry_result = None
         if retry_result is not None:
             return retry_result
-        raise _RuntimeTemplateRenderError(reason, _rejection_diagnostics(rejected_kwarg))
+        raise _RuntimeTemplateRenderError(
+            reason,
+            _rejection_diagnostics(rejected_kwarg, include_generation_category=False),
+        )
     provider_hint = str(kwargs.pop('token_place_provider', '') or '').lower()
     policy_hint = str(kwargs.pop('token_place_template_policy', '') or '').lower()
     render = getattr(llama, 'apply_chat_template', None)

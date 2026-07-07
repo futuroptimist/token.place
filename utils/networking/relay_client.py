@@ -44,12 +44,25 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+_LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS = None
+
+
+def _llama_cpp_inference_request_error_cls():
+    global _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS
+
+    if _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS is None:
+        from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+        _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS = LlamaCppInferenceRequestError
+    return _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS
+
+
 def _new_llama_cpp_inference_request_error(
     message: str, *, diagnostics: Optional[Dict[str, Any]] = None
 ) -> RuntimeError:
-    from utils.llm.model_manager import LlamaCppInferenceRequestError
-
-    return LlamaCppInferenceRequestError(message, diagnostics=diagnostics)
+    return _llama_cpp_inference_request_error_cls()(
+        message, diagnostics=diagnostics
+    )
 
 
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (

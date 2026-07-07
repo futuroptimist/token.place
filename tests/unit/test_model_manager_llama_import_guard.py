@@ -35,7 +35,16 @@ def test_import_guard_rejects_repo_local_llama_cpp_shim(monkeypatch):
         Llama=object,
     )
 
-    monkeypatch.setattr(model_manager.importlib, "import_module", lambda _name: fake_module)
+    monkeypatch.setattr(
+        model_manager,
+        "_find_llama_cpp_spec_in_subprocess",
+        lambda **_kwargs: {"module_path": None},
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "_import_llama_cpp_in_parent_with_timeout",
+        lambda **_kwargs: fake_module,
+    )
 
     with pytest.raises(ImportError, match="repository-local llama_cpp.py shim"):
         model_manager._import_llama_cpp_runtime(require_real_runtime=True)

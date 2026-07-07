@@ -262,8 +262,6 @@ def _completion_smoke_reason_from_api_v1_error(error: Dict[str, Any]) -> str:
             generation_exception_category = worker_category
     if generation_exception_category and generation_exception_category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
         return _COMPLETION_SMOKE_REASON_BY_CATEGORY[generation_exception_category]
-    if internal_reason == "unsupported_render_kwarg":
-        return "runtime_completion_smoke_render_template_unexpected_kwarg"
     if internal_reason in {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",

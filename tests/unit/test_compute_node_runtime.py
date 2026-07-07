@@ -150,7 +150,9 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         # Render-path kwarg rejections map to the render-specific reason.
         ({"generation_exception_category": "unsupported_render_kwarg"}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
         ({"worker_diagnostics": {"generation_exception_category": "unsupported_render_kwarg"}}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
-        ({"internal_reason": "unsupported_render_kwarg"}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
+        # Relay promotes both internal_reason and generation_exception_category when category is unsupported_render_kwarg;
+        # generation_exception_category wins (dict lookup before internal_reason checks).
+        ({"internal_reason": "unsupported_render_kwarg", "generation_exception_category": "unsupported_render_kwarg"}, "runtime_completion_smoke_render_template_unexpected_kwarg"),
         # Template-path internal_reason values map to the render-exception reason.
         ({"internal_reason": "runtime_chat_template_metadata_missing"}, "runtime_completion_smoke_render_template_exception"),
         ({"internal_reason": "runtime_chat_template_renderer_unavailable"}, "runtime_completion_smoke_render_template_exception"),

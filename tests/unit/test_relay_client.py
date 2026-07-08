@@ -5192,7 +5192,7 @@ def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_cont
     class Runtime:
         def apply_chat_template(self, messages, **kwargs):
             calls.append(dict(kwargs))
-            assert 'enable_thinking' in kwargs, 'render retried without enable_thinking'
+            assert 'enable_thinking' in kwargs, 'render omitted enable_thinking before raising TypeError'
             raise TypeError('unexpected keyword argument enable_thinking')
 
     assert RelayClient._api_v1_render_chat_prompt(
@@ -5210,7 +5210,7 @@ def test_qwen_tokenizer_render_returns_none_when_enable_thinking_typeerror_would
     class Tokenizer:
         def apply_chat_template(self, messages, **kwargs):
             calls.append(dict(kwargs))
-            assert 'enable_thinking' in kwargs, 'tokenizer retried without enable_thinking'
+            assert 'enable_thinking' in kwargs, 'tokenizer omitted enable_thinking before raising TypeError'
             raise TypeError('unexpected keyword argument enable_thinking')
 
     class Runtime:
@@ -5222,7 +5222,7 @@ def test_qwen_tokenizer_render_returns_none_when_enable_thinking_typeerror_would
     class ChatFormatModule:
         @staticmethod
         def format_llama3(*args, **kwargs):  # pragma: no cover - should never be used
-            raise AssertionError('chat_format fallback should not run for hard non-thinking renders')
+            raise AssertionError('chat_format fallback should not run for hard non-thinking render requests')
 
     monkeypatch.setattr(
         RelayClient,

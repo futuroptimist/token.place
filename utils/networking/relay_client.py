@@ -2847,8 +2847,12 @@ class RelayClient:
         """Render chat messages with the active runtime chat template."""
 
         hard_non_thinking_requested = enable_thinking is False
+        existing_render_error = hasattr(llm_instance, "_token_place_last_render_tokenize_error")
+        hard_switch_rejection_recorded = False
 
-        def record_hard_switch_rejection(method: str) -> None:
+        def record_enable_thinking_rejection(method: str) -> None:
+            nonlocal hard_switch_rejection_recorded
+            hard_switch_rejection_recorded = True
             llm_instance._token_place_last_render_tokenize_error = {
                 "code": "compute_node_context_admission_unavailable",
                 "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
@@ -2873,7 +2877,7 @@ class RelayClient:
                         "compute_node_context_admission_unavailable",
                     )
                     if hard_non_thinking_requested:
-                        record_hard_switch_rejection("apply_chat_template")
+                        record_enable_thinking_rejection("apply_chat_template")
                     return None
                 try:
                     rendered = apply_chat_template(messages)
@@ -2907,7 +2911,7 @@ class RelayClient:
                             "compute_node_context_admission_unavailable",
                         )
                         if hard_non_thinking_requested:
-                            record_hard_switch_rejection("tokenizer.apply_chat_template")
+                            record_enable_thinking_rejection("tokenizer.apply_chat_template")
                     rendered = None
                 except Exception:
                     rendered = None
@@ -2917,8 +2921,8 @@ class RelayClient:
                     return rendered
         try:
             if hard_non_thinking_requested:
-                if not hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
-                    record_hard_switch_rejection("apply_chat_template")
+                if not (hard_switch_rejection_recorded or existing_render_error):
+                    record_enable_thinking_rejection("apply_chat_template")
                 return None
             if not allow_chat_format_fallback:
                 return None

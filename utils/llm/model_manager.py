@@ -2233,7 +2233,7 @@ def _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
         return False
     for message in messages:
         if not isinstance(message, dict):
-            return False
+            continue
         content = message.get('content')
         if isinstance(content, str):
             continue

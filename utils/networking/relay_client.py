@@ -3919,16 +3919,15 @@ class RelayClient:
                         else None
                     )
                 )
-                error_code = (
-                    "compute_node_invalid_request"
-                    if safe_worker_diagnostics.get("code") == "compute_node_invalid_request"
-                    else "compute_node_options_unsupported"
-                    if (
-                        safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
-                        or internal_reason == "unsupported_generation_option"
-                    )
-                    else "compute_node_internal_error"
-                )
+                if safe_worker_diagnostics.get("code") == "compute_node_invalid_request":
+                    error_code = "compute_node_invalid_request"
+                elif (
+                    safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
+                    or internal_reason == "unsupported_generation_option"
+                ):
+                    error_code = "compute_node_options_unsupported"
+                else:
+                    error_code = "compute_node_internal_error"
                 self._last_api_v1_runtime_health = {
                     "runtime_healthy": True,
                     "recovery_attempted": False,

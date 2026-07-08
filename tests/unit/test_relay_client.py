@@ -6316,3 +6316,50 @@ def test_api_v1_qwen_preserves_user_provided_literal_no_think():
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
     assert manager.runtime.calls[-1]["messages"][-1]["content"] == "/no_think\nhello"
+
+
+def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    worker_diagnostics = {
+        "code": "compute_node_internal_error",
+        "generation_exception_category": "worker_exception",
+        "exception_type": "RuntimeError",
+        "method": "create_completion_keyword_prompt",
+        "attempted_generation_kwargs": "max_tokens,prompt",
+        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+        "plain_completion_create_completion_callable": True,
+        "plain_completion_llama_call_callable": True,
+        "plain_completion_signature_inspectable": True,
+        "plain_completion_accepts_prompt_kwarg": False,
+        "plain_completion_accepts_max_tokens_kwarg": True,
+        "plain_completion_accepts_var_kwargs": False,
+        "qwen_api_v1_non_thinking_template_fallback": False,
+    }
+    manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+        "llama_cpp request failed",
+        diagnostics=worker_diagnostics,
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-plain-capabilities",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    for key, value in worker_diagnostics.items():
+        assert error["worker_diagnostics"].get(key) == value
+    for key in (
+        "plain_completion_create_completion_callable",
+        "plain_completion_llama_call_callable",
+        "plain_completion_signature_inspectable",
+        "plain_completion_accepts_prompt_kwarg",
+        "plain_completion_accepts_max_tokens_kwarg",
+        "plain_completion_accepts_var_kwargs",
+        "qwen_api_v1_non_thinking_template_fallback",
+    ):
+        assert error[key] == worker_diagnostics[key]

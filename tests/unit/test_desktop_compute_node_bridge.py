@@ -4784,3 +4784,39 @@ def test_desktop_runtime_context_shim_uses_legacy_call_when_signature_uninspecta
         'runtime_action': 'legacy_uninspectable'
     }
     assert calls == ['auto']
+
+
+def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fields():
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_result': 'failed',
+            'api_v1_readiness_error_code': 'compute_node_internal_error',
+            'api_v1_readiness_error_reason': 'runtime_completion_smoke_plain_completion_worker_exception',
+            'api_v1_readiness_completion_smoke_method': 'create_completion_keyword_prompt',
+            'api_v1_readiness_completion_smoke_attempted_generation_kwargs': 'max_tokens,prompt',
+            'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable': True,
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': False,
+            'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
+            'api_v1_readiness_completion_smoke_result_shape': 'dict_malformed',
+            'prompt': 'SECRET_PROMPT',
+            'rendered_prompt': '<|im_start|>SECRET_PROMPT',
+            'assistant_output': 'SECRET_OUTPUT',
+            'decrypted_payload': 'SECRET_PAYLOAD',
+            'ciphertext': 'SECRET_CIPHERTEXT_INTERNALS',
+            'key': 'SECRET_KEY',
+            'tool_args': {'secret': True},
+            'api_v1_readiness_completion_smoke_internal_reason': 'bad value with spaces and secret prompt',
+        }
+    )
+
+    safe = compute_node_bridge._safe_readiness_diagnostics(manager)
+
+    assert safe['api_v1_readiness_result'] == 'failed'
+    assert safe['api_v1_readiness_completion_smoke_method'] == 'create_completion_keyword_prompt'
+    assert safe['api_v1_readiness_completion_smoke_attempted_generation_kwargs'] == 'max_tokens,prompt'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is False
+    dumped = json.dumps(safe)
+    assert 'SECRET_' not in dumped
+    assert 'prompt text' not in dumped
+    assert 'api_v1_readiness_completion_smoke_internal_reason' not in safe

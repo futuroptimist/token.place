@@ -486,6 +486,52 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+_SAFE_READINESS_DIAGNOSTIC_KEYS = {
+    "api_v1_readiness_result",
+    "api_v1_readiness_error_code",
+    "api_v1_readiness_error_reason",
+    "api_v1_readiness_completion_smoke_result",
+    "api_v1_readiness_completion_smoke_failure_reason",
+    "api_v1_readiness_completion_smoke_error_code",
+    "api_v1_readiness_completion_smoke_internal_reason",
+    "api_v1_readiness_completion_smoke_exception_category",
+    "api_v1_readiness_completion_smoke_exception_type",
+    "api_v1_readiness_completion_smoke_rejected_generation_kwarg",
+    "api_v1_readiness_completion_smoke_attempted_generation_kwargs",
+    "api_v1_readiness_completion_smoke_attempted_plain_completion_methods",
+    "api_v1_readiness_completion_smoke_method",
+    "api_v1_readiness_completion_smoke_generation_exception_category",
+    "api_v1_readiness_completion_smoke_result_shape",
+    "api_v1_readiness_completion_smoke_plain_completion_create_completion_callable",
+    "api_v1_readiness_completion_smoke_plain_completion_llama_call_callable",
+    "api_v1_readiness_completion_smoke_plain_completion_signature_inspectable",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs",
+    "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
+}
+_SAFE_READINESS_DIAGNOSTIC_STRING_RE = re.compile(r"^[A-Za-z0-9_.:/@,+\-]{0,256}$")
+
+
+def _safe_readiness_diagnostics(model_manager: Any) -> Dict[str, Any]:
+    diagnostics = getattr(model_manager, "last_compute_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return {}
+    safe: Dict[str, Any] = {}
+    for key in _SAFE_READINESS_DIAGNOSTIC_KEYS:
+        if key not in diagnostics:
+            continue
+        value = diagnostics.get(key)
+        if isinstance(value, bool) or value is None:
+            safe[key] = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            safe[key] = value
+        elif isinstance(value, str):
+            bounded = value[:256]
+            if _SAFE_READINESS_DIAGNOSTIC_STRING_RE.fullmatch(bounded):
+                safe[key] = bounded
+    return safe
+
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
 ) -> str:
@@ -987,6 +1033,7 @@ def run(args: argparse.Namespace) -> int:
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
         }
+        payload.update(_safe_readiness_diagnostics(runtime.model_manager))
         payload.update(worker_lifecycle_status())
         if extra:
             payload.update(extra)

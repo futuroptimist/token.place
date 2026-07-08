@@ -4824,3 +4824,40 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped
     assert 'api_v1_readiness_completion_smoke_internal_reason' not in safe
+
+
+def test_warm_load_failure_safe_readiness_diagnostics_stderr_includes_safe_fields(capsys):
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_result': 'failed',
+            'api_v1_readiness_completion_smoke_method': 'create_completion_keyword_prompt',
+            'api_v1_readiness_completion_smoke_attempted_generation_kwargs': 'max_tokens,prompt',
+            'api_v1_readiness_completion_smoke_attempted_plain_completion_methods': 'create_completion_keyword_prompt',
+            'api_v1_readiness_completion_smoke_generation_exception_category': 'worker_exception',
+            'api_v1_readiness_completion_smoke_exception_type': 'LlamaCppInferenceRequestError',
+            'api_v1_readiness_completion_smoke_safe_summary': 'LlamaCppInferenceRequestError:redacted',
+            'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable': True,
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': True,
+            'rendered_prompt': 'SECRET_RENDERED_PROMPT',
+            'assistant_output': 'SECRET_OUTPUT',
+        }
+    )
+
+    compute_node_bridge._emit_safe_readiness_diagnostics_line(manager)
+
+    stderr = capsys.readouterr().err
+    assert stderr.startswith('desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics ')
+    assert 'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt' in stderr
+    assert 'api_v1_readiness_completion_smoke_generation_exception_category=worker_exception' in stderr
+    assert 'api_v1_readiness_completion_smoke_exception_type=LlamaCppInferenceRequestError' in stderr
+    assert 'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg=true' in stderr
+    assert 'SECRET_' not in stderr
+
+
+def test_warm_load_failure_safe_readiness_diagnostics_stderr_unavailable(capsys):
+    compute_node_bridge._emit_safe_readiness_diagnostics_line(SimpleNamespace())
+
+    stderr = capsys.readouterr().err
+    assert stderr == (
+        'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics unavailable=true\n'
+    )

@@ -533,6 +533,30 @@ def _safe_readiness_diagnostics(model_manager: Any) -> Dict[str, Any]:
                 safe[key] = bounded
     return safe
 
+
+def _format_safe_readiness_diagnostic_value(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def _emit_safe_readiness_diagnostics_line(model_manager: Any) -> None:
+    safe = _safe_readiness_diagnostics(model_manager)
+    prefix = "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics"
+    if not safe:
+        print(f"{prefix} unavailable=true", file=sys.stderr)
+        return
+    fields = " ".join(
+        f"{key}={_format_safe_readiness_diagnostic_value(safe[key])}"
+        for key in sorted(safe)
+    )
+    print(f"{prefix} {fields}", file=sys.stderr)
+
+
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
 ) -> str:
@@ -1200,6 +1224,7 @@ def run(args: argparse.Namespace) -> int:
     def fail_on_warm_load_error(*, active_relay_url: str) -> None:
         nonlocal last_error, warm_load_fatal
         last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+        _emit_safe_readiness_diagnostics_line(runtime.model_manager)
         emit_status_event(
             registered=False,
             active_relay_url=active_relay_url,

@@ -862,6 +862,11 @@ class ComputeNodeRuntime:
                     exception_type = smoke_error.get("exception_type")
                     if isinstance(exception_type, str):
                         diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
+                    sanitized_error_summary = smoke_error.get("sanitized_error_summary")
+                    if isinstance(sanitized_error_summary, str):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                            sanitized_error_summary
+                        )
                     worker_diagnostics = smoke_error.get("worker_diagnostics")
                     safe_worker_diagnostics: Dict[str, Any] = {}
                     if isinstance(worker_diagnostics, dict):
@@ -892,6 +897,13 @@ class ComputeNodeRuntime:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]
                         elif key in safe_worker_diagnostics:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
+                    if (
+                        "api_v1_readiness_completion_smoke_safe_summary" not in diagnostics
+                        and isinstance(safe_worker_diagnostics.get("sanitized_error_summary"), str)
+                    ):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                            safe_worker_diagnostics["sanitized_error_summary"]
+                        )
                 elif (
                     smoke_message is not None
                     and smoke_message.get("role") == "assistant"

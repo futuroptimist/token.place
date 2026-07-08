@@ -2291,6 +2291,58 @@ def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnos
     assert "SECRET_" not in dumped
 
 
+def test_deployed_plain_completion_worker_exception_populates_flat_safe_readiness_fields():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class FailingRuntime(_Qwen64kRuntime):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed with SECRET_PROMPT",
+                diagnostics={
+                    "method": "create_completion_keyword_prompt",
+                    "attempted_generation_kwargs": "max_tokens,prompt",
+                    "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                    "generation_exception_category": "worker_exception",
+                    "exception_type": "LlamaCppInferenceRequestError",
+                    "sanitized_error_summary": "LlamaCppInferenceRequestError:redacted",
+                    "plain_completion_create_completion_callable": True,
+                    "plain_completion_llama_call_callable": False,
+                    "plain_completion_signature_inspectable": True,
+                    "plain_completion_accepts_prompt_kwarg": True,
+                    "plain_completion_accepts_max_tokens_kwarg": True,
+                    "plain_completion_accepts_var_kwargs": True,
+                    "prompt": "SECRET_PROMPT",
+                    "rendered_prompt": "SECRET_RENDERED_PROMPT",
+                    "assistant_output": "SECRET_OUTPUT",
+                },
+            )
+
+    model_manager = _qwen_64k_model_manager(FailingRuntime())
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_plain_completion_worker_exception"
+    assert diagnostics["api_v1_readiness_completion_smoke_method"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "worker_exception"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "LlamaCppInferenceRequestError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "LlamaCppInferenceRequestError:redacted"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_create_completion_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_llama_call_callable"] is False
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_signature_inspectable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs"] is True
+    assert "SECRET_" not in json.dumps(diagnostics)
+
+
 def test_qwen_64k_yarn_eval_exception_fails_closed_before_registration():
     class FailingRuntime(_Qwen64kRuntime):
         def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):

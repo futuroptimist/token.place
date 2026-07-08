@@ -156,13 +156,13 @@ class TestModelManager:
             [{'role': 'user', 'content': 'hello packaged parity'}],
             max_tokens=8,
         )
-        qwen_prompt_tokens = llm.render_and_tokenize_chat(
+        render_token_result = llm.render_and_tokenize_chat(
             [{'role': 'user', 'content': 'hello packaged parity'}],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        qwen_rendered = llm.apply_chat_template(
+        rendered_with_thinking_disabled = llm.apply_chat_template(
             [{'role': 'user', 'content': 'hello packaged parity'}],
             tokenize=False,
             add_generation_prompt=True,
@@ -180,8 +180,14 @@ class TestModelManager:
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
         assert render_complete['choices'][0]['message']['content'].startswith('Mock Response:')
-        assert qwen_prompt_tokens == {'prompt_tokens': len(tokens)}
-        assert qwen_rendered == rendered
+        assert render_token_result == {'prompt_tokens': len(tokens)}
+        assert rendered_with_thinking_disabled == rendered
+        assert llm._token_place_last_mock_render_and_tokenize_kwargs == {
+            'enable_thinking': False
+        }
+        assert llm._token_place_last_mock_template_kwargs == {
+            'enable_thinking': False
+        }
 
     def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
         """API v1 admission is limited to the active profile/runtime identifiers."""

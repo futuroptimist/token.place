@@ -3726,8 +3726,9 @@ class ModelManager:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                **_kwargs,
+                **kwargs,
             ):
+                mock_llama_instance._token_place_last_mock_template_kwargs = dict(kwargs)
                 rendered_parts = []
                 for message in messages:
                     role = message.get('role', 'user') if isinstance(message, dict) else 'user'
@@ -3752,6 +3753,7 @@ class ModelManager:
                 add_generation_prompt=True,
                 **kwargs,
             ):
+                mock_llama_instance._token_place_last_mock_render_and_tokenize_kwargs = dict(kwargs)
                 rendered = _mock_apply_chat_template(
                     messages,
                     tokenize=False,

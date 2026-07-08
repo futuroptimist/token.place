@@ -4797,6 +4797,7 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'api_v1_readiness_completion_smoke_safe_summary': 'RuntimeError:worker_timeout',
             'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable': True,
             'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': False,
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs': True,
             'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
             'api_v1_readiness_completion_smoke_result_shape': 'dict_malformed',
             'prompt': 'SECRET_PROMPT',
@@ -4818,6 +4819,7 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert safe['api_v1_readiness_completion_smoke_safe_summary'] == 'RuntimeError:worker_timeout'
     assert safe['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
     assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is False
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs'] is True
     dumped = json.dumps(safe)
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped

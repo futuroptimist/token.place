@@ -980,6 +980,86 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
+def test_compute_node_runtime_exception_path_promotes_nested_worker_failure_details(monkeypatch):
+    class NestedWorkerDiagnosticException(Exception):
+        def __init__(self):
+            super().__init__("outer wrapper with SECRET_PROMPT")
+            self.diagnostics = {
+                "worker_diagnostics": {
+                    "prompt": "SECRET_PROMPT",
+                    "rendered_prompt": "SECRET_RENDERED_PROMPT",
+                    "assistant_output": "SECRET_OUTPUT",
+                    "decrypted_payload": "SECRET_PAYLOAD",
+                    "ciphertext": "SECRET_CIPHERTEXT",
+                    "key": "SECRET_KEY",
+                    "tool_args": {"secret": True},
+                    "method": "create_completion_keyword_prompt",
+                    "attempted_generation_kwargs": "max_tokens,prompt",
+                    "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                    "generation_exception_category": "worker_timeout",
+                    "exception_type": "TimeoutError",
+                    "sanitized_error_summary": "TimeoutError:redacted",
+                    "plain_completion_create_completion_callable": True,
+                    "plain_completion_llama_call_callable": True,
+                    "plain_completion_signature_inspectable": True,
+                    "plain_completion_accepts_prompt_kwarg": True,
+                    "plain_completion_accepts_max_tokens_kwarg": True,
+                    "plain_completion_accepts_var_kwargs": False,
+                    "qwen_api_v1_non_thinking_template_fallback": True,
+                }
+            }
+
+    class RaisingRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            raise NestedWorkerDiagnosticException()
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=RaisingRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_method"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "worker_timeout"
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "TimeoutError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "TimeoutError:redacted"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_create_completion_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_llama_call_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_signature_inspectable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs"] is False
+    assert diagnostics["api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback"] is True
+    dumped = json.dumps(diagnostics)
+    for unsafe_key in (
+        "prompt",
+        "rendered_prompt",
+        "assistant_output",
+        "decrypted_payload",
+        "ciphertext",
+        "key",
+        "tool_args",
+    ):
+        assert f'"{unsafe_key}"' not in dumped
+    assert "SECRET_" not in dumped
+
 def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readiness_fields(monkeypatch):
     class NestedWorkerDiagnosticRelayClient:
         def _api_v1_authoritative_context_admission(self, **_kwargs):

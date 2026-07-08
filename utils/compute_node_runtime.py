@@ -231,7 +231,10 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     }
     worker_diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(worker_diagnostics, dict):
-        safe_worker = _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
+        raw_worker_diagnostics = worker_diagnostics.get("worker_diagnostics")
+        if not isinstance(raw_worker_diagnostics, dict):
+            raw_worker_diagnostics = worker_diagnostics
+        safe_worker = _safe_completion_smoke_worker_diagnostics(raw_worker_diagnostics)
         diagnostics["worker_diagnostics"] = safe_worker
         category = safe_worker.get("generation_exception_category")
         if category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:

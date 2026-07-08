@@ -1931,7 +1931,11 @@ class _RuntimeTemplateRenderError(RuntimeError):
         super().__init__(reason)
         self.diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
 
-_UNSUPPORTED_QWEN_NON_THINKING_BLOCK_TYPES = {'input_image', 'image', 'image_url'}
+_QWEN_NON_THINKING_UNSUPPORTED_BLOCK_TYPES = {
+    'input_image',
+    'image',
+    'image_url',
+}
 
 def _safe_kwarg_names_csv(value):
     if isinstance(value, str):
@@ -2244,7 +2248,7 @@ def _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get('type') in _UNSUPPORTED_QWEN_NON_THINKING_BLOCK_TYPES:
+            if block.get('type') in _QWEN_NON_THINKING_UNSUPPORTED_BLOCK_TYPES:
                 return True
     return False
 
@@ -2252,6 +2256,8 @@ def _render_qwen_api_v1_non_thinking_template(messages, llama, *, add_generation
     if not isinstance(messages, list):
         raise RuntimeError('runtime_chat_template_render_exception')
     if _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
+        # Keep the specific contract violation in the worker reason/category while
+        # exposing the broader invalid-request class via the public error code.
         raise _RuntimeTemplateRenderError(
             'runtime_text_only_content_blocks_required',
             {

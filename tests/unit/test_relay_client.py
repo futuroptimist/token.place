@@ -5701,7 +5701,10 @@ def test_qwen_render_tokenize_multimodal_rejection_surfaces_invalid_request():
     error = envelope["api_v1_response"]["error"]
     assert error["code"] == "compute_node_invalid_request"
     assert error["internal_reason"] == "runtime_text_only_content_blocks_required"
-    assert error["message"] == "API v1 chat completions are text-only and do not support image content"
+    assert error["message"] == (
+        "API v1 chat completions are text-only and do not support image content. "
+        "Use text-only messages or API v2 for multimodal requests."
+    )
     assert "unsafe_prompt" not in json.dumps(error, sort_keys=True)
 
 

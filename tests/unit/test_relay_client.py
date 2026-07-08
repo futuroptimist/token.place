@@ -6316,3 +6316,50 @@ def test_api_v1_qwen_preserves_user_provided_literal_no_think():
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
     assert manager.runtime.calls[-1]["messages"][-1]["content"] == "/no_think\nhello"
+
+
+def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    manager.runtime.create_chat_completion_from_rendered_prompt = MagicMock(side_effect=LlamaCppInferenceRequestError(
+        "llama_cpp request failed",
+        diagnostics={
+            "generation_exception_category": "worker_exception",
+            "exception_type": "RuntimeError",
+            "method": "create_completion_keyword_prompt",
+            "attempted_plain_completion_methods": "create_completion_keyword_prompt,create_completion_positional_prompt",
+            "attempted_generation_kwargs": "max_tokens,prompt",
+            "plain_completion_create_completion_callable": True,
+            "plain_completion_llama_call_callable": True,
+            "plain_completion_signature_inspectable": True,
+            "plain_completion_accepts_prompt_kwarg": True,
+            "plain_completion_accepts_max_tokens_kwarg": True,
+            "plain_completion_accepts_var_kwargs": False,
+            "qwen_api_v1_non_thinking_template_fallback": False,
+        },
+    ))
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-worker-diagnostics",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"max_tokens": 64},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    for key in (
+        "plain_completion_create_completion_callable",
+        "plain_completion_llama_call_callable",
+        "plain_completion_signature_inspectable",
+        "plain_completion_accepts_prompt_kwarg",
+        "plain_completion_accepts_max_tokens_kwarg",
+        "plain_completion_accepts_var_kwargs",
+        "qwen_api_v1_non_thinking_template_fallback",
+    ):
+        assert key in error
+        assert error[key] == error["worker_diagnostics"][key]
+    assert error["method"] == "create_completion_keyword_prompt"
+    assert error["attempted_generation_kwargs"] == "max_tokens,prompt"

@@ -2203,3 +2203,53 @@ def test_qwen_8k_readiness_still_passes_without_yarn():
 
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager.last_compute_diagnostics["api_v1_readiness_yarn_rope_enabled"] is False
+
+
+def test_compute_node_runtime_promotes_nested_plain_completion_worker_diagnostics():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled"}
+    model_manager.context_tier = "64k-full"
+    model_manager.context_window_tokens = 65536
+    model_manager.api_model_id = "qwen3-8b-instruct"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    relay_client = SimpleNamespace(
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 3),
+        _generate_api_v1_response_with_runtime_model=MagicMock(return_value={
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_internal_error",
+                    "internal_reason": "runtime_completion_smoke_plain_completion_worker_exception",
+                    "exception_category": "worker_exception",
+                    "worker_diagnostics": {
+                        "method": "create_completion_keyword_prompt",
+                        "attempted_generation_kwargs": "max_tokens,prompt",
+                        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                        "generation_exception_category": "worker_exception",
+                        "exception_type": "RuntimeError",
+                        "plain_completion_create_completion_callable": True,
+                        "plain_completion_llama_call_callable": True,
+                        "plain_completion_signature_inspectable": True,
+                        "plain_completion_accepts_prompt_kwarg": True,
+                        "plain_completion_accepts_max_tokens_kwarg": True,
+                        "plain_completion_accepts_var_kwargs": False,
+                        "qwen_api_v1_non_thinking_template_fallback": False,
+                    },
+                }
+            }
+        }),
+    )
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_method"] == "create_completion_keyword_prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_create_completion_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs"] is False

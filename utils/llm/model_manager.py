@@ -2652,40 +2652,72 @@ for line in sys.stdin:
                     plain_capabilities['plain_completion_accepts_max_tokens_kwarg'] = 'max_tokens' in params or plain_capabilities['plain_completion_accepts_var_kwargs']
                 except Exception:
                     pass
+            fatal_plain_completion_categories = {
+                'metal_memory_allocation',
+                'kv_cache_allocation',
+                'rope_yarn_eval_failure',
+                'worker_timeout',
+                'worker_dead',
+                'context_window_exceeded',
+                'context_overflow',
+                'token_overflow',
+            }
+
+            def _record_plain_attempt(method_name, attempted_kwargs, *, value=None, exc=None):
+                item = {
+                    'method': method_name,
+                    'attempted_kwarg_names': ','.join(attempted_kwargs),
+                }
+                if value is not None:
+                    item['result_shape'] = _completion_result_shape(value)
+                if exc is not None:
+                    item['exception_type'] = type(exc).__name__
+                    item['generation_exception_category'] = _plain_completion_method_shape_category(exc)
+                    item['rejected_generation_kwarg'] = _extract_unsupported_generation_kwarg(
+                        str(exc), attempted_kwargs
+                    ) or ''
+                    item['sanitized_error_summary'] = _sanitize_error_summary(exc)
+                attempts.append(item)
+                return item
+
+            def _last_attempt_fatal():
+                return bool(attempts and attempts[-1].get('generation_exception_category') in fatal_plain_completion_categories)
+
             if callable(create_completion):
-                attempt_method = 'create_completion_keyword_prompt'
-                attempted_kwargs = ['max_tokens', 'prompt']
                 try:
                     result = create_completion(prompt=rendered_prompt, max_tokens=max_tokens)
                     completion_error = None
-                    attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'result_shape': _completion_result_shape(result)})
+                    _record_plain_attempt(
+                        'create_completion_keyword_prompt', ['max_tokens', 'prompt'], value=result
+                    )
                 except Exception as exc:
-                    category = _plain_completion_method_shape_category(exc)
-                    rejected = _extract_unsupported_generation_kwarg(str(exc), attempted_kwargs)
-                    attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'exception_type': type(exc).__name__, 'generation_exception_category': category, 'rejected_generation_kwarg': rejected or ''})
+                    _record_plain_attempt(
+                        'create_completion_keyword_prompt', ['max_tokens', 'prompt'], exc=exc
+                    )
                     completion_error = exc
-                    if category == 'unsupported_prompt_kwarg' or rejected == 'prompt':
-                        attempt_method = 'create_completion_positional_prompt'
-                        attempted_kwargs = ['max_tokens']
-                        try:
-                            result = create_completion(rendered_prompt, max_tokens=max_tokens)
-                            completion_error = None
-                            attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'result_shape': _completion_result_shape(result)})
-                        except Exception as positional_exc:
-                            category = _plain_completion_method_shape_category(positional_exc)
-                            rejected = _extract_unsupported_generation_kwarg(str(positional_exc), attempted_kwargs)
-                            attempts.append({'method': attempt_method, 'attempted_kwarg_names': ','.join(attempted_kwargs), 'exception_type': type(positional_exc).__name__, 'generation_exception_category': category, 'rejected_generation_kwarg': rejected or ''})
-                            completion_error = positional_exc
-            if result is None and callable(llama) and (
-                not attempts
-                or attempts[-1].get('generation_exception_category') not in {'worker_exception', 'metal_memory_allocation', 'kv_cache_allocation', 'rope_yarn_eval_failure'}
-            ):
+            if result is None and callable(create_completion) and not _last_attempt_fatal():
+                try:
+                    result = create_completion(rendered_prompt, max_tokens=max_tokens)
+                    completion_error = None
+                    _record_plain_attempt(
+                        'create_completion_positional_prompt', ['max_tokens'], value=result
+                    )
+                except Exception as exc:
+                    _record_plain_attempt(
+                        'create_completion_positional_prompt', ['max_tokens'], exc=exc
+                    )
+                    completion_error = exc
+            if result is None and callable(llama) and not _last_attempt_fatal():
                 try:
                     result = llama(rendered_prompt, max_tokens=max_tokens)
                     completion_error = None
-                    attempts.append({'method': 'llama_call_positional_prompt', 'attempted_kwarg_names': 'max_tokens', 'result_shape': _completion_result_shape(result)})
+                    _record_plain_attempt(
+                        'llama_call_positional_prompt', ['max_tokens'], value=result
+                    )
                 except Exception as exc:
-                    attempts.append({'method': 'llama_call_positional_prompt', 'attempted_kwarg_names': 'max_tokens', 'exception_type': type(exc).__name__, 'generation_exception_category': _plain_completion_method_shape_category(exc), 'rejected_generation_kwarg': _extract_unsupported_generation_kwarg(str(exc), ['max_tokens']) or ''})
+                    _record_plain_attempt(
+                        'llama_call_positional_prompt', ['max_tokens'], exc=exc
+                    )
                     completion_error = exc
             if result is None:
                 extra = dict(render_diagnostics)
@@ -2696,6 +2728,9 @@ for line in sys.stdin:
                     'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
                     'generation_exception_category': attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception',
                     'rejected_generation_kwarg': attempts[-1].get('rejected_generation_kwarg', '') if attempts else '',
+                    'exception_type': attempts[-1].get('exception_type', type(completion_error).__name__ if completion_error is not None else ''),
+                    'sanitized_error_summary': attempts[-1].get('sanitized_error_summary', _sanitize_error_summary(completion_error) if completion_error is not None else ''),
+                    'result_shape': attempts[-1].get('result_shape', ''),
                 })
                 _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))
                 continue

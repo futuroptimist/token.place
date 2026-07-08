@@ -4012,6 +4012,13 @@ class RelayClient:
                     "method",
                     "generation_exception_category",
                     "result_shape",
+                    "plain_completion_create_completion_callable",
+                    "plain_completion_llama_call_callable",
+                    "plain_completion_signature_inspectable",
+                    "plain_completion_accepts_prompt_kwarg",
+                    "plain_completion_accepts_max_tokens_kwarg",
+                    "plain_completion_accepts_var_kwargs",
+                    "qwen_api_v1_non_thinking_template_fallback",
                 ):
                     safe_value = safe_worker_diagnostics.get(safe_key)
                     if safe_value is not None:

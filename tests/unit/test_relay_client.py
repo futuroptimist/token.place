@@ -5661,6 +5661,50 @@ def test_qwen_render_tokenize_worker_diagnostics_propagate_to_admission_error():
     assert "unsafe_prompt" not in serialized
 
 
+def test_qwen_render_tokenize_multimodal_rejection_surfaces_invalid_request():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class Runtime:
+        def render_and_tokenize_chat(self, messages, **kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "code": "compute_node_invalid_request",
+                    "reason": "runtime_text_only_content_blocks_required",
+                    "generation_exception_category": "text_only_content_blocks_required",
+                    "unsafe_prompt": "do not expose me",
+                },
+            )
+
+        def create_chat_completion(self, **kwargs):  # pragma: no cover - admission fails first
+            raise AssertionError("generation should not run when admission rejects the request")
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {
+        "id": "qwen3-local",
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "chat_template_policy": "qwen3-no-think",
+    }
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-qwen-multimodal-invalid",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello diagnostic secret"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_request"
+    assert error["internal_reason"] == "runtime_text_only_content_blocks_required"
+    assert error["message"] == "API v1 chat completions are text-only and do not support image content"
+    assert "unsafe_prompt" not in json.dumps(error, sort_keys=True)
+
+
 def test_render_tokenize_success_clears_stale_worker_diagnostics():
     class Runtime:
         def __init__(self):

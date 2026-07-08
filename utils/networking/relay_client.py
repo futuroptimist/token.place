@@ -3089,6 +3089,23 @@ class RelayClient:
             internal_reason = "runtime_template_tokenizer_bridge_unavailable"
             if isinstance(worker_diagnostics, dict) and isinstance(worker_diagnostics.get("reason"), str):
                 internal_reason = worker_diagnostics["reason"]
+            if (
+                isinstance(worker_diagnostics, dict)
+                and worker_diagnostics.get("code") == "compute_node_invalid_request"
+            ):
+                return (
+                    False,
+                    {
+                        "code": "compute_node_invalid_request",
+                        "type": "validation_error",
+                        "message": (
+                            "API v1 chat completions are text-only and do not support image content"
+                        ),
+                        "retryable": False,
+                        "internal_reason": internal_reason,
+                    },
+                    None,
+                )
             safe_diagnostics = {
                 "active_model_id": getattr(self.model_manager, "api_model_id", None),
                 "active_profile_id": model_profile.get("id") or model_profile.get("model_id"),
@@ -3903,7 +3920,9 @@ class RelayClient:
                     )
                 )
                 error_code = (
-                    "compute_node_options_unsupported"
+                    "compute_node_invalid_request"
+                    if safe_worker_diagnostics.get("code") == "compute_node_invalid_request"
+                    else "compute_node_options_unsupported"
                     if (
                         safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
                         or internal_reason == "unsupported_generation_option"

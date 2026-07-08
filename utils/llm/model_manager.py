@@ -2228,9 +2228,36 @@ def _runtime_message_content_text(content):
             return ('\\n' * 2).join(parts)
     raise RuntimeError('runtime_chat_template_render_exception')
 
+def _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        content = message.get('content')
+        if isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') in {'input_image', 'image', 'image_url'}:
+                return True
+    return False
+
 def _render_qwen_api_v1_non_thinking_template(messages, llama, *, add_generation_prompt=True):
     if not isinstance(messages, list):
         raise RuntimeError('runtime_chat_template_render_exception')
+    if _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
+        raise _RuntimeTemplateRenderError(
+            'runtime_text_only_content_blocks_required',
+            {
+                'code': 'compute_node_invalid_request',
+                'generation_exception_category': 'text_only_content_blocks_required',
+                'retryable': False,
+            },
+        )
     rendered = []
     bos_token = _runtime_token_text(llama, 'bos')
     if isinstance(bos_token, str) and bos_token:
@@ -2494,6 +2521,7 @@ for line in sys.stdin:
                         'runtime_template_tokenizer_bridge_unavailable',
                         'runtime_chat_template_render_exception',
                         'runtime_chat_template_qwen_evidence_missing',
+                        'runtime_text_only_content_blocks_required',
                     } else 'runtime_chat_template_render_exception'
                     _emit(_safe_request_error(reason, request=request, exc=exc, extra=getattr(exc, 'diagnostics', None) if isinstance(getattr(exc, 'diagnostics', None), dict) else (_render_diagnostics if isinstance(locals().get('_render_diagnostics'), dict) else None)))
                 continue
@@ -2569,6 +2597,7 @@ for line in sys.stdin:
                     'runtime_template_tokenizer_bridge_unavailable',
                     'runtime_chat_template_render_exception',
                     'runtime_chat_template_qwen_evidence_missing',
+                    'runtime_text_only_content_blocks_required',
                 } else 'runtime_chat_template_render_exception'
                 if (
                     reason == 'runtime_chat_template_metadata_missing'

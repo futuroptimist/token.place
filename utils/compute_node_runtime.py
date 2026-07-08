@@ -231,7 +231,10 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     }
     worker_diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(worker_diagnostics, dict):
-        safe_worker = _safe_completion_smoke_worker_diagnostics(worker_diagnostics)
+        raw_worker_diagnostics = worker_diagnostics.get("worker_diagnostics")
+        if not isinstance(raw_worker_diagnostics, dict):
+            raw_worker_diagnostics = worker_diagnostics
+        safe_worker = _safe_completion_smoke_worker_diagnostics(raw_worker_diagnostics)
         diagnostics["worker_diagnostics"] = safe_worker
         category = safe_worker.get("generation_exception_category")
         if category in _COMPLETION_SMOKE_REASON_BY_CATEGORY:
@@ -934,7 +937,37 @@ class ComputeNodeRuntime:
                 diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_diagnostics.get("exception_type")
                 diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = exception_diagnostics.get("sanitized_error_summary")
                 if "worker_diagnostics" in exception_diagnostics:
-                    diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = exception_diagnostics["worker_diagnostics"]
+                    safe_worker_diagnostics = exception_diagnostics["worker_diagnostics"]
+                    diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = safe_worker_diagnostics
+                    if safe_worker_diagnostics.get("exception_type"):
+                        diagnostics["api_v1_readiness_completion_smoke_exception_type"] = safe_worker_diagnostics[
+                            "exception_type"
+                        ]
+                    if safe_worker_diagnostics.get("sanitized_error_summary"):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = safe_worker_diagnostics[
+                            "sanitized_error_summary"
+                        ]
+                    for key in (
+                        "runtime_healthy",
+                        "recovery_attempted",
+                        "recovery_succeeded",
+                        "rejected_option",
+                        "rejected_generation_kwarg",
+                        "attempted_generation_kwargs",
+                        "attempted_plain_completion_methods",
+                        "result_shape",
+                        "method",
+                        "generation_exception_category",
+                        "plain_completion_create_completion_callable",
+                        "plain_completion_llama_call_callable",
+                        "plain_completion_signature_inspectable",
+                        "plain_completion_accepts_prompt_kwarg",
+                        "plain_completion_accepts_max_tokens_kwarg",
+                        "plain_completion_accepts_var_kwargs",
+                        "qwen_api_v1_non_thinking_template_fallback",
+                    ):
+                        if key in safe_worker_diagnostics:
+                            diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
                 diagnostics["api_v1_readiness_repair_retry_attempted"] = False
                 diagnostics["api_v1_readiness_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)

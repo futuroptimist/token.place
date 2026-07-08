@@ -249,7 +249,20 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         diagnostics = manager.last_compute_diagnostics
         assert diagnostics['api_v1_readiness_error_reason'] == 'runtime_completion_smoke_kv_cache_allocation'
         assert diagnostics['api_v1_readiness_error_reason'] != 'runtime_completion_smoke_exception'
-        assert 'SECRET_PROMPT' not in str(diagnostics)
+        assert diagnostics['api_v1_readiness_completion_smoke_method'] == 'create_completion_keyword_prompt'
+        assert diagnostics['api_v1_readiness_completion_smoke_attempted_generation_kwargs'] == 'max_tokens,prompt'
+        assert diagnostics['api_v1_readiness_completion_smoke_attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+        assert diagnostics['api_v1_readiness_completion_smoke_generation_exception_category'] == 'kv_cache_allocation'
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_llama_call_callable'] is False
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_signature_inspectable'] is True
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg'] is True
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is True
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs'] is True
+        dumped = json.dumps(diagnostics)
+        assert 'SECRET_PROMPT' not in dumped
+        for unsafe in ('assistant_output', 'decrypted_payload', 'key', 'tool_args', 'ciphertext'):
+            assert f'"{unsafe}"' not in dumped
     finally:
         proxy.close()
 

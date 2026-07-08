@@ -1931,6 +1931,8 @@ class _RuntimeTemplateRenderError(RuntimeError):
         super().__init__(reason)
         self.diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
 
+_UNSUPPORTED_QWEN_NON_THINKING_BLOCK_TYPES = {'input_image', 'image', 'image_url'}
+
 def _safe_kwarg_names_csv(value):
     if isinstance(value, str):
         names = value.split(',')
@@ -2242,7 +2244,7 @@ def _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get('type') in {'input_image', 'image', 'image_url'}:
+            if block.get('type') in _UNSUPPORTED_QWEN_NON_THINKING_BLOCK_TYPES:
                 return True
     return False
 

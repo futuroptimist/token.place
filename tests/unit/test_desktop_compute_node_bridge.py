@@ -2988,6 +2988,12 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     class ApiPayloadWarmFailRuntime(FakeRuntime):
         def ensure_api_v1_runtime_ready(self):
             calls.append("warm")
+            self.model_manager.last_compute_diagnostics = {
+                "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+                "api_v1_readiness_completion_smoke_generation_exception_category": "worker_exception",
+                "api_v1_readiness_completion_smoke_exception_type": "LlamaCppInferenceRequestError",
+                "prompt": "SECRET_PROMPT",
+            }
             return False
 
         def register_and_poll_once(self):
@@ -3012,7 +3018,12 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     status = compute_node_bridge.run(args)
     assert status == 1
     assert calls == ["warm"]
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    output = capsys.readouterr()
+    assert "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics" in output.err
+    assert "api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt" in output.err
+    assert "api_v1_readiness_completion_smoke_generation_exception_category=worker_exception" in output.err
+    assert "SECRET_PROMPT" not in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     error_event = next(event for event in events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
 
@@ -3052,6 +3063,7 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_raises(capsys, mon
     assert "error_response.submitted" not in output.err
     assert "code=compute_node_runtime_unavailable" not in output.err
     assert "exc_type=RuntimeError" in output.err
+    assert "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics unavailable=true" in output.err
     assert "sensitive model init failure details" not in output.err
     assert ApiPayloadWarmRaiseRuntime.last_instance is not None
     assert ApiPayloadWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == []

@@ -880,6 +880,7 @@ class ComputeNodeRuntime:
                         "result_shape",
                         "method",
                         "generation_exception_category",
+                        "sanitized_error_summary",
                         "plain_completion_create_completion_callable",
                         "plain_completion_llama_call_callable",
                         "plain_completion_signature_inspectable",
@@ -892,6 +893,10 @@ class ComputeNodeRuntime:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]
                         elif key in safe_worker_diagnostics:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
+                    if safe_worker_diagnostics.get("sanitized_error_summary"):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                            safe_worker_diagnostics["sanitized_error_summary"]
+                        )
                 elif (
                     smoke_message is not None
                     and smoke_message.get("role") == "assistant"
@@ -958,6 +963,7 @@ class ComputeNodeRuntime:
                         "result_shape",
                         "method",
                         "generation_exception_category",
+                        "sanitized_error_summary",
                         "plain_completion_create_completion_callable",
                         "plain_completion_llama_call_callable",
                         "plain_completion_signature_inspectable",

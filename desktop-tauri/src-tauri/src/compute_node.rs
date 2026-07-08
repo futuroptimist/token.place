@@ -80,6 +80,8 @@ pub struct ComputeNodeStatus {
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
     pub log_file_path: Option<String>,
+    #[serde(default)]
+    pub readiness_diagnostics: serde_json::Map<String, Value>,
 }
 
 fn default_request_context_tier() -> String {
@@ -289,6 +291,7 @@ fn startup_failure_status(
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
+        readiness_diagnostics: serde_json::Map::new(),
     }
 }
 
@@ -322,6 +325,13 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(running) = payload.get("running").and_then(Value::as_bool) {
         status.running = running;
+    }
+    if payload.get("type").and_then(Value::as_str) == Some("started") {
+        status.readiness_diagnostics.clear();
+    }
+    let readiness_diagnostics = safe_readiness_diagnostics_from_payload(payload);
+    if !readiness_diagnostics.is_empty() {
+        status.readiness_diagnostics.extend(readiness_diagnostics);
     }
     if let Some(registered) = payload.get("registered").and_then(Value::as_bool) {
         status.registered = registered;
@@ -592,7 +602,7 @@ fn finalize_bridge_exit(
         let updated_at_ms = current_time_ms();
         status.sequence = Some(sequence);
         status.updated_at_ms = Some(updated_at_ms);
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": "error",
             "running": false,
             "registered": false,
@@ -605,7 +615,16 @@ fn finalize_bridge_exit(
             "operator_session_id": expected_session_id,
             "sequence": sequence,
             "updated_at_ms": updated_at_ms,
-        })
+        });
+        if !status.readiness_diagnostics.is_empty() {
+            if let Some(map) = payload.as_object_mut() {
+                map.insert(
+                    "readiness_diagnostics".into(),
+                    Value::Object(status.readiness_diagnostics.clone()),
+                );
+            }
+        }
+        payload
     })
 }
 
@@ -707,8 +726,69 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         }
     }
 
+    summary.extend(safe_readiness_diagnostics_from_payload(payload));
+
     serde_json::to_string(&Value::Object(summary))
         .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into())
+}
+
+const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
+    "api_v1_readiness_result",
+    "api_v1_readiness_error_code",
+    "api_v1_readiness_error_reason",
+    "api_v1_readiness_completion_smoke_result",
+    "api_v1_readiness_completion_smoke_failure_reason",
+    "api_v1_readiness_completion_smoke_error_code",
+    "api_v1_readiness_completion_smoke_safe_summary",
+    "api_v1_readiness_completion_smoke_internal_reason",
+    "api_v1_readiness_completion_smoke_exception_category",
+    "api_v1_readiness_completion_smoke_exception_type",
+    "api_v1_readiness_completion_smoke_rejected_generation_kwarg",
+    "api_v1_readiness_completion_smoke_attempted_generation_kwargs",
+    "api_v1_readiness_completion_smoke_attempted_plain_completion_methods",
+    "api_v1_readiness_completion_smoke_method",
+    "api_v1_readiness_completion_smoke_generation_exception_category",
+    "api_v1_readiness_completion_smoke_result_shape",
+    "api_v1_readiness_completion_smoke_plain_completion_create_completion_callable",
+    "api_v1_readiness_completion_smoke_plain_completion_llama_call_callable",
+    "api_v1_readiness_completion_smoke_plain_completion_signature_inspectable",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs",
+    "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
+];
+
+fn safe_readiness_diagnostics_from_payload(payload: &Value) -> serde_json::Map<String, Value> {
+    let mut diagnostics = serde_json::Map::new();
+    let Some(map) = payload.as_object() else {
+        return diagnostics;
+    };
+    for key in SAFE_READINESS_DIAGNOSTIC_KEYS {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        if let Some(safe_value) = safe_readiness_diagnostic_value(value) {
+            diagnostics.insert((*key).to_string(), safe_value);
+        }
+    }
+    diagnostics
+}
+
+fn safe_readiness_diagnostic_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Bool(_) | Value::Null => Some(value.clone()),
+        Value::Number(_) => Some(value.clone()),
+        Value::String(text) if is_safe_readiness_diagnostic_string(text) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn is_safe_readiness_diagnostic_string(text: &str) -> bool {
+    text.len() <= 256
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '.' | ':' | '/' | '@' | ',' | '+' | '-')
+        })
 }
 
 fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
@@ -1059,6 +1139,7 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
+                readiness_diagnostics: serde_json::Map::new(),
             };
             true
         }
@@ -1324,6 +1405,23 @@ mod tests {
         }
     }
 
+    fn failure_exit_status() -> ExitStatus {
+        #[cfg(windows)]
+        {
+            StdCommand::new("cmd")
+                .args(["/C", "exit", "7"])
+                .status()
+                .expect("status")
+        }
+        #[cfg(not(windows))]
+        {
+            StdCommand::new("sh")
+                .args(["-c", "exit 7"])
+                .status()
+                .expect("status")
+        }
+    }
+
     #[test]
     fn compute_node_request_accepts_multiple_relay_urls() {
         let request: ComputeNodeRequest = serde_json::from_str(
@@ -1477,6 +1575,126 @@ mod tests {
         assert!(!redacted.contains("Example User"));
         assert!(!redacted.contains("plaintext prompt"));
         assert!(!redacted.contains("token=secret"));
+    }
+
+    #[test]
+    fn summarize_bridge_stdout_payload_includes_safe_readiness_diagnostics() {
+        let payload = serde_json::json!({
+            "type": "error",
+            "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+            "api_v1_readiness_completion_smoke_generation_exception_category": "worker_exception",
+            "api_v1_readiness_completion_smoke_exception_type": "LlamaCppInferenceRequestError",
+            "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
+            "api_v1_readiness_completion_smoke_attempted_generation_kwargs": "max_tokens,prompt",
+            "prompt": "SECRET_PROMPT"
+        });
+
+        let summary: Value =
+            serde_json::from_str(&summarize_bridge_stdout_payload(&payload)).expect("summary json");
+
+        assert_eq!(
+            summary
+                .get("api_v1_readiness_completion_smoke_method")
+                .and_then(Value::as_str),
+            Some("create_completion_keyword_prompt")
+        );
+        assert_eq!(
+            summary
+                .get("api_v1_readiness_completion_smoke_generation_exception_category")
+                .and_then(Value::as_str),
+            Some("worker_exception")
+        );
+        assert_eq!(
+            summary
+                .get("api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(summary.get("prompt").is_none());
+    }
+
+    #[test]
+    fn safe_readiness_diagnostics_drops_unsafe_values() {
+        let payload = serde_json::json!({
+            "api_v1_readiness_result": "failed",
+            "api_v1_readiness_error_reason": "contains spaces and prompt text",
+            "api_v1_readiness_completion_smoke_method": ["create_completion_keyword_prompt"],
+            "api_v1_readiness_completion_smoke_safe_summary": {"prompt": "SECRET_PROMPT"},
+            "api_v1_readiness_completion_smoke_plain_completion_llama_call_callable": false,
+            "api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs": null,
+            "prompt": "SECRET_PROMPT"
+        });
+
+        let diagnostics = safe_readiness_diagnostics_from_payload(&payload);
+
+        assert_eq!(
+            diagnostics
+                .get("api_v1_readiness_result")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            diagnostics
+                .get("api_v1_readiness_completion_smoke_plain_completion_llama_call_callable")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(diagnostics
+            .get("api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs")
+            .is_some_and(Value::is_null));
+        assert!(diagnostics.get("api_v1_readiness_error_reason").is_none());
+        assert!(diagnostics
+            .get("api_v1_readiness_completion_smoke_method")
+            .is_none());
+        assert!(diagnostics
+            .get("api_v1_readiness_completion_smoke_safe_summary")
+            .is_none());
+        assert!(diagnostics.get("prompt").is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_preserves_only_safe_readiness_diagnostics() {
+        let mut status = ComputeNodeStatus::default();
+        let payload = serde_json::json!({
+            "type": "error",
+            "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+            "api_v1_readiness_completion_smoke_internal_reason": "unsafe prompt text",
+            "rendered_prompt": "SECRET_RENDERED_PROMPT"
+        });
+
+        assert!(update_status_from_event(&mut status, &payload));
+
+        assert_eq!(
+            status
+                .readiness_diagnostics
+                .get("api_v1_readiness_completion_smoke_method")
+                .and_then(Value::as_str),
+            Some("create_completion_keyword_prompt")
+        );
+        assert!(status
+            .readiness_diagnostics
+            .get("api_v1_readiness_completion_smoke_internal_reason")
+            .is_none());
+        assert!(status
+            .readiness_diagnostics
+            .get("rendered_prompt")
+            .is_none());
+    }
+
+    #[test]
+    fn started_event_clears_stale_readiness_diagnostics() {
+        let mut status = ComputeNodeStatus {
+            readiness_diagnostics: serde_json::Map::from_iter([(
+                "api_v1_readiness_result".to_string(),
+                Value::String("failed".into()),
+            )]),
+            ..ComputeNodeStatus::default()
+        };
+        let payload = serde_json::json!({"type": "started", "running": true});
+
+        assert!(update_status_from_event(&mut status, &payload));
+
+        assert!(status.readiness_diagnostics.is_empty());
     }
 
     #[test]
@@ -2510,6 +2728,38 @@ mod tests {
         assert_eq!(
             command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
             None
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_exit_preserves_safe_readiness_diagnostics_in_error_payload() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(4),
+            readiness_diagnostics: serde_json::Map::from_iter([(
+                "api_v1_readiness_completion_smoke_method".to_string(),
+                Value::String("create_completion_keyword_prompt".into()),
+            )]),
+            ..ComputeNodeStatus::default()
+        };
+
+        let payload = finalize_bridge_exit(
+            &mut status,
+            failure_exit_status(),
+            true,
+            false,
+            "session-1",
+            None,
+        )
+        .expect("exit payload");
+
+        assert_eq!(
+            payload
+                .get("readiness_diagnostics")
+                .and_then(|value| value.get("api_v1_readiness_completion_smoke_method"))
+                .and_then(Value::as_str),
+            Some("create_completion_keyword_prompt")
         );
     }
 }

@@ -6316,3 +6316,64 @@ def test_api_v1_qwen_preserves_user_provided_literal_no_think():
 
     assert envelope["api_v1_response"]["message"]["content"] == "ok"
     assert manager.runtime.calls[-1]["messages"][-1]["content"] == "/no_think\nhello"
+
+
+def test_api_v1_runtime_error_promotes_plain_completion_capability_worker_diagnostics():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class Runtime:
+        def __init__(self):
+            self.apply_chat_template = MagicMock(return_value="<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n")
+            self.tokenize = MagicMock(return_value=[1, 2])
+
+        def render_and_tokenize_chat(self, *_args, **_kwargs):
+            return {"tokens": [1, 2]}
+
+        def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "generation_exception_category": "worker_exception",
+                    "exception_type": "RuntimeError",
+                    "method": "create_completion_keyword_prompt",
+                    "attempted_generation_kwargs": "max_tokens,prompt",
+                    "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                    "plain_completion_create_completion_callable": True,
+                    "plain_completion_llama_call_callable": True,
+                    "plain_completion_signature_inspectable": True,
+                    "plain_completion_accepts_prompt_kwarg": True,
+                    "plain_completion_accepts_max_tokens_kwarg": True,
+                    "plain_completion_accepts_var_kwargs": False,
+                    "qwen_api_v1_non_thinking_template_fallback": False,
+                    "rendered_prompt": "SECRET rendered prompt",
+                },
+            )
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.model_profile = {"provider": "qwen", "thinking_mode": "disabled", "chat_template_policy": "gguf-jinja"}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-worker-capabilities",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"max_tokens": 5},
+        requested_context_tier="8k-fast",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    for key, expected in {
+        "plain_completion_create_completion_callable": True,
+        "plain_completion_llama_call_callable": True,
+        "plain_completion_signature_inspectable": True,
+        "plain_completion_accepts_prompt_kwarg": True,
+        "plain_completion_accepts_max_tokens_kwarg": True,
+        "plain_completion_accepts_var_kwargs": False,
+        "qwen_api_v1_non_thinking_template_fallback": False,
+    }.items():
+        assert error[key] is expected
+        assert error["worker_diagnostics"][key] is expected
+    assert error["method"] == "create_completion_keyword_prompt"
+    assert "SECRET" not in json.dumps(error)

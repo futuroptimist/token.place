@@ -995,6 +995,13 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
                             "attempted_generation_kwargs": "max_tokens,stream",
                             "attempted_plain_completion_methods": "create_completion_keyword_prompt",
                             "result_shape": "dict_malformed",
+                            "plain_completion_create_completion_callable": True,
+                            "plain_completion_llama_call_callable": True,
+                            "plain_completion_signature_inspectable": True,
+                            "plain_completion_accepts_prompt_kwarg": True,
+                            "plain_completion_accepts_max_tokens_kwarg": True,
+                            "plain_completion_accepts_var_kwargs": False,
+                            "qwen_api_v1_non_thinking_template_fallback": False,
                         },
                     }
                 }
@@ -1018,16 +1025,24 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     diagnostics = model_manager.last_compute_diagnostics
-    assert diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] == {
-        "rejected_generation_kwarg": "stream",
-        "attempted_generation_kwargs": "max_tokens,stream",
-        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
-        "result_shape": "dict_malformed",
-    }
+    worker_diagnostics = diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"]
+    assert worker_diagnostics["rejected_generation_kwarg"] == "stream"
+    assert worker_diagnostics["attempted_generation_kwargs"] == "max_tokens,stream"
+    assert worker_diagnostics["attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+    assert worker_diagnostics["result_shape"] == "dict_malformed"
+    assert worker_diagnostics["plain_completion_create_completion_callable"] is True
+    assert worker_diagnostics["plain_completion_llama_call_callable"] is True
     assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "stream"
     assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,stream"
     assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
     assert diagnostics["api_v1_readiness_completion_smoke_result_shape"] == "dict_malformed"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_create_completion_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_llama_call_callable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_signature_inspectable"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs"] is False
+    assert diagnostics["api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback"] is False
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
     class ThinkRuntime:

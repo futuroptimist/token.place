@@ -6996,3 +6996,132 @@ def test_llama_worker_render_complete_empty_and_thinking_fail_safely(tmp_path, m
     assert empty_exc.value.diagnostics['generation_exception_category'] == 'empty_completion_output'
     assert think_exc.value.diagnostics['generation_exception_category'] == 'thinking_leaked'
     assert 'secret reasoning' not in json.dumps(think_exc.value.diagnostics)
+
+
+def test_llama_worker_render_complete_continues_after_generic_keyword_worker_exception(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'generic keyword fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    calls = []\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        type(self).calls.append(('create_completion', bool(args), sorted(kwargs)))\n"
+        "        if 'prompt' in kwargs:\n"
+        "            raise RuntimeError('wrapper failed without fatal runtime category')\n"
+        "        if len(args) != 1 or set(kwargs) != {'max_tokens'} or kwargs['max_tokens'] <= 0:\n"
+        "            raise TypeError('bad bounded shape')\n"
+        "        return {'choices': [{'text': 'generic fallback ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'generic fallback ok'}}]}
+
+
+def test_llama_worker_render_complete_continues_from_create_completion_to_llama_call(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'generic callable fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if kwargs.get('max_tokens') is None:\n"
+        "            raise AssertionError('unbounded create_completion call')\n"
+        "        raise RuntimeError('generic wrapper failure')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if set(kwargs) != {'max_tokens'} or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded llama call')\n"
+        "        return {'choices': [{'text': 'llama bounded ok'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'llama bounded ok'}}]}
+
+
+def test_llama_worker_render_complete_max_tokens_rejected_fails_closed_without_unbounded_fallback(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'max tokens rejected fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded create_completion fallback')\n"
+        "        raise TypeError(\"got an unexpected keyword argument 'max_tokens'\")\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded llama fallback')\n"
+        "        raise TypeError(\"got an unexpected keyword argument 'max_tokens'\")\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['rejected_generation_kwarg'] == 'max_tokens'
+    assert diagnostics['attempted_generation_kwargs'] == 'max_tokens,prompt'
+    assert diagnostics['attempted_plain_completion_methods'] == (
+        'create_completion_keyword_prompt,create_completion_positional_prompt,llama_call_positional_prompt'
+    )

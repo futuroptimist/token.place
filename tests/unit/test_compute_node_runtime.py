@@ -284,6 +284,30 @@ def test_completion_smoke_reason_prefers_nested_worker_specific_category_over_ge
     assert 'plaintext prompt' not in json.dumps(safe)
 
 
+def test_completion_smoke_reason_maps_top_level_render_kwarg_rejection_by_method():
+    error = {
+        'internal_reason': 'unsupported_generation_option',
+        'rejected_generation_kwarg': 'enable_thinking',
+        'method': 'apply_chat_template',
+    }
+
+    assert _completion_smoke_reason_from_api_v1_error(error) == (
+        'runtime_completion_smoke_render_template_unexpected_kwarg'
+    )
+
+
+def test_completion_smoke_reason_maps_top_level_plain_completion_kwarg_rejection_by_method():
+    error = {
+        'internal_reason': 'unsupported_generation_option',
+        'rejected_generation_kwarg': 'stream',
+        'method': 'llama_call_positional_prompt',
+    }
+
+    assert _completion_smoke_reason_from_api_v1_error(error) == (
+        'runtime_completion_smoke_plain_completion_unexpected_kwarg'
+    )
+
+
 def test_classify_completion_smoke_exception_detects_rope_scaling_text():
     category, reason, diagnostics = _classify_completion_smoke_exception(
         RuntimeError("RoPE scaling failure before eval")

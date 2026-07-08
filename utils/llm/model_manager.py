@@ -3722,7 +3722,12 @@ class ModelManager:
             self.last_compute_diagnostics = self._mock_compute_plan()
             mock_llama_instance = MagicMock()
 
-            def _mock_apply_chat_template(messages, tokenize=False, add_generation_prompt=True):
+            def _mock_apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **_kwargs,
+            ):
                 rendered_parts = []
                 for message in messages:
                     role = message.get('role', 'user') if isinstance(message, dict) else 'user'
@@ -3741,6 +3746,24 @@ class ModelManager:
                     return _mock_tokenize(rendered.encode('utf-8'), add_bos=False)
                 return rendered
 
+            def _mock_render_and_tokenize_chat(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **kwargs,
+            ):
+                rendered = _mock_apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    **kwargs,
+                )
+                return {
+                    'prompt_tokens': len(
+                        _mock_tokenize(rendered.encode('utf-8'), add_bos=False)
+                    )
+                }
+
             def _mock_tokenize(content, add_bos=True):
                 if isinstance(content, bytes):
                     text = content.decode('utf-8', errors='ignore')
@@ -3756,6 +3779,7 @@ class ModelManager:
                 return list(range(1, len(tokens) + 1))
 
             mock_llama_instance.apply_chat_template.side_effect = _mock_apply_chat_template
+            mock_llama_instance.render_and_tokenize_chat.side_effect = _mock_render_and_tokenize_chat
             mock_llama_instance.tokenize.side_effect = _mock_tokenize
             mock_response = {
                 'choices': [

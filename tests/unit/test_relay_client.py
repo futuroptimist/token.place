@@ -4657,7 +4657,9 @@ class _AdmissionRuntime:
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         assert tokenize is False
         if 'enable_thinking' in kwargs:
-            assert kwargs['enable_thinking'] is False
+            assert kwargs['enable_thinking'] is False, (
+                f"Expected enable_thinking=False, got {kwargs['enable_thinking']!r}"
+            )
         rendered = "<s>"
         for message in messages:
             content = message["content"]
@@ -5192,7 +5194,9 @@ def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_cont
     class Runtime:
         def apply_chat_template(self, messages, **kwargs):
             calls.append(dict(kwargs))
-            assert 'enable_thinking' in kwargs, 'render omitted enable_thinking before raising TypeError'
+            assert 'enable_thinking' in kwargs, (
+                'enable_thinking was omitted from kwargs before raising TypeError'
+            )
             raise TypeError('unexpected keyword argument enable_thinking')
 
     assert RelayClient._api_v1_render_chat_prompt(
@@ -5210,7 +5214,9 @@ def test_qwen_tokenizer_render_returns_none_when_enable_thinking_typeerror_would
     class Tokenizer:
         def apply_chat_template(self, messages, **kwargs):
             calls.append(dict(kwargs))
-            assert 'enable_thinking' in kwargs, 'tokenizer omitted enable_thinking before raising TypeError'
+            assert 'enable_thinking' in kwargs, (
+                'enable_thinking was omitted from kwargs before raising TypeError'
+            )
             raise TypeError('unexpected keyword argument enable_thinking')
 
     class Runtime:

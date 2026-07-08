@@ -936,6 +936,14 @@ class ComputeNodeRuntime:
                 if "worker_diagnostics" in exception_diagnostics:
                     safe_worker_diagnostics = exception_diagnostics["worker_diagnostics"]
                     diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = safe_worker_diagnostics
+                    if safe_worker_diagnostics.get("exception_type"):
+                        diagnostics["api_v1_readiness_completion_smoke_exception_type"] = safe_worker_diagnostics[
+                            "exception_type"
+                        ]
+                    if safe_worker_diagnostics.get("sanitized_error_summary"):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = safe_worker_diagnostics[
+                            "sanitized_error_summary"
+                        ]
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",

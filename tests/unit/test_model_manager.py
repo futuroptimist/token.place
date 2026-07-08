@@ -7083,6 +7083,62 @@ def test_llama_worker_render_complete_continues_to_llama_after_generic_create_co
     assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'callable recovered'}}]}
 
 
+@pytest.mark.parametrize(
+    ("message", "category"),
+    [
+        ("KV cache allocation failed", "kv_cache_allocation"),
+        ("Metal buffer allocation out of memory", "metal_memory_allocation"),
+        ("RoPE YaRN eval failure", "rope_yarn_eval_failure"),
+    ],
+)
+def test_llama_worker_render_complete_fatal_plain_completion_failure_does_not_retry(
+    tmp_path, monkeypatch, message, category
+):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / f"fatal fallback fake site {category}"
+    fake_pkg = fake_site / "llama_cpp"
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / "__init__.py").write_text(
+        "MESSAGE = " + repr(message) + "\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        if args:\n"
+        "            raise AssertionError('positional create_completion fallback attempted')\n"
+        "        raise RuntimeError(MESSAGE)\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        raise AssertionError('llama callable fallback attempted')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / "mock.gguf"),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{"role": "user", "content": "secret prompt text"}],
+                max_tokens=4,
+                token_place_provider="qwen",
+                token_place_template_policy="gguf-jinja",
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["generation_exception_category"] == category
+    assert diagnostics["attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert diagnostics["attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
+
+
 def test_llama_worker_render_complete_max_tokens_rejected_fails_closed_without_unbounded_fallback(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

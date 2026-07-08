@@ -2846,6 +2846,18 @@ class RelayClient:
     ) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
 
+        hard_non_thinking_requested = enable_thinking is False
+
+        def record_hard_switch_rejection(method: str) -> None:
+            llm_instance._token_place_last_render_tokenize_error = {
+                "code": "compute_node_context_admission_unavailable",
+                "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                "rejected_generation_kwarg": "enable_thinking",
+                "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                "method": method,
+                "retryable": False,
+            }
+
         apply_chat_template = getattr(llm_instance, "apply_chat_template", None)
         if callable(apply_chat_template):
             try:
@@ -2860,6 +2872,8 @@ class RelayClient:
                         "reason=enable_thinking_unsupported safe_error_code=%s",
                         "compute_node_context_admission_unavailable",
                     )
+                    if hard_non_thinking_requested:
+                        record_hard_switch_rejection("apply_chat_template")
                     return None
                 try:
                     rendered = apply_chat_template(messages)
@@ -2868,6 +2882,8 @@ class RelayClient:
             except Exception:
                 rendered = None
             if isinstance(rendered, str):
+                if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                    delattr(llm_instance, "_token_place_last_render_tokenize_error")
                 return rendered
         tokenizer = getattr(llm_instance, "tokenizer", None)
         if callable(tokenizer):
@@ -2883,11 +2899,27 @@ class RelayClient:
                     if enable_thinking is not None:
                         kwargs["enable_thinking"] = enable_thinking
                     rendered = tokenizer_template(messages, **kwargs)
+                except TypeError:
+                    if enable_thinking is not None:
+                        logger.warning(
+                            "api_v1.chat_template_render result=rejected "
+                            "reason=enable_thinking_unsupported safe_error_code=%s",
+                            "compute_node_context_admission_unavailable",
+                        )
+                        if hard_non_thinking_requested:
+                            record_hard_switch_rejection("tokenizer.apply_chat_template")
+                    rendered = None
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
+                    if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                        delattr(llm_instance, "_token_place_last_render_tokenize_error")
                     return rendered
         try:
+            if hard_non_thinking_requested:
+                if not hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                    record_hard_switch_rejection("apply_chat_template")
+                return None
             if not allow_chat_format_fallback:
                 return None
             if not hasattr(llm_instance, "chat_format"):
@@ -2993,6 +3025,12 @@ class RelayClient:
             "direct_apply_chat_template_available",
             "metadata_template_available",
             "jinja_renderer_available",
+            "rejected_option",
+            "rejected_generation_kwarg",
+            "attempted_generation_kwargs",
+            "generation_exception_category",
+            "method",
+            "retryable",
         ):
             if key in safe_diagnostics:
                 error[key] = safe_diagnostics[key]
@@ -3076,7 +3114,7 @@ class RelayClient:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
                 messages,
-                enable_thinking=None,
+                enable_thinking=admission_enable_thinking,
                 allow_chat_format_fallback=not is_qwen_non_thinking,
             )
             prompt_tokens = (
@@ -3118,6 +3156,17 @@ class RelayClient:
                 "metadata_template_available": internal_reason != "runtime_chat_template_metadata_missing",
                 "jinja_renderer_available": internal_reason != "runtime_chat_template_renderer_unavailable",
             }
+            if isinstance(worker_diagnostics, dict):
+                for key in (
+                    "rejected_option",
+                    "rejected_generation_kwarg",
+                    "attempted_generation_kwargs",
+                    "generation_exception_category",
+                    "method",
+                    "retryable",
+                ):
+                    if key in worker_diagnostics:
+                        safe_diagnostics[key] = worker_diagnostics[key]
             log_error(
                 "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={} model_id={} profile_id={} template_policy={} non_thinking={} runtime_facade={} direct_apply_chat_template_available={} metadata_template_available={} jinja_renderer_available={}",
                 active_context_tier,

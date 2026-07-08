@@ -4181,7 +4181,7 @@ class _ApiV1RuntimeManager:
             )
         )
         self.runtime.apply_chat_template.side_effect = (
-            lambda messages, tokenize=False, add_generation_prompt=True: "".join(
+            lambda messages, tokenize=False, add_generation_prompt=True, **kwargs: "".join(
                 f"<{message['role']}>{message['content']}" for message in messages
             ) + ("<assistant>" if add_generation_prompt else "")
         )
@@ -4654,8 +4654,10 @@ class _AdmissionRuntime:
     def __init__(self):
         self.calls = []
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         assert tokenize is False
+        if 'enable_thinking' in kwargs:
+            assert kwargs['enable_thinking'] is False
         rendered = "<s>"
         for message in messages:
             content = message["content"]
@@ -5132,7 +5134,7 @@ def test_qwen_context_admission_preserves_messages_without_no_think_injection():
     )
 
     assert envelope['api_v1_response']['message']['content'] == 'ok'
-    assert manager.runtime.calls[0]['template_kwargs'] == {}
+    assert manager.runtime.calls[0]['template_kwargs'] == {'enable_thinking': False}
     assert manager.runtime.calls[0]['messages'][-1]['content'] == 'hello'
     assert manager.runtime.calls[-1]['messages'][-1]['content'] == 'hello'
 
@@ -5185,11 +5187,13 @@ def test_qwen_no_think_messages_preserves_content_blocks_without_injection():
 
 
 def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_control():
+    calls = []
+
     class Runtime:
         def apply_chat_template(self, messages, **kwargs):
-            if 'enable_thinking' in kwargs:
-                raise TypeError('unexpected keyword argument enable_thinking')
-            return '<thinking-default>'
+            calls.append(dict(kwargs))
+            assert 'enable_thinking' in kwargs, 'render retried without enable_thinking'
+            raise TypeError('unexpected keyword argument enable_thinking')
 
     assert RelayClient._api_v1_render_chat_prompt(
         Runtime(),
@@ -5197,6 +5201,42 @@ def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_cont
         enable_thinking=False,
         allow_chat_format_fallback=False,
     ) is None
+    assert calls == [{'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False}]
+
+
+def test_qwen_tokenizer_render_returns_none_when_enable_thinking_typeerror_would_drop_control(monkeypatch):
+    calls = []
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append(dict(kwargs))
+            assert 'enable_thinking' in kwargs, 'tokenizer retried without enable_thinking'
+            raise TypeError('unexpected keyword argument enable_thinking')
+
+    class Runtime:
+        chat_format = 'llama-3'
+
+        def tokenizer(self):
+            return Tokenizer()
+
+    class ChatFormatModule:
+        @staticmethod
+        def format_llama3(*args, **kwargs):  # pragma: no cover - should never be used
+            raise AssertionError('chat_format fallback should not run for hard non-thinking renders')
+
+    monkeypatch.setattr(
+        RelayClient,
+        '_api_v1_llama_chat_format_module',
+        staticmethod(lambda: ChatFormatModule),
+    )
+
+    assert RelayClient._api_v1_render_chat_prompt(
+        Runtime(),
+        [{'role': 'user', 'content': 'hello'}],
+        enable_thinking=False,
+        allow_chat_format_fallback=True,
+    ) is None
+    assert calls == [{'tokenize': False, 'add_generation_prompt': True, 'enable_thinking': False}]
 
 
 def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallback():
@@ -5221,6 +5261,97 @@ def test_qwen_context_admission_unavailable_when_template_missing_no_llama_fallb
     )
 
     assert envelope['api_v1_response']['error']['code'] == 'compute_node_context_admission_unavailable'
+
+
+def test_qwen_context_admission_fails_closed_when_fallback_render_rejects_enable_thinking():
+    class Runtime(_AdmissionRuntime):
+        def __init__(self):
+            super().__init__()
+            self.render_calls = []
+
+        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.render_calls.append({'bridge': kwargs, 'messages': messages})
+            return None
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.calls.append({'template_kwargs': kwargs, 'messages': messages})
+            assert kwargs['enable_thinking'] is False
+            raise TypeError('unexpected keyword argument enable_thinking')
+
+        def create_chat_completion(self, **kwargs):  # pragma: no cover - admission fails first
+            raise AssertionError('generation should not run when admission cannot preserve enable_thinking=False')
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {
+        'id': 'qwen3-local',
+        'provider': 'qwen',
+        'thinking_mode': 'disabled',
+        'chat_template_policy': 'qwen3-no-think',
+    }
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-fallback-hard-switch',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    error = envelope['api_v1_response']['error']
+    assert error['code'] == 'compute_node_context_admission_unavailable'
+    assert error['internal_reason'] == 'runtime_qwen_non_thinking_hard_switch_unavailable'
+    assert error['rejected_generation_kwarg'] == 'enable_thinking'
+    assert error['generation_exception_category'] == 'qwen_non_thinking_hard_switch_unavailable'
+    assert error['method'] == 'apply_chat_template'
+    assert error['retryable'] is False
+    assert manager.runtime.render_calls[0]['bridge']['enable_thinking'] is False
+    assert manager.runtime.render_calls[0]['messages'][-1]['content'] == 'hello'
+    assert manager.runtime.calls[0]['template_kwargs'] == {'enable_thinking': False}
+    serialized = json.dumps(error, sort_keys=True)
+    assert '/no_think' not in serialized
+
+
+def test_api_v1_qwen_paths_never_send_enable_thinking_true():
+    class Runtime(_AdmissionRuntime):
+        def __init__(self):
+            super().__init__()
+            self.render_calls = []
+
+        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            self.render_calls.append(kwargs)
+            assert kwargs['enable_thinking'] is False
+            return {'prompt_tokens': 7}
+
+        def create_chat_completion_from_rendered_prompt(self, messages, **kwargs):
+            self.calls.append(kwargs)
+            assert kwargs['enable_thinking'] is False
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+    manager = _AdmissionManager(window=128)
+    manager.api_model_id = 'qwen3-8b-instruct'
+    manager.model_profile = {'provider': 'qwen', 'thinking_mode': 'disabled'}
+    manager.runtime = Runtime()
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id='req-qwen-never-true',
+        model_id='qwen3-8b-instruct',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        options={'max_tokens': 5},
+        requested_context_tier='8k-fast',
+    )
+
+    assert envelope['api_v1_response']['message']['content'] == 'ok'
+    sent_values = [
+        kwargs['enable_thinking']
+        for kwargs in manager.runtime.render_calls + manager.runtime.calls
+        if 'enable_thinking' in kwargs
+    ]
+    assert sent_values
+    assert sent_values == [False, False]
 
 
 

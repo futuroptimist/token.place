@@ -1851,6 +1851,16 @@ def _classify_generation_exception(exc):
         return 'kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return 'rope_yarn_eval_failure'
+    if 'timeout' in text or 'timed out' in text:
+        return 'worker_timeout'
+    if any(term in text for term in ('worker_dead', 'worker dead', 'worker exited', 'subprocess exited', 'liveness')):
+        return 'worker_dead'
+    if any(term in text for term in ('context window', 'context_window', 'maximum context', 'exceeds context')):
+        return 'context_window_exceeded'
+    if any(term in text for term in ('context length', 'n_ctx', 'ctx size')):
+        return 'context_length_exceeded'
+    if any(term in text for term in ('token overflow', 'too many tokens', 'exceeds token')):
+        return 'token_overflow'
     if _extract_unsupported_generation_kwarg(str(exc or '')) is not None:
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'

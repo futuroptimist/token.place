@@ -493,6 +493,7 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_result",
     "api_v1_readiness_completion_smoke_failure_reason",
     "api_v1_readiness_completion_smoke_error_code",
+    "api_v1_readiness_completion_smoke_safe_summary",
     "api_v1_readiness_completion_smoke_internal_reason",
     "api_v1_readiness_completion_smoke_exception_category",
     "api_v1_readiness_completion_smoke_exception_type",

@@ -6019,6 +6019,11 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
     assert classify_shape(RuntimeError("KV cache allocation failed")) == 'kv_cache_allocation'
+    assert classify_shape(TimeoutError("llama_cpp inference timed out")) == 'worker_timeout'
+    assert classify_shape(RuntimeError("llama_cpp worker exited during liveness check")) == 'worker_dead'
+    assert classify_shape(RuntimeError("prompt exceeds context window")) == 'context_window_exceeded'
+    assert classify_shape(RuntimeError("requested context length exceeds n_ctx")) == 'context_length_exceeded'
+    assert classify_shape(RuntimeError("too many tokens in prompt")) == 'token_overflow'
 
 
 

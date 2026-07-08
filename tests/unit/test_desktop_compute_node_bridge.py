@@ -4794,6 +4794,7 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'api_v1_readiness_error_reason': 'runtime_completion_smoke_plain_completion_worker_exception',
             'api_v1_readiness_completion_smoke_method': 'create_completion_keyword_prompt',
             'api_v1_readiness_completion_smoke_attempted_generation_kwargs': 'max_tokens,prompt',
+            'api_v1_readiness_completion_smoke_safe_summary': 'RuntimeError:worker_timeout',
             'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable': True,
             'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': False,
             'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
@@ -4814,6 +4815,7 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert safe['api_v1_readiness_result'] == 'failed'
     assert safe['api_v1_readiness_completion_smoke_method'] == 'create_completion_keyword_prompt'
     assert safe['api_v1_readiness_completion_smoke_attempted_generation_kwargs'] == 'max_tokens,prompt'
+    assert safe['api_v1_readiness_completion_smoke_safe_summary'] == 'RuntimeError:worker_timeout'
     assert safe['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
     assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is False
     dumped = json.dumps(safe)

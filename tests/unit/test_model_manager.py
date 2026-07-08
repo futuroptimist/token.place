@@ -4772,6 +4772,45 @@ class Llama:
     assert response['diagnostics']['generation_exception_category'] == 'text_only_content_blocks_required'
 
 
+def test_llama_worker_render_and_tokenize_chat_rejects_other_non_text_blocks_as_invalid_request(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Transcribe this note'},
+                    {'type': 'input_audio', 'input_audio': {'url': 'data:audio/wav;base64,AAAA'}},
+                ],
+            }]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+                'token_place_provider': 'qwen',
+                'token_place_template_policy': 'gguf-jinja',
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize must not run for unsupported non-text content')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['code'] == 'compute_node_invalid_request'
+    assert response['diagnostics']['reason'] == 'runtime_text_only_content_blocks_required'
+    assert response['diagnostics']['generation_exception_category'] == 'text_only_content_blocks_required'
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()

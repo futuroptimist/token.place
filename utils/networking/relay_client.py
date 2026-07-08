@@ -3099,7 +3099,7 @@ class RelayClient:
                         "code": "compute_node_invalid_request",
                         "type": "validation_error",
                         "message": (
-                            "API v1 chat completions are text-only and do not support image content. "
+                            "API v1 chat completions are text-only and do not support non-text content blocks. "
                             "Use text-only messages or API v2 for multimodal requests."
                         ),
                         "retryable": False,

@@ -1931,7 +1931,7 @@ class _RuntimeTemplateRenderError(RuntimeError):
         super().__init__(reason)
         self.diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
 
-_QWEN_NON_THINKING_TEXT_BLOCK_TYPES = {
+_QWEN_NON_THINKING_ALLOWED_BLOCK_TYPES = {
     'input_text',
     'text',
 }
@@ -2248,7 +2248,7 @@ def _qwen_api_v1_non_thinking_has_unsupported_multimodal_content(messages):
             if not isinstance(block, dict):
                 continue
             block_type = block.get('type')
-            if isinstance(block_type, str) and block_type not in _QWEN_NON_THINKING_TEXT_BLOCK_TYPES:
+            if block_type not in _QWEN_NON_THINKING_ALLOWED_BLOCK_TYPES:
                 return True
     return False
 

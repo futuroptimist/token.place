@@ -4784,3 +4784,34 @@ def test_desktop_runtime_context_shim_uses_legacy_call_when_signature_uninspecta
         'runtime_action': 'legacy_uninspectable'
     }
     assert calls == ['auto']
+
+
+def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe():
+    manager = SimpleNamespace(last_compute_diagnostics={
+        "api_v1_readiness_result": "failed",
+        "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+        "api_v1_readiness_completion_smoke_plain_completion_create_completion_callable": True,
+        "api_v1_readiness_completion_smoke_attempted_generation_kwargs": "max_tokens,prompt",
+        "api_v1_readiness_completion_smoke_exception_type": "RuntimeError",
+        "prompt": "SECRET_PROMPT",
+        "rendered_prompt": "SECRET_RENDERED",
+        "assistant_output": "SECRET_OUTPUT",
+        "decrypted_payload": "SECRET_PAYLOAD",
+        "key": "SECRET_KEY",
+        "tool_args": "SECRET_TOOL",
+        "ciphertext": "SECRET_CIPHERTEXT",
+        "api_v1_readiness_completion_smoke_failure_reason": "contains spaces and prompt text",
+    })
+
+    safe = compute_node_bridge._safe_readiness_diagnostics(manager)
+
+    assert safe["api_v1_readiness_result"] == "failed"
+    assert safe["api_v1_readiness_completion_smoke_method"] == "create_completion_keyword_prompt"
+    assert safe["api_v1_readiness_completion_smoke_plain_completion_create_completion_callable"] is True
+    assert safe["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,prompt"
+    assert safe["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert "api_v1_readiness_completion_smoke_failure_reason" in safe
+    encoded = json.dumps(safe)
+    assert "SECRET_" not in encoded
+    assert "prompt" not in safe
+    assert "rendered_prompt" not in safe

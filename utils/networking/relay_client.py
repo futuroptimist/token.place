@@ -2846,7 +2846,7 @@ class RelayClient:
     ) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
 
-        requires_thinking_disabled = enable_thinking is False
+        enforce_thinking_disabled = enable_thinking is False
         existing_render_error = hasattr(llm_instance, "_token_place_last_render_tokenize_error")
         hard_switch_rejection_recorded = False
 
@@ -2876,7 +2876,7 @@ class RelayClient:
                         "reason=enable_thinking_unsupported safe_error_code=%s",
                         "compute_node_context_admission_unavailable",
                     )
-                    if requires_thinking_disabled:
+                    if enforce_thinking_disabled:
                         record_enable_thinking_rejection("apply_chat_template")
                     return None
                 try:
@@ -2910,7 +2910,7 @@ class RelayClient:
                             "reason=enable_thinking_unsupported safe_error_code=%s",
                             "compute_node_context_admission_unavailable",
                         )
-                        if requires_thinking_disabled:
+                        if enforce_thinking_disabled:
                             record_enable_thinking_rejection("tokenizer.apply_chat_template")
                     rendered = None
                 except Exception:
@@ -2920,12 +2920,12 @@ class RelayClient:
                         delattr(llm_instance, "_token_place_last_render_tokenize_error")
                     return rendered
         try:
-            if requires_thinking_disabled:
+            if enforce_thinking_disabled:
                 should_record_rejection = not (
                     hard_switch_rejection_recorded or existing_render_error
                 )
                 if should_record_rejection:
-                    record_enable_thinking_rejection("apply_chat_template")
+                    record_enable_thinking_rejection("fallback_render")
                 return None
             if not allow_chat_format_fallback:
                 return None

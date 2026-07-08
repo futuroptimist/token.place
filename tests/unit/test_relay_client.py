@@ -4658,7 +4658,7 @@ class _AdmissionRuntime:
         assert tokenize is False
         if 'enable_thinking' in kwargs:
             assert kwargs['enable_thinking'] is False, (
-                f"Expected enable_thinking=False, got {kwargs['enable_thinking']!r}"
+                f"Expected enable_thinking=False, got {kwargs['enable_thinking']}"
             )
         rendered = "<s>"
         for message in messages:
@@ -5197,6 +5197,7 @@ def test_qwen_render_returns_none_when_enable_thinking_typeerror_would_drop_cont
             assert 'enable_thinking' in kwargs, (
                 'enable_thinking was omitted from kwargs before raising TypeError'
             )
+            assert kwargs['enable_thinking'] is False
             raise TypeError('unexpected keyword argument enable_thinking')
 
     assert RelayClient._api_v1_render_chat_prompt(
@@ -5217,6 +5218,7 @@ def test_qwen_tokenizer_render_returns_none_when_enable_thinking_typeerror_would
             assert 'enable_thinking' in kwargs, (
                 'enable_thinking was omitted from kwargs before raising TypeError'
             )
+            assert kwargs['enable_thinking'] is False
             raise TypeError('unexpected keyword argument enable_thinking')
 
     class Runtime:

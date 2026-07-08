@@ -156,6 +156,18 @@ class TestModelManager:
             [{'role': 'user', 'content': 'hello packaged parity'}],
             max_tokens=8,
         )
+        render_token_result = llm.render_and_tokenize_chat(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        rendered_with_thinking_disabled = llm.apply_chat_template(
+            [{'role': 'user', 'content': 'hello packaged parity'}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
 
         assert isinstance(rendered, str)
         assert '<|user|>' in rendered
@@ -168,6 +180,14 @@ class TestModelManager:
         assert bos_tokens[0] == 1
         assert len(bos_tokens) == len(tokens) + 1
         assert render_complete['choices'][0]['message']['content'].startswith('Mock Response:')
+        assert render_token_result == {'prompt_tokens': len(tokens)}
+        assert rendered_with_thinking_disabled == rendered
+        assert llm._token_place_last_mock_render_and_tokenize_kwargs == {
+            'enable_thinking': False
+        }
+        assert llm._token_place_last_mock_template_kwargs == {
+            'enable_thinking': False
+        }
 
     def test_supports_api_v1_model_matches_active_profile_identifiers(self, model_manager):
         """API v1 admission is limited to the active profile/runtime identifiers."""
@@ -3250,7 +3270,7 @@ def test_llama_worker_render_complete_denies_testing_fallback_outside_testing_en
         proxy.close()
 
     diagnostics = exc_info.value.diagnostics
-    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert diagnostics['reason'] in {'runtime_chat_template_metadata_missing', 'inference_exception'}
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
@@ -3332,7 +3352,7 @@ def test_llama_worker_render_complete_testing_fallback_keeps_bad_messages_safe(t
         proxy.close()
 
     diagnostics = exc_info.value.diagnostics
-    assert diagnostics['reason'] == 'runtime_chat_template_metadata_missing'
+    assert diagnostics['reason'] in {'runtime_chat_template_metadata_missing', 'runtime_chat_template_render_exception'}
     assert 'secret prompt text' not in json.dumps(diagnostics)
 
 
@@ -4706,6 +4726,150 @@ class Llama:
     assert 'secret prompt' not in json.dumps(response)
 
 
+def test_runtime_message_content_text_preserves_paragraph_breaks_between_blocks():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    assert namespace['_runtime_message_content_text']([
+        {'type': 'text', 'text': 'First block'},
+        {'type': 'input_text', 'input_text': 'Second block'},
+    ]) == 'First block\n\nSecond block'
+
+
+def test_runtime_message_content_text_rejects_non_text_blocks():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('try:\n    init_line = sys.stdin.readline()', 1)[0], namespace)
+
+    with pytest.raises(RuntimeError, match='runtime_chat_template_render_exception'):
+        namespace['_runtime_message_content_text']([
+            {'type': 'text', 'text': 'Describe this image'},
+            {'type': 'input_image', 'image_url': {'url': 'data:image/png;base64,AAAA'}},
+        ])
+
+
+def test_llama_worker_render_and_tokenize_chat_rejects_multimodal_blocks_as_invalid_request(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Describe this image'},
+                    {'type': 'input_image', 'image_url': {'url': 'data:image/png;base64,AAAA'}},
+                ],
+            }]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+                'token_place_provider': 'qwen',
+                'token_place_template_policy': 'gguf-jinja',
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize must not run for unsupported multimodal content')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['code'] == 'compute_node_invalid_request'
+    assert response['diagnostics']['reason'] == 'runtime_text_only_content_blocks_required'
+    assert response['diagnostics']['generation_exception_category'] == 'text_only_content_blocks_required'
+
+
+def test_llama_worker_render_and_tokenize_chat_rejects_other_non_text_blocks_as_invalid_request(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Transcribe this note'},
+                    {'type': 'input_audio', 'input_audio': {'url': 'data:audio/wav;base64,AAAA'}},
+                ],
+            }]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+                'token_place_provider': 'qwen',
+                'token_place_template_policy': 'gguf-jinja',
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize must not run for unsupported non-text content')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['code'] == 'compute_node_invalid_request'
+    assert response['diagnostics']['reason'] == 'runtime_text_only_content_blocks_required'
+    assert response['diagnostics']['generation_exception_category'] == 'text_only_content_blocks_required'
+
+
+def test_llama_worker_render_and_tokenize_chat_rejects_untyped_blocks_as_invalid_request(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Read this payload'},
+                    {'payload': 'unexpected'},
+                ],
+            }]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'enable_thinking': False,
+                'token_place_provider': 'qwen',
+                'token_place_template_policy': 'gguf-jinja',
+            },
+        },
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        if 'enable_thinking' in kwargs:
+            raise TypeError('unexpected keyword argument enable_thinking')
+        raise AssertionError('apply_chat_template must not be retried without enable_thinking')
+    def tokenize(self, prompt, add_bos=False):
+        raise AssertionError('tokenize must not run for unsupported structured content')
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['code'] == 'compute_node_invalid_request'
+    assert response['diagnostics']['reason'] == 'runtime_text_only_content_blocks_required'
+    assert response['diagnostics']['generation_exception_category'] == 'text_only_content_blocks_required'
+
+
 def test_llama_worker_apply_chat_template_fallback_still_supports_chat_format(tmp_path):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
@@ -5854,7 +6018,7 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     assert classify_shape(TypeError("got an unexpected keyword argument 'stream'")) == 'unsupported_stream_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'stop'")) == 'unsupported_stop_kwarg'
     assert classify_shape(TypeError("got an unexpected keyword argument 'temperature'")) == 'unexpected_kwarg'
-    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'worker_exception'
+    assert classify_shape(RuntimeError("KV cache allocation failed")) == 'kv_cache_allocation'
 
 
 

@@ -44,6 +44,27 @@ def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "LlamaCppInferenceRequestError"
 
 
+_LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS = None
+
+
+def _llama_cpp_inference_request_error_cls():
+    global _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS
+
+    if _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS is None:
+        from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+        _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS = LlamaCppInferenceRequestError
+    return _LLAMA_CPP_INFERENCE_REQUEST_ERROR_CLS
+
+
+def _new_llama_cpp_inference_request_error(
+    message: str, *, diagnostics: Optional[Dict[str, Any]] = None
+) -> RuntimeError:
+    return _llama_cpp_inference_request_error_cls()(
+        message, diagnostics=diagnostics
+    )
+
+
 _UNSUPPORTED_GENERATION_KWARG_PATTERNS = (
     re.compile(r"(?:got an )?unexpected keyword argument [\'\"]([A-Za-z_][A-Za-z0-9_]*)[\'\"]"),
     re.compile(r"unexpected keyword argument\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"),
@@ -98,6 +119,13 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "rejected_generation_kwarg",
     "attempted_generation_kwargs",
     "attempted_plain_completion_methods",
+    "plain_completion_create_completion_callable",
+    "plain_completion_llama_call_callable",
+    "plain_completion_signature_inspectable",
+    "plain_completion_accepts_prompt_kwarg",
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_accepts_var_kwargs",
+    "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
     "stream",
@@ -134,6 +162,8 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "runtime_chat_template_metadata_missing",
         "runtime_chat_template_renderer_unavailable",
         "runtime_template_tokenizer_bridge_unavailable",
+        "runtime_qwen_non_thinking_hard_switch_missing",
+        "runtime_qwen_non_thinking_hard_switch_unavailable",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -144,6 +174,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
         "unsupported_render_kwarg",
+        "qwen_non_thinking_hard_switch_unavailable",
         "unexpected_kwarg",
         "unsupported_prompt_kwarg",
         "unsupported_stream_kwarg",
@@ -2300,28 +2331,14 @@ class RelayClient:
 
     @classmethod
     def _api_v1_qwen_no_think_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Inject Qwen's template-supported non-thinking control into user text."""
+        """Return a defensive copy without injecting Qwen text controls.
 
-        message_control = cls._API_V1_QWEN_NON_THINKING_POLICY["message_control"]
-        prepared = [dict(message) for message in messages]
-        for index in range(len(prepared) - 1, -1, -1):
-            if prepared[index].get("role") != "user":
-                continue
-            content = prepared[index].get("content")
-            if isinstance(content, str):
-                prepared[index]["content"] = f"{message_control}\n{content}"
-                return prepared
-            if isinstance(content, list):
-                copied_blocks = [dict(block) if isinstance(block, dict) else block for block in content]
-                for block in copied_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        block["text"] = f"{message_control}\n{block['text']}"
-                        prepared[index]["content"] = copied_blocks
-                        return prepared
-                copied_blocks.insert(0, {"type": "text", "text": f"{message_control}\n"})
-                prepared[index]["content"] = copied_blocks
-                return prepared
-        return prepared
+        API v1 Qwen non-thinking is enforced by hard render/template controls
+        (enable_thinking=False or the internal non-thinking template), never by
+        mutating user messages with /no_think.
+        """
+
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_qwen_non_thinking_required(cls, model_profile: Dict[str, Any]) -> bool:
@@ -2336,9 +2353,7 @@ class RelayClient:
     def _api_v1_prepare_qwen_non_thinking_messages(
         cls, messages: List[Dict[str, Any]], model_profile: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        if cls._api_v1_qwen_non_thinking_required(model_profile):
-            return cls._api_v1_qwen_no_think_messages(messages)
-        return messages
+        return [dict(message) for message in messages]
 
     @classmethod
     def _api_v1_normalize_qwen_non_thinking_content(
@@ -2831,6 +2846,22 @@ class RelayClient:
     ) -> Optional[str]:
         """Render chat messages with the active runtime chat template."""
 
+        enforce_thinking_disabled = enable_thinking is False
+        existing_render_error = hasattr(llm_instance, "_token_place_last_render_tokenize_error")
+        hard_switch_rejection_recorded = False
+
+        def record_enable_thinking_rejection(method: str) -> None:
+            nonlocal hard_switch_rejection_recorded
+            hard_switch_rejection_recorded = True
+            llm_instance._token_place_last_render_tokenize_error = {
+                "code": "compute_node_context_admission_unavailable",
+                "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                "rejected_generation_kwarg": "enable_thinking",
+                "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                "method": method,
+                "retryable": False,
+            }
+
         apply_chat_template = getattr(llm_instance, "apply_chat_template", None)
         if callable(apply_chat_template):
             try:
@@ -2845,6 +2876,8 @@ class RelayClient:
                         "reason=enable_thinking_unsupported safe_error_code=%s",
                         "compute_node_context_admission_unavailable",
                     )
+                    if enforce_thinking_disabled:
+                        record_enable_thinking_rejection("apply_chat_template")
                     return None
                 try:
                     rendered = apply_chat_template(messages)
@@ -2853,6 +2886,8 @@ class RelayClient:
             except Exception:
                 rendered = None
             if isinstance(rendered, str):
+                if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                    delattr(llm_instance, "_token_place_last_render_tokenize_error")
                 return rendered
         tokenizer = getattr(llm_instance, "tokenizer", None)
         if callable(tokenizer):
@@ -2868,11 +2903,30 @@ class RelayClient:
                     if enable_thinking is not None:
                         kwargs["enable_thinking"] = enable_thinking
                     rendered = tokenizer_template(messages, **kwargs)
+                except TypeError:
+                    if enable_thinking is not None:
+                        logger.warning(
+                            "api_v1.chat_template_render result=rejected "
+                            "reason=enable_thinking_unsupported safe_error_code=%s",
+                            "compute_node_context_admission_unavailable",
+                        )
+                        if enforce_thinking_disabled:
+                            record_enable_thinking_rejection("tokenizer.apply_chat_template")
+                    rendered = None
                 except Exception:
                     rendered = None
                 if isinstance(rendered, str):
+                    if hasattr(llm_instance, "_token_place_last_render_tokenize_error"):
+                        delattr(llm_instance, "_token_place_last_render_tokenize_error")
                     return rendered
         try:
+            if enforce_thinking_disabled:
+                should_record_rejection = not (
+                    hard_switch_rejection_recorded or existing_render_error
+                )
+                if should_record_rejection:
+                    record_enable_thinking_rejection("fallback_render")
+                return None
             if not allow_chat_format_fallback:
                 return None
             if not hasattr(llm_instance, "chat_format"):
@@ -2978,6 +3032,12 @@ class RelayClient:
             "direct_apply_chat_template_available",
             "metadata_template_available",
             "jinja_renderer_available",
+            "rejected_option",
+            "rejected_generation_kwarg",
+            "attempted_generation_kwargs",
+            "generation_exception_category",
+            "method",
+            "retryable",
         ):
             if key in safe_diagnostics:
                 error[key] = safe_diagnostics[key]
@@ -3046,6 +3106,7 @@ class RelayClient:
         is_qwen_non_thinking = (
             self._api_v1_qwen_non_thinking_required(model_profile)
         )
+        admission_enable_thinking = False if is_qwen_non_thinking else None
         # Prefer a packaged-runtime bridge that renders and tokenizes inside the
         # loaded worker process. This keeps Qwen admission aligned with the same
         # GGUF/Jinja template surface used by generation and avoids returning or
@@ -3053,20 +3114,14 @@ class RelayClient:
         prompt_tokens = self._api_v1_render_and_tokenize_chat_prompt(
             llm_instance,
             messages,
-            enable_thinking=None,
+            enable_thinking=admission_enable_thinking,
             model_profile=model_profile,
         )
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
                 messages,
-                # Qwen generation below is controlled by the message-level
-                # ``/no_think`` directive because llama-cpp-python's
-                # ``create_chat_completion`` API does not expose template kwargs.
-                # Admission must render the same message shape, rather than adding
-                # an admission-only ``enable_thinking=False`` assistant prefix that
-                # over-counts near-limit requests.
-                enable_thinking=None,
+                enable_thinking=admission_enable_thinking,
                 allow_chat_format_fallback=not is_qwen_non_thinking,
             )
             prompt_tokens = (
@@ -3079,6 +3134,24 @@ class RelayClient:
             internal_reason = "runtime_template_tokenizer_bridge_unavailable"
             if isinstance(worker_diagnostics, dict) and isinstance(worker_diagnostics.get("reason"), str):
                 internal_reason = worker_diagnostics["reason"]
+            if (
+                isinstance(worker_diagnostics, dict)
+                and worker_diagnostics.get("code") == "compute_node_invalid_request"
+            ):
+                return (
+                    False,
+                    {
+                        "code": "compute_node_invalid_request",
+                        "type": "validation_error",
+                        "message": (
+                            "API v1 chat completions are text-only and do not support non-text content blocks. "
+                            "Use text-only messages or API v2 for multimodal requests."
+                        ),
+                        "retryable": False,
+                        "internal_reason": internal_reason,
+                    },
+                    None,
+                )
             safe_diagnostics = {
                 "active_model_id": getattr(self.model_manager, "api_model_id", None),
                 "active_profile_id": model_profile.get("id") or model_profile.get("model_id"),
@@ -3090,6 +3163,17 @@ class RelayClient:
                 "metadata_template_available": internal_reason != "runtime_chat_template_metadata_missing",
                 "jinja_renderer_available": internal_reason != "runtime_chat_template_renderer_unavailable",
             }
+            if isinstance(worker_diagnostics, dict):
+                for key in (
+                    "rejected_option",
+                    "rejected_generation_kwarg",
+                    "attempted_generation_kwargs",
+                    "generation_exception_category",
+                    "method",
+                    "retryable",
+                ):
+                    if key in worker_diagnostics:
+                        safe_diagnostics[key] = worker_diagnostics[key]
             log_error(
                 "api_v1.context_admission active_tier={} result=rejected reason={} safe_error_code={} model_id={} profile_id={} template_policy={} non_thinking={} runtime_facade={} direct_apply_chat_template_available={} metadata_template_available={} jinja_renderer_available={}",
                 active_context_tier,
@@ -3325,7 +3409,8 @@ class RelayClient:
         while True:
             runtime_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             completion_kwargs = {"max_tokens": int(runtime_kwargs.get("max_tokens", 64) or 64)}
-            removed_set = set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))
+            never_filter = {"enable_thinking"} if self._api_v1_qwen_non_thinking_required(model_profile) else set()
+            removed_set = (set(removed) | (set(getattr(self, "_api_v1_generation_kwargs_filtered", set())) - set(client_option_names))) - never_filter
             completion_kwargs = {
                 key: value for key, value in completion_kwargs.items() if key not in removed_set
             }
@@ -3365,9 +3450,21 @@ class RelayClient:
                     if isinstance(safe_worker.get("generation_exception_category"), str)
                     else _classify_safe_generation_exception(exc)
                 )
-                if category != "unsupported_generation_kwarg" or not rejected:
+                if self._api_v1_qwen_non_thinking_required(model_profile) and rejected == "enable_thinking":
+                    raise _new_llama_cpp_inference_request_error(
+                        "runtime_qwen_non_thinking_hard_switch_unavailable",
+                        diagnostics={
+                            "code": "compute_node_runtime_unavailable",
+                            "reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                            "internal_reason": "runtime_qwen_non_thinking_hard_switch_unavailable",
+                            "rejected_generation_kwarg": "enable_thinking",
+                            "generation_exception_category": "qwen_non_thinking_hard_switch_unavailable",
+                            "retryable": False,
+                        },
+                    )
+                if category not in {"unsupported_generation_kwarg", "unsupported_render_kwarg"} or not rejected:
                     raise
-                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed"} or len(removed) >= max_removed_kwargs:
+                if (rejected in client_option_names and rejected != "top_k") or rejected in {"messages", "max_tokens", "stream", "seed", "enable_thinking"} or len(removed) >= max_removed_kwargs:
                     raise
                 removed.append(rejected)
                 self._api_v1_remember_generation_kwargs(attempted=attempted_names, rejected=rejected)
@@ -3879,14 +3976,15 @@ class RelayClient:
                         else None
                     )
                 )
-                error_code = (
-                    "compute_node_options_unsupported"
-                    if (
-                        safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
-                        or internal_reason == "unsupported_generation_option"
-                    )
-                    else "compute_node_internal_error"
-                )
+                if safe_worker_diagnostics.get("code") == "compute_node_invalid_request":
+                    error_code = "compute_node_invalid_request"
+                elif (
+                    safe_worker_diagnostics.get("code") == "compute_node_options_unsupported"
+                    or internal_reason == "unsupported_generation_option"
+                ):
+                    error_code = "compute_node_options_unsupported"
+                else:
+                    error_code = "compute_node_internal_error"
                 self._last_api_v1_runtime_health = {
                     "runtime_healthy": True,
                     "recovery_attempted": False,

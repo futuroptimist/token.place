@@ -3167,6 +3167,7 @@ class RelayClient:
                 for key in (
                     "rejected_option",
                     "rejected_generation_kwarg",
+                    "sanitized_error_summary",
                     "attempted_generation_kwargs",
                     "generation_exception_category",
                     "method",
@@ -4000,6 +4001,11 @@ class RelayClient:
                     "exception_category": category,
                     "exception_type": (
                         safe_worker_diagnostics.get("exception_type")
+                        if isinstance(safe_worker_diagnostics, dict)
+                        else None
+                    ),
+                    "sanitized_error_summary": (
+                        safe_worker_diagnostics.get("sanitized_error_summary")
                         if isinstance(safe_worker_diagnostics, dict)
                         else None
                     ),

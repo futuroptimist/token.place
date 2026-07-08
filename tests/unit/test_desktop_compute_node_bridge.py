@@ -4824,3 +4824,32 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped
     assert 'api_v1_readiness_completion_smoke_internal_reason' not in safe
+
+
+def test_safe_readiness_diagnostics_stderr_includes_sorted_safe_fields(capsys):
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_completion_smoke_method': 'create_completion_keyword_prompt',
+            'api_v1_readiness_completion_smoke_generation_exception_category': 'worker_exception',
+            'api_v1_readiness_completion_smoke_exception_type': 'LlamaCppInferenceRequestError',
+            'api_v1_readiness_completion_smoke_safe_summary': 'LlamaCppInferenceRequestError:redacted',
+            'prompt': 'SECRET_PROMPT',
+        }
+    )
+
+    compute_node_bridge._emit_safe_readiness_diagnostics_stderr(manager)
+
+    captured = capsys.readouterr()
+    line = captured.err.strip()
+    assert line.startswith('desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics ')
+    assert 'api_v1_readiness_completion_smoke_exception_type=LlamaCppInferenceRequestError' in line
+    assert 'api_v1_readiness_completion_smoke_generation_exception_category=worker_exception' in line
+    assert 'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt' in line
+    assert 'SECRET_' not in line
+
+
+def test_safe_readiness_diagnostics_stderr_emits_unavailable_when_absent(capsys):
+    compute_node_bridge._emit_safe_readiness_diagnostics_stderr(SimpleNamespace(last_compute_diagnostics={}))
+
+    captured = capsys.readouterr()
+    assert captured.err.strip() == 'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics unavailable=true'

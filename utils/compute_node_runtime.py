@@ -862,6 +862,13 @@ class ComputeNodeRuntime:
                     exception_type = smoke_error.get("exception_type")
                     if isinstance(exception_type, str):
                         diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_type
+                    sanitized_error_summary = smoke_error.get("sanitized_error_summary")
+                    if isinstance(sanitized_error_summary, str):
+                        safe_summary = _safe_completion_smoke_worker_diagnostic_value(
+                            "sanitized_error_summary", sanitized_error_summary
+                        )
+                        if isinstance(safe_summary, str):
+                            diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = safe_summary
                     worker_diagnostics = smoke_error.get("worker_diagnostics")
                     safe_worker_diagnostics: Dict[str, Any] = {}
                     if isinstance(worker_diagnostics, dict):
@@ -869,6 +876,13 @@ class ComputeNodeRuntime:
                         diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = (
                             safe_worker_diagnostics
                         )
+                        if (
+                            "api_v1_readiness_completion_smoke_safe_summary" not in diagnostics
+                            and isinstance(safe_worker_diagnostics.get("sanitized_error_summary"), str)
+                        ):
+                            diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = safe_worker_diagnostics[
+                                "sanitized_error_summary"
+                            ]
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",

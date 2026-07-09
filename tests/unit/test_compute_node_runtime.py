@@ -1170,6 +1170,7 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
                         "plain_completion_prompt_tokenization_special": True,
                         "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
                         "plain_completion_reset_after_failure_count": 2,
+                        "plain_completion_eval_return_code": 1,
                         "prompt": "SECRET_PROMPT",
                         "rendered_prompt": "SECRET_RENDERED_PROMPT",
                         "token_ids": [1, 2, 3],
@@ -1211,6 +1212,7 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
         "plain_completion_prompt_tokenization_special": True,
         "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
         "plain_completion_reset_after_failure_count": 2,
+        "plain_completion_eval_return_code": 1,
     }
     assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "stream"
     assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,stream"
@@ -1222,6 +1224,8 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
     assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] is True
     assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category"] == "prompt_tokenization_failure"
     assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_reset_after_failure_count"] == 2
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_eval_return_code"] == 1
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"] == 3
     assert "SECRET" not in json.dumps(diagnostics)
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):

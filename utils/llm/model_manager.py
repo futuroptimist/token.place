@@ -2931,6 +2931,8 @@ for line in sys.stdin:
                             if invalid_reason is not None:
                                 last_invalid_reason = invalid_reason
                                 result = None
+                    if result is not None:
+                        break
             if result is not None:
                 normalized, invalid_reason = _normalize_plain_completion_result(result)
             if result is None and last_invalid_reason != 'thinking_leaked' and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories):

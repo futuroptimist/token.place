@@ -5983,6 +5983,10 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
         None,
         'thinking_leaked',
     )
+    assert normalize({'choices': [{'message': {'content': 'visible', 'reasoning': 'hidden'}}]}) == (
+        None,
+        'thinking_leaked',
+    )
     assert normalize({'choices': [{'message': {'content': 'visible', 'reasoning': {'trace': 'hidden'}}}]}) == (
         None,
         'thinking_leaked',
@@ -7524,13 +7528,24 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert 'SECRET_RENDERED_PROMPT' not in sanitize(RuntimeError('failed to tokenize SECRET_RENDERED_PROMPT'))
 
 
-def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning_metadata(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "reasoning_metadata",
+    [
+        {"reasoning_content": "hidden chain"},
+        {"reasoning": "hidden chain"},
+        {"reasoning": {"trace": "hidden chain"}},
+    ],
+)
+def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning_metadata(
+    tmp_path, monkeypatch, reasoning_metadata
+):
     from utils.llm import model_manager as model_manager_module
 
     fake_site = tmp_path / 'high level fallback reasoning fake site'
     fake_pkg = fake_site / 'llama_cpp'
     fake_pkg.mkdir(parents=True)
     (fake_pkg / '__init__.py').write_text(
+        f"REASONING_METADATA = {reasoning_metadata!r}\n"
         "class Llama:\n"
         "    def __init__(self, *args, **kwargs):\n"
         "        pass\n"
@@ -7543,7 +7558,9 @@ def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning
         "    def __call__(self, prompt, **kwargs):\n"
         "        raise RuntimeError('failed to eval prompt')\n"
         "    def create_chat_completion(self, *, messages, max_tokens, chat_template_kwargs):\n"
-        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'visible', 'reasoning_content': 'hidden chain'}}]}\n",
+        "        message = {'role': 'assistant', 'content': 'visible'}\n"
+        "        message.update(REASONING_METADATA)\n"
+        "        return {'choices': [{'message': message}]}\n",
         encoding='utf-8',
     )
     monkeypatch.syspath_prepend(str(fake_site))

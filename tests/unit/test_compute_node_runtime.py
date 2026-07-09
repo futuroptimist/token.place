@@ -980,6 +980,44 @@ def test_compute_node_runtime_readiness_smoke_completion_rejects_missing_content
     assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_invalid_model_output"
 
 
+def test_compute_node_runtime_api_v1_error_falls_back_to_redacted_safe_summary(monkeypatch):
+    class ErrorEnvelopeRelayClient:
+        def _api_v1_authoritative_context_admission(self, **_kwargs):
+            return True, None, 2
+
+        def _generate_api_v1_response_with_runtime_model(self, **_kwargs):
+            return {
+                "api_v1_response": {
+                    "error": {
+                        "code": "compute_node_context_admission_unavailable",
+                        "internal_reason": "runtime_completion_smoke_worker_exception",
+                        "exception_type": "RuntimeError",
+                    }
+                }
+            }
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_profile = {"provider": "local", "thinking_mode": "n/a"}
+    model_manager.context_tier = "8k-fast"
+    model_manager.context_window_tokens = 8192
+    model_manager.api_model_id = "local-model"
+    model_manager.last_compute_diagnostics = {}
+    model_manager.get_llm_instance.return_value = _ReadyRuntime()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=ErrorEnvelopeRelayClient(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "RuntimeError:redacted"
+
+
 def test_compute_node_runtime_exception_path_promotes_nested_worker_failure_details(monkeypatch):
     class NestedWorkerDiagnosticException(Exception):
         def __init__(self):
@@ -2289,6 +2327,36 @@ def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnos
     for unsafe_key in unsafe_fields:
         assert f'"{unsafe_key}"' not in dumped
     assert "SECRET_" not in dumped
+
+
+def test_qwen_64k_completion_smoke_exception_falls_back_to_redacted_safe_summary():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    class FailingRuntime(_Qwen64kRuntime):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "method": "create_completion_keyword_prompt",
+                    "generation_exception_category": "worker_exception",
+                    "exception_type": "LlamaCppInferenceRequestError",
+                    "prompt": "SECRET_PROMPT",
+                },
+            )
+
+    model_manager = _qwen_64k_model_manager(FailingRuntime())
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=_ready_relay_client(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "LlamaCppInferenceRequestError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "LlamaCppInferenceRequestError:redacted"
+    assert "SECRET_" not in json.dumps(diagnostics)
 
 
 def test_qwen_64k_deployed_plain_completion_worker_exception_populates_flat_safe_fields():

@@ -4860,6 +4860,21 @@ def test_warm_load_failure_stderr_includes_safe_readiness_diagnostics(capsys, mo
     assert "unsafe free text prompt" not in err
 
 
+def test_safe_readiness_stderr_renders_null_diagnostic_values(capsys):
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_error_code': None,
+            'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
+        }
+    )
+
+    compute_node_bridge._emit_safe_readiness_diagnostics_stderr(manager)
+
+    err = capsys.readouterr().err
+    assert "api_v1_readiness_error_code=null" in err
+    assert "api_v1_readiness_completion_smoke_exception_type=RuntimeError" in err
+
+
 def test_warm_load_failure_stderr_marks_safe_readiness_diagnostics_unavailable(capsys, monkeypatch):
     _reset_cancel_queue()
 

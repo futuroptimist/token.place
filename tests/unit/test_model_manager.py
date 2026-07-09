@@ -7184,3 +7184,112 @@ def test_llama_worker_render_complete_max_tokens_rejected_fails_closed_without_u
     assert diagnostics['attempted_plain_completion_methods'] == (
         'create_completion_keyword_prompt,create_completion_positional_prompt,llama_call_positional_prompt'
     )
+
+def test_llama_worker_render_complete_token_id_keyword_fallback_recovers(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'token id keyword fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.reset_count = 0\n"
+        "    def reset(self):\n"
+        "        self.reset_count += 1\n"
+        "    def tokenize(self, prompt, add_bos=False, special=False):\n"
+        "        if special is not True or add_bos is not False:\n"
+        "            raise AssertionError('special tokenization not preferred')\n"
+        "        return [101, 202, 303]\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, str):\n"
+        "            raise RuntimeError('failed to tokenize prompt')\n"
+        "        if prompt == [101, 202, 303]:\n"
+        "            return {'choices': [{'text': 'token ids ok'}]}\n"
+        "        raise AssertionError('unexpected prompt shape')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'token ids ok'}}]}
+
+
+def test_llama_worker_render_complete_token_id_positional_fallback_and_safe_diagnostics(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'token id positional fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.reset_count = 0\n"
+        "    def reset(self):\n"
+        "        self.reset_count += 1\n"
+        "    def tokenize(self, prompt, add_bos=False, special=False):\n"
+        "        return [7, 8, 9]\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, str):\n"
+        "            raise RuntimeError('llama_decode returned -1')\n"
+        "        if 'prompt' in kwargs and isinstance(prompt, list):\n"
+        "            raise TypeError(\"got an unexpected keyword argument 'prompt'\")\n"
+        "        if args and args[0] == [7, 8, 9]:\n"
+        "            return {'choices': [{'text': 'positional token ids ok'}]}\n"
+        "        raise AssertionError('unexpected prompt shape')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded llama call')\n"
+        "        raise RuntimeError('no logits available')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5)
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'positional token ids ok'}}]}
+
+
+def test_subprocess_worker_plain_completion_classifies_runtime_failures_safely():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    exec(model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE.split('def _metadata_value', 1)[0], namespace)
+    classify = namespace['_plain_completion_method_shape_category']
+    sanitize = namespace['_sanitize_error_summary']
+
+    assert classify(RuntimeError('failed to tokenize prompt containing SECRET')) == 'prompt_tokenization_failure'
+    assert sanitize(RuntimeError('failed to tokenize prompt containing SECRET')) == 'RuntimeError:prompt_tokenization_failure'
+    assert classify(RuntimeError('llama_decode returned -1 with SECRET')) == 'prompt_eval_failure'
+    assert sanitize(RuntimeError('llama_decode returned -1 with SECRET')) == 'RuntimeError:prompt_eval_failure'
+    assert classify(RuntimeError('no logits for SECRET')) == 'sampling_failure'
+    assert sanitize(RuntimeError('sampler failed for SECRET')) == 'RuntimeError:sampling_failure'

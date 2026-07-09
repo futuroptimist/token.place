@@ -62,6 +62,9 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "empty_completion_output": "runtime_completion_smoke_plain_completion_empty_output",
     "thinking_leaked": "runtime_completion_smoke_plain_completion_thinking_leaked",
     "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
+    "prompt_tokenization_failure": "runtime_completion_smoke_plain_completion_prompt_tokenization_failure",
+    "prompt_eval_failure": "runtime_completion_smoke_plain_completion_eval_failure",
+    "sampling_failure": "runtime_completion_smoke_plain_completion_sampling_failure",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -81,6 +84,12 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_accepts_prompt_kwarg",
     "plain_completion_accepts_max_tokens_kwarg",
     "plain_completion_accepts_var_kwargs",
+    "plain_completion_prompt_tokenization_attempted",
+    "plain_completion_prompt_token_count",
+    "plain_completion_prompt_tokenization_method",
+    "plain_completion_prompt_tokenization_special",
+    "plain_completion_prompt_tokenization_error_category",
+    "plain_completion_reset_after_failure_count",
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
@@ -152,6 +161,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "create_completion_keyword_prompt",
         "create_completion_positional_prompt",
         "llama_call_positional_prompt",
+        "create_completion_keyword_token_ids",
+        "create_completion_positional_token_ids",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -160,13 +171,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
-    r"rope_yarn_eval_failure|unsupported_kwarg)$"
+    r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|sampling_failure)$"
 )
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
     "llama", "llama_context", "ggml", "metal", "kv", "cache", "alloc", "allocation",
     "memory", "oom", "buffer", "rope", "yarn", "flash_attn", "type_k", "type_v",
     "n_ctx", "context", "unsupported", "keyword", "argument", "failed", "error",
-    "runtime", "worker", "exception", "redacted", "path", "out", "of", "to", "create",
+    "runtime", "worker", "exception", "redacted", "path", "out", "of", "to", "create", "tokenize", "tokenization", "eval", "evaluate", "decode", "sample", "sampler", "logits",
 }
 
 

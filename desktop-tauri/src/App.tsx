@@ -53,6 +53,49 @@ interface RelayStatus {
 
 type ReadinessDiagnostics = Record<string, string | number | boolean | null>;
 
+const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
+  'api_v1_readiness_result',
+  'api_v1_readiness_error_code',
+  'api_v1_readiness_error_reason',
+  'api_v1_readiness_completion_smoke_result',
+  'api_v1_readiness_completion_smoke_failure_reason',
+  'api_v1_readiness_completion_smoke_error_code',
+  'api_v1_readiness_completion_smoke_safe_summary',
+  'api_v1_readiness_completion_smoke_exception_category',
+  'api_v1_readiness_completion_smoke_exception_type',
+  'api_v1_readiness_completion_smoke_rejected_generation_kwarg',
+  'api_v1_readiness_completion_smoke_rejected_option',
+  'api_v1_readiness_completion_smoke_attempted_generation_kwargs',
+  'api_v1_readiness_completion_smoke_attempted_plain_completion_methods',
+  'api_v1_readiness_completion_smoke_method',
+  'api_v1_readiness_completion_smoke_generation_exception_category',
+  'api_v1_readiness_completion_smoke_result_shape',
+  'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable',
+  'api_v1_readiness_completion_smoke_plain_completion_llama_call_callable',
+  'api_v1_readiness_completion_smoke_plain_completion_signature_inspectable',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs',
+  'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',
+]);
+
+function isSafeReadinessDiagnosticString(value: string): boolean {
+  return value.length <= 256 && /^[A-Za-z0-9_.:/@,+-]*$/.test(value);
+}
+
+function safeReadinessDiagnosticValue(value: unknown): string | number | boolean | null | undefined {
+  if (typeof value === 'boolean' || value === null) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && isSafeReadinessDiagnosticString(value)) {
+    return value;
+  }
+  return undefined;
+}
+
 interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
@@ -198,13 +241,12 @@ function readinessDiagnosticsPayload(value: unknown): ReadinessDiagnostics | nul
   }
   const diagnostics: ReadinessDiagnostics = {};
   for (const [key, item] of Object.entries(value)) {
-    if (
-      typeof item === 'string' ||
-      typeof item === 'boolean' ||
-      item === null ||
-      (typeof item === 'number' && Number.isFinite(item))
-    ) {
-      diagnostics[key] = item;
+    if (!SAFE_READINESS_DIAGNOSTIC_KEYS.has(key)) {
+      continue;
+    }
+    const safeValue = safeReadinessDiagnosticValue(item);
+    if (safeValue !== undefined) {
+      diagnostics[key] = safeValue;
     }
   }
   return diagnostics;
@@ -219,14 +261,12 @@ function readinessDiagnosticsFromEventPayload(
     Object.assign(diagnostics, nestedDiagnostics);
   }
   for (const [key, item] of Object.entries(payload)) {
-    if (
-      key.startsWith('api_v1_readiness_') &&
-      (typeof item === 'string' ||
-        typeof item === 'boolean' ||
-        item === null ||
-        (typeof item === 'number' && Number.isFinite(item)))
-    ) {
-      diagnostics[key] = item;
+    if (!SAFE_READINESS_DIAGNOSTIC_KEYS.has(key)) {
+      continue;
+    }
+    const safeValue = safeReadinessDiagnosticValue(item);
+    if (safeValue !== undefined) {
+      diagnostics[key] = safeValue;
     }
   }
   return Object.keys(diagnostics).length > 0 ? diagnostics : null;

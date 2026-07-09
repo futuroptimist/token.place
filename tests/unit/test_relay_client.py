@@ -43,13 +43,27 @@ def test_worker_diagnostic_sanitizer_preserves_tokenization_string_enums():
         {
             "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
             "plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "plain_completion_prompt_tokenization_attempted": True,
+            "plain_completion_prompt_tokenization_special": True,
+            "plain_completion_prompt_token_count": 3,
+            "plain_completion_reset_after_failure_count": 2,
             "content": "SECRET prompt text",
+            "rendered_prompt": "SECRET rendered prompt",
+            "token_ids": [1, 2, 3],
+            "assistant_output": "SECRET output",
+            "key": "SECRET key",
+            "tool_args": {"secret": True},
+            "ciphertext": "SECRET ciphertext",
         }
     )
 
     assert safe == {
         "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
         "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_attempted": True,
+        "plain_completion_prompt_tokenization_special": True,
+        "plain_completion_prompt_token_count": 3,
+        "plain_completion_reset_after_failure_count": 2,
     }
     assert "SECRET" not in json.dumps(safe)
 
@@ -6351,7 +6365,20 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
         "plain_completion_accepts_prompt_kwarg": False,
         "plain_completion_accepts_max_tokens_kwarg": True,
         "plain_completion_accepts_var_kwargs": False,
+        "plain_completion_reset_after_failure_count": 2,
+        "plain_completion_prompt_tokenization_attempted": True,
+        "plain_completion_prompt_token_count": 3,
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_special": True,
+        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
         "qwen_api_v1_non_thinking_template_fallback": False,
+        "prompt": "SECRET prompt",
+        "rendered_prompt": "SECRET rendered prompt",
+        "token_ids": [1, 2, 3],
+        "assistant_output": "SECRET output",
+        "key": "SECRET key",
+        "tool_args": {"secret": True},
+        "ciphertext": "SECRET ciphertext",
     }
     manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
         "llama_cpp request failed",
@@ -6368,6 +6395,8 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
 
     error = envelope["api_v1_response"]["error"]
     for key, value in worker_diagnostics.items():
+        if key in {"prompt", "rendered_prompt", "token_ids", "assistant_output", "key", "tool_args", "ciphertext"}:
+            continue
         assert error["worker_diagnostics"].get(key) == value
     for key in (
         "plain_completion_create_completion_callable",
@@ -6376,6 +6405,42 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
         "plain_completion_accepts_prompt_kwarg",
         "plain_completion_accepts_max_tokens_kwarg",
         "plain_completion_accepts_var_kwargs",
+        "plain_completion_reset_after_failure_count",
+        "plain_completion_prompt_tokenization_attempted",
+        "plain_completion_prompt_token_count",
+        "plain_completion_prompt_tokenization_method",
+        "plain_completion_prompt_tokenization_special",
+        "plain_completion_prompt_tokenization_error_category",
         "qwen_api_v1_non_thinking_template_fallback",
     ):
         assert error[key] == worker_diagnostics[key]
+    assert "SECRET" not in json.dumps(error)
+
+
+def test_api_v1_runtime_error_promotes_tokenization_category_to_safe_internal_reason():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    manager = _ApiV1RuntimeManager()
+    manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
+        "failed to tokenize prompt SECRET_PROMPT",
+        diagnostics={
+            "generation_exception_category": "prompt_tokenization_failure",
+            "exception_type": "RuntimeError",
+            "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        },
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = client._generate_api_v1_response_with_runtime_model(
+        request_id="req-tokenization-category",
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={},
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["internal_reason"] == "runtime_prompt_tokenization_failure"
+    assert error["generation_exception_category"] == "prompt_tokenization_failure"
+    assert error["plain_completion_prompt_tokenization_method"] == "llama.tokenize"
+    assert "SECRET" not in json.dumps(error)

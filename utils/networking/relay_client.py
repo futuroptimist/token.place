@@ -216,11 +216,10 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "",
         "tokenizer_unavailable",
         "method_shape",
+        "tokenizer_special_rejected",
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "sampling_failure",
-        "unknown_generation_exception",
-        "worker_exception",
     },
     "plain_completion_prompt_tokenization_method": {"", "llama.tokenize"},
 }
@@ -3979,6 +3978,9 @@ class RelayClient:
                     "worker_timeout",
                     "worker_dead",
                     "unsupported_render_kwarg",
+                    "prompt_tokenization_failure",
+                    "prompt_eval_failure",
+                    "sampling_failure",
                 }:
                     internal_reason = f"runtime_{category}"
                 elif category == "unsupported_generation_kwarg":
@@ -4040,6 +4042,12 @@ class RelayClient:
                     "plain_completion_accepts_prompt_kwarg",
                     "plain_completion_accepts_max_tokens_kwarg",
                     "plain_completion_accepts_var_kwargs",
+                    "plain_completion_reset_after_failure_count",
+                    "plain_completion_prompt_tokenization_attempted",
+                    "plain_completion_prompt_token_count",
+                    "plain_completion_prompt_tokenization_method",
+                    "plain_completion_prompt_tokenization_special",
+                    "plain_completion_prompt_tokenization_error_category",
                     "qwen_api_v1_non_thinking_template_fallback",
                 ):
                     safe_value = safe_worker_diagnostics.get(safe_key)

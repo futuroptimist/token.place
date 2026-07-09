@@ -171,11 +171,10 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "",
         "tokenizer_unavailable",
         "method_shape",
+        "tokenizer_special_rejected",
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "sampling_failure",
-        "unknown_generation_exception",
-        "worker_exception",
     },
     "plain_completion_prompt_tokenization_method": {"", "llama.tokenize"},
 }
@@ -919,6 +918,12 @@ class ComputeNodeRuntime:
                         "plain_completion_accepts_prompt_kwarg",
                         "plain_completion_accepts_max_tokens_kwarg",
                         "plain_completion_accepts_var_kwargs",
+                        "plain_completion_reset_after_failure_count",
+                        "plain_completion_prompt_tokenization_attempted",
+                        "plain_completion_prompt_token_count",
+                        "plain_completion_prompt_tokenization_method",
+                        "plain_completion_prompt_tokenization_special",
+                        "plain_completion_prompt_tokenization_error_category",
                         "qwen_api_v1_non_thinking_template_fallback",
                     ):
                         if key in smoke_error:
@@ -993,6 +998,12 @@ class ComputeNodeRuntime:
                     "plain_completion_accepts_prompt_kwarg",
                     "plain_completion_accepts_max_tokens_kwarg",
                     "plain_completion_accepts_var_kwargs",
+                    "plain_completion_reset_after_failure_count",
+                    "plain_completion_prompt_tokenization_attempted",
+                    "plain_completion_prompt_token_count",
+                    "plain_completion_prompt_tokenization_method",
+                    "plain_completion_prompt_tokenization_special",
+                    "plain_completion_prompt_tokenization_error_category",
                     "qwen_api_v1_non_thinking_template_fallback",
                 ):
                     if key in exception_diagnostics:
@@ -1025,6 +1036,12 @@ class ComputeNodeRuntime:
                         "plain_completion_accepts_prompt_kwarg",
                         "plain_completion_accepts_max_tokens_kwarg",
                         "plain_completion_accepts_var_kwargs",
+                        "plain_completion_reset_after_failure_count",
+                        "plain_completion_prompt_tokenization_attempted",
+                        "plain_completion_prompt_token_count",
+                        "plain_completion_prompt_tokenization_method",
+                        "plain_completion_prompt_tokenization_special",
+                        "plain_completion_prompt_tokenization_error_category",
                         "qwen_api_v1_non_thinking_template_fallback",
                     ):
                         if key in safe_worker_diagnostics:

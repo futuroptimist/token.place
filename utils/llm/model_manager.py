@@ -1939,7 +1939,11 @@ def _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt):
             if last_category == 'unknown_generation_exception':
                 last_category = 'prompt_tokenization_failure'
             continue
-        if isinstance(tokens, (list, tuple)) and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens):
+        if (
+            isinstance(tokens, (list, tuple))
+            and bool(tokens)
+            and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens)
+        ):
             diagnostics['plain_completion_prompt_token_count'] = len(tokens)
             diagnostics['plain_completion_prompt_tokenization_method'] = method_name
             diagnostics['plain_completion_prompt_tokenization_special'] = special_value
@@ -2816,6 +2820,7 @@ for line in sys.stdin:
                 normalized, invalid_reason = _normalize_plain_completion_result(result)
                 if (
                     invalid_reason is not None
+                    and invalid_reason != 'thinking_leaked'
                     and rendered_prompt_token_ids is None
                     and callable(create_completion)
                     and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories)

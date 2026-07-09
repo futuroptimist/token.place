@@ -7156,11 +7156,11 @@ def test_llama_worker_render_complete_token_id_fallback_recovers_after_invalid_s
         "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
         "        if isinstance(prompt, list):\n"
         "            return {'choices': [{'text': 'token fallback after invalid output'}]}\n"
-        "        return {'choices': [{'text': '<think>leaked reasoning</think> bad'}]}\n"
+        "        return {'choices': []}\n"
         "    def __call__(self, prompt, **kwargs):\n"
         "        if 'max_tokens' not in kwargs:\n"
         "            raise AssertionError('unbounded llama call')\n"
-        "        return {'choices': [{'text': '<think>still leaked</think> bad'}]}\n",
+        "        return {'choices': []}\n",
         encoding='utf-8',
     )
     monkeypatch.syspath_prepend(str(fake_site))
@@ -7184,6 +7184,167 @@ def test_llama_worker_render_complete_token_id_fallback_recovers_after_invalid_s
     assert result == {
         'choices': [{'message': {'role': 'assistant', 'content': 'token fallback after invalid output'}}]
     }
+
+
+def test_llama_worker_render_complete_thinking_leak_never_uses_token_id_fallback(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'thinking leak no fallback fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def tokenize(self, *args, **kwargs):\n"
+        "        raise AssertionError('tokenization must not be called after thinking leak')\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, list):\n"
+        "            raise AssertionError('token-id fallback must not be attempted')\n"
+        "        return {'choices': [{'text': '<think>leaked reasoning</think> bad'}]}\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        raise AssertionError('llama fallback must not run after successful keyword response')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'thinking_leaked'
+    assert diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
+    assert 'plain_completion_prompt_tokenization_attempted' not in diagnostics
+    assert 'create_completion_keyword_token_ids' not in json.dumps(diagnostics)
+    unsafe_dump = json.dumps(diagnostics)
+    for unsafe in ('leaked reasoning', 'secret prompt text', '<think>', 'token_ids', 'ciphertext', 'tool_args'):
+        assert unsafe not in unsafe_dump
+
+
+def test_llama_worker_render_complete_empty_tokenization_does_not_attempt_token_id_fallback(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'empty tokenization no fallback fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.calls = []\n"
+        "    def tokenize(self, prompt, add_bos=False, special=False):\n"
+        "        return []\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, list):\n"
+        "            raise AssertionError('empty token-id fallback must not be attempted')\n"
+        "        raise RuntimeError('failed to tokenize prompt')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded llama call')\n"
+        "        raise RuntimeError('failed to tokenize prompt')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['plain_completion_prompt_tokenization_attempted'] is True
+    assert diagnostics['plain_completion_prompt_token_count'] == 0
+    assert diagnostics['plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
+    assert 'create_completion_keyword_token_ids' not in diagnostics['attempted_plain_completion_methods']
+    unsafe_dump = json.dumps(diagnostics)
+    for unsafe in ('secret prompt text', 'rendered_prompt', 'token_ids', 'model output', 'decrypted_payload', 'ciphertext', 'tool_args'):
+        assert unsafe not in unsafe_dump
+
+
+def test_llama_worker_render_complete_token_id_thinking_leak_fails_without_retry(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'token id thinking leak fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def tokenize(self, prompt, add_bos=False, special=False):\n"
+        "        return [8, 9]\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, list) and 'prompt' in kwargs:\n"
+        "            return {'choices': [{'text': '<think>token reasoning</think> bad'}]}\n"
+        "        if isinstance(prompt, list):\n"
+        "            raise AssertionError('positional token-id retry must not run after thinking leak')\n"
+        "        raise RuntimeError('failed to tokenize prompt')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded llama call')\n"
+        "        raise RuntimeError('failed to tokenize prompt')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['generation_exception_category'] == 'thinking_leaked'
+    assert diagnostics['attempted_plain_completion_methods'].endswith('create_completion_keyword_token_ids')
+    assert 'create_completion_positional_token_ids' not in diagnostics['attempted_plain_completion_methods']
+    unsafe_dump = json.dumps(diagnostics)
+    for unsafe in ('token reasoning', 'secret prompt text', '<think>', '8', '9', 'ciphertext', 'tool_args'):
+        assert unsafe not in unsafe_dump
 
 def test_llama_worker_render_complete_token_id_positional_fallback_records_all_methods(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
@@ -7280,9 +7441,9 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
             return []
 
     tokens, diagnostics = tokenize_prompt(RuntimeEmptyTokens(), '')
-    assert tokens == []
+    assert tokens is None
     assert diagnostics['plain_completion_prompt_token_count'] == 0
-    assert diagnostics['plain_completion_prompt_tokenization_error_category'] == ''
+    assert diagnostics['plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
 
     assert classify_shape(RuntimeError('failed to tokenize prompt')) == 'prompt_tokenization_failure'
     assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_failure'

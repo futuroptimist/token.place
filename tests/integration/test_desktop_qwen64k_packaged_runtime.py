@@ -101,6 +101,10 @@ class Llama:
         if path:
             with open(path, 'a', encoding='utf-8') as handle:
                 handle.write(json.dumps({'prompt': prompt, **kwargs}, sort_keys=True) + '\\n')
+        if isinstance(prompt, str) and os.environ.get('TOKEN_PLACE_STRING_COMPLETION_THINK'):
+            return {'choices': [{'text': os.environ.get('TOKEN_PLACE_STRING_COMPLETION_THINK')}]}
+        if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_THINK'):
+            return {'choices': [{'text': os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_THINK')}]}
         if isinstance(prompt, str) and os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'):
             raise RuntimeError(os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'))
         if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR'):
@@ -443,6 +447,37 @@ def test_qwen64k_packaged_subprocess_token_id_fallback_failure_reports_safe_cate
         assert any(isinstance(attempt["prompt"], str) for attempt in completion_attempts)
         assert any(attempt["prompt"] == [1] * 42 for attempt in completion_attempts)
         assert all(attempt.get("max_tokens") == 64 for attempt in completion_attempts)
+    finally:
+        proxy.close()
+
+
+
+def test_qwen64k_packaged_subprocess_thinking_leak_fails_closed_without_token_fallback(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_STRING_COMPLETION_THINK', '<think>SECRET_ASSISTANT_OUTPUT</think> bad')
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is False
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "thinking_leaked"
+        assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_plain_completion_thinking_leaked"
+        dumped = json.dumps(diagnostics)
+        assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
+        assert '<think>' not in dumped
+
+        completion_attempts = [
+            json.loads(line) for line in completion_kwargs_file.read_text().splitlines()
+        ]
+        assert len(completion_attempts) == 1
+        assert isinstance(completion_attempts[0]["prompt"], str)
+        assert completion_attempts[0].get("max_tokens") == 64
     finally:
         proxy.close()
 

@@ -51,6 +51,8 @@ interface RelayStatus {
   request_count?: number;
 }
 
+type ReadinessDiagnostics = Record<string, string | number | boolean | null>;
+
 interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
@@ -88,6 +90,7 @@ interface ComputeNodeStatus {
   log_file_path: string | null;
   context_tier: string | null;
   context_window_tokens: number | null;
+  readiness_diagnostics: ReadinessDiagnostics;
 }
 
 interface ModelArtifactInfo {
@@ -145,6 +148,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   log_file_path: null,
   context_tier: null,
   context_window_tokens: null,
+  readiness_diagnostics: {},
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -153,6 +157,17 @@ function formatErrorMessage(error: unknown): string {
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
+}
+
+function formatReadinessDiagnostics(diagnostics: ReadinessDiagnostics): string {
+  const entries = Object.entries(diagnostics);
+  if (entries.length === 0) {
+    return 'none';
+  }
+  return entries
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(' ');
 }
 
 function isStoppedOrIdleOperatorStatus(
@@ -175,6 +190,24 @@ function isStoppedOrIdleOperatorStatus(
 
 function stringArrayPayload(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function readinessDiagnosticsPayload(value: unknown): ReadinessDiagnostics | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const diagnostics: ReadinessDiagnostics = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      typeof item === 'string' ||
+      typeof item === 'boolean' ||
+      item === null ||
+      (typeof item === 'number' && Number.isFinite(item))
+    ) {
+      diagnostics[key] = item;
+    }
+  }
+  return diagnostics;
 }
 
 function relayStatusesPayload(value: unknown): RelayStatus[] {
@@ -324,6 +357,7 @@ function stoppedComputeStatus(
     worker_state: 'stopped',
     worker_alive: false,
     last_error: lastError,
+    readiness_diagnostics: {},
   };
 }
 
@@ -541,6 +575,10 @@ function mergeComputeStatusEvent(
           : typeof payload.message === 'string'
             ? payload.message
             : stoppedBase.last_error,
+    readiness_diagnostics:
+      payload.type === 'started'
+        ? {}
+        : readinessDiagnosticsPayload(payload.readiness_diagnostics) ?? stoppedBase.readiness_diagnostics,
   };
 }
 
@@ -1094,6 +1132,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend selected: <code>{displayStatusValue(computeStatus.backend_selected, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Readiness diagnostics: <code>{formatReadinessDiagnostics(computeStatus.readiness_diagnostics)}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Operator debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>
         <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>

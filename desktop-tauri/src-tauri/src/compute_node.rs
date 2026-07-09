@@ -252,10 +252,10 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_failure_reason",
     "api_v1_readiness_completion_smoke_error_code",
     "api_v1_readiness_completion_smoke_safe_summary",
-    "api_v1_readiness_completion_smoke_internal_reason",
     "api_v1_readiness_completion_smoke_exception_category",
     "api_v1_readiness_completion_smoke_exception_type",
     "api_v1_readiness_completion_smoke_rejected_generation_kwarg",
+    "api_v1_readiness_completion_smoke_rejected_option",
     "api_v1_readiness_completion_smoke_attempted_generation_kwargs",
     "api_v1_readiness_completion_smoke_attempted_plain_completion_methods",
     "api_v1_readiness_completion_smoke_method",
@@ -392,7 +392,11 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
         status.readiness_diagnostics.clear();
     }
     let readiness_diagnostics = safe_readiness_diagnostics_from_payload(payload);
-    if !readiness_diagnostics.is_empty() {
+    if matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("started" | "status" | "error" | "stopped")
+    ) || !readiness_diagnostics.is_empty()
+    {
         status.readiness_diagnostics = readiness_diagnostics;
     }
     if let Some(registered) = payload.get("registered").and_then(Value::as_bool) {
@@ -1565,6 +1569,7 @@ mod tests {
             "api_v1_readiness_completion_smoke_exception_type": "LlamaCppInferenceRequestError",
             "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
             "api_v1_readiness_completion_smoke_attempted_plain_completion_methods": "create_completion_keyword_prompt",
+            "api_v1_readiness_completion_smoke_rejected_option": "temperature",
         }));
         let payload: Value = serde_json::from_str(&summary).expect("summary json");
 
@@ -1579,6 +1584,12 @@ mod tests {
                 .get("api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_completion_smoke_rejected_option")
+                .and_then(Value::as_str),
+            Some("temperature")
         );
     }
 
@@ -1638,7 +1649,7 @@ mod tests {
             "type": "error",
             "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
             "api_v1_readiness_completion_smoke_safe_summary": "plain_completion_worker_exception",
-            "api_v1_readiness_completion_smoke_internal_reason": "contains unsafe spaces",
+            "api_v1_readiness_completion_smoke_internal_reason": "SECRET_PROMPT",
             "api_v1_readiness_completion_smoke_attempted_generation_kwargs": {"max_tokens": true},
         });
 
@@ -1658,6 +1669,19 @@ mod tests {
             .readiness_diagnostics
             .get("api_v1_readiness_completion_smoke_attempted_generation_kwargs")
             .is_none());
+    }
+
+    #[test]
+    fn status_event_without_diagnostics_clears_stale_readiness_diagnostics() {
+        let mut status = ComputeNodeStatus::default();
+        status.readiness_diagnostics.insert(
+            "api_v1_readiness_completion_smoke_method".into(),
+            Value::String("create_completion_keyword_prompt".into()),
+        );
+        let payload = serde_json::json!({"type": "error", "last_error": "different_failure"});
+
+        assert!(update_status_from_event(&mut status, &payload));
+        assert!(status.readiness_diagnostics.is_empty());
     }
 
     #[test]

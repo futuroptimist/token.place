@@ -1080,7 +1080,40 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Backend selected:/).textContent).toContain('pending');
     expect(screen.getByText(/Backend used:/).textContent).toContain('pending');
     expect(screen.getByText(/Fallback reason:/).textContent).toContain('none');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none');
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('merges compute-node readiness diagnostics into the desktop status snapshot', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        readiness_diagnostics: {
+          api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+          api_v1_readiness_completion_smoke_rejected_option: 'temperature',
+          unsafe_nested: { prompt: 'secret' },
+        },
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_completion_smoke_rejected_option=temperature'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
   });
 
   it('renders ready-but-not-registered and registered runtime diagnostics from bridge events', async () => {

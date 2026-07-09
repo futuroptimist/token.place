@@ -1868,13 +1868,13 @@ def _classify_generation_exception(exc):
         return 'prompt_tokenization_failure'
     if any(term in text for term in ('llama_decode', 'decode failed', 'decode returned')):
         return 'prompt_eval_decode_failure'
-    if 'invalid token' in text or 'token id' in text:
+    if 'invalid token' in text or 'invalid token id' in text or 'token id is invalid' in text:
         return 'prompt_eval_invalid_token_failure'
     if 'backend' in text and any(term in text for term in ('eval', 'decode', 'failed', 'error')):
         return 'prompt_eval_backend_failure'
-    if 'state' in text and any(term in text for term in ('eval', 'decode', 'failed', 'error')):
+    if any(term in text for term in ('llama state', 'model state', 'decode state', 'eval state')) and any(term in text for term in ('eval', 'decode', 'failed', 'error')):
         return 'prompt_eval_state_failure'
-    if 'context' in text and any(term in text for term in ('eval', 'decode', 'failed', 'error')):
+    if any(term in text for term in ('llama context', 'model context', 'decode context', 'eval context')) and any(term in text for term in ('eval', 'decode', 'failed', 'error')):
         return 'prompt_eval_context_failure'
     if any(term in text for term in ('failed to eval', 'failed to evaluate', 'model failed to evaluate', 'llama_eval')):
         return 'prompt_eval_failure'
@@ -1965,7 +1965,7 @@ def _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prom
             last_category = 'prompt_tokenization_failure'
             continue
         token_count = len(tokens)
-        fingerprint = (variant_id, token_count)
+        fingerprint = tuple(tokens)
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -2026,6 +2026,12 @@ def _normalize_plain_completion_result(result):
             if isinstance(choice.get('text'), str):
                 text = choice.get('text')
             elif isinstance(message, dict):
+                for reasoning_key in ('reasoning_content', 'reasoning'):
+                    reasoning_value = message.get(reasoning_key)
+                    if isinstance(reasoning_value, str) and reasoning_value.strip():
+                        return None, 'thinking_leaked'
+                    if reasoning_value not in (None, '') and not isinstance(reasoning_value, str):
+                        return None, 'thinking_leaked'
                 content = message.get('content')
                 if isinstance(content, str):
                     text = content
@@ -2775,6 +2781,9 @@ for line in sys.stdin:
                 'plain_completion_accepts_var_kwargs': None,
                 'plain_completion_reset_after_failure_count': 0,
             }
+            normalized = None
+            invalid_reason = None
+            last_invalid_reason = None
             if callable(create_completion):
                 try:
                     sig = inspect.signature(create_completion)
@@ -2794,7 +2803,6 @@ for line in sys.stdin:
                 'context_window_exceeded',
                 'context_length_exceeded',
                 'token_overflow',
-                'thinking_leaked',
             }
             def _plain_attempt_diagnostics():
                 return {
@@ -2833,6 +2841,9 @@ for line in sys.stdin:
                         plain_capabilities['plain_completion_reset_after_failure_count'] += 1
                     return None, exc
 
+            normalized = None
+            invalid_reason = None
+            last_invalid_reason = None
             if callable(create_completion):
                 result, completion_error = _attempt_plain_completion(
                     'create_completion_keyword_prompt',
@@ -2840,7 +2851,8 @@ for line in sys.stdin:
                     lambda: create_completion(prompt=rendered_prompt, max_tokens=max_tokens),
                 )
             if result is None and callable(create_completion) and (
-                not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
+                last_invalid_reason != 'thinking_leaked'
+                and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories)
             ):
                 result, completion_error = _attempt_plain_completion(
                     'create_completion_positional_prompt',
@@ -2858,9 +2870,6 @@ for line in sys.stdin:
             rendered_prompt_token_ids = None
             tokenization_variants = []
             tokenization_diagnostics = {}
-            normalized = None
-            invalid_reason = None
-            last_invalid_reason = None
             if result is not None:
                 normalized, invalid_reason = _normalize_plain_completion_result(result)
                 if invalid_reason is not None:
@@ -2873,7 +2882,7 @@ for line in sys.stdin:
                 tokenization_variants, tokenization_diagnostics = _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prompt)
                 plain_capabilities.update(tokenization_diagnostics)
                 for tokenization_variant in tokenization_variants:
-                    if result is not None or (attempts and attempts[-1].get('generation_exception_category') in fatal_plain_completion_categories):
+                    if last_invalid_reason == 'thinking_leaked' or (attempts and attempts[-1].get('generation_exception_category') in fatal_plain_completion_categories):
                         break
                     rendered_prompt_token_ids = tokenization_variant['tokens']
                     variant_id = tokenization_variant['tokenization_variant_id']
@@ -2884,7 +2893,12 @@ for line in sys.stdin:
                         lambda token_ids=rendered_prompt_token_ids: create_completion(prompt=token_ids, max_tokens=max_tokens),
                         variant_id,
                     )
-                    if result is None and (
+                    if result is not None:
+                        normalized, invalid_reason = _normalize_plain_completion_result(result)
+                        if invalid_reason is not None:
+                            last_invalid_reason = invalid_reason
+                            result = None
+                    if result is None and last_invalid_reason != 'thinking_leaked' and (
                         not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
                     ):
                         result, completion_error = _attempt_plain_completion(
@@ -2893,9 +2907,14 @@ for line in sys.stdin:
                             lambda token_ids=rendered_prompt_token_ids: create_completion(token_ids, max_tokens=max_tokens),
                             variant_id,
                         )
+                        if result is not None:
+                            normalized, invalid_reason = _normalize_plain_completion_result(result)
+                            if invalid_reason is not None:
+                                last_invalid_reason = invalid_reason
+                                result = None
             if result is not None:
                 normalized, invalid_reason = _normalize_plain_completion_result(result)
-            if result is None and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories):
+            if result is None and last_invalid_reason != 'thinking_leaked' and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories):
                 chat_fallback_category = 'unsupported_generation_kwarg'
                 create_chat_completion = getattr(llama, 'create_chat_completion', None)
                 plain_capabilities['qwen_high_level_chat_fallback_attempted'] = True
@@ -2915,7 +2934,7 @@ for line in sys.stdin:
                             'create_chat_completion_qwen_non_thinking',
                             ['chat_template_kwargs', 'max_tokens', 'messages'],
                             lambda: create_chat_completion(
-                                messages=request.get('args', [None])[0],
+                                messages=(request.get('args') or [None])[0],
                                 max_tokens=max_tokens,
                                 chat_template_kwargs={'enable_thinking': False},
                             ),

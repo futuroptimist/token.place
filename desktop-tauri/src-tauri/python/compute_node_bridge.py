@@ -509,6 +509,12 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg",
     "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg",
     "api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs",
+    "api_v1_readiness_completion_smoke_plain_completion_reset_after_failure_count",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_token_count",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted",
     "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
 }
 _SAFE_READINESS_DIAGNOSTIC_STRING_RE = re.compile(r"^[A-Za-z0-9_.:/@,+\-]{0,256}$")

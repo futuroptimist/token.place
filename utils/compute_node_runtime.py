@@ -62,6 +62,9 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "empty_completion_output": "runtime_completion_smoke_plain_completion_empty_output",
     "thinking_leaked": "runtime_completion_smoke_plain_completion_thinking_leaked",
     "worker_exception": "runtime_completion_smoke_plain_completion_worker_exception",
+    "prompt_tokenization_failure": "runtime_completion_smoke_plain_completion_prompt_tokenization_failure",
+    "prompt_eval_failure": "runtime_completion_smoke_plain_completion_eval_failure",
+    "sampling_failure": "runtime_completion_smoke_plain_completion_sampling_failure",
     "worker_timeout": "runtime_completion_smoke_worker_timeout",
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
@@ -81,6 +84,12 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_accepts_prompt_kwarg",
     "plain_completion_accepts_max_tokens_kwarg",
     "plain_completion_accepts_var_kwargs",
+    "plain_completion_reset_after_failure_count",
+    "plain_completion_prompt_tokenization_error_category",
+    "plain_completion_prompt_tokenization_special",
+    "plain_completion_prompt_tokenization_method",
+    "plain_completion_prompt_token_count",
+    "plain_completion_prompt_tokenization_attempted",
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
@@ -138,6 +147,9 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "worker_timeout",
         "worker_dead",
         "unknown_generation_exception",
+        "prompt_tokenization_failure",
+        "prompt_eval_failure",
+        "sampling_failure",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -152,6 +164,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "create_completion_keyword_prompt",
         "create_completion_positional_prompt",
         "llama_call_positional_prompt",
+        "create_completion_keyword_token_ids",
+        "create_completion_positional_token_ids",
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
@@ -160,7 +174,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
-    r"rope_yarn_eval_failure|unsupported_kwarg)$"
+    r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|sampling_failure)$"
 )
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
     "llama", "llama_context", "ggml", "metal", "kv", "cache", "alloc", "allocation",
@@ -253,6 +267,12 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
         category = "kv_cache_allocation"
     elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):
         category = "rope_yarn_eval_failure"
+    elif any(token in text for token in ("failed to tokenize", "tokenization failed", "llama_tokenize", "could not tokenize")):
+        category = "prompt_tokenization_failure"
+    elif any(token in text for token in ("failed to eval", "failed to evaluate", "model failed to evaluate", "llama_eval", "llama_decode", "decode failed", "decode returned")):
+        category = "prompt_eval_failure"
+    elif any(token in text for token in ("sample failed", "sampler", "logits", "no logits")):
+        category = "sampling_failure"
     elif "unexpected keyword argument" in text:
         category = "unsupported_generation_kwarg"
     else:

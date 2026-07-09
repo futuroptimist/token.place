@@ -4824,3 +4824,75 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped
     assert 'api_v1_readiness_completion_smoke_internal_reason' not in safe
+
+
+def test_warm_load_failure_stderr_includes_safe_readiness_diagnostics(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class WarmLoadDiagnosticRuntime(ApiV1Runtime):
+        def ensure_api_v1_runtime_ready(self):
+            self.model_manager.last_compute_diagnostics = {
+                'api_v1_readiness_completion_smoke_method': 'create_completion_keyword_prompt',
+                'api_v1_readiness_completion_smoke_generation_exception_category': 'worker_exception',
+                'api_v1_readiness_completion_smoke_exception_type': 'LlamaCppInferenceRequestError',
+                'api_v1_readiness_completion_smoke_safe_summary': 'plain_completion_worker_exception',
+                'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': True,
+                'prompt': 'SECRET_PROMPT',
+                'api_v1_readiness_completion_smoke_internal_reason': 'unsafe free text prompt',
+            }
+            return False
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmLoadDiagnosticRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    err = capsys.readouterr().err
+
+    assert "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics" in err
+    assert "api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt" in err
+    assert "api_v1_readiness_completion_smoke_generation_exception_category=worker_exception" in err
+    assert "api_v1_readiness_completion_smoke_exception_type=LlamaCppInferenceRequestError" in err
+    assert "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg=true" in err
+    assert "SECRET_PROMPT" not in err
+    assert "unsafe free text prompt" not in err
+
+
+def test_safe_readiness_stderr_renders_null_diagnostic_values(capsys):
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_error_code': None,
+            'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
+        }
+    )
+
+    compute_node_bridge._emit_safe_readiness_diagnostics_stderr(manager)
+
+    err = capsys.readouterr().err
+    assert "api_v1_readiness_error_code=null" in err
+    assert "api_v1_readiness_completion_smoke_exception_type=RuntimeError" in err
+
+
+def test_warm_load_failure_stderr_marks_safe_readiness_diagnostics_unavailable(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class WarmLoadNoDiagnosticRuntime(ApiV1Runtime):
+        def ensure_api_v1_runtime_ready(self):
+            self.model_manager.last_compute_diagnostics = None
+            return False
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmLoadNoDiagnosticRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    err = capsys.readouterr().err
+
+    assert (
+        "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics unavailable=true"
+        in err
+    )

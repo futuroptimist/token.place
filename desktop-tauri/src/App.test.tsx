@@ -1080,7 +1080,131 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Backend selected:/).textContent).toContain('pending');
     expect(screen.getByText(/Backend used:/).textContent).toContain('pending');
     expect(screen.getByText(/Fallback reason:/).textContent).toContain('none');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none');
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('merges compute-node readiness diagnostics into the desktop status snapshot', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        readiness_diagnostics: {
+          api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+          api_v1_readiness_completion_smoke_rejected_option: 'temperature',
+          api_v1_readiness_completion_smoke_internal_reason: 'SECRET_PROMPT',
+          unsafe_nested: { prompt: 'secret' },
+        },
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_completion_smoke_rejected_option=temperature'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain(
+      'api_v1_readiness_completion_smoke_internal_reason'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('SECRET_PROMPT');
+  });
+
+  it('merges flat compute-node readiness diagnostics into the desktop status snapshot', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+        api_v1_readiness_completion_smoke_attempted_generation_kwargs: 'max_tokens',
+        api_v1_readiness_completion_smoke_internal_reason: 'SECRET_PROMPT',
+        api_v1_readiness_error_reason: 'contains spaces and should be dropped',
+        unsafe_nested: { prompt: 'secret' },
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_completion_smoke_attempted_generation_kwargs=max_tokens'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain(
+      'api_v1_readiness_completion_smoke_internal_reason'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('SECRET_PROMPT');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('contains spaces');
+  });
+
+  it('clears readiness diagnostics on diagnostic-free status and error events', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        relay_runtime_state: 'idle',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none'));
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'later failure without diagnostics',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none'));
   });
 
   it('renders ready-but-not-registered and registered runtime diagnostics from bridge events', async () => {

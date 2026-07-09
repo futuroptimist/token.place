@@ -51,6 +51,51 @@ interface RelayStatus {
   request_count?: number;
 }
 
+type ReadinessDiagnostics = Record<string, string | number | boolean | null>;
+
+const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
+  'api_v1_readiness_result',
+  'api_v1_readiness_error_code',
+  'api_v1_readiness_error_reason',
+  'api_v1_readiness_completion_smoke_result',
+  'api_v1_readiness_completion_smoke_failure_reason',
+  'api_v1_readiness_completion_smoke_error_code',
+  'api_v1_readiness_completion_smoke_safe_summary',
+  'api_v1_readiness_completion_smoke_exception_category',
+  'api_v1_readiness_completion_smoke_exception_type',
+  'api_v1_readiness_completion_smoke_rejected_generation_kwarg',
+  'api_v1_readiness_completion_smoke_rejected_option',
+  'api_v1_readiness_completion_smoke_attempted_generation_kwargs',
+  'api_v1_readiness_completion_smoke_attempted_plain_completion_methods',
+  'api_v1_readiness_completion_smoke_method',
+  'api_v1_readiness_completion_smoke_generation_exception_category',
+  'api_v1_readiness_completion_smoke_result_shape',
+  'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable',
+  'api_v1_readiness_completion_smoke_plain_completion_llama_call_callable',
+  'api_v1_readiness_completion_smoke_plain_completion_signature_inspectable',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg',
+  'api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs',
+  'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',
+]);
+
+function isSafeReadinessDiagnosticString(value: string): boolean {
+  return value.length <= 256 && /^[A-Za-z0-9_.:/@,+-]*$/.test(value);
+}
+
+function safeReadinessDiagnosticValue(value: unknown): string | number | boolean | null | undefined {
+  if (typeof value === 'boolean' || value === null) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && isSafeReadinessDiagnosticString(value)) {
+    return value;
+  }
+  return undefined;
+}
+
 interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
@@ -88,6 +133,7 @@ interface ComputeNodeStatus {
   log_file_path: string | null;
   context_tier: string | null;
   context_window_tokens: number | null;
+  readiness_diagnostics: ReadinessDiagnostics;
 }
 
 interface ModelArtifactInfo {
@@ -145,6 +191,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   log_file_path: null,
   context_tier: null,
   context_window_tokens: null,
+  readiness_diagnostics: {},
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -153,6 +200,17 @@ function formatErrorMessage(error: unknown): string {
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
+}
+
+function formatReadinessDiagnostics(diagnostics: ReadinessDiagnostics): string {
+  const entries = Object.entries(diagnostics);
+  if (entries.length === 0) {
+    return 'none';
+  }
+  return entries
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(' ');
 }
 
 function isStoppedOrIdleOperatorStatus(
@@ -175,6 +233,43 @@ function isStoppedOrIdleOperatorStatus(
 
 function stringArrayPayload(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function readinessDiagnosticsPayload(value: unknown): ReadinessDiagnostics | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const diagnostics: ReadinessDiagnostics = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!SAFE_READINESS_DIAGNOSTIC_KEYS.has(key)) {
+      continue;
+    }
+    const safeValue = safeReadinessDiagnosticValue(item);
+    if (safeValue !== undefined) {
+      diagnostics[key] = safeValue;
+    }
+  }
+  return diagnostics;
+}
+
+function readinessDiagnosticsFromEventPayload(
+  payload: Record<string, unknown>
+): ReadinessDiagnostics | null {
+  const diagnostics: ReadinessDiagnostics = {};
+  const nestedDiagnostics = readinessDiagnosticsPayload(payload.readiness_diagnostics);
+  if (nestedDiagnostics) {
+    Object.assign(diagnostics, nestedDiagnostics);
+  }
+  for (const [key, item] of Object.entries(payload)) {
+    if (!SAFE_READINESS_DIAGNOSTIC_KEYS.has(key)) {
+      continue;
+    }
+    const safeValue = safeReadinessDiagnosticValue(item);
+    if (safeValue !== undefined) {
+      diagnostics[key] = safeValue;
+    }
+  }
+  return Object.keys(diagnostics).length > 0 ? diagnostics : null;
 }
 
 function relayStatusesPayload(value: unknown): RelayStatus[] {
@@ -324,6 +419,7 @@ function stoppedComputeStatus(
     worker_state: 'stopped',
     worker_alive: false,
     last_error: lastError,
+    readiness_diagnostics: {},
   };
 }
 
@@ -368,6 +464,12 @@ function mergeComputeStatusEvent(
 
   const isStoppedEvent = payload.type === 'stopped';
   const stoppedBase = isStoppedEvent ? stoppedComputeStatus(prev, null) : prev;
+  const readinessDiagnostics = readinessDiagnosticsFromEventPayload(payload);
+  const shouldClearReadinessDiagnostics =
+    payload.type === 'started' ||
+    payload.type === 'status' ||
+    payload.type === 'error' ||
+    payload.type === 'stopped';
 
   return {
     ...stoppedBase,
@@ -541,6 +643,10 @@ function mergeComputeStatusEvent(
           : typeof payload.message === 'string'
             ? payload.message
             : stoppedBase.last_error,
+    readiness_diagnostics:
+      payload.type === 'started'
+        ? {}
+        : readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
   };
 }
 
@@ -1094,6 +1200,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend selected: <code>{displayStatusValue(computeStatus.backend_selected, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Readiness diagnostics: <code>{formatReadinessDiagnostics(computeStatus.readiness_diagnostics)}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Operator debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>
         <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>

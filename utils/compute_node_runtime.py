@@ -869,6 +869,10 @@ class ComputeNodeRuntime:
                         diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = (
                             safe_worker_diagnostics
                         )
+                        if safe_worker_diagnostics.get("sanitized_error_summary"):
+                            diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                                safe_worker_diagnostics["sanitized_error_summary"]
+                            )
                     for key in (
                         "runtime_healthy",
                         "recovery_attempted",
@@ -892,6 +896,13 @@ class ComputeNodeRuntime:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = smoke_error[key]
                         elif key in safe_worker_diagnostics:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
+                    if (
+                        not diagnostics.get("api_v1_readiness_completion_smoke_safe_summary")
+                        and diagnostics.get("api_v1_readiness_completion_smoke_exception_type")
+                    ):
+                        diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                            f"{diagnostics['api_v1_readiness_completion_smoke_exception_type']}:redacted"
+                        )
                 elif (
                     smoke_message is not None
                     and smoke_message.get("role") == "assistant"
@@ -936,6 +947,27 @@ class ComputeNodeRuntime:
                 diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
                 diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_diagnostics.get("exception_type")
                 diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = exception_diagnostics.get("sanitized_error_summary")
+                for key in (
+                    "runtime_healthy",
+                    "recovery_attempted",
+                    "recovery_succeeded",
+                    "rejected_option",
+                    "rejected_generation_kwarg",
+                    "attempted_generation_kwargs",
+                    "attempted_plain_completion_methods",
+                    "result_shape",
+                    "method",
+                    "generation_exception_category",
+                    "plain_completion_create_completion_callable",
+                    "plain_completion_llama_call_callable",
+                    "plain_completion_signature_inspectable",
+                    "plain_completion_accepts_prompt_kwarg",
+                    "plain_completion_accepts_max_tokens_kwarg",
+                    "plain_completion_accepts_var_kwargs",
+                    "qwen_api_v1_non_thinking_template_fallback",
+                ):
+                    if key in exception_diagnostics:
+                        diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = exception_diagnostics[key]
                 if "worker_diagnostics" in exception_diagnostics:
                     safe_worker_diagnostics = exception_diagnostics["worker_diagnostics"]
                     diagnostics["api_v1_readiness_completion_smoke_worker_diagnostics"] = safe_worker_diagnostics
@@ -968,6 +1000,13 @@ class ComputeNodeRuntime:
                     ):
                         if key in safe_worker_diagnostics:
                             diagnostics[f"api_v1_readiness_completion_smoke_{key}"] = safe_worker_diagnostics[key]
+                if (
+                    not diagnostics.get("api_v1_readiness_completion_smoke_safe_summary")
+                    and diagnostics.get("api_v1_readiness_completion_smoke_exception_type")
+                ):
+                    diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = (
+                        f"{diagnostics['api_v1_readiness_completion_smoke_exception_type']}:redacted"
+                    )
                 diagnostics["api_v1_readiness_repair_retry_attempted"] = False
                 diagnostics["api_v1_readiness_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)

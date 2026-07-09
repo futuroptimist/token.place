@@ -494,10 +494,10 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_failure_reason",
     "api_v1_readiness_completion_smoke_error_code",
     "api_v1_readiness_completion_smoke_safe_summary",
-    "api_v1_readiness_completion_smoke_internal_reason",
     "api_v1_readiness_completion_smoke_exception_category",
     "api_v1_readiness_completion_smoke_exception_type",
     "api_v1_readiness_completion_smoke_rejected_generation_kwarg",
+    "api_v1_readiness_completion_smoke_rejected_option",
     "api_v1_readiness_completion_smoke_attempted_generation_kwargs",
     "api_v1_readiness_completion_smoke_attempted_plain_completion_methods",
     "api_v1_readiness_completion_smoke_method",
@@ -532,6 +532,26 @@ def _safe_readiness_diagnostics(model_manager: Any) -> Dict[str, Any]:
             if _SAFE_READINESS_DIAGNOSTIC_STRING_RE.fullmatch(bounded):
                 safe[key] = bounded
     return safe
+
+
+def _emit_safe_readiness_diagnostics_stderr(model_manager: Any) -> None:
+    diagnostics = _safe_readiness_diagnostics(model_manager)
+    prefix = "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics"
+    if not diagnostics:
+        print(f"{prefix} unavailable=true", file=sys.stderr)
+        return
+
+    fields: List[str] = []
+    for key in sorted(diagnostics):
+        value = diagnostics[key]
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif value is None:
+            rendered = "null"
+        else:
+            rendered = str(value)
+        fields.append(f"{key}={rendered}")
+    print(f"{prefix} {' '.join(fields)}", file=sys.stderr)
 
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
@@ -1200,6 +1220,7 @@ def run(args: argparse.Namespace) -> int:
     def fail_on_warm_load_error(*, active_relay_url: str) -> None:
         nonlocal last_error, warm_load_fatal
         last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+        _emit_safe_readiness_diagnostics_stderr(runtime.model_manager)
         emit_status_event(
             registered=False,
             active_relay_url=active_relay_url,

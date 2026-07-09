@@ -1,4 +1,6 @@
 import json
+import importlib.util
+import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +11,31 @@ from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeCon
 from utils.context_profiles import apply_context_profile
 from utils.llm import model_manager as model_manager_module
 from utils.llm.model_manager import LlamaCppInferenceRequestError, ModelManager
+
+BRIDGE_MODULE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / 'desktop-tauri'
+    / 'src-tauri'
+    / 'python'
+    / 'compute_node_bridge.py'
+)
+BRIDGE_SPEC = importlib.util.spec_from_file_location(
+    'desktop_compute_node_bridge_packaged_integration',
+    BRIDGE_MODULE_PATH,
+)
+compute_node_bridge = importlib.util.module_from_spec(BRIDGE_SPEC)
+assert BRIDGE_SPEC and BRIDGE_SPEC.loader
+BRIDGE_SPEC.loader.exec_module(compute_node_bridge)
+
+UNSAFE_READINESS_SENTINELS = (
+    'SECRET_PROMPT',
+    'SECRET_RENDERED_PROMPT',
+    'SECRET_ASSISTANT_OUTPUT',
+    'SECRET_DECRYPTED_PAYLOAD',
+    'SECRET_KEY',
+    'SECRET_TOOL_ARGS',
+    'SECRET_CIPHERTEXT_INTERNALS',
+)
 
 
 def _config(tmp_path):
@@ -57,10 +84,23 @@ class Llama:
             print('ggml_metal: KV cache allocation failed while creating llama_context', file=sys.stderr, flush=True)
             raise ValueError('Failed to create llama_context')
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+        path = os.environ.get('TOKEN_PLACE_RENDER_ATTEMPTS_JSONL')
+        if path:
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps({
+                    'messages': messages,
+                    'tokenize': tokenize,
+                    'add_generation_prompt': add_generation_prompt,
+                    'enable_thinking': enable_thinking,
+                }, sort_keys=True) + '\\n')
         return '<qwen>'
     def tokenize(self, payload, add_bos=False):
         return [1] * 42
     def create_completion(self, prompt, **kwargs):
+        path = os.environ.get('TOKEN_PLACE_COMPLETION_KWARGS_JSONL')
+        if path:
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps({'prompt': prompt, **kwargs}, sort_keys=True) + '\\n')
 """
         + completion_branch,
         encoding='utf-8',
@@ -231,18 +271,34 @@ def test_qwen64k_packaged_fake_runtime_generation_exception_has_specific_safe_re
 def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'runtime'
     _write_fake_llama_cpp_runtime(runtime_root, completion_error='kv')
+    render_attempts_file = tmp_path / 'render_attempts.jsonl'
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
     monkeypatch.syspath_prepend(str(runtime_root))
-    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_ERROR', 'KV cache allocation failed for SECRET_PROMPT')
+    monkeypatch.setenv(
+        'TOKEN_PLACE_COMPLETION_ERROR',
+        'KV cache allocation failed for '
+        'SECRET_PROMPT SECRET_RENDERED_PROMPT SECRET_ASSISTANT_OUTPUT '
+        'SECRET_DECRYPTED_PAYLOAD SECRET_KEY SECRET_TOOL_ARGS SECRET_CIPHERTEXT_INTERNALS',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_RENDER_ATTEMPTS_JSONL', str(render_attempts_file))
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
 
     proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
     try:
-        assert proxy.render_and_tokenize_chat([{'role': 'user', 'content': 'safe'}]) == {'prompt_tokens': 42}
+        literal_no_think_messages = [{'role': 'user', 'content': 'ordinary /no_think text'}]
+        assert proxy.render_and_tokenize_chat(literal_no_think_messages) == {'prompt_tokens': 42}
         with pytest.raises(LlamaCppInferenceRequestError) as exc_info:
             proxy.create_chat_completion_from_rendered_prompt([{'role': 'user', 'content': 'SECRET_PROMPT'}], stream=False)
         assert exc_info.value.diagnostics['method'] == 'create_completion_keyword_prompt'
         assert exc_info.value.diagnostics['generation_exception_category'] == 'kv_cache_allocation'
         assert exc_info.value.diagnostics['attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
-        assert 'SECRET_PROMPT' not in str(exc_info.value.diagnostics)
+        assert exc_info.value.diagnostics['exception_type'] == 'RuntimeError'
+        assert exc_info.value.diagnostics['sanitized_error_summary'] == 'RuntimeError:kv_cache_allocation'
+        assert exc_info.value.diagnostics['plain_completion_create_completion_callable'] is True
+        assert exc_info.value.diagnostics['plain_completion_llama_call_callable'] is False
+        assert exc_info.value.diagnostics['plain_completion_accepts_max_tokens_kwarg'] is True
+        assert exc_info.value.diagnostics['plain_completion_accepts_var_kwargs'] is True
+        assert all(sentinel not in str(exc_info.value.diagnostics) for sentinel in UNSAFE_READINESS_SENTINELS)
 
         runtime, manager = _runtime_for(proxy)
         assert runtime.ensure_api_v1_runtime_ready() is False
@@ -253,6 +309,8 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         assert diagnostics['api_v1_readiness_completion_smoke_attempted_generation_kwargs'] == 'max_tokens,prompt'
         assert diagnostics['api_v1_readiness_completion_smoke_attempted_plain_completion_methods'] == 'create_completion_keyword_prompt'
         assert diagnostics['api_v1_readiness_completion_smoke_generation_exception_category'] == 'kv_cache_allocation'
+        assert diagnostics['api_v1_readiness_completion_smoke_exception_type'] == 'RuntimeError'
+        assert diagnostics['api_v1_readiness_completion_smoke_safe_summary'] == 'RuntimeError:kv_cache_allocation'
         assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
         assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_llama_call_callable'] is False
         assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_signature_inspectable'] is True
@@ -260,9 +318,56 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is True
         assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs'] is True
         dumped = json.dumps(diagnostics)
-        assert 'SECRET_PROMPT' not in dumped
-        for unsafe in ('assistant_output', 'decrypted_payload', 'key', 'tool_args', 'ciphertext'):
+        assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
+        for unsafe in ('rendered_prompt', 'assistant_output', 'decrypted_payload', 'key', 'tool_args', 'ciphertext'):
             assert f'"{unsafe}"' not in dumped
+
+        safe_bridge_diagnostics = compute_node_bridge._safe_readiness_diagnostics(manager)
+        for expected_key in (
+            'api_v1_readiness_completion_smoke_method',
+            'api_v1_readiness_completion_smoke_attempted_generation_kwargs',
+            'api_v1_readiness_completion_smoke_attempted_plain_completion_methods',
+            'api_v1_readiness_completion_smoke_generation_exception_category',
+            'api_v1_readiness_completion_smoke_exception_type',
+            'api_v1_readiness_completion_smoke_safe_summary',
+            'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable',
+            'api_v1_readiness_completion_smoke_plain_completion_llama_call_callable',
+            'api_v1_readiness_completion_smoke_plain_completion_signature_inspectable',
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_prompt_kwarg',
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg',
+            'api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs',
+        ):
+            assert expected_key in safe_bridge_diagnostics
+        safe_bridge_dump = json.dumps(safe_bridge_diagnostics, sort_keys=True)
+        assert all(sentinel not in safe_bridge_dump for sentinel in UNSAFE_READINESS_SENTINELS)
+
+        rendered_status = io.StringIO()
+        with patch.object(compute_node_bridge.sys, 'stdout', rendered_status):
+            compute_node_bridge.emit({'event': 'status', **safe_bridge_diagnostics})
+        status_line = rendered_status.getvalue()
+        assert 'api_v1_readiness_completion_smoke_method' in status_line
+        assert 'api_v1_readiness_completion_smoke_safe_summary' in status_line
+        assert all(sentinel not in status_line for sentinel in UNSAFE_READINESS_SENTINELS)
+
+        rendered_stderr = []
+        with patch.object(compute_node_bridge, 'print', lambda payload, file=None: rendered_stderr.append(payload)):
+            compute_node_bridge._emit_safe_readiness_diagnostics_stderr(manager)
+        assert rendered_stderr
+        stderr_line = rendered_stderr[-1]
+        assert 'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics' in stderr_line
+        assert 'api_v1_readiness_completion_smoke_safe_summary=RuntimeError:kv_cache_allocation' in stderr_line
+        assert all(sentinel not in stderr_line for sentinel in UNSAFE_READINESS_SENTINELS)
+
+        render_attempts = [json.loads(line) for line in render_attempts_file.read_text().splitlines()]
+        assert render_attempts[0]['messages'] == literal_no_think_messages
+        assert render_attempts[0]['enable_thinking'] is False
+        assert all('/no_think' not in json.dumps(attempt) for attempt in render_attempts[1:])
+        assert all(attempt['enable_thinking'] is False for attempt in render_attempts)
+        completion_attempts = [
+            json.loads(line) for line in completion_kwargs_file.read_text().splitlines()
+        ]
+        assert completion_attempts
+        assert all(attempt.get('max_tokens') == 64 for attempt in completion_attempts)
     finally:
         proxy.close()
 

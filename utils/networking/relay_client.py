@@ -125,6 +125,12 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_accepts_prompt_kwarg",
     "plain_completion_accepts_max_tokens_kwarg",
     "plain_completion_accepts_var_kwargs",
+    "plain_completion_prompt_tokenization_attempted",
+    "plain_completion_prompt_token_count",
+    "plain_completion_prompt_tokenization_method",
+    "plain_completion_prompt_tokenization_special",
+    "plain_completion_prompt_tokenization_error_category",
+    "plain_completion_reset_after_failure_count",
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
@@ -181,6 +187,10 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "unsupported_stop_kwarg",
         "method_shape",
         "worker_exception",
+        "prompt_tokenization_failure",
+        "prompt_eval_failure",
+        "sampling_failure",
+        "tokenizer_unavailable",
         "malformed_completion_output",
         "empty_completion_output",
         "thinking_leaked",
@@ -197,6 +207,9 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "create_completion_keyword_prompt",
         "create_completion_positional_prompt",
         "llama_call_positional_prompt",
+        "create_completion_keyword_token_ids",
+        "create_completion_positional_token_ids",
+        "llama.tokenize",
         "render_and_tokenize_chat",
         "tokenize",
     },
@@ -206,7 +219,7 @@ _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$
 _SAFE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
-    r"rope_yarn_eval_failure|unsupported_kwarg)$"
+    r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|sampling_failure)$"
 )
 _SAFE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
     "llama", "llama_context", "ggml", "metal", "kv", "cache", "alloc", "allocation",
@@ -4018,6 +4031,12 @@ class RelayClient:
                     "plain_completion_accepts_prompt_kwarg",
                     "plain_completion_accepts_max_tokens_kwarg",
                     "plain_completion_accepts_var_kwargs",
+                    "plain_completion_prompt_tokenization_attempted",
+                    "plain_completion_prompt_token_count",
+                    "plain_completion_prompt_tokenization_method",
+                    "plain_completion_prompt_tokenization_special",
+                    "plain_completion_prompt_tokenization_error_category",
+                    "plain_completion_reset_after_failure_count",
                     "qwen_api_v1_non_thinking_template_fallback",
                 ):
                     safe_value = safe_worker_diagnostics.get(safe_key)

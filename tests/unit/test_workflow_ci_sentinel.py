@@ -352,6 +352,17 @@ def test_run_all_tests_uses_absolute_default_real_e2e_model_path() -> None:
     )
 
 
+def test_run_all_tests_real_guardrail_requires_importable_llama_cpp_runtime() -> None:
+    runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
+
+    assert "llama_cpp_runtime_available()" in runner
+    assert 'importlib.util.find_spec("llama_cpp")' in runner
+    assert 'Path.cwd() / "llama_cpp.py"' in runner
+    assert "origin != repo_shim" in runner
+    assert "&& llama_cpp_runtime_available" in runner
+    assert "real llama_cpp runtime is not importable" in runner
+
+
 def test_ci_reboot_or_cgroup_prep_branch_fails_instead_of_green_skip() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "ci.yml")
     steps = workflow_data["jobs"]["test"]["steps"]

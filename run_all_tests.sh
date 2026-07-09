@@ -134,6 +134,20 @@ if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ]; then
     export TOKENPLACE_REAL_E2E_MODEL_PATH
 fi
 
+llama_cpp_runtime_available() {
+    "$PYTHON_CMD" - <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.find_spec("llama_cpp")
+origin = Path(getattr(spec, "origin", "") or "").resolve() if spec else None
+repo_shim = (Path.cwd() / "llama_cpp.py").resolve()
+
+sys.exit(0 if origin is not None and origin != repo_shim else 1)
+PY
+}
+
 # Array to track test failures
 FAILED_TESTS=()
 
@@ -195,13 +209,15 @@ else
 fi
 
 # 8b. Relay landing-page real desktop-bridge API v1 guardrail (requires local GGUF model path)
-if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ]; then
+if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ] && llama_cpp_runtime_available; then
     # Use a tiny real GGUF model here so CI still validates true inference plumbing
     # end-to-end instead of passing with a mock/stub-only desktop bridge path.
     run_test \
         "Relay Landing Page Real Desktop-Bridge API v1 Guardrail" \
         "RUN_RELAY_REGISTRATION_TESTS=1 $PYTHON_CMD -m pytest tests/e2e/test_ui.py -v -k 'landing_chat_real_inference_with_desktop_bridge_api_v1' $COVERAGE_ARGS" \
         "Verifying browser -> relay/API v1 -> desktop bridge runtime with non-streaming guardrails"
+elif [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ]; then
+    echo "Skipping Relay Landing Page Real Desktop-Bridge API v1 Guardrail (real llama_cpp runtime is not importable in this environment)"
 else
     echo "Skipping Relay Landing Page Real Desktop-Bridge API v1 Guardrail (set TOKENPLACE_REAL_E2E_MODEL_PATH to a local GGUF file to enable)"
 fi

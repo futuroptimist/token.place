@@ -7414,8 +7414,9 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     runtime = RuntimeWithSpecial()
     tokens, diagnostics = tokenize_prompt(runtime, 'SECRET_RENDERED_PROMPT')
     assert tokens == [101, 202]
-    assert runtime.calls == [{'add_bos': False, 'special': True, 'prompt_type': 'bytes'}]
-    assert diagnostics['plain_completion_prompt_tokenization_special'] is True
+    assert runtime.calls[0] == {'add_bos': False, 'special': False, 'prompt_type': 'bytes'}
+    assert diagnostics['plain_completion_prompt_tokenization_special'] is False
+    assert diagnostics['plain_completion_prompt_tokenization_variant_ids'].split(',')[0] == 'special_false_add_bos_false'
     assert diagnostics['plain_completion_prompt_token_count'] == 2
     assert 'SECRET_RENDERED_PROMPT' not in json.dumps(diagnostics)
     assert '101' not in json.dumps(diagnostics)
@@ -7432,7 +7433,7 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     fallback_runtime = RuntimeRejectsSpecial()
     tokens, diagnostics = tokenize_prompt(fallback_runtime, 'SECRET_RENDERED_PROMPT')
     assert tokens == [303]
-    assert fallback_runtime.calls == [True, False]
+    assert fallback_runtime.calls == [False, False, True]
     assert diagnostics['plain_completion_prompt_tokenization_special'] is False
     assert '303' not in json.dumps(diagnostics)
 
@@ -7446,7 +7447,7 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert diagnostics['plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
 
     assert classify_shape(RuntimeError('failed to tokenize prompt')) == 'prompt_tokenization_failure'
-    assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_failure'
+    assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_decode_failure'
     assert classify_shape(RuntimeError('no logits available from sampler')) == 'sampling_failure'
     assert sanitize(RuntimeError('failed to tokenize SECRET_RENDERED_PROMPT')) == 'RuntimeError:prompt_tokenization_failure'
     assert 'SECRET_RENDERED_PROMPT' not in sanitize(RuntimeError('failed to tokenize SECRET_RENDERED_PROMPT'))

@@ -131,6 +131,26 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_prompt_tokenization_method",
     "plain_completion_prompt_token_count",
     "plain_completion_prompt_tokenization_attempted",
+    "plain_completion_prompt_tokenization_variant_count",
+    "plain_completion_prompt_tokenization_variant_ids",
+    "plain_completion_prompt_tokenization_token_counts",
+    "plain_completion_prompt_tokenization_special_values",
+    "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_attempt_methods",
+    "plain_completion_attempt_categories",
+    "plain_completion_attempt_exception_types",
+    "plain_completion_attempt_safe_summaries",
+    "plain_completion_attempt_rejected_kwargs",
+    "plain_completion_attempt_result_shapes",
+    "plain_completion_attempt_tokenization_variants",
+    "plain_completion_attempt_count",
+    "plain_completion_eval_return_code",
+    "qwen_high_level_chat_fallback_attempted",
+    "qwen_high_level_chat_fallback_supported",
+    "qwen_high_level_chat_fallback_succeeded",
+    "qwen_high_level_chat_fallback_rejected_kwarg",
+    "qwen_high_level_chat_fallback_category",
+
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
     "method",
@@ -195,6 +215,11 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "unknown_generation_exception",
         "prompt_tokenization_failure",
         "prompt_eval_failure",
+        "prompt_eval_context_failure",
+        "prompt_eval_state_failure",
+        "prompt_eval_invalid_token_failure",
+        "prompt_eval_backend_failure",
+        "prompt_eval_decode_failure",
         "sampling_failure",
     },
     "method": {
@@ -208,6 +233,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "llama_call_positional_prompt",
         "create_completion_keyword_token_ids",
         "create_completion_positional_token_ids",
+        "qwen_high_level_chat_fallback",
         "render_and_tokenize_chat",
         "tokenize",
     },
@@ -230,7 +256,7 @@ _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$
 _SAFE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
-    r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|sampling_failure)$"
+    r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|prompt_eval_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|prompt_eval_state_failure|prompt_eval_context_failure|sampling_failure|method_shape|worker_exception)$"
 )
 _SAFE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
     "llama", "llama_context", "ggml", "metal", "kv", "cache", "alloc", "allocation",
@@ -258,11 +284,16 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_prompt_tokenization_selected_variant", "qwen_high_level_chat_fallback_rejected_kwarg", "qwen_high_level_chat_fallback_category"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
-    if key in {"attempted_generation_kwargs", "attempted_plain_completion_methods"}:
+    if key in {"attempted_generation_kwargs", "attempted_plain_completion_methods", "plain_completion_attempt_methods", "plain_completion_attempt_categories", "plain_completion_attempt_exception_types", "plain_completion_attempt_rejected_kwargs", "plain_completion_attempt_result_shapes", "plain_completion_attempt_tokenization_variants", "plain_completion_prompt_tokenization_variant_ids", "plain_completion_prompt_tokenization_token_counts", "plain_completion_prompt_tokenization_special_values"}:
         names = [part for part in bounded.split(",") if part]
         if names and all(_SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(part) for part in names):
+            return ",".join(names[:32])
+        return None
+    if key == "plain_completion_attempt_safe_summaries":
+        names = [part for part in bounded.split(",") if part]
+        if names and all(_SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(part) for part in names):
             return ",".join(names[:32])
         return None
     if key == "sanitized_error_summary":

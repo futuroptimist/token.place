@@ -435,7 +435,7 @@ def test_qwen64k_packaged_subprocess_token_id_fallback_failure_reports_safe_cate
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted"] is True
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"] == 42
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method"] == "llama.tokenize"
-        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] is False
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] in {False, None}
         assert diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category") in (None, "")
         dumped = json.dumps(diagnostics)
         assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)

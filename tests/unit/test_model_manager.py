@@ -7495,6 +7495,26 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert 'SECRET_RENDERED_PROMPT' not in json.dumps(diagnostics)
     assert '101' not in json.dumps(diagnostics)
 
+    class RuntimeDuplicateTokenArrays:
+        def __init__(self):
+            self.calls = []
+        def tokenize(self, prompt, *, add_bos=False, special=False):
+            self.calls.append(special)
+            return [404, 505]
+
+    duplicate_runtime = RuntimeDuplicateTokenArrays()
+    duplicate_variants, duplicate_diagnostics = tokenize_variants(
+        duplicate_runtime,
+        'SECRET_RENDERED_PROMPT',
+    )
+    assert duplicate_runtime.calls == [False, False, True]
+    assert [variant['tokens'] for variant in duplicate_variants] == [[404, 505]]
+    assert duplicate_diagnostics['plain_completion_prompt_tokenization_variant_count'] == 1
+    duplicate_dump = json.dumps(duplicate_diagnostics)
+    assert 'SECRET_RENDERED_PROMPT' not in duplicate_dump
+    assert '404' not in duplicate_dump
+    assert '505' not in duplicate_dump
+
     class RuntimeRejectsSpecial:
         def __init__(self):
             self.calls = []
@@ -7524,6 +7544,8 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert classify_shape(RuntimeError('failed to tokenize prompt')) == 'prompt_tokenization_failure'
     assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_decode_failure'
     assert classify_shape(RuntimeError('no logits available from sampler')) == 'sampling_failure'
+    assert classify_shape(RuntimeError('state file failed to open')) == 'worker_exception'
+    assert classify_shape(RuntimeError('contextual logging error')) == 'worker_exception'
     assert sanitize(RuntimeError('failed to tokenize SECRET_RENDERED_PROMPT')) == 'RuntimeError:prompt_tokenization_failure'
     assert 'SECRET_RENDERED_PROMPT' not in sanitize(RuntimeError('failed to tokenize SECRET_RENDERED_PROMPT'))
 

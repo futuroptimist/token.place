@@ -210,6 +210,28 @@ function readinessDiagnosticsPayload(value: unknown): ReadinessDiagnostics | nul
   return diagnostics;
 }
 
+function readinessDiagnosticsFromEventPayload(
+  payload: Record<string, unknown>
+): ReadinessDiagnostics | null {
+  const diagnostics: ReadinessDiagnostics = {};
+  const nestedDiagnostics = readinessDiagnosticsPayload(payload.readiness_diagnostics);
+  if (nestedDiagnostics) {
+    Object.assign(diagnostics, nestedDiagnostics);
+  }
+  for (const [key, item] of Object.entries(payload)) {
+    if (
+      key.startsWith('api_v1_readiness_') &&
+      (typeof item === 'string' ||
+        typeof item === 'boolean' ||
+        item === null ||
+        (typeof item === 'number' && Number.isFinite(item)))
+    ) {
+      diagnostics[key] = item;
+    }
+  }
+  return Object.keys(diagnostics).length > 0 ? diagnostics : null;
+}
+
 function relayStatusesPayload(value: unknown): RelayStatus[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -402,6 +424,12 @@ function mergeComputeStatusEvent(
 
   const isStoppedEvent = payload.type === 'stopped';
   const stoppedBase = isStoppedEvent ? stoppedComputeStatus(prev, null) : prev;
+  const readinessDiagnostics = readinessDiagnosticsFromEventPayload(payload);
+  const shouldClearReadinessDiagnostics =
+    payload.type === 'started' ||
+    payload.type === 'status' ||
+    payload.type === 'error' ||
+    payload.type === 'stopped';
 
   return {
     ...stoppedBase,
@@ -578,7 +606,7 @@ function mergeComputeStatusEvent(
     readiness_diagnostics:
       payload.type === 'started'
         ? {}
-        : readinessDiagnosticsPayload(payload.readiness_diagnostics) ?? stoppedBase.readiness_diagnostics,
+        : readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
   };
 }
 

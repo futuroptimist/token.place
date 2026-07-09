@@ -1116,6 +1116,85 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
   });
 
+  it('merges flat compute-node readiness diagnostics into the desktop status snapshot', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+        api_v1_readiness_completion_smoke_attempted_generation_kwargs: 'max_tokens',
+        unsafe_nested: { prompt: 'secret' },
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_completion_smoke_attempted_generation_kwargs=max_tokens'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
+  });
+
+  it('clears readiness diagnostics on diagnostic-free status and error events', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'warm load failed',
+        api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+        'api_v1_readiness_completion_smoke_method=create_completion_keyword_prompt'
+      )
+    );
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        relay_runtime_state: 'idle',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none'));
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        last_error: 'later failure without diagnostics',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('none'));
+  });
+
   it('renders ready-but-not-registered and registered runtime diagnostics from bridge events', async () => {
     render(<App />);
     await screen.findByText('Start operator');

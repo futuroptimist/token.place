@@ -1939,7 +1939,7 @@ def _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt):
             if last_category == 'unknown_generation_exception':
                 last_category = 'prompt_tokenization_failure'
             continue
-        if isinstance(tokens, (list, tuple)) and tokens and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens):
+        if isinstance(tokens, (list, tuple)) and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens):
             diagnostics['plain_completion_prompt_token_count'] = len(tokens)
             diagnostics['plain_completion_prompt_tokenization_method'] = method_name
             diagnostics['plain_completion_prompt_tokenization_special'] = special_value
@@ -2812,6 +2812,32 @@ for line in sys.stdin:
                     ['max_tokens'],
                     lambda: create_completion(rendered_prompt_token_ids, max_tokens=max_tokens),
                 )
+            if result is not None:
+                normalized, invalid_reason = _normalize_plain_completion_result(result)
+                if (
+                    invalid_reason is not None
+                    and rendered_prompt_token_ids is None
+                    and callable(create_completion)
+                    and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories)
+                ):
+                    rendered_prompt_token_ids, tokenization_diagnostics = _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt)
+                    plain_capabilities.update(tokenization_diagnostics)
+                    if rendered_prompt_token_ids is not None:
+                        result, completion_error = _attempt_plain_completion(
+                            'create_completion_keyword_token_ids',
+                            ['max_tokens', 'prompt'],
+                            lambda: create_completion(prompt=rendered_prompt_token_ids, max_tokens=max_tokens),
+                        )
+                        if result is None and (
+                            not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
+                        ):
+                            result, completion_error = _attempt_plain_completion(
+                                'create_completion_positional_token_ids',
+                                ['max_tokens'],
+                                lambda: create_completion(rendered_prompt_token_ids, max_tokens=max_tokens),
+                            )
+                        if result is not None:
+                            normalized, invalid_reason = _normalize_plain_completion_result(result)
             if result is None:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
@@ -2824,7 +2850,6 @@ for line in sys.stdin:
                 })
                 _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))
                 continue
-            normalized, invalid_reason = _normalize_plain_completion_result(result)
             if invalid_reason is not None:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)

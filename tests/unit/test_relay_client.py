@@ -37,6 +37,22 @@ def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics
 
     assert RelayClient._api_v1_models_module() is None
 
+
+def test_worker_diagnostic_sanitizer_preserves_tokenization_string_enums():
+    safe = relay_client_module._safe_worker_diagnostics(
+        {
+            "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "content": "SECRET prompt text",
+        }
+    )
+
+    assert safe == {
+        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+    }
+    assert "SECRET" not in json.dumps(safe)
+
 # Common test data
 TEST_VALID_RESPONSE = {
     'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',  # Base64 encoded "client_key_b64"

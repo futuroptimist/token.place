@@ -75,6 +75,8 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
             "method": "create_chat_completion",
             "reason": "malformed_completion_output",
             "generation_exception_category": "malformed_completion_output",
+            "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
             "unsafe_prompt": "Reply with exactly: ok",
             "nested": {"rendered_prompt": "secret"},
             "content": "assistant output",
@@ -99,6 +101,8 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
         "method": "create_chat_completion",
         "reason": "malformed_completion_output",
         "generation_exception_category": "malformed_completion_output",
+        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
     }
     assert "Reply with exactly" not in json.dumps(safe)
     assert "assistant output" not in json.dumps(safe)

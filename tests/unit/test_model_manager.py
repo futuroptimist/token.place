@@ -7135,6 +7135,56 @@ def test_llama_worker_render_complete_token_id_keyword_fallback_recovers_after_s
     assert result == {'choices': [{'message': {'role': 'assistant', 'content': 'token keyword recovered'}}]}
 
 
+
+def test_llama_worker_render_complete_token_id_fallback_recovers_after_invalid_string_output(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'token invalid output fallback fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def tokenize(self, prompt, add_bos=False, special=False):\n"
+        "        if add_bos is not False or special is not True:\n"
+        "            raise AssertionError('expected special tokenization first')\n"
+        "        return [44, 55]\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs or kwargs['max_tokens'] <= 0:\n"
+        "            raise AssertionError('unbounded create_completion')\n"
+        "        prompt = kwargs.get('prompt') if 'prompt' in kwargs else (args[0] if args else None)\n"
+        "        if isinstance(prompt, list):\n"
+        "            return {'choices': [{'text': 'token fallback after invalid output'}]}\n"
+        "        return {'choices': [{'text': '<think>leaked reasoning</think> bad'}]}\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        if 'max_tokens' not in kwargs:\n"
+        "            raise AssertionError('unbounded llama call')\n"
+        "        return {'choices': [{'text': '<think>still leaked</think> bad'}]}\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(
+        model_path=str(tmp_path / 'mock.gguf'),
+        timeout_seconds=5,
+    )
+    try:
+        result = proxy.create_chat_completion_from_rendered_prompt(
+            [{'role': 'user', 'content': 'secret prompt text'}],
+            max_tokens=4,
+            token_place_provider='qwen',
+            token_place_template_policy='gguf-jinja',
+            enable_thinking=False,
+        )
+    finally:
+        proxy.close()
+
+    assert result == {
+        'choices': [{'message': {'role': 'assistant', 'content': 'token fallback after invalid output'}}]
+    }
+
 def test_llama_worker_render_complete_token_id_positional_fallback_records_all_methods(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -7224,6 +7274,15 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert fallback_runtime.calls == [True, False]
     assert diagnostics['plain_completion_prompt_tokenization_special'] is False
     assert '303' not in json.dumps(diagnostics)
+
+    class RuntimeEmptyTokens:
+        def tokenize(self, prompt, *, add_bos=False, special=False):
+            return []
+
+    tokens, diagnostics = tokenize_prompt(RuntimeEmptyTokens(), '')
+    assert tokens == []
+    assert diagnostics['plain_completion_prompt_token_count'] == 0
+    assert diagnostics['plain_completion_prompt_tokenization_error_category'] == ''
 
     assert classify_shape(RuntimeError('failed to tokenize prompt')) == 'prompt_tokenization_failure'
     assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_failure'

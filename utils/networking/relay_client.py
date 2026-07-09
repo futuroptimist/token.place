@@ -212,6 +212,17 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "tokenize",
     },
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
+    "plain_completion_prompt_tokenization_error_category": {
+        "",
+        "tokenizer_unavailable",
+        "method_shape",
+        "prompt_tokenization_failure",
+        "prompt_eval_failure",
+        "sampling_failure",
+        "unknown_generation_exception",
+        "worker_exception",
+    },
+    "plain_completion_prompt_tokenization_method": {"", "llama.tokenize"},
 }
 _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")

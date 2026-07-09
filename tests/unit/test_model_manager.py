@@ -5987,10 +5987,16 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
         None,
         'thinking_leaked',
     )
-    assert normalize({'choices': [{'message': {'content': 'visible', 'reasoning': {'trace': 'hidden'}}}]}) == (
-        None,
-        'thinking_leaked',
-    )
+    for completion in (
+        {'choices': [{'message': {'content': 'visible', 'reasoning_content': ''}}]},
+        {'choices': [{'message': {'content': 'visible', 'reasoning_content': None}}]},
+        {'choices': [{'message': {'content': 'visible', 'reasoning': ''}}]},
+        {'choices': [{'text': 'visible', 'reasoning': 'hidden'}]},
+        {'choices': [{'message': {'content': 'visible'}, 'reasoning': 'hidden'}]},
+        {'choices': [{'message': {'content': 'visible', 'metadata': [{'reasoning': False}]}}]},
+        {'choices': [{'message': {'content': 'visible', 'reasoning': {'trace': 'hidden'}}}]},
+    ):
+        assert normalize(completion) == (None, 'thinking_leaked')
     normalized, invalid_reason = normalize('direct ok')
     assert invalid_reason is None
     assert normalized['choices'][0]['message']['content'] == 'direct ok'
@@ -7551,15 +7557,16 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
 
 
 @pytest.mark.parametrize(
-    "reasoning_metadata",
+    ("message_reasoning_metadata", "choice_reasoning_metadata"),
     [
-        {"reasoning_content": "hidden chain"},
-        {"reasoning": "hidden chain"},
-        {"reasoning": {"trace": "hidden chain"}},
+        ({"reasoning_content": "hidden chain"}, {}),
+        ({"reasoning": "hidden chain"}, {}),
+        ({"reasoning": {"trace": "hidden chain"}}, {}),
+        ({}, {"reasoning": "hidden chain"}),
     ],
 )
 def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning_metadata(
-    tmp_path, monkeypatch, reasoning_metadata
+    tmp_path, monkeypatch, message_reasoning_metadata, choice_reasoning_metadata
 ):
     from utils.llm import model_manager as model_manager_module
 
@@ -7567,7 +7574,8 @@ def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning
     fake_pkg = fake_site / 'llama_cpp'
     fake_pkg.mkdir(parents=True)
     (fake_pkg / '__init__.py').write_text(
-        f"REASONING_METADATA = {reasoning_metadata!r}\n"
+        f"MESSAGE_REASONING_METADATA = {message_reasoning_metadata!r}\n"
+        f"CHOICE_REASONING_METADATA = {choice_reasoning_metadata!r}\n"
         "class Llama:\n"
         "    def __init__(self, *args, **kwargs):\n"
         "        pass\n"
@@ -7581,8 +7589,10 @@ def test_llama_worker_render_complete_high_level_qwen_fallback_rejects_reasoning
         "        raise RuntimeError('failed to eval prompt')\n"
         "    def create_chat_completion(self, *, messages, max_tokens, chat_template_kwargs):\n"
         "        message = {'role': 'assistant', 'content': 'visible'}\n"
-        "        message.update(REASONING_METADATA)\n"
-        "        return {'choices': [{'message': message}]}\n",
+        "        message.update(MESSAGE_REASONING_METADATA)\n"
+        "        choice = {'message': message}\n"
+        "        choice.update(CHOICE_REASONING_METADATA)\n"
+        "        return {'choices': [choice]}\n",
         encoding='utf-8',
     )
     monkeypatch.syspath_prepend(str(fake_site))

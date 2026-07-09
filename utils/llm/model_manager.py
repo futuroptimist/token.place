@@ -2014,7 +2014,18 @@ def _completion_result_shape(result):
         return 'dict_malformed'
     return type(result).__name__
 
+def _completion_contains_reasoning_field(payload):
+    if isinstance(payload, dict):
+        if 'reasoning_content' in payload or 'reasoning' in payload:
+            return True
+        return any(_completion_contains_reasoning_field(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_completion_contains_reasoning_field(item) for item in payload)
+    return False
+
 def _normalize_plain_completion_result(result):
+    if _completion_contains_reasoning_field(result):
+        return None, 'thinking_leaked'
     text = None
     if isinstance(result, str):
         text = result
@@ -2026,12 +2037,6 @@ def _normalize_plain_completion_result(result):
             if isinstance(choice.get('text'), str):
                 text = choice.get('text')
             elif isinstance(message, dict):
-                for reasoning_key in ('reasoning_content', 'reasoning'):
-                    reasoning_value = message.get(reasoning_key)
-                    if isinstance(reasoning_value, str) and reasoning_value.strip():
-                        return None, 'thinking_leaked'
-                    if reasoning_value not in (None, '') and not isinstance(reasoning_value, str):
-                        return None, 'thinking_leaked'
                 content = message.get('content')
                 if isinstance(content, str):
                     text = content

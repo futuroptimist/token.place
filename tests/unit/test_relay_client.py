@@ -67,6 +67,33 @@ def test_worker_diagnostic_sanitizer_preserves_tokenization_string_enums():
     }
     assert "SECRET" not in json.dumps(safe)
 
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "context_window_exceeded",
+        "context_length_exceeded",
+        "token_overflow",
+    ],
+)
+def test_worker_diagnostic_sanitizer_preserves_tokenization_length_categories(category):
+    safe = relay_client_module._safe_worker_diagnostics(
+        {
+            "plain_completion_prompt_tokenization_error_category": category,
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "plain_completion_prompt_tokenization_attempted": True,
+            "rendered_prompt": "SECRET rendered prompt",
+            "token_ids": [1, 2, 3],
+        }
+    )
+
+    assert safe == {
+        "plain_completion_prompt_tokenization_error_category": category,
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_attempted": True,
+    }
+    assert "SECRET" not in json.dumps(safe)
+
 # Common test data
 TEST_VALID_RESPONSE = {
     'client_public_key': 'Y2xpZW50X2tleV9iNjQ=',  # Base64 encoded "client_key_b64"

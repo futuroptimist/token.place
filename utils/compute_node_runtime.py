@@ -169,9 +169,12 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     "kv_cache_mode": {"f16", "q8_0", "q4_0", "auto", "unknown"},
     "plain_completion_prompt_tokenization_error_category": {
         "",
+        "context_length_exceeded",
+        "context_window_exceeded",
         "tokenizer_unavailable",
         "method_shape",
         "tokenizer_special_rejected",
+        "token_overflow",
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "sampling_failure",

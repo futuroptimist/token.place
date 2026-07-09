@@ -6471,3 +6471,38 @@ def test_api_v1_runtime_error_promotes_tokenization_category_to_safe_internal_re
     assert error["generation_exception_category"] == "prompt_tokenization_failure"
     assert error["plain_completion_prompt_tokenization_method"] == "llama.tokenize"
     assert "SECRET" not in json.dumps(error)
+
+
+def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields():
+    from utils.networking import relay_client
+
+    safe = relay_client._safe_worker_diagnostics({
+        "plain_completion_prompt_tokenization_variant_count": 3,
+        "plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special",
+        "plain_completion_prompt_tokenization_token_counts": "50,28",
+        "plain_completion_prompt_tokenization_special_values": "false,none,true",
+        "plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+        "plain_completion_attempt_methods": "create_completion_keyword_prompt,create_completion_keyword_token_ids",
+        "plain_completion_attempt_categories": "prompt_eval_failure,prompt_eval_decode_failure",
+        "plain_completion_attempt_exception_types": "RuntimeError,TypeError",
+        "plain_completion_attempt_safe_summaries": "RuntimeError:prompt_eval_failure,RuntimeError:prompt_eval_decode_failure",
+        "plain_completion_attempt_rejected_kwargs": "prompt",
+        "plain_completion_attempt_result_shapes": "choices_text",
+        "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false",
+        "plain_completion_attempt_count": 4,
+        "qwen_high_level_chat_fallback_attempted": True,
+        "qwen_high_level_chat_fallback_supported": True,
+        "qwen_high_level_chat_fallback_succeeded": False,
+        "qwen_high_level_chat_fallback_rejected_kwarg": "chat_template_kwargs",
+        "qwen_high_level_chat_fallback_category": "unsupported_generation_kwarg",
+        "plain_completion_eval_return_code": 1,
+        "prompt": "SECRET_PROMPT",
+        "token_ids": "1,2,3",
+    })
+
+    assert safe["plain_completion_prompt_tokenization_variant_count"] == 3
+    assert safe["plain_completion_attempt_count"] == 4
+    assert safe["qwen_high_level_chat_fallback_attempted"] is True
+    assert "prompt" not in safe
+    assert "token_ids" not in safe
+    assert "SECRET_PROMPT" not in json.dumps(safe)

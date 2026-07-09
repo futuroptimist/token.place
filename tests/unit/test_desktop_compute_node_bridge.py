@@ -4798,6 +4798,12 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'api_v1_readiness_completion_smoke_plain_completion_create_completion_callable': True,
             'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': False,
             'api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs': True,
+            'api_v1_readiness_completion_smoke_plain_completion_reset_after_failure_count': 2,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted': True,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_token_count': 3,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method': 'llama.tokenize',
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special': True,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category': 'prompt_tokenization_failure',
             'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
             'api_v1_readiness_completion_smoke_result_shape': 'dict_malformed',
             'prompt': 'SECRET_PROMPT',
@@ -4820,6 +4826,12 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert safe['api_v1_readiness_completion_smoke_plain_completion_create_completion_callable'] is True
     assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg'] is False
     assert safe['api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs'] is True
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_reset_after_failure_count'] == 2
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted'] is True
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_token_count'] == 3
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method'] == 'llama.tokenize'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special'] is True
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
     dumped = json.dumps(safe)
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped

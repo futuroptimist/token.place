@@ -75,7 +75,19 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
             "method": "create_chat_completion",
             "reason": "malformed_completion_output",
             "generation_exception_category": "malformed_completion_output",
+            "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "plain_completion_prompt_tokenization_attempted": True,
+            "plain_completion_prompt_tokenization_special": True,
+            "plain_completion_prompt_token_count": 3,
+            "plain_completion_reset_after_failure_count": 2,
             "unsafe_prompt": "Reply with exactly: ok",
+            "rendered_prompt": "SECRET rendered prompt",
+            "token_ids": [1, 2, 3],
+            "assistant_output": "SECRET output",
+            "key": "SECRET key",
+            "tool_args": {"secret": True},
+            "ciphertext": "SECRET ciphertext",
             "nested": {"rendered_prompt": "secret"},
             "content": "assistant output",
         }
@@ -99,6 +111,12 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
         "method": "create_chat_completion",
         "reason": "malformed_completion_output",
         "generation_exception_category": "malformed_completion_output",
+        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_attempted": True,
+        "plain_completion_prompt_tokenization_special": True,
+        "plain_completion_prompt_token_count": 3,
+        "plain_completion_reset_after_failure_count": 2,
     }
     assert "Reply with exactly" not in json.dumps(safe)
     assert "assistant output" not in json.dumps(safe)
@@ -124,6 +142,33 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
 
 
 @pytest.mark.parametrize(
+    "category",
+    [
+        "context_window_exceeded",
+        "context_length_exceeded",
+        "token_overflow",
+    ],
+)
+def test_completion_smoke_worker_diagnostic_sanitizer_preserves_tokenization_length_categories(category):
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "plain_completion_prompt_tokenization_error_category": category,
+            "plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "plain_completion_prompt_tokenization_attempted": True,
+            "rendered_prompt": "SECRET rendered prompt",
+            "token_ids": [1, 2, 3],
+        }
+    )
+
+    assert safe == {
+        "plain_completion_prompt_tokenization_error_category": category,
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_attempted": True,
+    }
+    assert "SECRET" not in json.dumps(safe)
+
+
+@pytest.mark.parametrize(
     ("error", "expected_reason"),
     [
         ({"internal_reason": "runtime_unsupported_generation_kwarg"}, "runtime_completion_smoke_unsupported_generation_kwarg"),
@@ -139,6 +184,9 @@ def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
         ({"generation_exception_category": "malformed_completion_output"}, "runtime_completion_smoke_plain_completion_malformed_output"),
         ({"generation_exception_category": "method_shape"}, "runtime_completion_smoke_plain_completion_method_shape"),
         ({"generation_exception_category": "unsupported_prompt_kwarg"}, "runtime_completion_smoke_plain_completion_method_shape"),
+        ({"generation_exception_category": "prompt_tokenization_failure"}, "runtime_completion_smoke_plain_completion_prompt_tokenization_failure"),
+        ({"generation_exception_category": "prompt_eval_failure"}, "runtime_completion_smoke_plain_completion_eval_failure"),
+        ({"generation_exception_category": "sampling_failure"}, "runtime_completion_smoke_plain_completion_sampling_failure"),
         # Relay path: generation_exception_category nested inside worker_diagnostics.
         ({"worker_diagnostics": {"generation_exception_category": "method_shape"}}, "runtime_completion_smoke_plain_completion_method_shape"),
         ({"worker_diagnostics": {"generation_exception_category": "unsupported_prompt_kwarg"}}, "runtime_completion_smoke_plain_completion_method_shape"),
@@ -171,6 +219,9 @@ def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, e
         (RuntimeError("worker dead: broken pipe"), "worker_dead", "runtime_completion_smoke_worker_dead"),
         (RuntimeError("Metal buffer allocation out of memory"), "metal_memory_allocation", "runtime_completion_smoke_metal_memory_allocation"),
         (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
+        (RuntimeError("failed to tokenize prompt"), "prompt_tokenization_failure", "runtime_completion_smoke_plain_completion_prompt_tokenization_failure"),
+        (RuntimeError("llama_decode failed to eval prompt"), "prompt_eval_failure", "runtime_completion_smoke_plain_completion_eval_failure"),
+        (RuntimeError("sampler failed with no logits"), "sampling_failure", "runtime_completion_smoke_plain_completion_sampling_failure"),
         (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
     ],
@@ -1110,12 +1161,25 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
                         "code": "compute_node_internal_error",
                         "worker_diagnostics": {
                             "rejected_generation_kwarg": "stream",
-                            "attempted_generation_kwargs": "max_tokens,stream",
-                            "attempted_plain_completion_methods": "create_completion_keyword_prompt",
-                            "result_shape": "dict_malformed",
-                        },
-                    }
+                        "attempted_generation_kwargs": "max_tokens,stream",
+                        "attempted_plain_completion_methods": "create_completion_keyword_prompt",
+                        "result_shape": "dict_malformed",
+                        "plain_completion_prompt_tokenization_attempted": True,
+                        "plain_completion_prompt_token_count": 3,
+                        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+                        "plain_completion_prompt_tokenization_special": True,
+                        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+                        "plain_completion_reset_after_failure_count": 2,
+                        "prompt": "SECRET_PROMPT",
+                        "rendered_prompt": "SECRET_RENDERED_PROMPT",
+                        "token_ids": [1, 2, 3],
+                        "assistant_output": "SECRET_OUTPUT",
+                        "key": "SECRET_KEY",
+                        "tool_args": {"secret": True},
+                        "ciphertext": "SECRET_CIPHERTEXT",
+                    },
                 }
+            }
             }
 
     monkeypatch.setenv("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", "1")
@@ -1141,11 +1205,24 @@ def test_compute_node_runtime_promotes_nested_worker_diagnostics_to_flat_readine
         "attempted_generation_kwargs": "max_tokens,stream",
         "attempted_plain_completion_methods": "create_completion_keyword_prompt",
         "result_shape": "dict_malformed",
+        "plain_completion_prompt_tokenization_attempted": True,
+        "plain_completion_prompt_token_count": 3,
+        "plain_completion_prompt_tokenization_method": "llama.tokenize",
+        "plain_completion_prompt_tokenization_special": True,
+        "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+        "plain_completion_reset_after_failure_count": 2,
     }
     assert diagnostics["api_v1_readiness_completion_smoke_rejected_generation_kwarg"] == "stream"
     assert diagnostics["api_v1_readiness_completion_smoke_attempted_generation_kwargs"] == "max_tokens,stream"
     assert diagnostics["api_v1_readiness_completion_smoke_attempted_plain_completion_methods"] == "create_completion_keyword_prompt"
     assert diagnostics["api_v1_readiness_completion_smoke_result_shape"] == "dict_malformed"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"] == 3
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method"] == "llama.tokenize"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] is True
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category"] == "prompt_tokenization_failure"
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_reset_after_failure_count"] == 2
+    assert "SECRET" not in json.dumps(diagnostics)
 
 def test_compute_node_runtime_qwen_readiness_smoke_completion_is_required_without_env(monkeypatch):
     class ThinkRuntime:

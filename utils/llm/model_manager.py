@@ -1839,6 +1839,9 @@ def _sanitize_error_summary(message):
         return type(message).__name__ + ':kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return type(message).__name__ + ':rope_yarn_eval_failure'
+    classified = _classify_generation_exception(message)
+    if classified in {'prompt_tokenization_failure', 'prompt_eval_failure', 'sampling_failure'}:
+        return type(message).__name__ + ':' + classified
     if _extract_unsupported_generation_kwarg(str(message or '')) is not None:
         return type(message).__name__ + ':unsupported_kwarg'
     return type(message).__name__ + ':redacted'
@@ -1861,6 +1864,12 @@ def _classify_generation_exception(exc):
         return 'context_length_exceeded'
     if any(term in text for term in ('token overflow', 'too many tokens', 'exceeds token')):
         return 'token_overflow'
+    if any(term in text for term in ('failed to tokenize', 'tokenization failed', 'llama_tokenize', 'could not tokenize')):
+        return 'prompt_tokenization_failure'
+    if any(term in text for term in ('failed to eval', 'failed to evaluate', 'model failed to evaluate', 'llama_eval', 'llama_decode', 'decode failed', 'decode returned')):
+        return 'prompt_eval_failure'
+    if any(term in text for term in ('sample failed', 'sampler', 'logits', 'no logits')):
+        return 'sampling_failure'
     if _extract_unsupported_generation_kwarg(str(exc or '')) is not None:
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
@@ -1882,6 +1891,67 @@ def _plain_completion_method_shape_category(exc):
     if classified != 'unknown_generation_exception':
         return classified
     return 'worker_exception'
+
+
+def _reset_plain_completion_state(llama):
+    reset = getattr(llama, 'reset', None)
+    if not callable(reset):
+        return False
+    try:
+        reset()
+        return True
+    except Exception:
+        return False
+
+def _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt):
+    diagnostics = {
+        'plain_completion_prompt_tokenization_attempted': True,
+        'plain_completion_prompt_token_count': 0,
+        'plain_completion_prompt_tokenization_method': '',
+        'plain_completion_prompt_tokenization_special': None,
+        'plain_completion_prompt_tokenization_error_category': '',
+    }
+    tokenize = getattr(llama, 'tokenize', None)
+    if not callable(tokenize):
+        diagnostics['plain_completion_prompt_tokenization_error_category'] = 'tokenizer_unavailable'
+        return None, diagnostics
+    prompt_bytes = rendered_prompt.encode('utf-8') if isinstance(rendered_prompt, str) else rendered_prompt
+    supports_special = False
+    try:
+        sig = inspect.signature(tokenize)
+        supports_special = 'special' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        supports_special = False
+    attempts = []
+    if supports_special:
+        attempts.append(('llama.tokenize', True, {'add_bos': False, 'special': True}))
+        attempts.append(('llama.tokenize', False, {'add_bos': False, 'special': False}))
+    attempts.append(('llama.tokenize', False, {'add_bos': False}))
+    last_category = 'prompt_tokenization_failure'
+    for method_name, special_value, kwargs in attempts:
+        try:
+            tokens = tokenize(prompt_bytes, **kwargs)
+        except TypeError:
+            last_category = 'method_shape'
+            continue
+        except Exception as exc:
+            last_category = _classify_generation_exception(exc)
+            if last_category == 'unknown_generation_exception':
+                last_category = 'prompt_tokenization_failure'
+            continue
+        if (
+            isinstance(tokens, (list, tuple))
+            and bool(tokens)
+            and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens)
+        ):
+            diagnostics['plain_completion_prompt_token_count'] = len(tokens)
+            diagnostics['plain_completion_prompt_tokenization_method'] = method_name
+            diagnostics['plain_completion_prompt_tokenization_special'] = special_value
+            diagnostics['plain_completion_prompt_tokenization_error_category'] = ''
+            return list(tokens), diagnostics
+        last_category = 'prompt_tokenization_failure'
+    diagnostics['plain_completion_prompt_tokenization_error_category'] = last_category
+    return None, diagnostics
 
 def _completion_result_shape(result):
     if isinstance(result, str):
@@ -2010,6 +2080,12 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             'plain_completion_accepts_prompt_kwarg',
             'plain_completion_accepts_max_tokens_kwarg',
             'plain_completion_accepts_var_kwargs',
+            'plain_completion_prompt_tokenization_attempted',
+            'plain_completion_prompt_token_count',
+            'plain_completion_prompt_tokenization_method',
+            'plain_completion_prompt_tokenization_special',
+            'plain_completion_prompt_tokenization_error_category',
+            'plain_completion_reset_after_failure_count',
         }
         for key, value in extra.items():
             if (
@@ -2651,6 +2727,7 @@ for line in sys.stdin:
                 'plain_completion_accepts_prompt_kwarg': None,
                 'plain_completion_accepts_max_tokens_kwarg': None,
                 'plain_completion_accepts_var_kwargs': None,
+                'plain_completion_reset_after_failure_count': 0,
             }
             if callable(create_completion):
                 try:
@@ -2692,6 +2769,8 @@ for line in sys.stdin:
                         'rejected_generation_kwarg': rejected or '',
                         'sanitized_error_summary': _sanitize_error_summary(exc),
                     })
+                    if category not in fatal_plain_completion_categories and _reset_plain_completion_state(llama):
+                        plain_capabilities['plain_completion_reset_after_failure_count'] += 1
                     return None, exc
 
             if callable(create_completion):
@@ -2716,6 +2795,54 @@ for line in sys.stdin:
                     ['max_tokens'],
                     lambda: llama(rendered_prompt, max_tokens=max_tokens),
                 )
+            rendered_prompt_token_ids = None
+            tokenization_diagnostics = {}
+            if result is None and callable(create_completion) and (
+                not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
+            ):
+                rendered_prompt_token_ids, tokenization_diagnostics = _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt)
+                plain_capabilities.update(tokenization_diagnostics)
+                if rendered_prompt_token_ids is not None:
+                    result, completion_error = _attempt_plain_completion(
+                        'create_completion_keyword_token_ids',
+                        ['max_tokens', 'prompt'],
+                        lambda: create_completion(prompt=rendered_prompt_token_ids, max_tokens=max_tokens),
+                    )
+            if result is None and rendered_prompt_token_ids is not None and callable(create_completion) and (
+                not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
+            ):
+                result, completion_error = _attempt_plain_completion(
+                    'create_completion_positional_token_ids',
+                    ['max_tokens'],
+                    lambda: create_completion(rendered_prompt_token_ids, max_tokens=max_tokens),
+                )
+            if result is not None:
+                normalized, invalid_reason = _normalize_plain_completion_result(result)
+                if (
+                    invalid_reason is not None
+                    and invalid_reason != 'thinking_leaked'
+                    and rendered_prompt_token_ids is None
+                    and callable(create_completion)
+                    and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories)
+                ):
+                    rendered_prompt_token_ids, tokenization_diagnostics = _tokenize_rendered_prompt_for_plain_completion(llama, rendered_prompt)
+                    plain_capabilities.update(tokenization_diagnostics)
+                    if rendered_prompt_token_ids is not None:
+                        result, completion_error = _attempt_plain_completion(
+                            'create_completion_keyword_token_ids',
+                            ['max_tokens', 'prompt'],
+                            lambda: create_completion(prompt=rendered_prompt_token_ids, max_tokens=max_tokens),
+                        )
+                        if result is None and (
+                            not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories
+                        ):
+                            result, completion_error = _attempt_plain_completion(
+                                'create_completion_positional_token_ids',
+                                ['max_tokens'],
+                                lambda: create_completion(rendered_prompt_token_ids, max_tokens=max_tokens),
+                            )
+                        if result is not None:
+                            normalized, invalid_reason = _normalize_plain_completion_result(result)
             if result is None:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
@@ -2728,7 +2855,6 @@ for line in sys.stdin:
                 })
                 _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))
                 continue
-            normalized, invalid_reason = _normalize_plain_completion_result(result)
             if invalid_reason is not None:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)

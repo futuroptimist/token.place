@@ -101,6 +101,14 @@ class Llama:
         if path:
             with open(path, 'a', encoding='utf-8') as handle:
                 handle.write(json.dumps({'prompt': prompt, **kwargs}, sort_keys=True) + '\\n')
+        if isinstance(prompt, str) and os.environ.get('TOKEN_PLACE_STRING_COMPLETION_THINK'):
+            return {'choices': [{'text': os.environ.get('TOKEN_PLACE_STRING_COMPLETION_THINK')}]}
+        if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_THINK'):
+            return {'choices': [{'text': os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_THINK')}]}
+        if isinstance(prompt, str) and os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'):
+            raise RuntimeError(os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'))
+        if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR'):
+            raise RuntimeError(os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR'))
 """
         + completion_branch,
         encoding='utf-8',
@@ -368,6 +376,108 @@ def test_qwen64k_packaged_subprocess_generation_error_preserves_safe_diagnostics
         ]
         assert completion_attempts
         assert all(attempt.get('max_tokens') == 64 for attempt in completion_attempts)
+    finally:
+        proxy.close()
+
+
+def test_qwen64k_packaged_subprocess_token_id_fallback_passes_readiness_and_registers(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_STRING_COMPLETION_ERROR', 'failed to tokenize prompt')
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is True
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics["api_v1_runtime_ready"] is True
+        assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
+
+        completion_attempts = [
+            json.loads(line) for line in completion_kwargs_file.read_text().splitlines()
+        ]
+        assert any(isinstance(attempt["prompt"], str) for attempt in completion_attempts)
+        assert any(attempt["prompt"] == [1] * 42 for attempt in completion_attempts)
+        assert all(attempt.get("max_tokens") == 64 for attempt in completion_attempts)
+
+        assert manager.last_runtime_init_error is None
+    finally:
+        proxy.close()
+
+
+def test_qwen64k_packaged_subprocess_token_id_fallback_failure_reports_safe_category(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv(
+        'TOKEN_PLACE_STRING_COMPLETION_ERROR',
+        'failed to tokenize prompt SECRET_PROMPT SECRET_RENDERED_PROMPT SECRET_ASSISTANT_OUTPUT',
+    )
+    monkeypatch.setenv(
+        'TOKEN_PLACE_TOKEN_COMPLETION_ERROR',
+        'failed to eval prompt SECRET_PROMPT SECRET_KEY SECRET_TOOL_ARGS SECRET_CIPHERTEXT_INTERNALS',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is False
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_plain_completion_eval_failure"
+        assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "prompt_eval_failure"
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted"] is True
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"] == 42
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method"] == "llama.tokenize"
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] is False
+        assert diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category") in (None, "")
+        dumped = json.dumps(diagnostics)
+        assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
+        assert '"token_ids"' not in dumped
+
+        completion_attempts = [
+            json.loads(line) for line in completion_kwargs_file.read_text().splitlines()
+        ]
+        assert any(isinstance(attempt["prompt"], str) for attempt in completion_attempts)
+        assert any(attempt["prompt"] == [1] * 42 for attempt in completion_attempts)
+        assert all(attempt.get("max_tokens") == 64 for attempt in completion_attempts)
+    finally:
+        proxy.close()
+
+
+
+def test_qwen64k_packaged_subprocess_thinking_leak_fails_closed_without_token_fallback(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_STRING_COMPLETION_THINK', '<think>SECRET_ASSISTANT_OUTPUT</think> bad')
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is False
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "thinking_leaked"
+        assert diagnostics["api_v1_readiness_error_reason"] == "runtime_completion_smoke_plain_completion_thinking_leaked"
+        dumped = json.dumps(diagnostics)
+        assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
+        assert '<think>' not in dumped
+
+        completion_attempts = [
+            json.loads(line) for line in completion_kwargs_file.read_text().splitlines()
+        ]
+        assert len(completion_attempts) == 1
+        assert isinstance(completion_attempts[0]["prompt"], str)
+        assert completion_attempts[0].get("max_tokens") == 64
     finally:
         proxy.close()
 

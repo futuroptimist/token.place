@@ -4804,6 +4804,25 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method': 'llama.tokenize',
             'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special': True,
             'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category': 'prompt_tokenization_failure',
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count': 3,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids': 'tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special,tokenize_add_bos_false_special_true',
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts': '3,3,4',
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values': 'false,none,true',
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant': 'tokenize_add_bos_false_no_special',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_methods': 'create_completion_keyword_prompt,create_completion_keyword_token_ids,create_chat_completion_qwen_non_thinking',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_categories': 'prompt_eval_failure,prompt_eval_decode_failure,',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_exception_types': 'RuntimeError,RuntimeError,',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_safe_summaries': 'RuntimeError:prompt_eval_failure,RuntimeError:prompt_eval_decode_failure,',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_rejected_kwargs': ',,',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_result_shapes': ',,choices_message',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_tokenization_variants': ',tokenize_add_bos_false_no_special,',
+            'api_v1_readiness_completion_smoke_plain_completion_attempt_count': 3,
+            'api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_attempted': True,
+            'api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_supported': True,
+            'api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_succeeded': False,
+            'api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_rejected_kwarg': '',
+            'api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category': 'thinking_leaked',
+            'api_v1_readiness_completion_smoke_plain_completion_eval_return_code': 1,
             'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
             'api_v1_readiness_completion_smoke_result_shape': 'dict_malformed',
             'prompt': 'SECRET_PROMPT',
@@ -4811,6 +4830,8 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'assistant_output': 'SECRET_OUTPUT',
             'decrypted_payload': 'SECRET_PAYLOAD',
             'ciphertext': 'SECRET_CIPHERTEXT_INTERNALS',
+            'token_ids': [1, 2, 3],
+            'output': 'SECRET_OUTPUT',
             'key': 'SECRET_KEY',
             'tool_args': {'secret': True},
             'api_v1_readiness_completion_smoke_internal_reason': 'bad value with spaces and secret prompt',
@@ -4832,6 +4853,16 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method'] == 'llama.tokenize'
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special'] is True
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count'] == 3
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values'] == 'false,none,true'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant'] == 'tokenize_add_bos_false_no_special'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_attempt_methods'].endswith('create_chat_completion_qwen_non_thinking')
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_attempt_count'] == 3
+    assert safe['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_attempted'] is True
+    assert safe['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_supported'] is True
+    assert safe['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_succeeded'] is False
+    assert safe['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category'] == 'thinking_leaked'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_eval_return_code'] == 1
     dumped = json.dumps(safe)
     assert 'SECRET_' not in dumped
     assert 'prompt text' not in dumped

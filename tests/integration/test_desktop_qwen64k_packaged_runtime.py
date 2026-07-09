@@ -94,8 +94,12 @@ class Llama:
                     'enable_thinking': enable_thinking,
                 }, sort_keys=True) + '\\n')
         return '<qwen>'
-    def tokenize(self, payload, add_bos=False):
-        return [1] * 42
+    def tokenize(self, payload, add_bos=False, special=None):
+        if special is True:
+            return [3] * 42
+        if special is False:
+            return [1] * 42
+        return [2] * 42
     def create_completion(self, prompt, **kwargs):
         path = os.environ.get('TOKEN_PLACE_COMPLETION_KWARGS_JSONL')
         if path:
@@ -107,10 +111,24 @@ class Llama:
             return {'choices': [{'text': os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_THINK')}]}
         if isinstance(prompt, str) and os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'):
             raise RuntimeError(os.environ.get('TOKEN_PLACE_STRING_COMPLETION_ERROR'))
+        if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR_SPECIAL_TRUE') and prompt == [3] * 42:
+            raise RuntimeError(os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR_SPECIAL_TRUE'))
         if isinstance(prompt, list) and os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR'):
             raise RuntimeError(os.environ.get('TOKEN_PLACE_TOKEN_COMPLETION_ERROR'))
 """
-        + completion_branch,
+        + completion_branch
+        + """
+    def create_chat_completion(self, *, messages, max_tokens, chat_template_kwargs):
+        path = os.environ.get('TOKEN_PLACE_CHAT_COMPLETION_KWARGS_JSONL') or os.environ.get('TOKEN_PLACE_COMPLETION_KWARGS_JSONL')
+        if path:
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps({'messages': messages, 'max_tokens': max_tokens, 'chat_template_kwargs': chat_template_kwargs}, sort_keys=True) + '\\n')
+        if os.environ.get('TOKEN_PLACE_CHAT_COMPLETION_ERROR'):
+            raise RuntimeError(os.environ.get('TOKEN_PLACE_CHAT_COMPLETION_ERROR'))
+        if os.environ.get('TOKEN_PLACE_CHAT_COMPLETION_OK') == '1':
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'chat ok'}}]}
+        raise RuntimeError('failed to eval prompt')
+""",
         encoding='utf-8',
     )
 
@@ -435,7 +453,7 @@ def test_qwen64k_packaged_subprocess_token_id_fallback_failure_reports_safe_cate
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted"] is True
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"] == 42
         assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method"] == "llama.tokenize"
-        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] in {False, "none"}
+        assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special"] is False
         assert diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category") in (None, "")
         dumped = json.dumps(diagnostics)
         assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
@@ -451,6 +469,61 @@ def test_qwen64k_packaged_subprocess_token_id_fallback_failure_reports_safe_cate
         proxy.close()
 
 
+
+
+def test_qwen64k_packaged_subprocess_high_level_chat_fallback_passes_readiness(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_STRING_COMPLETION_ERROR', 'failed to eval prompt SECRET_PROMPT')
+    monkeypatch.setenv('TOKEN_PLACE_TOKEN_COMPLETION_ERROR', 'failed to eval prompt SECRET_PROMPT')
+    monkeypatch.setenv('TOKEN_PLACE_CHAT_COMPLETION_OK', '1')
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is True
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics['api_v1_readiness_completion_smoke_result'] == 'passed'
+        attempts = [json.loads(line) for line in completion_kwargs_file.read_text().splitlines()]
+        assert attempts[-1]['chat_template_kwargs'] == {'enable_thinking': False}
+        assert attempts[-1]['max_tokens'] == 64
+        assert all(attempt.get('max_tokens', 64) > 0 for attempt in attempts)
+    finally:
+        proxy.close()
+
+
+def test_qwen64k_packaged_subprocess_all_plain_paths_fail_reports_safe_variant_diagnostics(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(runtime_root)
+    completion_kwargs_file = tmp_path / 'completion_kwargs.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_STRING_COMPLETION_ERROR', 'failed to eval prompt SECRET_PROMPT SECRET_RENDERED_PROMPT')
+    monkeypatch.setenv('TOKEN_PLACE_TOKEN_COMPLETION_ERROR', 'failed to eval prompt SECRET_KEY SECRET_TOOL_ARGS SECRET_CIPHERTEXT_INTERNALS')
+    monkeypatch.setenv('TOKEN_PLACE_CHAT_COMPLETION_ERROR', 'failed to eval prompt SECRET_DECRYPTED_PAYLOAD SECRET_ASSISTANT_OUTPUT')
+    monkeypatch.setenv('TOKEN_PLACE_COMPLETION_KWARGS_JSONL', str(completion_kwargs_file))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', type_k=8, type_v=8, timeout_seconds=5)
+    try:
+        runtime, manager = _runtime_for(proxy)
+
+        assert runtime.ensure_api_v1_runtime_ready() is False
+        diagnostics = manager.last_compute_diagnostics
+        assert diagnostics['api_v1_readiness_error_reason'] == 'runtime_completion_smoke_plain_completion_eval_failure'
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count'] == 3
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values'] == 'false,none,true'
+        assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_attempt_count'] >= 6
+        assert diagnostics['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_attempted'] is True
+        assert diagnostics['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_succeeded'] is False
+        dumped = json.dumps(diagnostics)
+        assert all(sentinel not in dumped for sentinel in UNSAFE_READINESS_SENTINELS)
+        for unsafe in ('rendered_prompt', 'token_ids', 'assistant_output', 'decrypted_payload', 'key', 'tool_args', 'payload', 'ciphertext'):
+            assert f'"{unsafe}"' not in dumped
+    finally:
+        proxy.close()
 
 def test_qwen64k_packaged_subprocess_thinking_leak_fails_closed_without_token_fallback(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'runtime'

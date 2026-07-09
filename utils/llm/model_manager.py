@@ -1940,7 +1940,7 @@ def _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prom
     attempts = []
     if supports_special:
         attempts.append(('tokenize_add_bos_false_special_false', 'llama.tokenize', False, False, {'add_bos': False, 'special': False}))
-    attempts.append(('tokenize_add_bos_false_no_special', 'llama.tokenize', 'none', False, {'add_bos': False}))
+    attempts.append(('tokenize_add_bos_false_no_special', 'llama.tokenize', None, False, {'add_bos': False}))
     if supports_special:
         attempts.append(('tokenize_add_bos_false_special_true', 'llama.tokenize', True, False, {'add_bos': False, 'special': True}))
     variants = []
@@ -1986,7 +1986,7 @@ def _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prom
             'plain_completion_prompt_tokenization_variant_count': len(variants),
             'plain_completion_prompt_tokenization_variant_ids': ','.join(v['tokenization_variant_id'] for v in variants),
             'plain_completion_prompt_tokenization_token_counts': ','.join(str(v['token_count']) for v in variants),
-            'plain_completion_prompt_tokenization_special_values': ','.join(str(v['special']).lower() for v in variants),
+            'plain_completion_prompt_tokenization_special_values': ','.join('none' if v['special'] is None else str(v['special']).lower() for v in variants),
             'plain_completion_prompt_tokenization_selected_variant': variants[0]['tokenization_variant_id'],
         })
     else:
@@ -2137,6 +2137,25 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             'plain_completion_prompt_tokenization_method',
             'plain_completion_prompt_tokenization_special',
             'plain_completion_prompt_tokenization_error_category',
+            'plain_completion_prompt_tokenization_variant_count',
+            'plain_completion_prompt_tokenization_variant_ids',
+            'plain_completion_prompt_tokenization_token_counts',
+            'plain_completion_prompt_tokenization_special_values',
+            'plain_completion_prompt_tokenization_selected_variant',
+            'plain_completion_attempt_methods',
+            'plain_completion_attempt_categories',
+            'plain_completion_attempt_exception_types',
+            'plain_completion_attempt_safe_summaries',
+            'plain_completion_attempt_rejected_kwargs',
+            'plain_completion_attempt_result_shapes',
+            'plain_completion_attempt_tokenization_variants',
+            'plain_completion_attempt_count',
+            'qwen_high_level_chat_fallback_attempted',
+            'qwen_high_level_chat_fallback_supported',
+            'qwen_high_level_chat_fallback_succeeded',
+            'qwen_high_level_chat_fallback_rejected_kwarg',
+            'qwen_high_level_chat_fallback_category',
+            'plain_completion_eval_return_code',
             'plain_completion_reset_after_failure_count',
         }
         for key, value in extra.items():

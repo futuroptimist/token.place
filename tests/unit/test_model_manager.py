@@ -7886,7 +7886,7 @@ def test_llama_worker_high_level_qwen_fallback_rejects_missing_chat_template_kwa
 
 
 
-def test_llama_worker_high_level_qwen_fallback_missing_chat_preserves_decode_failure(tmp_path, monkeypatch):
+def test_qwen_fallback_preserves_decode_failure(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     fake_site = tmp_path / 'high level fallback missing chat fake site'
@@ -7937,7 +7937,7 @@ def test_llama_worker_high_level_qwen_fallback_missing_chat_preserves_decode_fai
     assert 'llama_decode returned -1' not in diagnostics_dump
 
 
-def test_llama_worker_high_level_qwen_fallback_malformed_then_missing_chat_preserves_malformed_output(tmp_path, monkeypatch):
+def test_qwen_fallback_preserves_malformed_output(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     fake_site = tmp_path / 'high level fallback malformed missing chat fake site'
@@ -7985,7 +7985,7 @@ def test_llama_worker_high_level_qwen_fallback_malformed_then_missing_chat_prese
     assert 'llama_decode returned -1' not in diagnostics_dump
 
 
-def test_llama_worker_high_level_qwen_fallback_missing_chat_is_primary_only_without_bounded_attempts(tmp_path, monkeypatch):
+def test_qwen_fallback_unsupported_without_bounded_attempts(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     fake_site = tmp_path / 'high level fallback unsupported only fake site'

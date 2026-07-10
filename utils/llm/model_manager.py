@@ -3040,6 +3040,13 @@ for line in sys.stdin:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
                 extra.update(_plain_attempt_diagnostics())
+                # The Qwen high-level chat fallback is optional and is commonly
+                # unsupported by deployed llama-cpp-python builds that lack
+                # chat_template_kwargs.  Keep concrete bounded-completion
+                # failures (including malformed/empty output) as the primary
+                # readiness signal; report unsupported chat fallback only as
+                # secondary diagnostics unless there was no real primary
+                # failure to preserve.
                 preserve_primary_failure = (
                     plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
                     and chat_fallback_category == 'unsupported_generation_kwarg'

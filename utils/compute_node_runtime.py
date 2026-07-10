@@ -100,6 +100,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_prompt_tokenization_token_counts",
     "plain_completion_prompt_tokenization_special_values",
     "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
     "plain_completion_attempt_methods",
     "plain_completion_attempt_categories",
     "plain_completion_attempt_exception_types",
@@ -114,6 +116,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "qwen_high_level_chat_fallback_rejected_kwarg",
     "qwen_high_level_chat_fallback_category",
     "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
@@ -278,7 +287,9 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         if names and all(_SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(part) for part in names):
             return ",".join(names[:64])
         return "" if not names else None
-    if key in {"plain_completion_prompt_tokenization_selected_variant", "plain_completion_prompt_tokenization_special", "qwen_high_level_chat_fallback_category", "qwen_high_level_chat_fallback_rejected_kwarg"}:
+    if key in {"plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special", "plain_completion_prompt_tokenization_special", "qwen_high_level_chat_fallback_category", "qwen_high_level_chat_fallback_rejected_kwarg"}:
         return bounded if not bounded or _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "sanitized_error_summary":
         return (
@@ -823,6 +834,13 @@ class ComputeNodeRuntime:
                 "original_context_tokens"
             ),
             "api_v1_readiness_yarn_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
+            "qwen_yarn_requested_context_tokens": yarn_diagnostics.get("qwen_yarn_requested_context_tokens"),
+            "qwen_yarn_original_context_tokens": yarn_diagnostics.get("qwen_yarn_original_context_tokens"),
+            "qwen_yarn_context_multiplier": yarn_diagnostics.get("qwen_yarn_context_multiplier"),
+            "qwen_yarn_rope_freq_scale": yarn_diagnostics.get("qwen_yarn_rope_freq_scale"),
+            "qwen_yarn_ext_factor_overridden": yarn_diagnostics.get("qwen_yarn_ext_factor_overridden"),
+            "qwen_yarn_rope_scaling_type_source": yarn_diagnostics.get("qwen_yarn_rope_scaling_type_source") or yarn_diagnostics.get("yarn_resolver_source"),
+            "qwen_yarn_configuration_valid": yarn_diagnostics.get("qwen_yarn_configuration_valid"),
             "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
             "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
             "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
@@ -986,6 +1004,8 @@ class ComputeNodeRuntime:
                         "plain_completion_prompt_tokenization_token_counts",
                         "plain_completion_prompt_tokenization_special_values",
                         "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
                         "plain_completion_attempt_methods",
                         "plain_completion_attempt_categories",
                         "plain_completion_attempt_exception_types",
@@ -1000,6 +1020,13 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",
@@ -1086,6 +1113,8 @@ class ComputeNodeRuntime:
                     "plain_completion_prompt_tokenization_token_counts",
                     "plain_completion_prompt_tokenization_special_values",
                     "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
                     "plain_completion_attempt_methods",
                     "plain_completion_attempt_categories",
                     "plain_completion_attempt_exception_types",
@@ -1100,6 +1129,13 @@ class ComputeNodeRuntime:
                     "qwen_high_level_chat_fallback_rejected_kwarg",
                     "qwen_high_level_chat_fallback_category",
                     "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
                     "plain_completion_prompt_token_count",
                     "plain_completion_prompt_tokenization_method",
@@ -1144,6 +1180,8 @@ class ComputeNodeRuntime:
                         "plain_completion_prompt_tokenization_token_counts",
                         "plain_completion_prompt_tokenization_special_values",
                         "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
                         "plain_completion_attempt_methods",
                         "plain_completion_attempt_categories",
                         "plain_completion_attempt_exception_types",
@@ -1158,6 +1196,13 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",

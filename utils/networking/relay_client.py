@@ -136,6 +136,8 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_prompt_tokenization_token_counts",
     "plain_completion_prompt_tokenization_special_values",
     "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
     "plain_completion_attempt_methods",
     "plain_completion_attempt_categories",
     "plain_completion_attempt_exception_types",
@@ -150,6 +152,13 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "qwen_high_level_chat_fallback_rejected_kwarg",
     "qwen_high_level_chat_fallback_category",
     "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
@@ -316,7 +325,9 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         if names and all(_SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(part) for part in names):
             return ",".join(names[:64])
         return "" if not names else None
-    if key in {"plain_completion_prompt_tokenization_selected_variant", "plain_completion_prompt_tokenization_special", "qwen_high_level_chat_fallback_category", "qwen_high_level_chat_fallback_rejected_kwarg"}:
+    if key in {"plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special", "plain_completion_prompt_tokenization_special", "qwen_high_level_chat_fallback_category", "qwen_high_level_chat_fallback_rejected_kwarg"}:
         return bounded if not bounded or _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     if key == "sanitized_error_summary":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE.fullmatch(bounded) else None
@@ -4105,6 +4116,8 @@ class RelayClient:
                     "plain_completion_prompt_tokenization_token_counts",
                     "plain_completion_prompt_tokenization_special_values",
                     "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
                     "plain_completion_attempt_methods",
                     "plain_completion_attempt_categories",
                     "plain_completion_attempt_exception_types",
@@ -4119,6 +4132,13 @@ class RelayClient:
                     "qwen_high_level_chat_fallback_rejected_kwarg",
                     "qwen_high_level_chat_fallback_category",
                     "plain_completion_eval_return_code",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "qwen_yarn_context_multiplier",
+    "qwen_yarn_rope_freq_scale",
+    "qwen_yarn_ext_factor_overridden",
+    "qwen_yarn_rope_scaling_type_source",
+    "qwen_yarn_configuration_valid",
 
                     "plain_completion_prompt_token_count",
                     "plain_completion_prompt_tokenization_method",

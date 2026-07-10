@@ -3006,10 +3006,12 @@ for line in sys.stdin:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
                 extra.update(_plain_attempt_diagnostics())
-                if (
+                unsupported_chat_fallback_is_terminal = (
                     plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
                     and chat_fallback_category == 'unsupported_generation_kwarg'
-                ):
+                    and last_invalid_reason not in {'empty_completion_output', 'thinking_leaked'}
+                )
+                if unsupported_chat_fallback_is_terminal:
                     completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 extra.update({
                     'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
@@ -3017,9 +3019,7 @@ for line in sys.stdin:
                     'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
                     'generation_exception_category': (
                         chat_fallback_category
-                        if last_invalid_reason is None
-                        and plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
-                        and chat_fallback_category == 'unsupported_generation_kwarg'
+                        if unsupported_chat_fallback_is_terminal
                         else last_invalid_reason or (attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception')
                     ),
                     'rejected_generation_kwarg': attempts[-1].get('rejected_generation_kwarg', '') if attempts else '',

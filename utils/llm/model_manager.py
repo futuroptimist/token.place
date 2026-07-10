@@ -3006,6 +3006,12 @@ for line in sys.stdin:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
                 extra.update(_plain_attempt_diagnostics())
+                if (
+                    last_invalid_reason is None
+                    and plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
+                    and chat_fallback_category == 'unsupported_generation_kwarg'
+                ):
+                    completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 extra.update({
                     'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
                     'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),

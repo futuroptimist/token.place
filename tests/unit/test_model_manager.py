@@ -7879,6 +7879,8 @@ def test_llama_worker_high_level_qwen_fallback_missing_chat_reports_unsupported_
     assert diagnostics['qwen_high_level_chat_fallback_supported'] is False
     assert diagnostics['qwen_high_level_chat_fallback_category'] == 'unsupported_generation_kwarg'
     assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['exception_type'] == 'RuntimeError'
+    assert diagnostics['sanitized_error_summary'] == 'RuntimeError:unsupported_kwarg'
     assert diagnostics['plain_completion_eval_return_code'] == -1
     diagnostics_dump = json.dumps(diagnostics)
     assert 'secret prompt text' not in diagnostics_dump

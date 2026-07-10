@@ -1851,7 +1851,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search("llama_decode\\\\s+returned\\\\s+(-?\\\\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -3000,7 +3000,8 @@ for line in sys.stdin:
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
                         chat_fallback_category = 'unsupported_generation_kwarg'
-                        completion_error = RuntimeError('unsupported_generation_kwarg')
+                        if completion_error is None:
+                            completion_error = RuntimeError('unsupported_generation_kwarg')
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)
@@ -3785,6 +3786,48 @@ class ModelManager:
             and n_ctx > native_context
         )
         if needs_yarn:
+            try:
+                original_context_tokens = int(rope_policy['original_context_tokens'])
+                requested_context_tokens = int(n_ctx)
+                configured_multiplier = float(rope_policy['factor'])
+                computed_multiplier = requested_context_tokens / original_context_tokens
+                # Qwen profile factor is a context multiplier (64K over 32K),
+                # which llama-cpp-python expects as rope_freq_scale=1/N.
+                rope_freq_scale = 1.0 / configured_multiplier
+            except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+                self.last_yarn_rope_diagnostics = {
+                    'active_profile_id': self.profile_id,
+                    'active_context_tier': context_tier,
+                    'requested_n_ctx': n_ctx,
+                    'qwen_yarn_configuration_valid': False,
+                    'missing_reason': 'runtime_qwen_64k_yarn_configuration_invalid',
+                }
+                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid') from exc
+            configuration_valid = (
+                original_context_tokens == 32768
+                and requested_context_tokens == 65536
+                and original_context_tokens > 0
+                and requested_context_tokens > original_context_tokens
+                and math.isfinite(configured_multiplier)
+                and configured_multiplier > 1.0
+                and math.isclose(configured_multiplier, computed_multiplier, rel_tol=1e-12, abs_tol=1e-12)
+                and math.isclose(rope_freq_scale, 0.5, rel_tol=1e-12, abs_tol=1e-12)
+            )
+            if not configuration_valid:
+                self.last_yarn_rope_diagnostics = {
+                    'active_profile_id': self.profile_id,
+                    'active_context_tier': context_tier,
+                    'requested_n_ctx': n_ctx,
+                    'qwen_yarn_requested_context_tokens': requested_context_tokens,
+                    'qwen_yarn_original_context_tokens': original_context_tokens,
+                    'qwen_yarn_context_multiplier': configured_multiplier,
+                    'qwen_yarn_rope_freq_scale': rope_freq_scale,
+                    'qwen_yarn_ext_factor_overridden': False,
+                    'qwen_yarn_configuration_valid': False,
+                    'missing_reason': 'runtime_qwen_64k_yarn_configuration_invalid',
+                }
+                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid')
+
             llama_module = llama_cpp_module or inspect.getmodule(llama_cls)
             yarn_probe = _runtime_supports_qwen_yarn_rope(llama_module, llama_cls)
             self.last_yarn_rope_diagnostics = {
@@ -3826,26 +3869,6 @@ class ModelManager:
                 raise RuntimeError(
                     f'{QWEN_64K_YARN_UNSUPPORTED_MESSAGE}; {safe_diagnostics}'
                 )
-            try:
-                original_context_tokens = int(rope_policy['original_context_tokens'])
-                requested_context_tokens = int(n_ctx)
-                configured_multiplier = float(rope_policy['factor'])
-                computed_multiplier = requested_context_tokens / original_context_tokens
-                rope_freq_scale = 1.0 / configured_multiplier
-            except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
-                self.last_yarn_rope_diagnostics['qwen_yarn_configuration_valid'] = False
-                self.last_yarn_rope_diagnostics['missing_reason'] = 'runtime_qwen_64k_yarn_configuration_invalid'
-                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid') from exc
-            configuration_valid = (
-                original_context_tokens == 32768
-                and requested_context_tokens == 65536
-                and original_context_tokens > 0
-                and requested_context_tokens > original_context_tokens
-                and math.isfinite(configured_multiplier)
-                and configured_multiplier > 1.0
-                and math.isclose(configured_multiplier, computed_multiplier, rel_tol=1e-12, abs_tol=1e-12)
-                and math.isclose(rope_freq_scale, 0.5, rel_tol=1e-12, abs_tol=1e-12)
-            )
             self.last_yarn_rope_diagnostics.update({
                 'qwen_yarn_requested_context_tokens': requested_context_tokens,
                 'qwen_yarn_original_context_tokens': original_context_tokens,

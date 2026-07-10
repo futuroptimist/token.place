@@ -209,6 +209,12 @@ pub fn sanitize_operator_path_display(path: &Path) -> String {
 
 fn sanitize_operator_diagnostic_token(token: &str) -> String {
     if token.starts_with('{') || token.starts_with('[') {
+        if token.len() <= 4096 {
+            return token.to_string();
+        }
+        if serde_json::from_str::<serde_json::Value>(token).is_ok() {
+            return r#"{"type":"operator_diagnostic_json_omitted","truncated":true}"#.to_string();
+        }
         return token.chars().take(4096).collect();
     }
     if token.starts_with("http://") || token.starts_with("https://") {

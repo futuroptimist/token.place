@@ -301,6 +301,23 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_rejected_kwarg",
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category",
     "api_v1_readiness_completion_smoke_plain_completion_eval_return_code",
+    "api_v1_readiness_completion_smoke_plain_completion_first_failure_method",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_state_sticky",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_recreation_required",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
+    "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
+    "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
+    "api_v1_readiness_qwen_64k_runtime_profile_flash_attn",
+    "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_k",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_v",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_batch",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch",
+    "api_v1_readiness_qwen_64k_runtime_profile_result",
+    "api_v1_readiness_qwen_64k_runtime_profile_failure_category",
     "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
 ];
 
@@ -743,6 +760,54 @@ async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
 fn append_operator_log_line(log_sink: &Option<OperatorLogSink>, source: &str, line: &str) {
     if let Some(log_sink) = log_sink {
         log_sink.append_line(source, line);
+    }
+}
+
+fn append_readiness_diagnostic_log_chunks(log_sink: &Option<OperatorLogSink>, payload: &Value) {
+    let diagnostics = safe_readiness_diagnostics_from_payload(payload);
+    if diagnostics.is_empty() {
+        return;
+    }
+    let operator_session_id = payload
+        .get("operator_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let sequence = payload.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+    let mut chunks: Vec<Map<String, Value>> = Vec::new();
+    let mut current = Map::new();
+    for (key, value) in diagnostics.into_iter() {
+        let mut candidate = current.clone();
+        candidate.insert(key.clone(), value.clone());
+        let line = serde_json::json!({
+            "type": "readiness_diagnostics",
+            "operator_session_id": operator_session_id,
+            "sequence": sequence,
+            "chunk_index": 0,
+            "chunk_count": 1,
+            "diagnostics": candidate,
+        });
+        if serde_json::to_string(&line).map(|text| text.len()).unwrap_or(usize::MAX) > 3500 && !current.is_empty() {
+            chunks.push(current);
+            current = Map::new();
+        }
+        current.insert(key, value);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    let chunk_count = chunks.len().max(1);
+    for (index, diagnostics) in chunks.into_iter().enumerate() {
+        let line = serde_json::json!({
+            "type": "readiness_diagnostics",
+            "operator_session_id": operator_session_id,
+            "sequence": sequence,
+            "chunk_index": index,
+            "chunk_count": chunk_count,
+            "diagnostics": diagnostics,
+        });
+        if let Ok(text) = serde_json::to_string(&line) {
+            append_operator_log_line(log_sink, "desktop.compute_node.readiness", &text);
+        }
     }
 }
 
@@ -1207,6 +1272,9 @@ pub async fn start_compute_node(
             "desktop.compute_node.stdout",
             &redact_bridge_stdout_line(&line),
         );
+        if let Ok(payload_for_logs) = serde_json::from_str::<Value>(&line) {
+            append_readiness_diagnostic_log_chunks(&log_sink, &payload_for_logs);
+        }
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 let payload = with_log_file_path(payload, log_file_path.as_deref());

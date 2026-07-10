@@ -675,7 +675,17 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     model_manager.context_window_tokens = 65536
     model_manager.api_model_id = "qwen3-8b-instruct"
     model_manager.last_compute_diagnostics = {}
-    model_manager.last_yarn_rope_diagnostics = {"supported": True, "missing_reason": None}
+    model_manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "missing_reason": None,
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+        "qwen_yarn_context_multiplier": 2.0,
+        "qwen_yarn_rope_freq_scale": 0.5,
+        "qwen_yarn_ext_factor_overridden": False,
+        "qwen_yarn_rope_scaling_type_source": "enum",
+        "qwen_yarn_configuration_valid": True,
+    }
     model_manager.get_llm_instance.return_value = ReadyRuntime()
     relay_client = SimpleNamespace(
         _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 2)
@@ -692,6 +702,12 @@ def test_compute_node_runtime_qwen_64k_readiness_reports_yarn_rope():
     assert diagnostics["api_v1_readiness_yarn_rope_enabled"] is True
     assert diagnostics["api_v1_readiness_yarn_rope_factor"] == 2.0
     assert diagnostics["api_v1_readiness_yarn_original_context_tokens"] == 32768
+    assert diagnostics["api_v1_readiness_yarn_requested_context_tokens"] == 65536
+    assert diagnostics["api_v1_readiness_yarn_context_multiplier"] == 2.0
+    assert diagnostics["api_v1_readiness_yarn_rope_freq_scale"] == 0.5
+    assert diagnostics["api_v1_readiness_yarn_ext_factor_overridden"] is False
+    assert diagnostics["api_v1_readiness_yarn_rope_scaling_type_source"] == "enum"
+    assert diagnostics["api_v1_readiness_yarn_configuration_valid"] is True
     assert diagnostics["api_v1_readiness_tokenizer_render_bridge_available"] is True
 
 
@@ -2290,6 +2306,13 @@ def _qwen_64k_model_manager(runtime):
         "supported": True,
         "yarn_resolver_source": "numeric_fallback",
         "llama_cpp_python_version": "0.3.32",
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+        "qwen_yarn_context_multiplier": 2.0,
+        "qwen_yarn_rope_freq_scale": 0.5,
+        "qwen_yarn_ext_factor_overridden": False,
+        "qwen_yarn_rope_scaling_type_source": "numeric_fallback",
+        "qwen_yarn_configuration_valid": True,
     }
     model_manager.last_compute_diagnostics = {
         "active_profile_id": "qwen3-8b-q4-k-m",
@@ -2524,6 +2547,12 @@ def test_qwen_64k_completion_smoke_passes_with_yarn_and_kv_diagnostics():
     assert diagnostics["api_v1_readiness_yarn_rope_enabled"] is True
     assert diagnostics["api_v1_readiness_yarn_rope_factor"] == 2.0
     assert diagnostics["api_v1_readiness_yarn_original_context_tokens"] == 32768
+    assert diagnostics["api_v1_readiness_yarn_requested_context_tokens"] == 65536
+    assert diagnostics["api_v1_readiness_yarn_context_multiplier"] == 2.0
+    assert diagnostics["api_v1_readiness_yarn_rope_freq_scale"] == 0.5
+    assert diagnostics["api_v1_readiness_yarn_ext_factor_overridden"] is False
+    assert diagnostics["api_v1_readiness_yarn_rope_scaling_type_source"] == "numeric_fallback"
+    assert diagnostics["api_v1_readiness_yarn_configuration_valid"] is True
     assert diagnostics["api_v1_readiness_kv_cache_mode"] == {"type_k": 8, "type_v": 8, "flash_attn": True}
 
 
@@ -2555,6 +2584,9 @@ def test_completion_smoke_diagnostic_sanitizer_allows_qwen_plain_completion_vari
         "generation_exception_category": "prompt_eval_decode_failure",
         "plain_completion_prompt_tokenization_variant_count": 2,
         "plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special",
+        "plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+        "plain_completion_prompt_tokenization_selected_token_count": 42,
+        "plain_completion_prompt_tokenization_selected_special": False,
         "plain_completion_attempt_methods": "create_completion_keyword_prompt,create_completion_keyword_token_ids",
         "plain_completion_attempt_categories": "prompt_eval_failure,prompt_eval_decode_failure",
         "plain_completion_attempt_safe_summaries": "RuntimeError:prompt_eval_failure,RuntimeError:prompt_eval_decode_failure",
@@ -2566,6 +2598,14 @@ def test_completion_smoke_diagnostic_sanitizer_allows_qwen_plain_completion_vari
 
     assert safe["generation_exception_category"] == "prompt_eval_decode_failure"
     assert safe["plain_completion_prompt_tokenization_variant_count"] == 2
+    assert safe["plain_completion_prompt_tokenization_variant_ids"] == (
+        "tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special"
+    )
+    assert safe["plain_completion_prompt_tokenization_selected_variant"] == (
+        "tokenize_add_bos_false_special_false"
+    )
+    assert safe["plain_completion_prompt_tokenization_selected_token_count"] == 42
+    assert safe["plain_completion_prompt_tokenization_selected_special"] is False
     assert safe["plain_completion_attempt_count"] == 3
     assert "prompt" not in safe
     assert "SECRET_PROMPT" not in json.dumps(safe)

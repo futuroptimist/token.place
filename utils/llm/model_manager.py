@@ -1851,7 +1851,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode[ \\t\\r\\n]+returned[ \\t\\r\\n]+(-?[0-9]+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -2964,6 +2964,40 @@ for line in sys.stdin:
                         break
             if result is not None:
                 normalized, invalid_reason = _normalize_plain_completion_result(result)
+            primary_attempt = attempts[-1] if attempts else None
+            primary_completion_error = completion_error
+            primary_invalid_reason = last_invalid_reason
+            primary_generation_exception_category = (
+                'thinking_leaked'
+                if primary_invalid_reason == 'thinking_leaked'
+                else primary_invalid_reason
+                or (
+                    primary_attempt.get('generation_exception_category')
+                    if primary_attempt is not None
+                    else None
+                )
+                or 'worker_exception'
+            )
+            primary_method = (
+                primary_attempt.get('method')
+                if primary_attempt is not None
+                else 'create_completion_from_rendered_prompt'
+            )
+            primary_rejected_generation_kwarg = (
+                primary_attempt.get('rejected_generation_kwarg', '')
+                if primary_attempt is not None
+                else ''
+            )
+            primary_eval_return_code = plain_capabilities.get(
+                'plain_completion_eval_return_code'
+            )
+            primary_failure_exists = (
+                primary_attempt is not None
+                or primary_invalid_reason is not None
+                or primary_completion_error is not None
+            )
+            chat_fallback_category = ''
+            chat_fallback_invoked = False
             if result is None and last_invalid_reason != 'thinking_leaked' and (not attempts or attempts[-1].get('generation_exception_category') not in fatal_plain_completion_categories):
                 chat_fallback_category = 'unsupported_generation_kwarg'
                 create_chat_completion = getattr(llama, 'create_chat_completion', None)
@@ -2980,6 +3014,7 @@ for line in sys.stdin:
                         chat_supported = False
                     plain_capabilities['qwen_high_level_chat_fallback_supported'] = bool(chat_supported)
                     if chat_supported:
+                        chat_fallback_invoked = True
                         result, completion_error = _attempt_plain_completion(
                             'create_chat_completion_qwen_non_thinking',
                             ['chat_template_kwargs', 'max_tokens', 'messages'],
@@ -3000,29 +3035,57 @@ for line in sys.stdin:
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
                         chat_fallback_category = 'unsupported_generation_kwarg'
-                        completion_error = RuntimeError('unsupported option: chat_template_kwargs')
+                if (
+                    chat_fallback_category == 'unsupported_generation_kwarg'
+                    and not chat_fallback_invoked
+                    and not primary_failure_exists
+                    and completion_error is None
+                ):
+                    completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)
                 extra.update(plain_capabilities)
                 extra.update(_plain_attempt_diagnostics())
+                preserve_primary_failure = (
+                    plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
+                    and chat_fallback_category == 'unsupported_generation_kwarg'
+                    and not chat_fallback_invoked
+                    and primary_failure_exists
+                )
                 unsupported_chat_fallback_is_terminal = (
                     plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
                     and chat_fallback_category == 'unsupported_generation_kwarg'
-                    and last_invalid_reason != 'thinking_leaked'
+                    and not chat_fallback_invoked
+                    and not primary_failure_exists
                 )
-                if unsupported_chat_fallback_is_terminal:
+                if preserve_primary_failure and primary_completion_error is not None:
+                    completion_error = primary_completion_error
+                if preserve_primary_failure and primary_eval_return_code is not None:
+                    plain_capabilities['plain_completion_eval_return_code'] = primary_eval_return_code
+                if unsupported_chat_fallback_is_terminal and completion_error is None:
                     completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 extra.update({
-                    'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
+                    'method': (
+                        primary_method
+                        if preserve_primary_failure
+                        else (attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt')
+                    ),
                     'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),
                     'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
                     'generation_exception_category': (
+                        primary_generation_exception_category
+                        if preserve_primary_failure
+                        else
                         chat_fallback_category
                         if unsupported_chat_fallback_is_terminal
                         else last_invalid_reason or (attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception')
                     ),
-                    'rejected_generation_kwarg': attempts[-1].get('rejected_generation_kwarg', '') if attempts else '',
+                    'rejected_generation_kwarg': (
+                        primary_rejected_generation_kwarg
+                        if preserve_primary_failure
+                        else (attempts[-1].get('rejected_generation_kwarg', '') if attempts else '')
+                    ),
                 })
                 _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))
                 continue

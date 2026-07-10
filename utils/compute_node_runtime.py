@@ -824,13 +824,27 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
                 "original_context_tokens"
             ),
-            "qwen_yarn_requested_context_tokens": yarn_diagnostics.get("qwen_yarn_requested_context_tokens"),
-            "qwen_yarn_original_context_tokens": yarn_diagnostics.get("qwen_yarn_original_context_tokens"),
-            "qwen_yarn_context_multiplier": yarn_diagnostics.get("qwen_yarn_context_multiplier"),
-            "qwen_yarn_rope_freq_scale": yarn_diagnostics.get("qwen_yarn_rope_freq_scale"),
-            "qwen_yarn_ext_factor_overridden": yarn_diagnostics.get("qwen_yarn_ext_factor_overridden"),
-            "qwen_yarn_rope_scaling_type_source": yarn_diagnostics.get("qwen_yarn_rope_scaling_type_source"),
-            "qwen_yarn_configuration_valid": yarn_diagnostics.get("qwen_yarn_configuration_valid"),
+            "api_v1_readiness_yarn_requested_context_tokens": yarn_diagnostics.get(
+                "qwen_yarn_requested_context_tokens"
+            ),
+            "api_v1_readiness_yarn_original_context_tokens": yarn_diagnostics.get(
+                "qwen_yarn_original_context_tokens"
+            ),
+            "api_v1_readiness_yarn_context_multiplier": yarn_diagnostics.get(
+                "qwen_yarn_context_multiplier"
+            ),
+            "api_v1_readiness_yarn_rope_freq_scale": yarn_diagnostics.get(
+                "qwen_yarn_rope_freq_scale"
+            ),
+            "api_v1_readiness_yarn_ext_factor_overridden": yarn_diagnostics.get(
+                "qwen_yarn_ext_factor_overridden"
+            ),
+            "api_v1_readiness_yarn_rope_scaling_type_source": yarn_diagnostics.get(
+                "qwen_yarn_rope_scaling_type_source"
+            ),
+            "api_v1_readiness_yarn_configuration_valid": yarn_diagnostics.get(
+                "qwen_yarn_configuration_valid"
+            ),
             "api_v1_readiness_yarn_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
             "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
             "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),

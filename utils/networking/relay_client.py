@@ -152,6 +152,12 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "qwen_high_level_chat_fallback_rejected_kwarg",
     "qwen_high_level_chat_fallback_category",
     "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
@@ -218,6 +224,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -251,6 +264,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -291,9 +311,13 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
     enum_values = _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES.get(key)
     if enum_values is not None:
         return bounded if bounded in enum_values else None
+    if key in {"plain_completion_backend_state_sticky", "plain_completion_backend_recreation_required"}:
+        return value if isinstance(value, bool) else None
+    if key == "plain_completion_metal_command_buffer_status":
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_backend_failure_category", "plain_completion_metal_error_category"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     csv_identifier_keys = {
         "attempted_generation_kwargs",
@@ -4123,6 +4147,12 @@ class RelayClient:
                     "qwen_high_level_chat_fallback_rejected_kwarg",
                     "qwen_high_level_chat_fallback_category",
                     "plain_completion_eval_return_code",
+                    "plain_completion_first_failure_method",
+                    "plain_completion_backend_failure_category",
+                    "plain_completion_backend_state_sticky",
+                    "plain_completion_backend_recreation_required",
+                    "plain_completion_metal_error_category",
+                    "plain_completion_metal_command_buffer_status",
 
                     "plain_completion_prompt_token_count",
                     "plain_completion_prompt_tokenization_method",

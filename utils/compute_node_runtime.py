@@ -65,6 +65,13 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "prompt_tokenization_failure": "runtime_completion_smoke_plain_completion_prompt_tokenization_failure",
     "prompt_eval_failure": "runtime_completion_smoke_plain_completion_eval_failure",
     "prompt_eval_decode_failure": "runtime_completion_smoke_plain_completion_decode_failure",
+    "prompt_eval_invalid_batch": "runtime_completion_smoke_plain_completion_invalid_batch",
+    "backend_allocation_failure": "runtime_completion_smoke_backend_allocation_failure",
+    "backend_graph_compute_failure": "runtime_completion_smoke_backend_graph_compute_failure",
+    "metal_graph_compute_failure": "runtime_completion_smoke_metal_graph_compute_failure",
+    "kv_slot_unavailable": "runtime_completion_smoke_kv_slot_unavailable",
+    "decode_aborted": "runtime_completion_smoke_decode_aborted",
+    "backend_decode_failure": "runtime_completion_smoke_backend_decode_failure",
     "prompt_eval_backend_failure": "runtime_completion_smoke_plain_completion_backend_failure",
     "prompt_eval_invalid_token_failure": "runtime_completion_smoke_plain_completion_eval_failure",
     "prompt_eval_state_failure": "runtime_completion_smoke_plain_completion_eval_failure",
@@ -116,6 +123,12 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "qwen_high_level_chat_fallback_rejected_kwarg",
     "qwen_high_level_chat_fallback_category",
     "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
@@ -178,6 +191,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -211,6 +231,13 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -253,9 +280,13 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
     enum_values = _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES.get(key)
     if enum_values is not None:
         return bounded if bounded in enum_values else None
+    if key in {"plain_completion_backend_state_sticky", "plain_completion_backend_recreation_required"}:
+        return value if isinstance(value, bool) else None
+    if key == "plain_completion_metal_command_buffer_status":
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_backend_failure_category", "plain_completion_metal_error_category"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     csv_identifier_keys = {
         "attempted_generation_kwargs",
@@ -849,6 +880,21 @@ class ComputeNodeRuntime:
             "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
             "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
         })
+        for _key in (
+            "qwen_64k_runtime_profile_id",
+            "qwen_64k_runtime_profile_attempt_ids",
+            "qwen_64k_runtime_profile_recovery_count",
+            "qwen_64k_runtime_profile_flash_attn",
+            "qwen_64k_runtime_profile_offload_kqv",
+            "qwen_64k_runtime_profile_type_k",
+            "qwen_64k_runtime_profile_type_v",
+            "qwen_64k_runtime_profile_n_batch",
+            "qwen_64k_runtime_profile_n_ubatch",
+            "qwen_64k_runtime_profile_result",
+            "qwen_64k_runtime_profile_failure_category",
+        ):
+            if _key in diagnostics:
+                diagnostics[f"api_v1_readiness_{_key}"] = diagnostics.get(_key)
 
         yarn_required_for_active_tier = (
             model_profile.get("provider") == "qwen"
@@ -1024,6 +1070,12 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",
@@ -1126,6 +1178,12 @@ class ComputeNodeRuntime:
                     "qwen_high_level_chat_fallback_rejected_kwarg",
                     "qwen_high_level_chat_fallback_category",
                     "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                     "plain_completion_prompt_token_count",
                     "plain_completion_prompt_tokenization_method",
@@ -1186,6 +1244,12 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",
@@ -1243,6 +1307,26 @@ class ComputeNodeRuntime:
                     f"{admission_code} reason={admission_reason}"
                 )
             )
+            recover_category = (
+                diagnostics.get("api_v1_readiness_completion_smoke_generation_exception_category")
+                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category")
+                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category")
+            )
+            recover = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
+            if callable(recover) and recover_category in {
+                "backend_allocation_failure", "backend_graph_compute_failure", "metal_graph_compute_failure",
+                "kv_slot_unavailable", "metal_command_buffer_out_of_memory", "metal_command_buffer_timeout",
+                "metal_command_buffer_page_fault", "metal_command_buffer_execution_failure", "metal_backend_sticky_error",
+                "metal_graph_compute_failed", "memory_context_apply_failed", "graph_initialization_failed",
+                "unknown_metal_backend_failure",
+            }:
+                next_runtime = recover(
+                    llm_runtime,
+                    str(recover_category),
+                    diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
+                )
+                if next_runtime is not None:
+                    return self.ensure_api_v1_runtime_ready()
             setattr(self.model_manager, 'last_runtime_init_error', message)
             _log_error(message)
             return False

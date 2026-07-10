@@ -3000,6 +3000,7 @@ for line in sys.stdin:
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
                         chat_fallback_category = 'unsupported_generation_kwarg'
+                        completion_error = RuntimeError('unsupported_generation_kwarg')
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)

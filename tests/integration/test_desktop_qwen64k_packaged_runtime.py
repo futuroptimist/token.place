@@ -150,7 +150,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
             'backend': 'metal',
             'gpu_offload_supported': True,
             'constructor_kwarg_support': {
-                'rope_scaling_type': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
                 'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
                 'n_batch': True, 'n_ubatch': True,
             },
@@ -190,7 +190,7 @@ def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, m
         desktop_runtime_probe={
             'backend': 'metal', 'gpu_offload_supported': True,
             'constructor_kwarg_support': {
-                'rope_scaling_type': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
                 'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
                 'n_batch': True, 'n_ubatch': True,
             },

@@ -41,6 +41,7 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
         yarn_resolver_source=resolver,
         rope_scaling_type_supported=yarn,
         yarn_ext_factor_supported=yarn,
+        rope_freq_scale_supported=yarn,
         yarn_orig_ctx_supported=yarn,
     )
 
@@ -1336,7 +1337,7 @@ def test_probe_subprocess_keeps_stdlib_ahead_of_polluted_dependency_target(monke
                 'def llama_supports_gpu_offload():',
                 '    return True',
                 'class Llama:',
-                '    def __init__(self, rope_scaling_type=None, yarn_ext_factor=None, yarn_orig_ctx=None):',
+                '    def __init__(self, rope_scaling_type=None, rope_freq_scale=None, yarn_orig_ctx=None):',
                 '        pass',
             ]
         ),
@@ -1968,7 +1969,7 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
     assert 'version=0.3.16' in result['fallback_reason']
     assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
     assert 'rope_scaling_type_supported=False' in result['fallback_reason']
-    assert 'yarn_ext_factor_supported=False' in result['fallback_reason']
+    assert 'rope_freq_scale_supported=False' in result['fallback_reason']
     assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
     assert recorded_failures
 

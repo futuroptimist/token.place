@@ -7061,7 +7061,9 @@ def test_llama_worker_render_complete_empty_and_thinking_fail_safely(tmp_path, m
     finally:
         proxy.close()
 
-    assert empty_exc.value.diagnostics['generation_exception_category'] == 'empty_completion_output'
+    assert empty_exc.value.diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert empty_exc.value.diagnostics['qwen_high_level_chat_fallback_category'] == 'unsupported_generation_kwarg'
+    assert empty_exc.value.diagnostics['sanitized_error_summary'] == 'RuntimeError:unsupported_kwarg'
     assert think_exc.value.diagnostics['generation_exception_category'] == 'thinking_leaked'
     assert 'secret reasoning' not in json.dumps(think_exc.value.diagnostics)
 

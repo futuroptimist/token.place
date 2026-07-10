@@ -3009,7 +3009,7 @@ for line in sys.stdin:
                 unsupported_chat_fallback_is_terminal = (
                     plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
                     and chat_fallback_category == 'unsupported_generation_kwarg'
-                    and last_invalid_reason not in {'empty_completion_output', 'thinking_leaked'}
+                    and last_invalid_reason != 'thinking_leaked'
                 )
                 if unsupported_chat_fallback_is_terminal:
                     completion_error = RuntimeError('unsupported option: chat_template_kwargs')

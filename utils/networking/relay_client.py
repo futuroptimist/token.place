@@ -174,6 +174,12 @@ _SAFE_WORKER_DIAGNOSTIC_KEYS = {
     "type_v",
     "stderr_tail",
     "child_stderr_tail",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
     "sanitized_error_summary",
 }
 
@@ -218,6 +224,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -251,6 +264,13 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "prompt_tokenization_failure",
         "prompt_eval_failure",
         "prompt_eval_decode_failure",
+        "prompt_eval_invalid_batch",
+        "backend_allocation_failure",
+        "backend_graph_compute_failure",
+        "metal_graph_compute_failure",
+        "kv_slot_unavailable",
+        "decode_aborted",
+        "backend_decode_failure",
         "prompt_eval_backend_failure",
         "prompt_eval_invalid_token_failure",
         "prompt_eval_state_failure",
@@ -258,13 +278,15 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
         "sampling_failure",
     },
     "plain_completion_prompt_tokenization_method": {"", "llama.tokenize"},
+    "plain_completion_backend_failure_category": {"", "metal_graph_compute_failure"},
+    "plain_completion_metal_error_category": {"", "metal_command_buffer_out_of_memory", "metal_command_buffer_timeout", "metal_command_buffer_page_fault", "metal_command_buffer_execution_failure", "metal_backend_sticky_error", "metal_graph_compute_failed", "memory_context_apply_failed", "graph_initialization_failed", "unknown_metal_backend_failure"},
 }
 _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
     r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|"
-    r"prompt_eval_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|"
+    r"prompt_eval_decode_failure|prompt_eval_invalid_batch|backend_allocation_failure|backend_graph_compute_failure|metal_graph_compute_failure|kv_slot_unavailable|decode_aborted|backend_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|"
     r"prompt_eval_state_failure|prompt_eval_context_failure|sampling_failure)$"
 )
 _SAFE_WORKER_DIAGNOSTIC_TAIL_WORDS = {
@@ -293,7 +315,7 @@ def _safe_worker_diagnostic_value(key: str, value: Any) -> Any:
         return bounded if bounded in enum_values else None
     if key == "exception_type":
         return bounded if _SAFE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_first_failure_method"}:
         return bounded if _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     csv_identifier_keys = {
         "attempted_generation_kwargs",

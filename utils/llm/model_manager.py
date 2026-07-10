@@ -46,9 +46,9 @@ QWEN_64K_KV_CACHE_TYPE_NAMES = {
 }
 QWEN_64K_BATCH_TOKENS = 256
 QWEN_64K_UBATCH_TOKENS = 128
-QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_default'
-QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8'
-QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4'
+QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
+QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
+QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
 # Only retry context-create failures backed by safe Metal/KV/cache/buffer
 # evidence. A bare ``Failed to create llama_context`` remains classified as
 # ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
@@ -59,6 +59,28 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
+}
+QWEN_64K_READINESS_PROFILE_RECOVERABLE_CATEGORIES = {
+    'backend_allocation_failure',
+    'backend_graph_compute_failure',
+    'metal_graph_compute_failure',
+    'kv_slot_unavailable',
+    'metal_command_buffer_out_of_memory',
+    'metal_command_buffer_timeout',
+    'metal_command_buffer_page_fault',
+    'metal_command_buffer_execution_failure',
+    'metal_backend_sticky_error',
+    'metal_graph_compute_failed',
+    'memory_context_apply_failed',
+    'graph_initialization_failed',
+}
+FATAL_CURRENT_WORKER_GENERATION_CATEGORIES = {
+    'backend_allocation_failure',
+    'backend_graph_compute_failure',
+    'metal_graph_compute_failure',
+    'kv_slot_unavailable',
+    'decode_aborted',
+    'backend_decode_failure',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -309,63 +331,54 @@ def _build_qwen_64k_runtime_profiles(
 ) -> list[Dict[str, Any]]:
     capabilities = _qwen_64k_runtime_capabilities(llama_cpp_module, llama_cls)
     support = capabilities['constructor_kwarg_support']
-    profiles: list[Dict[str, Any]] = [{
-        'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
-        'kwargs': {},
-        'diagnostics': {
-            'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
-            'enabled': True,
-            'applied': {},
-            'omitted': {},
-            'constructor_kwarg_support': support,
-            'capability_source': capabilities['capability_source'],
-            'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
-            'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, 'f16', capabilities.get('backend') or ''),
-            'kqv_offload_allowed': bool(enable_kqv_offload),
-        },
-    }]
-    for precision, profile_id in (('q8', QWEN_64K_RUNTIME_PROFILE_Q8), ('q4', QWEN_64K_RUNTIME_PROFILE_Q4)):
-        omitted: Dict[str, str] = {}
+
+    def _common_kwargs() -> tuple[Dict[str, Any], Dict[str, str]]:
         kwargs: Dict[str, Any] = {}
-        kv_info = capabilities['kv_constants'].get(precision) or {}
-        kv_value = kv_info.get('value')
-        if kv_value is None:
-            omitted['type_k'] = omitted['type_v'] = 'kv_type_constant_unavailable'
-        if kv_value is not None and support.get('type_k'):
-            kwargs['type_k'] = kv_value
-        elif kv_value is not None:
-            omitted['type_k'] = 'constructor_kwarg_unsupported'
-        if kv_value is not None and support.get('type_v'):
-            kwargs['type_v'] = kv_value
-        elif kv_value is not None:
-            omitted['type_v'] = 'constructor_kwarg_unsupported'
-        if 'type_v' in kwargs and precision != 'f16' and not enable_kqv_offload:
-            omitted['flash_attn'] = 'gpu_offload_disabled'
-        if 'type_v' in kwargs and precision != 'f16' and enable_kqv_offload:
-            if support.get('flash_attn'):
-                kwargs['flash_attn'] = True
+        omitted: Dict[str, str] = {}
+        for key, value in (
+            ('flash_attn', True),
+            ('offload_kqv', True),
+            ('n_batch', QWEN_64K_BATCH_TOKENS),
+            ('n_ubatch', QWEN_64K_UBATCH_TOKENS),
+        ):
+            if key == 'offload_kqv' and not enable_kqv_offload:
+                omitted[key] = 'gpu_offload_disabled'
+            elif support.get(key):
+                kwargs[key] = value
             else:
-                omitted['flash_attn'] = 'required_for_quantized_v_but_unsupported'
-                kwargs.pop('type_v', None)
-                if 'type_k' not in kwargs:
-                    omitted['profile'] = 'no_supported_quantized_kv_kwargs'
-        if 'type_k' not in kwargs and 'type_v' not in kwargs:
-            omitted['profile'] = omitted.get('profile') or 'no_applied_quantized_kv_kwargs'
-        if enable_kqv_offload and support.get('offload_kqv'):
-            kwargs['offload_kqv'] = True
-        elif enable_kqv_offload:
-            omitted['offload_kqv'] = 'constructor_kwarg_unsupported'
-        if support.get('n_batch'):
-            kwargs['n_batch'] = QWEN_64K_BATCH_TOKENS
+                omitted[key] = 'constructor_kwarg_unsupported'
+        return kwargs, omitted
+
+    profiles: list[Dict[str, Any]] = []
+    skipped_profiles: list[Dict[str, Any]] = []
+    for precision, profile_id in (
+        ('f16', QWEN_64K_RUNTIME_PROFILE_DEFAULT),
+        ('q8', QWEN_64K_RUNTIME_PROFILE_Q8),
+        ('q4', QWEN_64K_RUNTIME_PROFILE_Q4),
+    ):
+        kwargs, omitted = _common_kwargs()
+        if precision != 'f16':
+            kv_info = capabilities['kv_constants'].get(precision) or {}
+            kv_value = kv_info.get('value')
+            if kv_value is None:
+                omitted['type_k'] = omitted['type_v'] = 'kv_type_constant_unavailable'
+            elif not support.get('flash_attn'):
+                omitted['profile'] = 'quantized_v_requires_flash_attn_support'
+            else:
+                if support.get('type_k'):
+                    kwargs['type_k'] = kv_value
+                else:
+                    omitted['type_k'] = 'constructor_kwarg_unsupported'
+                if support.get('type_v'):
+                    kwargs['type_v'] = kv_value
+                else:
+                    omitted['type_v'] = 'constructor_kwarg_unsupported'
         else:
-            omitted['n_batch'] = 'constructor_kwarg_unsupported'
-        if support.get('n_ubatch'):
-            kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
-        else:
-            omitted['n_ubatch'] = 'constructor_kwarg_unsupported'
+            kv_info = capabilities['kv_constants'].get('f16') or {}
+        enabled = 'profile' not in omitted and (precision == 'f16' or support.get('flash_attn'))
         diagnostics = {
             'profile_id': profile_id,
-            'enabled': bool(kwargs) and 'profile' not in omitted,
+            'enabled': bool(enabled),
             'applied': dict(kwargs),
             'omitted': omitted,
             'kv_precision': precision,
@@ -376,12 +389,13 @@ def _build_qwen_64k_runtime_profiles(
             'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, precision, capabilities.get('backend') or ''),
             'kqv_offload_allowed': bool(enable_kqv_offload),
         }
-        if diagnostics['enabled']:
+        if enabled:
             profiles.append({'profile_id': profile_id, 'kwargs': kwargs, 'diagnostics': diagnostics})
         else:
-            profiles[0]['diagnostics'].setdefault('skipped_profiles', []).append(diagnostics)
+            skipped_profiles.append(diagnostics)
+    if profiles and skipped_profiles:
+        profiles[0]['diagnostics']['skipped_profiles'] = skipped_profiles
     return profiles
-
 
 def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -> str:
     text = f'{error or ""}\n{child_stderr or ""}'.lower()
@@ -1844,7 +1858,7 @@ def _sanitize_error_summary(message):
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
         return type(message).__name__ + ':rope_yarn_eval_failure'
     classified = _classify_generation_exception(message)
-    if classified in {'prompt_tokenization_failure', 'prompt_eval_failure', 'prompt_eval_decode_failure', 'prompt_eval_backend_failure', 'prompt_eval_invalid_token_failure', 'prompt_eval_state_failure', 'prompt_eval_context_failure', 'sampling_failure'}:
+    if classified in {'prompt_tokenization_failure', 'prompt_eval_failure', 'prompt_eval_invalid_batch', 'backend_allocation_failure', 'backend_graph_compute_failure', 'kv_slot_unavailable', 'decode_aborted', 'backend_decode_failure', 'prompt_eval_backend_failure', 'prompt_eval_invalid_token_failure', 'prompt_eval_state_failure', 'prompt_eval_context_failure', 'sampling_failure'}:
         return type(message).__name__ + ':' + classified
     if _extract_unsupported_generation_kwarg(str(message or '')) is not None:
         return type(message).__name__ + ':unsupported_kwarg'
@@ -1879,6 +1893,10 @@ def _classify_generation_exception(exc):
         return 'token_overflow'
     if any(term in text for term in ('failed to tokenize', 'tokenization failed', 'llama_tokenize', 'could not tokenize')):
         return 'prompt_tokenization_failure'
+    code = _safe_plain_completion_eval_return_code(exc)
+    decode_category = _classify_llama_decode_return_code(code)
+    if decode_category is not None:
+        return decode_category
     if any(term in text for term in ('llama_decode', 'decode failed', 'decode returned')):
         return 'prompt_eval_decode_failure'
     if 'invalid token' in text or 'invalid token id' in text or 'token id is invalid' in text:
@@ -1897,6 +1915,64 @@ def _classify_generation_exception(exc):
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
 
+
+def _classify_llama_decode_return_code(code):
+    if code is None:
+        return None
+    if code == -1:
+        return 'prompt_eval_invalid_batch'
+    if code == -2:
+        return 'backend_allocation_failure'
+    if code == -3:
+        return 'backend_graph_compute_failure'
+    if code == 1:
+        return 'kv_slot_unavailable'
+    if code == 2:
+        return 'decode_aborted'
+    if code < 0:
+        return 'backend_decode_failure'
+    return None
+
+def _safe_metal_backend_failure_diagnostics(lines, *, backend=''):
+    text = '\\n'.join(str(line or '') for line in lines).lower()
+    if not text:
+        return {}
+    is_metal = 'metal' in text or str(backend or '').lower() == 'metal'
+    if not is_metal:
+        return {}
+    category = 'unknown_metal_backend_failure'
+    if any(term in text for term in ('out of memory', 'insufficient memory', 'insufficient resources', 'resource shortage', 'oom')):
+        category = 'metal_command_buffer_out_of_memory'
+    elif 'timeout' in text or 'timed out' in text:
+        category = 'metal_command_buffer_timeout'
+    elif 'page fault' in text:
+        category = 'metal_command_buffer_page_fault'
+    elif 'backend is in error state' in text or 'has_error' in text:
+        category = 'metal_backend_sticky_error'
+    elif 'ggml_metal_graph_compute' in text or ('graph' in text and 'compute' in text and 'fail' in text):
+        category = 'metal_graph_compute_failed'
+    elif 'memory_context' in text and 'fail' in text:
+        category = 'memory_context_apply_failed'
+    elif 'graph' in text and 'init' in text and 'fail' in text:
+        category = 'graph_initialization_failed'
+    elif 'command buffer' in text and ('error' in text or 'fail' in text):
+        category = 'metal_command_buffer_execution_failure'
+    status = None
+    m = re.search(r'(?:command[- ]buffer(?: status)?|status)\s*[:=]\s*(-?\d{1,6})', text)
+    if m:
+        try:
+            status = int(m.group(1))
+        except ValueError:
+            status = None
+    result = {
+        'plain_completion_backend_failure_category': 'metal_graph_compute_failure',
+        'plain_completion_backend_state_sticky': category == 'metal_backend_sticky_error' or 'backend is in error state' in text,
+        'plain_completion_backend_recreation_required': True,
+        'plain_completion_metal_error_category': category,
+    }
+    if status is not None:
+        result['plain_completion_metal_command_buffer_status'] = status
+    return result
 def _plain_completion_method_shape_category(exc):
     text = str(exc or '').lower()
     rejected = _extract_unsupported_generation_kwarg(text)
@@ -2180,6 +2256,12 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             'qwen_high_level_chat_fallback_rejected_kwarg',
             'qwen_high_level_chat_fallback_category',
             'plain_completion_eval_return_code',
+            'plain_completion_first_failure_method',
+            'plain_completion_backend_failure_category',
+            'plain_completion_backend_state_sticky',
+            'plain_completion_backend_recreation_required',
+            'plain_completion_metal_error_category',
+            'plain_completion_metal_command_buffer_status',
             'plain_completion_reset_after_failure_count',
         }
         for key, value in extra.items():
@@ -2846,6 +2928,12 @@ for line in sys.stdin:
                 'context_window_exceeded',
                 'context_length_exceeded',
                 'token_overflow',
+                'backend_allocation_failure',
+                'backend_graph_compute_failure',
+                'metal_graph_compute_failure',
+                'kv_slot_unavailable',
+                'decode_aborted',
+                'backend_decode_failure',
             }
             def _plain_attempt_diagnostics():
                 return {
@@ -2883,6 +2971,14 @@ for line in sys.stdin:
                     return_code = _safe_plain_completion_eval_return_code(exc)
                     if return_code is not None:
                         plain_capabilities['plain_completion_eval_return_code'] = return_code
+                    if category == 'backend_allocation_failure':
+                        plain_capabilities['plain_completion_backend_recreation_required'] = True
+                    if category == 'backend_graph_compute_failure':
+                        plain_capabilities['plain_completion_backend_failure_category'] = 'metal_graph_compute_failure'
+                        plain_capabilities['plain_completion_backend_state_sticky'] = True
+                        plain_capabilities['plain_completion_backend_recreation_required'] = True
+                    if category in fatal_plain_completion_categories:
+                        plain_capabilities['plain_completion_first_failure_method'] = plain_capabilities.get('plain_completion_first_failure_method') or method_name
                     if category not in fatal_plain_completion_categories and _reset_plain_completion_state(llama):
                         plain_capabilities['plain_completion_reset_after_failure_count'] += 1
                     return None, exc
@@ -3117,6 +3213,60 @@ for line in sys.stdin:
     except Exception as exc:
         _emit(_safe_request_error('inference_exception', request=request, exc=exc))
 """
+
+
+def _classify_llama_decode_return_code(code: Optional[int]) -> Optional[str]:
+    if code is None:
+        return None
+    if code == -1:
+        return 'prompt_eval_invalid_batch'
+    if code == -2:
+        return 'backend_allocation_failure'
+    if code == -3:
+        return 'backend_graph_compute_failure'
+    if code == 1:
+        return 'kv_slot_unavailable'
+    if code == 2:
+        return 'decode_aborted'
+    if code < 0:
+        return 'backend_decode_failure'
+    return None
+
+
+def _safe_metal_backend_failure_diagnostics(lines: Iterable[str], *, backend: str = '') -> Dict[str, Any]:
+    text = '\n'.join(str(line or '') for line in lines).lower()
+    if not text or ('metal' not in text and str(backend or '').lower() != 'metal'):
+        return {}
+    category = 'unknown_metal_backend_failure'
+    if any(term in text for term in ('out of memory', 'insufficient memory', 'insufficient resources', 'resource shortage', 'oom')):
+        category = 'metal_command_buffer_out_of_memory'
+    elif 'timeout' in text or 'timed out' in text:
+        category = 'metal_command_buffer_timeout'
+    elif 'page fault' in text:
+        category = 'metal_command_buffer_page_fault'
+    elif 'backend is in error state' in text or 'has_error' in text:
+        category = 'metal_backend_sticky_error'
+    elif 'ggml_metal_graph_compute' in text or ('graph' in text and 'compute' in text and 'fail' in text):
+        category = 'metal_graph_compute_failed'
+    elif 'memory_context' in text and 'fail' in text:
+        category = 'memory_context_apply_failed'
+    elif 'graph' in text and 'init' in text and 'fail' in text:
+        category = 'graph_initialization_failed'
+    elif 'command buffer' in text and ('error' in text or 'fail' in text):
+        category = 'metal_command_buffer_execution_failure'
+    result: Dict[str, Any] = {
+        'plain_completion_backend_failure_category': 'metal_graph_compute_failure',
+        'plain_completion_backend_state_sticky': category == 'metal_backend_sticky_error' or 'backend is in error state' in text,
+        'plain_completion_backend_recreation_required': True,
+        'plain_completion_metal_error_category': category,
+    }
+    m = re.search(r'(?:command[- ]buffer(?: status)?|status)\s*[:=]\s*(-?\d{1,6})', text)
+    if m:
+        try:
+            result['plain_completion_metal_command_buffer_status'] = int(m.group(1))
+        except ValueError:
+            pass
+    return result
 
 
 def _llama_cpp_package_parent_from_module_path(module_path: Any) -> Optional[str]:
@@ -3552,6 +3702,11 @@ class ModelManager:
         self.last_worker_restart_at_ms: Optional[int] = None
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
+        self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
+        self._qwen_64k_selected_profile_index = 0
+        self._qwen_64k_selected_profile_id = QWEN_64K_RUNTIME_PROFILE_DEFAULT
+        self._qwen_64k_profile_attempt_ids: list[str] = []
+        self._qwen_64k_profile_recovery_count = 0
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -4312,13 +4467,15 @@ class ModelManager:
                             if is_qwen_64k:
                                 _runtime_supports_qwen_yarn_rope(llama_cpp, Llama)
                                 Llama = llama_cpp.Llama
-                                runtime_profiles = _build_qwen_64k_runtime_profiles(
-                                    llama_cpp,
-                                    Llama,
-                                    model_path=self.model_path,
-                                    n_ctx=int(self.config.get('model.context_size', 65536)),
-                                    enable_kqv_offload=n_gpu_layers != 0,
-                                )
+                                if not self._qwen_64k_runtime_profiles:
+                                    self._qwen_64k_runtime_profiles = _build_qwen_64k_runtime_profiles(
+                                        llama_cpp,
+                                        Llama,
+                                        model_path=self.model_path,
+                                        n_ctx=int(self.config.get('model.context_size', 65536)),
+                                        enable_kqv_offload=n_gpu_layers != 0,
+                                    )
+                                runtime_profiles = self._qwen_64k_runtime_profiles[self._qwen_64k_selected_profile_index:]
                             profile_failures = []
                             llm_instance = None
                             runtime_kwargs = {}
@@ -4328,6 +4485,14 @@ class ModelManager:
                                 profile_id = profile_diag.get('profile_id') if isinstance(profile_diag, dict) else 'default'
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
+                                    if is_qwen_64k:
+                                        self._qwen_64k_selected_profile_id = str(profile_id)
+                                        try:
+                                            self._qwen_64k_selected_profile_index = next(i for i, p in enumerate(self._qwen_64k_runtime_profiles) if p.get('profile_id') == profile_id)
+                                        except StopIteration:
+                                            pass
+                                        if str(profile_id) not in self._qwen_64k_profile_attempt_ids:
+                                            self._qwen_64k_profile_attempt_ids.append(str(profile_id))
                                     if isinstance(profile_diag, dict):
                                         profile_diag['selected'] = True
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
@@ -4478,6 +4643,53 @@ class ModelManager:
                             return None
 
         return self.llm
+
+    def reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        self,
+        failed_runtime: Any,
+        failure_category: str,
+        decode_return_code: Optional[int] = None,
+    ):
+        category = str(failure_category or '')
+        if category == 'backend_graph_compute_failure':
+            category = 'backend_graph_compute_failure'
+        if not (
+            self.model_profile.get('provider') == 'qwen'
+            and getattr(self, 'context_tier', '8k-fast') == '64k-full'
+            and category in QWEN_64K_READINESS_PROFILE_RECOVERABLE_CATEGORIES
+        ):
+            return None
+        with self.llm_lock:
+            if failed_runtime is not self.llm:
+                return None
+            self.llm = None
+            next_index = self._qwen_64k_selected_profile_index + 1
+            self._qwen_64k_selected_profile_index = next_index
+            self._qwen_64k_profile_recovery_count += 1
+        self._close_llm_proxy(failed_runtime)
+        if next_index >= len(self._qwen_64k_runtime_profiles):
+            return None
+        return self.get_llm_instance()
+
+    def qwen_64k_runtime_profile_diagnostics(self) -> Dict[str, Any]:
+        profile = None
+        if self._qwen_64k_runtime_profiles and 0 <= self._qwen_64k_selected_profile_index < len(self._qwen_64k_runtime_profiles):
+            profile = self._qwen_64k_runtime_profiles[self._qwen_64k_selected_profile_index]
+        diag = dict((profile or {}).get('diagnostics') or {})
+        applied = dict(diag.get('applied') or {})
+        return {
+            'qwen_64k_runtime_profile_id': self._qwen_64k_selected_profile_id,
+            'qwen_64k_runtime_profile_attempt_ids': ','.join(self._qwen_64k_profile_attempt_ids),
+            'qwen_64k_runtime_profile_recovery_count': self._qwen_64k_profile_recovery_count,
+            'qwen_64k_runtime_profile_flash_attn': applied.get('flash_attn'),
+            'qwen_64k_runtime_profile_offload_kqv': applied.get('offload_kqv'),
+            'qwen_64k_runtime_profile_type_k': applied.get('type_k'),
+            'qwen_64k_runtime_profile_type_v': applied.get('type_v'),
+            'qwen_64k_runtime_profile_n_batch': applied.get('n_batch'),
+            'qwen_64k_runtime_profile_n_ubatch': applied.get('n_ubatch'),
+            'qwen_64k_runtime_profile_result': diag.get('result') or '',
+            'qwen_64k_runtime_profile_failure_category': diag.get('failure_category') or '',
+        }
 
     def _close_llm_proxy(self, llm: Any) -> None:
         close = getattr(llm, 'close', None)

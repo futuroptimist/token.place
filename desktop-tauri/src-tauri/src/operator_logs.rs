@@ -209,7 +209,10 @@ pub fn sanitize_operator_path_display(path: &Path) -> String {
 
 fn sanitize_operator_diagnostic_token(token: &str) -> String {
     if token.starts_with('{') || token.starts_with('[') {
-        return token.chars().take(4096).collect();
+        if serde_json::from_str::<serde_json::Value>(token).is_ok() && token.len() <= 4096 {
+            return token.to_string();
+        }
+        return r#"{"type":"operator_diagnostic_truncated","reason":"json_token_exceeded_limit"}"#.to_string();
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);

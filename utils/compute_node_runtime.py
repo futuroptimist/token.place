@@ -100,6 +100,8 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "plain_completion_prompt_tokenization_token_counts",
     "plain_completion_prompt_tokenization_special_values",
     "plain_completion_prompt_tokenization_selected_variant",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "plain_completion_prompt_tokenization_selected_special",
     "plain_completion_attempt_methods",
     "plain_completion_attempt_categories",
     "plain_completion_attempt_exception_types",
@@ -819,8 +821,28 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get("supported"),
             "api_v1_readiness_yarn_rope_missing_reason": yarn_diagnostics.get("missing_reason"),
             "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
-            "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
-                "original_context_tokens"
+            "api_v1_readiness_yarn_requested_context_tokens": yarn_diagnostics.get(
+                "qwen_yarn_requested_context_tokens"
+            ),
+            "api_v1_readiness_yarn_original_context_tokens": (
+                yarn_diagnostics.get("qwen_yarn_original_context_tokens")
+                if yarn_diagnostics.get("qwen_yarn_original_context_tokens") is not None
+                else rope_policy.get("original_context_tokens")
+            ),
+            "api_v1_readiness_yarn_context_multiplier": yarn_diagnostics.get(
+                "qwen_yarn_context_multiplier"
+            ),
+            "api_v1_readiness_yarn_rope_freq_scale": yarn_diagnostics.get(
+                "qwen_yarn_rope_freq_scale"
+            ),
+            "api_v1_readiness_yarn_ext_factor_overridden": yarn_diagnostics.get(
+                "qwen_yarn_ext_factor_overridden"
+            ),
+            "api_v1_readiness_yarn_rope_scaling_type_source": yarn_diagnostics.get(
+                "qwen_yarn_rope_scaling_type_source"
+            ),
+            "api_v1_readiness_yarn_configuration_valid": yarn_diagnostics.get(
+                "qwen_yarn_configuration_valid"
             ),
             "api_v1_readiness_yarn_resolver_source": yarn_diagnostics.get("yarn_resolver_source"),
             "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
@@ -986,6 +1008,8 @@ class ComputeNodeRuntime:
                         "plain_completion_prompt_tokenization_token_counts",
                         "plain_completion_prompt_tokenization_special_values",
                         "plain_completion_prompt_tokenization_selected_variant",
+                        "plain_completion_prompt_tokenization_selected_token_count",
+                        "plain_completion_prompt_tokenization_selected_special",
                         "plain_completion_attempt_methods",
                         "plain_completion_attempt_categories",
                         "plain_completion_attempt_exception_types",
@@ -1086,6 +1110,8 @@ class ComputeNodeRuntime:
                     "plain_completion_prompt_tokenization_token_counts",
                     "plain_completion_prompt_tokenization_special_values",
                     "plain_completion_prompt_tokenization_selected_variant",
+                    "plain_completion_prompt_tokenization_selected_token_count",
+                    "plain_completion_prompt_tokenization_selected_special",
                     "plain_completion_attempt_methods",
                     "plain_completion_attempt_categories",
                     "plain_completion_attempt_exception_types",
@@ -1144,6 +1170,8 @@ class ComputeNodeRuntime:
                         "plain_completion_prompt_tokenization_token_counts",
                         "plain_completion_prompt_tokenization_special_values",
                         "plain_completion_prompt_tokenization_selected_variant",
+                        "plain_completion_prompt_tokenization_selected_token_count",
+                        "plain_completion_prompt_tokenization_selected_special",
                         "plain_completion_attempt_methods",
                         "plain_completion_attempt_categories",
                         "plain_completion_attempt_exception_types",

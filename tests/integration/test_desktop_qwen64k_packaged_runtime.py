@@ -119,6 +119,7 @@ class Llama:
         + completion_branch
         + """
     def create_chat_completion(self, *, messages, max_tokens, chat_template_kwargs):
+        _ = chat_template_kwargs
         path = os.environ.get('TOKEN_PLACE_CHAT_COMPLETION_KWARGS_JSONL') or os.environ.get('TOKEN_PLACE_COMPLETION_KWARGS_JSONL')
         if path:
             with open(path, 'a', encoding='utf-8') as handle:
@@ -150,7 +151,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
             'backend': 'metal',
             'gpu_offload_supported': True,
             'constructor_kwarg_support': {
-                'rope_scaling_type': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
                 'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
                 'n_batch': True, 'n_ubatch': True,
             },
@@ -190,7 +191,7 @@ def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, m
         desktop_runtime_probe={
             'backend': 'metal', 'gpu_offload_supported': True,
             'constructor_kwarg_support': {
-                'rope_scaling_type': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
                 'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
                 'n_batch': True, 'n_ubatch': True,
             },
@@ -245,8 +246,24 @@ def _model_manager(runtime):
     manager.context_window_tokens = 65536
     manager.api_model_id = "qwen3-8b-instruct"
     manager.create_chat_completion_with_recovery = None
-    manager.last_yarn_rope_diagnostics = {"supported": True, "yarn_resolver_source": "test"}
-    manager.last_compute_diagnostics = {"n_ctx": 65536, "kv_cache_mode": {"type_k": 8, "type_v": 8}}
+    manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "yarn_resolver_source": "test",
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+        "qwen_yarn_context_multiplier": 2.0,
+        "qwen_yarn_rope_freq_scale": 0.5,
+        "qwen_yarn_ext_factor_overridden": False,
+        "qwen_yarn_rope_scaling_type_source": "enum",
+        "qwen_yarn_configuration_valid": True,
+    }
+    manager.last_compute_diagnostics = {
+        "n_ctx": 65536,
+        "kv_cache_mode": {"type_k": 8, "type_v": 8},
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 50,
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": False,
+    }
     manager.get_llm_instance.return_value = runtime
     return manager
 
@@ -588,3 +605,81 @@ def test_qwen64k_packaged_fake_runtime_filters_unsupported_internal_top_k_and_re
     assert diagnostics["api_v1_readiness_completion_smoke_result"] == "passed"
     assert "top_k" not in fake.calls[0]
     assert diagnostics.get("api_v1_generation_kwargs_filtered", []) == []
+
+def test_qwen64k_yarn_rope_freq_scale_fix_reproduces_old_decode_failure_and_passes_readiness(tmp_path):
+    captured = {}
+
+    class ConstructorSensitiveRuntime:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._bad_yarn = (
+                kwargs.get('n_ctx') == 65536
+                and (
+                    kwargs.get('rope_freq_scale') != 0.5
+                    or kwargs.get('yarn_ext_factor') == 2.0
+                )
+            )
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return '<qwen>'
+
+        def tokenize(self, *_args, special=None, **_kwargs):
+            return [3] * 28 if special is True else [1] * 50
+
+        def create_completion(self, *_args, **_kwargs):
+            if self._bad_yarn:
+                raise RuntimeError('llama_decode returned -1')
+            return {'choices': [{'text': 'ok'}]}
+
+        def create_chat_completion(self, *, messages, max_tokens, chat_template_kwargs):
+            _ = chat_template_kwargs
+            if self._bad_yarn:
+                raise RuntimeError('llama_decode returned -1')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            if self._bad_yarn:
+                raise RuntimeError('llama_decode returned -1')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+    old_runtime = ConstructorSensitiveRuntime(n_ctx=65536, rope_scaling_type=2, yarn_ext_factor=2.0, yarn_orig_ctx=32768)
+    with pytest.raises(RuntimeError, match='llama_decode returned -1'):
+        old_runtime.create_completion(prompt='x', max_tokens=1)
+    captured.clear()
+
+    manager = ModelManager(_config(tmp_path))
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.model_path).write_text('fake')
+    fake_llama_cpp = SimpleNamespace(
+        Llama=ConstructorSensitiveRuntime,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        __version__='0.3.32-test',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert captured['n_ctx'] == 65536
+    assert captured['rope_scaling_type'] == 2
+    assert captured['rope_freq_scale'] == 0.5
+    assert captured['yarn_orig_ctx'] == 32768
+    assert 'yarn_ext_factor' not in captured
+
+    runtime, readiness_manager = _runtime_for(manager.llm)
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    diagnostics = readiness_manager.last_compute_diagnostics
+    assert diagnostics['api_v1_runtime_ready'] is True
+    assert diagnostics['api_v1_readiness_completion_smoke_result'] == 'passed'
+    assert diagnostics['api_v1_readiness_result'] == 'passed'
+    assert diagnostics['api_v1_readiness_yarn_requested_context_tokens'] == 65536
+    assert diagnostics['api_v1_readiness_yarn_original_context_tokens'] == 32768
+    assert diagnostics['api_v1_readiness_yarn_context_multiplier'] == 2.0
+    assert diagnostics['api_v1_readiness_yarn_rope_freq_scale'] == 0.5
+    assert diagnostics['api_v1_readiness_yarn_ext_factor_overridden'] is False
+    assert diagnostics['api_v1_readiness_yarn_configuration_valid'] is True
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant'] == 'tokenize_add_bos_false_special_false'
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count'] == 50
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special'] is False
+    for value in diagnostics.values():
+        assert not (isinstance(value, str) and any(marker in value for marker in UNSAFE_READINESS_SENTINELS))

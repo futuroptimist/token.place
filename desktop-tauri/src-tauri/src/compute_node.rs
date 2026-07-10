@@ -248,6 +248,13 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_result",
     "api_v1_readiness_error_code",
     "api_v1_readiness_error_reason",
+    "api_v1_readiness_yarn_requested_context_tokens",
+    "api_v1_readiness_yarn_original_context_tokens",
+    "api_v1_readiness_yarn_context_multiplier",
+    "api_v1_readiness_yarn_rope_freq_scale",
+    "api_v1_readiness_yarn_ext_factor_overridden",
+    "api_v1_readiness_yarn_rope_scaling_type_source",
+    "api_v1_readiness_yarn_configuration_valid",
     "api_v1_readiness_completion_smoke_result",
     "api_v1_readiness_completion_smoke_failure_reason",
     "api_v1_readiness_completion_smoke_error_code",
@@ -278,6 +285,8 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts",
     "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values",
     "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special",
     "api_v1_readiness_completion_smoke_plain_completion_attempt_methods",
     "api_v1_readiness_completion_smoke_plain_completion_attempt_categories",
     "api_v1_readiness_completion_smoke_plain_completion_attempt_exception_types",
@@ -292,7 +301,6 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_rejected_kwarg",
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category",
     "api_v1_readiness_completion_smoke_plain_completion_eval_return_code",
-
     "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
 ];
 
@@ -1596,6 +1604,15 @@ mod tests {
             "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
             "api_v1_readiness_completion_smoke_attempted_plain_completion_methods": "create_completion_keyword_prompt",
             "api_v1_readiness_completion_smoke_rejected_option": "temperature",
+            "api_v1_readiness_yarn_requested_context_tokens": 65536,
+            "api_v1_readiness_yarn_original_context_tokens": 32768,
+            "api_v1_readiness_yarn_context_multiplier": 2.0,
+            "api_v1_readiness_yarn_rope_freq_scale": 0.5,
+            "api_v1_readiness_yarn_ext_factor_overridden": false,
+            "api_v1_readiness_yarn_rope_scaling_type_source": "enum",
+            "api_v1_readiness_yarn_configuration_valid": true,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 28,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": true,
         }));
         let payload: Value = serde_json::from_str(&summary).expect("summary json");
 
@@ -1616,6 +1633,60 @@ mod tests {
                 .get("api_v1_readiness_completion_smoke_rejected_option")
                 .and_then(Value::as_str),
             Some("temperature")
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_requested_context_tokens")
+                .and_then(Value::as_i64),
+            Some(65536)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_original_context_tokens")
+                .and_then(Value::as_i64),
+            Some(32768)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_context_multiplier")
+                .and_then(Value::as_f64),
+            Some(2.0)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_rope_freq_scale")
+                .and_then(Value::as_f64),
+            Some(0.5)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_ext_factor_overridden")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_rope_scaling_type_source")
+                .and_then(Value::as_str),
+            Some("enum")
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_yarn_configuration_valid")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count")
+                .and_then(Value::as_i64),
+            Some(28)
+        );
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 
@@ -1648,6 +1719,21 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+        assert!(payload
+            .get("api_v1_readiness_yarn_requested_context_tokens")
+            .is_none());
+        assert!(payload
+            .get("api_v1_readiness_yarn_rope_scaling_type_source")
+            .is_none());
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count")
+            .is_none());
+        assert_eq!(
+            payload
+                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1655,6 +1741,10 @@ mod tests {
         let diagnostics = safe_readiness_diagnostics_from_payload(&serde_json::json!({
             "api_v1_readiness_completion_smoke_method": "rendered prompt leaked",
             "api_v1_readiness_completion_smoke_exception_type": "LlamaCppInferenceRequestError",
+            "api_v1_readiness_yarn_requested_context_tokens": [65536],
+            "api_v1_readiness_yarn_rope_scaling_type_source": "unsafe source with spaces",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": {"count": 28},
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": true,
         }));
 
         assert!(diagnostics
@@ -1677,6 +1767,15 @@ mod tests {
             "api_v1_readiness_completion_smoke_safe_summary": "plain_completion_worker_exception",
             "api_v1_readiness_completion_smoke_internal_reason": "SECRET_PROMPT",
             "api_v1_readiness_completion_smoke_attempted_generation_kwargs": {"max_tokens": true},
+            "api_v1_readiness_yarn_requested_context_tokens": 65536,
+            "api_v1_readiness_yarn_original_context_tokens": 32768,
+            "api_v1_readiness_yarn_context_multiplier": 2.0,
+            "api_v1_readiness_yarn_rope_freq_scale": 0.5,
+            "api_v1_readiness_yarn_ext_factor_overridden": false,
+            "api_v1_readiness_yarn_rope_scaling_type_source": "enum",
+            "api_v1_readiness_yarn_configuration_valid": true,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 28,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": true,
         });
 
         assert!(update_status_from_event(&mut status, &payload));
@@ -1695,6 +1794,20 @@ mod tests {
             .readiness_diagnostics
             .get("api_v1_readiness_completion_smoke_attempted_generation_kwargs")
             .is_none());
+        assert_eq!(
+            status
+                .readiness_diagnostics
+                .get("api_v1_readiness_yarn_requested_context_tokens")
+                .and_then(Value::as_i64),
+            Some(65536)
+        );
+        assert_eq!(
+            status
+                .readiness_diagnostics
+                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1703,6 +1816,10 @@ mod tests {
         status.readiness_diagnostics.insert(
             "api_v1_readiness_completion_smoke_method".into(),
             Value::String("create_completion_keyword_prompt".into()),
+        );
+        status.readiness_diagnostics.insert(
+            "api_v1_readiness_yarn_requested_context_tokens".into(),
+            Value::Number(65536.into()),
         );
         let payload = serde_json::json!({"type": "error", "last_error": "different_failure"});
 
@@ -2416,6 +2533,10 @@ mod tests {
             "api_v1_readiness_completion_smoke_method".into(),
             Value::String("create_completion_keyword_prompt".into()),
         );
+        status.readiness_diagnostics.insert(
+            "api_v1_readiness_yarn_requested_context_tokens".into(),
+            Value::Number(65536.into()),
+        );
 
         let payload =
             finalize_bridge_exit(&mut status, exit_status, true, false, "session-1", None)
@@ -2428,6 +2549,16 @@ mod tests {
                 .and_then(|diagnostics| diagnostics.get("api_v1_readiness_completion_smoke_method"))
                 .and_then(Value::as_str),
             Some("create_completion_keyword_prompt")
+        );
+        assert_eq!(
+            payload
+                .get("readiness_diagnostics")
+                .and_then(Value::as_object)
+                .and_then(
+                    |diagnostics| diagnostics.get("api_v1_readiness_yarn_requested_context_tokens")
+                )
+                .and_then(Value::as_i64),
+            Some(65536)
         );
     }
 

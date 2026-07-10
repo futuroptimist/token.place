@@ -1336,7 +1336,7 @@ def test_probe_subprocess_keeps_stdlib_ahead_of_polluted_dependency_target(monke
                 'def llama_supports_gpu_offload():',
                 '    return True',
                 'class Llama:',
-                '    def __init__(self, rope_scaling_type=None, yarn_ext_factor=None, yarn_orig_ctx=None):',
+                '    def __init__(self, rope_scaling_type=None, rope_freq_scale=None, yarn_ext_factor=None, yarn_orig_ctx=None):',
                 '        pass',
             ]
         ),

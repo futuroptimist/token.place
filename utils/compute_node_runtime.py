@@ -65,6 +65,13 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "prompt_tokenization_failure": "runtime_completion_smoke_plain_completion_prompt_tokenization_failure",
     "prompt_eval_failure": "runtime_completion_smoke_plain_completion_eval_failure",
     "prompt_eval_decode_failure": "runtime_completion_smoke_plain_completion_decode_failure",
+    "prompt_eval_invalid_batch": "runtime_completion_smoke_plain_completion_eval_failure",
+    "backend_allocation_failure": "runtime_completion_smoke_plain_completion_backend_failure",
+    "backend_graph_compute_failure": "runtime_completion_smoke_plain_completion_backend_failure",
+    "metal_graph_compute_failure": "runtime_completion_smoke_plain_completion_backend_failure",
+    "kv_slot_unavailable": "runtime_completion_smoke_plain_completion_backend_failure",
+    "decode_aborted": "runtime_completion_smoke_plain_completion_decode_failure",
+    "backend_decode_failure": "runtime_completion_smoke_plain_completion_backend_failure",
     "prompt_eval_backend_failure": "runtime_completion_smoke_plain_completion_backend_failure",
     "prompt_eval_invalid_token_failure": "runtime_completion_smoke_plain_completion_eval_failure",
     "prompt_eval_state_failure": "runtime_completion_smoke_plain_completion_eval_failure",
@@ -116,6 +123,12 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "qwen_high_level_chat_fallback_rejected_kwarg",
     "qwen_high_level_chat_fallback_category",
     "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
     "qwen_api_v1_non_thinking_template_fallback",
     "result_shape",
@@ -849,6 +862,10 @@ class ComputeNodeRuntime:
             "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
             "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
         })
+        profile_diagnostics = getattr(self.model_manager, "qwen_64k_runtime_profile_diagnostics", lambda: {})()
+        if isinstance(profile_diagnostics, dict):
+            for key, value in profile_diagnostics.items():
+                diagnostics[f"api_v1_readiness_{key}"] = value
 
         yarn_required_for_active_tier = (
             model_profile.get("provider") == "qwen"
@@ -1024,6 +1041,12 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",
@@ -1126,6 +1149,12 @@ class ComputeNodeRuntime:
                     "qwen_high_level_chat_fallback_rejected_kwarg",
                     "qwen_high_level_chat_fallback_category",
                     "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                     "plain_completion_prompt_token_count",
                     "plain_completion_prompt_tokenization_method",
@@ -1186,6 +1215,12 @@ class ComputeNodeRuntime:
                         "qwen_high_level_chat_fallback_rejected_kwarg",
                         "qwen_high_level_chat_fallback_category",
                         "plain_completion_eval_return_code",
+    "plain_completion_first_failure_method",
+    "plain_completion_backend_failure_category",
+    "plain_completion_backend_state_sticky",
+    "plain_completion_backend_recreation_required",
+    "plain_completion_metal_error_category",
+    "plain_completion_metal_command_buffer_status",
 
                         "plain_completion_prompt_token_count",
                         "plain_completion_prompt_tokenization_method",
@@ -1243,10 +1278,30 @@ class ComputeNodeRuntime:
                     f"{admission_code} reason={admission_reason}"
                 )
             )
+            recoverable_category = (
+                diagnostics.get("api_v1_readiness_completion_smoke_generation_exception_category")
+                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category")
+                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category")
+            )
+            decode_code = diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code")
+            reinit = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
+            depth = int(getattr(self, "_qwen_64k_readiness_recovery_depth", 0) or 0)
+            max_depth = len(getattr(self.model_manager, "_qwen_64k_runtime_profiles", []) or [])
+            if callable(reinit) and depth < max(0, max_depth - 1):
+                new_runtime = None
+                try:
+                    self._qwen_64k_readiness_recovery_depth = depth + 1
+                    new_runtime = reinit(llm_runtime, str(recoverable_category or ""), decode_code if isinstance(decode_code, int) else None)
+                finally:
+                    self._qwen_64k_readiness_recovery_depth = depth
+                if new_runtime is not None:
+                    return self.ensure_api_v1_runtime_ready()
             setattr(self.model_manager, 'last_runtime_init_error', message)
             _log_error(message)
             return False
 
+        if isinstance(getattr(self.model_manager, 'last_qwen_64k_memory_profile_diagnostics', None), dict):
+            self.model_manager.last_qwen_64k_memory_profile_diagnostics['result'] = 'passed'
         setattr(self.model_manager, 'last_runtime_init_error', None)
         return True
 

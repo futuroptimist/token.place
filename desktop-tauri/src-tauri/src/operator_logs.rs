@@ -209,7 +209,10 @@ pub fn sanitize_operator_path_display(path: &Path) -> String {
 
 fn sanitize_operator_diagnostic_token(token: &str) -> String {
     if token.starts_with('{') || token.starts_with('[') {
-        return token.chars().take(4096).collect();
+        if token.len() <= 4096 {
+            return token.to_string();
+        }
+        return r#"{"type":"operator_log_json_token_omitted","reason":"length_limit"}"#.to_string();
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);

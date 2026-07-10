@@ -46,9 +46,9 @@ QWEN_64K_KV_CACHE_TYPE_NAMES = {
 }
 QWEN_64K_BATCH_TOKENS = 256
 QWEN_64K_UBATCH_TOKENS = 128
-QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_default'
-QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8'
-QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4'
+QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
+QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
+QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
 # Only retry context-create failures backed by safe Metal/KV/cache/buffer
 # evidence. A bare ``Failed to create llama_context`` remains classified as
 # ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
@@ -59,6 +59,24 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
+}
+QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
+    'backend_allocation_failure',
+    'backend_graph_compute_failure',
+    'metal_graph_compute_failure',
+    'kv_slot_unavailable',
+    'metal_command_buffer_out_of_memory',
+    'metal_command_buffer_timeout',
+    'metal_command_buffer_page_fault',
+    'metal_command_buffer_execution_failure',
+}
+FATAL_CURRENT_WORKER_GENERATION_CATEGORIES = {
+    'backend_allocation_failure',
+    'backend_graph_compute_failure',
+    'metal_graph_compute_failure',
+    'kv_slot_unavailable',
+    'decode_aborted',
+    'backend_decode_failure',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -309,48 +327,15 @@ def _build_qwen_64k_runtime_profiles(
 ) -> list[Dict[str, Any]]:
     capabilities = _qwen_64k_runtime_capabilities(llama_cpp_module, llama_cls)
     support = capabilities['constructor_kwarg_support']
-    profiles: list[Dict[str, Any]] = [{
-        'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
-        'kwargs': {},
-        'diagnostics': {
-            'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
-            'enabled': True,
-            'applied': {},
-            'omitted': {},
-            'constructor_kwarg_support': support,
-            'capability_source': capabilities['capability_source'],
-            'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
-            'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, 'f16', capabilities.get('backend') or ''),
-            'kqv_offload_allowed': bool(enable_kqv_offload),
-        },
-    }]
-    for precision, profile_id in (('q8', QWEN_64K_RUNTIME_PROFILE_Q8), ('q4', QWEN_64K_RUNTIME_PROFILE_Q4)):
-        omitted: Dict[str, str] = {}
+    profiles: list[Dict[str, Any]] = []
+
+    def _profile(profile_id: str, precision: str, kv_value: Any = None) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
-        kv_info = capabilities['kv_constants'].get(precision) or {}
-        kv_value = kv_info.get('value')
-        if kv_value is None:
-            omitted['type_k'] = omitted['type_v'] = 'kv_type_constant_unavailable'
-        if kv_value is not None and support.get('type_k'):
-            kwargs['type_k'] = kv_value
-        elif kv_value is not None:
-            omitted['type_k'] = 'constructor_kwarg_unsupported'
-        if kv_value is not None and support.get('type_v'):
-            kwargs['type_v'] = kv_value
-        elif kv_value is not None:
-            omitted['type_v'] = 'constructor_kwarg_unsupported'
-        if 'type_v' in kwargs and precision != 'f16' and not enable_kqv_offload:
-            omitted['flash_attn'] = 'gpu_offload_disabled'
-        if 'type_v' in kwargs and precision != 'f16' and enable_kqv_offload:
-            if support.get('flash_attn'):
-                kwargs['flash_attn'] = True
-            else:
-                omitted['flash_attn'] = 'required_for_quantized_v_but_unsupported'
-                kwargs.pop('type_v', None)
-                if 'type_k' not in kwargs:
-                    omitted['profile'] = 'no_supported_quantized_kv_kwargs'
-        if 'type_k' not in kwargs and 'type_v' not in kwargs:
-            omitted['profile'] = omitted.get('profile') or 'no_applied_quantized_kv_kwargs'
+        omitted: Dict[str, str] = {}
+        if support.get('flash_attn'):
+            kwargs['flash_attn'] = True
+        else:
+            omitted['flash_attn'] = 'required_for_metal_64k_profile'
         if enable_kqv_offload and support.get('offload_kqv'):
             kwargs['offload_kqv'] = True
         elif enable_kqv_offload:
@@ -363,25 +348,50 @@ def _build_qwen_64k_runtime_profiles(
             kwargs['n_ubatch'] = QWEN_64K_UBATCH_TOKENS
         else:
             omitted['n_ubatch'] = 'constructor_kwarg_unsupported'
+        if kv_value is not None:
+            if support.get('type_k'):
+                kwargs['type_k'] = kv_value
+            else:
+                omitted['type_k'] = 'constructor_kwarg_unsupported'
+            if support.get('type_v') and support.get('flash_attn'):
+                kwargs['type_v'] = kv_value
+            elif not support.get('type_v'):
+                omitted['type_v'] = 'constructor_kwarg_unsupported'
+            else:
+                omitted['type_v'] = 'flash_attn_required_for_quantized_v'
+        enabled = not any(key in omitted for key in ('flash_attn', 'type_k', 'type_v'))
         diagnostics = {
             'profile_id': profile_id,
-            'enabled': bool(kwargs) and 'profile' not in omitted,
+            'enabled': enabled,
             'applied': dict(kwargs),
             'omitted': omitted,
             'kv_precision': precision,
-            'kv_cache_type': kv_info,
             'constructor_kwarg_support': support,
             'capability_source': capabilities['capability_source'],
             'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
             'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, precision, capabilities.get('backend') or ''),
             'kqv_offload_allowed': bool(enable_kqv_offload),
         }
-        if diagnostics['enabled']:
-            profiles.append({'profile_id': profile_id, 'kwargs': kwargs, 'diagnostics': diagnostics})
-        else:
-            profiles[0]['diagnostics'].setdefault('skipped_profiles', []).append(diagnostics)
-    return profiles
+        return {'profile_id': profile_id, 'kwargs': kwargs, 'diagnostics': diagnostics}
 
+    profiles.append(_profile(QWEN_64K_RUNTIME_PROFILE_DEFAULT, 'f16'))
+    for precision, profile_id in (('q8', QWEN_64K_RUNTIME_PROFILE_Q8), ('q4', QWEN_64K_RUNTIME_PROFILE_Q4)):
+        kv_info = capabilities['kv_constants'].get(precision) or {}
+        kv_value = kv_info.get('value')
+        if kv_value is None:
+            skipped = _profile(profile_id, precision)
+            skipped['diagnostics']['enabled'] = False
+            skipped['diagnostics']['omitted']['type_k'] = 'kv_type_constant_unavailable'
+            skipped['diagnostics']['omitted']['type_v'] = 'kv_type_constant_unavailable'
+            profiles[0]['diagnostics'].setdefault('skipped_profiles', []).append(skipped['diagnostics'])
+            continue
+        candidate = _profile(profile_id, precision, kv_value)
+        candidate['diagnostics']['kv_cache_type'] = kv_info
+        if candidate['diagnostics']['enabled']:
+            profiles.append(candidate)
+        else:
+            profiles[0]['diagnostics'].setdefault('skipped_profiles', []).append(candidate['diagnostics'])
+    return profiles
 
 def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -> str:
     text = f'{error or ""}\n{child_stderr or ""}'.lower()
@@ -723,6 +733,47 @@ class LlamaCppInferenceRequestError(RuntimeError):
         super().__init__(message)
 
 
+
+def _parent_safe_metal_backend_failure_diagnostics(lines, *, is_metal=True):
+    text = '\n'.join(str(line or '') for line in lines).lower()
+    if not text:
+        return {}
+    category = None
+    status = None
+    if re.search(r'(insufficient memory|out of memory|oom|resource shortage|not enough memory)', text):
+        category = 'metal_command_buffer_out_of_memory'
+    elif 'timeout' in text or 'timed out' in text:
+        category = 'metal_command_buffer_timeout'
+    elif 'page fault' in text:
+        category = 'metal_command_buffer_page_fault'
+    elif 'backend is in error state' in text or 'has_error' in text:
+        category = 'metal_backend_sticky_error'
+    elif 'command buffer' in text and any(term in text for term in ('error', 'fail')):
+        category = 'metal_command_buffer_execution_failure'
+    elif 'graph' in text and any(term in text for term in ('compute', 'fail')):
+        category = 'metal_graph_compute_failed'
+    elif 'memory context' in text and 'fail' in text:
+        category = 'memory_context_apply_failed'
+    elif 'graph' in text and any(term in text for term in ('init', 'alloc')) and 'fail' in text:
+        category = 'graph_initialization_failed'
+    elif is_metal and 'metal' in text:
+        category = 'unknown_metal_backend_failure'
+    match = re.search(r'command[- ]buffer[^\n]*(?:status|error)\s*[:=]?\s*(-?\d+)', text)
+    if match:
+        try:
+            status = int(match.group(1))
+        except ValueError:
+            status = None
+    diagnostics = {}
+    if category:
+        diagnostics['plain_completion_metal_error_category'] = category
+        diagnostics['plain_completion_backend_failure_category'] = category
+        diagnostics['plain_completion_backend_recreation_required'] = True
+        diagnostics['plain_completion_backend_state_sticky'] = category in {'metal_backend_sticky_error', 'metal_graph_compute_failed', 'metal_command_buffer_execution_failure', 'metal_command_buffer_out_of_memory'}
+    if status is not None:
+        diagnostics['plain_completion_metal_command_buffer_status'] = max(min(status, 999999), -999999)
+    return diagnostics
+
 class LlamaCppRestartableWorkerError(RuntimeError):
     """Raised when the llama.cpp worker transport is unusable and may be replaced."""
 
@@ -1062,7 +1113,7 @@ def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optio
         )
 
     stdout = (completed.stdout or '').strip().splitlines()
-    diagnostics: Dict[str, Any] = {}
+    diagnostics = {}
     if stdout:
         try:
             parsed = json.loads(stdout[-1])
@@ -1591,6 +1642,24 @@ class _SubprocessLlamaProxy:
 
         threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True).start()
 
+    def _stderr_cursor(self) -> int:
+        tail = getattr(self._process, '_token_place_stderr_tail', None)
+        return len(tail) if isinstance(tail, list) else 0
+
+    def _stderr_since(self, cursor: int) -> list[str]:
+        time.sleep(0.1)
+        tail = getattr(self._process, '_token_place_stderr_tail', None)
+        if not isinstance(tail, list):
+            return []
+        return [str(line) for line in tail[max(0, cursor):]]
+
+    def _augment_request_error(self, error: Exception, cursor: int) -> None:
+        if not isinstance(error, LlamaCppInferenceRequestError):
+            return
+        extra = _parent_safe_metal_backend_failure_diagnostics(self._stderr_since(cursor))
+        for key, value in extra.items():
+            error.diagnostics.setdefault(key, value)
+
     def _send(self, payload: Dict[str, Any], *, check_health: bool = True) -> None:
         if check_health:
             self.assert_healthy()
@@ -1621,6 +1690,7 @@ class _SubprocessLlamaProxy:
         if stream:
             return self._stream_chat_completion(*args, **kwargs)
         with self._lock:
+            stderr_cursor = self._stderr_cursor()
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
             try:
                 message = _read_llama_subprocess_message(
@@ -1631,11 +1701,15 @@ class _SubprocessLlamaProxy:
             except LlamaCppWorkerEOFError:
                 self._closed = True
                 raise
+            except LlamaCppInferenceRequestError as exc:
+                self._augment_request_error(exc, stderr_cursor)
+                raise
         return message.get('result')
 
 
     def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
         with self._lock:
+            stderr_cursor = self._stderr_cursor()
             self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
             try:
                 message = _read_llama_subprocess_message(
@@ -1645,6 +1719,9 @@ class _SubprocessLlamaProxy:
                 )
             except LlamaCppWorkerEOFError:
                 self._closed = True
+                raise
+            except LlamaCppInferenceRequestError as exc:
+                self._augment_request_error(exc, stderr_cursor)
                 raise
         return message.get('result')
 
@@ -1859,7 +1936,69 @@ def _safe_plain_completion_eval_return_code(exc):
     except ValueError:
         return None
 
+
+def _classify_llama_decode_return_code(code):
+    if code is None:
+        return None
+    if code == -1:
+        return 'prompt_eval_invalid_batch'
+    if code == -2:
+        return 'backend_allocation_failure'
+    if code == -3:
+        return 'backend_graph_compute_failure'
+    if code == 1:
+        return 'kv_slot_unavailable'
+    if code == 2:
+        return 'decode_aborted'
+    if code < 0:
+        return 'backend_decode_failure'
+    return None
+
+def _safe_metal_backend_failure_diagnostics(lines, *, is_metal=True):
+    text = '\\n'.join(str(line or '') for line in lines).lower()
+    if not text:
+        return {}
+    category = None
+    status = None
+    if re.search(r'(insufficient memory|out of memory|oom|resource shortage|not enough memory)', text):
+        category = 'metal_command_buffer_out_of_memory'
+    elif 'timeout' in text or 'timed out' in text:
+        category = 'metal_command_buffer_timeout'
+    elif 'page fault' in text:
+        category = 'metal_command_buffer_page_fault'
+    elif 'backend is in error state' in text or 'has_error' in text:
+        category = 'metal_backend_sticky_error'
+    elif 'command buffer' in text and any(term in text for term in ('error', 'fail')):
+        category = 'metal_command_buffer_execution_failure'
+    elif 'graph' in text and any(term in text for term in ('compute', 'fail')):
+        category = 'metal_graph_compute_failed'
+    elif 'memory context' in text and 'fail' in text:
+        category = 'memory_context_apply_failed'
+    elif 'graph' in text and any(term in text for term in ('init', 'alloc')) and 'fail' in text:
+        category = 'graph_initialization_failed'
+    elif is_metal and 'metal' in text:
+        category = 'unknown_metal_backend_failure'
+    match = re.search(r'command[- ]buffer[^\\n]*(?:status|error)\s*[:=]?\s*(-?\d+)', text)
+    if match:
+        try:
+            status = int(match.group(1))
+        except ValueError:
+            status = None
+    diagnostics: Dict[str, Any] = {}
+    if category:
+        diagnostics['plain_completion_metal_error_category'] = category
+        diagnostics['plain_completion_backend_failure_category'] = category
+        diagnostics['plain_completion_backend_recreation_required'] = True
+        diagnostics['plain_completion_backend_state_sticky'] = category in {'metal_backend_sticky_error', 'metal_graph_compute_failed', 'metal_command_buffer_execution_failure', 'metal_command_buffer_out_of_memory'}
+    if status is not None:
+        diagnostics['plain_completion_metal_command_buffer_status'] = max(min(status, 999999), -999999)
+    return diagnostics
+
 def _classify_generation_exception(exc):
+    code = _safe_plain_completion_eval_return_code(exc)
+    code_category = _classify_llama_decode_return_code(code)
+    if code_category is not None:
+        return code_category
     text = str(exc or '').lower()
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
         return 'metal_memory_allocation'
@@ -2846,6 +2985,12 @@ for line in sys.stdin:
                 'context_window_exceeded',
                 'context_length_exceeded',
                 'token_overflow',
+                'backend_allocation_failure',
+                'backend_graph_compute_failure',
+                'metal_graph_compute_failure',
+                'kv_slot_unavailable',
+                'decode_aborted',
+                'backend_decode_failure',
             }
             def _plain_attempt_diagnostics():
                 return {
@@ -2871,7 +3016,7 @@ for line in sys.stdin:
                 except Exception as exc:
                     category = _plain_completion_method_shape_category(exc)
                     rejected = _extract_unsupported_generation_kwarg(str(exc), attempted_kwargs)
-                    attempts.append({
+                    attempt = {
                         'method': method_name,
                         'attempted_kwarg_names': ','.join(attempted_kwargs),
                         'exception_type': type(exc).__name__,
@@ -2879,10 +3024,30 @@ for line in sys.stdin:
                         'rejected_generation_kwarg': rejected or '',
                         'sanitized_error_summary': _sanitize_error_summary(exc),
                         'tokenization_variant_id': tokenization_variant_id,
-                    })
+                    }
+                    diagnostics = getattr(exc, 'diagnostics', None)
+                    if isinstance(diagnostics, dict):
+                        for key in (
+                            'plain_completion_backend_failure_category',
+                            'plain_completion_backend_state_sticky',
+                            'plain_completion_backend_recreation_required',
+                            'plain_completion_metal_error_category',
+                            'plain_completion_metal_command_buffer_status',
+                        ):
+                            if key in diagnostics:
+                                plain_capabilities.setdefault(key, diagnostics[key])
+                    attempts.append(attempt)
                     return_code = _safe_plain_completion_eval_return_code(exc)
                     if return_code is not None:
                         plain_capabilities['plain_completion_eval_return_code'] = return_code
+                    if category == 'backend_allocation_failure':
+                        plain_capabilities['plain_completion_backend_recreation_required'] = True
+                    if category == 'backend_graph_compute_failure':
+                        plain_capabilities.setdefault('plain_completion_backend_failure_category', 'metal_graph_compute_failure')
+                        plain_capabilities['plain_completion_backend_state_sticky'] = True
+                        plain_capabilities['plain_completion_backend_recreation_required'] = True
+                    if category in fatal_plain_completion_categories:
+                        plain_capabilities.setdefault('plain_completion_first_failure_method', method_name)
                     if category not in fatal_plain_completion_categories and _reset_plain_completion_state(llama):
                         plain_capabilities['plain_completion_reset_after_failure_count'] += 1
                     return None, exc
@@ -3552,6 +3717,12 @@ class ModelManager:
         self.last_worker_restart_at_ms: Optional[int] = None
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
+        self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
+        self._qwen_64k_selected_profile_index: int = 0
+        self._qwen_64k_selected_profile_id: Optional[str] = None
+        self._qwen_64k_profile_attempt_ids: list[str] = []
+        self._qwen_64k_profile_recovery_count: int = 0
+        self._qwen_64k_disable_runtime_profiles: bool = False
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -3959,7 +4130,7 @@ class ModelManager:
                     'yarn_orig_ctx': original_context_tokens,
                 }
             )
-            if runtime_profile is None:
+            if runtime_profile is None and not getattr(self, '_qwen_64k_disable_runtime_profiles', False):
                 runtime_profile = _build_qwen_64k_runtime_profiles(
                     llama_module,
                     llama_cls,
@@ -3988,6 +4159,59 @@ class ModelManager:
                 'missing_reason': 'not_required_for_active_profile_or_tier',
             }
         return kwargs
+
+
+    def qwen_64k_runtime_profile_diagnostics(self) -> Dict[str, Any]:
+        diag = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
+        applied = diag.get('applied') if isinstance(diag, dict) and isinstance(diag.get('applied'), dict) else {}
+        profile_id = self._qwen_64k_selected_profile_id or (diag.get('profile_id') if isinstance(diag, dict) else None)
+        result = diag.get('result') if isinstance(diag, dict) else None
+        failure = diag.get('failure_category') if isinstance(diag, dict) else None
+        return {
+            'qwen_64k_runtime_profile_id': profile_id,
+            'qwen_64k_runtime_profile_attempt_ids': ','.join(self._qwen_64k_profile_attempt_ids),
+            'qwen_64k_runtime_profile_recovery_count': self._qwen_64k_profile_recovery_count,
+            'qwen_64k_runtime_profile_flash_attn': applied.get('flash_attn'),
+            'qwen_64k_runtime_profile_offload_kqv': applied.get('offload_kqv'),
+            'qwen_64k_runtime_profile_type_k': applied.get('type_k'),
+            'qwen_64k_runtime_profile_type_v': applied.get('type_v'),
+            'qwen_64k_runtime_profile_n_batch': applied.get('n_batch'),
+            'qwen_64k_runtime_profile_n_ubatch': applied.get('n_ubatch'),
+            'qwen_64k_runtime_profile_result': result,
+            'qwen_64k_runtime_profile_failure_category': failure,
+        }
+
+    def reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        self,
+        failed_runtime: Any,
+        failure_category: str,
+        decode_return_code: Optional[int] = None,
+    ) -> Any:
+        category = _classify_llama_decode_return_code(decode_return_code) or str(failure_category or '')
+        if self.model_profile.get('provider') != 'qwen' or getattr(self, 'context_tier', '8k-fast') != '64k-full':
+            return None
+        if category not in QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES:
+            return None
+        failed_to_close = None
+        with self.llm_lock:
+            if failed_runtime is not self.llm:
+                return None
+            failed_to_close = self.llm
+            self.llm = None
+            if isinstance(getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None), dict):
+                self.last_qwen_64k_memory_profile_diagnostics['result'] = 'failed'
+                self.last_qwen_64k_memory_profile_diagnostics['failure_category'] = category
+            self._qwen_64k_selected_profile_index += 1
+            self._qwen_64k_profile_recovery_count += 1
+            self.worker_restart_count += 1
+            self._llm_generation += 1
+        close = getattr(failed_to_close, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return self.get_llm_instance()
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
@@ -4312,6 +4536,8 @@ class ModelManager:
                             if is_qwen_64k:
                                 _runtime_supports_qwen_yarn_rope(llama_cpp, Llama)
                                 Llama = llama_cpp.Llama
+                            self._qwen_64k_disable_runtime_profiles = bool(is_qwen_64k and compute_plan.get('backend_used') != 'metal')
+                            if is_qwen_64k and compute_plan.get('backend_used') == 'metal':
                                 runtime_profiles = _build_qwen_64k_runtime_profiles(
                                     llama_cpp,
                                     Llama,
@@ -4319,6 +4545,9 @@ class ModelManager:
                                     n_ctx=int(self.config.get('model.context_size', 65536)),
                                     enable_kqv_offload=n_gpu_layers != 0,
                                 )
+                                self._qwen_64k_runtime_profiles = list(runtime_profiles)
+                                start_index = max(0, min(self._qwen_64k_selected_profile_index, len(runtime_profiles) - 1))
+                                runtime_profiles = runtime_profiles[start_index:]
                             profile_failures = []
                             llm_instance = None
                             runtime_kwargs = {}
@@ -4327,10 +4556,18 @@ class ModelManager:
                                 profile_diag = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', {})
                                 profile_id = profile_diag.get('profile_id') if isinstance(profile_diag, dict) else 'default'
                                 try:
+                                    if is_qwen_64k and profile_id:
+                                        self._qwen_64k_profile_attempt_ids.append(str(profile_id))
                                     llm_instance = Llama(**runtime_kwargs)
                                     if isinstance(profile_diag, dict):
                                         profile_diag['selected'] = True
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
+                                    if is_qwen_64k and profile_id:
+                                        self._qwen_64k_selected_profile_id = str(profile_id)
+                                        for idx, candidate in enumerate(self._qwen_64k_runtime_profiles):
+                                            if candidate.get('profile_id') == profile_id:
+                                                self._qwen_64k_selected_profile_index = idx
+                                                break
                                     break
                                 except Exception as init_exc:
                                     category = _classify_runtime_context_create_error(init_exc)
@@ -4425,6 +4662,7 @@ class ModelManager:
                             memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
                             if isinstance(memory_profile, dict):
                                 compute_plan['qwen_64k_memory_profile'] = dict(memory_profile)
+                                compute_plan.update(self.qwen_64k_runtime_profile_diagnostics())
                                 applied_memory = memory_profile.get('applied') if isinstance(memory_profile.get('applied'), dict) else {}
                                 compute_plan['kv_cache_mode'] = {
                                     key: applied_memory.get(key)

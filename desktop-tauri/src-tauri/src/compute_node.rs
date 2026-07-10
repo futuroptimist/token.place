@@ -301,6 +301,23 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_rejected_kwarg",
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category",
     "api_v1_readiness_completion_smoke_plain_completion_eval_return_code",
+    "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
+    "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
+    "api_v1_readiness_qwen_64k_runtime_profile_flash_attn",
+    "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_k",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_v",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_batch",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch",
+    "api_v1_readiness_qwen_64k_runtime_profile_result",
+    "api_v1_readiness_qwen_64k_runtime_profile_failure_category",
+    "api_v1_readiness_completion_smoke_plain_completion_first_failure_method",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_state_sticky",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_recreation_required",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
 ];
 
@@ -824,6 +841,76 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into())
 }
 
+fn readiness_diagnostic_chunks(payload: &Value) -> Vec<String> {
+    let diagnostics = safe_readiness_diagnostics_from_payload(payload);
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let session = payload
+        .get("operator_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let sequence = payload.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+    let mut keys: Vec<String> = diagnostics.keys().cloned().collect();
+    keys.sort();
+    let mut chunks: Vec<Map<String, Value>> = Vec::new();
+    let mut current = Map::new();
+    for key in keys {
+        let Some(value) = diagnostics.get(&key).cloned() else {
+            continue;
+        };
+        let mut probe = current.clone();
+        probe.insert(key.clone(), value.clone());
+        let line = readiness_chunk_line(session, sequence, 0, 1, probe.clone());
+        if !current.is_empty() && line.len() > 3500 {
+            chunks.push(current);
+            current = Map::new();
+        }
+        current.insert(key, value);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    let count = chunks.len().max(1);
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| readiness_chunk_line(session, sequence, idx, count, chunk))
+        .collect()
+}
+
+fn readiness_chunk_line(
+    session: &str,
+    sequence: u64,
+    chunk_index: usize,
+    chunk_count: usize,
+    diagnostics: Map<String, Value>,
+) -> String {
+    let value = serde_json::json!({
+        "type": "readiness_diagnostics",
+        "operator_session_id": session,
+        "sequence": sequence,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "diagnostics": diagnostics,
+    });
+    let serialized = serde_json::to_string(&value)
+        .unwrap_or_else(|_| "{\"type\":\"readiness_diagnostics_error\"}".into());
+    if serialized.len() <= 3500 {
+        serialized
+    } else {
+        serde_json::json!({
+            "type": "readiness_diagnostics",
+            "operator_session_id": session,
+            "sequence": sequence,
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+            "diagnostics": {"chunk_omitted": "length_limit"},
+        })
+        .to_string()
+    }
+}
+
 fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
     if is_sensitive_bridge_log_key(key) {
         return Value::String("<redacted>".into());
@@ -1207,6 +1294,15 @@ pub async fn start_compute_node(
             "desktop.compute_node.stdout",
             &redact_bridge_stdout_line(&line),
         );
+        if let Ok(payload_for_log) = serde_json::from_str::<Value>(&line) {
+            for readiness_line in readiness_diagnostic_chunks(&payload_for_log) {
+                append_operator_log_line(
+                    &log_sink,
+                    "desktop.compute_node.readiness",
+                    &readiness_line,
+                );
+            }
+        }
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 let payload = with_log_file_path(payload, log_file_path.as_deref());

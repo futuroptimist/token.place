@@ -4994,14 +4994,14 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     Path(manager.model_path).write_text('fake')
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
             captured.update({
                 'model_path': model_path,
                 'n_gpu_layers': n_gpu_layers,
                 'n_ctx': n_ctx,
                 'verbose': verbose,
                 'rope_scaling_type': rope_scaling_type,
-                'yarn_ext_factor': yarn_ext_factor,
+                'rope_freq_scale': rope_freq_scale,
                 'yarn_orig_ctx': yarn_orig_ctx,
             })
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
@@ -5019,7 +5019,7 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
 
     assert captured['n_ctx'] == 65536
     assert captured['rope_scaling_type'] == 2
-    assert captured['yarn_ext_factor'] == 2.0
+    assert captured['rope_freq_scale'] == 0.5
     assert captured['yarn_orig_ctx'] == 32768
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is True
     assert manager.last_compute_diagnostics['rope_yarn_factor'] == 2.0
@@ -5045,7 +5045,7 @@ def test_qwen_64k_runtime_resolves_nested_yarn_enum(tmp_path):
     Path(manager.model_path).write_text('fake')
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
             captured['rope_scaling_type'] = rope_scaling_type
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
@@ -5117,11 +5117,11 @@ def test_qwen_64k_runtime_uses_numeric_yarn_fallback_when_enum_constant_missing(
     Path(manager.model_path).write_text('fake')
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
             captured.update({
                 'n_ctx': n_ctx,
                 'rope_scaling_type': rope_scaling_type,
-                'yarn_ext_factor': yarn_ext_factor,
+                'rope_freq_scale': rope_freq_scale,
                 'yarn_orig_ctx': yarn_orig_ctx,
             })
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
@@ -5139,7 +5139,7 @@ def test_qwen_64k_runtime_uses_numeric_yarn_fallback_when_enum_constant_missing(
     assert captured == {
         'n_ctx': 65536,
         'rope_scaling_type': 2,
-        'yarn_ext_factor': 2.0,
+        'rope_freq_scale': 0.5,
         'yarn_orig_ctx': 32768,
     }
     assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'numeric_fallback'
@@ -5165,7 +5165,7 @@ def test_qwen_64k_runtime_fails_when_yarn_enum_missing_and_constructor_lacks_rop
 
     class FakeLlama:
         def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, yarn_ext_factor, yarn_orig_ctx):
-            pass
+            _ = yarn_ext_factor
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
             return '<qwen>'
 
@@ -5326,14 +5326,14 @@ def test_qwen_64k_missing_reason_does_not_repeat_rope_scaling_type():
 
     assert diagnostics['supported'] is False
     assert diagnostics['missing_reason'].count('rope_scaling_type') == 1
-    assert 'missing constructor kwargs: yarn_ext_factor, yarn_orig_ctx' in diagnostics['missing_reason']
+    assert 'runtime_qwen_64k_yarn_rope_freq_scale_unavailable; missing constructor kwargs: yarn_orig_ctx' in diagnostics['missing_reason']
 
 
 def test_qwen_64k_diagnostics_mark_supported_when_required_yarn_kwargs_are_available():
     from utils.llm import model_manager as model_manager_module
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
             pass
 
     diagnostics = model_manager_module._qwen_64k_rope_support_diagnostics(
@@ -5412,7 +5412,7 @@ def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path)
     Path(manager.model_path).write_text('fake')
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, yarn_ext_factor, yarn_orig_ctx):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
             captured.update(locals())
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
@@ -5448,7 +5448,7 @@ def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
 
     support = {
         'rope_scaling_type': True,
-        'yarn_ext_factor': True,
+        'yarn_ext_factor': True, 'rope_freq_scale': True,
         'yarn_orig_ctx': True,
         'type_k': False,
         'type_v': False,
@@ -5498,7 +5498,7 @@ def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monk
             'runtime_action': 'already_supported',
             'constructor_kwarg_support': {
                 'rope_scaling_type': False,
-                'yarn_ext_factor': False,
+                'yarn_ext_factor': False, 'rope_freq_scale': False,
                 'yarn_orig_ctx': False,
             },
             'capability_source': 'parent_facade_signature',
@@ -5513,7 +5513,7 @@ def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monk
             'llama_cpp_python_version': '0.3.32',
             'constructor_kwarg_support': {
                 'rope_scaling_type': True,
-                'yarn_ext_factor': True,
+                'yarn_ext_factor': True, 'rope_freq_scale': True,
                 'yarn_orig_ctx': True,
             },
             'constructor_has_var_kwargs': False,
@@ -5561,7 +5561,7 @@ def test_qwen_64k_subprocess_facade_unknown_reprobes_real_child(monkeypatch):
             'llama_cpp_python_version': '0.3.32',
             'constructor_kwarg_support': {
                 'rope_scaling_type': True,
-                'yarn_ext_factor': True,
+                'yarn_ext_factor': True, 'rope_freq_scale': True,
                 'yarn_orig_ctx': True,
             },
             'constructor_has_var_kwargs': False,
@@ -5704,13 +5704,13 @@ def test_qwen_64k_runtime_init_guard_rejects_supported_probe_without_yarn_value(
             'yarn_resolver_source': 'top_level_enum',
             'constructor_kwarg_support': {
                 'rope_scaling_type': True,
-                'yarn_ext_factor': True,
+                'yarn_ext_factor': True, 'rope_freq_scale': True,
                 'yarn_orig_ctx': True,
             },
             'missing_reason': None,
             'llama_module_path': '/runtime/llama_cpp/__init__.py',
             'llama_cpp_python_version': '0.3.32',
-            'accepted_constructor_kwargs': ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'],
+            'accepted_constructor_kwargs': ['rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'],
             'missing_required_kwargs': [],
             'capability_source': 'worker_probe',
             'constructor_signature_inspectable': True,
@@ -5785,7 +5785,7 @@ def test_qwen_64k_numeric_fallback_not_used_when_child_rejects_rope_scaling(monk
             'gpu_offload_supported': True,
             'constructor_kwarg_support': {
                 'rope_scaling_type': False,
-                'yarn_ext_factor': True,
+                'yarn_ext_factor': True, 'rope_freq_scale': True,
                 'yarn_orig_ctx': True,
             },
             'constructor_signature_inspectable': True,
@@ -7892,3 +7892,34 @@ def test_llama_worker_high_level_qwen_fallback_rejects_nonempty_think_content(tm
     dumped_calls = json.dumps(calls)
     assert 'enable_thinking": true' not in dumped_calls.lower()
     assert '\n/no_think' not in dumped_calls
+
+def test_qwen_64k_runtime_rejects_mismatched_yarn_context_multiplier(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.gpu_mode': 'cpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    manager.model_profile = dict(manager.model_profile)
+    manager.model_profile['rope_scaling_policy'] = dict(manager.model_profile['rope_scaling_policy'])
+    manager.model_profile['rope_scaling_policy']['factor'] = 3.0
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose, rope_scaling_type, rope_freq_scale, yarn_orig_ctx):
+            raise AssertionError('constructor must not be called when YaRN config is invalid')
+
+    fake_llama_cpp = SimpleNamespace(Llama=FakeLlama, LLAMA_ROPE_SCALING_TYPE_YARN=2)
+
+    with pytest.raises(RuntimeError, match='runtime_qwen_64k_yarn_configuration_invalid'):
+        manager._runtime_init_kwargs(FakeLlama, 0, fake_llama_cpp, None)
+    assert manager.last_yarn_rope_diagnostics['qwen_yarn_configuration_valid'] is False

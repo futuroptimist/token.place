@@ -107,6 +107,9 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "thinking_mode": "disabled",
         "generation_defaults": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0},
         "aliases": ["llama-3.1-8b-instruct", "llama-3-8b-instruct", "gpt-3.5-turbo", "gpt-5-chat-latest"],
+        # ``factor`` is the context multiplier: llama.cpp ``--rope-scale N`` maps
+        # to llama-cpp-python ``rope_freq_scale=1/N``. It is not yarn_ext_factor,
+        # which is YaRN's separate extrapolation-mix parameter.
         "rope_scaling_policy": {"type": "yarn", "required_for_tier": "64k-full", "factor": 2.0, "original_context_tokens": 32768},
         "public_catalog": True,
         "runnable": True,

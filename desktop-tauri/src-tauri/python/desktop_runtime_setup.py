@@ -63,6 +63,7 @@ class RuntimeProbe:
     yarn_resolver_source: str = "unsupported"
     rope_scaling_type_supported: bool = False
     yarn_ext_factor_supported: bool = False
+    rope_freq_scale_supported: bool = False
     yarn_orig_ctx_supported: bool = False
 
 
@@ -203,6 +204,7 @@ try:
     Llama = getattr(llama_cpp, "Llama", None)
     rope_scaling_type_supported = _accepts(Llama, "rope_scaling_type")
     yarn_ext_factor_supported = _accepts(Llama, "yarn_ext_factor")
+    rope_freq_scale_supported = _accepts(Llama, "rope_freq_scale")
     yarn_orig_ctx_supported = _accepts(Llama, "yarn_orig_ctx")
     if getattr(llama_cpp, "LLAMA_ROPE_SCALING_TYPE_YARN", None) is not None:
         yarn_resolver_source = "top_level_enum"
@@ -215,7 +217,7 @@ try:
     yarn_rope_supported = bool(
         yarn_resolver_source != "unsupported"
         and rope_scaling_type_supported
-        and yarn_ext_factor_supported
+        and rope_freq_scale_supported
         and yarn_orig_ctx_supported
     )
     llama_cpp_python_version = getattr(llama_cpp, "__version__", None)
@@ -241,6 +243,7 @@ try:
         "yarn_resolver_source": yarn_resolver_source,
         "rope_scaling_type_supported": rope_scaling_type_supported,
         "yarn_ext_factor_supported": yarn_ext_factor_supported,
+        "rope_freq_scale_supported": rope_freq_scale_supported,
         "yarn_orig_ctx_supported": yarn_orig_ctx_supported,
         "error": None,
     }
@@ -261,6 +264,7 @@ except Exception as exc:
         "yarn_resolver_source": "unsupported",
         "rope_scaling_type_supported": False,
         "yarn_ext_factor_supported": False,
+        "rope_freq_scale_supported": False,
         "yarn_orig_ctx_supported": False,
         "error": str(exc),
     }
@@ -419,6 +423,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         yarn_resolver_source=str(payload.get("yarn_resolver_source", "unsupported")),
         rope_scaling_type_supported=bool(payload.get("rope_scaling_type_supported", False)),
         yarn_ext_factor_supported=bool(payload.get("yarn_ext_factor_supported", False)),
+        rope_freq_scale_supported=bool(payload.get("rope_freq_scale_supported", False)),
         yarn_orig_ctx_supported=bool(payload.get("yarn_orig_ctx_supported", False)),
     )
 
@@ -657,6 +662,7 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
         "yarn_resolver_source": probe.yarn_resolver_source,
         "rope_scaling_type_supported": str(probe.rope_scaling_type_supported).lower(),
         "yarn_ext_factor_supported": str(probe.yarn_ext_factor_supported).lower(),
+        "rope_freq_scale_supported": str(probe.rope_freq_scale_supported).lower(),
         "yarn_orig_ctx_supported": str(probe.yarn_orig_ctx_supported).lower(),
     }
 
@@ -668,6 +674,7 @@ def _qwen_64k_runtime_repair_failed_reason(probe: RuntimeProbe) -> str:
         f"module={probe.llama_module_path}; "
         f"rope_scaling_type_supported={probe.rope_scaling_type_supported}; "
         f"yarn_ext_factor_supported={probe.yarn_ext_factor_supported}; "
+        f"rope_freq_scale_supported={probe.rope_freq_scale_supported}; "
         f"yarn_orig_ctx_supported={probe.yarn_orig_ctx_supported}"
     )
 

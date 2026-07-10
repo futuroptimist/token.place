@@ -4,6 +4,7 @@ Model manager module for handling LLM model downloading, initialization and infe
 import os
 import time
 import logging
+import math
 from utils.networking.http_requests_compat import requests
 import json
 import re
@@ -538,7 +539,7 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
     )
     accepted_kwargs = sorted(name for name, supported in kwarg_support.items() if supported)
     yarn_value, resolver_source = _resolve_yarn_rope_scaling_type(llama_cpp_module, llama_cls)
-    required_kwargs = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
+    required_kwargs = ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx')
     constructor_has_var_kwargs = worker_capabilities.get('constructor_has_var_kwargs') is True
     missing_kwargs = (
         []
@@ -551,8 +552,11 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         missing_kwargs_for_reason = [name for name in missing_kwargs if name != 'rope_scaling_type']
     else:
         missing_kwargs_for_reason = missing_kwargs
-    if missing_kwargs_for_reason:
-        missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs_for_reason)}')
+    if 'rope_freq_scale' in missing_kwargs_for_reason:
+        missing_reasons.append('runtime_qwen_64k_yarn_rope_freq_scale_unavailable')
+    remaining_missing = [name for name in missing_kwargs_for_reason if name != 'rope_freq_scale']
+    if remaining_missing:
+        missing_reasons.append(f'missing constructor kwargs: {", ".join(remaining_missing)}')
     support_classification = worker_capabilities.get('qwen_64k_yarn_support')
     if support_classification not in {'supported', 'unknown', 'unsupported'}:
         support_classification = 'supported' if not missing_reasons else 'unsupported'
@@ -599,7 +603,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
         kwarg_support = capabilities.get('constructor_kwarg_support')
         required_supported = (
             isinstance(kwarg_support, dict)
-            and all(bool(kwarg_support.get(name)) for name in ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx'))
+            and all(bool(kwarg_support.get(name)) for name in ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'))
         )
         has_concrete_yarn_value = capabilities.get('yarn_enum_value') is not None
         facade_capabilities_complete = (
@@ -1118,7 +1122,7 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
         "if yarn_value is None and constructor_support.get('rope_scaling_type'):\n"
         "    yarn_value = 2\n"
         "    yarn_source = 'numeric_fallback'\n"
-        "required_yarn = ('rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')\n"
+        "required_yarn = ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx')\n"
         "if yarn_source != 'unsupported' and all(constructor_support.get(name) for name in required_yarn):\n"
         "    qwen_yarn_support = 'supported'\n"
         "elif not signature_inspectable:\n"
@@ -1846,6 +1850,15 @@ def _sanitize_error_summary(message):
         return type(message).__name__ + ':unsupported_kwarg'
     return type(message).__name__ + ':redacted'
 
+def _safe_plain_completion_eval_return_code(exc):
+    match = re.search("llama_decode\\\\s+returned\\\\s+(-?\\\\d+)", str(exc or ''), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
 def _classify_generation_exception(exc):
     text = str(exc or '').lower()
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
@@ -1925,6 +1938,8 @@ def _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prom
         'plain_completion_prompt_tokenization_token_counts': '',
         'plain_completion_prompt_tokenization_special_values': '',
         'plain_completion_prompt_tokenization_selected_variant': '',
+        'plain_completion_prompt_tokenization_selected_token_count': 0,
+        'plain_completion_prompt_tokenization_selected_special': None,
     }
     tokenize = getattr(llama, 'tokenize', None)
     if not callable(tokenize):
@@ -1988,6 +2003,8 @@ def _tokenize_rendered_prompt_variants_for_plain_completion(llama, rendered_prom
             'plain_completion_prompt_tokenization_token_counts': ','.join(str(v['token_count']) for v in variants),
             'plain_completion_prompt_tokenization_special_values': ','.join('none' if v['special'] is None else str(v['special']).lower() for v in variants),
             'plain_completion_prompt_tokenization_selected_variant': variants[0]['tokenization_variant_id'],
+            'plain_completion_prompt_tokenization_selected_token_count': variants[0]['token_count'],
+            'plain_completion_prompt_tokenization_selected_special': variants[0]['special'],
         })
     else:
         diagnostics['plain_completion_prompt_tokenization_error_category'] = last_category
@@ -2147,6 +2164,8 @@ def _safe_request_error(reason, *, request=None, exc=None, extra=None):
             'plain_completion_prompt_tokenization_token_counts',
             'plain_completion_prompt_tokenization_special_values',
             'plain_completion_prompt_tokenization_selected_variant',
+            'plain_completion_prompt_tokenization_selected_token_count',
+            'plain_completion_prompt_tokenization_selected_special',
             'plain_completion_attempt_methods',
             'plain_completion_attempt_categories',
             'plain_completion_attempt_exception_types',
@@ -2861,6 +2880,9 @@ for line in sys.stdin:
                         'sanitized_error_summary': _sanitize_error_summary(exc),
                         'tokenization_variant_id': tokenization_variant_id,
                     })
+                    return_code = _safe_plain_completion_eval_return_code(exc)
+                    if return_code is not None:
+                        plain_capabilities['plain_completion_eval_return_code'] = return_code
                     if category not in fatal_plain_completion_categories and _reset_plain_completion_state(llama):
                         plain_capabilities['plain_completion_reset_after_failure_count'] += 1
                     return None, exc
@@ -2911,6 +2933,8 @@ for line in sys.stdin:
                     rendered_prompt_token_ids = tokenization_variant['tokens']
                     variant_id = tokenization_variant['tokenization_variant_id']
                     plain_capabilities['plain_completion_prompt_tokenization_selected_variant'] = variant_id
+                    plain_capabilities['plain_completion_prompt_tokenization_selected_token_count'] = tokenization_variant['token_count']
+                    plain_capabilities['plain_completion_prompt_tokenization_selected_special'] = tokenization_variant['special']
                     result, completion_error = _attempt_plain_completion(
                         'create_completion_keyword_token_ids',
                         ['max_tokens', 'prompt'],
@@ -2975,7 +2999,7 @@ for line in sys.stdin:
                             chat_fallback_category = attempts[-1].get('generation_exception_category', 'worker_exception')
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
-                        completion_error = RuntimeError('unsupported_generation_kwarg')
+                        chat_fallback_category = 'unsupported_generation_kwarg'
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)
@@ -3781,7 +3805,7 @@ class ModelManager:
                 'parent_facade_type': yarn_probe.get('parent_facade_type'),
                 'child_probe_reprobe_attempted': yarn_probe.get('child_probe_reprobe_attempted'),
                 'constructor_kwargs_attempted': (
-                    ['rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx']
+                    ['rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx']
                     if yarn_probe.get('supported') else []
                 ),
             }
@@ -3801,11 +3825,43 @@ class ModelManager:
                 raise RuntimeError(
                     f'{QWEN_64K_YARN_UNSUPPORTED_MESSAGE}; {safe_diagnostics}'
                 )
+            try:
+                original_context_tokens = int(rope_policy['original_context_tokens'])
+                requested_context_tokens = int(n_ctx)
+                configured_multiplier = float(rope_policy['factor'])
+                computed_multiplier = requested_context_tokens / original_context_tokens
+                rope_freq_scale = 1.0 / configured_multiplier
+            except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+                self.last_yarn_rope_diagnostics['qwen_yarn_configuration_valid'] = False
+                self.last_yarn_rope_diagnostics['missing_reason'] = 'runtime_qwen_64k_yarn_configuration_invalid'
+                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid') from exc
+            configuration_valid = (
+                original_context_tokens == 32768
+                and requested_context_tokens == 65536
+                and original_context_tokens > 0
+                and requested_context_tokens > original_context_tokens
+                and math.isfinite(configured_multiplier)
+                and configured_multiplier > 1.0
+                and math.isclose(configured_multiplier, computed_multiplier, rel_tol=1e-12, abs_tol=1e-12)
+                and math.isclose(rope_freq_scale, 0.5, rel_tol=1e-12, abs_tol=1e-12)
+            )
+            self.last_yarn_rope_diagnostics.update({
+                'qwen_yarn_requested_context_tokens': requested_context_tokens,
+                'qwen_yarn_original_context_tokens': original_context_tokens,
+                'qwen_yarn_context_multiplier': configured_multiplier,
+                'qwen_yarn_rope_freq_scale': rope_freq_scale,
+                'qwen_yarn_ext_factor_overridden': False,
+                'qwen_yarn_rope_scaling_type_source': yarn_probe.get('yarn_resolver_source'),
+                'qwen_yarn_configuration_valid': configuration_valid,
+            })
+            if not configuration_valid:
+                self.last_yarn_rope_diagnostics['missing_reason'] = 'runtime_qwen_64k_yarn_configuration_invalid'
+                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid')
             kwargs.update(
                 {
                     'rope_scaling_type': yarn_probe['yarn_enum_value'],
-                    'yarn_ext_factor': float(rope_policy.get('factor', 2.0)),
-                    'yarn_orig_ctx': int(rope_policy.get('original_context_tokens', native_context)),
+                    'rope_freq_scale': rope_freq_scale,
+                    'yarn_orig_ctx': original_context_tokens,
                 }
             )
             if runtime_profile is None:
@@ -4206,10 +4262,9 @@ class ModelManager:
                                             profile_diag.get('memory_estimate')
                                             if isinstance(profile_diag, dict) else {}
                                         ),
-                                        'child_stderr_tail': _sanitize_child_diagnostic_text(init_exc),
                                         'attempted_runtime_kwargs': {
                                             key: runtime_kwargs.get(key)
-                                            for key in ('n_ctx', 'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch', 'rope_scaling_type', 'yarn_ext_factor', 'yarn_orig_ctx')
+                                            for key in ('n_ctx', 'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch', 'rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx')
                                             if key in runtime_kwargs
                                         },
                                     }
@@ -4267,8 +4322,9 @@ class ModelManager:
                                     int(self.model_profile.get('maximum_validated_context_tokens') or runtime_kwargs.get('n_ctx')),
                                     int(runtime_kwargs.get('n_ctx') or 0),
                                 ),
-                                'rope_yarn_enabled': 'yarn_ext_factor' in runtime_kwargs,
-                                'rope_yarn_factor': runtime_kwargs.get('yarn_ext_factor'),
+                                'rope_yarn_enabled': 'rope_freq_scale' in runtime_kwargs,
+                                'rope_yarn_factor': rope_policy.get('factor'),
+                                'rope_freq_scale': runtime_kwargs.get('rope_freq_scale'),
                                 'yarn_original_context': runtime_kwargs.get('yarn_orig_ctx') or rope_policy.get('original_context_tokens'),
                             })
                             memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)

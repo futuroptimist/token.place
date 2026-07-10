@@ -3000,8 +3000,7 @@ for line in sys.stdin:
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
                         chat_fallback_category = 'unsupported_generation_kwarg'
-                        if completion_error is None:
-                            completion_error = RuntimeError('unsupported_generation_kwarg')
+                        completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)
@@ -3011,7 +3010,13 @@ for line in sys.stdin:
                     'method': attempts[-1].get('method') if attempts else 'create_completion_from_rendered_prompt',
                     'attempted_plain_completion_methods': ','.join(item.get('method', '') for item in attempts if item.get('method')),
                     'attempted_generation_kwargs': ','.join(sorted(set(','.join(item.get('attempted_kwarg_names', '') for item in attempts).split(',')) - {''})),
-                    'generation_exception_category': last_invalid_reason or (attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception'),
+                    'generation_exception_category': (
+                        chat_fallback_category
+                        if last_invalid_reason is None
+                        and plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
+                        and chat_fallback_category == 'unsupported_generation_kwarg'
+                        else last_invalid_reason or (attempts[-1].get('generation_exception_category', 'worker_exception') if attempts else 'worker_exception')
+                    ),
                     'rejected_generation_kwarg': attempts[-1].get('rejected_generation_kwarg', '') if attempts else '',
                 })
                 _emit(_safe_request_error('inference_exception', request=request, exc=completion_error, extra=extra))

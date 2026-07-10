@@ -7837,6 +7837,53 @@ def test_llama_worker_high_level_qwen_fallback_rejects_missing_chat_template_kwa
     assert not calls_file.exists()
 
 
+
+def test_llama_worker_high_level_qwen_fallback_missing_chat_reports_unsupported_operation(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'high level fallback missing chat fake site'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False, **kwargs):\n"
+        "        return '<qwen>'\n"
+        "    def tokenize(self, payload, add_bos=False, special=False):\n"
+        "        return [1, 2, 3]\n"
+        "    def create_completion(self, *args, **kwargs):\n"
+        "        raise RuntimeError('llama_decode returned -1')\n"
+        "    def __call__(self, prompt, **kwargs):\n"
+        "        raise RuntimeError('llama_decode returned -1')\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'mock.gguf'), timeout_seconds=5)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as exc_info:
+            proxy.create_chat_completion_from_rendered_prompt(
+                [{'role': 'user', 'content': 'secret prompt text'}],
+                max_tokens=4,
+                token_place_provider='qwen',
+                token_place_template_policy='gguf-jinja',
+                enable_thinking=False,
+            )
+    finally:
+        proxy.close()
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics['qwen_high_level_chat_fallback_attempted'] is True
+    assert diagnostics['qwen_high_level_chat_fallback_supported'] is False
+    assert diagnostics['qwen_high_level_chat_fallback_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['generation_exception_category'] == 'unsupported_generation_kwarg'
+    assert diagnostics['plain_completion_eval_return_code'] == -1
+    diagnostics_dump = json.dumps(diagnostics)
+    assert 'secret prompt text' not in diagnostics_dump
+    assert 'llama_decode returned -1' not in diagnostics_dump
+
 def test_llama_worker_high_level_qwen_fallback_rejects_nonempty_think_content(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

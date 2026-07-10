@@ -1851,7 +1851,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''))
+    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -3035,13 +3035,6 @@ for line in sys.stdin:
                             plain_capabilities['qwen_high_level_chat_fallback_rejected_kwarg'] = attempts[-1].get('rejected_generation_kwarg', '')
                     else:
                         chat_fallback_category = 'unsupported_generation_kwarg'
-                if (
-                    chat_fallback_category == 'unsupported_generation_kwarg'
-                    and not chat_fallback_invoked
-                    and not primary_failure_exists
-                    and completion_error is None
-                ):
-                    completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 plain_capabilities['qwen_high_level_chat_fallback_category'] = chat_fallback_category
             if result is None:
                 extra = dict(render_diagnostics)
@@ -3059,10 +3052,11 @@ for line in sys.stdin:
                     and not chat_fallback_invoked
                     and not primary_failure_exists
                 )
-                if preserve_primary_failure and primary_completion_error is not None:
-                    completion_error = primary_completion_error
-                if preserve_primary_failure and primary_eval_return_code is not None:
-                    plain_capabilities['plain_completion_eval_return_code'] = primary_eval_return_code
+                if preserve_primary_failure:
+                    if primary_completion_error is not None:
+                        completion_error = primary_completion_error
+                    if primary_eval_return_code is not None:
+                        plain_capabilities['plain_completion_eval_return_code'] = primary_eval_return_code
                 if unsupported_chat_fallback_is_terminal and completion_error is None:
                     completion_error = RuntimeError('unsupported option: chat_template_kwargs')
                 extra.update({

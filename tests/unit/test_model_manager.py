@@ -5026,6 +5026,51 @@ def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     assert manager.last_compute_diagnostics['yarn_rope_enum_location'] == 'top_level_enum'
 
 
+def test_qwen_64k_runtime_rejects_malformed_yarn_policy_before_probe(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    manager.model_profile = dict(manager.model_profile)
+    manager.model_profile['rope_scaling_policy'] = dict(manager.model_profile['rope_scaling_policy'])
+    del manager.model_profile['rope_scaling_policy']['original_context_tokens']
+
+    class FakeLlama:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('constructor must not be called when YaRN config is malformed')
+
+    with patch(
+        'utils.llm.model_manager._runtime_supports_qwen_yarn_rope',
+        side_effect=AssertionError('capability probe must not run for malformed YaRN config'),
+    ):
+        with pytest.raises(RuntimeError, match='runtime_qwen_64k_yarn_configuration_invalid'):
+            manager._runtime_init_kwargs(
+                FakeLlama,
+                0,
+                SimpleNamespace(Llama=FakeLlama, LLAMA_ROPE_SCALING_TYPE_YARN=2),
+                None,
+            )
+
+    assert manager.last_yarn_rope_diagnostics == {
+        'active_profile_id': 'qwen3-8b-q4-k-m',
+        'active_context_tier': '64k-full',
+        'requested_n_ctx': 65536,
+        'qwen_yarn_configuration_valid': False,
+        'missing_reason': 'runtime_qwen_64k_yarn_configuration_invalid',
+    }
+
+
 def test_qwen_64k_runtime_resolves_nested_yarn_enum(tmp_path):
     from utils.context_profiles import apply_context_profile
     captured = {}

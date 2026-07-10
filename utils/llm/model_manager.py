@@ -3889,9 +3889,6 @@ class ModelManager:
                 'qwen_yarn_rope_scaling_type_source': yarn_probe.get('yarn_resolver_source'),
                 'qwen_yarn_configuration_valid': configuration_valid,
             })
-            if not configuration_valid:
-                self.last_yarn_rope_diagnostics['missing_reason'] = 'runtime_qwen_64k_yarn_configuration_invalid'
-                raise RuntimeError('runtime_qwen_64k_yarn_configuration_invalid')
             kwargs.update(
                 {
                     'rope_scaling_type': yarn_probe['yarn_enum_value'],

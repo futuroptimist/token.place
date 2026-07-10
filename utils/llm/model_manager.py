@@ -1851,7 +1851,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode\\s+returned\\s+(-?\\d+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -3007,8 +3007,7 @@ for line in sys.stdin:
                 extra.update(plain_capabilities)
                 extra.update(_plain_attempt_diagnostics())
                 if (
-                    last_invalid_reason is None
-                    and plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
+                    plain_capabilities.get('qwen_high_level_chat_fallback_attempted')
                     and chat_fallback_category == 'unsupported_generation_kwarg'
                 ):
                     completion_error = RuntimeError('unsupported option: chat_template_kwargs')

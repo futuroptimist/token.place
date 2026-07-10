@@ -155,7 +155,7 @@ The intended Qwen profile is:
 | Maximum validated context tokens | `131072` at model-card level; token.place validates only `65536` in this arc |
 | Supported token.place tiers | `8k-fast`, `64k-full` |
 | Default API v1 mode | non-thinking / non-reasoning |
-| Context extension policy | no YaRN at or below native context; YaRN/RoPE for `64k-full` with factor `2.0`, original context `32768` |
+| Context extension policy | no YaRN at or below native context; YaRN/RoPE for `64k-full` with model-profile context multiplier `factor=2.0`, original context `32768`; llama.cpp `--rope-scale 2` maps to llama-cpp-python `rope_freq_scale=0.5`, not `yarn_ext_factor` |
 | Chat-template policy | Qwen/GGUF Jinja template or verified Qwen llama-cpp-python handler; never `llama-3` |
 | Compatibility alias plan | During P23d, accept `llama-3.1-8b-instruct` as an intentional transition alias to the active canonical Qwen profile, unless maintainers choose a tested hard cut |
 
@@ -423,8 +423,10 @@ staging:
 - Output validation tests prove responses containing `<think>` are rejected or
   safely handled and never forwarded as assistant content.
 - Qwen `8k-fast` tests prove no YaRN/RoPE scaling is enabled.
-- Qwen `64k-full` tests prove YaRN/RoPE factor `2.0`, original context `32768`,
-  target context `65536`, and safe diagnostics are configured.
+- Qwen `64k-full` tests prove YaRN/RoPE context multiplier `factor=2.0`,
+  original context `32768`, target context `65536`, translated
+  `rope_freq_scale=0.5`, no `yarn_ext_factor` override, and safe diagnostics are
+  configured.
 - Boundary admission tests cover exact `64k-full` edges at `65535` and `65536`
   tokens to catch llama-cpp-python YaRN/RoPE rounding, truncation, or off-by-one
   behavior at the effective tier limit.
@@ -491,7 +493,7 @@ staging:
    - native context,
    - chat template mode,
    - thinking disabled/enforced,
-   - YaRN/RoPE enabled boolean, factor, original context,
+   - YaRN/RoPE enabled boolean, context multiplier, `rope_freq_scale`, original context,
    - backend/offload class.
 6. After token.place staging is healthy, merge P23e in DSPACE.
 7. Add P23f ad-hoc smoke script and rollback runbook.

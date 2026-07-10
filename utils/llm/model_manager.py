@@ -1851,7 +1851,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode\\s+returned\\s+(-?\\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode[ \\t\\r\\n]+returned[ \\t\\r\\n]+(-?[0-9]+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:

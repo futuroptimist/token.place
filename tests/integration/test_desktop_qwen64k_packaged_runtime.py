@@ -246,8 +246,24 @@ def _model_manager(runtime):
     manager.context_window_tokens = 65536
     manager.api_model_id = "qwen3-8b-instruct"
     manager.create_chat_completion_with_recovery = None
-    manager.last_yarn_rope_diagnostics = {"supported": True, "yarn_resolver_source": "test"}
-    manager.last_compute_diagnostics = {"n_ctx": 65536, "kv_cache_mode": {"type_k": 8, "type_v": 8}}
+    manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "yarn_resolver_source": "test",
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+        "qwen_yarn_context_multiplier": 2.0,
+        "qwen_yarn_rope_freq_scale": 0.5,
+        "qwen_yarn_ext_factor_overridden": False,
+        "qwen_yarn_rope_scaling_type_source": "enum",
+        "qwen_yarn_configuration_valid": True,
+    }
+    manager.last_compute_diagnostics = {
+        "n_ctx": 65536,
+        "kv_cache_mode": {"type_k": 8, "type_v": 8},
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 50,
+        "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": False,
+    }
     manager.get_llm_instance.return_value = runtime
     return manager
 
@@ -656,5 +672,14 @@ def test_qwen64k_yarn_rope_freq_scale_fix_reproduces_old_decode_failure_and_pass
     assert diagnostics['api_v1_runtime_ready'] is True
     assert diagnostics['api_v1_readiness_completion_smoke_result'] == 'passed'
     assert diagnostics['api_v1_readiness_result'] == 'passed'
+    assert diagnostics['api_v1_readiness_yarn_requested_context_tokens'] == 65536
+    assert diagnostics['api_v1_readiness_yarn_original_context_tokens'] == 32768
+    assert diagnostics['api_v1_readiness_yarn_context_multiplier'] == 2.0
+    assert diagnostics['api_v1_readiness_yarn_rope_freq_scale'] == 0.5
+    assert diagnostics['api_v1_readiness_yarn_ext_factor_overridden'] is False
+    assert diagnostics['api_v1_readiness_yarn_configuration_valid'] is True
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant'] == 'tokenize_add_bos_false_special_false'
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count'] == 50
+    assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special'] is False
     for value in diagnostics.values():
         assert not (isinstance(value, str) and any(marker in value for marker in UNSAFE_READINESS_SENTINELS))

@@ -6399,14 +6399,22 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
         "plain_completion_prompt_tokenization_method": "llama.tokenize",
         "plain_completion_prompt_tokenization_special": True,
         "plain_completion_prompt_tokenization_error_category": "prompt_tokenization_failure",
+        "plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_true",
+        "plain_completion_prompt_tokenization_selected_token_count": 28,
+        "plain_completion_prompt_tokenization_selected_special": True,
         "qwen_api_v1_non_thinking_template_fallback": False,
         "prompt": "SECRET prompt",
         "rendered_prompt": "SECRET rendered prompt",
         "token_ids": [1, 2, 3],
         "assistant_output": "SECRET output",
+        "model_output": "SECRET model output",
+        "reasoning_content": "SECRET reasoning",
+        "decrypted_payload": "SECRET payload",
         "key": "SECRET key",
+        "api_key": "SECRET api key",
         "tool_args": {"secret": True},
         "ciphertext": "SECRET ciphertext",
+        "raw_exception": "llama_decode returned -1 SECRET",
     }
     manager.runtime.create_chat_completion.side_effect = LlamaCppInferenceRequestError(
         "llama_cpp request failed",
@@ -6423,7 +6431,20 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
 
     error = envelope["api_v1_response"]["error"]
     for key, value in worker_diagnostics.items():
-        if key in {"prompt", "rendered_prompt", "token_ids", "assistant_output", "key", "tool_args", "ciphertext"}:
+        if key in {
+            "prompt",
+            "rendered_prompt",
+            "token_ids",
+            "assistant_output",
+            "model_output",
+            "reasoning_content",
+            "decrypted_payload",
+            "key",
+            "api_key",
+            "tool_args",
+            "ciphertext",
+            "raw_exception",
+        }:
             continue
         assert error["worker_diagnostics"].get(key) == value
     for key in (
@@ -6440,6 +6461,9 @@ def test_api_v1_runtime_error_promotes_plain_completion_capability_diagnostics()
         "plain_completion_prompt_tokenization_method",
         "plain_completion_prompt_tokenization_special",
         "plain_completion_prompt_tokenization_error_category",
+        "plain_completion_prompt_tokenization_selected_variant",
+        "plain_completion_prompt_tokenization_selected_token_count",
+        "plain_completion_prompt_tokenization_selected_special",
         "qwen_api_v1_non_thinking_template_fallback",
     ):
         assert error[key] == worker_diagnostics[key]
@@ -6484,6 +6508,8 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
         "plain_completion_prompt_tokenization_token_counts": "50,28",
         "plain_completion_prompt_tokenization_special_values": "false,none,true",
         "plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+        "plain_completion_prompt_tokenization_selected_token_count": 28,
+        "plain_completion_prompt_tokenization_selected_special": True,
         "plain_completion_attempt_methods": "create_completion_keyword_prompt,create_completion_keyword_token_ids",
         "plain_completion_attempt_categories": "prompt_eval_failure,prompt_eval_decode_failure",
         "plain_completion_attempt_exception_types": "RuntimeError,TypeError",

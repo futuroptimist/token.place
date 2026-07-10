@@ -2611,3 +2611,21 @@ def test_completion_smoke_diagnostic_sanitizer_allows_qwen_plain_completion_vari
     assert "SECRET_PROMPT" not in json.dumps(safe)
     assert compute_node_runtime._COMPLETION_SMOKE_REASON_BY_CATEGORY["prompt_eval_decode_failure"] == "runtime_completion_smoke_plain_completion_decode_failure"
     assert compute_node_runtime._COMPLETION_SMOKE_REASON_BY_CATEGORY["prompt_eval_backend_failure"] == "runtime_completion_smoke_plain_completion_backend_failure"
+
+
+def test_compute_node_runtime_has_single_authoritative_yarn_original_context_assignment():
+    import ast
+    from pathlib import Path
+
+    source = Path("utils/compute_node_runtime.py").read_text()
+    tree = ast.parse(source)
+    matching_dicts = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = [key.value for key in node.keys if isinstance(key, ast.Constant)]
+        count = keys.count("api_v1_readiness_yarn_original_context_tokens")
+        if count:
+            matching_dicts.append(count)
+    assert matching_dicts
+    assert all(count == 1 for count in matching_dicts)

@@ -4825,6 +4825,15 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
             'api_v1_readiness_completion_smoke_plain_completion_eval_return_code': 1,
             'api_v1_readiness_completion_smoke_exception_type': 'RuntimeError',
             'api_v1_readiness_completion_smoke_result_shape': 'dict_malformed',
+            'api_v1_readiness_yarn_requested_context_tokens': 65536,
+            'api_v1_readiness_yarn_original_context_tokens': 32768,
+            'api_v1_readiness_yarn_context_multiplier': 2.0,
+            'api_v1_readiness_yarn_rope_freq_scale': 0.5,
+            'api_v1_readiness_yarn_ext_factor_overridden': False,
+            'api_v1_readiness_yarn_rope_scaling_type_source': 'enum',
+            'api_v1_readiness_yarn_configuration_valid': True,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count': 3,
+            'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special': None,
             'prompt': 'SECRET_PROMPT',
             'rendered_prompt': '<|im_start|>SECRET_PROMPT',
             'assistant_output': 'SECRET_OUTPUT',
@@ -4856,6 +4865,15 @@ def test_safe_readiness_diagnostics_allowlists_scalar_fields_and_drops_unsafe_fi
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count'] == 3
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values'] == 'false,none,true'
     assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant'] == 'tokenize_add_bos_false_no_special'
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count'] == 3
+    assert safe['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special'] is None
+    assert safe['api_v1_readiness_yarn_requested_context_tokens'] == 65536
+    assert safe['api_v1_readiness_yarn_original_context_tokens'] == 32768
+    assert safe['api_v1_readiness_yarn_context_multiplier'] == 2.0
+    assert safe['api_v1_readiness_yarn_rope_freq_scale'] == 0.5
+    assert safe['api_v1_readiness_yarn_ext_factor_overridden'] is False
+    assert safe['api_v1_readiness_yarn_rope_scaling_type_source'] == 'enum'
+    assert safe['api_v1_readiness_yarn_configuration_valid'] is True
     assert safe['api_v1_readiness_completion_smoke_plain_completion_attempt_methods'].endswith('create_chat_completion_qwen_non_thinking')
     assert safe['api_v1_readiness_completion_smoke_plain_completion_attempt_count'] == 3
     assert safe['api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_attempted'] is True
@@ -4880,6 +4898,15 @@ def test_warm_load_failure_stderr_includes_safe_readiness_diagnostics(capsys, mo
                 'api_v1_readiness_completion_smoke_exception_type': 'LlamaCppInferenceRequestError',
                 'api_v1_readiness_completion_smoke_safe_summary': 'plain_completion_worker_exception',
                 'api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg': True,
+                'api_v1_readiness_yarn_requested_context_tokens': 65536,
+                'api_v1_readiness_yarn_original_context_tokens': 32768,
+                'api_v1_readiness_yarn_context_multiplier': 2.0,
+                'api_v1_readiness_yarn_rope_freq_scale': 0.5,
+                'api_v1_readiness_yarn_ext_factor_overridden': False,
+                'api_v1_readiness_yarn_rope_scaling_type_source': 'enum',
+                'api_v1_readiness_yarn_configuration_valid': True,
+                'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count': 28,
+                'api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special': True,
                 'prompt': 'SECRET_PROMPT',
                 'api_v1_readiness_completion_smoke_internal_reason': 'unsafe free text prompt',
             }
@@ -4899,6 +4926,14 @@ def test_warm_load_failure_stderr_includes_safe_readiness_diagnostics(capsys, mo
     assert "api_v1_readiness_completion_smoke_generation_exception_category=worker_exception" in err
     assert "api_v1_readiness_completion_smoke_exception_type=LlamaCppInferenceRequestError" in err
     assert "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg=true" in err
+    assert "api_v1_readiness_yarn_requested_context_tokens=65536" in err
+    assert "api_v1_readiness_yarn_original_context_tokens=32768" in err
+    assert "api_v1_readiness_yarn_context_multiplier=2.0" in err
+    assert "api_v1_readiness_yarn_rope_freq_scale=0.5" in err
+    assert "api_v1_readiness_yarn_ext_factor_overridden=false" in err
+    assert "api_v1_readiness_yarn_configuration_valid=true" in err
+    assert "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count=28" in err
+    assert "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special=true" in err
     assert "SECRET_PROMPT" not in err
     assert "unsafe free text prompt" not in err
 

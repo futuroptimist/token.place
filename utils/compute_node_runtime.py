@@ -821,14 +821,13 @@ class ComputeNodeRuntime:
             "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get("supported"),
             "api_v1_readiness_yarn_rope_missing_reason": yarn_diagnostics.get("missing_reason"),
             "api_v1_readiness_yarn_rope_factor": rope_policy.get("factor"),
-            "api_v1_readiness_yarn_original_context_tokens": rope_policy.get(
-                "original_context_tokens"
-            ),
             "api_v1_readiness_yarn_requested_context_tokens": yarn_diagnostics.get(
                 "qwen_yarn_requested_context_tokens"
             ),
-            "api_v1_readiness_yarn_original_context_tokens": yarn_diagnostics.get(
-                "qwen_yarn_original_context_tokens"
+            "api_v1_readiness_yarn_original_context_tokens": (
+                yarn_diagnostics.get("qwen_yarn_original_context_tokens")
+                if yarn_diagnostics.get("qwen_yarn_original_context_tokens") is not None
+                else rope_policy.get("original_context_tokens")
             ),
             "api_v1_readiness_yarn_context_multiplier": yarn_diagnostics.get(
                 "qwen_yarn_context_multiplier"

@@ -6614,6 +6614,159 @@ def test_subprocess_proxy_close_ignores_temp_worker_unlink_failure(monkeypatch):
     assert proxy._worker_tmpfile is None
 
 
+
+def test_safe_metal_backend_failure_classifier_covers_recoverable_categories():
+    from utils.llm import model_manager as model_manager_module
+
+    cases = [
+        (["Metal backend is in error state has_error"], "metal_backend_sticky_error", None),
+        (["Metal command buffer page fault status 5"], "metal_command_buffer_page_fault", 5),
+        (["Metal command buffer timed out status 3"], "metal_command_buffer_timeout", 3),
+        (["Metal command buffer out of memory"], "metal_command_buffer_out_of_memory", None),
+        (["Metal command buffer completed with status 9"], "metal_command_buffer_execution_failure", 9),
+        (["ggml_metal_graph_compute failed"], "metal_graph_compute_failed", None),
+        (["memory_context_apply failed on metal"], "memory_context_apply_failed", None),
+        (["metal graph initialization fail"], "graph_initialization_failed", None),
+        (["metal unknown backend diagnostic"], "unknown_metal_backend_failure", None),
+    ]
+
+    for lines, category, status in cases:
+        diagnostics = model_manager_module._classify_safe_metal_backend_failure(lines)
+        assert diagnostics["plain_completion_metal_error_category"] == category
+        if status is not None:
+            assert diagnostics["plain_completion_metal_command_buffer_status"] == status
+        if category in {
+            "metal_backend_sticky_error",
+            "metal_command_buffer_out_of_memory",
+            "metal_command_buffer_timeout",
+            "metal_command_buffer_page_fault",
+            "metal_command_buffer_execution_failure",
+            "metal_graph_compute_failed",
+        }:
+            assert diagnostics["plain_completion_backend_state_sticky"] is True
+            assert diagnostics["plain_completion_backend_recreation_required"] is True
+
+    assert model_manager_module._classify_safe_metal_backend_failure([]) == {}
+    assert model_manager_module._classify_safe_metal_backend_failure(["ordinary warning"]) == {}
+
+
+def test_subprocess_proxy_stderr_cursor_supports_monotonic_and_legacy_tails():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._process = SimpleNamespace(_token_place_stderr_sequence=101, _token_place_stderr_tail=[
+        (99, "old capped line"),
+        (100, "cursor line"),
+        (101, "new command buffer failed"),
+    ])
+
+    assert proxy._stderr_cursor() == 101
+    assert proxy._stderr_since(100) == ["new command buffer failed"]
+
+    proxy._process._token_place_stderr_tail = ["legacy first", "legacy second"]
+    assert proxy._stderr_since(0) == ["legacy first", "legacy second"]
+    assert proxy._stderr_since(2) == []
+
+    proxy._process._token_place_stderr_tail = None
+    assert proxy._stderr_since(0) == []
+
+
+def test_subprocess_proxy_adds_request_scoped_metal_diagnostics_outside_lock(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class TrackingLock:
+        def __init__(self):
+            self.held = False
+            self.sleep_held = None
+        def __enter__(self):
+            self.held = True
+            return self
+        def __exit__(self, *_args):
+            self.held = False
+            return False
+
+    class FakeProcess:
+        stdin = SimpleNamespace(write=lambda *_args: None, flush=lambda *_args: None)
+
+    for method_name in ("create_chat_completion", "create_chat_completion_from_rendered_prompt"):
+        lock = TrackingLock()
+        proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+        proxy._closed = False
+        proxy._lock = lock
+        proxy._process = FakeProcess()
+        proxy._stderr_cursor = MagicMock(return_value=7)
+        proxy._stderr_since = MagicMock(return_value=["Metal command buffer out of memory status 11"])
+        proxy.assert_healthy = MagicMock()
+
+        error = model_manager_module.LlamaCppInferenceRequestError("llama_cpp request failed", diagnostics={})
+        monkeypatch.setattr(model_manager_module, "_read_llama_subprocess_message", MagicMock(side_effect=error))
+        monkeypatch.setattr(model_manager_module, "_llama_cpp_subprocess_inference_timeout_seconds", lambda: 1)
+        def fake_sleep(_seconds):
+            lock.sleep_held = lock.held
+        monkeypatch.setattr(model_manager_module.time, "sleep", fake_sleep)
+
+        with pytest.raises(model_manager_module.LlamaCppInferenceRequestError) as raised:
+            getattr(proxy, method_name)([{"role": "user", "content": "hi"}])
+
+        assert lock.sleep_held is False
+        assert raised.value.diagnostics["plain_completion_metal_error_category"] == "metal_command_buffer_out_of_memory"
+        assert raised.value.diagnostics["plain_completion_backend_failure_category"] == "metal_command_buffer_out_of_memory"
+        assert raised.value.diagnostics["plain_completion_metal_command_buffer_status"] == 11
+        proxy._stderr_since.assert_called_once_with(7)
+
+
+def test_qwen_64k_readiness_recovery_rejects_unsafe_or_stale_runtime():
+    manager = object.__new__(ModelManager)
+    failed_runtime = MagicMock()
+    manager.llm_lock = threading.RLock()
+    manager.llm = failed_runtime
+    manager.model_profile = {"provider": "qwen"}
+    manager.context_tier = "64k-full"
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager.worker_restart_count = 0
+    manager._llm_generation = 0
+    manager._qwen_64k_profile_recovery_count = 0
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_runtime_profiles = [{"profile_id": "only"}]
+    manager._close_llm_proxy = MagicMock()
+    manager.get_llm_instance = MagicMock()
+
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "not_recoverable",
+    ) is None
+    manager.model_profile = {"provider": "llama"}
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_decode_failure",
+    ) is None
+    manager.model_profile = {"provider": "qwen"}
+    manager.context_tier = "8k-fast"
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_decode_failure",
+    ) is None
+    manager.context_tier = "64k-full"
+    manager.llm = object()
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_decode_failure",
+    ) is None
+
+    manager.llm = failed_runtime
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_decode_failure",
+        decode_return_code=-4,
+    ) is None
+    manager._close_llm_proxy.assert_called_once_with(failed_runtime)
+    manager.get_llm_instance.assert_not_called()
+    assert manager.last_plain_completion_eval_return_code == -4
+
+
 def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypatch):
     for category, decode_return_code in (("decode_aborted", 2), ("backend_decode_failure", -4)):
         manager = object.__new__(ModelManager)

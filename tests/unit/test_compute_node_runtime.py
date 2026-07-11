@@ -2370,6 +2370,48 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     assert "SECRET" not in json.dumps(diagnostics)
 
 
+def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
+    failed_runtime = _Qwen64kRuntime()
+    recovered_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.get_llm_instance.side_effect = [failed_runtime, recovered_runtime]
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = recovered_runtime
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": "runtime_completion_smoke_metal_memory_allocation",
+                    "exception_category": "runtime_metal_memory_allocation",
+                    "worker_diagnostics": {
+                        "generation_exception_category": "metal_memory_allocation",
+                        "plain_completion_backend_failure_category": "metal_command_buffer_out_of_memory",
+                        "plain_completion_eval_return_code": -3,
+                        "exception_type": "RuntimeError",
+                        "sanitized_error_summary": "RuntimeError:redacted",
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once_with(
+        failed_runtime,
+        "metal_command_buffer_out_of_memory",
+        -3,
+    )
+
+
 def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnostics():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 

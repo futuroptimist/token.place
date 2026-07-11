@@ -81,6 +81,24 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
 
+_QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES = {
+    "backend_allocation_failure",
+    "backend_graph_compute_failure",
+    "metal_graph_compute_failure",
+    "kv_slot_unavailable",
+    "decode_aborted",
+    "backend_decode_failure",
+    "metal_command_buffer_out_of_memory",
+    "metal_command_buffer_timeout",
+    "metal_command_buffer_page_fault",
+    "metal_command_buffer_execution_failure",
+    "metal_backend_sticky_error",
+    "metal_graph_compute_failed",
+    "memory_context_apply_failed",
+    "graph_initialization_failed",
+    "unknown_metal_backend_failure",
+}
+
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "code",
     "reason",
@@ -1307,20 +1325,17 @@ class ComputeNodeRuntime:
                     f"{admission_code} reason={admission_reason}"
                 )
             )
-            recover_category = (
-                diagnostics.get("api_v1_readiness_completion_smoke_generation_exception_category")
-                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category")
-                or diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category")
-            )
+            recover_category = None
+            for candidate in (
+                diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category"),
+                diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category"),
+                diagnostics.get("api_v1_readiness_completion_smoke_generation_exception_category"),
+            ):
+                if candidate in _QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES:
+                    recover_category = candidate
+                    break
             recover = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
-            if callable(recover) and recover_category in {
-                "backend_allocation_failure", "backend_graph_compute_failure", "metal_graph_compute_failure",
-                "kv_slot_unavailable", "decode_aborted", "backend_decode_failure",
-                "metal_command_buffer_out_of_memory", "metal_command_buffer_timeout",
-                "metal_command_buffer_page_fault", "metal_command_buffer_execution_failure", "metal_backend_sticky_error",
-                "metal_graph_compute_failed", "memory_context_apply_failed", "graph_initialization_failed",
-                "unknown_metal_backend_failure",
-            }:
+            if callable(recover) and recover_category:
                 next_runtime = recover(
                     llm_runtime,
                     str(recover_category),

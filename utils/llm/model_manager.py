@@ -1988,7 +1988,7 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 
-def _safe_plain_completion_eval_return_code(exc):
+def _worker_safe_plain_completion_eval_return_code(exc):
     # This helper intentionally mirrors the parent-module parser. It lives
     # inside _LLAMA_CPP_RUNTIME_WORKER_CODE so the standalone subprocess can
     # classify decode return codes without importing parent process helpers;
@@ -2002,7 +2002,7 @@ def _safe_plain_completion_eval_return_code(exc):
         return None
 
 def _decode_return_category(exc):
-    code = _safe_plain_completion_eval_return_code(exc)
+    code = _worker_safe_plain_completion_eval_return_code(exc)
     if code == -1:
         return 'prompt_eval_invalid_batch'
     if code == -2:
@@ -3054,7 +3054,7 @@ for line in sys.stdin:
                         'sanitized_error_summary': _sanitize_error_summary(exc),
                         'tokenization_variant_id': tokenization_variant_id,
                     })
-                    return_code = _safe_plain_completion_eval_return_code(exc)
+                    return_code = _worker_safe_plain_completion_eval_return_code(exc)
                     if return_code is not None:
                         plain_capabilities['plain_completion_eval_return_code'] = return_code
                     if category == 'backend_graph_compute_failure':

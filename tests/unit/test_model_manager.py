@@ -6758,6 +6758,32 @@ def test_decode_return_code_and_worker_status_edge_cases():
     assert model_manager_module._generation_category_for_decode_return_code(2) == "decode_aborted"
     assert model_manager_module._generation_category_for_decode_return_code(-4) == "backend_decode_failure"
     assert model_manager_module._generation_category_for_decode_return_code(0) is None
+    worker_namespace = {}
+    exec(
+        model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE.split(
+            "try:\n    init_line = sys.stdin.readline()",
+            1,
+        )[0],
+        worker_namespace,
+    )
+    assert "_safe_plain_completion_eval_return_code" not in worker_namespace
+    worker_parser = worker_namespace["_worker_safe_plain_completion_eval_return_code"]
+    worker_category = worker_namespace["_decode_return_category"]
+    for text, code, category in (
+        ("llama_decode returned -1", -1, "prompt_eval_invalid_batch"),
+        ("llama_decode returned -2", -2, "backend_allocation_failure"),
+        ("llama_decode returned -3", -3, "backend_graph_compute_failure"),
+        ("llama_decode returned 1", 1, "kv_slot_unavailable"),
+        ("llama_decode returned 2", 2, "decode_aborted"),
+        ("llama_decode returned -4", -4, "backend_decode_failure"),
+        ("unrecognized decode text", None, None),
+    ):
+        assert worker_parser(text) == code
+        assert worker_category(text) == category
+        assert (
+            model_manager_module._generation_category_for_decode_return_code(code)
+            == category
+        )
 
     manager = object.__new__(ModelManager)
     manager.llm_lock = threading.RLock()
@@ -6775,6 +6801,70 @@ def test_decode_return_code_and_worker_status_edge_cases():
     assert status["worker_state"] == "stopped"
     assert status["worker_alive"] is False
     assert status["last_plain_completion_eval_return_code"] == -4
+
+
+def test_qwen_64k_readiness_worker_invalidation_filters_safe_diagnostics(monkeypatch):
+    manager = object.__new__(ModelManager)
+    failed_runtime = MagicMock()
+    stale_runtime = MagicMock()
+    manager.llm_lock = threading.RLock()
+    manager.llm = failed_runtime
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager._qwen_64k_first_readiness_failure_category = None
+    manager._qwen_64k_first_readiness_failure_diagnostics = {}
+    monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
+
+    manager.invalidate_qwen_64k_readiness_failed_worker(
+        failed_runtime,
+        "backend_graph_compute_failure",
+        decode_return_code=-3,
+    )
+    assert manager.llm is failed_runtime
+    manager._close_llm_proxy.assert_not_called()
+
+    manager.invalidate_qwen_64k_readiness_failed_worker(
+        stale_runtime,
+        "backend_decode_failure",
+        decode_return_code=-4,
+    )
+    assert manager.llm is failed_runtime
+    manager._close_llm_proxy.assert_not_called()
+
+    manager.invalidate_qwen_64k_readiness_failed_worker(
+        failed_runtime,
+        "backend_decode_failure",
+        decode_return_code=-4,
+        failure_diagnostics={
+            "method": "create_completion",
+            "backend_failure_category": "backend_decode_failure",
+            "metal_error_category": "metal_backend_sticky_error",
+            "backend_state_sticky": True,
+            "backend_recreation_required": True,
+            "metal_command_buffer_status": "error",
+            "eval_return_code": -4,
+            "prompt": "SECRET",
+        },
+    )
+
+    assert manager.llm is None
+    assert manager.worker_state == "failed"
+    assert manager.last_worker_error_code == "backend_decode_failure"
+    assert manager.last_plain_completion_eval_return_code == -4
+    assert manager._qwen_64k_first_readiness_failure_category == "backend_decode_failure"
+    assert manager._qwen_64k_first_readiness_failure_diagnostics == {
+        "method": "create_completion",
+        "backend_failure_category": "backend_decode_failure",
+        "metal_error_category": "metal_backend_sticky_error",
+        "backend_state_sticky": True,
+        "backend_recreation_required": True,
+        "metal_command_buffer_status": "error",
+        "eval_return_code": -4,
+        "category": "backend_decode_failure",
+    }
+    manager._close_llm_proxy.assert_called_once_with(failed_runtime)
 
 
 def test_subprocess_proxy_stderr_cursor_supports_monotonic_and_legacy_tails():

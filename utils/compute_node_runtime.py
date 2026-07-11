@@ -791,11 +791,20 @@ class ComputeNodeRuntime:
             and getattr(self.model_manager, "context_tier", "8k-fast") == "64k-full"
         )
         profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
-        if callable(profile_budget_fn) and "unittest.mock" not in type(profile_budget_fn).__module__:
+        if callable(profile_budget_fn):
             try:
-                profile_attempt_budget = max(1, int(profile_budget_fn()))
+                budget_result = profile_budget_fn()
             except Exception:
                 profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+            else:
+                if (
+                    isinstance(budget_result, int)
+                    and not isinstance(budget_result, bool)
+                    and budget_result > 0
+                ):
+                    profile_attempt_budget = min(budget_result, 3)
+                else:
+                    profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
         seen_runtime_ids: set[int] = set()
         seen_profile_ids: set[str] = set()
         pending_runtime = None

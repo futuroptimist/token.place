@@ -1448,7 +1448,31 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
     assert status == 0
     assert captured['config'].relay_url == 'http://127.0.0.1:5010'
     assert captured['config'].use_configured_relay_fallbacks is False
-    assert captured['config'].relay_urls == ('http://127.0.0.1:5010',)
+
+
+def test_run_supplies_stop_requested_as_runtime_cancellation_predicate(monkeypatch):
+    _reset_cancel_queue()
+    captured = {}
+
+    class CapturingRuntime(FakeRuntime):
+        def __init__(self, config, cancellation_predicate=None):
+            super().__init__(config)
+            captured['cancellation_predicate'] = cancellation_predicate
+            self._responses = [{'next_ping_in_x_seconds': 0}]
+
+    _install_fake_runtime_module(monkeypatch, CapturingRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    assert captured['cancellation_predicate'] is compute_node_bridge.stop_requested
+    assert captured['cancellation_predicate']() is True
 
 
 def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):

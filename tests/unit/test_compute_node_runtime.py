@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import call, MagicMock
 
@@ -2370,6 +2371,82 @@ class _Qwen64kRuntime(_ReadyRuntime):
         return {"prompt_tokens": 42}
 
 
+def _real_qwen_64k_model_manager(runtimes):
+    from utils.llm.model_manager import ModelManager
+
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = runtimes[0]
+    manager.use_mock_llm = True
+    manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+        "chat_template_policy": "gguf-jinja",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "required_for_tier": "64k-full",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    manager.context_tier = "64k-full"
+    manager.context_window_tokens = 65536
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+    }
+    manager.last_compute_diagnostics = {
+        "active_profile_id": "qwen3-8b-q4-k-m",
+        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+        "n_ctx": 65536,
+        "native_context_tokens": 32768,
+        "kv_cache_mode": {"type_k": 8, "type_v": 8, "flash_attn": True},
+        "backend_used": "metal",
+    }
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_runtime_init_error = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager.worker_restart_count = 0
+    manager._llm_generation = 0
+    manager._qwen_64k_profile_recovery_count = 0
+    manager._qwen_64k_first_readiness_failure_category = None
+    manager._qwen_64k_first_readiness_failure_diagnostics = {}
+    manager._qwen_64k_profile_attempt_ids = ["qwen64k_f16_fa_small_batch"]
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_runtime_profiles = [
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+    ]
+    close_calls = []
+    manager._close_llm_proxy = MagicMock(side_effect=lambda runtime: close_calls.append(runtime))
+    runtime_iter = iter(runtimes[1:])
+
+    def _get_llm_instance():
+        try:
+            replacement = next(runtime_iter)
+        except StopIteration:
+            return None
+        manager._qwen_64k_selected_profile_id = manager._qwen_64k_runtime_profiles[
+            manager._qwen_64k_selected_profile_index
+        ]["profile_id"]
+        manager.llm = replacement
+        manager._qwen_64k_profile_attempt_ids.append(manager._qwen_64k_selected_profile_id)
+        manager.last_compute_diagnostics["qwen_64k_runtime_profile_id"] = manager._qwen_64k_selected_profile_id
+        return replacement
+
+    manager.get_llm_instance = MagicMock(side_effect=_get_llm_instance)
+    manager._test_close_calls = close_calls
+    return manager
+
+
 def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 
@@ -2531,6 +2608,91 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
     model_manager.cancel_qwen_64k_readiness_failed_worker.assert_called_once()
     call = model_manager.cancel_qwen_64k_readiness_failed_worker.call_args
     assert call.args[:3] == (failed_runtime, "decode_aborted", 2)
+
+
+@pytest.mark.parametrize(
+    ("budget_value", "expected_attempts"),
+    [
+        (None, 3),
+        (0, 3),
+        (False, 3),
+        ("3", 3),
+        (99, 3),
+        (2, 2),
+    ],
+)
+def test_qwen_64k_readiness_profile_budget_validation_is_bounded(budget_value, expected_attempts):
+    runtimes = [_Qwen64kRuntime(), _Qwen64kRuntime(), _Qwen64kRuntime()]
+    model_manager = _real_qwen_64k_model_manager(runtimes)
+    if budget_value is None:
+        model_manager.qwen_64k_readiness_profile_attempt_budget = None
+    else:
+        model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(return_value=budget_value)
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_decode_aborted",
+                "worker_diagnostics": {
+                    "generation_exception_category": "decode_aborted",
+                    "plain_completion_eval_return_code": 2,
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    expected_with_fake = min(expected_attempts, 2)
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == expected_with_fake
+    assert len(model_manager._test_close_calls) == expected_with_fake
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count <= 3
+
+
+@pytest.mark.parametrize(
+    ("category", "decode_return_code"),
+    [("decode_aborted", 2), ("backend_decode_failure", -4)],
+)
+def test_qwen_64k_readiness_decode_recovery_uses_real_model_manager_lifecycle(
+    category, decode_return_code
+):
+    failed_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, q8_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": f"runtime_completion_smoke_{category}",
+                    "worker_diagnostics": {
+                        "generation_exception_category": category,
+                        "plain_completion_eval_return_code": decode_return_code,
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count >= 1
 
 
 def test_qwen_64k_readiness_error_marks_profile_failed_and_redacted_summary():

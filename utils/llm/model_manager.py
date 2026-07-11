@@ -20,7 +20,6 @@ import threading
 import sysconfig
 from pathlib import Path
 from threading import Lock
-from unittest.mock import MagicMock
 from typing import Dict, List, Any, Optional, Iterable
 
 from utils.system import resource_monitor
@@ -519,6 +518,27 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'graph_initialization_failed',
     'unknown_metal_backend_failure',
 }
+
+
+class _MockLlamaCallable:
+    def __init__(self) -> None:
+        self.side_effect = None
+        self.return_value = None
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.side_effect is not None:
+            return self.side_effect(*args, **kwargs)
+        return self.return_value
+
+
+class _MockLlamaInstance:
+    """Tiny local mock for USE_MOCK_LLM without importing test frameworks."""
+
+    def __init__(self) -> None:
+        self.apply_chat_template = _MockLlamaCallable()
+        self.render_and_tokenize_chat = _MockLlamaCallable()
+        self.tokenize = _MockLlamaCallable()
+        self.create_chat_completion = _MockLlamaCallable()
 
 
 def is_qwen_64k_profile_recoverable_failure_category(category: Any) -> bool:
@@ -4358,13 +4378,13 @@ class ModelManager:
         or returns a mock if USE_MOCK_LLM is set.
 
         Returns:
-            A Llama instance or a MagicMock object
+            A Llama instance or a local mock object
         """
         # Check if mocking is enabled via configuration
         if self.use_mock_llm:
             self.log_info("Using Mock LLM instance based on USE_MOCK_LLM configuration.")
             self.last_compute_diagnostics = self._mock_compute_plan()
-            mock_llama_instance = MagicMock()
+            mock_llama_instance = _MockLlamaInstance()
 
             def _mock_apply_chat_template(
                 messages,

@@ -608,7 +608,7 @@ class TestModelManager:
 
         # Check the result
         assert llm is not None
-        assert isinstance(llm, MagicMock)
+        assert callable(llm.create_chat_completion)
 
         # Check that the mock is properly configured
         completion = llm.create_chat_completion()
@@ -1149,7 +1149,7 @@ class TestModelManager:
              patch.object(model_manager, '_resolve_compute_plan') as resolve_plan:
             llm = model_manager.get_llm_instance()
 
-        assert isinstance(llm, MagicMock)
+        assert callable(llm.create_chat_completion)
         assert model_manager.last_compute_diagnostics == expected_plan
         resolve_plan.assert_not_called()
 

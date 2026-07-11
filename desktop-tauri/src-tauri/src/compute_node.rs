@@ -1754,12 +1754,12 @@ mod tests {
             .get("api_v1_readiness_completion_smoke_attempted_generation_kwargs")
             .is_none());
         assert!(payload.get("api_v1_readiness_prompt_text").is_none());
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
+        // summarize_bridge_stdout_payload emits only lifecycle fields; readiness
+        // diagnostic keys (even safe booleans) go to readiness_operator_log_chunks,
+        // not to the stdout summary.
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs")
+            .is_none());
         assert!(payload
             .get("api_v1_readiness_yarn_requested_context_tokens")
             .is_none());
@@ -1769,12 +1769,9 @@ mod tests {
         assert!(payload
             .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count")
             .is_none());
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
+            .is_none());
     }
 
     #[test]

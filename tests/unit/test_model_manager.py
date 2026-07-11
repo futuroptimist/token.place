@@ -6894,6 +6894,18 @@ def test_qwen_64k_readiness_recovery_rejects_unsafe_or_stale_runtime():
     manager._close_llm_proxy.assert_not_called()
     manager.get_llm_instance.assert_not_called()
 
+    # Non-Metal (CPU) profile must not close or advance anything.
+    manager.llm = failed_runtime
+    manager._qwen_64k_runtime_profiles = [
+        {"profile_id": "only", "diagnostics": {"backend": "cpu"}},
+    ]
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_graph_compute_failure",
+    ) is None
+    manager._close_llm_proxy.assert_not_called()
+    manager.get_llm_instance.assert_not_called()
+
 
 def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monkeypatch):
     for category, decode_return_code in (("decode_aborted", 2), ("backend_decode_failure", -4)):
@@ -6933,6 +6945,60 @@ def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monke
         assert manager.last_plain_completion_eval_return_code is None
         manager._close_llm_proxy.assert_not_called()
         manager.get_llm_instance.assert_not_called()
+
+
+def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(monkeypatch):
+    """First recoverable failure category is preserved even after a second profile advance."""
+    manager = object.__new__(ModelManager)
+    first_runtime = MagicMock()
+    second_runtime = MagicMock()
+    third_runtime = object()
+    manager.llm_lock = threading.RLock()
+    manager.llm = first_runtime
+    manager.model_profile = {"provider": "qwen"}
+    manager.context_tier = "64k-full"
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager.worker_restart_count = 0
+    manager._llm_generation = 0
+    manager._qwen_64k_profile_recovery_count = 0
+    manager._qwen_64k_first_readiness_failure_category = None
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_runtime_profiles = [
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+    ]
+    monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=second_runtime))
+
+    # First failure: F16 fails with backend_graph_compute_failure
+    result1 = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        first_runtime,
+        "backend_graph_compute_failure",
+        decode_return_code=-3,
+    )
+    assert result1 is second_runtime
+    assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert manager._qwen_64k_profile_recovery_count == 1
+    assert manager._qwen_64k_selected_profile_index == 1
+
+    # Second failure: Q8 fails with metal_command_buffer_out_of_memory
+    manager.llm = second_runtime
+    manager.get_llm_instance = MagicMock(return_value=third_runtime)
+    result2 = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        second_runtime,
+        "metal_command_buffer_out_of_memory",
+        decode_return_code=None,
+    )
+    assert result2 is third_runtime
+    # First failure must be preserved; second failure must NOT overwrite it.
+    assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert manager._qwen_64k_profile_recovery_count == 2
+    assert manager._qwen_64k_selected_profile_index == 2
 
 
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):

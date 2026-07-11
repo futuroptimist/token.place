@@ -2711,3 +2711,125 @@ def test_compute_node_runtime_has_single_authoritative_yarn_original_context_ass
             matching_dicts.append(count)
     assert matching_dicts
     assert all(count == 1 for count in matching_dicts)
+
+
+def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
+    """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    f16_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(f16_runtime)
+
+    # reinitialize returns the Q8 runtime and sets the first-failure attribute
+    def _side_effect(failed_rt, category, decode_return_code=None):
+        model_manager._qwen_64k_first_readiness_failure_category = category
+        model_manager._qwen_64k_profile_recovery_count = 1
+        model_manager.get_llm_instance.return_value = q8_runtime
+        return q8_runtime
+
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _side_effect
+
+    # First generate_api_v1 call fails; second (Q8) passes
+    model_manager._relay_client = MagicMock()
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": "runtime_completion_smoke_backend_decode_failure",
+                    "exception_category": "runtime_backend_graph_compute_failure",
+                    "worker_diagnostics": {
+                        "generation_exception_category": "backend_graph_compute_failure",
+                        "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                        "plain_completion_eval_return_code": -3,
+                        "exception_type": "RuntimeError",
+                        "sanitized_error_summary": "RuntimeError:redacted",
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once_with(
+        f16_runtime,
+        "backend_graph_compute_failure",
+        -3,
+    )
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+
+
+def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
+    """All three Metal profiles fail the smoke; ensure_api_v1_runtime_ready returns False."""
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    f16_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    q4_runtime = _Qwen64kRuntime()
+
+    model_manager = _qwen_64k_model_manager(f16_runtime)
+
+    reinitialize_calls = []
+
+    def _reinitialize_side_effect(failed_rt, category, decode_return_code=None):
+        reinitialize_calls.append((failed_rt, category))
+        if len(reinitialize_calls) == 1:
+            model_manager._qwen_64k_first_readiness_failure_category = category
+            model_manager._qwen_64k_profile_recovery_count = 1
+            model_manager.get_llm_instance.return_value = q8_runtime
+            return q8_runtime
+        if len(reinitialize_calls) == 2:
+            model_manager._qwen_64k_profile_recovery_count = 2
+            model_manager.get_llm_instance.return_value = q4_runtime
+            return q4_runtime
+        # Profiles exhausted
+        model_manager._qwen_64k_profile_recovery_count = 3
+        return None
+
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _reinitialize_side_effect
+
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_backend_graph_compute_failure",
+                "exception_category": "runtime_backend_graph_compute_failure",
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                    "plain_completion_eval_return_code": -3,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            }
+        }
+    }
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_count == 3
+    assert reinitialize_calls[0][0] is f16_runtime
+    assert reinitialize_calls[1][0] is q8_runtime
+    assert reinitialize_calls[2][0] is q4_runtime
+    assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert model_manager._qwen_64k_profile_recovery_count == 3

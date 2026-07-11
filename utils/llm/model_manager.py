@@ -3736,6 +3736,10 @@ class ModelManager:
         self._qwen_64k_selected_profile_id: Optional[str] = None
         self._qwen_64k_profile_attempt_ids: list[str] = []
         self._qwen_64k_profile_recovery_count = 0
+        # Preserved across profile advances: the first recoverable failure
+        # category from the initial readiness smoke, so later profile failures
+        # do not overwrite it and the first Metal failure remains observable.
+        self._qwen_64k_first_readiness_failure_category: Optional[str] = None
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -4729,6 +4733,10 @@ class ModelManager:
             self.worker_restart_count += 1
             self._llm_generation += 1
             self._qwen_64k_profile_recovery_count += 1
+            # Preserve the first recoverable failure category so later
+            # profile failures do not overwrite it.
+            if self._qwen_64k_first_readiness_failure_category is None:
+                self._qwen_64k_first_readiness_failure_category = category
             next_index = int(self._qwen_64k_selected_profile_index or 0) + 1
             self._qwen_64k_selected_profile_index = next_index
             exhausted = next_index >= len(profiles)

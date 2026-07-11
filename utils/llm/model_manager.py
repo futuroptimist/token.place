@@ -503,6 +503,8 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'backend_graph_compute_failure',
     'metal_graph_compute_failure',
     'kv_slot_unavailable',
+    'decode_aborted',
+    'backend_decode_failure',
     'metal_command_buffer_out_of_memory',
     'metal_command_buffer_timeout',
     'metal_command_buffer_page_fault',

@@ -6613,6 +6613,45 @@ def test_subprocess_proxy_close_ignores_temp_worker_unlink_failure(monkeypatch):
     assert unlink_calls == ["/tmp/token-place-worker.py"]
     assert proxy._worker_tmpfile is None
 
+
+def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypatch):
+    for category, decode_return_code in (("decode_aborted", 2), ("backend_decode_failure", -4)):
+        manager = object.__new__(ModelManager)
+        failed_runtime = MagicMock()
+        replacement_runtime = object()
+        manager.llm_lock = threading.RLock()
+        manager.llm = failed_runtime
+        manager.model_profile = {"provider": "qwen"}
+        manager.context_tier = "64k-full"
+        manager.worker_state = "ready"
+        manager.last_worker_error_code = None
+        manager.last_worker_restart_at_ms = None
+        manager.last_plain_completion_eval_return_code = None
+        manager.worker_restart_count = 0
+        manager._llm_generation = 0
+        manager._qwen_64k_profile_recovery_count = 0
+        manager._qwen_64k_selected_profile_index = 0
+        manager._qwen_64k_runtime_profiles = [
+            {"profile_id": "qwen64k_f16_fa_small_batch"},
+            {"profile_id": "qwen64k_kv_q8_fa_small_batch"},
+        ]
+        monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
+        monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=replacement_runtime))
+
+        recovered = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+            failed_runtime,
+            category,
+            decode_return_code=decode_return_code,
+        )
+
+        assert recovered is replacement_runtime
+        assert manager._qwen_64k_selected_profile_index == 1
+        assert manager.last_worker_error_code == category
+        assert manager.last_plain_completion_eval_return_code == decode_return_code
+        manager._close_llm_proxy.assert_called_once_with(failed_runtime)
+        manager.get_llm_instance.assert_called_once_with()
+
+
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 

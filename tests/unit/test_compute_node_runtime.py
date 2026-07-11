@@ -262,6 +262,9 @@ def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, e
         (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
         (RuntimeError("failed to tokenize prompt"), "prompt_tokenization_failure", "runtime_completion_smoke_plain_completion_prompt_tokenization_failure"),
         (RuntimeError("llama_decode failed to eval prompt"), "prompt_eval_failure", "runtime_completion_smoke_plain_completion_eval_failure"),
+        (RuntimeError("llama_decode returned -3"), "backend_graph_compute_failure", "runtime_completion_smoke_backend_graph_compute_failure"),
+        (RuntimeError("llama_decode returned 2"), "decode_aborted", "runtime_completion_smoke_decode_aborted"),
+        (RuntimeError("llama_decode returned -4"), "backend_decode_failure", "runtime_completion_smoke_backend_decode_failure"),
         (RuntimeError("sampler failed with no logits"), "sampling_failure", "runtime_completion_smoke_plain_completion_sampling_failure"),
         (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
@@ -274,6 +277,8 @@ def test_classify_completion_smoke_exception_uses_safe_specific_reasons(exc, exp
     assert reason == expected_reason
     assert diagnostics["exception_type"] == type(exc).__name__
     assert diagnostics["sanitized_error_summary"] == f"{type(exc).__name__}:redacted"
+    if "llama_decode returned" in str(exc):
+        assert diagnostics["plain_completion_eval_return_code"] == int(str(exc).rsplit(" ", 1)[-1])
     assert "prompt text" not in json.dumps(diagnostics)
 
 
@@ -2574,6 +2579,47 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     assert call.args[:3] == (failed_runtime, category, decode_return_code)
     assert call.args[3]["eval_return_code"] == decode_return_code
     relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_category", "decode_return_code"),
+    [
+        ("llama_decode returned -3", "backend_graph_compute_failure", -3),
+        ("llama_decode returned 2", "decode_aborted", 2),
+        ("llama_decode returned -4", "backend_decode_failure", -4),
+    ],
+)
+def test_qwen_64k_readiness_raw_decode_exception_uses_profile_recovery(
+    message,
+    expected_category,
+    decode_return_code,
+):
+    failed_runtime = _Qwen64kRuntime()
+    recovered_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.get_llm_instance.side_effect = [failed_runtime, recovered_runtime]
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = recovered_runtime
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        RuntimeError(message),
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
+    assert call.args[:3] == (failed_runtime, expected_category, decode_return_code)
+    assert call.args[3]["eval_return_code"] == decode_return_code
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == expected_category
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_eval_return_code"] == decode_return_code
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
 
 
 def test_qwen_64k_readiness_decode_recovery_honors_cancellation():

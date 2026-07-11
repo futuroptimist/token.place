@@ -377,7 +377,15 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     elif any(token in text for token in ("failed to tokenize", "tokenization failed", "llama_tokenize", "could not tokenize")):
         category = "prompt_tokenization_failure"
     elif any(token in text for token in ("failed to eval", "failed to evaluate", "model failed to evaluate", "llama_eval", "llama_decode", "decode failed", "decode returned")):
-        category = "prompt_eval_failure"
+        decode_category = None
+        decode_return_code = None
+        if "llama_decode" in text or "decode returned" in text:
+            from utils.llm.model_manager import safe_plain_completion_decode_failure_category_and_code
+
+            decode_category, decode_return_code = safe_plain_completion_decode_failure_category_and_code(exc)
+        if decode_return_code is not None:
+            diagnostics["plain_completion_eval_return_code"] = decode_return_code
+        category = decode_category or "prompt_eval_failure"
     elif any(token in text for token in ("sample failed", "sampler", "logits", "no logits")):
         category = "sampling_failure"
     elif "unexpected keyword argument" in text:
@@ -1214,6 +1222,7 @@ class ComputeNodeRuntime:
                     diagnostics["api_v1_readiness_completion_smoke_result"] = "failed"
                     diagnostics["api_v1_readiness_completion_smoke_failure_reason"] = safe_reason
                     diagnostics["api_v1_readiness_completion_smoke_exception_category"] = exception_category
+                    diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] = exception_category
                     diagnostics["api_v1_readiness_completion_smoke_shape"] = "exception"
                     diagnostics["api_v1_readiness_completion_smoke_exception_type"] = exception_diagnostics.get("exception_type")
                     diagnostics["api_v1_readiness_completion_smoke_safe_summary"] = exception_diagnostics.get("sanitized_error_summary")

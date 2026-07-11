@@ -20,7 +20,7 @@ import threading
 import sysconfig
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Any, Optional, Iterable
+from typing import Dict, List, Any, Optional, Iterable, Tuple
 
 from utils.system import resource_monitor
 from utils.llm.model_profiles import get_model_profile, resolve_profile_id
@@ -486,6 +486,13 @@ def _generation_category_for_decode_return_code(return_code: Optional[int]) -> O
     if return_code < 0:
         return 'backend_decode_failure'
     return None
+
+
+def safe_plain_completion_decode_failure_category_and_code(exc: Any) -> Tuple[Optional[str], Optional[int]]:
+    """Return the safe decode category/code parsed from a llama_decode exception string."""
+
+    return_code = _safe_plain_completion_eval_return_code(exc)
+    return _generation_category_for_decode_return_code(return_code), return_code
 
 
 _FATAL_CURRENT_WORKER_GENERATION_CATEGORIES = {

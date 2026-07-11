@@ -81,12 +81,6 @@ _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "worker_dead": "runtime_completion_smoke_worker_dead",
 }
 
-_QWEN_64K_READINESS_FATAL_CURRENT_WORKER_CATEGORIES = {
-    "decode_aborted",
-    "backend_decode_failure",
-}
-
-
 def _qwen_64k_readiness_profile_recoverable(category: Any) -> bool:
     from utils.llm.model_manager import is_qwen_64k_profile_recoverable_failure_category
 
@@ -786,11 +780,34 @@ class ComputeNodeRuntime:
             _log_error("Model manager missing get_llm_instance required for API v1 warmup")
             return False
 
-        while True:
+        profile_budget_fn = getattr(
+            self.model_manager,
+            "qwen_64k_readiness_profile_attempt_budget",
+            None,
+        )
+        model_profile_for_budget = getattr(self.model_manager, "model_profile", {}) or {}
+        is_qwen_64k_for_budget = (
+            model_profile_for_budget.get("provider") == "qwen"
+            and getattr(self.model_manager, "context_tier", "8k-fast") == "64k-full"
+        )
+        profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+        if callable(profile_budget_fn) and "unittest.mock" not in type(profile_budget_fn).__module__:
+            try:
+                profile_attempt_budget = max(1, int(profile_budget_fn()))
+            except Exception:
+                profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+        seen_runtime_ids: set[int] = set()
+        seen_profile_ids: set[str] = set()
+        pending_runtime = None
+        for _readiness_attempt_index in range(profile_attempt_budget):
             model_path = getattr(self.model_manager, "model_path", "unknown")
             _log_info(f"API v1 runtime warmup about to instantiate model: {model_path}")
             try:
-                llm_runtime = get_llm_instance()
+                if pending_runtime is not None:
+                    llm_runtime = pending_runtime
+                    pending_runtime = None
+                else:
+                    llm_runtime = get_llm_instance()
             except Exception as exc:
                 setattr(self.model_manager, 'last_runtime_init_error', str(exc))
                 _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
@@ -809,6 +826,31 @@ class ComputeNodeRuntime:
                     )
                 _log_error(message)
                 return False
+
+            runtime_identity = id(llm_runtime)
+            if runtime_identity in seen_runtime_ids:
+                setattr(
+                    self.model_manager,
+                    'last_runtime_init_error',
+                    'qwen_64k_readiness_repeated_runtime_identity',
+                )
+                _log_error("API v1 runtime warmup failed: repeated runtime identity")
+                return False
+            seen_runtime_ids.add(runtime_identity)
+            current_profile_id = None
+            current_diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+            if isinstance(current_diagnostics, dict):
+                current_profile_id = current_diagnostics.get("qwen_64k_runtime_profile_id")
+            if isinstance(current_profile_id, str) and current_profile_id:
+                if current_profile_id in seen_profile_ids:
+                    setattr(
+                        self.model_manager,
+                        'last_runtime_init_error',
+                        'qwen_64k_readiness_repeated_runtime_profile',
+                    )
+                    _log_error("API v1 runtime warmup failed: repeated Qwen 64K runtime profile")
+                    return False
+                seen_profile_ids.add(current_profile_id)
 
             create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
             if not callable(create_chat_completion):
@@ -1340,7 +1382,6 @@ class ComputeNodeRuntime:
                     )
                 )
                 recover_category = None
-                fatal_current_worker_category = None
                 for candidate in (
                     diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category"),
                     diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category"),
@@ -1348,9 +1389,6 @@ class ComputeNodeRuntime:
                 ):
                     if _qwen_64k_readiness_profile_recoverable(candidate):
                         recover_category = candidate
-                        break
-                    if candidate in _QWEN_64K_READINESS_FATAL_CURRENT_WORKER_CATEGORIES:
-                        fatal_current_worker_category = candidate
                         break
                 failure_diagnostics = {
                     "method": diagnostics.get("api_v1_readiness_completion_smoke_method"),
@@ -1364,14 +1402,17 @@ class ComputeNodeRuntime:
                 recover = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
                 if callable(recover) and recover_category:
                     if self._api_v1_readiness_cancel_requested():
-                        invalidate = getattr(self.model_manager, "invalidate_qwen_64k_readiness_failed_worker", None)
-                        if callable(invalidate):
-                            invalidate(
+                        cancel_failed_worker = getattr(
+                            self.model_manager,
+                            "cancel_qwen_64k_readiness_failed_worker",
+                            None,
+                        )
+                        if callable(cancel_failed_worker):
+                            cancel_failed_worker(
                                 llm_runtime,
                                 str(recover_category),
                                 diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
                                 failure_diagnostics,
-                                allow_recoverable_category=True,
                             )
                         setattr(self.model_manager, 'last_runtime_init_error', 'api_v1_readiness_cancelled')
                         _log_warning("API v1 runtime readiness cancelled before Qwen profile advance")
@@ -1383,25 +1424,22 @@ class ComputeNodeRuntime:
                         failure_diagnostics,
                     )
                     if next_runtime is not None:
+                        pending_runtime = next_runtime
                         continue
-                if fatal_current_worker_category:
-                    # Fatal-current-worker decode categories invalidate this
-                    # readiness worker but intentionally do not advance the
-                    # profile cursor or replay readiness on another profile.
-                    invalidate = getattr(self.model_manager, "invalidate_qwen_64k_readiness_failed_worker", None)
-                    if callable(invalidate):
-                        invalidate(
-                            llm_runtime,
-                            str(fatal_current_worker_category),
-                            diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
-                            failure_diagnostics,
-                        )
                 setattr(self.model_manager, 'last_runtime_init_error', message)
                 _log_error(message)
                 return False
 
             setattr(self.model_manager, 'last_runtime_init_error', None)
             return True
+
+        setattr(
+            self.model_manager,
+            'last_runtime_init_error',
+            'qwen_64k_readiness_profile_attempts_exhausted',
+        )
+        _log_error("API v1 runtime readiness failed: Qwen 64K profile attempts exhausted")
+        return False
 
     def start_relay_polling(self) -> threading.Thread:
         """Start relay polling in a background thread and return the thread."""

@@ -4716,6 +4716,26 @@ class ModelManager:
 
         return self.llm
 
+
+    def qwen_64k_readiness_profile_attempt_budget(self) -> int:
+        """Return remaining bounded Qwen 64K Metal readiness profile attempts."""
+        if self.model_profile.get('provider') != 'qwen' or getattr(self, 'context_tier', '8k-fast') != '64k-full':
+            return 1
+        profiles = list(self._qwen_64k_runtime_profiles or [])
+        profile_ids = [
+            profile.get('profile_id')
+            for profile in profiles[:3]
+            if isinstance(profile, dict) and profile.get('profile_id')
+        ]
+        if not profile_ids:
+            profile_ids = [
+                QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+                QWEN_64K_RUNTIME_PROFILE_Q8,
+                QWEN_64K_RUNTIME_PROFILE_Q4,
+            ]
+        current_index = max(0, int(getattr(self, '_qwen_64k_selected_profile_index', 0) or 0))
+        return max(1, len(profile_ids) - current_index)
+
     def reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         self,
         failed_runtime: Any,
@@ -4783,24 +4803,16 @@ class ModelManager:
             return None
         return self.get_llm_instance()
 
-    def invalidate_qwen_64k_readiness_failed_worker(
+    def cancel_qwen_64k_readiness_failed_worker(
         self,
         failed_runtime: Any,
         failure_category: str,
         decode_return_code: Optional[int] = None,
         failure_diagnostics: Optional[Dict[str, Any]] = None,
-        *,
-        allow_recoverable_category: bool = False,
     ) -> None:
-        """Close a fatal-current-worker readiness failure without profile replay."""
+        """Close a cancelled readiness worker without advancing the profile cursor."""
         category = str(failure_category or '')
-        if (
-            category not in {'decode_aborted', 'backend_decode_failure'}
-            and not (
-                allow_recoverable_category
-                and is_qwen_64k_profile_recoverable_failure_category(category)
-            )
-        ):
+        if not is_qwen_64k_profile_recoverable_failure_category(category):
             return
         with self.llm_lock:
             if self.llm is not failed_runtime:

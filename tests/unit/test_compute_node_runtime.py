@@ -2465,7 +2465,7 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     failed_runtime = _Qwen64kRuntime()
     model_manager = _qwen_64k_model_manager(failed_runtime)
     model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
-    model_manager.invalidate_qwen_64k_readiness_failed_worker = MagicMock()
+    model_manager.cancel_qwen_64k_readiness_failed_worker = MagicMock()
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.return_value = {
@@ -2492,7 +2492,7 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once()
-    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_not_called()
+    model_manager.cancel_qwen_64k_readiness_failed_worker.assert_not_called()
     call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
     assert call.args[:3] == (failed_runtime, category, decode_return_code)
     assert call.args[3]["eval_return_code"] == decode_return_code
@@ -2503,7 +2503,7 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
     failed_runtime = _Qwen64kRuntime()
     model_manager = _qwen_64k_model_manager(failed_runtime)
     model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure = MagicMock()
-    model_manager.invalidate_qwen_64k_readiness_failed_worker = MagicMock()
+    model_manager.cancel_qwen_64k_readiness_failed_worker = MagicMock()
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.return_value = {
@@ -2528,8 +2528,8 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_not_called()
-    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_called_once()
-    call = model_manager.invalidate_qwen_64k_readiness_failed_worker.call_args
+    model_manager.cancel_qwen_64k_readiness_failed_worker.assert_called_once()
+    call = model_manager.cancel_qwen_64k_readiness_failed_worker.call_args
     assert call.args[:3] == (failed_runtime, "decode_aborted", 2)
 
 

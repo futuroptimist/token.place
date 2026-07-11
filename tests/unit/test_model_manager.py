@@ -6817,15 +6817,15 @@ def test_qwen_64k_readiness_worker_invalidation_filters_safe_diagnostics(monkeyp
     manager._qwen_64k_first_readiness_failure_diagnostics = {}
     monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
 
-    manager.invalidate_qwen_64k_readiness_failed_worker(
+    manager.cancel_qwen_64k_readiness_failed_worker(
         failed_runtime,
-        "backend_graph_compute_failure",
-        decode_return_code=-3,
+        "prompt_eval_invalid_batch",
+        decode_return_code=-1,
     )
     assert manager.llm is failed_runtime
     manager._close_llm_proxy.assert_not_called()
 
-    manager.invalidate_qwen_64k_readiness_failed_worker(
+    manager.cancel_qwen_64k_readiness_failed_worker(
         stale_runtime,
         "backend_decode_failure",
         decode_return_code=-4,
@@ -6833,7 +6833,7 @@ def test_qwen_64k_readiness_worker_invalidation_filters_safe_diagnostics(monkeyp
     assert manager.llm is failed_runtime
     manager._close_llm_proxy.assert_not_called()
 
-    manager.invalidate_qwen_64k_readiness_failed_worker(
+    manager.cancel_qwen_64k_readiness_failed_worker(
         failed_runtime,
         "backend_decode_failure",
         decode_return_code=-4,

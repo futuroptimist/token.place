@@ -91,8 +91,9 @@ _QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES = {
     # Readiness closes the poisoned worker for these categories without moving
     # the profile cursor or trying Q8/Q4 on the same warm-load attempt; only
     # the explicit backend/Metal categories below may advance Qwen 64K
-    # readiness profiles. This fail-closed distinction is intentional even if a
-    # later readiness attempt recreates the same selected profile.
+    # readiness profiles. A later warm-load retry recreating the same selected
+    # profile is the intended fail-closed behavior unless a prompt-approved
+    # backend/Metal diagnostic is present to justify cross-profile replay.
     "metal_command_buffer_out_of_memory",
     "metal_command_buffer_timeout",
     "metal_command_buffer_page_fault",

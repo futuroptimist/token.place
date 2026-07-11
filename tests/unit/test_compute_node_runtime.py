@@ -2450,6 +2450,55 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
     assert call.args[3]["backend_failure_category"] == "metal_command_buffer_out_of_memory"
 
 
+@pytest.mark.parametrize(
+    ("category", "decode_return_code", "internal_reason"),
+    [
+        ("decode_aborted", 2, "runtime_completion_smoke_decode_aborted"),
+        ("backend_decode_failure", -4, "runtime_completion_smoke_backend_decode_failure"),
+    ],
+)
+def test_qwen_64k_readiness_decode_failures_invalidate_without_profile_replay(
+    category,
+    decode_return_code,
+    internal_reason,
+):
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
+    model_manager.invalidate_qwen_64k_readiness_failed_worker = MagicMock()
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": internal_reason,
+                "exception_category": f"runtime_{category}",
+                "worker_diagnostics": {
+                    "generation_exception_category": category,
+                    "plain_completion_eval_return_code": decode_return_code,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_not_called()
+    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_called_once()
+    call = model_manager.invalidate_qwen_64k_readiness_failed_worker.call_args
+    assert call.args[:3] == (failed_runtime, category, decode_return_code)
+    assert call.args[3]["eval_return_code"] == decode_return_code
+    relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
+
+
 def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnostics():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 

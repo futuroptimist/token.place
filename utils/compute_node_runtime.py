@@ -88,8 +88,9 @@ _QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES = {
     "kv_slot_unavailable",
     # Decode-abort / generic backend-decode failures remain fatal-current-worker
     # categories, but are intentionally excluded from profile replay recovery.
-    # Only the explicit backend/Metal categories below may advance Qwen 64K
-    # readiness profiles.
+    # Readiness closes the poisoned worker for these categories without moving
+    # the profile cursor; only the explicit backend/Metal categories below may
+    # advance Qwen 64K readiness profiles.
     "metal_command_buffer_out_of_memory",
     "metal_command_buffer_timeout",
     "metal_command_buffer_page_fault",

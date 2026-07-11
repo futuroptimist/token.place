@@ -707,7 +707,7 @@ def test_qwen64k_packaged_profile_recovery_f16_decode_failure_then_q8_success():
     manager = _model_manager(f16_runtime)
     recovery_calls = []
 
-    def _reinitialize(failed_rt, category, decode_return_code=None):
+    def _reinitialize(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
         recovery_calls.append((failed_rt, category, decode_return_code))
         manager._qwen_64k_first_readiness_failure_category = category
         manager._qwen_64k_profile_recovery_count = 1
@@ -756,7 +756,7 @@ def test_qwen64k_packaged_profile_recovery_all_profiles_exhausted_fails_closed()
     manager = _model_manager(f16_runtime)
     recovery_calls = []
 
-    def _reinitialize(failed_rt, category, decode_return_code=None):
+    def _reinitialize(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
         recovery_calls.append((failed_rt, category))
         if len(recovery_calls) == 1:
             manager._qwen_64k_first_readiness_failure_category = category

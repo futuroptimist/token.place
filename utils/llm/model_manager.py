@@ -3740,6 +3740,7 @@ class ModelManager:
         # category from the initial readiness smoke, so later profile failures
         # do not overwrite it and the first Metal failure remains observable.
         self._qwen_64k_first_readiness_failure_category: Optional[str] = None
+        self._qwen_64k_first_readiness_failure_diagnostics: Dict[str, Any] = {}
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -4526,7 +4527,14 @@ class ModelManager:
                                 profile_diag = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', {})
                                 profile_id = profile_diag.get('profile_id') if isinstance(profile_diag, dict) else 'default'
                                 if is_qwen_64k and isinstance(profile_id, str):
-                                    self._qwen_64k_profile_attempt_ids.append(profile_id)
+                                    if profile_id not in self._qwen_64k_profile_attempt_ids:
+                                        allowed_profile_ids = [
+                                            profile.get('profile_id')
+                                            for profile in self._qwen_64k_runtime_profiles[:3]
+                                            if isinstance(profile, dict)
+                                        ]
+                                        if profile_id in allowed_profile_ids:
+                                            self._qwen_64k_profile_attempt_ids.append(profile_id)
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
                                     if is_qwen_64k and isinstance(profile_id, str):
@@ -4648,6 +4656,10 @@ class ModelManager:
                                     'qwen_64k_runtime_profile_n_ubatch': applied_memory.get('n_ubatch'),
                                     'qwen_64k_runtime_profile_result': 'constructed',
                                 })
+                                first_failure = getattr(self, '_qwen_64k_first_readiness_failure_diagnostics', {})
+                                if isinstance(first_failure, dict):
+                                    for key, value in first_failure.items():
+                                        compute_plan[f'qwen_64k_first_readiness_failure_{key}'] = value
                             yarn_diagnostics = getattr(self, 'last_yarn_rope_diagnostics', None)
                             if isinstance(yarn_diagnostics, dict):
                                 compute_plan['yarn_rope_diagnostics'] = dict(yarn_diagnostics)
@@ -4701,6 +4713,7 @@ class ModelManager:
         failed_runtime: Any,
         failure_category: str,
         decode_return_code: Optional[int] = None,
+        failure_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Replace a failed pre-registration Qwen 64K runtime with the next profile."""
         category = str(failure_category or '')
@@ -4737,6 +4750,23 @@ class ModelManager:
             # profile failures do not overwrite it.
             if self._qwen_64k_first_readiness_failure_category is None:
                 self._qwen_64k_first_readiness_failure_category = category
+                self._qwen_64k_first_readiness_failure_diagnostics = {
+                    key: value
+                    for key, value in (failure_diagnostics or {}).items()
+                    if key in {
+                        'method',
+                        'backend_failure_category',
+                        'metal_error_category',
+                        'backend_state_sticky',
+                        'backend_recreation_required',
+                        'metal_command_buffer_status',
+                        'eval_return_code',
+                    }
+                    and value is not None
+                }
+                self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
+                if decode_return_code is not None:
+                    self._qwen_64k_first_readiness_failure_diagnostics.setdefault('eval_return_code', decode_return_code)
             next_index = int(self._qwen_64k_selected_profile_index or 0) + 1
             self._qwen_64k_selected_profile_index = next_index
             exhausted = next_index >= len(profiles)
@@ -4744,6 +4774,44 @@ class ModelManager:
         if exhausted:
             return None
         return self.get_llm_instance()
+
+    def invalidate_qwen_64k_readiness_failed_worker(
+        self,
+        failed_runtime: Any,
+        failure_category: str,
+        decode_return_code: Optional[int] = None,
+        failure_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Close a fatal-current-worker readiness failure without profile replay."""
+        category = str(failure_category or '')
+        if category not in {'decode_aborted', 'backend_decode_failure'}:
+            return
+        with self.llm_lock:
+            if self.llm is not failed_runtime:
+                return
+            self.llm = None
+            self.worker_state = 'failed'
+            self.last_worker_error_code = category
+            self.last_worker_restart_at_ms = int(time.time() * 1000)
+            self.last_plain_completion_eval_return_code = decode_return_code
+            if self._qwen_64k_first_readiness_failure_category is None:
+                self._qwen_64k_first_readiness_failure_category = category
+                self._qwen_64k_first_readiness_failure_diagnostics = {
+                    key: value
+                    for key, value in (failure_diagnostics or {}).items()
+                    if key in {
+                        'method',
+                        'backend_failure_category',
+                        'metal_error_category',
+                        'backend_state_sticky',
+                        'backend_recreation_required',
+                        'metal_command_buffer_status',
+                        'eval_return_code',
+                    }
+                    and value is not None
+                }
+                self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
+        self._close_llm_proxy(failed_runtime)
 
     def _close_llm_proxy(self, llm: Any) -> None:
         close = getattr(llm, 'close', None)

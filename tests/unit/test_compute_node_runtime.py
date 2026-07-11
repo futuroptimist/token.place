@@ -2445,11 +2445,9 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once_with(
-        failed_runtime,
-        "metal_command_buffer_out_of_memory",
-        -3,
-    )
+    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
+    assert call.args[:3] == (failed_runtime, "metal_command_buffer_out_of_memory", -3)
+    assert call.args[3]["backend_failure_category"] == "metal_command_buffer_out_of_memory"
 
 
 def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnostics():
@@ -2720,7 +2718,7 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     model_manager = _qwen_64k_model_manager(f16_runtime)
 
     # reinitialize returns the Q8 runtime and sets the first-failure attribute
-    def _side_effect(failed_rt, category, decode_return_code=None):
+    def _side_effect(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
         model_manager._qwen_64k_first_readiness_failure_category = category
         model_manager._qwen_64k_profile_recovery_count = 1
         model_manager.get_llm_instance.return_value = q8_runtime
@@ -2760,11 +2758,9 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once_with(
-        f16_runtime,
-        "backend_graph_compute_failure",
-        -3,
-    )
+    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
+    assert call.args[:3] == (f16_runtime, "backend_graph_compute_failure", -3)
+    assert call.args[3]["backend_failure_category"] == "backend_graph_compute_failure"
     assert model_manager._qwen_64k_profile_recovery_count == 1
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
 
@@ -2779,7 +2775,7 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
 
     reinitialize_calls = []
 
-    def _reinitialize_side_effect(failed_rt, category, decode_return_code=None):
+    def _reinitialize_side_effect(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
         reinitialize_calls.append((failed_rt, category))
         if len(reinitialize_calls) == 1:
             model_manager._qwen_64k_first_readiness_failure_category = category

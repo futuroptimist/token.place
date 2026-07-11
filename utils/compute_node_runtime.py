@@ -101,6 +101,11 @@ _QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES = {
     "unknown_metal_backend_failure",
 }
 
+_QWEN_64K_READINESS_FATAL_CURRENT_WORKER_CATEGORIES = {
+    "decode_aborted",
+    "backend_decode_failure",
+}
+
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_KEYS = {
     "code",
     "reason",
@@ -912,6 +917,14 @@ class ComputeNodeRuntime:
             "qwen_64k_runtime_profile_n_ubatch",
             "qwen_64k_runtime_profile_result",
             "qwen_64k_runtime_profile_failure_category",
+            "qwen_64k_first_readiness_failure_category",
+            "qwen_64k_first_readiness_failure_method",
+            "qwen_64k_first_readiness_failure_backend_failure_category",
+            "qwen_64k_first_readiness_failure_metal_error_category",
+            "qwen_64k_first_readiness_failure_backend_state_sticky",
+            "qwen_64k_first_readiness_failure_backend_recreation_required",
+            "qwen_64k_first_readiness_failure_metal_command_buffer_status",
+            "qwen_64k_first_readiness_failure_eval_return_code",
         ):
             if _key in diagnostics:
                 diagnostics[f"api_v1_readiness_{_key}"] = diagnostics.get(_key)
@@ -1290,6 +1303,10 @@ class ComputeNodeRuntime:
                 diagnostics["api_v1_readiness_recovery_succeeded"] = False
             diagnostics["api_v1_runtime_ready"] = bool(admitted)
             diagnostics["api_v1_readiness_result"] = "passed" if admitted else "failed"
+            if diagnostics.get("api_v1_readiness_qwen_64k_runtime_profile_id"):
+                diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"] = (
+                    "passed" if admitted else "failed"
+                )
             diagnostics["api_v1_readiness_error_code"] = (admission_error or {}).get("code") if not admitted else None
             diagnostics["api_v1_readiness_error_reason"] = (
                 (admission_error or {}).get("internal_reason")
@@ -1328,6 +1345,7 @@ class ComputeNodeRuntime:
                 )
             )
             recover_category = None
+            fatal_current_worker_category = None
             for candidate in (
                 diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category"),
                 diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category"),
@@ -1336,15 +1354,40 @@ class ComputeNodeRuntime:
                 if candidate in _QWEN_64K_READINESS_RECOVERABLE_FAILURE_CATEGORIES:
                     recover_category = candidate
                     break
+                if candidate in _QWEN_64K_READINESS_FATAL_CURRENT_WORKER_CATEGORIES:
+                    fatal_current_worker_category = candidate
+                    break
+            failure_diagnostics = {
+                "method": diagnostics.get("api_v1_readiness_completion_smoke_method"),
+                "backend_failure_category": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_failure_category"),
+                "metal_error_category": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_error_category"),
+                "backend_state_sticky": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_state_sticky"),
+                "backend_recreation_required": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_backend_recreation_required"),
+                "metal_command_buffer_status": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status"),
+                "eval_return_code": diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
+            }
             recover = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
             if callable(recover) and recover_category:
                 next_runtime = recover(
                     llm_runtime,
                     str(recover_category),
                     diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
+                    failure_diagnostics,
                 )
                 if next_runtime is not None:
                     return self.ensure_api_v1_runtime_ready()
+            if fatal_current_worker_category:
+                # Fatal-current-worker decode categories invalidate this
+                # readiness worker but intentionally do not advance the
+                # profile cursor or replay readiness on another profile.
+                invalidate = getattr(self.model_manager, "invalidate_qwen_64k_readiness_failed_worker", None)
+                if callable(invalidate):
+                    invalidate(
+                        llm_runtime,
+                        str(fatal_current_worker_category),
+                        diagnostics.get("api_v1_readiness_completion_smoke_plain_completion_eval_return_code"),
+                        failure_diagnostics,
+                    )
             setattr(self.model_manager, 'last_runtime_init_error', message)
             _log_error(message)
             return False

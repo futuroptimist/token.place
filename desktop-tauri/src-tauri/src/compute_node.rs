@@ -824,6 +824,16 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "last_error",
         "configured_relay_count",
         "registered_relay_count",
+        "api_v1_readiness_result",
+        "api_v1_readiness_error_code",
+        "api_v1_readiness_error_reason",
+        "api_v1_readiness_qwen_64k_runtime_profile_id",
+        "api_v1_readiness_qwen_64k_runtime_profile_result",
+        "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
+        "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category",
+        "api_v1_readiness_qwen_64k_first_readiness_failure_metal_error_category",
+        "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category",
+        "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     ] {
         if let Some(value) = map.get(key) {
             summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
@@ -870,16 +880,26 @@ fn readiness_operator_log_chunks(payload: &Value) -> Vec<String> {
         sorted.insert(key, value);
     }
     for (key, value) in sorted {
-        let pair_len = serde_json::to_string(&serde_json::json!({ &key: value.clone() }))
+        let mut safe_value = value;
+        let mut pair_len = serde_json::to_string(&serde_json::json!({ &key: safe_value.clone() }))
             .map(|text| text.len())
             .unwrap_or(3500);
+        if pair_len > 2800 {
+            safe_value = serde_json::json!({
+                "omitted": true,
+                "reason": "diagnostic_value_too_large"
+            });
+            pair_len = serde_json::to_string(&serde_json::json!({ &key: safe_value.clone() }))
+                .map(|text| text.len())
+                .unwrap_or(128);
+        }
         if !current.is_empty() && current_len.saturating_add(pair_len) > 2800 {
             chunks.push(current);
             current = Map::new();
             current_len = 0;
         }
         current_len = current_len.saturating_add(pair_len);
-        current.insert(key, value);
+        current.insert(key, safe_value);
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -897,10 +917,27 @@ fn readiness_operator_log_chunks(payload: &Value) -> Vec<String> {
                 "chunk_count": chunk_count,
                 "diagnostics": diagnostics,
             });
-            serde_json::to_string(&event)
+            let serialized = serde_json::to_string(&event)
+                .unwrap_or_else(|_| "{\"type\":\"readiness_diagnostics_error\"}".into());
+            if serialized.len() <= 3500 {
+                serialized
+            } else {
+                serde_json::to_string(&serde_json::json!({
+                    "type": "readiness_diagnostics",
+                    "operator_session_id": operator_session_id,
+                    "sequence": sequence,
+                    "chunk_index": idx,
+                    "chunk_count": chunk_count,
+                    "diagnostics": {
+                        "chunk_omitted": {
+                            "omitted": true,
+                            "reason": "diagnostic_chunk_too_large"
+                        }
+                    },
+                }))
                 .unwrap_or_else(|_| "{\"type\":\"readiness_diagnostics_error\"}".into())
+            }
         })
-        .filter(|chunk| chunk.len() <= 3500)
         .collect()
 }
 fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
@@ -1772,6 +1809,68 @@ mod tests {
         assert!(payload
             .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
             .is_none());
+    }
+
+    #[test]
+    fn readiness_operator_log_chunks_reconstruct_safe_sorted_diagnostics() {
+        let payload = serde_json::json!({
+            "type": "status",
+            "operator_session_id": "s1",
+            "sequence": 12,
+            "api_v1_readiness_result": "failed",
+            "api_v1_readiness_error_code": "compute_node_inference_failed",
+            "api_v1_readiness_qwen_64k_runtime_profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "api_v1_readiness_qwen_64k_runtime_profile_result": "failed",
+            "api_v1_readiness_qwen_64k_runtime_profile_recovery_count": 1,
+            "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category": "backend_graph_compute_failure",
+            "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+            "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category": "backend_graph_compute_failure",
+            "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status": 5,
+            "api_v1_readiness_completion_smoke_safe_summary": "RuntimeError:redacted",
+            "api_v1_readiness_prompt_text": "unsafe prompt",
+            "api_v1_readiness_completion_smoke_attempted_generation_kwargs": ["max_tokens"],
+        });
+        let summary = summarize_bridge_stdout_payload(&payload);
+        assert!(summary.len() <= 3500);
+        let summary_payload: Value = serde_json::from_str(&summary).expect("summary json");
+        assert_eq!(
+            summary_payload
+                .get("api_v1_readiness_qwen_64k_runtime_profile_id")
+                .and_then(Value::as_str),
+            Some("qwen64k_kv_q8_fa_small_batch")
+        );
+        assert!(summary_payload
+            .get("api_v1_readiness_completion_smoke_method")
+            .is_none());
+
+        let chunks = readiness_operator_log_chunks(&payload);
+        assert!(!chunks.is_empty());
+        let expected = safe_readiness_diagnostics_from_payload(&payload);
+        let mut reconstructed = Map::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.len() <= 3500);
+            let event: Value = serde_json::from_str(chunk).expect("chunk json");
+            assert_eq!(
+                event.get("chunk_index").and_then(Value::as_u64),
+                Some(idx as u64)
+            );
+            assert_eq!(
+                event.get("chunk_count").and_then(Value::as_u64),
+                Some(chunks.len() as u64)
+            );
+            let diagnostics = event
+                .get("diagnostics")
+                .and_then(Value::as_object)
+                .expect("diagnostics object");
+            let keys: Vec<_> = diagnostics.keys().cloned().collect();
+            let mut sorted_keys = keys.clone();
+            sorted_keys.sort();
+            assert_eq!(keys, sorted_keys);
+            for (key, value) in diagnostics {
+                reconstructed.insert(key.clone(), value.clone());
+            }
+        }
+        assert_eq!(Value::Object(reconstructed), Value::Object(expected));
     }
 
     #[test]

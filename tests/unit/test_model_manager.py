@@ -6923,6 +6923,8 @@ def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monke
         manager.worker_restart_count = 0
         manager._llm_generation = 0
         manager._qwen_64k_profile_recovery_count = 0
+        manager._qwen_64k_first_readiness_failure_category = None
+        manager._qwen_64k_first_readiness_failure_diagnostics = {}
         manager._qwen_64k_selected_profile_index = 0
         manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
         manager._qwen_64k_runtime_profiles = [
@@ -6937,13 +6939,21 @@ def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monke
             category,
             decode_return_code=decode_return_code,
         )
-
         assert recovered is None
-        assert manager.llm is failed_runtime
+        manager.invalidate_qwen_64k_readiness_failed_worker(
+            failed_runtime,
+            category,
+            decode_return_code=decode_return_code,
+            failure_diagnostics={"method": "create_completion"},
+        )
+
+        assert manager.llm is None
+        assert manager.worker_state == "failed"
         assert manager._qwen_64k_selected_profile_index == 0
-        assert manager.last_worker_error_code is None
-        assert manager.last_plain_completion_eval_return_code is None
-        manager._close_llm_proxy.assert_not_called()
+        assert manager._qwen_64k_profile_recovery_count == 0
+        assert manager.last_worker_error_code == category
+        assert manager.last_plain_completion_eval_return_code == decode_return_code
+        manager._close_llm_proxy.assert_called_once_with(failed_runtime)
         manager.get_llm_instance.assert_not_called()
 
 

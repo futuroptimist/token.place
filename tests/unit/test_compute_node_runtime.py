@@ -2457,7 +2457,7 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
         ("backend_decode_failure", -4, "runtime_completion_smoke_backend_decode_failure"),
     ],
 )
-def test_qwen_64k_readiness_decode_failures_invalidate_without_profile_replay(
+def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     category,
     decode_return_code,
     internal_reason,
@@ -2491,9 +2491,9 @@ def test_qwen_64k_readiness_decode_failures_invalidate_without_profile_replay(
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_not_called()
-    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_called_once()
-    call = model_manager.invalidate_qwen_64k_readiness_failed_worker.call_args
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once()
+    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_not_called()
+    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
     assert call.args[:3] == (failed_runtime, category, decode_return_code)
     assert call.args[3]["eval_return_code"] == decode_return_code
     relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()

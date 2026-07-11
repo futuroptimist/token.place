@@ -6907,7 +6907,7 @@ def test_qwen_64k_readiness_recovery_rejects_unsafe_or_stale_runtime():
     manager.get_llm_instance.assert_not_called()
 
 
-def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monkeypatch):
+def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypatch):
     for category, decode_return_code in (("decode_aborted", 2), ("backend_decode_failure", -4)):
         manager = object.__new__(ModelManager)
         failed_runtime = MagicMock()
@@ -6938,23 +6938,20 @@ def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monke
             failed_runtime,
             category,
             decode_return_code=decode_return_code,
-        )
-        assert recovered is None
-        manager.invalidate_qwen_64k_readiness_failed_worker(
-            failed_runtime,
-            category,
-            decode_return_code=decode_return_code,
             failure_diagnostics={"method": "create_completion"},
         )
 
+        assert recovered is replacement_runtime
         assert manager.llm is None
-        assert manager.worker_state == "failed"
-        assert manager._qwen_64k_selected_profile_index == 0
-        assert manager._qwen_64k_profile_recovery_count == 0
+        assert manager.worker_state == "recovering"
+        assert manager._qwen_64k_selected_profile_index == 1
+        assert manager._qwen_64k_profile_recovery_count == 1
         assert manager.last_worker_error_code == category
         assert manager.last_plain_completion_eval_return_code == decode_return_code
+        assert manager._qwen_64k_first_readiness_failure_category == category
+        assert manager._qwen_64k_first_readiness_failure_diagnostics["eval_return_code"] == decode_return_code
         manager._close_llm_proxy.assert_called_once_with(failed_runtime)
-        manager.get_llm_instance.assert_not_called()
+        manager.get_llm_instance.assert_called_once()
 
 
 def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(monkeypatch):

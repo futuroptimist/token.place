@@ -504,9 +504,11 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'metal_graph_compute_failure',
     'kv_slot_unavailable',
     # Decode-abort / generic backend-decode categories are fatal for the
-    # current worker, but intentionally do not replay readiness on another
-    # profile: only the explicit prompt-approved backend/Metal failures below
-    # may advance Qwen 64K profiles.
+    # current worker. During synthetic pre-registration readiness only, the
+    # bounded Qwen 64K Metal profile sequence may continue after closing that
+    # failed worker; live user requests are never replayed.
+    'decode_aborted',
+    'backend_decode_failure',
     'metal_command_buffer_out_of_memory',
     'metal_command_buffer_timeout',
     'metal_command_buffer_page_fault',

@@ -520,6 +520,12 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'unknown_metal_backend_failure',
 }
 
+
+def is_qwen_64k_profile_recoverable_failure_category(category: Any) -> bool:
+    """Return whether a readiness failure may advance the Qwen 64K Metal profile."""
+
+    return str(category or '') in _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES
+
 _METAL_COMMAND_BUFFER_STATUS_RE = re.compile(r'(?:command[- ]buffer|command buffer).*?status\D*(-?\d+)', re.IGNORECASE)
 
 
@@ -4783,10 +4789,18 @@ class ModelManager:
         failure_category: str,
         decode_return_code: Optional[int] = None,
         failure_diagnostics: Optional[Dict[str, Any]] = None,
+        *,
+        allow_recoverable_category: bool = False,
     ) -> None:
         """Close a fatal-current-worker readiness failure without profile replay."""
         category = str(failure_category or '')
-        if category not in {'decode_aborted', 'backend_decode_failure'}:
+        if (
+            category not in {'decode_aborted', 'backend_decode_failure'}
+            and not (
+                allow_recoverable_category
+                and is_qwen_64k_profile_recoverable_failure_category(category)
+            )
+        ):
             return
         with self.llm_lock:
             if self.llm is not failed_runtime:

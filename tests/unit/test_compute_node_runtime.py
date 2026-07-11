@@ -2499,6 +2499,40 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
 
 
+def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure = MagicMock()
+    model_manager.invalidate_qwen_64k_readiness_failed_worker = MagicMock()
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_decode_aborted",
+                "worker_diagnostics": {
+                    "generation_exception_category": "decode_aborted",
+                    "plain_completion_eval_return_code": 2,
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+        cancellation_predicate=lambda: True,
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_not_called()
+    model_manager.invalidate_qwen_64k_readiness_failed_worker.assert_called_once()
+    call = model_manager.invalidate_qwen_64k_readiness_failed_worker.call_args
+    assert call.args[:3] == (failed_runtime, "decode_aborted", 2)
+
+
 def test_qwen_64k_readiness_error_marks_profile_failed_and_redacted_summary():
     failed_runtime = _Qwen64kRuntime()
     model_manager = _qwen_64k_model_manager(failed_runtime)

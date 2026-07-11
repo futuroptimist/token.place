@@ -902,12 +902,16 @@ def run(args: argparse.Namespace) -> int:
             relay_urls=(target_relay_url,),
         )
         if shared_runtime is None:
-            return ComputeNodeRuntime(config)
+            try:
+                return ComputeNodeRuntime(config, cancellation_predicate=stop_requested)
+            except TypeError:
+                return ComputeNodeRuntime(config)
         try:
             return ComputeNodeRuntime(
                 config,
                 crypto_manager=getattr(shared_runtime, "crypto_manager", None),
                 model_manager=getattr(shared_runtime, "model_manager", None),
+                cancellation_predicate=stop_requested,
             )
         except TypeError:
             relay_runtime = ComputeNodeRuntime(config)

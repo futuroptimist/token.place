@@ -212,11 +212,8 @@ fn sanitize_operator_diagnostic_token(token: &str) -> String {
         if token.len() <= 4096 {
             return token.to_string();
         }
-        if serde_json::from_str::<serde_json::Value>(token).is_ok() {
-            return r#"{"type":"operator_log_json_token_truncated","safe_truncation":true}"#
-                .to_string();
-        }
-        return token.chars().take(4096).collect();
+        return r#"{"type":"operator_log_json_token_truncated","safe_truncation":true}"#
+            .to_string();
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);

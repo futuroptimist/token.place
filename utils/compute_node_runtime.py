@@ -286,7 +286,7 @@ def _safe_completion_smoke_worker_diagnostic_value(key: str, value: Any) -> Any:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     if key == "exception_type":
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE.fullmatch(bounded) else None
-    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_backend_failure_category", "plain_completion_metal_error_category"}:
+    if key in {"rejected_option", "rejected_generation_kwarg", "profile_id", "context_tier", "type_k", "type_v", "result_shape", "plain_completion_backend_failure_category", "plain_completion_metal_error_category", "plain_completion_first_failure_method"}:
         return bounded if _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(bounded) else None
     csv_identifier_keys = {
         "attempted_generation_kwargs",

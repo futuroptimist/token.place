@@ -1449,10 +1449,12 @@ def _import_llama_cpp_in_parent_with_timeout(
 def _llama_subprocess_tail(process: subprocess.Popen, name: str) -> str:
     value = getattr(process, name, '')
     if isinstance(value, list):
-        text = ''.join(
-            line for line in value
-            if not str(line).startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
-        )
+        lines = []
+        for item in value:
+            line = item[1] if isinstance(item, tuple) and len(item) == 2 else item
+            if not str(line).startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
+                lines.append(str(line))
+        text = ''.join(lines)
     else:
         text = str(value or '')
     return text[-2000:].strip()
@@ -1639,6 +1641,7 @@ class _SubprocessLlamaProxy:
         self._process._token_place_module_path_hint = module_path_hint or ''  # type: ignore[attr-defined]
         self._process._token_place_stdout_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
+        self._process._token_place_stderr_sequence = 0  # type: ignore[attr-defined]
         self._start_stderr_tail_reader()
         try:
             self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
@@ -1677,20 +1680,29 @@ class _SubprocessLlamaProxy:
             for line in stderr:
                 tail = getattr(self._process, '_token_place_stderr_tail', None)
                 if isinstance(tail, list):
-                    tail.append(line)
+                    seq = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0) + 1
+                    self._process._token_place_stderr_sequence = seq  # type: ignore[attr-defined]
+                    tail.append((seq, line))
                     del tail[:-100]
 
         threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True).start()
 
     def _stderr_cursor(self) -> int:
-        tail = getattr(self._process, '_token_place_stderr_tail', None)
-        return len(tail) if isinstance(tail, list) else 0
+        return int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
 
     def _stderr_since(self, cursor: int) -> list[str]:
         tail = getattr(self._process, '_token_place_stderr_tail', None)
         if not isinstance(tail, list):
             return []
-        return list(tail[max(0, cursor):])
+        lines: list[str] = []
+        for item in tail:
+            if isinstance(item, tuple) and len(item) == 2:
+                seq, line = item
+                if int(seq) > cursor:
+                    lines.append(str(line))
+            elif cursor <= 0:
+                lines.append(str(item))
+        return lines
 
     def _send(self, payload: Dict[str, Any], *, check_health: bool = True) -> None:
         if check_health:
@@ -1721,46 +1733,48 @@ class _SubprocessLlamaProxy:
         stream = bool(kwargs.get('stream', False))
         if stream:
             return self._stream_chat_completion(*args, **kwargs)
-        with self._lock:
-            stderr_cursor = self._stderr_cursor()
-            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
-            try:
+        stderr_cursor = 0
+        try:
+            with self._lock:
+                stderr_cursor = self._stderr_cursor()
+                self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
                 message = _read_llama_subprocess_message(
                     self._process,
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
                 )
-            except LlamaCppInferenceRequestError as exc:
-                time.sleep(0.1)
-                metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
-                if metal_diag:
-                    exc.diagnostics.update({k: v for k, v in metal_diag.items() if k not in exc.diagnostics})
-                raise
-            except LlamaCppWorkerEOFError:
-                self._closed = True
-                raise
+        except LlamaCppInferenceRequestError as exc:
+            time.sleep(0.1)
+            metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
+            if metal_diag:
+                exc.diagnostics.update({k: v for k, v in metal_diag.items() if k not in exc.diagnostics})
+            raise
+        except LlamaCppWorkerEOFError:
+            self._closed = True
+            raise
         return message.get('result')
 
 
     def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
-        with self._lock:
-            stderr_cursor = self._stderr_cursor()
-            self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
-            try:
+        stderr_cursor = 0
+        try:
+            with self._lock:
+                stderr_cursor = self._stderr_cursor()
+                self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
                 message = _read_llama_subprocess_message(
                     self._process,
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
                 )
-            except LlamaCppInferenceRequestError as exc:
-                time.sleep(0.1)
-                metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
-                if metal_diag:
-                    exc.diagnostics.update({k: v for k, v in metal_diag.items() if k not in exc.diagnostics})
-                raise
-            except LlamaCppWorkerEOFError:
-                self._closed = True
-                raise
+        except LlamaCppInferenceRequestError as exc:
+            time.sleep(0.1)
+            metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
+            if metal_diag:
+                exc.diagnostics.update({k: v for k, v in metal_diag.items() if k not in exc.diagnostics})
+            raise
+        except LlamaCppWorkerEOFError:
+            self._closed = True
+            raise
         return message.get('result')
 
 
@@ -1965,8 +1979,9 @@ def _sanitize_error_summary(message):
         return type(message).__name__ + ':unsupported_kwarg'
     return type(message).__name__ + ':redacted'
 
+
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode\\s+returned\\s+(-?\\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -3703,6 +3718,7 @@ class ModelManager:
         self.last_worker_error_code: Optional[str] = None
         self.last_worker_exit_code: Optional[int] = None
         self.last_worker_restart_at_ms: Optional[int] = None
+        self.last_plain_completion_eval_return_code: Optional[int] = None
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
         self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
@@ -4685,6 +4701,7 @@ class ModelManager:
             self.worker_state = 'recovering'
             self.last_worker_error_code = category
             self.last_worker_restart_at_ms = int(time.time() * 1000)
+            self.last_plain_completion_eval_return_code = decode_return_code
             self.worker_restart_count += 1
             self._llm_generation += 1
             self._qwen_64k_profile_recovery_count += 1
@@ -4734,6 +4751,7 @@ class ModelManager:
             last_error_code = self.last_worker_error_code
             last_exit_code = self.last_worker_exit_code
             last_restart_at_ms = self.last_worker_restart_at_ms
+            last_eval_return_code = self.last_plain_completion_eval_return_code
         alive = self._llm_is_usable(llm) if llm is not None else False
         if llm is None and state not in {'failed', 'recovering', 'starting'}:
             state = 'stopped'
@@ -4745,6 +4763,7 @@ class ModelManager:
             'last_worker_error_code': last_error_code,
             'last_worker_exit_code': last_exit_code,
             'last_worker_restart_at_ms': last_restart_at_ms,
+            'last_plain_completion_eval_return_code': last_eval_return_code,
         }
 
     def _invalidate_llm_if_current(self, failed_llm: Any, error: Any = None) -> int:

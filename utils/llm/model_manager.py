@@ -503,8 +503,10 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'backend_graph_compute_failure',
     'metal_graph_compute_failure',
     'kv_slot_unavailable',
-    'decode_aborted',
-    'backend_decode_failure',
+    # Decode-abort / generic backend-decode categories are fatal for the
+    # current worker, but intentionally do not replay readiness on another
+    # profile: only the explicit prompt-approved backend/Metal failures below
+    # may advance Qwen 64K profiles.
     'metal_command_buffer_out_of_memory',
     'metal_command_buffer_timeout',
     'metal_command_buffer_page_fault',
@@ -1985,6 +1987,10 @@ def _sanitize_error_summary(message):
 
 
 def _safe_plain_completion_eval_return_code(exc):
+    # This helper intentionally mirrors the parent-module parser. It lives
+    # inside _LLAMA_CPP_RUNTIME_WORKER_CODE so the standalone subprocess can
+    # classify decode return codes without importing parent process helpers;
+    # it does not override the parent helper at module import time.
     match = re.search(r"llama_decode[ \t]+returned[ \t]+(-?[0-9]+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
@@ -4698,6 +4704,20 @@ class ModelManager:
             return None
         if self.model_profile.get('provider') != 'qwen' or getattr(self, 'context_tier', '8k-fast') != '64k-full':
             return None
+        profiles = list(self._qwen_64k_runtime_profiles or [])
+        if not profiles:
+            return None
+        active_profile_id = getattr(self, '_qwen_64k_selected_profile_id', None)
+        profile_ids = [profile.get('profile_id') for profile in profiles if isinstance(profile, dict)]
+        if active_profile_id not in profile_ids:
+            return None
+        active_profile = next(
+            (profile for profile in profiles if isinstance(profile, dict) and profile.get('profile_id') == active_profile_id),
+            None,
+        )
+        active_diagnostics = active_profile.get('diagnostics') if isinstance(active_profile, dict) else {}
+        if str((active_diagnostics or {}).get('backend') or '').lower() != 'metal':
+            return None
         with self.llm_lock:
             if self.llm is not failed_runtime:
                 return None
@@ -4711,7 +4731,6 @@ class ModelManager:
             self._qwen_64k_profile_recovery_count += 1
             next_index = int(self._qwen_64k_selected_profile_index or 0) + 1
             self._qwen_64k_selected_profile_index = next_index
-            profiles = list(self._qwen_64k_runtime_profiles or [])
             exhausted = next_index >= len(profiles)
         self._close_llm_proxy(failed_runtime)
         if exhausted:
@@ -4845,6 +4864,13 @@ class ModelManager:
             return create_chat_completion(*args, **kwargs)
         except LlamaCppInferenceRequestError as exc:
             safe_error_code = _safe_worker_error_code(exc)
+            diagnostics = getattr(exc, 'diagnostics', {}) or {}
+            requires_recreation = (
+                diagnostics.get('plain_completion_backend_state_sticky') is True
+                or diagnostics.get('plain_completion_backend_recreation_required') is True
+            )
+            if requires_recreation:
+                self._invalidate_llm_if_current(llm_instance, exc)
             with self.llm_lock:
                 self.last_worker_error_code = safe_error_code
                 generation = self._llm_generation

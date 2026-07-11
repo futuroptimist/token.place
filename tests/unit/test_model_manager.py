@@ -3685,6 +3685,39 @@ def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monk
     assert created == [first]
 
 
+def test_model_manager_sticky_request_error_invalidates_without_replay(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    first = _RestartableFakeWorker('first')
+    second = _RestartableFakeWorker('second')
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    def _sticky_failure(*_args, **_kwargs):
+        first.calls += 1
+        raise model_manager_module.LlamaCppInferenceRequestError(
+            'request failed',
+            diagnostics={
+                'plain_completion_backend_state_sticky': True,
+                'plain_completion_backend_recreation_required': True,
+            },
+        )
+
+    first.create_chat_completion = _sticky_failure
+
+    with pytest.raises(model_manager_module.LlamaCppInferenceRequestError):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    assert first.calls == 1
+    assert first.closed is True
+    assert manager.llm is None
+    assert created == [first]
+
+    result = manager.create_chat_completion_with_recovery(messages=[])
+
+    assert result['choices'][0]['message']['content'] == 'second'
+    assert created == [first, second]
+
+
 def test_model_manager_concurrent_dead_worker_creates_one_replacement(tmp_path, monkeypatch):
     dead = _RestartableFakeWorker('dead', fail='dead')
     replacement = _RestartableFakeWorker('replacement')
@@ -6824,7 +6857,8 @@ def test_qwen_64k_readiness_recovery_rejects_unsafe_or_stale_runtime():
     manager._llm_generation = 0
     manager._qwen_64k_profile_recovery_count = 0
     manager._qwen_64k_selected_profile_index = 0
-    manager._qwen_64k_runtime_profiles = [{"profile_id": "only"}]
+    manager._qwen_64k_selected_profile_id = "only"
+    manager._qwen_64k_runtime_profiles = [{"profile_id": "only", "diagnostics": {"backend": "metal"}}]
     manager._close_llm_proxy = MagicMock()
     manager.get_llm_instance = MagicMock()
 
@@ -6835,33 +6869,33 @@ def test_qwen_64k_readiness_recovery_rejects_unsafe_or_stale_runtime():
     manager.model_profile = {"provider": "llama"}
     assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         failed_runtime,
-        "backend_decode_failure",
+        "backend_graph_compute_failure",
     ) is None
     manager.model_profile = {"provider": "qwen"}
     manager.context_tier = "8k-fast"
     assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         failed_runtime,
-        "backend_decode_failure",
+        "backend_graph_compute_failure",
     ) is None
     manager.context_tier = "64k-full"
     manager.llm = object()
     assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         failed_runtime,
-        "backend_decode_failure",
+        "backend_graph_compute_failure",
     ) is None
 
     manager.llm = failed_runtime
+    manager._qwen_64k_runtime_profiles = []
     assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         failed_runtime,
-        "backend_decode_failure",
+        "backend_graph_compute_failure",
         decode_return_code=-4,
     ) is None
-    manager._close_llm_proxy.assert_called_once_with(failed_runtime)
+    manager._close_llm_proxy.assert_not_called()
     manager.get_llm_instance.assert_not_called()
-    assert manager.last_plain_completion_eval_return_code == -4
 
 
-def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypatch):
+def test_qwen_64k_readiness_recovery_fail_closes_decode_failure_categories(monkeypatch):
     for category, decode_return_code in (("decode_aborted", 2), ("backend_decode_failure", -4)):
         manager = object.__new__(ModelManager)
         failed_runtime = MagicMock()
@@ -6878,9 +6912,10 @@ def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypat
         manager._llm_generation = 0
         manager._qwen_64k_profile_recovery_count = 0
         manager._qwen_64k_selected_profile_index = 0
+        manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
         manager._qwen_64k_runtime_profiles = [
-            {"profile_id": "qwen64k_f16_fa_small_batch"},
-            {"profile_id": "qwen64k_kv_q8_fa_small_batch"},
+            {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
+            {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
         ]
         monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
         monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=replacement_runtime))
@@ -6891,12 +6926,13 @@ def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypat
             decode_return_code=decode_return_code,
         )
 
-        assert recovered is replacement_runtime
-        assert manager._qwen_64k_selected_profile_index == 1
-        assert manager.last_worker_error_code == category
-        assert manager.last_plain_completion_eval_return_code == decode_return_code
-        manager._close_llm_proxy.assert_called_once_with(failed_runtime)
-        manager.get_llm_instance.assert_called_once_with()
+        assert recovered is None
+        assert manager.llm is failed_runtime
+        assert manager._qwen_64k_selected_profile_index == 0
+        assert manager.last_worker_error_code is None
+        assert manager.last_plain_completion_eval_return_code is None
+        manager._close_llm_proxy.assert_not_called()
+        manager.get_llm_instance.assert_not_called()
 
 
 def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):

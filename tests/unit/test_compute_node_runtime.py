@@ -2382,7 +2382,7 @@ def _real_qwen_64k_model_manager(runtimes):
     manager = object.__new__(ModelManager)
     manager.llm_lock = threading.RLock()
     manager.llm = runtimes[0]
-    manager.use_mock_llm = True
+    manager.use_mock_llm = False
     manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
     manager.model_profile = {
         "provider": "qwen",
@@ -2404,6 +2404,7 @@ def _real_qwen_64k_model_manager(runtimes):
         "qwen_yarn_requested_context_tokens": 65536,
         "qwen_yarn_original_context_tokens": 32768,
     }
+    manager.download_model_if_needed = MagicMock(return_value=True)
     manager.last_compute_diagnostics = {
         "active_profile_id": "qwen3-8b-q4-k-m",
         "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
@@ -2432,7 +2433,7 @@ def _real_qwen_64k_model_manager(runtimes):
     ]
     close_calls = []
     manager._close_llm_proxy = MagicMock(side_effect=lambda runtime: close_calls.append(runtime))
-    runtime_iter = iter(runtimes[1:])
+    runtime_iter = iter(runtimes)
 
     def _get_llm_instance():
         try:
@@ -2495,9 +2496,7 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
 def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
     failed_runtime = _Qwen64kRuntime()
     recovered_runtime = _Qwen64kRuntime()
-    model_manager = _qwen_64k_model_manager(failed_runtime)
-    model_manager.get_llm_instance.side_effect = [failed_runtime, recovered_runtime]
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = recovered_runtime
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, recovered_runtime])
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
@@ -2527,9 +2526,15 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
-    assert call.args[:3] == (failed_runtime, "metal_command_buffer_out_of_memory", -3)
-    assert call.args[3]["backend_failure_category"] == "metal_command_buffer_out_of_memory"
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.llm is recovered_runtime
+    assert model_manager._qwen_64k_first_readiness_failure_category == "metal_command_buffer_out_of_memory"
+    assert (
+        model_manager._qwen_64k_first_readiness_failure_diagnostics["backend_failure_category"]
+        == "metal_command_buffer_out_of_memory"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2545,9 +2550,7 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     internal_reason,
 ):
     failed_runtime = _Qwen64kRuntime()
-    model_manager = _qwen_64k_model_manager(failed_runtime)
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
-    model_manager.cancel_qwen_64k_readiness_failed_worker = MagicMock()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime])
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.return_value = {
@@ -2573,11 +2576,11 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_called_once()
-    model_manager.cancel_qwen_64k_readiness_failed_worker.assert_not_called()
-    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
-    assert call.args[:3] == (failed_runtime, category, decode_return_code)
-    assert call.args[3]["eval_return_code"] == decode_return_code
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager._qwen_64k_first_readiness_failure_diagnostics["eval_return_code"] == decode_return_code
     relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
 
 
@@ -2596,9 +2599,7 @@ def test_qwen_64k_readiness_raw_decode_exception_uses_profile_recovery(
 ):
     failed_runtime = _Qwen64kRuntime()
     recovered_runtime = _Qwen64kRuntime()
-    model_manager = _qwen_64k_model_manager(failed_runtime)
-    model_manager.get_llm_instance.side_effect = [failed_runtime, recovered_runtime]
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = recovered_runtime
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, recovered_runtime])
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
@@ -2613,20 +2614,23 @@ def test_qwen_64k_readiness_raw_decode_exception_uses_profile_recovery(
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
-    assert call.args[:3] == (failed_runtime, expected_category, decode_return_code)
-    assert call.args[3]["eval_return_code"] == decode_return_code
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager.llm is recovered_runtime
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == expected_category
     assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_eval_return_code"] == decode_return_code
     assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
 
 
 def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
     failed_runtime = _Qwen64kRuntime()
-    model_manager = _qwen_64k_model_manager(failed_runtime)
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure = MagicMock()
-    model_manager.cancel_qwen_64k_readiness_failed_worker = MagicMock()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, q8_runtime])
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
     relay_client._generate_api_v1_response_with_runtime_model.return_value = {
@@ -2650,10 +2654,13 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.assert_not_called()
-    model_manager.cancel_qwen_64k_readiness_failed_worker.assert_called_once()
-    call = model_manager.cancel_qwen_64k_readiness_failed_worker.call_args
-    assert call.args[:3] == (failed_runtime, "decode_aborted", 2)
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 0
+    assert model_manager._qwen_64k_profile_recovery_count == 0
+    assert model_manager.last_plain_completion_eval_return_code == 2
+    assert model_manager.get_llm_instance.call_count == 1
+    assert model_manager.llm is None
+    assert q8_runtime not in model_manager._test_close_calls
 
 
 @pytest.mark.parametrize(
@@ -2696,7 +2703,7 @@ def test_qwen_64k_readiness_profile_budget_validation_is_bounded(budget_value, e
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    expected_with_fake = min(expected_attempts, 2)
+    expected_with_fake = min(expected_attempts, 3)
     assert relay_client._generate_api_v1_response_with_runtime_model.call_count == expected_with_fake
     assert len(model_manager._test_close_calls) == expected_with_fake
     assert relay_client._generate_api_v1_response_with_runtime_model.call_count <= 3
@@ -2736,9 +2743,16 @@ def test_qwen_64k_readiness_decode_recovery_uses_real_model_manager_lifecycle(
         crypto_manager=MagicMock(),
     )
 
-    assert runtime.ensure_api_v1_runtime_ready() is False
-    assert model_manager.last_runtime_init_error
-    assert relay_client._generate_api_v1_response_with_runtime_model.call_count >= 1
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager.llm is q8_runtime
+    assert failed_runtime is not q8_runtime
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
 
 
 def test_qwen_64k_readiness_error_marks_profile_failed_and_redacted_summary():
@@ -3075,16 +3089,7 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
     f16_runtime = _Qwen64kRuntime()
     q8_runtime = _Qwen64kRuntime()
-    model_manager = _qwen_64k_model_manager(f16_runtime)
-
-    # reinitialize returns the Q8 runtime and sets the first-failure attribute
-    def _side_effect(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
-        model_manager._qwen_64k_first_readiness_failure_category = category
-        model_manager._qwen_64k_profile_recovery_count = 1
-        model_manager.get_llm_instance.return_value = q8_runtime
-        return q8_runtime
-
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _side_effect
+    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime])
 
     # First generate_api_v1 call fails; second (Q8) passes
     model_manager._relay_client = MagicMock()
@@ -3118,9 +3123,12 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    call = model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_args
-    assert call.args[:3] == (f16_runtime, "backend_graph_compute_failure", -3)
-    assert call.args[3]["backend_failure_category"] == "backend_graph_compute_failure"
+    assert model_manager._test_close_calls == [f16_runtime]
+    assert model_manager.llm is q8_runtime
+    assert f16_runtime is not q8_runtime
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
     assert model_manager._qwen_64k_profile_recovery_count == 1
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
 
@@ -3131,26 +3139,7 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     q8_runtime = _Qwen64kRuntime()
     q4_runtime = _Qwen64kRuntime()
 
-    model_manager = _qwen_64k_model_manager(f16_runtime)
-
-    reinitialize_calls = []
-
-    def _reinitialize_side_effect(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
-        reinitialize_calls.append((failed_rt, category))
-        if len(reinitialize_calls) == 1:
-            model_manager._qwen_64k_first_readiness_failure_category = category
-            model_manager._qwen_64k_profile_recovery_count = 1
-            model_manager.get_llm_instance.return_value = q8_runtime
-            return q8_runtime
-        if len(reinitialize_calls) == 2:
-            model_manager._qwen_64k_profile_recovery_count = 2
-            model_manager.get_llm_instance.return_value = q4_runtime
-            return q4_runtime
-        # Profiles exhausted
-        model_manager._qwen_64k_profile_recovery_count = 3
-        return None
-
-    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _reinitialize_side_effect
+    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime, q4_runtime])
 
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
@@ -3179,9 +3168,10 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    assert model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_count == 3
-    assert reinitialize_calls[0][0] is f16_runtime
-    assert reinitialize_calls[1][0] is q8_runtime
-    assert reinitialize_calls[2][0] is q4_runtime
+    assert model_manager._test_close_calls == [f16_runtime, q8_runtime, q4_runtime]
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 3
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 3
+    assert model_manager.download_model_if_needed.call_count == 1
+    assert model_manager.get_llm_instance.call_count == 3
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
     assert model_manager._qwen_64k_profile_recovery_count == 3

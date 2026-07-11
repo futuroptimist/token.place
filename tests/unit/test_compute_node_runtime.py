@@ -2499,6 +2499,75 @@ def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
     relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
 
 
+def test_qwen_64k_readiness_error_marks_profile_failed_and_redacted_summary():
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.last_compute_diagnostics = {
+        **model_manager.last_compute_diagnostics,
+        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+    }
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_worker_exception",
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "exception_type": "RuntimeError",
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "backend_graph_compute_failure"
+
+
+def test_qwen_64k_completion_smoke_exception_adds_redacted_summary_without_worker_summary():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+
+    def raise_without_summary(**_kwargs):
+        raise LlamaCppInferenceRequestError(
+            "llama_cpp request failed",
+            diagnostics={
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "exception_type": "RuntimeError",
+                }
+            },
+        )
+
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = raise_without_summary
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "LlamaCppInferenceRequestError:redacted"
+
+
 def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnostics():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 

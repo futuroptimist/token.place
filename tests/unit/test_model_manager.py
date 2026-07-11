@@ -8590,3 +8590,45 @@ def test_qwen_64k_runtime_rejects_mismatched_yarn_context_multiplier(tmp_path):
     with pytest.raises(RuntimeError, match='runtime_qwen_64k_yarn_configuration_invalid'):
         manager._runtime_init_kwargs(FakeLlama, 0, fake_llama_cpp, None)
     assert manager.last_yarn_rope_diagnostics['qwen_yarn_configuration_valid'] is False
+
+
+def test_qwen_64k_recovery_exhaustion_and_lifecycle_edge_coverage(monkeypatch):
+    manager = object.__new__(ModelManager)
+    failed_runtime = MagicMock()
+    manager.llm_lock = threading.RLock()
+    manager.llm = failed_runtime
+    manager.model_profile = {"provider": "qwen"}
+    manager.context_tier = "64k-full"
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager.worker_restart_count = 0
+    manager._llm_generation = 0
+    manager._qwen_64k_profile_recovery_count = 0
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_selected_profile_id = "only"
+    manager._qwen_64k_runtime_profiles = [{"profile_id": "only", "diagnostics": {"backend": "metal"}}]
+    manager._qwen_64k_first_readiness_failure_category = None
+    manager._qwen_64k_first_readiness_failure_diagnostics = {}
+    monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
+    manager.get_llm_instance = MagicMock()
+
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
+        failed_runtime,
+        "backend_graph_compute_failure",
+        decode_return_code=-3,
+        failure_diagnostics={"method": "create_completion"},
+    ) is None
+
+    manager._close_llm_proxy.assert_called_once_with(failed_runtime)
+    manager.get_llm_instance.assert_not_called()
+    assert manager.llm is None
+    assert manager._qwen_64k_selected_profile_index == 1
+    assert manager._qwen_64k_first_readiness_failure_diagnostics["method"] == "create_completion"
+
+    class BadProcess:
+        def poll(self):
+            raise RuntimeError("poll failed")
+
+    assert manager._worker_exit_code(SimpleNamespace(_process=BadProcess())) is None

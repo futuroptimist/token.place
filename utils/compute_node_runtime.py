@@ -1315,7 +1315,8 @@ class ComputeNodeRuntime:
             recover = getattr(self.model_manager, "reinitialize_qwen_64k_with_next_profile_after_readiness_failure", None)
             if callable(recover) and recover_category in {
                 "backend_allocation_failure", "backend_graph_compute_failure", "metal_graph_compute_failure",
-                "kv_slot_unavailable", "metal_command_buffer_out_of_memory", "metal_command_buffer_timeout",
+                "kv_slot_unavailable", "decode_aborted", "backend_decode_failure",
+                "metal_command_buffer_out_of_memory", "metal_command_buffer_timeout",
                 "metal_command_buffer_page_fault", "metal_command_buffer_execution_failure", "metal_backend_sticky_error",
                 "metal_graph_compute_failed", "memory_context_apply_failed", "graph_initialization_failed",
                 "unknown_metal_backend_failure",

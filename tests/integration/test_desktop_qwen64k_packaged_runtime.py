@@ -171,7 +171,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
     assert len(attempts) == 2
     assert 'type_k' not in attempts[0]
     assert attempts[1]['type_k'] == 8
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 
 def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, monkeypatch):

@@ -357,6 +357,8 @@ def _build_qwen_64k_runtime_profiles(
                 else:
                     omitted['type_v'] = 'flash_attn_required'
         enabled = not omitted.get('profile') and all(k in kwargs for k in ('flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch'))
+        if precision != 'f16' and not all(k in kwargs for k in ('type_k', 'type_v')):
+            enabled = False
         diagnostics = {
             'profile_id': profile_id,
             'enabled': bool(enabled),
@@ -460,7 +462,7 @@ def _sanitize_child_diagnostic_text(text: Any, *, limit: int = 1200) -> str:
 
 
 def _safe_plain_completion_eval_return_code(exc: Any) -> Optional[int]:
-    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode[ \t]+returned[ \t]+(-?[0-9]+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:
@@ -1981,7 +1983,7 @@ def _sanitize_error_summary(message):
 
 
 def _safe_plain_completion_eval_return_code(exc):
-    match = re.search(r"llama_decode\s+returned\s+(-?\d+)", str(exc or ''), re.IGNORECASE)
+    match = re.search(r"llama_decode[ \t]+returned[ \t]+(-?[0-9]+)", str(exc or ''), re.IGNORECASE)
     if not match:
         return None
     try:

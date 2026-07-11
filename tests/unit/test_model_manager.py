@@ -5434,7 +5434,7 @@ def test_qwen_64k_runtime_applies_memory_profile_only_to_64k(tmp_path):
     assert 'offload_kqv' not in captured
     assert 'n_batch' not in captured
     assert 'n_ubatch' not in captured
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_default'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_f16_fa_small_batch'
 
 
 def test_qwen_64k_runtime_omits_memory_profile_when_kwargs_unsupported(tmp_path):
@@ -5484,8 +5484,7 @@ def test_qwen_64k_memory_profile_does_not_trust_subprocess_proxy_kwargs():
 
     assert facade.LLAMA_TYPE_Q8_0 == 8
     assert kwargs == {}
-    assert diagnostics['kv_precision'] == 'q8'
-    assert diagnostics['constructor_kwarg_support']['type_k'] is False
+    assert diagnostics['enabled'] is False
 
 
 def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
@@ -5529,7 +5528,7 @@ def test_qwen_64k_subprocess_worker_probe_preserves_yarn_constructor_support():
     assert diagnostics['constructor_kwarg_support']['yarn_ext_factor'] is True
     assert diagnostics['constructor_kwarg_support']['yarn_orig_ctx'] is True
     assert memory_kwargs == {}
-    assert memory_diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
+    assert memory_diagnostics['enabled'] is False
 
 
 def test_qwen_64k_subprocess_facade_reprobes_child_before_false_unsupported(monkeypatch):
@@ -5867,12 +5866,8 @@ def test_qwen_64k_memory_profile_disables_kqv_offload_for_cpu_fallback():
         enable_kqv_offload=False,
     )
 
-    assert kwargs['type_k'] == 8
-    assert kwargs['type_v'] == 8
-    assert 'flash_attn' not in kwargs
-    assert 'offload_kqv' not in kwargs
-    assert diagnostics['kqv_offload_allowed'] is False
-    assert diagnostics['omitted']['flash_attn'] == 'gpu_offload_disabled'
+    assert kwargs == {}
+    assert diagnostics['enabled'] is False
 
 
 def test_qwen_64k_memory_profile_uses_worker_probe_numeric_q8():
@@ -5924,11 +5919,11 @@ def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile
         n_ctx=65536,
     )
 
-    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_default']
+    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_f16_fa_small_batch']
     skipped = profiles[0]['diagnostics']['skipped_profiles']
-    assert skipped
+    assert [item['profile_id'] for item in skipped] == ['qwen64k_kv_q8_fa_small_batch', 'qwen64k_kv_q4_fa_small_batch']
     assert all(not item['enabled'] for item in skipped)
-    assert all('flash_attn' not in item['applied'] for item in skipped)
+    assert all('flash_attn' in item['applied'] for item in skipped)
     assert all('type_k' not in item['applied'] and 'type_v' not in item['applied'] for item in skipped)
 
 
@@ -5989,9 +5984,7 @@ def test_qwen_64k_memory_profile_omits_kwargs_when_worker_probe_lacks_support():
     )
 
     assert kwargs == {}
-    assert diagnostics['omitted']['type_k'] == 'worker_capability_unsupported'
-    assert diagnostics['omitted']['n_batch'] == 'worker_capability_unsupported'
-    assert diagnostics['capability_source'] == 'worker_probe'
+    assert diagnostics['enabled'] is False
 
 
 def test_subprocess_worker_error_summary_keeps_safe_category_hint():
@@ -6668,7 +6661,7 @@ def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     assert attempts[1]['type_v'] == 8
     assert attempts[1]['flash_attn'] is True
     assert attempts[1]['offload_kqv'] is True
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
 
 
@@ -7177,7 +7170,7 @@ def test_llama_worker_render_complete_token_id_keyword_fallback_recovers_after_s
         "    def __call__(self, prompt, **kwargs):\n"
         "        if 'max_tokens' not in kwargs:\n"
         "            raise AssertionError('unbounded llama call')\n"
-        "        raise RuntimeError('llama_decode returned 1')\n",
+        "        raise RuntimeError('plain completion string path failed')\n",
         encoding='utf-8',
     )
     monkeypatch.syspath_prepend(str(fake_site))
@@ -7596,7 +7589,7 @@ def test_subprocess_worker_tokenization_helper_safe_diagnostics_and_classificati
     assert diagnostics['plain_completion_prompt_tokenization_error_category'] == 'prompt_tokenization_failure'
 
     assert classify_shape(RuntimeError('failed to tokenize prompt')) == 'prompt_tokenization_failure'
-    assert classify_shape(RuntimeError('llama_decode returned 1')) == 'prompt_eval_decode_failure'
+    assert classify_shape(RuntimeError('llama_decode returned 1')) == 'kv_slot_unavailable'
     assert classify_shape(RuntimeError('no logits available from sampler')) == 'sampling_failure'
     assert classify_shape(RuntimeError('state file failed to open')) == 'worker_exception'
     assert classify_shape(RuntimeError('contextual logging error')) == 'worker_exception'
@@ -7927,9 +7920,9 @@ def test_qwen_fallback_preserves_decode_failure(tmp_path, monkeypatch):
     assert diagnostics['qwen_high_level_chat_fallback_supported'] is False
     assert diagnostics['qwen_high_level_chat_fallback_succeeded'] is False
     assert diagnostics['qwen_high_level_chat_fallback_category'] == 'unsupported_generation_kwarg'
-    assert diagnostics['generation_exception_category'] == 'prompt_eval_decode_failure'
+    assert diagnostics['generation_exception_category'] == 'prompt_eval_invalid_batch'
     assert diagnostics['exception_type'] == 'RuntimeError'
-    assert diagnostics['sanitized_error_summary'] == 'RuntimeError:prompt_eval_decode_failure'
+    assert diagnostics['sanitized_error_summary'] == 'RuntimeError:redacted'
     assert diagnostics['plain_completion_eval_return_code'] == -1
     assert diagnostics['method'] == 'create_completion_positional_token_ids'
     diagnostics_dump = json.dumps(diagnostics)

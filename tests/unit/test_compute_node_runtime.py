@@ -122,6 +122,46 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
     assert "assistant output" not in json.dumps(safe)
 
 
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_new_edge_shapes():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "plain_completion_backend_state_sticky": "true",
+            "plain_completion_backend_recreation_required": "false",
+            "plain_completion_metal_command_buffer_status": "7",
+            "attempted_plain_completion_methods": "",
+            "plain_completion_attempt_safe_summaries": "",
+            "child_stderr_tail": "metal buffer failed redacted",
+        }
+    )
+
+    assert "plain_completion_backend_state_sticky" not in safe
+    assert "plain_completion_backend_recreation_required" not in safe
+    assert "plain_completion_metal_command_buffer_status" not in safe
+    assert safe["attempted_plain_completion_methods"] == ""
+    assert safe["plain_completion_attempt_safe_summaries"] == ""
+    assert safe["child_stderr_tail"] == "metal buffer failed redacted"
+
+
+def test_payload_helpers_reject_non_dict_and_compute_mode_cpu_fallback():
+    assert is_legacy_relay_payload(["not", "dict"]) is False
+    assert is_api_v1_relay_payload("not-dict") is False
+
+    manager = SimpleNamespace(
+        requested_compute_mode="cpu",
+        last_compute_diagnostics={"requested_mode": "gpu"},
+    )
+
+    assert compute_mode_diagnostics(manager) == {
+        "requested_mode": "cpu",
+        "effective_mode": "cpu",
+        "backend_available": "unknown",
+        "backend_selected": "cpu",
+        "backend_used": "cpu",
+        "n_gpu_layers": 0,
+        "fallback_reason": None,
+    }
+
+
 def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
     unsafe = _safe_completion_smoke_worker_diagnostics(
         {

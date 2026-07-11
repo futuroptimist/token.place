@@ -6650,6 +6650,100 @@ def test_safe_metal_backend_failure_classifier_covers_recoverable_categories():
     assert model_manager_module._classify_safe_metal_backend_failure(["ordinary warning"]) == {}
 
 
+def test_qwen_64k_profile_helpers_cover_omitted_diagnostics_and_error_categories():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(
+            self,
+            *,
+            model_path,
+            n_ctx,
+            flash_attn=None,
+            offload_kqv=None,
+            n_batch=None,
+            n_ubatch=None,
+            type_k=None,
+        ):
+            pass
+
+    llama_cpp = SimpleNamespace(
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        LLAMA_KV_CACHE_TYPE_Q8_0=8,
+        __token_place_worker_capabilities__={
+            "capability_source": "worker_probe",
+            "constructor_kwarg_support": {
+                "type_k": True,
+                "type_v": False,
+                "flash_attn": True,
+                "offload_kqv": True,
+                "n_batch": True,
+                "n_ubatch": True,
+            },
+            "q8_kv_cache_type_value": 8,
+        },
+    )
+
+    kwargs, diagnostics = model_manager_module._qwen_64k_memory_profile_kwargs(
+        llama_cpp,
+        FakeLlama,
+    )
+    assert kwargs == {}
+    assert diagnostics["profile_id"] == model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8
+    assert diagnostics["omitted"]["type_v"] == "worker_capability_unsupported"
+
+    assert (
+        model_manager_module._classify_runtime_context_create_error(
+            "unexpected keyword argument type_v",
+        )
+        == "runtime_context_create_unsupported_kwarg"
+    )
+    assert (
+        model_manager_module._classify_runtime_context_create_error(
+            "rope freq scale invalid for yarn",
+        )
+        == "runtime_context_create_rope_yarn_config"
+    )
+    assert (
+        model_manager_module._classify_runtime_context_create_error(
+            "metal allocation failed while creating llama_context",
+        )
+        == "runtime_context_create_metal_memory"
+    )
+
+
+def test_decode_return_code_and_worker_status_edge_cases():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._safe_plain_completion_eval_return_code("no decode code") is None
+    assert model_manager_module._safe_plain_completion_eval_return_code("llama_decode returned -3") == -3
+    assert model_manager_module._generation_category_for_decode_return_code(None) is None
+    assert model_manager_module._generation_category_for_decode_return_code(-1) == "prompt_eval_invalid_batch"
+    assert model_manager_module._generation_category_for_decode_return_code(-2) == "backend_allocation_failure"
+    assert model_manager_module._generation_category_for_decode_return_code(-3) == "backend_graph_compute_failure"
+    assert model_manager_module._generation_category_for_decode_return_code(1) == "kv_slot_unavailable"
+    assert model_manager_module._generation_category_for_decode_return_code(2) == "decode_aborted"
+    assert model_manager_module._generation_category_for_decode_return_code(-4) == "backend_decode_failure"
+    assert model_manager_module._generation_category_for_decode_return_code(0) is None
+
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 3
+    manager.worker_restart_count = 2
+    manager.last_worker_error_code = "backend_decode_failure"
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = 123
+    manager.last_plain_completion_eval_return_code = -4
+
+    status = manager.worker_lifecycle_status()
+
+    assert status["worker_state"] == "stopped"
+    assert status["worker_alive"] is False
+    assert status["last_plain_completion_eval_return_code"] == -4
+
+
 def test_subprocess_proxy_stderr_cursor_supports_monotonic_and_legacy_tails():
     from utils.llm import model_manager as model_manager_module
 

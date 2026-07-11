@@ -2715,8 +2715,6 @@ def test_compute_node_runtime_has_single_authoritative_yarn_original_context_ass
 
 def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
-    from utils.llm.model_manager import LlamaCppInferenceRequestError
-
     f16_runtime = _Qwen64kRuntime()
     q8_runtime = _Qwen64kRuntime()
     model_manager = _qwen_64k_model_manager(f16_runtime)
@@ -2773,8 +2771,6 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
 
 def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     """All three Metal profiles fail the smoke; ensure_api_v1_runtime_ready returns False."""
-    from utils.llm.model_manager import LlamaCppInferenceRequestError
-
     f16_runtime = _Qwen64kRuntime()
     q8_runtime = _Qwen64kRuntime()
     q4_runtime = _Qwen64kRuntime()

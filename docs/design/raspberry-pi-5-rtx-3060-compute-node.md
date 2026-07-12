@@ -59,7 +59,7 @@ Current token.place model facts:
 - `utils/config_schema.py` maps the default model config from that profile, including context size and Qwen chat-template policy.
 - `utils/llm/model_manager.py` passes `n_gpu_layers`, `n_ctx`, and Qwen-specific YaRN/KV kwargs only after runtime capability probing.
 
-Recommended initial capability advertisement: `8k-fast` only. Do not advertise `64k-full` until the exact Pi/GPU/container stack proves it can warm-load, fully offload, and serve near-filled long contexts without CPU fallback, VRAM exhaustion, recurring NVRM/AER errors, or unsafe temperatures.
+Recommended initial capability advertisement: `8k-fast` only. Do not advertise `64k-full` until the exact Pi/GPU/container stack proves it can warm-load, fully offload, and serve near-filled long contexts without CPU fallback, VRAM exhaustion, recurring NVRM or PCIe Advanced Error Reporting errors, or unsafe temperatures.
 
 Runtime target:
 
@@ -76,11 +76,11 @@ Approximate memory budget:
 | --- | ---: | --- |
 | GGUF weights | about 4.7-5.0GB | Qwen3 8B Q4_K_M community/Hugging Face artifact class; verify exact file size before deployment. |
 | Runtime/CUDA/graph buffers | about 0.8-2.0GB | Workload-dependent; must be measured with `nvidia-smi` and llama.cpp backend logs. |
-| 8K KV cache, f16 K/V | 4.0GB | Current runtime estimate uses 524,288 bytes/token for Qwen 64K f16 KV math; 8,192 tokens × 524,288 bytes. This corresponds to 36 layers × 8 KV heads × 128 head dim × K+V × 2 bytes. |
-| 64K KV cache, f16 K/V | 32.0GB | Exceeds RTX 3060 12GB by itself; `64k-full` is not viable with default f16 K/V on this card. |
-| 64K KV cache, q8 K/V | 16.0GB | Still exceeds 12GB before weights and buffers. |
-| 64K KV cache, q4 K/V | 8.0GB | Theoretically leaves too little headroom after weights and buffers; do not advertise without successful real warm-load and soak validation. |
-| 8K total, f16 K/V | about 9.5-11GB | May fit in 12GB but must be validated because buffers and fragmentation matter. |
+| 8K KV cache, f16 K/V | about 1.125GB | 36 layers × 8 KV heads × 128 head dim × K+V × 2 bytes × 8,192 tokens = 1,207,959,552 bytes. |
+| 64K KV cache, f16 K/V | about 9.0GB | Leaves insufficient room for weights and runtime buffers on an RTX 3060 12GB. |
+| 64K KV cache, q8 K/V | about 4.5GB | May fit with weights and buffers, but requires validation on the exact runtime. |
+| 64K KV cache, q4 K/V | about 2.25GB | May fit with weights and buffers, but requires successful warm-load and soak validation. |
+| 8K total, f16 K/V | about 6.6-8.1GB | Estimated from weights, runtime buffers, and KV cache; validate allocator overhead and fragmentation on the exact stack. |
 
 Capability registration must prevent the relay from scheduling unsupported context tiers. A Pi node that has only validated `8k-fast` must reject or avoid `64k-full` work even if the model profile lists `64k-full` as a general token.place tier.
 
@@ -95,7 +95,7 @@ Capability registration must prevent the relay from scheduling unsupported conte
 | Direct CUDA comparison using RTX 2080 Ti | Pi 59.45 tok/s; x86 60.51 tok/s | Community CUDA comparison with a different NVIDIA GPU. |
 | Desktop RTX 3060 Qwen3 8B Q4_K_M | Around 49 tok/s | Separate Qiita community benchmark; not the Pi host. |
 | Estimated Pi Qwen3 short/moderate context | About 45-50 tok/s | Extrapolation until measured on proposed node. |
-| Estimated Pi Qwen3 near filled 8K | About 38-45 tok/s | Extrapolation; KV/cache pressure and prompt length may reduce speed. |
+| Estimated Pi Qwen3 near-filled 8K | About 38-45 tok/s | Extrapolation; KV/cache pressure and prompt length may reduce speed. |
 
 Disclosure and limits:
 
@@ -390,7 +390,7 @@ Operational requirements:
 - Confirm `lspci` sees the RTX 3060.
 - Confirm all 12GB through `nvidia-smi`.
 - Run CUDA `deviceQuery`.
-- Inspect `dmesg` for PCIe AER and NVRM errors.
+- Inspect `dmesg` for PCIe Advanced Error Reporting and NVRM errors.
 - Validate PSU, slot connector, PCB, and GPU power-connector temperatures.
 
 ### Native inference
@@ -419,9 +419,9 @@ Operational requirements:
 
 Go/no-go criteria:
 
-- Qwen3 8B Q4_K_M decode at 8K is at least 35 tok/s sustained, with target 38-45 tok/s near filled 8K.
+- Qwen3 8B Q4_K_M decode at 8K is at least 35 tok/s sustained, with target 38-45 tok/s near-filled 8K.
 - No CPU fallback when CUDA is requested.
-- No recurring PCIe AER or NVRM errors.
+- No recurring PCIe Advanced Error Reporting or NVRM errors.
 - Safe connector/PCB/PSU/GPU temperatures under soak; exact thresholds should follow component ratings and measured baselines.
 - Automatic registration succeeds reliably after cold boot and cleans up on failure.
 - Zero plaintext leakage in logs, diagnostics, relay state, or container output.
@@ -430,7 +430,7 @@ Go/no-go criteria:
 
 | Risk | Likelihood | Impact | Mitigation | Residual risk |
 | --- | --- | --- | --- | --- |
-| Unmerged/out-of-tree NVIDIA driver patch | High | High | Pin branch/driver/kernel; image backup; monitor PR #972. | High until upstreamed and packaged. |
+| Unmerged/out-of-tree NVIDIA driver patch | High | High | Pin branch/driver/kernel; image backup; monitor NVIDIA/open-gpu-kernel-modules PR #972. | High until upstreamed and packaged. |
 | Kernel update breakage | High | High | Hold kernel/driver packages; staged updates only. | Medium-high. |
 | ARM64 CUDA dependency builds | Medium | High | Native ARM64 build cache; source-build pin; avoid QEMU release path initially. | Medium. |
 | PCIe Gen 3 signal integrity | Medium | Medium | Bring up Gen 2; Gen 3 only after soak. | Medium. |

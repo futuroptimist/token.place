@@ -48,6 +48,12 @@ QWEN_64K_UBATCH_TOKENS = 128
 QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
+
+LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
+    'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+    'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+    'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',
+)
 # Only retry context-create failures backed by safe Metal/KV/cache/buffer
 # evidence. A bare ``Failed to create llama_context`` remains classified as
 # ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
@@ -58,6 +64,8 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
     'runtime_context_create_metal_buffer_limit',
+    'runtime_context_create_cuda_memory',
+    'runtime_context_create_cuda_buffer_limit',
 }
 
 CRITICAL_STDLIB_IMPORT_MODULES = (
@@ -109,6 +117,20 @@ def _coerce_optional_int_enum(value: Any) -> Optional[int]:
     return None
 
 
+def _coerce_strict_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == 'true':
+            return True
+        if lowered == 'false':
+            return False
+    return None
+
+
 def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any]:
     capabilities = getattr(llama_cpp_module, '__token_place_worker_capabilities__', None)
     if not isinstance(capabilities, dict):
@@ -117,7 +139,9 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
     support = capabilities.get('constructor_kwarg_support')
     if isinstance(support, dict):
         payload['constructor_kwarg_support'] = {
-            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
+            str(name): bool(value)
+            for name, value in support.items()
+            if isinstance(name, str) and name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
         }
     for key in ('q8_kv_cache_type_value', 'q4_kv_cache_type_value', 'f16_kv_cache_type_value'):
         value = capabilities.get(key)
@@ -133,6 +157,8 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         'qwen_64k_yarn_support',
         'yarn_resolver_source',
         'llama_module_path',
+        'child_probe_reprobe_attempted',
+        'child_probe_reprobe_skipped_reason',
     ):
         if field in capabilities:
             payload[field] = capabilities.get(field)
@@ -392,6 +418,10 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_metal_buffer_limit'
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
         return 'runtime_context_create_metal_memory'
+    if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'cublas')):
+        return 'runtime_context_create_cuda_memory'
+    if 'cuda' in text and any(term in text for term in ('buffer', 'resource', 'allocation')):
+        return 'runtime_context_create_cuda_buffer_limit'
     if 'failed to create llama_context' in text or 'llamacontext' in text:
         return 'runtime_context_create_failed'
     return 'runtime_init_unclassified'
@@ -524,6 +554,8 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'memory_context_apply_failed',
     'graph_initialization_failed',
     'unknown_metal_backend_failure',
+    'runtime_context_create_cuda_memory',
+    'runtime_context_create_cuda_buffer_limit',
 }
 
 
@@ -728,33 +760,56 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
 
 
 def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
-    reprobe_attempted = False
     if getattr(llama_cpp_module, '__token_place_subprocess_facade__', False):
         capabilities = _safe_constructor_capability_payload(llama_cpp_module)
-        existing_support = capabilities.get('qwen_64k_yarn_support')
+        source = capabilities.get('capability_source')
         kwarg_support = capabilities.get('constructor_kwarg_support')
-        required_supported = (
-            isinstance(kwarg_support, dict)
-            and all(bool(kwarg_support.get(name)) for name in ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'))
+        required = ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx')
+        required_supported = isinstance(kwarg_support, dict) and all(kwarg_support.get(name) is True for name in required)
+        authoritative_backend = str(capabilities.get('backend') or '').lower() in {'cuda', 'metal'}
+        authoritative = (
+            source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}
+            and authoritative_backend
+            and capabilities.get('gpu_offload_supported') is True
+            and bool(capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None))
         )
-        has_concrete_yarn_value = capabilities.get('yarn_enum_value') is not None
-        facade_capabilities_complete = (
-            existing_support == 'supported'
+        complete = (
+            capabilities.get('qwen_64k_yarn_support') == 'supported'
             and required_supported
-            and has_concrete_yarn_value
+            and capabilities.get('yarn_enum_value') is not None
         )
-        if not facade_capabilities_complete:
-            reprobe_attempted = True
-            probe = _probe_llama_cpp_capabilities_in_subprocess(
-                timeout_seconds=getattr(llama_cpp_module, '_timeout_seconds', None)
-            )
-            if isinstance(probe, dict):
-                probe = dict(probe)
-                probe['child_probe_reprobe_attempted'] = True
-                llama_cpp_module.__token_place_worker_capabilities__ = probe
+        if authoritative and complete:
+            diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
+            diagnostics['child_probe_reprobe_attempted'] = False
+            diagnostics['child_probe_reprobe_skipped_reason'] = 'desktop_probe_authoritative'
+            diagnostics['desktop_probe_authoritative'] = True
+            return diagnostics
+        if source == 'desktop_runtime_setup_probe' and not complete:
+            missing = []
+            if capabilities.get('qwen_64k_yarn_support') != 'supported':
+                missing.append('qwen_64k_yarn_support')
+            if not required_supported:
+                missing.extend([name for name in required if not (isinstance(kwarg_support, dict) and kwarg_support.get(name) is True)])
+            if capabilities.get('yarn_enum_value') is None:
+                missing.append('yarn_enum_value')
+            diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
+            diagnostics.update({
+                'supported': False,
+                'missing_reason': 'runtime_desktop_capability_probe_incomplete',
+                'missing_required_kwargs': sorted(set(missing)),
+                'child_probe_reprobe_attempted': False,
+                'child_probe_reprobe_skipped_reason': 'desktop_probe_incomplete_fail_closed',
+                'desktop_probe_authoritative': False,
+            })
+            return diagnostics
+        probe = _probe_llama_cpp_capabilities_in_subprocess(timeout_seconds=getattr(llama_cpp_module, '_timeout_seconds', None))
+        if isinstance(probe, dict):
+            probe = dict(probe)
+            probe['child_probe_reprobe_attempted'] = True
+            llama_cpp_module.__token_place_worker_capabilities__ = probe
     diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
-    if reprobe_attempted:
-        diagnostics['child_probe_reprobe_attempted'] = True
+    if diagnostics.get('child_probe_reprobe_attempted') is not True:
+        diagnostics.setdefault('child_probe_reprobe_attempted', False)
     return diagnostics
 
 def _is_site_packages_path(path_text: Any) -> bool:
@@ -1929,16 +1984,26 @@ class _SubprocessLlamaCppModule:
         self._timeout_seconds = timeout_seconds
         self.__token_place_subprocess_facade__ = True
         self.LLAMA_TYPE_Q8_0 = 8
+        self.GGML_TYPE_Q8_0 = 8
         probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
         self.__token_place_worker_capabilities__ = dict(probe or {})
-        if 'constructor_kwarg_support' in self.__token_place_worker_capabilities__:
-            self.__token_place_worker_capabilities__['capability_source'] = 'worker_probe'
         backend = str((probe or {}).get('backend') or '').lower()
         self.GGML_USE_CUDA = backend == 'cuda'
         self.GGML_USE_METAL = backend == 'metal'
-        q8_value = self.__token_place_worker_capabilities__.get('q8_kv_cache_type_value')
-        if isinstance(q8_value, int):
-            self.LLAMA_TYPE_Q8_0 = q8_value
+        for attr, key in (
+            ('LLAMA_TYPE_Q8_0', 'q8_kv_cache_type_value'),
+            ('GGML_TYPE_Q8_0', 'q8_kv_cache_type_value'),
+            ('LLAMA_TYPE_Q4_0', 'q4_kv_cache_type_value'),
+            ('GGML_TYPE_Q4_0', 'q4_kv_cache_type_value'),
+            ('LLAMA_TYPE_F16', 'f16_kv_cache_type_value'),
+            ('GGML_TYPE_F16', 'f16_kv_cache_type_value'),
+        ):
+            value = self.__token_place_worker_capabilities__.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                setattr(self, attr, value)
+        yarn_value = self.__token_place_worker_capabilities__.get('yarn_enum_value')
+        if isinstance(yarn_value, int) and not isinstance(yarn_value, bool):
+            self.LLAMA_ROPE_SCALING_TYPE_YARN = yarn_value
 
     def llama_supports_gpu_offload(self) -> bool:
         return bool(self.GGML_USE_CUDA or self.GGML_USE_METAL)
@@ -3460,7 +3525,7 @@ def _import_llama_cpp_runtime(
     path_diagnostics = _sanitize_llama_cpp_import_paths()
     logger.info(
         "llama_cpp import path sanitized import_root=%s deprioritized_entries=%s sys_path_count=%s",
-        path_diagnostics.get('import_root'),
+        _redact_paths_from_text(path_diagnostics.get('import_root')),
         len(path_diagnostics.get('deprioritized_entries', [])),
         path_diagnostics.get('sys_path_count'),
     )
@@ -3471,16 +3536,16 @@ def _import_llama_cpp_runtime(
         llama_module_path = expected_module_path
         logger.info(
             "llama_cpp runtime discovery reused desktop probe module_path=%s interpreter=%s",
-            llama_module_path,
-            sys.executable,
+            _redact_paths_from_text(llama_module_path),
+            _redact_paths_from_text(sys.executable),
         )
     else:
         spec_diagnostics = _find_llama_cpp_spec_in_subprocess(timeout_seconds=timeout_seconds)
         llama_module_path = spec_diagnostics.get('module_path')
         logger.info(
             "llama_cpp runtime discovery complete module_path=%s interpreter=%s",
-            llama_module_path or 'missing',
-            sys.executable,
+            _redact_paths_from_text(llama_module_path or 'missing'),
+            _redact_paths_from_text(sys.executable),
         )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
@@ -3495,8 +3560,8 @@ def _import_llama_cpp_runtime(
 
     logger.info(
         "llama_cpp direct import start module_path_hint=%s interpreter=%s",
-        llama_module_path or 'unknown',
-        sys.executable,
+        _redact_paths_from_text(llama_module_path or 'unknown'),
+        _redact_paths_from_text(sys.executable),
     )
     llama_cpp = _import_llama_cpp_in_parent_with_timeout(
         timeout_seconds=timeout_seconds,
@@ -3519,8 +3584,8 @@ def _import_llama_cpp_runtime(
     llama_module_path = imported_module_path
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",
-        llama_module_path or 'unknown',
-        sys.executable,
+        _redact_paths_from_text(llama_module_path or 'unknown'),
+        _redact_paths_from_text(sys.executable),
     )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
@@ -3669,7 +3734,8 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
     error = str(probe.get('error') or probe.get('fallback_reason') or '').strip()
     action = str(probe.get('runtime_action') or probe.get('action') or '').strip().lower()
     backend = str(probe.get('selected_backend') or probe.get('backend') or '').strip().lower()
-    gpu_supported = bool(probe.get('gpu_offload_supported', backend in {'cuda', 'metal'}))
+    gpu_bool = _coerce_strict_bool(probe.get('gpu_offload_supported', True if backend in {'cuda', 'metal'} else False))
+    gpu_supported = bool(gpu_bool)
     module_path = str(probe.get('llama_module_path') or '').strip()
     if not backend or backend == 'missing' or action in {'failed', 'unavailable', 'shadowed_repo_llama_cpp'}:
         return None
@@ -3685,29 +3751,65 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         'error': None,
         'runtime_action': action or 'unknown',
     }
-    support = probe.get('constructor_kwarg_support')
-    if isinstance(support, dict):
-        coerced['constructor_kwarg_support'] = {
-            str(name): bool(value) for name, value in support.items() if isinstance(name, str)
-        }
-    q8_value = probe.get('q8_kv_cache_type_value')
-    if isinstance(q8_value, int):
-        coerced['q8_kv_cache_type_value'] = q8_value
-    if probe.get('capability_source'):
-        coerced['capability_source'] = str(probe.get('capability_source'))
+    support: Dict[str, bool] = {}
+    raw_support = probe.get('constructor_kwarg_support')
+    if isinstance(raw_support, dict):
+        for name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS:
+            if name in raw_support:
+                value = _coerce_strict_bool(raw_support.get(name))
+                if value is not None:
+                    support[name] = value
+    legacy_map = {
+        'rope_scaling_type': 'rope_scaling_type_supported',
+        'yarn_ext_factor': 'yarn_ext_factor_supported',
+        'rope_freq_scale': 'rope_freq_scale_supported',
+        'yarn_orig_ctx': 'yarn_orig_ctx_supported',
+    }
+    for kwarg, field in legacy_map.items():
+        if kwarg not in support and field in probe:
+            value = _coerce_strict_bool(probe.get(field))
+            if value is not None:
+                support[kwarg] = value
+    if support:
+        coerced['constructor_kwarg_support'] = support
+
+    for field in ('q8_kv_cache_type_value', 'q4_kv_cache_type_value', 'f16_kv_cache_type_value'):
+        value = _coerce_optional_int_enum(probe.get(field))
+        if value is not None and 0 <= value <= 2**31 - 1:
+            coerced[field] = value
     if probe.get('llama_cpp_python_version'):
         coerced['llama_cpp_python_version'] = str(probe.get('llama_cpp_python_version'))
-    if probe.get('constructor_has_var_kwargs') is not None:
-        coerced['constructor_has_var_kwargs'] = bool(probe.get('constructor_has_var_kwargs'))
-    if probe.get('constructor_signature_inspectable') is not None:
-        coerced['constructor_signature_inspectable'] = bool(probe.get('constructor_signature_inspectable'))
-    if probe.get('qwen_64k_yarn_support') in {'supported', 'unknown', 'unsupported'}:
-        coerced['qwen_64k_yarn_support'] = str(probe.get('qwen_64k_yarn_support'))
+    for field in ('constructor_has_var_kwargs', 'constructor_signature_inspectable'):
+        value = _coerce_strict_bool(probe.get(field))
+        if value is not None:
+            coerced[field] = value
+    yarn_support = probe.get('qwen_64k_yarn_support')
+    if yarn_support in {'supported', 'unknown', 'unsupported'}:
+        coerced['qwen_64k_yarn_support'] = str(yarn_support)
     if probe.get('yarn_resolver_source'):
         coerced['yarn_resolver_source'] = str(probe.get('yarn_resolver_source'))
     yarn_enum_value = _coerce_optional_int_enum(probe.get('yarn_enum_value'))
-    if yarn_enum_value is not None:
+    if yarn_enum_value is not None and 0 <= yarn_enum_value <= 2**31 - 1:
         coerced['yarn_enum_value'] = yarn_enum_value
+
+    source = str(probe.get('capability_source') or '').strip()
+    if source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy', 'worker_probe'}:
+        coerced['capability_source'] = source
+
+    # Compatibility bridge for deployed flat desktop probes. Do not invent
+    # unobserved performance/KV kwargs.
+    legacy_yarn = _coerce_strict_bool(probe.get('yarn_rope_supported'))
+    required_supported = all(support.get(name) is True for name in ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'))
+    if (
+        coerced.get('qwen_64k_yarn_support') is None
+        and legacy_yarn is True
+        and required_supported
+        and str(probe.get('yarn_resolver_source') or '').lower() != 'unsupported'
+    ):
+        coerced['qwen_64k_yarn_support'] = 'supported'
+        coerced['yarn_enum_value'] = 2
+        coerced['constructor_signature_inspectable'] = True
+        coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
     return coerced
 
 
@@ -4541,7 +4643,7 @@ class ModelManager:
                             if is_qwen_64k:
                                 _runtime_supports_qwen_yarn_rope(llama_cpp, Llama)
                                 Llama = llama_cpp.Llama
-                                if str(compute_plan.get('backend_used') or '').lower() == 'metal':
+                                if str(compute_plan.get('backend_used') or '').lower() in {'metal', 'cuda'}:
                                     runtime_profiles = _build_qwen_64k_runtime_profiles(
                                         llama_cpp,
                                         Llama,
@@ -4735,10 +4837,17 @@ class ModelManager:
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)
                             self.worker_state = 'failed'
                             self.last_worker_error_code = _safe_worker_error_code(e)
-                            self.log_error(
-                                f"Failed to initialize Llama model: {self.last_runtime_init_error}",
-                                exc_info=True,
-                            )
+                            if isinstance(e, LlamaCppRuntimeStageTimeout):
+                                self.log_error(
+                                    "desktop.llama_cpp_worker.init_failed "
+                                    f"stage={e.stage} category=worker_timeout timeout_seconds={e.timeout_seconds:g}",
+                                    exc_info=False,
+                                )
+                            else:
+                                self.log_error(
+                                    f"Failed to initialize Llama model: {self.last_runtime_init_error}",
+                                    exc_info=True,
+                                )
                             return None
 
         return self.llm
@@ -4788,7 +4897,7 @@ class ModelManager:
             None,
         )
         active_diagnostics = active_profile.get('diagnostics') if isinstance(active_profile, dict) else {}
-        if str((active_diagnostics or {}).get('backend') or '').lower() != 'metal':
+        if str((active_diagnostics or {}).get('backend') or '').lower() not in {'metal', 'cuda'}:
             return None
         with self.llm_lock:
             if self.llm is not failed_runtime:
@@ -4815,6 +4924,7 @@ class ModelManager:
                         'backend_state_sticky',
                         'backend_recreation_required',
                         'metal_command_buffer_status',
+                        'cuda_error_category',
                         'eval_return_code',
                     }
                     and value is not None
@@ -4861,6 +4971,7 @@ class ModelManager:
                         'backend_state_sticky',
                         'backend_recreation_required',
                         'metal_command_buffer_status',
+                        'cuda_error_category',
                         'eval_return_code',
                     }
                     and value is not None

@@ -196,6 +196,9 @@ pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String
 }
 
 pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
+    if line.contains("TimeoutExpired") && line.contains("Command [") {
+        return "desktop.llama_cpp_worker.init_failed stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=30".to_string();
+    }
     let line = sanitize_log_line(line);
     let trimmed = line.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -579,10 +582,20 @@ fn sanitize_path_display(value: &str) -> String {
 }
 
 fn is_path_like(value: &str) -> bool {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
     trimmed.starts_with('/')
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
+        || trimmed.starts_with("\\")
+        || lower.starts_with("//?/c:/")
+        || lower.starts_with("//?/unc/")
+        || lower.starts_with("//")
+        || lower.contains("/users/")
+        || lower.contains("/appdata/")
+        || lower.contains("/programs/python/")
         || trimmed.contains('/')
         || (trimmed.len() > 2
             && trimmed.as_bytes()[1] == b':'
@@ -1058,5 +1071,24 @@ mod tests {
         sink.append_line("desktop.compute_node.stderr", "bridge stderr line");
         let raw = fs::read_to_string(path).expect("log");
         assert!(raw.contains("desktop.compute_node.stderr bridge stderr line"));
+    }
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_windows_timeout_paths() {
+        let raw = r#"TimeoutExpired: Command ['\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe', '-c', 'import llama_cpp'] timed out after 30 seconds C:\Users\Alice\AppData\Local\token.place desktop"#;
+        let sanitized = sanitize_operator_diagnostic_line(raw);
+        assert!(!sanitized.contains("Alice"));
+        assert!(!sanitized.contains("AppData"));
+        assert!(!sanitized.contains("Command ["));
+        assert!(sanitized.contains("stage=llama_cpp_gpu_probe"));
+        assert!(sanitized.contains("category=worker_timeout"));
+        assert!(sanitized.contains("timeout_seconds=30"));
+
+        let json = sanitize_operator_diagnostic_line(
+            r#"{"path":"C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe","stage":"llama_cpp_gpu_probe"}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parseable json");
+        assert_eq!(parsed["path"], "<path:python.exe>");
+        assert!(!json.contains("Alice"));
+        assert!(!json.contains("AppData"));
     }
 }

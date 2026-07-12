@@ -48,6 +48,9 @@ def _log_warning(message: str, *, exc_info: bool = False) -> None:
 
 _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+    "cuda_memory_allocation": "runtime_completion_smoke_cuda_memory_allocation",
+    "runtime_context_create_cuda_memory": "runtime_completion_smoke_cuda_memory_allocation",
+    "runtime_context_create_cuda_buffer_limit": "runtime_completion_smoke_cuda_buffer_limit",
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
     "unsupported_render_kwarg": "runtime_completion_smoke_render_template_unexpected_kwarg",
@@ -370,6 +373,8 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
         category = "worker_dead"
     elif "metal" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom")):
         category = "metal_memory_allocation"
+    elif "cuda" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom", "cudamalloc", "cublas")):
+        category = "cuda_memory_allocation"
     elif "kv" in text and any(token in text for token in ("alloc", "cache", "memory", "out of memory", "oom")):
         category = "kv_cache_allocation"
     elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):
@@ -978,6 +983,7 @@ class ComputeNodeRuntime:
                 "qwen_64k_first_readiness_failure_backend_state_sticky",
                 "qwen_64k_first_readiness_failure_backend_recreation_required",
                 "qwen_64k_first_readiness_failure_metal_command_buffer_status",
+                "qwen_64k_first_readiness_failure_cuda_error_category",
                 "qwen_64k_first_readiness_failure_eval_return_code",
             ):
                 if _key in diagnostics:

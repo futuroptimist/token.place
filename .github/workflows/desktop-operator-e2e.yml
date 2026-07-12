@@ -148,6 +148,12 @@ jobs:
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 
+      - name: Run Windows CUDA capability handoff regressions (fakes)
+        run: |
+          python -m pytest tests/unit/test_desktop_runtime_setup.py -q
+          python -m pytest tests/unit/test_model_manager.py -q
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
+
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()
         uses: actions/upload-artifact@v4

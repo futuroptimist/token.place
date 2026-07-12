@@ -8632,3 +8632,65 @@ def test_qwen_64k_recovery_exhaustion_and_lifecycle_edge_coverage(monkeypatch):
             raise RuntimeError("poll failed")
 
     assert manager._worker_exit_code(SimpleNamespace(_process=BadProcess())) is None
+
+
+def test_desktop_runtime_probe_strict_bool_coercion_rejects_truthy_strings():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._coerce_strict_bool(False) is False
+    assert model_manager_module._coerce_strict_bool(0) is False
+    assert model_manager_module._coerce_strict_bool('false') is False
+    assert model_manager_module._coerce_strict_bool(True) is True
+    assert model_manager_module._coerce_strict_bool(1) is True
+    assert model_manager_module._coerce_strict_bool('true') is True
+    assert model_manager_module._coerce_strict_bool('yes') is None
+
+
+def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        'C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'llama_module_path': 'C:/redacted/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'constructor_has_var_kwargs': False,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_enum_value': 2,
+            'q8_kv_cache_type_value': 8,
+            'q4_kv_cache_type_value': 2,
+            'f16_kv_cache_type_value': 1,
+            'capability_source': 'desktop_runtime_setup_probe',
+        },
+    )
+
+    def fail_probe(**_kwargs):
+        raise AssertionError('unexpected secondary probe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_probe)
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        facade,
+        facade.Llama,
+        model_path=__file__,
+        n_ctx=65536,
+    )
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
+    assert [profile['profile_id'] for profile in profiles] == [
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+    ]
+    assert profiles[0]['diagnostics']['backend'] == 'cuda'
+    assert profiles[0]['kwargs']['flash_attn'] is True
+    assert profiles[0]['kwargs']['offload_kqv'] is True
+    assert profiles[0]['kwargs']['n_batch'] == 256
+    assert profiles[0]['kwargs']['n_ubatch'] == 128

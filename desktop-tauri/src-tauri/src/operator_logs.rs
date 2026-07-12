@@ -546,7 +546,8 @@ fn validate_bounded_csv(value: &str, validate_entry: impl Fn(&str) -> bool) -> b
 }
 
 fn sanitize_url_display(value: &str) -> String {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | ',' | ';' | ')' | '(') || ch == '\"');
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
     let without_query = without_fragment
         .split('?')
@@ -563,7 +564,8 @@ fn sanitize_url_display(value: &str) -> String {
 }
 
 fn sanitize_path_display(value: &str) -> String {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | ',' | ';' | ')' | '(') || ch == '\"');
     let path = Path::new(trimmed);
     if trimmed.starts_with('/') && trimmed.split('/').filter(|part| !part.is_empty()).count() <= 2 {
         return "<path>".into();
@@ -579,10 +581,13 @@ fn sanitize_path_display(value: &str) -> String {
 }
 
 fn is_path_like(value: &str) -> bool {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | ',' | ';' | ')' | '(') || ch == '\"');
     trimmed.starts_with('/')
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("\\\\?\\")
         || trimmed.contains('/')
         || (trimmed.len() > 2
             && trimmed.as_bytes()[1] == b':'
@@ -610,7 +615,8 @@ fn sanitize_filename_component(value: &str) -> String {
 }
 
 fn sanitize_log_line(line: &str) -> String {
-    line.chars()
+    let normalized: String = line
+        .chars()
         .map(|ch| {
             if ch.is_control() && ch != '\t' {
                 ' '
@@ -618,7 +624,59 @@ fn sanitize_log_line(line: &str) -> String {
                 ch
             }
         })
-        .collect()
+        .collect();
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.contains("timeoutexpired") || lowered.contains("command [") {
+        if lowered.contains("timeout") || lowered.contains("timed out") {
+            return "desktop.llama_cpp_worker.init_failed stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=30".into();
+        }
+    }
+    redact_windows_paths_in_text(&normalized)
+}
+
+fn redact_windows_paths_in_text(value: &str) -> String {
+    let mut out = Vec::new();
+    for token in value.split_whitespace() {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(ch, '\'' | ',' | ';' | ')' | '(' | '[' | ']') || ch == '\"'
+        });
+        let lower = trimmed.to_ascii_lowercase();
+        let sensitive = lower.contains("appdata")
+            || lower.contains("\\\\?\\c:\\users\\")
+            || lower.contains("//?/c:/users/")
+            || lower.contains("c:\\users\\")
+            || lower.contains("c:/users/")
+            || lower.contains("\\\\?\\unc\\")
+            || lower.starts_with("\\\\")
+            || lower.contains("python311")
+            || lower.contains("programs\\python")
+            || lower.contains("programs/python");
+        if sensitive {
+            out.push("<path>".to_string());
+        } else {
+            out.push(token.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".into()
+    } else {
+        sanitized
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -712,6 +770,27 @@ mod tests {
             lifecycle_index < second_sink_index,
             "lifecycle append must not be overwritten by subsequent sink writes: {raw}"
         );
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_windows_timeout_paths() {
+        let sentinels = [
+            r"C:\Users\Alice\AppData\Local\token.place desktop",
+            r"\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe",
+            r"TimeoutExpired: Command ['C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe', '-c', 'import llama_cpp'] timed out after 30 seconds",
+        ];
+        for line in sentinels {
+            let sanitized = sanitize_operator_diagnostic_line(line);
+            assert!(!sanitized.contains("Alice"));
+            assert!(!sanitized.contains("AppData"));
+            assert!(!sanitized.contains("Command ["));
+        }
+        let json_line = serde_json::json!({"type":"x","message":sentinels[2]}).to_string();
+        let sanitized = sanitize_operator_diagnostic_line(&json_line);
+        let _: serde_json::Value =
+            serde_json::from_str(&sanitized).expect("json remains parseable");
+        assert!(!sanitized.contains("Alice"));
+        assert!(!sanitized.contains("AppData"));
     }
 
     #[test]

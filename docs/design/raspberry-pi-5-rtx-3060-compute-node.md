@@ -158,35 +158,35 @@ Additional topology constraints:
 
 ## 6. Bill of materials
 
-Prices are volatile and were spot-checked on 2026-07-12. Use current street prices, not MSRP, before purchase.
+Prices are volatile and were spot-checked on 2026-07-12. Use current street prices, not MSRP, before purchase. Numerical prices below are retained only where a direct product, retailer, or market-tracker source was rechecked; otherwise the price is marked `TBD — recheck before purchase`.
 
 | Category | Part or example | Required/optional | Qty | Interface/connectors | Power requirement | Approx. current price | Price-check date | Source | Notes and compatibility risks |
 | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- |
 | Host | Raspberry Pi 5 8GB | Required | 1 | 40-pin, USB 3, GbE, PCIe FFC | 5V, high-current; through X1010 pogo pins in Option A or official PSU in Option B | $175 | 2026-07-12 | [PiShop.us Raspberry Pi 5/8GB](https://www.pishop.us/product/raspberry-pi-5-8gb/) and [PiShop.us boards category](https://www.pishop.us/product-category/raspberry-pi/raspberry-pi-5/raspberry-pi-5-boards/) | Volatile DRAM pricing; PiShop.us listed Raspberry Pi 5/8GB at $175.00 on the recheck date. |
-| GPU | Used NVIDIA GeForce RTX 3060 12GB | Required | 1 | PCIe x16 edge, usually 1×8-pin; exact AIB varies | Reference board power around 170W ([NVIDIA family specs](https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3060-3060ti/)) | $245-300 used | 2026-07-12 | TBD — recheck before purchase | Must be 12GB, not 8GB; inspect fans, connectors, and mining wear. |
+| GPU | Used NVIDIA GeForce RTX 3060 12GB | Required | 1 | PCIe x16 edge, usually 1×8-pin; exact AIB varies | Reference board power around 170W ([NVIDIA family specs](https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3060-3060ti/)) | about $244 used | 2026-07-12 | [Best Value GPU RTX 3060 tracker](https://bestvaluegpu.com/history/new-and-used-rtx-3060-price-history-and-specs/) | Must be 12GB, not 8GB; tracker showed used RTX 3060 around $244.99 on eBay on the recheck date; inspect fans, connectors, and mining wear. |
 | Direct adapter | Geekworm/SupTronics X1010 v1.1 | Option A required | 1 | Pi PCIe FFC to open-ended x4 slot | Native four-pin peripheral/Molex input; powers Pi via pogo pins | $28-30 | 2026-07-12 | [Geekworm X1010 wiki](https://wiki.geekworm.com/X1010), [Central Computer listing](https://www.centralcomputer.com/geekworm-x1010-pcie-ffc-to-standard-pcie-x4-slot-expansion-board-for-raspberry-pi-5.html) | Do not load GPU mechanically from PCB; slot-power certification unclear. |
 | OCuLink dock | Minisforum DEG1 or JMT powered dock | Option B required | 1 | OCuLink to powered x16 slot | ATX/SFX PSU | $109-140 | 2026-07-12 | [Minisforum DEG1 listing](https://store.minisforum.com/products/minisforum-egpu-dock) | Add M.2 HAT, OCuLink adapter, cable; validate sequencing. |
 | Pi M.2 HAT | PCIe-to-M.2 M-key HAT | Option B required | 1 | Pi FFC to M.2 M-key | Pi-side power only | TBD — recheck before purchase | 2026-07-12 | TBD | Must expose PCIe, not USB. |
 | M.2 to OCuLink | M-key to OCuLink adapter + cable | Option B required | 1 | M.2 M-key, OCuLink | Passive/low power | TBD — recheck before purchase | 2026-07-12 | TBD | Use short, known-good cable; signal quality matters. |
-| PSU | Quality 450-550W ATX/SFX, recommend 550W | Required | 1 | 24-pin ATX, PCIe 6+2, peripheral lead if Option A | AC mains; enough 12V headroom | $60-90 new | 2026-07-12 | TBD — recheck before purchase | Prefer 550W for connector availability and margin. |
-| GPU power cable | Native PCIe lead for exact PSU/card | Required | 1 | 6+2-pin PCIe | Up to card-specific supplemental draw | Included with PSU | 2026-07-12 | TBD — recheck before purchase | No SATA/Molex-to-GPU adapters; never mix modular cables. |
-| X1010 power lead | Native four-pin peripheral lead | Option A required | 1 | PSU peripheral/Molex to X1010 | Slot/Pi power path | Included with PSU | 2026-07-12 | TBD — recheck before purchase | Must be native PSU cable, not SATA adapter. |
-| PS_ON bridge | Proper 24-pin ATX jumper/bridge | Required for single-PSU unattended AC restore | 1 | 24-pin ATX | Low-voltage control | $5-10 | 2026-07-12 | TBD — recheck before purchase | Use molded bridge, not a paperclip. |
-| CPU cooling | Raspberry Pi Active Cooler | Required | 1 | Pi fan header | Pi 5V fan | $5-10 | 2026-07-12 | TBD — recheck before purchase | Preserve airflow in stand. |
-| Storage | USB 3 SSD, 256GB+ | Required | 1 | USB 3 | USB-powered or powered enclosure | $25-50 | 2026-07-12 | TBD — recheck before purchase | Model storage via USB because PCIe lane is GPU. High-endurance microSD is fallback. |
-| Networking | Ethernet cable | Required | 1 | RJ45 GbE | None | $3-10 | 2026-07-12 | TBD — recheck before purchase | Prefer wired networking for unattended node. |
-| Surge/UPS | Surge protector or small UPS | Optional but recommended | 1 | AC | Node load plus margin | $20-100 | 2026-07-12 | TBD — recheck before purchase | UPS improves AC-loss testing/recovery. |
-| GPU support | Bracket/stand/anti-sag support | Required | 1 | Mechanical | None | $10-30 | 2026-07-12 | TBD — recheck before purchase | No load on X1010 slot or Pi PCB. |
-| Fasteners | M2.5/M3 screws, standoffs, heat-set inserts, vibration feet | Required for custom stand | Assorted | Mechanical | None | $10-25 | 2026-07-12 | TBD — recheck before purchase | Exact sizes depend on selected card/adapter. |
+| PSU | Quality 450-550W ATX/SFX, recommend 550W | Required | 1 | 24-pin ATX, PCIe 6+2, peripheral lead if Option A | AC mains; enough 12V headroom | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Prefer 550W for connector availability and margin. |
+| GPU power cable | Native PCIe lead for exact PSU/card | Required | 1 | 6+2-pin PCIe | Up to card-specific supplemental draw | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | No SATA/Molex-to-GPU adapters; verify inclusion with selected PSU and never mix modular cables. |
+| X1010 power lead | Native four-pin peripheral lead | Option A required | 1 | PSU peripheral/Molex to X1010 | Slot/Pi power path | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Must be native PSU cable, not SATA adapter; verify inclusion with selected PSU. |
+| PS_ON bridge | Proper 24-pin ATX jumper/bridge | Required for single-PSU unattended AC restore | 1 | 24-pin ATX | Low-voltage control | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Use molded bridge, not a paperclip. |
+| CPU cooling | Raspberry Pi Active Cooler | Required | 1 | Pi fan header | Pi 5V fan | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Preserve airflow in stand. |
+| Storage | USB 3 SSD, 256GB+ | Required | 1 | USB 3 | USB-powered or powered enclosure | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Model storage via USB because PCIe lane is GPU. High-endurance microSD is fallback. |
+| Networking | Ethernet cable | Required | 1 | RJ45 GbE | None | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Prefer wired networking for unattended node. |
+| Surge/UPS | Surge protector or small UPS | Optional but recommended | 1 | AC | Node load plus margin | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | UPS improves AC-loss testing/recovery. |
+| GPU support | Bracket/stand/anti-sag support | Required | 1 | Mechanical | None | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | No load on X1010 slot or Pi PCB. |
+| Fasteners | M2.5/M3 screws, standoffs, heat-set inserts, vibration feet | Required for custom stand | Assorted | Mechanical | None | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Exact sizes depend on selected card/adapter. |
 | FFC cable | Short PCIe FFC supplied with adapter | Required | 1 | Pi PCIe FFC | Signal only | Included | 2026-07-12 | [Geekworm X1010 wiki](https://wiki.geekworm.com/X1010), [Central Computer listing](https://www.centralcomputer.com/geekworm-x1010-pcie-ffc-to-standard-pcie-x4-slot-expansion-board-for-raspberry-pi-5.html) | 37mm-class supplied cables constrain stand geometry. |
-| Measurement | Thermal probes or wall-power meter | Optional validation | 1 | Probe/clamp/outlet | Battery/AC | $15-40 | 2026-07-12 | TBD — recheck before purchase | Needed for connector/PCB/PSU-lead validation. |
+| Measurement | Thermal probes or wall-power meter | Optional validation | 1 | Probe/clamp/outlet | Battery/AC | TBD — recheck before purchase | 2026-07-12 | TBD — recheck before purchase | Needed for connector/PCB/PSU-lead validation. |
 
 Estimated subtotals:
 
-- Required Option A subtotal excluding already-owned Pi/GPU: about $156-245 (X1010, PSU, PS_ON bridge, cooler, USB SSD, Ethernet, support hardware, fasteners; excluding optional UPS/meter).
-- Estimated Option A total including representative used RTX 3060 and $175 Pi: about $576-720.
-- OCuLink alternative subtotal excluding Pi/GPU: about $275-415 plus any unverified M.2/OCuLink adapter prices; recheck before purchase.
-- Volatile/TBD items: used RTX 3060 condition/market price, M.2-to-OCuLink chain, exact AIB power connector requirements.
+- Required Option A verified subtotal, partial: about $447-449 for the $175 Pi, about $244 used RTX 3060, and $28-30 X1010 only. Excluded required TBD components: PSU, GPU power cable, X1010 power lead, PS_ON bridge, CPU cooler, USB SSD, Ethernet cable, GPU support, and fasteners; optional surge/UPS and measurement tools are also excluded.
+- Estimated Option A total: partial only until excluded required components above are repriced from live sources; do not treat the earlier full-system numerical range as supported.
+- OCuLink alternative verified subtotal, partial and excluding Pi/GPU: about $109-140 for the powered dock only. Excluded required TBD components: Pi M.2 HAT, M.2-to-OCuLink adapter/cable, PSU, GPU power cable, Pi power source if not already owned, storage, Ethernet, support hardware, and fasteners.
+- Volatile/TBD items: remaining used-GPU listing condition at purchase time, M.2-to-OCuLink chain, selected PSU/accessory cable bundle, exact AIB power connector requirements, and commodity support/measurement hardware.
 
 ## 7. Electrical and safety design
 

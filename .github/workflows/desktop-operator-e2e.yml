@@ -145,6 +145,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Run targeted CUDA capability handoff fakes (Windows)
+        run: |
+          python -m pytest tests/unit/test_desktop_runtime_setup.py -q
+          python -m pytest tests/unit/test_model_manager.py -q
+          python -m pytest tests/unit/test_compute_node_runtime.py -q
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 

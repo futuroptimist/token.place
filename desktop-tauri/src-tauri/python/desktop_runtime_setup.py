@@ -9,9 +9,9 @@ import platform as platform_module
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
@@ -34,6 +34,23 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+LLAMA_CPP_DESKTOP_PROBE_CONSTRUCTOR_KWARGS = (
+    "type_k",
+    "type_v",
+    "flash_attn",
+    "offload_kqv",
+    "n_batch",
+    "n_ubatch",
+    "rope_scaling_type",
+    "yarn_ext_factor",
+    "yarn_attn_factor",
+    "yarn_beta_fast",
+    "yarn_beta_slow",
+    "yarn_orig_ctx",
+    "rope_freq_base",
+    "rope_freq_scale",
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,15 @@ class RuntimeProbe:
     yarn_ext_factor_supported: bool = False
     rope_freq_scale_supported: bool = False
     yarn_orig_ctx_supported: bool = False
+    constructor_kwarg_support: Dict[str, bool] = field(default_factory=dict)
+    constructor_has_var_kwargs: bool = False
+    constructor_signature_inspectable: bool = False
+    qwen_64k_yarn_support: str = "unsupported"
+    yarn_enum_value: Optional[int] = None
+    q8_kv_cache_type_value: Optional[int] = None
+    q4_kv_cache_type_value: Optional[int] = None
+    f16_kv_cache_type_value: Optional[int] = None
+    capability_source: str = "desktop_runtime_setup_probe"
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
@@ -194,32 +220,55 @@ try:
     if gpu_offload_supported and backend == "cpu":
         backend = "metal" if sys.platform == "darwin" else "cuda"
 
-    def _accepts(cls, name):
-        try:
-            params = inspect.signature(getattr(cls, "__init__", cls)).parameters
-        except (TypeError, ValueError):
-            return False
-        return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-    Llama = getattr(llama_cpp, "Llama", None)
-    rope_scaling_type_supported = _accepts(Llama, "rope_scaling_type")
-    yarn_ext_factor_supported = _accepts(Llama, "yarn_ext_factor")
-    rope_freq_scale_supported = _accepts(Llama, "rope_freq_scale")
-    yarn_orig_ctx_supported = _accepts(Llama, "yarn_orig_ctx")
-    if getattr(llama_cpp, "LLAMA_ROPE_SCALING_TYPE_YARN", None) is not None:
-        yarn_resolver_source = "top_level_enum"
-    elif getattr(getattr(llama_cpp, "llama_cpp", None), "LLAMA_ROPE_SCALING_TYPE_YARN", None) is not None:
-        yarn_resolver_source = "nested_enum"
-    elif rope_scaling_type_supported:
-        yarn_resolver_source = "numeric_fallback"
-    else:
-        yarn_resolver_source = "unsupported"
-    yarn_rope_supported = bool(
-        yarn_resolver_source != "unsupported"
-        and rope_scaling_type_supported
-        and rope_freq_scale_supported
-        and yarn_orig_ctx_supported
+    probe_constructor_kwargs = (
+        "type_k", "type_v", "flash_attn", "offload_kqv", "n_batch", "n_ubatch",
+        "rope_scaling_type", "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_fast",
+        "yarn_beta_slow", "yarn_orig_ctx", "rope_freq_base", "rope_freq_scale",
     )
+    Llama = getattr(llama_cpp, "Llama", None)
+    try:
+        params = inspect.signature(getattr(Llama, "__init__", Llama)).parameters
+        constructor_signature_inspectable = True
+    except (TypeError, ValueError):
+        params = {}
+        constructor_signature_inspectable = False
+    constructor_has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    constructor_kwarg_support = {name: (name in params or constructor_has_var_kwargs) for name in probe_constructor_kwargs}
+    rope_scaling_type_supported = bool(constructor_kwarg_support.get("rope_scaling_type"))
+    yarn_ext_factor_supported = bool(constructor_kwarg_support.get("yarn_ext_factor"))
+    rope_freq_scale_supported = bool(constructor_kwarg_support.get("rope_freq_scale"))
+    yarn_orig_ctx_supported = bool(constructor_kwarg_support.get("yarn_orig_ctx"))
+    yarn_enum_value = getattr(llama_cpp, "LLAMA_ROPE_SCALING_TYPE_YARN", None)
+    if yarn_enum_value is not None:
+        yarn_resolver_source = "top_level_enum"
+    else:
+        yarn_enum_value = getattr(getattr(llama_cpp, "llama_cpp", None), "LLAMA_ROPE_SCALING_TYPE_YARN", None)
+        yarn_resolver_source = "nested_enum" if yarn_enum_value is not None else "unsupported"
+    if yarn_enum_value is None and rope_scaling_type_supported:
+        yarn_enum_value = 2
+        yarn_resolver_source = "numeric_fallback"
+    if not isinstance(yarn_enum_value, int) or isinstance(yarn_enum_value, bool):
+        yarn_enum_value = None
+        yarn_resolver_source = "unsupported"
+    def _const(*names):
+        for owner in (llama_cpp, getattr(llama_cpp, "llama_cpp", None)):
+            if owner is None:
+                continue
+            for name in names:
+                value = getattr(owner, name, None)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+        return None
+    q8_kv_cache_type_value = _const("GGML_TYPE_Q8_0", "LLAMA_TYPE_Q8_0")
+    q4_kv_cache_type_value = _const("GGML_TYPE_Q4_0", "LLAMA_TYPE_Q4_0")
+    f16_kv_cache_type_value = _const("GGML_TYPE_F16", "LLAMA_TYPE_F16")
+    yarn_rope_supported = bool(yarn_enum_value is not None and rope_scaling_type_supported and rope_freq_scale_supported and yarn_orig_ctx_supported)
+    if yarn_rope_supported:
+        qwen_64k_yarn_support = "supported"
+    elif not constructor_signature_inspectable:
+        qwen_64k_yarn_support = "unknown"
+    else:
+        qwen_64k_yarn_support = "unsupported"
     llama_cpp_python_version = getattr(llama_cpp, "__version__", None)
     if not llama_cpp_python_version:
         try:
@@ -245,6 +294,15 @@ try:
         "yarn_ext_factor_supported": yarn_ext_factor_supported,
         "rope_freq_scale_supported": rope_freq_scale_supported,
         "yarn_orig_ctx_supported": yarn_orig_ctx_supported,
+        "constructor_kwarg_support": constructor_kwarg_support,
+        "constructor_has_var_kwargs": constructor_has_var_kwargs,
+        "constructor_signature_inspectable": constructor_signature_inspectable,
+        "qwen_64k_yarn_support": qwen_64k_yarn_support,
+        "yarn_enum_value": yarn_enum_value,
+        "q8_kv_cache_type_value": q8_kv_cache_type_value,
+        "q4_kv_cache_type_value": q4_kv_cache_type_value,
+        "f16_kv_cache_type_value": f16_kv_cache_type_value,
+        "capability_source": "desktop_runtime_setup_probe",
         "error": None,
     }
 except Exception as exc:
@@ -266,6 +324,15 @@ except Exception as exc:
         "yarn_ext_factor_supported": False,
         "rope_freq_scale_supported": False,
         "yarn_orig_ctx_supported": False,
+        "constructor_kwarg_support": {},
+        "constructor_has_var_kwargs": False,
+        "constructor_signature_inspectable": False,
+        "qwen_64k_yarn_support": "unknown",
+        "yarn_enum_value": None,
+        "q8_kv_cache_type_value": None,
+        "q4_kv_cache_type_value": None,
+        "f16_kv_cache_type_value": None,
+        "capability_source": "desktop_runtime_setup_probe",
         "error": str(exc),
     }
 
@@ -361,6 +428,20 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
             cwd=str(repo_root),
             env=env,
         )
+    except subprocess.TimeoutExpired:
+        return RuntimeProbe(
+            backend="missing",
+            gpu_offload_supported=False,
+            detected_device="none",
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path="missing",
+            error="desktop_runtime_probe_timeout_after_30s",
+            python_version=_python_version_text(),
+            base_prefix=getattr(sys, "base_prefix", sys.prefix),
+            dependency_target=dependency_target_text,
+            pip_version=pip_version,
+        )
     except Exception as exc:
         return RuntimeProbe(
             backend="missing",
@@ -425,6 +506,15 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         yarn_ext_factor_supported=bool(payload.get("yarn_ext_factor_supported", False)),
         rope_freq_scale_supported=bool(payload.get("rope_freq_scale_supported", False)),
         yarn_orig_ctx_supported=bool(payload.get("yarn_orig_ctx_supported", False)),
+        constructor_kwarg_support={str(k): bool(v) for k, v in (payload.get("constructor_kwarg_support") or {}).items()} if isinstance(payload.get("constructor_kwarg_support"), dict) else {},
+        constructor_has_var_kwargs=bool(payload.get("constructor_has_var_kwargs", False)),
+        constructor_signature_inspectable=bool(payload.get("constructor_signature_inspectable", False)),
+        qwen_64k_yarn_support=str(payload.get("qwen_64k_yarn_support", "unsupported")),
+        yarn_enum_value=payload.get("yarn_enum_value") if isinstance(payload.get("yarn_enum_value"), int) and not isinstance(payload.get("yarn_enum_value"), bool) else None,
+        q8_kv_cache_type_value=payload.get("q8_kv_cache_type_value") if isinstance(payload.get("q8_kv_cache_type_value"), int) and not isinstance(payload.get("q8_kv_cache_type_value"), bool) else None,
+        q4_kv_cache_type_value=payload.get("q4_kv_cache_type_value") if isinstance(payload.get("q4_kv_cache_type_value"), int) and not isinstance(payload.get("q4_kv_cache_type_value"), bool) else None,
+        f16_kv_cache_type_value=payload.get("f16_kv_cache_type_value") if isinstance(payload.get("f16_kv_cache_type_value"), int) and not isinstance(payload.get("f16_kv_cache_type_value"), bool) else None,
+        capability_source=str(payload.get("capability_source", "desktop_runtime_setup_probe")),
     )
 
 
@@ -646,8 +736,10 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
     return dependency_target, dependency_target_error
 
 
-def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
+def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     return {
+        "backend": probe.backend,
+        "gpu_offload_supported": probe.gpu_offload_supported,
         "detected_device": probe.detected_device or "cpu",
         "interpreter": probe.interpreter,
         "python_version": probe.python_version,
@@ -658,6 +750,15 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
         "pip_version": probe.pip_version,
         "llama_module_path": probe.llama_module_path,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
+        "constructor_kwarg_support": dict(probe.constructor_kwarg_support),
+        "constructor_has_var_kwargs": probe.constructor_has_var_kwargs,
+        "constructor_signature_inspectable": probe.constructor_signature_inspectable,
+        "qwen_64k_yarn_support": probe.qwen_64k_yarn_support,
+        "yarn_enum_value": probe.yarn_enum_value,
+        "q8_kv_cache_type_value": probe.q8_kv_cache_type_value,
+        "q4_kv_cache_type_value": probe.q4_kv_cache_type_value,
+        "f16_kv_cache_type_value": probe.f16_kv_cache_type_value,
+        "capability_source": probe.capability_source,
         "yarn_rope_supported": str(probe.yarn_rope_supported).lower(),
         "yarn_resolver_source": probe.yarn_resolver_source,
         "rope_scaling_type_supported": str(probe.rope_scaling_type_supported).lower(),
@@ -1190,11 +1291,22 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
     }
 
 
-def _record_desktop_runtime_probe(result: Dict[str, str]) -> Dict[str, str]:
+def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
     """Expose the successful setup probe to later diagnostics in this process."""
 
+    env_payload = dict(result)
+    for key in (
+        "yarn_rope_supported",
+        "rope_scaling_type_supported",
+        "yarn_ext_factor_supported",
+        "rope_freq_scale_supported",
+        "yarn_orig_ctx_supported",
+    ):
+        value = env_payload.get(key)
+        if isinstance(value, str) and value.lower() in {"true", "false"}:
+            env_payload[key] = value.lower() == "true"
     try:
-        os.environ[RUNTIME_PROBE_ENV] = json.dumps(result)
+        os.environ[RUNTIME_PROBE_ENV] = json.dumps(env_payload)
     except (TypeError, ValueError):
         os.environ.pop(RUNTIME_PROBE_ENV, None)
     return result

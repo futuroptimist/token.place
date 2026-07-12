@@ -1,5 +1,7 @@
 # Raspberry Pi Deployment Guide
 
+> For an experimental GPU compute-node concept using a Raspberry Pi 5 plus an RTX 3060 12GB, see [Raspberry Pi 5 + RTX 3060 headless compute-node design](design/raspberry-pi-5-rtx-3060-compute-node.md).
+
 This guide combines the runbook, k3s cluster instructions and bill of materials into a single place.
 It documents how we built a three-node Raspberry Pi 5 cluster for token.place
  and captures some lessons learned along the way.

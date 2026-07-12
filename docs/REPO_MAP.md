@@ -52,3 +52,6 @@ near-term, and target architecture.
 - [2026-04-20 relay API v1 chat outage writeup](outages/2026-04-20-relay-api-v1-chat-regression.md)
 
 Use these together with the roadmap doc when planning implementation prompts 1–7.
+
+- `docs/design/raspberry-pi-5-rtx-3060-compute-node.md`
+  - Experimental Raspberry Pi 5 + RTX 3060 headless compute-node design.

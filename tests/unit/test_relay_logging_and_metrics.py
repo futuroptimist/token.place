@@ -454,6 +454,63 @@ def test_response_acceptance_serializes_cancellation_before_queueing(relay_clien
     )
 
 
+def test_stale_cancellation_does_not_delete_accepted_response(relay_client) -> None:
+    """Cancellation selected before locking must not terminalize after response acceptance wins."""
+
+    _register_node(relay_client)
+    _queue_request(relay_client, request_id="request-response-wins")
+    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
+    assert poll.status_code == 200
+
+    before = _metric_body(relay_client)
+    before_completed = _metric_value(
+        before,
+        'tokenplace_relay_request_outcomes_total',
+        '{outcome="completed"}',
+    )
+    before_expired = _metric_value(
+        before,
+        'tokenplace_relay_request_outcomes_total',
+        '{outcome="expired"}',
+    )
+
+    response = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-key",
+            "request_id": "request-response-wins",
+            "ciphertext": "sealed-response",
+            "cipherkey": "sealed-key",
+            "iv": "sealed-iv",
+            "protocol": "e2ee_v1",
+        },
+    )
+    assert response.status_code == 200
+
+    removed = relay_module._cancel_api_v1_request(
+        "client-key",
+        "request-response-wins",
+        status="expired",
+        reason="server_unregistered",
+    )
+
+    assert removed == 0
+    assert relay_module._get_terminal_request("client-key", "request-response-wins") is None
+    retrieve = relay_client.post("/api/v1/relay/responses/retrieve", json={"client_public_key": "client-key"})
+    assert retrieve.status_code == 200
+    assert retrieve.get_json()["request_id"] == "request-response-wins"
+
+    after = _metric_body(relay_client)
+    assert (
+        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="completed"}')
+        == before_completed + 1
+    )
+    assert (
+        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="expired"}')
+        == before_expired
+    )
+
+
 def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkeypatch) -> None:
     """Metrics auth failures should be failed HTTP outcomes, not completed traffic."""
 

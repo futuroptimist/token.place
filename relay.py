@@ -2211,7 +2211,6 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     reason = _sanitize_terminal_reason(reason, status)
     with api_v1_terminal_transition_lock:
         removed = _remove_request_from_server_queues(client_public_key, request_id)
-        response_removed = _remove_client_responses_for_request(client_public_key, request_id)
         pending_removed = _clear_pending_request(client_public_key, request_id)
         in_flight_removed = 0
         with server_round_robin_lock:
@@ -2225,7 +2224,13 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
                         in_flight_removed += 1
                         if not in_flight_requests:
                             server_payload.pop("api_v1_in_flight_requests", None)
-        if removed or response_removed or pending_removed or in_flight_removed:
+        lifecycle_removed = bool(removed or pending_removed or in_flight_removed)
+        if lifecycle_removed:
+            # A queued response means response acceptance already won the terminal
+            # transition. Removing a response alone must never authorize stale
+            # cancellation/expiration work that selected a request before taking
+            # api_v1_terminal_transition_lock.
+            _remove_client_responses_for_request(client_public_key, request_id)
             _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",

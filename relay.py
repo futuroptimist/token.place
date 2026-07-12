@@ -527,7 +527,10 @@ def _initialise_metric_labels() -> None:
         COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
     RELAY_QUEUE_DEPTH.labels("relay").set(0)
     RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
-    BUILD_INFO.labels(BUILD_METADATA.get("version", "dev"), BUILD_METADATA.get("revision", "unknown")).set(1)
+    BUILD_INFO.labels(
+        BUILD_METADATA.get("version", "dev"),
+        BUILD_METADATA.get("ref", "unknown"),
+    ).set(1)
     INSTRUMENTATION_UP.set(1)
 
 
@@ -570,7 +573,7 @@ def _outcome_for_response(response: Response) -> str:
         return explicit
     if response.status_code == 429:
         return "rate_limited"
-    if response.status_code >= 500:
+    if response.status_code >= 400:
         return "failed"
     return "completed"
 
@@ -582,6 +585,38 @@ def _record_terminal_outcome(outcome: str) -> None:
         RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome).inc()
     except Exception:
         LOGGER.debug("metrics.outcome_increment_failed", extra={"outcome": outcome})
+
+
+def _record_request_terminal_outcome_once(
+    client_public_key: str | None,
+    request_id: str | None,
+    outcome: str,
+) -> bool:
+    """Record a terminal request outcome once for a client/request pair."""
+
+    if not client_public_key or not request_id:
+        return False
+    if outcome not in OUTCOME_ENUM:
+        outcome = "failed"
+    expires_at = time.time() + max(TERMINAL_REQUEST_TTL_SECONDS, 1.0)
+    with client_terminal_outcomes_lock:
+        recorded_ids = client_terminal_outcomes.setdefault(client_public_key, {})
+        if request_id in recorded_ids:
+            return False
+        recorded_ids[request_id] = expires_at
+    _record_terminal_outcome(outcome)
+    return True
+
+
+def _is_relay_inference_route(route: str) -> bool:
+    return route in {
+        "/api/v1/relay/requests",
+        "/api/v1/relay/requests/cancel",
+        "/api/v1/relay/responses",
+        "/api/v1/relay/responses/retrieve",
+        "/api/v1/*",
+        "/api/v2/*",
+    }
 
 
 def _terminal_outcome_from_status_reason(status: str, reason: str | None) -> str:
@@ -721,6 +756,8 @@ client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
 client_terminal_request_ids = {}
 client_terminal_request_ids_lock = threading.Lock()
+client_terminal_outcomes: dict[str, dict[str, float]] = {}
+client_terminal_outcomes_lock = threading.Lock()
 TERMINAL_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300"))
 PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
 client_inference_requests_lock = threading.Lock()
@@ -1303,7 +1340,7 @@ def _log_request(response: Response):
         ).observe(duration or 0.0)
     except Exception:  # pragma: no cover - defensive metric observation
         LOGGER.debug("metrics.duration_observe_failed", extra={"route": route})
-    if outcome == "rate_limited":
+    if outcome == "rate_limited" and _is_relay_inference_route(route):
         _record_terminal_outcome("rate_limited")
 
     if endpoint not in IGNORED_LOG_ENDPOINTS and request.path.rstrip("/") != "/metrics":
@@ -1322,10 +1359,6 @@ def _log_request(response: Response):
         response.headers.setdefault("X-Request-Id", g.request_id)
 
     if request.path.rstrip("/") == "/metrics":
-        try:
-            _update_runtime_gauges()
-        except Exception:
-            LOGGER.debug("metrics.gauge_update_failed")
         response.headers.setdefault("Cache-Control", "no-store")
 
     return response
@@ -1946,7 +1979,11 @@ def _mark_request_terminal(client_public_key, request_id, *, status="cancelled",
         if request_id in terminal_ids:
             return
         terminal_ids[request_id] = {"status": status, "reason": reason, "expires_at": expires_at}
-    _record_terminal_outcome(_terminal_outcome_from_status_reason(status, reason))
+    _record_request_terminal_outcome_once(
+        client_public_key,
+        request_id,
+        _terminal_outcome_from_status_reason(status, reason),
+    )
 
 
 def _prune_terminal_requests(*, now=None):
@@ -1962,6 +1999,16 @@ def _prune_terminal_requests(*, now=None):
                     terminal_ids.pop(request_id, None)
             if not terminal_ids:
                 client_terminal_request_ids.pop(client_public_key, None)
+    with client_terminal_outcomes_lock:
+        for client_public_key, recorded_ids in list(client_terminal_outcomes.items()):
+            if not isinstance(recorded_ids, dict):
+                client_terminal_outcomes.pop(client_public_key, None)
+                continue
+            for request_id, expires_at in list(recorded_ids.items()):
+                if not isinstance(expires_at, (int, float)) or expires_at <= now:
+                    recorded_ids.pop(request_id, None)
+            if not recorded_ids:
+                client_terminal_outcomes.pop(client_public_key, None)
 
 
 def _get_terminal_request(client_public_key, request_id):
@@ -2604,7 +2651,7 @@ def api_v1_relay_responses():
 
     _queue_client_response(client_public_key, envelope)
     if isinstance(request_id, str) and request_id:
-        _record_terminal_outcome("completed")
+        _record_request_terminal_outcome_once(client_public_key, request_id, "completed")
     LOGGER.info(
         "relay.api_v1.response_received",
         extra={

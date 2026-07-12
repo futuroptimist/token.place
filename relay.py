@@ -14,14 +14,20 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata, resolve_asset_version
+from release_metadata import (
+    get_release_metadata,
+    resolve_asset_version,
+    resolve_deploy_ref,
+    resolve_release_version,
+)
 from utils.llm.model_profiles import build_model_aliases
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Gauge, Histogram, REGISTRY
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
+
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, datetime):
@@ -147,7 +153,11 @@ def _handle_shutdown_signal(signum: int, frame: Any) -> None:
         DRAINING.set()
 
     original = _ORIGINAL_SIGNAL_HANDLERS.get(signum)
-    if callable(original) and original not in (signal.SIG_DFL, signal.SIG_IGN, _handle_shutdown_signal):
+    if callable(original) and original not in (
+        signal.SIG_DFL,
+        signal.SIG_IGN,
+        _handle_shutdown_signal,
+    ):
         original(signum, frame)
         return
 
@@ -194,7 +204,11 @@ def _configure_mock_mode(enable_mock: bool) -> None:
 def _enforce_api_v1_distributed_guardrail() -> None:
     """Optionally force API v1 distributed routing for guardrail runs."""
 
-    enforce = os.environ.get("TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED", "0").strip().lower()
+    enforce = (
+        os.environ.get("TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED", "0")
+        .strip()
+        .lower()
+    )
     if enforce not in {"1", "true", "yes", "on"}:
         return
 
@@ -208,13 +222,17 @@ def _enforce_api_v1_distributed_guardrail() -> None:
         extra={
             "provider_mode": os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER"),
             "fallback": os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"),
-            "has_distributed_url": bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()),
+            "has_distributed_url": bool(
+                os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+            ),
         },
     )
 
 
 def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="token.place relay server", add_help=add_help)
+    parser = argparse.ArgumentParser(
+        description="token.place relay server", add_help=add_help
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -285,7 +303,9 @@ def _normalise_upstream_server_pool(servers: List[str]) -> List[str]:
     return normalised
 
 
-def _has_explicit_relay_upstream_config(configured_servers: List[str] | None = None) -> bool:
+def _has_explicit_relay_upstream_config(
+    configured_servers: List[str] | None = None,
+) -> bool:
     """Return whether relay upstream URLs were explicitly configured by env or config."""
 
     for env_name in (RELAY_UPSTREAMS_ENV, RELAY_UPSTREAM_COMPAT_ENV, UPSTREAM_URL_ENV):
@@ -375,7 +395,11 @@ UPSTREAM_CONFIG = _load_upstream_config()
 def _load_public_base_url() -> str | None:
     """Return the externally reachable relay URL when configured."""
 
-    for env_var in (PUBLIC_BASE_URL_ENV, PUBLIC_BASE_URL_COMPAT_ENV, PUBLIC_BASE_URL_FALLBACK_ENV):
+    for env_var in (
+        PUBLIC_BASE_URL_ENV,
+        PUBLIC_BASE_URL_COMPAT_ENV,
+        PUBLIC_BASE_URL_FALLBACK_ENV,
+    ):
         candidate = os.environ.get(env_var, "")
         if not candidate:
             continue
@@ -435,6 +459,292 @@ def _get_request_counter() -> Counter:
 
 REQUEST_COUNTER = _get_request_counter()
 
+HTTP_PROVIDER_MODES = (
+    "public_api",
+    "relay_client_read",
+    "compute_node_control_plane",
+    "operational",
+    "unknown",
+)
+REQUEST_OUTCOMES = (
+    "completed",
+    "cancelled",
+    "expired",
+    "timed_out",
+    "rate_limited",
+    "dependency_failure",
+    "failed",
+)
+EVICTION_REASONS = ("stale_lease", "explicit_unregister")
+HTTP_DURATION_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+)
+
+
+def _collector(name: str):
+    return getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+
+
+def _counter(name: str, documentation: str, labels: list[str]) -> Counter:
+    existing = _collector(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Counter(name, documentation, labels)
+
+
+def _gauge(name: str, documentation: str, labels: list[str] | None = None) -> Gauge:
+    existing = _collector(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Gauge(name, documentation, labels or [])
+
+
+def _histogram(
+    name: str, documentation: str, labels: list[str], buckets=HTTP_DURATION_BUCKETS
+) -> Histogram:
+    existing = _collector(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Histogram(name, documentation, labels, buckets=buckets)
+
+
+HTTP_REQUESTS = _counter(
+    "tokenplace_http_requests_total",
+    "Bounded relay HTTP requests by normalized route group and status class.",
+    ["method", "route", "status_class", "provider_mode", "outcome"],
+)
+HTTP_DURATION = _histogram(
+    "tokenplace_http_request_duration_seconds",
+    "Bounded relay HTTP request duration by normalized route group and status class.",
+    ["method", "route", "status_class", "provider_mode", "outcome"],
+)
+QUEUE_DEPTH = _gauge(
+    "tokenplace_relay_queue_depth",
+    "Current API v1 relay queue depth.",
+    ["provider_mode"],
+)
+OLDEST_QUEUED_AGE = _gauge(
+    "tokenplace_relay_oldest_queued_request_age_seconds",
+    "Age of the oldest queued API v1 request.",
+)
+COMPUTE_REGISTERED = _gauge(
+    "tokenplace_compute_nodes_registered", "Registered API v1 compute nodes."
+)
+COMPUTE_HEALTHY = _gauge(
+    "tokenplace_compute_nodes_healthy",
+    "Healthy API v1 compute nodes using runtime lease semantics.",
+)
+LEASE_AGE = _histogram(
+    "tokenplace_compute_node_lease_age_seconds",
+    "Compute node lease ages without node identity.",
+    [],
+    buckets=(1, 5, 10, 30, 60, 120, 300),
+)
+EVICTIONS = _counter(
+    "tokenplace_compute_node_evictions_total",
+    "Compute node evictions by fixed reason.",
+    ["reason"],
+)
+IN_FLIGHT = _gauge(
+    "tokenplace_relay_in_flight_requests", "Current API v1 relay in-flight requests."
+)
+OLDEST_IN_FLIGHT_AGE = _gauge(
+    "tokenplace_relay_oldest_in_flight_age_seconds",
+    "Age of the oldest API v1 in-flight request.",
+)
+REQUEST_OUTCOMES_COUNTER = _counter(
+    "tokenplace_relay_request_outcomes_total",
+    "Terminal API v1 relay request outcomes.",
+    ["outcome"],
+)
+BUILD_INFO = _gauge(
+    "tokenplace_build_info", "token.place build metadata.", ["version", "revision"]
+)
+INSTRUMENTATION_UP = _gauge(
+    "tokenplace_instrumentation_up", "Metrics instrumentation initialization state."
+)
+
+
+def _status_class(code: int) -> str:
+    return f"{max(min(int(code), 599), 100) // 100}xx"
+
+
+def _provider_mode_for_request(endpoint: str, path: str) -> str:
+    if path in {"/livez", "/healthz", "/metrics", "/relay/diagnostics"}:
+        return "operational"
+    if path in {
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/responses",
+    }:
+        return "compute_node_control_plane"
+    if path in {"/api/v1/relay/servers/next", "/api/v1/relay/responses/retrieve"}:
+        return "relay_client_read"
+    if path.startswith("/api/") or path.startswith("/v1/"):
+        return "public_api"
+    return "unknown"
+
+
+def _route_group(endpoint: str, path: str) -> str:
+    groups = {
+        "/metrics": "/metrics",
+        "/livez": "/livez",
+        "/healthz": "/healthz",
+        "/api/v1/relay/servers/register": "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister": "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/servers/poll": "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/next": "/api/v1/relay/servers/next",
+        "/api/v1/relay/requests": "/api/v1/relay/requests",
+        "/api/v1/relay/requests/cancel": "/api/v1/relay/requests/cancel",
+        "/api/v1/relay/responses": "/api/v1/relay/responses",
+        "/api/v1/relay/responses/retrieve": "/api/v1/relay/responses/retrieve",
+    }
+    if path in groups:
+        return groups[path]
+    if path.startswith("/api/v1/models") or path.startswith("/v1/models"):
+        return "/api/v1/models/{model}"
+    if path.startswith("/api/v1/") or path.startswith("/v1/"):
+        return "/api/v1/*"
+    return endpoint if endpoint in {"index", "static_files"} else "other"
+
+
+def _http_outcome(status_code: int) -> str:
+    if status_code == 429:
+        return "rate_limited"
+    if 200 <= status_code < 400:
+        return "completed"
+    if status_code == 410:
+        return "expired"
+    if 500 <= status_code < 600:
+        return "dependency_failure"
+    return "failed"
+
+
+def _record_request_outcome(outcome: str) -> None:
+    if outcome not in REQUEST_OUTCOMES:
+        outcome = "failed"
+    try:
+        REQUEST_OUTCOMES_COUNTER.labels(outcome).inc()
+    except Exception:
+        LOGGER.debug(
+            "metrics.request_outcome_increment_failed", extra={"outcome": outcome}
+        )
+
+
+def _queue_depth() -> int:
+    with client_inference_requests_changed:
+        return sum(
+            len(items)
+            for items in client_inference_requests.values()
+            if isinstance(items, list)
+        )
+
+
+def _oldest_queued_age() -> float:
+    now = time.time()
+    oldest = None
+    with client_inference_requests_changed:
+        for items in client_inference_requests.values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                queued_at = item.get("_queued_at") if isinstance(item, dict) else None
+                if isinstance(queued_at, (int, float)):
+                    oldest = queued_at if oldest is None else min(oldest, queued_at)
+    return 0.0 if oldest is None else max(now - float(oldest), 0.0)
+
+
+def _registered_nodes() -> int:
+    with server_round_robin_lock:
+        return len(_api_v1_round_robin_keys())
+
+
+def _healthy_nodes() -> int:
+    now = time.monotonic()
+    with server_round_robin_lock:
+        return sum(
+            1
+            for payload in known_servers.values()
+            if _api_v1_node_is_healthy(payload, now_monotonic=now)
+        )
+
+
+def _in_flight_count_and_oldest_age() -> tuple[int, float]:
+    now_mono = time.monotonic()
+    oldest_started = None
+    count = 0
+    with server_round_robin_lock:
+        with api_v1_in_flight_requests_lock:
+            for payload in known_servers.values():
+                reqs = (
+                    payload.get("api_v1_in_flight_requests")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if not isinstance(reqs, dict):
+                    continue
+                for entry in reqs.values():
+                    if not isinstance(entry, dict):
+                        continue
+                    expires_at = entry.get("expires_at")
+                    ttl = entry.get("ttl_seconds")
+                    if isinstance(expires_at, (int, float)) and expires_at > now_mono:
+                        count += 1
+                        if isinstance(ttl, (int, float)):
+                            started = float(expires_at) - float(ttl)
+                            oldest_started = (
+                                started
+                                if oldest_started is None
+                                else min(oldest_started, started)
+                            )
+    age = 0.0 if oldest_started is None else max(now_mono - oldest_started, 0.0)
+    return count, age
+
+
+def _record_lease_age_samples() -> None:
+    with server_round_robin_lock:
+        payloads = list(known_servers.values())
+    for payload in payloads:
+        if isinstance(payload, dict) and bool(payload.get(API_V1_SERVER_MARKER)):
+            age = _server_ping_age_seconds(payload.get("last_ping"))
+            if age != float("inf"):
+                LEASE_AGE.observe(age)
+
+
+def _init_custom_metrics() -> None:
+    try:
+        QUEUE_DEPTH.labels("distributed").set_function(_queue_depth)
+        OLDEST_QUEUED_AGE.set_function(_oldest_queued_age)
+        COMPUTE_REGISTERED.set_function(_registered_nodes)
+        COMPUTE_HEALTHY.set_function(_healthy_nodes)
+        IN_FLIGHT.set_function(lambda: _in_flight_count_and_oldest_age()[0])
+        OLDEST_IN_FLIGHT_AGE.set_function(lambda: _in_flight_count_and_oldest_age()[1])
+        metadata = get_release_metadata(None)
+        BUILD_INFO.labels(
+            resolve_release_version(),
+            metadata.get("ref") or resolve_deploy_ref() or "dev",
+        ).set(1)
+        INSTRUMENTATION_UP.set(1)
+        for outcome in REQUEST_OUTCOMES:
+            REQUEST_OUTCOMES_COUNTER.labels(outcome)
+        for reason in EVICTION_REASONS:
+            EVICTIONS.labels(reason)
+    except Exception:
+        INSTRUMENTATION_UP.set(0)
+        LOGGER.debug("metrics.initialization_failed", exc_info=True)
+
 
 def _load_server_registration_tokens():
     """Return configured relay server registration tokens."""
@@ -443,20 +753,22 @@ def _load_server_registration_tokens():
     try:
         from config import get_config
 
-        configured = get_config().get('relay.server_registration_token')
+        configured = get_config().get("relay.server_registration_token")
         if isinstance(configured, str):
-            tokens.extend(configured.split(','))
+            tokens.extend(configured.split(","))
     except (ImportError, AttributeError, KeyError, TypeError):
         tokens = []
 
-    plural_tokens = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '')
+    plural_tokens = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKENS", "")
     if plural_tokens:
-        tokens.extend(plural_tokens.replace("\n", ",").split(','))
-    singular_token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN', '')
+        tokens.extend(plural_tokens.replace("\n", ",").split(","))
+    singular_token = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKEN", "")
     if singular_token:
         tokens.append(singular_token)
 
-    normalized = [candidate.strip() for candidate in tokens if isinstance(candidate, str)]
+    normalized = [
+        candidate.strip() for candidate in tokens if isinstance(candidate, str)
+    ]
     return [token for token in normalized if token]
 
 
@@ -469,7 +781,7 @@ def _validate_server_registration():
     if not SERVER_REGISTRATION_TOKENS:
         return None
 
-    provided = request.headers.get('X-Relay-Server-Token', '')
+    provided = request.headers.get("X-Relay-Server-Token", "")
     candidate = provided.strip()
     if candidate:
         matched = False
@@ -479,12 +791,17 @@ def _validate_server_registration():
         if matched:
             return None
 
-    return jsonify({
-        'error': {
-            'message': 'Missing or invalid relay server token',
-            'code': 401,
-        }
-    }), 401
+    return (
+        jsonify(
+            {
+                "error": {
+                    "message": "Missing or invalid relay server token",
+                    "code": 401,
+                }
+            }
+        ),
+        401,
+    )
 
 
 known_servers = {}
@@ -500,8 +817,12 @@ client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
 client_terminal_request_ids = {}
 client_terminal_request_ids_lock = threading.Lock()
-TERMINAL_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300"))
-PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
+TERMINAL_REQUEST_TTL_SECONDS = float(
+    os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300")
+)
+PENDING_REQUEST_TTL_SECONDS = float(
+    os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300")
+)
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 api_v1_in_flight_requests_lock = threading.Lock()
@@ -548,7 +869,9 @@ def _server_stale_seconds() -> int:
 
 
 def _api_v1_poll_wait_seconds() -> float:
-    raw = os.environ.get(API_V1_POLL_WAIT_SECONDS_ENV, str(DEFAULT_API_V1_POLL_WAIT_SECONDS))
+    raw = os.environ.get(
+        API_V1_POLL_WAIT_SECONDS_ENV, str(DEFAULT_API_V1_POLL_WAIT_SECONDS)
+    )
     try:
         wait_seconds = float(raw)
     except ValueError:
@@ -565,8 +888,6 @@ def _api_v1_lease_seconds() -> int:
     except ValueError:
         return DEFAULT_API_V1_LEASE_SECONDS
     return max(value, 1)
-
-
 
 
 def _api_v1_max_queue_depth_per_node() -> int:
@@ -619,7 +940,9 @@ def _normalise_model_ids(value: Any) -> list[str] | None:
     return normalized
 
 
-def _normalise_positive_int(value: Any, *, min_value: int = 1, max_value: int = 1_000_000) -> int | None:
+def _normalise_positive_int(
+    value: Any, *, min_value: int = 1, max_value: int = 1_000_000
+) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     if min_value <= value <= max_value:
@@ -627,7 +950,9 @@ def _normalise_positive_int(value: Any, *, min_value: int = 1, max_value: int = 
     return None
 
 
-def _normalise_api_v1_capabilities(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+def _normalise_api_v1_capabilities(
+    value: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
     if value is None:
         return _api_v1_default_capabilities(), None
     if not isinstance(value, dict):
@@ -644,21 +969,36 @@ def _normalise_api_v1_capabilities(value: Any) -> tuple[dict[str, Any] | None, s
     if active_context_tier not in CONTEXT_TIER_ORDER:
         return None, "capabilities.active_context_tier is unsupported"
 
-    supported_model_ids = _normalise_model_ids(value.get("supported_model_ids") or value.get("model_ids"))
+    supported_model_ids = _normalise_model_ids(
+        value.get("supported_model_ids") or value.get("model_ids")
+    )
     if supported_model_ids is None:
         return None, "capabilities.supported_model_ids must be a non-empty string list"
 
     max_context = _normalise_positive_int(value.get("maximum_total_context_tokens"))
     if max_context is None:
-        return None, "capabilities.maximum_total_context_tokens must be a positive integer"
+        return (
+            None,
+            "capabilities.maximum_total_context_tokens must be a positive integer",
+        )
     if max_context < CONTEXT_TIER_ORDER[active_context_tier]:
-        return None, "capabilities.maximum_total_context_tokens is below the active tier"
+        return (
+            None,
+            "capabilities.maximum_total_context_tokens is below the active tier",
+        )
 
-    default_reservation = _normalise_positive_int(value.get("default_output_token_reservation"))
+    default_reservation = _normalise_positive_int(
+        value.get("default_output_token_reservation")
+    )
     maximum_output = _normalise_positive_int(value.get("maximum_output_tokens"))
-    max_concurrency = _normalise_positive_int(value.get("max_concurrency"), max_value=128)
+    max_concurrency = _normalise_positive_int(
+        value.get("max_concurrency"), max_value=128
+    )
     if default_reservation is None or maximum_output is None or max_concurrency is None:
-        return None, "capability token reservations and concurrency must be positive integers"
+        return (
+            None,
+            "capability token reservations and concurrency must be positive integers",
+        )
     if default_reservation > maximum_output:
         return None, "default output reservation cannot exceed maximum output tokens"
 
@@ -687,7 +1027,9 @@ def _context_tier_can_satisfy(active_tier: Any, requested_tier: str) -> bool:
     return CONTEXT_TIER_ORDER.get(active_tier, 0) >= CONTEXT_TIER_ORDER[requested_tier]
 
 
-def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: float | None = None) -> int:
+def _api_v1_active_in_flight_count(
+    payload: dict[str, Any], *, now_monotonic: float | None = None
+) -> int:
     now = time.monotonic() if now_monotonic is None else now_monotonic
     in_flight_requests = payload.get("api_v1_in_flight_requests")
     if not isinstance(in_flight_requests, dict):
@@ -702,13 +1044,26 @@ def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: fl
     return active
 
 
-def _api_v1_node_load_snapshot(server_public_key: str, payload: dict[str, Any], *, now_monotonic: float | None = None) -> dict[str, int | float]:
+def _api_v1_node_load_snapshot(
+    server_public_key: str,
+    payload: dict[str, Any],
+    *,
+    now_monotonic: float | None = None,
+) -> dict[str, int | float]:
     capabilities = payload.get("capabilities") if isinstance(payload, dict) else {}
-    max_concurrency = capabilities.get("max_concurrency") if isinstance(capabilities, dict) else 1
-    if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency < 1:
+    max_concurrency = (
+        capabilities.get("max_concurrency") if isinstance(capabilities, dict) else 1
+    )
+    if (
+        not isinstance(max_concurrency, int)
+        or isinstance(max_concurrency, bool)
+        or max_concurrency < 1
+    ):
         max_concurrency = 1
     queue_depth = len(client_inference_requests.get(server_public_key, []))
-    in_flight_count = _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic)
+    in_flight_count = _api_v1_active_in_flight_count(
+        payload, now_monotonic=now_monotonic
+    )
     raw_load = queue_depth + in_flight_count
     return {
         "queue_depth": queue_depth,
@@ -719,12 +1074,17 @@ def _api_v1_node_load_snapshot(server_public_key: str, payload: dict[str, Any], 
 
 
 def _api_v1_node_state(payload: dict[str, Any]) -> str:
-    state = payload.get("state") or payload.get("status") or payload.get("lifecycle_state")
+    state = (
+        payload.get("state") or payload.get("status") or payload.get("lifecycle_state")
+    )
     return state.strip().lower() if isinstance(state, str) else ""
 
 
 def _api_v1_node_has_ineligible_flag(payload: dict[str, Any]) -> bool:
-    return any(payload.get(flag) is True for flag in ("failed", "recovering", "draining", "unregistering"))
+    return any(
+        payload.get(flag) is True
+        for flag in ("failed", "recovering", "draining", "unregistering")
+    )
 
 
 def _api_v1_node_is_stale(payload: dict[str, Any], *, now_monotonic: float) -> bool:
@@ -734,18 +1094,39 @@ def _api_v1_node_is_stale(payload: dict[str, Any], *, now_monotonic: float) -> b
     stale_after = payload.get("last_ping_duration", _server_stale_seconds())
     if not isinstance(stale_after, (int, float)):
         stale_after = _server_stale_seconds()
-    return _server_ping_age_seconds(payload.get("last_ping")) > max(float(stale_after), 1.0)
+    return _server_ping_age_seconds(payload.get("last_ping")) > max(
+        float(stale_after), 1.0
+    )
 
 
-def _api_v1_safe_selected_server_payload(server_public_key: str, capabilities: dict[str, Any]) -> dict[str, Any]:
+def _api_v1_node_is_healthy(payload: dict[str, Any], *, now_monotonic: float) -> bool:
+    if not isinstance(payload, dict) or not bool(payload.get(API_V1_SERVER_MARKER)):
+        return False
+    if _api_v1_node_has_ineligible_flag(payload) or _api_v1_node_state(payload) in {
+        "failed",
+        "recovering",
+        "draining",
+        "unregistering",
+    }:
+        return False
+    return not _api_v1_node_is_stale(payload, now_monotonic=now_monotonic)
+
+
+def _api_v1_safe_selected_server_payload(
+    server_public_key: str, capabilities: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "public_key": server_public_key,
         "capabilities": {
             "api_version": "v1",
             "supported_model_ids": list(capabilities.get("supported_model_ids", [])),
             "active_context_tier": capabilities.get("active_context_tier"),
-            "maximum_total_context_tokens": capabilities.get("maximum_total_context_tokens"),
-            "default_output_token_reservation": capabilities.get("default_output_token_reservation"),
+            "maximum_total_context_tokens": capabilities.get(
+                "maximum_total_context_tokens"
+            ),
+            "default_output_token_reservation": capabilities.get(
+                "default_output_token_reservation"
+            ),
             "maximum_output_tokens": capabilities.get("maximum_output_tokens"),
             "max_concurrency": capabilities.get("max_concurrency"),
             "backend_class": capabilities.get("backend_class", "unknown"),
@@ -766,7 +1147,12 @@ def _api_v1_scheduler_candidate(
     if not isinstance(payload, dict) or not bool(payload.get(API_V1_SERVER_MARKER)):
         return None
     state = _api_v1_node_state(payload)
-    if state in {"failed", "recovering", "draining", "unregistering"} or _api_v1_node_has_ineligible_flag(payload):
+    if state in {
+        "failed",
+        "recovering",
+        "draining",
+        "unregistering",
+    } or _api_v1_node_has_ineligible_flag(payload):
         return None
     if _api_v1_node_is_stale(payload, now_monotonic=now_monotonic):
         return None
@@ -789,7 +1175,9 @@ def _api_v1_scheduler_candidate(
     tier_tokens = CONTEXT_TIER_ORDER.get(active_tier)
     if not tier_tokens or context_tokens < tier_tokens:
         return None
-    load = _api_v1_node_load_snapshot(server_public_key, payload, now_monotonic=now_monotonic)
+    load = _api_v1_node_load_snapshot(
+        server_public_key, payload, now_monotonic=now_monotonic
+    )
     capacity_limited = (
         load["in_flight_count"] >= load["max_concurrency"]
         or load["queue_depth"] >= _api_v1_max_queue_depth_per_node()
@@ -798,7 +1186,9 @@ def _api_v1_scheduler_candidate(
         return None
     return {
         "server_public_key": server_public_key,
-        "selected_server": _api_v1_safe_selected_server_payload(server_public_key, capabilities),
+        "selected_server": _api_v1_safe_selected_server_payload(
+            server_public_key, capabilities
+        ),
         "capabilities": dict(capabilities),
         "tier": active_tier,
         "tier_tokens": CONTEXT_TIER_ORDER[active_tier],
@@ -817,10 +1207,13 @@ def _pop_next_api_v1_request(public_key: str):
     first_request = None
 
     def _is_legacy_ciphertext_payload(payload):
-        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
+        return all(
+            key in payload
+            for key in ("client_public_key", "chat_history", "cipherkey", "iv")
+        )
 
     for idx, candidate in enumerate(queued_requests):
-        if bool(candidate.get('e2ee_v1')):
+        if bool(candidate.get("e2ee_v1")):
             first_request = queued_requests.pop(idx)
             break
 
@@ -832,8 +1225,10 @@ def _pop_next_api_v1_request(public_key: str):
                 break
             queued_requests.pop(0)
 
-    if first_request is not None and bool(first_request.get('e2ee_v1')):
-        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
+    if first_request is not None and bool(first_request.get("e2ee_v1")):
+        queued_requests[:] = [
+            item for item in queued_requests if bool(item.get("e2ee_v1"))
+        ]
 
     if not queued_requests:
         client_inference_requests.pop(public_key, None)
@@ -851,7 +1246,10 @@ def _evict_stale_servers() -> list[str]:
         server_items = list(known_servers.items())
         for server_public_key, payload in server_items:
             polling_until = payload.get("polling_until_monotonic")
-            if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+            if (
+                isinstance(polling_until, (int, float))
+                and polling_until > now_monotonic
+            ):
                 continue
             with api_v1_in_flight_requests_lock:
                 in_flight_requests = payload.get("api_v1_in_flight_requests")
@@ -859,15 +1257,34 @@ def _evict_stale_servers() -> list[str]:
                     for request_id, entry in list(in_flight_requests.items()):
                         if not isinstance(request_id, str) or not request_id:
                             continue
-                        expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
-                        if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
+                        expires_at = (
+                            entry.get("expires_at")
+                            if isinstance(entry, dict)
+                            else entry
+                        )
+                        if (
+                            isinstance(expires_at, (int, float))
+                            and expires_at > now_monotonic
+                        ):
                             continue
                         if in_flight_requests.get(request_id) == entry:
                             in_flight_requests.pop(request_id, None)
 
                     has_active_in_flight_requests = any(
-                        isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                        and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
+                        isinstance(
+                            (
+                                entry.get("expires_at")
+                                if isinstance(entry, dict)
+                                else entry
+                            ),
+                            (int, float),
+                        )
+                        and (
+                            entry.get("expires_at")
+                            if isinstance(entry, dict)
+                            else entry
+                        )
+                        > now_monotonic
                         for entry in in_flight_requests.values()
                     )
                     if has_active_in_flight_requests:
@@ -875,7 +1292,10 @@ def _evict_stale_servers() -> list[str]:
                     payload.pop("api_v1_in_flight_requests", None)
 
             in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
-            if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+            if (
+                isinstance(in_flight_until, (int, float))
+                and in_flight_until > now_monotonic
+            ):
                 continue
             payload.pop("api_v1_in_flight_until_monotonic", None)
             payload.pop("api_v1_in_flight_request_id", None)
@@ -885,7 +1305,7 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            if _unregister_server(server_public_key):
+            if _unregister_server(server_public_key, eviction_reason="stale_lease"):
                 evicted.append(server_public_key)
     return evicted
 
@@ -895,22 +1315,32 @@ def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any
     for server_public_key, payload in list(known_servers.items()):
         if api_v1_only and not bool(payload.get(API_V1_SERVER_MARKER)):
             continue
-        load = _api_v1_node_load_snapshot(server_public_key, payload) if bool(payload.get(API_V1_SERVER_MARKER)) else {
-            "queue_depth": len(client_inference_requests.get(server_public_key, [])),
-            "in_flight_count": 0,
-            "max_concurrency": None,
-            "load_score": len(client_inference_requests.get(server_public_key, [])),
-        }
-        diagnostics.append({
-            "server_public_key": server_public_key,
-            "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
-            "next_ping_in_x_seconds": payload.get("last_ping_duration"),
-            "queue_depth": load["queue_depth"],
-            "in_flight_count": load["in_flight_count"],
-            "max_concurrency": load["max_concurrency"],
-            "load_score": load["load_score"],
-            "capabilities": payload.get("capabilities"),
-        })
+        load = (
+            _api_v1_node_load_snapshot(server_public_key, payload)
+            if bool(payload.get(API_V1_SERVER_MARKER))
+            else {
+                "queue_depth": len(
+                    client_inference_requests.get(server_public_key, [])
+                ),
+                "in_flight_count": 0,
+                "max_concurrency": None,
+                "load_score": len(client_inference_requests.get(server_public_key, [])),
+            }
+        )
+        diagnostics.append(
+            {
+                "server_public_key": server_public_key,
+                "age_seconds": round(
+                    _server_ping_age_seconds(payload.get("last_ping")), 3
+                ),
+                "next_ping_in_x_seconds": payload.get("last_ping_duration"),
+                "queue_depth": load["queue_depth"],
+                "in_flight_count": load["in_flight_count"],
+                "max_concurrency": load["max_concurrency"],
+                "load_score": load["load_score"],
+                "capabilities": payload.get("capabilities"),
+            }
+        )
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
 
@@ -953,7 +1383,9 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
-def _unregister_server(server_public_key: str) -> bool:
+def _unregister_server(
+    server_public_key: str, *, eviction_reason: str = "explicit_unregister"
+) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     _record_api_v1_server_unregistered(server_public_key)
@@ -969,7 +1401,9 @@ def _unregister_server(server_public_key: str) -> bool:
     removed = _remove_known_server(server_public_key)
     dropped_requests = []
     with client_inference_requests_changed:
-        dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
+        dropped_requests = list(
+            client_inference_requests.pop(server_public_key, []) or []
+        )
         client_inference_requests_changed.notify_all()
 
     cancelled_queue_depth = 0
@@ -1013,6 +1447,14 @@ def _unregister_server(server_public_key: str) -> bool:
                 if mapped_session_id == session_id:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
+    if removed and eviction_reason in EVICTION_REASONS:
+        try:
+            EVICTIONS.labels(eviction_reason).inc()
+        except Exception:
+            LOGGER.debug(
+                "metrics.eviction_increment_failed", extra={"reason": eviction_reason}
+            )
+
     LOGGER.info(
         "server.unregistered",
         extra={
@@ -1024,12 +1466,34 @@ def _unregister_server(server_public_key: str) -> bool:
     return removed
 
 
+_init_custom_metrics()
+
+
 def _can_resolve_gpu_host(hostname: str) -> bool:
     try:
         socket.getaddrinfo(hostname, None)
         return True
     except socket.gaierror:
         return False
+
+
+@app.before_request
+def _protect_metrics_endpoint():
+    if request.path.rstrip("/") != "/metrics":
+        return None
+    try:
+        _record_lease_age_samples()
+    except Exception:
+        LOGGER.debug("metrics.lease_age_observe_failed")
+    token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "").strip()
+    if not token:
+        return None
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    candidate = header[len(prefix) :].strip() if header.startswith(prefix) else ""
+    if candidate and secrets.compare_digest(candidate, token):
+        return None
+    return Response("Unauthorized\n", status=401, mimetype="text/plain")
 
 
 @app.before_request
@@ -1043,6 +1507,10 @@ def _log_request(response: Response):
     endpoint = request.endpoint or "unknown"
     status_code = str(response.status_code)
 
+    duration = None
+    if hasattr(g, "request_start_time"):
+        duration = max(time.time() - g.request_start_time, 0)
+
     try:
         REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
     except Exception:  # pragma: no cover - defensive metric increment
@@ -1051,9 +1519,26 @@ def _log_request(response: Response):
             extra={"endpoint": endpoint, "status": status_code},
         )
 
-    duration = None
-    if hasattr(g, "request_start_time"):
-        duration = max(time.time() - g.request_start_time, 0)
+    try:
+        outcome = _http_outcome(response.status_code)
+        provider_mode = _provider_mode_for_request(endpoint, request.path)
+        labels = (
+            request.method,
+            _route_group(endpoint, request.path),
+            _status_class(response.status_code),
+            provider_mode if provider_mode in HTTP_PROVIDER_MODES else "unknown",
+            outcome,
+        )
+        HTTP_REQUESTS.labels(*labels).inc()
+        HTTP_DURATION.labels(*labels).observe(duration or 0.0)
+    except Exception:  # pragma: no cover - metrics must not break traffic
+        LOGGER.debug(
+            "metrics.http_increment_failed",
+            extra={
+                "route": endpoint,
+                "status_class": _status_class(response.status_code),
+            },
+        )
 
     if endpoint not in IGNORED_LOG_ENDPOINTS:
         LOGGER.info(
@@ -1121,7 +1606,10 @@ def healthz():
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
         LOGGER.warning(
             "healthz.resolution_failed",
-            extra={"gpu_host": gpu_host, "require_upstream_health": require_upstream_health},
+            extra={
+                "gpu_host": gpu_host,
+                "require_upstream_health": require_upstream_health,
+            },
         )
         return jsonify(status), 503
 
@@ -1134,6 +1622,8 @@ def healthz():
 @app.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
+
+
 def _register_stream_session(server_public_key, client_public_key):
     """Create or replace the streaming session for a client/server pair."""
 
@@ -1143,13 +1633,13 @@ def _register_stream_session(server_public_key, client_public_key):
     session_id = secrets.token_urlsafe(16)
     now = time.time()
     session = {
-        'session_id': session_id,
-        'server_public_key': server_public_key,
-        'client_public_key': client_public_key,
-        'chunks': [],
-        'status': 'open',
-        'created_at': now,
-        'updated_at': now,
+        "session_id": session_id,
+        "server_public_key": server_public_key,
+        "client_public_key": client_public_key,
+        "chunks": [],
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
     }
 
     with stream_lock:
@@ -1170,10 +1660,10 @@ def _append_stream_chunk(session_id, chunk, final=False):
         if not session:
             return False
 
-        session['chunks'].append(chunk)
-        session['updated_at'] = time.time()
+        session["chunks"].append(chunk)
+        session["updated_at"] = time.time()
         if final:
-            session['status'] = 'closed'
+            session["status"] = "closed"
 
     return True
 
@@ -1191,10 +1681,10 @@ def _pop_stream_chunks_for_client(client_public_key):
             streaming_sessions_by_client.pop(client_public_key, None)
             return None
 
-        chunks = list(session['chunks'])
-        session['chunks'].clear()
-        session['updated_at'] = time.time()
-        final = session['status'] == 'closed'
+        chunks = list(session["chunks"])
+        session["chunks"].clear()
+        session["updated_at"] = time.time()
+        final = session["status"] == "closed"
 
         if final:
             streaming_sessions.pop(session_id, None)
@@ -1202,9 +1692,10 @@ def _pop_stream_chunks_for_client(client_public_key):
 
     return session_id, chunks, final
 
-@app.route('/')
+
+@app.route("/")
 def index():
-    response = Response(_render_index_html(request.host), mimetype='text/html')
+    response = Response(_render_index_html(request.host), mimetype="text/html")
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -1215,58 +1706,68 @@ def _release_metadata_response():
     return response
 
 
-@app.route('/api/v1/meta', methods=['GET'])
+@app.route("/api/v1/meta", methods=["GET"])
 def api_v1_meta():
     return _release_metadata_response()
 
 
-@app.route('/api/v1/version', methods=['GET'])
+@app.route("/api/v1/version", methods=["GET"])
 def api_v1_version():
     return _release_metadata_response()
 
 
 # Generic route for serving static files
-@app.route('/static/<path:path>')
+@app.route("/static/<path:path>")
 def serve_static(path):
-    if path == 'index.html':
+    if path == "index.html":
         return index()
     response = send_from_directory(STATIC_DIR_PATH, path)
-    if path in {'chat.js', 'chat_typing.js'}:
-        response.headers['Cache-Control'] = (
-            'public, max-age=31536000, immutable'
-            if 'v' in request.args
-            else 'no-cache'
+    if path in {"chat.js", "chat_typing.js"}:
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if "v" in request.args else "no-cache"
         )
     return response
 
 
-
 def _legacy_routes_enabled() -> bool:
-    return str(os.getenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    return str(
+        os.getenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _legacy_route_deprecated_response(route_name: str):
-    return jsonify({
-        "error": {
-            "message": f"Legacy relay endpoint '{route_name}' is deprecated. Use API v1 relay E2EE routes.",
-            "code": "legacy_relay_endpoint_deprecated",
-            "deprecated": True,
-        }
-    }), 410
+    return (
+        jsonify(
+            {
+                "error": {
+                    "message": f"Legacy relay endpoint '{route_name}' is deprecated. Use API v1 relay E2EE routes.",
+                    "code": "legacy_relay_endpoint_deprecated",
+                    "deprecated": True,
+                }
+            }
+        ),
+        410,
+    )
 
 
-def _select_best_fit_server_key(*, model: str | None = None, context_tier: str = DEFAULT_CONTEXT_TIER) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
+def _select_best_fit_server_key(
+    *, model: str | None = None, context_tier: str = DEFAULT_CONTEXT_TIER
+) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
     """Select an API v1 node by smallest capable tier, then least load, then RR tie-break."""
 
     global server_round_robin_next_index
-    requested_model = model.strip().lower() if isinstance(model, str) and model.strip() else None
+    requested_model = (
+        model.strip().lower() if isinstance(model, str) and model.strip() else None
+    )
     if requested_model:
         requested_model = MODEL_ALIASES.get(requested_model, requested_model)
     now_monotonic = time.monotonic()
     with server_round_robin_lock:
         all_api_v1_keys = _api_v1_round_robin_keys()
         registered_count = len(all_api_v1_keys)
-        current_index = server_round_robin_next_index % registered_count if registered_count else 0
+        current_index = (
+            server_round_robin_next_index % registered_count if registered_count else 0
+        )
         capacity_limited_count = 0
         capacity_limited_tier_counts: dict[str, int] = {}
         candidates = []
@@ -1283,44 +1784,74 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
             if candidate is not None and candidate["capacity_limited"]:
                 capacity_limited_count += 1
                 tier = candidate["tier"]
-                capacity_limited_tier_counts[tier] = capacity_limited_tier_counts.get(tier, 0) + 1
+                capacity_limited_tier_counts[tier] = (
+                    capacity_limited_tier_counts.get(tier, 0) + 1
+                )
             elif candidate is not None:
                 candidates.append(candidate)
 
         eligible_tier_counts: dict[str, int] = {}
         for candidate in candidates:
-            eligible_tier_counts[candidate["tier"]] = eligible_tier_counts.get(candidate["tier"], 0) + 1
+            eligible_tier_counts[candidate["tier"]] = (
+                eligible_tier_counts.get(candidate["tier"], 0) + 1
+            )
 
         if not candidates:
-            return None, {
-                "eligible_count": 0,
-                "eligible_node_count": 0,
-                "requested_model": requested_model,
-                "eligible_tier_counts": eligible_tier_counts or capacity_limited_tier_counts,
-                "capacity_limited_tier_counts": capacity_limited_tier_counts,
-                "registered_api_v1_count": registered_count,
-                "round_robin_index": current_index,
-                "round_robin_position": None,
-                "selection_policy": API_V1_SELECTION_POLICY,
-                "capacity_limited_node_count": capacity_limited_count,
-            }, None
+            return (
+                None,
+                {
+                    "eligible_count": 0,
+                    "eligible_node_count": 0,
+                    "requested_model": requested_model,
+                    "eligible_tier_counts": eligible_tier_counts
+                    or capacity_limited_tier_counts,
+                    "capacity_limited_tier_counts": capacity_limited_tier_counts,
+                    "registered_api_v1_count": registered_count,
+                    "round_robin_index": current_index,
+                    "round_robin_position": None,
+                    "selection_policy": API_V1_SELECTION_POLICY,
+                    "capacity_limited_node_count": capacity_limited_count,
+                },
+                None,
+            )
 
         selected_tier_tokens = min(candidate["tier_tokens"] for candidate in candidates)
-        tier_candidates = [candidate for candidate in candidates if candidate["tier_tokens"] == selected_tier_tokens]
-        selected_load_score = min(candidate["load_score"] for candidate in tier_candidates)
-        load_candidates = [candidate for candidate in tier_candidates if candidate["load_score"] == selected_load_score]
+        tier_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["tier_tokens"] == selected_tier_tokens
+        ]
+        selected_load_score = min(
+            candidate["load_score"] for candidate in tier_candidates
+        )
+        load_candidates = [
+            candidate
+            for candidate in tier_candidates
+            if candidate["load_score"] == selected_load_score
+        ]
 
-        eligible_key = tuple(candidate["server_public_key"] for candidate in load_candidates)
+        eligible_key = tuple(
+            candidate["server_public_key"] for candidate in load_candidates
+        )
         if eligible_key in api_v1_filtered_round_robin_next_positions:
-            selected_load_index = api_v1_filtered_round_robin_next_positions[eligible_key] % len(load_candidates)
+            selected_load_index = api_v1_filtered_round_robin_next_positions[
+                eligible_key
+            ] % len(load_candidates)
         else:
             selected_load_index = min(
                 range(len(load_candidates)),
-                key=lambda index: (load_candidates[index]["registration_index"] - current_index) % registered_count,
+                key=lambda index: (
+                    load_candidates[index]["registration_index"] - current_index
+                )
+                % registered_count,
             )
         selected = load_candidates[selected_load_index]
-        api_v1_filtered_round_robin_next_positions[eligible_key] = (selected_load_index + 1) % len(load_candidates)
-        server_round_robin_next_index = (selected["registration_index"] + 1) % registered_count
+        api_v1_filtered_round_robin_next_positions[eligible_key] = (
+            selected_load_index + 1
+        ) % len(load_candidates)
+        server_round_robin_next_index = (
+            selected["registration_index"] + 1
+        ) % registered_count
 
         requested_tokens = CONTEXT_TIER_ORDER[context_tier]
         spillover = selected["tier_tokens"] > requested_tokens
@@ -1353,25 +1884,47 @@ def _select_next_server_payload(*, api_v1: bool = False):
         if not known_servers:
             server_round_robin_next_index = 0
             if api_v1:
-                return jsonify({
-                    'error': {
-                        'message': 'No registered compute nodes are available on this relay.',
-                        'code': 'no_registered_compute_nodes',
-                    }
-                }), 503
-            return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "No registered compute nodes are available on this relay.",
+                                "code": "no_registered_compute_nodes",
+                            }
+                        }
+                    ),
+                    503,
+                )
+            return (
+                jsonify({"error": {"message": "No servers available", "code": 503}}),
+                503,
+            )
         if not api_v1:
             server_public_key = secrets.choice(list(known_servers.keys()))
             server_payload = dict(known_servers[server_public_key])
-            return jsonify({'server_public_key': server_payload['public_key']})
+            return jsonify({"server_public_key": server_payload["public_key"]})
 
     model = request.args.get("model") if api_v1 else None
     if api_v1 and not (isinstance(model, str) and model.strip()):
         model = DEFAULT_MODEL_IDS[0]
     context_tier = request.args.get("context_tier") if api_v1 else None
-    context_tier = context_tier.strip() if isinstance(context_tier, str) and context_tier.strip() else DEFAULT_CONTEXT_TIER
+    context_tier = (
+        context_tier.strip()
+        if isinstance(context_tier, str) and context_tier.strip()
+        else DEFAULT_CONTEXT_TIER
+    )
     if api_v1 and context_tier not in CONTEXT_TIER_ORDER:
-        return jsonify({'error': {'message': 'Unsupported context_tier', 'code': 'invalid_context_tier'}}), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unsupported context_tier",
+                        "code": "invalid_context_tier",
+                    }
+                }
+            ),
+            400,
+        )
 
     server_public_key, selection, server_payload = _select_best_fit_server_key(
         model=model,
@@ -1380,38 +1933,67 @@ def _select_next_server_payload(*, api_v1: bool = False):
     if not server_public_key or server_payload is None:
         if selection.get("registered_api_v1_count", 0):
             if selection.get("capacity_limited_node_count", 0):
-                return jsonify({
-                    'error': {
-                        'message': 'Registered compute nodes match the requested model/context tier, but all matching nodes are at capacity. Retry with backoff.',
-                        'code': 'no_available_capacity',
-                        'selection_policy': API_V1_SELECTION_POLICY,
-                        'requested_context_tier': context_tier,
-                        'requested_model': model,
-                        'eligible_node_count': selection.get("eligible_node_count", 0),
-                        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
-                        'capacity_limited_node_count': selection.get("capacity_limited_node_count", 0),
-                        'capacity_limited_tier_counts': selection.get("capacity_limited_tier_counts", {}),
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "Registered compute nodes match the requested model/context tier, but all matching nodes are at capacity. Retry with backoff.",
+                                "code": "no_available_capacity",
+                                "selection_policy": API_V1_SELECTION_POLICY,
+                                "requested_context_tier": context_tier,
+                                "requested_model": model,
+                                "eligible_node_count": selection.get(
+                                    "eligible_node_count", 0
+                                ),
+                                "eligible_tier_counts": selection.get(
+                                    "eligible_tier_counts", {}
+                                ),
+                                "capacity_limited_node_count": selection.get(
+                                    "capacity_limited_node_count", 0
+                                ),
+                                "capacity_limited_tier_counts": selection.get(
+                                    "capacity_limited_tier_counts", {}
+                                ),
+                            }
+                        }
+                    ),
+                    503,
+                )
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Registered compute nodes are available, but none match the requested model/context tier.",
+                            "code": "no_matching_compute_node",
+                            "selection_policy": API_V1_SELECTION_POLICY,
+                            "requested_context_tier": context_tier,
+                            "requested_model": model,
+                            "eligible_node_count": selection.get(
+                                "eligible_node_count", 0
+                            ),
+                            "eligible_tier_counts": selection.get(
+                                "eligible_tier_counts", {}
+                            ),
+                        }
                     }
-                }), 503
-            return jsonify({
-                'error': {
-                    'message': 'Registered compute nodes are available, but none match the requested model/context tier.',
-                    'code': 'no_matching_compute_node',
-                    'selection_policy': API_V1_SELECTION_POLICY,
-                    'requested_context_tier': context_tier,
-                    'requested_model': model,
-                    'eligible_node_count': selection.get("eligible_node_count", 0),
-                    'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
+                ),
+                503,
+            )
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "No registered compute nodes are available on this relay.",
+                        "code": "no_registered_compute_nodes",
+                    }
                 }
-            }), 503
-        return jsonify({
-            'error': {
-                'message': 'No registered compute nodes are available on this relay.',
-                'code': 'no_registered_compute_nodes',
-            }
-        }), 503
+            ),
+            503,
+        )
 
-    capabilities = server_payload.get("capabilities") if isinstance(server_payload, dict) else {}
+    capabilities = (
+        server_payload.get("capabilities") if isinstance(server_payload, dict) else {}
+    )
     LOGGER.info(
         "relay.server_selected",
         extra={
@@ -1429,25 +2011,36 @@ def _select_next_server_payload(*, api_v1: bool = False):
             "api_v1": api_v1,
         },
     )
-    return jsonify({
-        'server_public_key': server_payload['public_key'],
-        'requested_context_tier': context_tier,
-        'requested_model': model,
-        'resolved_model': selection.get('requested_model'),
-        'selected_context_tier': capabilities.get("active_context_tier"),
-        'selected_context_window_tokens': capabilities.get("maximum_total_context_tokens"),
-        'selected_model_support': capabilities.get("supported_model_ids", []),
-        'selection_policy': API_V1_SELECTION_POLICY,
-        'eligible_node_count': selection.get("eligible_node_count", selection.get("eligible_count", 0)),
-        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
-        'selected_queue_depth': selection.get("selected_queue_depth", 0),
-        'selected_in_flight_count': selection.get("selected_in_flight_count", 0),
-        'selected_load_score': selection.get("selected_load_score", 0),
-        'spillover': bool(selection.get("spillover")),
-        **({'spillover_reason': selection.get("spillover_reason")} if selection.get("spillover_reason") else {}),
-    })
+    return jsonify(
+        {
+            "server_public_key": server_payload["public_key"],
+            "requested_context_tier": context_tier,
+            "requested_model": model,
+            "resolved_model": selection.get("requested_model"),
+            "selected_context_tier": capabilities.get("active_context_tier"),
+            "selected_context_window_tokens": capabilities.get(
+                "maximum_total_context_tokens"
+            ),
+            "selected_model_support": capabilities.get("supported_model_ids", []),
+            "selection_policy": API_V1_SELECTION_POLICY,
+            "eligible_node_count": selection.get(
+                "eligible_node_count", selection.get("eligible_count", 0)
+            ),
+            "eligible_tier_counts": selection.get("eligible_tier_counts", {}),
+            "selected_queue_depth": selection.get("selected_queue_depth", 0),
+            "selected_in_flight_count": selection.get("selected_in_flight_count", 0),
+            "selected_load_score": selection.get("selected_load_score", 0),
+            "spillover": bool(selection.get("spillover")),
+            **(
+                {"spillover_reason": selection.get("spillover_reason")}
+                if selection.get("spillover_reason")
+                else {}
+            ),
+        }
+    )
 
-@app.route('/next_server', methods=['GET'])
+
+@app.route('/next_server', methods=["GET"])
 def next_server():
     """
     Endpoint for clients to get the next server to send a request to.
@@ -1458,17 +2051,17 @@ def next_server():
         - error: an error message with a message and a code
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/next_server')
+        return _legacy_route_deprecated_response("/next_server")
     return _select_next_server_payload()
 
 
-@app.route('/api/v1/relay/servers/next', methods=['GET'])
+@app.route("/api/v1/relay/servers/next", methods=["GET"])
 def api_v1_relay_servers_next():
     """Get a registered compute node public key for API v1 encrypted relay requests."""
     return _select_next_server_payload(api_v1=True)
 
 
-@app.route('/relay/diagnostics', methods=['GET'])
+@app.route("/relay/diagnostics", methods=["GET"])
 def relay_diagnostics():
     """Live diagnostics for legacy and API v1 relay registered compute nodes."""
     _evict_stale_servers()
@@ -1501,82 +2094,94 @@ def relay_diagnostics():
     return response
 
 
-@app.route('/relay/api/v1/chat/completions', methods=['POST'])
+@app.route("/relay/api/v1/chat/completions", methods=["POST"])
 def relay_api_v1_chat_completions():
     """Fail closed for relay-dispatched API v1 plaintext chat payloads."""
 
-    return jsonify(
-        {
-            'error': {
-                'type': 'service_unavailable_error',
-                'code': 'distributed_api_v1_relay_disabled',
-                'message': (
-                    'Distributed relay API v1 chat completions are disabled pending '
-                    'an end-to-end encrypted relay design.'
-                ),
+    return (
+        jsonify(
+            {
+                "error": {
+                    "type": "service_unavailable_error",
+                    "code": "distributed_api_v1_relay_disabled",
+                    "message": (
+                        "Distributed relay API v1 chat completions are disabled pending "
+                        "an end-to-end encrypted relay design."
+                    ),
+                }
             }
-        }
-    ), 503
+        ),
+        503,
+    )
 
 
-@app.route('/relay/api/v1/source', methods=['POST'])
+@app.route("/relay/api/v1/source", methods=["POST"])
 def relay_api_v1_source():
     """Fail closed for relay-dispatched API v1 plaintext completion responses."""
 
-    return jsonify(
-        {
-            'error': {
-                'type': 'service_unavailable_error',
-                'code': 'distributed_api_v1_relay_disabled',
-                'message': (
-                    'Distributed relay API v1 source dispatch is disabled pending '
-                    'an end-to-end encrypted relay design.'
-                ),
+    return (
+        jsonify(
+            {
+                "error": {
+                    "type": "service_unavailable_error",
+                    "code": "distributed_api_v1_relay_disabled",
+                    "message": (
+                        "Distributed relay API v1 source dispatch is disabled pending "
+                        "an end-to-end encrypted relay design."
+                    ),
+                }
             }
-        }
-    ), 503
+        ),
+        503,
+    )
+
 
 def _extract_ciphertext_envelope(payload, *, require_server_key=False):
     if not isinstance(payload, dict):
-        return None, ('Invalid request data', 400)
+        return None, ("Invalid request data", 400)
 
-    required = ['cipherkey', 'iv']
-    has_ciphertext = 'ciphertext' in payload
-    has_chat_history = 'chat_history' in payload
+    required = ["cipherkey", "iv"]
+    has_ciphertext = "ciphertext" in payload
+    has_chat_history = "chat_history" in payload
     if not has_ciphertext and not has_chat_history:
-        return None, ('Invalid request data', 400)
+        return None, ("Invalid request data", 400)
     if require_server_key:
-        required.insert(0, 'server_public_key')
+        required.insert(0, "server_public_key")
     missing = [field for field in required if field not in payload]
     if missing:
-        return None, ('Invalid request data', 400)
+        return None, ("Invalid request data", 400)
 
     envelope = {
-        'client_public_key': payload.get('client_public_key'),
-        'chat_history': payload.get('ciphertext', payload.get('chat_history')),
-        'ciphertext': payload.get('ciphertext', payload.get('chat_history')),
-        'cipherkey': payload['cipherkey'],
-        'iv': payload['iv'],
+        "client_public_key": payload.get("client_public_key"),
+        "chat_history": payload.get("ciphertext", payload.get("chat_history")),
+        "ciphertext": payload.get("ciphertext", payload.get("chat_history")),
+        "cipherkey": payload["cipherkey"],
+        "iv": payload["iv"],
     }
     if require_server_key:
-        envelope['server_public_key'] = payload['server_public_key']
-    if 'request_id' in payload:
-        envelope['request_id'] = payload['request_id']
-    if 'protocol' in payload:
-        envelope['protocol'] = payload['protocol']
-    if 'version' in payload:
-        envelope['version'] = payload['version']
-    if 'cancel_token' in payload:
-        envelope['cancel_token'] = payload['cancel_token']
+        envelope["server_public_key"] = payload["server_public_key"]
+    if "request_id" in payload:
+        envelope["request_id"] = payload["request_id"]
+    if "protocol" in payload:
+        envelope["protocol"] = payload["protocol"]
+    if "version" in payload:
+        envelope["version"] = payload["version"]
+    if "cancel_token" in payload:
+        envelope["cancel_token"] = payload["cancel_token"]
     return envelope, None
-
-
 
 
 def _payload_has_plaintext_fields(payload):
     if not isinstance(payload, dict):
         return False
-    forbidden_plaintext_fields = {"messages", "prompt", "input", "content", "response", "text"}
+    forbidden_plaintext_fields = {
+        "messages",
+        "prompt",
+        "input",
+        "content",
+        "response",
+        "text",
+    }
     return any(field in payload for field in forbidden_plaintext_fields)
 
 
@@ -1673,14 +2278,24 @@ _ALLOWED_API_V1_TERMINAL_REASONS = {
 
 
 def _sanitize_terminal_status(value):
-    return value if isinstance(value, str) and value in _ALLOWED_API_V1_TERMINAL_STATUSES else "cancelled"
+    return (
+        value
+        if isinstance(value, str) and value in _ALLOWED_API_V1_TERMINAL_STATUSES
+        else "cancelled"
+    )
 
 
 def _sanitize_terminal_reason(value, status):
-    return value if isinstance(value, str) and value in _ALLOWED_API_V1_TERMINAL_REASONS else status
+    return (
+        value
+        if isinstance(value, str) and value in _ALLOWED_API_V1_TERMINAL_REASONS
+        else status
+    )
 
 
-def _mark_request_terminal(client_public_key, request_id, *, status="cancelled", reason=None):
+def _mark_request_terminal(
+    client_public_key, request_id, *, status="cancelled", reason=None
+):
     if not client_public_key or not request_id:
         return
     status = _sanitize_terminal_status(status)
@@ -1689,18 +2304,26 @@ def _mark_request_terminal(client_public_key, request_id, *, status="cancelled",
     _prune_terminal_requests(now=time.time())
     with client_terminal_request_ids_lock:
         terminal_ids = client_terminal_request_ids.setdefault(client_public_key, {})
-        terminal_ids[request_id] = {"status": status, "reason": reason, "expires_at": expires_at}
+        terminal_ids[request_id] = {
+            "status": status,
+            "reason": reason,
+            "expires_at": expires_at,
+        }
 
 
 def _prune_terminal_requests(*, now=None):
     now = time.time() if now is None else now
     with client_terminal_request_ids_lock:
-        for client_public_key, terminal_ids in list(client_terminal_request_ids.items()):
+        for client_public_key, terminal_ids in list(
+            client_terminal_request_ids.items()
+        ):
             if not isinstance(terminal_ids, dict):
                 client_terminal_request_ids.pop(client_public_key, None)
                 continue
             for request_id, terminal in list(terminal_ids.items()):
-                expires_at = terminal.get("expires_at") if isinstance(terminal, dict) else None
+                expires_at = (
+                    terminal.get("expires_at") if isinstance(terminal, dict) else None
+                )
                 if not isinstance(expires_at, (int, float)) or expires_at <= now:
                     terminal_ids.pop(request_id, None)
             if not terminal_ids:
@@ -1731,7 +2354,9 @@ def _get_terminal_request(client_public_key, request_id):
 def _remove_request_from_server_queues(client_public_key, request_id):
     removed = 0
     with client_inference_requests_changed:
-        for server_public_key, queued_requests in list(client_inference_requests.items()):
+        for server_public_key, queued_requests in list(
+            client_inference_requests.items()
+        ):
             if not isinstance(queued_requests, list):
                 continue
             kept = []
@@ -1747,7 +2372,9 @@ def _remove_request_from_server_queues(client_public_key, request_id):
                     LOGGER.info(
                         "relay.api_v1.request_removed_from_queue",
                         extra={
-                            "server_fingerprint": _safe_key_fingerprint(server_public_key),
+                            "server_fingerprint": _safe_key_fingerprint(
+                                server_public_key
+                            ),
                             "request_id": request_id,
                         },
                     )
@@ -1773,7 +2400,10 @@ def _remove_client_responses_for_request(client_public_key, request_id):
         if isinstance(queued, list):
             kept = []
             for candidate in queued:
-                if isinstance(candidate, dict) and candidate.get("request_id") == request_id:
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("request_id") == request_id
+                ):
                     removed += 1
                     continue
                 kept.append(candidate)
@@ -1797,7 +2427,8 @@ def _has_client_response_for_request(client_public_key, request_id):
         queued = client_responses.get(client_public_key)
         if isinstance(queued, list):
             return any(
-                isinstance(candidate, dict) and candidate.get("request_id") == request_id
+                isinstance(candidate, dict)
+                and candidate.get("request_id") == request_id
                 for candidate in queued
             )
         return isinstance(queued, dict) and queued.get("request_id") == request_id
@@ -1809,22 +2440,32 @@ def _in_flight_entry_matches_client(entry, client_public_key):
     return False
 
 
-def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled", reason=None):
+def _cancel_api_v1_request(
+    client_public_key, request_id, *, status="cancelled", reason=None
+):
     if not client_public_key or not request_id:
         return 0
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
+    if _get_terminal_request(client_public_key, request_id) is not None:
+        return 0
     removed = _remove_request_from_server_queues(client_public_key, request_id)
     _remove_client_responses_for_request(client_public_key, request_id)
     _clear_pending_request(client_public_key, request_id)
     _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
+    _record_request_outcome("expired" if status == "expired" else "cancelled")
     with server_round_robin_lock:
         with api_v1_in_flight_requests_lock:
             for server_payload in known_servers.values():
                 in_flight_requests = server_payload.get("api_v1_in_flight_requests")
-                if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                if (
+                    not isinstance(in_flight_requests, dict)
+                    or request_id not in in_flight_requests
+                ):
                     continue
-                if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                if _in_flight_entry_matches_client(
+                    in_flight_requests.get(request_id), client_public_key
+                ):
                     in_flight_requests.pop(request_id, None)
                     if not in_flight_requests:
                         server_payload.pop("api_v1_in_flight_requests", None)
@@ -1881,7 +2522,11 @@ def _pending_request_entry_is_expired(pending_entry, *, now=None):
     if PENDING_REQUEST_TTL_SECONDS <= 0:
         return False
     now = time.time() if now is None else now
-    queued_at = pending_entry.get("queued_at") if isinstance(pending_entry, dict) else pending_entry
+    queued_at = (
+        pending_entry.get("queued_at")
+        if isinstance(pending_entry, dict)
+        else pending_entry
+    )
     try:
         return (now - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS
     except (TypeError, ValueError):
@@ -1892,7 +2537,9 @@ def _expire_pending_request_if_stale(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
     with client_pending_request_ids_lock:
-        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(request_id)
+        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(
+            request_id
+        )
     if pending_entry is None or not _pending_request_entry_is_expired(pending_entry):
         return False
     _cancel_api_v1_request(
@@ -1908,7 +2555,9 @@ def _is_request_pending(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
     with client_pending_request_ids_lock:
-        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(request_id)
+        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(
+            request_id
+        )
     if pending_entry is None:
         return False
     if _pending_request_entry_is_expired(pending_entry):
@@ -1921,7 +2570,9 @@ def _get_pending_cancel_token(client_public_key, request_id):
     if not client_public_key or not request_id:
         return None
     with client_pending_request_ids_lock:
-        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(request_id)
+        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(
+            request_id
+        )
     if isinstance(pending_entry, dict):
         token = pending_entry.get("cancel_token")
         return token if isinstance(token, str) and token else None
@@ -1951,7 +2602,10 @@ def _cancel_token_for_queued_or_in_flight_request(client_public_key, request_id)
                 if not isinstance(in_flight_requests, dict):
                     continue
                 entry = in_flight_requests.get(request_id)
-                if isinstance(entry, dict) and entry.get("client_public_key") == client_public_key:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("client_public_key") == client_public_key
+                ):
                     token = entry.get("cancel_token")
                     return token if isinstance(token, str) and token else None
     return None
@@ -1991,13 +2645,15 @@ def _pop_client_response(client_public_key, request_id=None):
         if isinstance(queued, list):
             if request_id:
                 for idx, candidate in enumerate(queued):
-                    if candidate.get('request_id') == request_id:
+                    if candidate.get("request_id") == request_id:
                         response = queued.pop(idx)
                         if not queued:
                             client_responses.pop(client_public_key, None)
                         elif len(queued) == 1:
                             client_responses[client_public_key] = queued[0]
-                        _clear_pending_request(client_public_key, response.get('request_id'))
+                        _clear_pending_request(
+                            client_public_key, response.get("request_id")
+                        )
                         return response
                 return None
             response = queued.pop(0)
@@ -2005,17 +2661,17 @@ def _pop_client_response(client_public_key, request_id=None):
                 client_responses.pop(client_public_key, None)
             elif len(queued) == 1:
                 client_responses[client_public_key] = queued[0]
-            _clear_pending_request(client_public_key, response.get('request_id'))
+            _clear_pending_request(client_public_key, response.get("request_id"))
             return response
 
-        if request_id and queued.get('request_id') != request_id:
+        if request_id and queued.get("request_id") != request_id:
             return None
         response = client_responses.pop(client_public_key)
-        _clear_pending_request(client_public_key, response.get('request_id'))
+        _clear_pending_request(client_public_key, response.get("request_id"))
         return response
 
 
-@app.route('/api/v1/relay/servers/register', methods=['POST'])
+@app.route("/api/v1/relay/servers/register", methods=["POST"])
 def api_v1_relay_servers_register():
     """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
     global server_round_robin_next_index
@@ -2025,46 +2681,61 @@ def api_v1_relay_servers_register():
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    public_key = data.get('server_public_key')
+    public_key = data.get("server_public_key")
     if not public_key:
-        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
-    capabilities, capability_error = _normalise_api_v1_capabilities(data.get('capabilities'))
+        return (
+            jsonify({"error": {"message": "Missing server public key", "code": 400}}),
+            400,
+        )
+    capabilities, capability_error = _normalise_api_v1_capabilities(
+        data.get("capabilities")
+    )
     if capability_error:
-        return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
+        return (
+            jsonify(
+                {"error": {"message": capability_error, "code": "invalid_capabilities"}}
+            ),
+            400,
+        )
 
     lease_seconds = _api_v1_lease_seconds()
     with server_round_robin_lock:
         existing_payload = known_servers.get(public_key)
         existing_api_v1_count = len(_api_v1_round_robin_keys())
         if existing_payload and existing_payload.get(API_V1_SERVER_MARKER):
-            existing_payload['last_ping'] = datetime.now()
+            existing_payload["last_ping"] = datetime.now()
             log_event = "server.reregister"
         else:
             if existing_api_v1_count == 0:
                 server_round_robin_next_index = 0
             if existing_payload:
-                existing_payload['last_ping'] = datetime.now()
+                existing_payload["last_ping"] = datetime.now()
                 known_servers.pop(public_key, None)
                 known_servers[public_key] = existing_payload
             else:
                 known_servers[public_key] = {
-                    'public_key': public_key,
-                    'last_ping': datetime.now(),
-                    'last_ping_duration': lease_seconds,
+                    "public_key": public_key,
+                    "last_ping": datetime.now(),
+                    "last_ping_duration": lease_seconds,
                 }
             known_servers[public_key][API_V1_SERVER_MARKER] = True
             log_event = "server.registered"
-        known_servers[public_key]['last_ping_duration'] = lease_seconds
+        known_servers[public_key]["last_ping_duration"] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
-        known_servers[public_key]['capabilities'] = capabilities
+        known_servers[public_key]["capabilities"] = capabilities
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
-    return jsonify({
-        'next_ping_in_x_seconds': lease_seconds,
-        'poll_wait_seconds': _api_v1_poll_wait_seconds(),
-    }), 200
+    return (
+        jsonify(
+            {
+                "next_ping_in_x_seconds": lease_seconds,
+                "poll_wait_seconds": _api_v1_poll_wait_seconds(),
+            }
+        ),
+        200,
+    )
 
 
 def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
@@ -2077,27 +2748,27 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         if invalid_error_shape == "legacy":
-            return jsonify({'error': 'Invalid request data'}), 400
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+            return jsonify({"error": "Invalid request data"}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    public_key = data.get('server_public_key')
+    public_key = data.get("server_public_key")
     if not isinstance(public_key, str) or not public_key.strip():
         if invalid_error_shape == "legacy":
-            return jsonify({'error': 'Invalid public key'}), 400
-        return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
+            return jsonify({"error": "Invalid public key"}), 400
+        return jsonify({"error": {"message": "Invalid public key", "code": 400}}), 400
 
     removed = _unregister_server(public_key)
-    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
+    return jsonify({"message": "Server unregistered", "removed": removed}), 200
 
 
-@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
+@app.route("/api/v1/relay/servers/unregister", methods=["POST"])
 def api_v1_relay_servers_unregister():
     """Explicitly unregister an API v1 compute node and cancel its queued work."""
 
     return _handle_server_unregister_request()
 
 
-@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+@app.route("/api/v1/relay/servers/poll", methods=["POST"])
 def api_v1_relay_servers_poll():
     """Claim the next queued encrypted workload for a registered compute node."""
     auth_error = _validate_server_registration()
@@ -2107,47 +2778,86 @@ def api_v1_relay_servers_poll():
     _evict_stale_servers()
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    public_key = data.get('server_public_key')
+    public_key = data.get("server_public_key")
     if not public_key:
-        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+        return (
+            jsonify({"error": {"message": "Missing server public key", "code": 400}}),
+            400,
+        )
     capabilities = None
-    if 'capabilities' in data:
-        raw_capabilities = data.get('capabilities')
+    if "capabilities" in data:
+        raw_capabilities = data.get("capabilities")
         if raw_capabilities is not None:
-            capabilities, capability_error = _normalise_api_v1_capabilities(raw_capabilities)
+            capabilities, capability_error = _normalise_api_v1_capabilities(
+                raw_capabilities
+            )
             if capability_error:
-                return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": capability_error,
+                                "code": "invalid_capabilities",
+                            }
+                        }
+                    ),
+                    400,
+                )
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     lease_seconds = _api_v1_lease_seconds()
     with server_round_robin_lock:
         server_payload = known_servers.get(public_key)
         if server_payload is None:
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        server_payload['last_ping'] = datetime.now()
-        server_payload['last_ping_duration'] = lease_seconds
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Server with the specified public key not found",
+                            "code": 404,
+                        }
+                    }
+                ),
+                404,
+            )
+        server_payload["last_ping"] = datetime.now()
+        server_payload["last_ping_duration"] = lease_seconds
         if capabilities is not None:
-            server_payload['capabilities'] = capabilities
-        server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
+            server_payload["capabilities"] = capabilities
+        server_payload["polling_until_monotonic"] = time.monotonic() + max(
+            poll_wait_seconds, 0.0
+        )
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
     def _mark_claimed_request_terminal(claimed_request):
         if not isinstance(claimed_request, dict):
             return
-        if bool(claimed_request.get('e2ee_v1')):
+        if bool(claimed_request.get("e2ee_v1")):
             was_unregistered = _api_v1_server_was_recently_unregistered(public_key)
             _cancel_api_v1_request(
-                claimed_request.get('client_public_key'),
-                claimed_request.get('request_id'),
-                status='cancelled' if was_unregistered else 'expired',
-                reason='server_unregistered' if was_unregistered else 'provider_timeout',
+                claimed_request.get("client_public_key"),
+                claimed_request.get("request_id"),
+                status="cancelled" if was_unregistered else "expired",
+                reason=(
+                    "server_unregistered" if was_unregistered else "provider_timeout"
+                ),
             )
 
     def _server_not_found_response(claimed_request=None):
         _mark_claimed_request_terminal(claimed_request)
-        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Server with the specified public key not found",
+                        "code": 404,
+                    }
+                }
+            ),
+            404,
+        )
 
     first_request = None
     deadline = time.monotonic() + poll_wait_seconds
@@ -2172,23 +2882,32 @@ def api_v1_relay_servers_poll():
         if server_payload is None:
             server_missing = True
         else:
-            server_payload.pop('polling_until_monotonic', None)
+            server_payload.pop("polling_until_monotonic", None)
 
             if first_request is None:
-                server_payload['last_ping'] = datetime.now()
-                return jsonify({
-                    'message': 'No requests available',
-                    'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else max(server_payload['last_ping_duration'], 1),
-                    'poll_wait_seconds': poll_wait_seconds,
-                }), 200
+                server_payload["last_ping"] = datetime.now()
+                return (
+                    jsonify(
+                        {
+                            "message": "No requests available",
+                            "next_ping_in_x_seconds": (
+                                0
+                                if poll_wait_seconds > 0
+                                else max(server_payload["last_ping_duration"], 1)
+                            ),
+                            "poll_wait_seconds": poll_wait_seconds,
+                        }
+                    ),
+                    200,
+                )
     if server_missing:
         return _server_not_found_response(first_request)
 
     queue_wait_ms = None
-    queued_at = first_request.pop('_queued_at', None)
+    queued_at = first_request.pop("_queued_at", None)
     if isinstance(queued_at, (int, float)):
         queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
-    request_id = first_request.get('request_id')
+    request_id = first_request.get("request_id")
     if isinstance(request_id, str) and request_id:
         server_missing = False
         with server_round_robin_lock:
@@ -2197,12 +2916,16 @@ def api_v1_relay_servers_poll():
                 server_missing = True
             else:
                 with api_v1_in_flight_requests_lock:
-                    in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
+                    in_flight_requests = server_payload.setdefault(
+                        "api_v1_in_flight_requests", {}
+                    )
                     if isinstance(in_flight_requests, dict):
                         in_flight_requests[request_id] = {
-                            'expires_at': time.monotonic() + _api_v1_in_flight_ttl_seconds(),
-                            'client_public_key': first_request.get('client_public_key'),
-                            'cancel_token': first_request.get('cancel_token'),
+                            "expires_at": time.monotonic()
+                            + _api_v1_in_flight_ttl_seconds(),
+                            "ttl_seconds": _api_v1_in_flight_ttl_seconds(),
+                            "client_public_key": first_request.get("client_public_key"),
+                            "cancel_token": first_request.get("cancel_token"),
                         }
         if server_missing:
             return _server_not_found_response(first_request)
@@ -2219,36 +2942,70 @@ def api_v1_relay_servers_poll():
     )
     return jsonify(first_request), 200
 
-@app.route('/api/v1/relay/requests', methods=['POST'])
+
+@app.route("/api/v1/relay/requests", methods=["POST"])
 def api_v1_relay_requests():
     """Queue an encrypted API v1 relay request envelope for a target compute node."""
     _evict_stale_servers()
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
     if _payload_has_plaintext_fields(data):
-        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Plaintext relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
     if _payload_has_unexpected_relay_fields(data, allow_server_public_key=True):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unexpected relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
     if error:
         msg, code = error
-        return jsonify({'error': {'message': msg, 'code': code}}), code
+        return jsonify({"error": {"message": msg, "code": code}}), code
 
-    server_public_key = envelope.pop('server_public_key')
+    server_public_key = envelope.pop("server_public_key")
 
-    if not envelope.get('client_public_key'):
-        return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
+    if not envelope.get("client_public_key"):
+        return (
+            jsonify({"error": {"message": "Missing client public key", "code": 400}}),
+            400,
+        )
 
-    envelope['e2ee_v1'] = True
+    envelope["e2ee_v1"] = True
     queued_at = time.time()
-    envelope['_queued_at'] = queued_at
+    envelope["_queued_at"] = queued_at
     with server_round_robin_lock:
         server_payload = known_servers.get(server_public_key)
         if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Server with the specified public key not found",
+                            "code": 404,
+                        }
+                    }
+                ),
+                404,
+            )
         _mark_request_pending(
-            envelope.get('client_public_key'),
-            envelope.get('request_id'),
-            cancel_token=envelope.get('cancel_token'),
+            envelope.get("client_public_key"),
+            envelope.get("request_id"),
+            cancel_token=envelope.get("cancel_token"),
         )
         with client_inference_requests_changed:
             client_inference_requests.setdefault(server_public_key, []).append(envelope)
@@ -2263,43 +3020,54 @@ def api_v1_relay_requests():
             "queue_depth": queue_depth,
         },
     )
-    return jsonify({'message': 'Request received'}), 200
+    return jsonify({"message": "Request received"}), 200
 
 
-
-@app.route('/api/v1/relay/requests/cancel', methods=['POST'])
+@app.route("/api/v1/relay/requests/cancel", methods=["POST"])
 def api_v1_relay_requests_cancel():
     """Cancel or expire an API v1 relay request with its requester proof token."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    client_public_key = data.get('client_public_key')
-    request_id = data.get('request_id')
+    client_public_key = data.get("client_public_key")
+    request_id = data.get("request_id")
     if not client_public_key or not request_id:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    expected_cancel_token = _cancel_token_for_queued_or_in_flight_request(client_public_key, request_id)
-    provided_cancel_token = data.get('cancel_token')
+    expected_cancel_token = _cancel_token_for_queued_or_in_flight_request(
+        client_public_key, request_id
+    )
+    provided_cancel_token = data.get("cancel_token")
     if not (
         expected_cancel_token
         and isinstance(provided_cancel_token, str)
         and secrets.compare_digest(provided_cancel_token, expected_cancel_token)
     ):
-        return jsonify({'error': {'message': 'Missing or invalid cancel proof', 'code': 403}}), 403
+        return (
+            jsonify(
+                {"error": {"message": "Missing or invalid cancel proof", "code": 403}}
+            ),
+            403,
+        )
 
-    status = _sanitize_terminal_status(data.get('status'))
-    reason = _sanitize_terminal_reason(data.get('reason'), status)
+    status = _sanitize_terminal_status(data.get("status"))
+    reason = _sanitize_terminal_reason(data.get("reason"), status)
     removed = _cancel_api_v1_request(
         client_public_key,
         request_id,
         status=status,
         reason=reason,
     )
-    return jsonify({'status': status, 'request_id': request_id, 'removed_from_queue': removed}), 200
+    return (
+        jsonify(
+            {"status": status, "request_id": request_id, "removed_from_queue": removed}
+        ),
+        200,
+    )
 
 
-@app.route('/api/v1/relay/responses', methods=['POST'])
+@app.route("/api/v1/relay/responses", methods=["POST"])
 def api_v1_relay_responses():
     """Store an encrypted API v1 response envelope for client retrieval."""
     auth_error = _validate_server_registration()
@@ -2309,23 +3077,54 @@ def api_v1_relay_responses():
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
     if _payload_has_plaintext_fields(data):
-        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Plaintext relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
     if _payload_has_unexpected_relay_fields(data, allow_server_public_key=False):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unexpected relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
     if error:
         msg, code = error
-        return jsonify({'error': {'message': msg, 'code': code}}), code
+        return jsonify({"error": {"message": msg, "code": code}}), code
 
-    client_public_key = envelope.get('client_public_key')
+    client_public_key = envelope.get("client_public_key")
     if not client_public_key:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    request_id = envelope.get('request_id')
+    request_id = envelope.get("request_id")
     if isinstance(request_id, str) and request_id:
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            status = terminal.get("status", "cancelled")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Request is no longer waiting for a response",
+                            "code": status,
+                            "status": status,
+                        }
+                    }
+                ),
+                410,
+            )
         if _has_client_response_for_request(client_public_key, request_id):
             LOGGER.info(
                 "relay.api_v1.duplicate_response_ignored",
@@ -2334,23 +3133,41 @@ def api_v1_relay_responses():
                     "request_id": request_id,
                 },
             )
-            return jsonify({'message': 'Response already queued for client'}), 200
+            return jsonify({"message": "Response already queued for client"}), 200
         _expire_pending_request_if_stale(client_public_key, request_id)
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            status = terminal.get("status", "cancelled")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Request is no longer waiting for a response",
+                            "code": status,
+                            "status": status,
+                        }
+                    }
+                ),
+                410,
+            )
         with server_round_robin_lock:
             with api_v1_in_flight_requests_lock:
                 for server_payload in known_servers.values():
-                    in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-                    if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                    in_flight_requests = server_payload.get("api_v1_in_flight_requests")
+                    if (
+                        not isinstance(in_flight_requests, dict)
+                        or request_id not in in_flight_requests
+                    ):
                         continue
-                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                    if _in_flight_entry_matches_client(
+                        in_flight_requests.get(request_id), client_public_key
+                    ):
                         in_flight_requests.pop(request_id, None)
                         if not in_flight_requests:
-                            server_payload.pop('api_v1_in_flight_requests', None)
+                            server_payload.pop("api_v1_in_flight_requests", None)
                         break
+        _clear_pending_request(client_public_key, request_id)
+        _record_request_outcome("completed")
 
     _queue_client_response(client_public_key, envelope)
     LOGGER.info(
@@ -2360,45 +3177,104 @@ def api_v1_relay_responses():
             "request_id": request_id,
         },
     )
-    return jsonify({'message': 'Response received and queued for client'}), 200
+    return jsonify({"message": "Response received and queued for client"}), 200
 
 
-@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
+@app.route("/api/v1/relay/responses/retrieve", methods=["POST"])
 def api_v1_relay_responses_retrieve():
     """Retrieve an encrypted API v1 response envelope by client public key."""
     data = request.get_json()
-    if not data or 'client_public_key' not in data:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+    if not data or "client_public_key" not in data:
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    client_public_key = data['client_public_key']
-    request_id = data.get('request_id')
+    client_public_key = data["client_public_key"]
+    request_id = data.get("request_id")
     terminal = _get_terminal_request(client_public_key, request_id)
     if terminal is not None:
         _remove_client_responses_for_request(client_public_key, request_id)
-        status = terminal.get('status', 'cancelled')
-        return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
+        status = terminal.get("status", "cancelled")
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": f"Request {status}",
+                        "code": status,
+                        "status": status,
+                        "reason": terminal.get("reason", status),
+                    }
+                }
+            ),
+            410,
+        )
 
     response = _pop_client_response(client_public_key, request_id)
     if response is None:
         _expire_pending_request_if_stale(client_public_key, request_id)
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
+            status = terminal.get("status", "cancelled")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"Request {status}",
+                            "code": status,
+                            "status": status,
+                            "reason": terminal.get("reason", status),
+                        }
+                    }
+                ),
+                410,
+            )
     if response is None:
         if _is_request_pending(client_public_key, request_id):
             LOGGER.debug(
                 "relay.api_v1.response_pending",
-                extra={"client_fingerprint": _safe_key_fingerprint(client_public_key), "request_id": request_id},
+                extra={
+                    "client_fingerprint": _safe_key_fingerprint(client_public_key),
+                    "request_id": request_id,
+                },
             )
             return jsonify({"status": "pending"}), 202
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
+            status = terminal.get("status", "cancelled")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"Request {status}",
+                            "code": status,
+                            "status": status,
+                            "reason": terminal.get("reason", status),
+                        }
+                    }
+                ),
+                410,
+            )
         if request_id:
-            return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
-        return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"Unknown request_id: {request_id}",
+                            "code": 404,
+                        }
+                    }
+                ),
+                404,
+            )
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "No response available for the given public key",
+                        "code": 404,
+                    }
+                }
+            ),
+            404,
+        )
 
     LOGGER.info(
         "relay.api_v1.response_retrieved",
@@ -2409,7 +3285,8 @@ def api_v1_relay_responses_retrieve():
     )
     return jsonify(response), 200
 
-@app.route('/faucet', methods=['POST'])
+
+@app.route('/faucet', methods=["POST"])
 def faucet():
     """
     Endpoint for clients to request inference given a public key.
@@ -2453,66 +3330,95 @@ def faucet():
     }
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/faucet')
+        return _legacy_route_deprecated_response("/faucet")
 
     _evict_stale_servers()
     # Parse the request data
     data = request.get_json()
     if _payload_has_plaintext_fields(data):
-        return jsonify({
-            'error': {
-                'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only',
-                'code': 400
-            }
-        }), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Plaintext relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
     if _payload_has_unexpected_faucet_fields(data):
-        return jsonify({
-            'error': {
-                'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only',
-                'code': 400,
-            }
-        }), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unexpected relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
 
-    if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
-        return jsonify({
-            'error': {
-                'message': 'Invalid request data',
-                'code': 400
-            }
-        }), 400
+    if (
+        not data
+        or "server_public_key" not in data
+        or "chat_history" not in data
+        or "cipherkey" not in data
+        or "iv" not in data
+    ):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
 
-    server_public_key = data['server_public_key']
-    chat_history_ciphertext = data['chat_history']
-    cipherkey = data['cipherkey']
-    iv = data['iv']  # Extract the IV from the request data
-    stream_requested = bool(data.get('stream', False))
-    client_public_key = data.get('client_public_key', None)
+    server_public_key = data["server_public_key"]
+    chat_history_ciphertext = data["chat_history"]
+    cipherkey = data["cipherkey"]
+    iv = data["iv"]  # Extract the IV from the request data
+    stream_requested = bool(data.get("stream", False))
+    client_public_key = data.get("client_public_key", None)
 
     if stream_requested and not client_public_key:
-        return jsonify({
-            'error': {
-                'message': 'Streaming requests require a client public key',
-                'code': 400,
-            }
-        }), 400
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Streaming requests require a client public key",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
-        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Server with the specified public key not found",
+                        "code": 404,
+                    }
+                }
+            ),
+            404,
+        )
 
     # Append the client's request to the list of requests for the server
     with client_inference_requests_changed:
-        client_inference_requests.setdefault(server_public_key, []).append({
-            'chat_history': chat_history_ciphertext,
-            'client_public_key': client_public_key,
-            'cipherkey': cipherkey,
-            'iv': iv,  # Include the IV in the saved client's request
-            'stream': stream_requested,
-        })
+        client_inference_requests.setdefault(server_public_key, []).append(
+            {
+                "chat_history": chat_history_ciphertext,
+                "client_public_key": client_public_key,
+                "cipherkey": cipherkey,
+                "iv": iv,  # Include the IV in the saved client's request
+                "stream": stream_requested,
+            }
+        )
         client_inference_requests_changed.notify_all()
-    return jsonify({'message': 'Request received'}), 200
+    return jsonify({"message": "Request received"}), 200
 
-@app.route('/sink', methods=['POST'])
+
+@app.route('/sink', methods=["POST"])
 def sink():
     """
     Endpoint for server instances to announce their availability (offering a compute sink).
@@ -2527,7 +3433,7 @@ def sink():
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/sink')
+        return _legacy_route_deprecated_response("/sink")
 
     _evict_stale_servers()
     auth_error = _validate_server_registration()
@@ -2536,37 +3442,35 @@ def sink():
 
     data = request.get_json()
     if not isinstance(data, dict):
-        return jsonify({'error': 'Invalid request data'}), 400
-    public_key = data.get('server_public_key', None)
+        return jsonify({"error": "Invalid request data"}), 400
+    public_key = data.get("server_public_key", None)
 
-    raw_batch_size = data.get('max_batch_size') if isinstance(data, dict) else None
+    raw_batch_size = data.get("max_batch_size") if isinstance(data, dict) else None
     max_batch_size = 1
     if raw_batch_size is not None:
         try:
             max_batch_size = int(raw_batch_size)
         except (TypeError, ValueError):
-            return jsonify({'error': 'Invalid max_batch_size'}), 400
+            return jsonify({"error": "Invalid max_batch_size"}), 400
         if max_batch_size < 1:
-            return jsonify({'error': 'Invalid max_batch_size'}), 400
+            return jsonify({"error": "Invalid max_batch_size"}), 400
 
     if public_key is None:
-        return jsonify({'error': 'Invalid public key'}), 400
+        return jsonify({"error": "Invalid public key"}), 400
 
     # Update or add the server to known_servers
     with server_round_robin_lock:
         if public_key in known_servers:
-            known_servers[public_key]['last_ping'] = datetime.now()
+            known_servers[public_key]["last_ping"] = datetime.now()
         else:
             known_servers[public_key] = {
-                'public_key': public_key,
-                'last_ping': datetime.now(),
-                'last_ping_duration': 10
+                "public_key": public_key,
+                "last_ping": datetime.now(),
+                "last_ping_duration": 10,
             }
-        next_ping_duration = known_servers[public_key]['last_ping_duration']
+        next_ping_duration = known_servers[public_key]["last_ping_duration"]
 
-    response_data = {
-        'next_ping_in_x_seconds': next_ping_duration
-    }
+    response_data = {"next_ping_in_x_seconds": next_ping_duration}
 
     # Check if there are any client requests for this server
     with client_inference_requests_changed:
@@ -2575,82 +3479,95 @@ def sink():
             batch = []
             while queued_requests and len(batch) < max_batch_size:
                 request_payload = queued_requests[0]
-                if 'api_v1_request' in request_payload:
+                if "api_v1_request" in request_payload:
                     queued_requests.pop(0)
                     LOGGER.warning(
                         "relay.api_v1_plaintext_payload_dropped",
                         extra={"server_public_key": public_key},
                     )
                     continue
-                if request_payload.get('e2ee_v1'):
+                if request_payload.get("e2ee_v1"):
                     LOGGER.warning(
                         "relay.api_v1_ciphertext_payload_skipped",
                         extra={"server_public_key": public_key},
                     )
                     break
                 request_payload = queued_requests.pop(0)
-                if request_payload.get('stream'):
+                if request_payload.get("stream"):
                     session = _register_stream_session(
                         public_key,
-                        request_payload.get('client_public_key'),
+                        request_payload.get("client_public_key"),
                     )
                     if session is not None:
-                        request_payload['stream_session_id'] = session['session_id']
+                        request_payload["stream_session_id"] = session["session_id"]
                 batch.append(request_payload)
             if batch:
                 first_request = batch[0]
-                response_data['client_public_key'] = first_request.get('client_public_key')
-                response_data['chat_history'] = first_request.get('chat_history')
-                response_data['cipherkey'] = first_request.get('cipherkey')
-                response_data['iv'] = first_request.get('iv')
+                response_data["client_public_key"] = first_request.get(
+                    "client_public_key"
+                )
+                response_data["chat_history"] = first_request.get("chat_history")
+                response_data["cipherkey"] = first_request.get("cipherkey")
+                response_data["iv"] = first_request.get("iv")
 
-                if first_request.get('stream') and first_request.get('stream_session_id'):
-                    response_data['stream'] = True
-                    response_data['stream_session_id'] = first_request['stream_session_id']
+                if first_request.get("stream") and first_request.get(
+                    "stream_session_id"
+                ):
+                    response_data["stream"] = True
+                    response_data["stream_session_id"] = first_request[
+                        "stream_session_id"
+                    ]
 
                 if max_batch_size > 1:
-                    response_data['batch'] = batch
+                    response_data["batch"] = batch
 
     return jsonify(response_data)
 
 
-@app.route('/unregister', methods=['POST'])
+@app.route("/unregister", methods=["POST"])
 def unregister():
     """Explicitly unregister a compute node and clear relay queue/session state."""
     return _handle_server_unregister_request(invalid_error_shape="legacy")
 
-@app.route('/source', methods=['POST'])
+
+@app.route('/source', methods=["POST"])
 def source():
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/source')
+        return _legacy_route_deprecated_response("/source")
 
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
 
     data = request.get_json()
-    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
-        return jsonify({'error': 'Invalid request data'}), 400
+    if (
+        not data
+        or "client_public_key" not in data
+        or "chat_history" not in data
+        or "cipherkey" not in data
+        or "iv" not in data
+    ):
+        return jsonify({"error": "Invalid request data"}), 400
 
-    client_public_key = data['client_public_key']
-    encrypted_chat_history = data['chat_history']
-    encrypted_cipherkey = data['cipherkey']
-    iv = data['iv']
+    client_public_key = data["client_public_key"]
+    encrypted_chat_history = data["chat_history"]
+    encrypted_cipherkey = data["cipherkey"]
+    iv = data["iv"]
 
     # Store the response in the client_responses dictionary
     with client_responses_lock:
         client_responses[client_public_key] = {
-            'chat_history': encrypted_chat_history,
-            'cipherkey': encrypted_cipherkey,
-            'iv': iv
+            "chat_history": encrypted_chat_history,
+            "cipherkey": encrypted_cipherkey,
+            "iv": iv,
         }
-    return jsonify({'message': 'Response received and queued for client'}), 200
+    return jsonify({"message": "Response received and queued for client"}), 200
 
 
-@app.route('/stream/source', methods=['POST'])
+@app.route("/stream/source", methods=["POST"])
 def stream_source():
     """Accept streaming chunks emitted by compute nodes."""
 
@@ -2659,62 +3576,62 @@ def stream_source():
         return auth_error
 
     data = request.get_json()
-    if not data or 'session_id' not in data or 'chunk' not in data:
-        return jsonify({'error': 'Invalid request data'}), 400
+    if not data or "session_id" not in data or "chunk" not in data:
+        return jsonify({"error": "Invalid request data"}), 400
 
-    session_id = data['session_id']
-    chunk = data['chunk']
-    final = bool(data.get('final', False))
+    session_id = data["session_id"]
+    chunk = data["chunk"]
+    final = bool(data.get("final", False))
 
     if not _append_stream_chunk(session_id, chunk, final=final):
-        return jsonify({'error': 'Unknown stream session'}), 404
+        return jsonify({"error": "Unknown stream session"}), 404
 
-    return jsonify({'message': 'Chunk stored', 'final': final}), 200
+    return jsonify({"message": "Chunk stored", "final": final}), 200
 
 
-@app.route('/retrieve', methods=['POST'])
+@app.route('/retrieve', methods=["POST"])
 def retrieve():
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/retrieve')
+        return _legacy_route_deprecated_response("/retrieve")
 
     data = request.get_json()
-    if not data or 'client_public_key' not in data:
-        return jsonify({'error': 'Invalid request data'}), 400
+    if not data or "client_public_key" not in data:
+        return jsonify({"error": "Invalid request data"}), 400
 
-    client_public_key = data['client_public_key']
+    client_public_key = data["client_public_key"]
 
     # Check if there's a response for the given client public key
     with client_responses_lock:
         response_data = client_responses.pop(client_public_key, None)
     if response_data is not None:
         return jsonify(response_data), 200
-    return jsonify({'error': 'No response available for the given public key'}), 200
+    return jsonify({"error": "No response available for the given public key"}), 200
 
 
-@app.route('/stream/retrieve', methods=['POST'])
+@app.route("/stream/retrieve", methods=["POST"])
 def stream_retrieve():
     """Return queued streaming chunks for the requesting client."""
 
     data = request.get_json()
-    if not data or 'client_public_key' not in data:
-        return jsonify({'error': 'Invalid request data'}), 400
+    if not data or "client_public_key" not in data:
+        return jsonify({"error": "Invalid request data"}), 400
 
-    client_public_key = data['client_public_key']
+    client_public_key = data["client_public_key"]
     popped = _pop_stream_chunks_for_client(client_public_key)
     if popped is None:
-        return jsonify({'error': 'No active stream for the given public key'}), 200
+        return jsonify({"error": "No active stream for the given public key"}), 200
 
     session_id, chunks, final = popped
     response_payload = {
-        'stream': True,
-        'session_id': session_id,
-        'chunks': chunks,
+        "stream": True,
+        "session_id": session_id,
+        "chunks": chunks,
     }
     if final:
-        response_payload['final'] = True
+        response_payload["final"] = True
 
     return jsonify(response_payload), 200
 
@@ -2791,5 +3708,5 @@ def main(argv: list[str] | None = None) -> None:
     serve(host, port)
 
 
-if __name__ == '__main__':  # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover
     main()

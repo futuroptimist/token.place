@@ -150,6 +150,51 @@ def _metric_value(body: str, metric_name: str, labels: str = "") -> float:
     raise AssertionError(f"metric not found: {metric_name}{labels}")
 
 
+def test_build_revision_label_falls_back_to_display_version(monkeypatch) -> None:
+    """Build info should remain identifiable when release metadata omits ref."""
+
+    monkeypatch.setattr(relay_module, "resolve_deploy_ref", lambda: "")
+
+    assert (
+        relay_module._build_revision_label(
+            {
+                "environment": "staging",
+                "version": "main-830d0a4",
+                "label": "staging main-830d0a4",
+            }
+        )
+        == "main-830d0a4"
+    )
+
+
+def test_build_revision_label_prefers_ref_then_resolved_deploy_ref(monkeypatch) -> None:
+    """Explicit immutable refs should remain preferred for build_info revision."""
+
+    monkeypatch.setattr(relay_module, "resolve_deploy_ref", lambda: "main-resolved")
+
+    assert (
+        relay_module._build_revision_label(
+            {
+                "environment": "prod",
+                "version": "0.1.2",
+                "label": "prod 0.1.2",
+                "ref": "main-830d0a4",
+            }
+        )
+        == "main-830d0a4"
+    )
+    assert (
+        relay_module._build_revision_label(
+            {
+                "environment": "prod",
+                "version": "0.1.2",
+                "label": "prod 0.1.2",
+            }
+        )
+        == "main-resolved"
+    )
+
+
 def test_canonical_metrics_track_queue_in_flight_completion_and_eviction(relay_client) -> None:
     """Canonical gauges and counters reflect bounded relay state transitions."""
 

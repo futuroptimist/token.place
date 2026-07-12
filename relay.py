@@ -559,11 +559,22 @@ def _initialise_metric_labels() -> None:
     RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
-        BUILD_METADATA.get("ref") or resolve_deploy_ref() or "unknown",
+        _build_revision_label(BUILD_METADATA),
     ).set(1)
     INSTRUMENTATION_UP.set(1)
     global _METRICS_INITIALIZED
     _METRICS_INITIALIZED = True
+
+
+def _build_revision_label(metadata: dict[str, str]) -> str:
+    """Resolve the public build revision label for Prometheus build info."""
+
+    return (
+        metadata.get("ref")
+        or resolve_deploy_ref()
+        or metadata.get("version")
+        or "unknown"
+    )
 
 
 def _normalise_status_class(status_code: int | str) -> str:

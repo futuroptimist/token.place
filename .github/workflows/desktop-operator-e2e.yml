@@ -83,6 +83,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run targeted Rust regressions
+        run: |
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml compute_node
+
       - name: Install tauri-driver
         run: cargo install tauri-driver
 

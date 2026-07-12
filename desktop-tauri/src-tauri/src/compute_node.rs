@@ -1874,6 +1874,85 @@ mod tests {
     }
 
     #[test]
+    fn operator_log_path_preserves_safe_qwen_64k_token_metadata() {
+        let payload = serde_json::json!({
+            "type": "status",
+            "operator_session_id": "s64k",
+            "sequence": 64,
+            "running": true,
+            "registered": true,
+            "context_tier": "64k-full",
+            "context_window_tokens": 65536,
+            "api_v1_readiness_result": "passed",
+            "api_v1_readiness_yarn_requested_context_tokens": 65536,
+            "api_v1_readiness_yarn_original_context_tokens": 32768,
+            "api_v1_readiness_completion_smoke_result": "passed",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_token_count": 50,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 28,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count": 2,
+            "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": false,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "llama.tokenize",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_special_true",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts": "50,28",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,true",
+            "token": "SECRET_TOKEN",
+            "token_ids": [1, 2, 3],
+            "access_token": "SECRET_ACCESS_TOKEN",
+        });
+
+        let stdout = sanitize_operator_diagnostic_line(&summarize_bridge_stdout_payload(&payload));
+        let stdout_event: Value = serde_json::from_str(&stdout).expect("stdout event json");
+        assert!(stdout.len() <= 3500);
+        assert_eq!(
+            stdout_event
+                .get("context_window_tokens")
+                .and_then(Value::as_u64),
+            Some(65536)
+        );
+        assert!(stdout_event.get("token").is_none());
+        assert!(stdout_event.get("token_ids").is_none());
+        assert!(!stdout.contains("SECRET_TOKEN"));
+
+        let chunks = readiness_operator_log_chunks(&payload);
+        assert!(!chunks.is_empty());
+        let mut diagnostics = Map::new();
+        for chunk in chunks {
+            let sanitized = sanitize_operator_diagnostic_line(&chunk);
+            assert!(sanitized.len() <= 3500);
+            let event: Value = serde_json::from_str(&sanitized).expect("readiness event json");
+            let event_diagnostics = event
+                .get("diagnostics")
+                .and_then(Value::as_object)
+                .expect("diagnostics object");
+            for (key, value) in event_diagnostics {
+                diagnostics.insert(key.clone(), value.clone());
+            }
+            assert!(!sanitized.contains("SECRET_ACCESS_TOKEN"));
+        }
+
+        assert_eq!(
+            diagnostics
+                .get("api_v1_readiness_yarn_requested_context_tokens")
+                .and_then(Value::as_u64),
+            Some(65536)
+        );
+        assert_eq!(
+            diagnostics
+                .get("api_v1_readiness_yarn_original_context_tokens")
+                .and_then(Value::as_u64),
+            Some(32768)
+        );
+        assert_eq!(
+            diagnostics
+                .get("api_v1_readiness_completion_smoke_result")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+    }
+
+    #[test]
     fn safe_readiness_diagnostics_rejects_free_text_strings() {
         let diagnostics = safe_readiness_diagnostics_from_payload(&serde_json::json!({
             "api_v1_readiness_completion_smoke_method": "rendered prompt leaked",

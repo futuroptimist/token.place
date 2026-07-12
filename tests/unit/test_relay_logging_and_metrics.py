@@ -390,6 +390,70 @@ def test_late_response_rechecks_terminal_state_before_queueing(relay_client, mon
     assert "client-key" not in client_responses
 
 
+def test_response_acceptance_serializes_cancellation_before_queueing(relay_client, monkeypatch) -> None:
+    """A cancellation between duplicate checks and lifecycle ownership cannot leave an orphan response."""
+
+    _register_node(relay_client)
+    _queue_request(relay_client, request_id="request-atomic-cancel")
+    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
+    assert poll.status_code == 200
+
+    before = _metric_body(relay_client)
+    before_completed = _metric_value(
+        before,
+        'tokenplace_relay_request_outcomes_total',
+        '{outcome="completed"}',
+    )
+    before_cancelled = _metric_value(
+        before,
+        'tokenplace_relay_request_outcomes_total',
+        '{outcome="cancelled"}',
+    )
+
+    original_has_response = relay_module._has_client_response_for_request
+    cancelled = False
+
+    def cancel_during_acceptance(client_public_key: str, request_id: str) -> bool:
+        nonlocal cancelled
+        has_response = original_has_response(client_public_key, request_id)
+        if not cancelled:
+            cancelled = True
+            relay_module._cancel_api_v1_request(
+                client_public_key,
+                request_id,
+                status="cancelled",
+                reason="requester_cancelled",
+            )
+        return has_response
+
+    monkeypatch.setattr(relay_module, "_has_client_response_for_request", cancel_during_acceptance)
+
+    response = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-key",
+            "request_id": "request-atomic-cancel",
+            "ciphertext": "sealed-response",
+            "cipherkey": "sealed-key",
+            "iv": "sealed-iv",
+            "protocol": "e2ee_v1",
+        },
+    )
+
+    assert response.status_code == 410
+    assert response.get_json()["error"]["status"] == "cancelled"
+    assert "client-key" not in client_responses
+    after = _metric_body(relay_client)
+    assert (
+        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="completed"}')
+        == before_completed
+    )
+    assert (
+        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="cancelled"}')
+        == before_cancelled + 1
+    )
+
+
 def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkeypatch) -> None:
     """Metrics auth failures should be failed HTTP outcomes, not completed traffic."""
 

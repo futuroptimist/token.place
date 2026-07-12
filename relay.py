@@ -835,6 +835,7 @@ client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
 client_terminal_request_ids = {}
 client_terminal_request_ids_lock = threading.Lock()
+api_v1_terminal_transition_lock = threading.RLock()
 client_terminal_outcomes: dict[str, dict[str, float]] = {}
 client_terminal_outcomes_lock = threading.Lock()
 TERMINAL_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300"))
@@ -2208,23 +2209,24 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
         return 0
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
-    removed = _remove_request_from_server_queues(client_public_key, request_id)
-    response_removed = _remove_client_responses_for_request(client_public_key, request_id)
-    pending_removed = _clear_pending_request(client_public_key, request_id)
-    in_flight_removed = 0
-    with server_round_robin_lock:
-        with api_v1_in_flight_requests_lock:
-            for server_payload in known_servers.values():
-                in_flight_requests = server_payload.get("api_v1_in_flight_requests")
-                if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
-                    continue
-                if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
-                    in_flight_requests.pop(request_id, None)
-                    in_flight_removed += 1
-                    if not in_flight_requests:
-                        server_payload.pop("api_v1_in_flight_requests", None)
-    if removed or response_removed or pending_removed or in_flight_removed:
-        _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
+    with api_v1_terminal_transition_lock:
+        removed = _remove_request_from_server_queues(client_public_key, request_id)
+        response_removed = _remove_client_responses_for_request(client_public_key, request_id)
+        pending_removed = _clear_pending_request(client_public_key, request_id)
+        in_flight_removed = 0
+        with server_round_robin_lock:
+            with api_v1_in_flight_requests_lock:
+                for server_payload in known_servers.values():
+                    in_flight_requests = server_payload.get("api_v1_in_flight_requests")
+                    if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                        continue
+                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                        in_flight_requests.pop(request_id, None)
+                        in_flight_removed += 1
+                        if not in_flight_requests:
+                            server_payload.pop("api_v1_in_flight_requests", None)
+        if removed or response_removed or pending_removed or in_flight_removed:
+            _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",
         extra={
@@ -2716,50 +2718,49 @@ def api_v1_relay_responses():
 
     request_id = envelope.get('request_id')
     if isinstance(request_id, str) and request_id:
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-        if _has_client_response_for_request(client_public_key, request_id):
-            LOGGER.info(
-                "relay.api_v1.duplicate_response_ignored",
-                extra={
-                    "client_fingerprint": _safe_key_fingerprint(client_public_key),
-                },
-            )
-            return jsonify({'message': 'Response already queued for client'}), 200
-        _expire_pending_request_if_stale(client_public_key, request_id)
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-        lifecycle_owned = False
-        with server_round_robin_lock:
-            with api_v1_in_flight_requests_lock:
-                for server_payload in known_servers.values():
-                    in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-                    if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
-                        continue
-                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
-                        in_flight_requests.pop(request_id, None)
-                        lifecycle_owned = True
-                        if not in_flight_requests:
-                            server_payload.pop('api_v1_in_flight_requests', None)
-                        break
-        lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
-    else:
-        lifecycle_owned = False
-
-    if isinstance(request_id, str) and request_id:
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-        if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
+        with api_v1_terminal_transition_lock:
             terminal = _get_terminal_request(client_public_key, request_id)
-            status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-    _queue_client_response(client_public_key, envelope)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if _has_client_response_for_request(client_public_key, request_id):
+                LOGGER.info(
+                    "relay.api_v1.duplicate_response_ignored",
+                    extra={
+                        "client_fingerprint": _safe_key_fingerprint(client_public_key),
+                    },
+                )
+                return jsonify({'message': 'Response already queued for client'}), 200
+            _expire_pending_request_if_stale(client_public_key, request_id)
+            terminal = _get_terminal_request(client_public_key, request_id)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            lifecycle_owned = False
+            with server_round_robin_lock:
+                with api_v1_in_flight_requests_lock:
+                    for server_payload in known_servers.values():
+                        in_flight_requests = server_payload.get('api_v1_in_flight_requests')
+                        if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                            continue
+                        if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                            in_flight_requests.pop(request_id, None)
+                            lifecycle_owned = True
+                            if not in_flight_requests:
+                                server_payload.pop('api_v1_in_flight_requests', None)
+                            break
+            lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
+            terminal = _get_terminal_request(client_public_key, request_id)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
+                terminal = _get_terminal_request(client_public_key, request_id)
+                status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            _queue_client_response(client_public_key, envelope)
+    else:
+        _queue_client_response(client_public_key, envelope)
     LOGGER.info(
         "relay.api_v1.response_received",
         extra={

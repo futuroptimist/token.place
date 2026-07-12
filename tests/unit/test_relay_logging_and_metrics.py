@@ -351,6 +351,45 @@ def test_response_completion_does_not_double_count_after_terminal_race(relay_cli
     )
 
 
+def test_late_response_rechecks_terminal_state_before_queueing(relay_client, monkeypatch) -> None:
+    """A cancellation that wins during response acceptance prevents queueing a late response."""
+
+    _register_node(relay_client)
+    _queue_request(relay_client, request_id="request-late-cancel")
+    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
+    assert poll.status_code == 200
+
+    original_clear_pending = relay_module._clear_pending_request
+
+    def terminalize_during_acceptance(client_public_key: str, request_id: str) -> bool:
+        cleared = original_clear_pending(client_public_key, request_id)
+        relay_module._mark_request_terminal(
+            client_public_key,
+            request_id,
+            status="cancelled",
+            reason="requester_cancelled",
+        )
+        return cleared
+
+    monkeypatch.setattr(relay_module, "_clear_pending_request", terminalize_during_acceptance)
+
+    response = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-key",
+            "request_id": "request-late-cancel",
+            "ciphertext": "sealed-response",
+            "cipherkey": "sealed-key",
+            "iv": "sealed-iv",
+            "protocol": "e2ee_v1",
+        },
+    )
+
+    assert response.status_code == 410
+    assert response.get_json()["error"]["status"] == "cancelled"
+    assert "client-key" not in client_responses
+
+
 def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkeypatch) -> None:
     """Metrics auth failures should be failed HTTP outcomes, not completed traffic."""
 

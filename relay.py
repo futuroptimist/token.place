@@ -2750,9 +2750,16 @@ def api_v1_relay_responses():
     else:
         lifecycle_owned = False
 
+    if isinstance(request_id, str) and request_id:
+        terminal = _get_terminal_request(client_public_key, request_id)
+        if terminal is not None:
+            status = terminal.get('status', 'cancelled')
+            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+        if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
+            terminal = _get_terminal_request(client_public_key, request_id)
+            status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
+            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
     _queue_client_response(client_public_key, envelope)
-    if isinstance(request_id, str) and request_id and lifecycle_owned:
-        _record_request_terminal_outcome_once(client_public_key, request_id, "completed")
     LOGGER.info(
         "relay.api_v1.response_received",
         extra={

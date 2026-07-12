@@ -5806,7 +5806,7 @@ def test_qwen_64k_runtime_init_guard_rejects_supported_probe_without_yarn_value(
     )
 
 
-def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
+def test_desktop_runtime_probe_rejects_string_yarn_enum_value():
     from utils.llm import model_manager as model_manager_module
 
     coerced = model_manager_module._coerce_desktop_runtime_probe({
@@ -5821,7 +5821,7 @@ def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
         'yarn_enum_value': '2',
     })
 
-    assert coerced['yarn_enum_value'] == 2
+    assert 'yarn_enum_value' not in coerced
     assert coerced['llama_cpp_python_version'] == '0.3.32'
     assert coerced['constructor_has_var_kwargs'] is True
     assert coerced['constructor_signature_inspectable'] is False
@@ -8656,7 +8656,7 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
             'backend': 'cuda',
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
-            'llama_module_path': 'C:/redacted/llama_cpp/__init__.py',
+            'llama_module_path': 'C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py',
             'constructor_kwarg_support': support,
             'constructor_signature_inspectable': True,
             'constructor_has_var_kwargs': False,
@@ -8696,7 +8696,38 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
     assert profiles[0]['kwargs']['n_ubatch'] == 128
 
 
-def test_legacy_flat_desktop_probe_reprobes_instead_of_inventing_yarn_enum(monkeypatch):
+def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/runtime/actual/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/runtime/other/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_enum_value': 2,
+            'capability_source': 'desktop_runtime_setup_probe',
+        },
+    )
+
+    def fail_probe(**_kwargs):
+        raise AssertionError('unexpected secondary probe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
+    assert 'llama_module_path' in diagnostics['missing_required_kwargs']
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+
+
+def test_legacy_flat_desktop_probe_synthesizes_mandated_yarn_bridge(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     support = {
@@ -8717,7 +8748,9 @@ def test_legacy_flat_desktop_probe_reprobes_instead_of_inventing_yarn_enum(monke
     )
     capabilities = model_manager_module._safe_constructor_capability_payload(facade)
     assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
-    assert 'yarn_enum_value' not in capabilities
+    assert capabilities['yarn_enum_value'] == 2
+    assert capabilities['qwen_64k_yarn_support'] == 'supported'
+    assert capabilities['constructor_signature_inspectable'] is True
 
     probe_calls = []
 
@@ -8740,7 +8773,7 @@ def test_legacy_flat_desktop_probe_reprobes_instead_of_inventing_yarn_enum(monke
 
     diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
 
-    assert probe_calls
+    assert not probe_calls
     assert diagnostics['supported'] is True
-    assert diagnostics['yarn_enum_value'] == 7
-    assert diagnostics['capability_source'] == 'worker_probe'
+    assert diagnostics['yarn_enum_value'] == 2
+    assert diagnostics['capability_source'] == 'desktop_runtime_setup_probe_legacy'

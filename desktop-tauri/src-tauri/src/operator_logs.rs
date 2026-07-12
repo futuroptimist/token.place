@@ -196,12 +196,6 @@ pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String
 }
 
 pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
-    if line.contains("TimeoutExpired") && line.contains("Command [") {
-        let timeout_seconds = parse_timeout_expired_seconds(line).unwrap_or(30);
-        return format!(
-            "desktop.llama_cpp_worker.init_failed stage=subprocess_command category=worker_timeout timeout_seconds={timeout_seconds}"
-        );
-    }
     let line = sanitize_log_line(line);
     let trimmed = line.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -213,6 +207,15 @@ pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
             return serde_json::to_string(&sanitize_operator_json_value(&value))
                 .unwrap_or_else(|_| r#"{"type":"operator_log_json_sanitize_error"}"#.to_string());
         }
+    }
+    if line.contains("TimeoutExpired") && line.contains("Command [") {
+        let timeout_seconds = parse_timeout_expired_seconds(&line)
+            .map(|seconds| format!(" timeout_seconds={seconds}"))
+            .unwrap_or_default();
+        let stage = parse_timeout_expired_stage(&line).unwrap_or("subprocess_timeout");
+        return format!(
+            "desktop.llama_cpp_worker.init_failed stage={stage} category=worker_timeout{timeout_seconds}"
+        );
     }
     line.split_whitespace()
         .map(sanitize_operator_diagnostic_token)
@@ -605,6 +608,29 @@ fn parse_timeout_expired_seconds(line: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+fn parse_timeout_expired_stage(line: &str) -> Option<&'static str> {
+    const ALLOWED: &[&str] = &[
+        "llama_cpp_gpu_probe",
+        "desktop_runtime_probe",
+        "runtime_import_probe",
+        "pip_install",
+        "subprocess_timeout",
+    ];
+    for marker in ["stage=", "stage:"] {
+        if let Some(rest) = line.split(marker).nth(1) {
+            let stage = rest
+                .trim_start_matches(|ch: char| matches!(ch, '"' | '\'' | '[' | '('))
+                .split(|ch: char| !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
+                .next()
+                .unwrap_or("");
+            if let Some(allowed) = ALLOWED.iter().copied().find(|allowed| *allowed == stage) {
+                return Some(allowed);
+            }
+        }
+    }
+    None
+}
+
 fn is_windows_drive_path_like(value: &str) -> bool {
     let trimmed =
         value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
@@ -619,7 +645,13 @@ fn is_windows_extended_or_unc_path_like(value: &str) -> bool {
         value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
     let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
-    lower.starts_with("//?/c:/") || lower.starts_with("//?/unc/") || lower.starts_with("//")
+    (lower.len() > 6
+        && lower.starts_with("//?/")
+        && lower.as_bytes().get(5) == Some(&b':')
+        && lower.as_bytes().get(6) == Some(&b'/')
+        && lower.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic))
+        || lower.starts_with("//?/unc/")
+        || lower.starts_with("//")
 }
 
 fn is_path_like(value: &str) -> bool {
@@ -631,7 +663,11 @@ fn is_path_like(value: &str) -> bool {
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
         || trimmed.starts_with("\\")
-        || lower.starts_with("//?/c:/")
+        || (lower.len() > 6
+            && lower.starts_with("//?/")
+            && lower.as_bytes().get(5) == Some(&b':')
+            && lower.as_bytes().get(6) == Some(&b'/')
+            && lower.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic))
         || lower.starts_with("//?/unc/")
         || lower.starts_with("//")
         || lower.contains("/users/")

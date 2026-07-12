@@ -138,11 +138,14 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
     payload: Dict[str, Any] = {}
     support = capabilities.get('constructor_kwarg_support')
     if isinstance(support, dict):
-        payload['constructor_kwarg_support'] = {
-            str(name): bool(value)
-            for name, value in support.items()
-            if isinstance(name, str) and name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
-        }
+        payload_support: Dict[str, bool] = {}
+        for name, value in support.items():
+            if not isinstance(name, str) or name not in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS:
+                continue
+            coerced = _coerce_strict_bool(value)
+            if coerced is not None:
+                payload_support[name] = coerced
+        payload['constructor_kwarg_support'] = payload_support
     for key in ('q8_kv_cache_type_value', 'q4_kv_cache_type_value', 'f16_kv_cache_type_value'):
         value = capabilities.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -771,16 +774,26 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
         required = ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx')
         required_supported = isinstance(kwarg_support, dict) and all(kwarg_support.get(name) is True for name in required)
         authoritative_backend = str(capabilities.get('backend') or '').lower() in {'cuda', 'metal'}
+        capability_module_path = capabilities.get('llama_module_path')
+        facade_module_path = getattr(llama_cpp_module, '__file__', None)
+        module_paths_match = (
+            bool(capability_module_path)
+            and bool(facade_module_path)
+            and _canonical_path_for_compare(capability_module_path)
+            == _canonical_path_for_compare(facade_module_path)
+        )
         authoritative = (
-            source == 'desktop_runtime_setup_probe'
+            source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}
             and authoritative_backend
             and capabilities.get('gpu_offload_supported') is True
-            and bool(capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None))
+            and module_paths_match
         )
         complete = (
             capabilities.get('qwen_64k_yarn_support') == 'supported'
             and required_supported
             and capabilities.get('yarn_enum_value') is not None
+            and capabilities.get('constructor_signature_inspectable') is True
+            and module_paths_match
         )
         if authoritative and complete:
             diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
@@ -788,7 +801,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             diagnostics['child_probe_reprobe_skipped_reason'] = 'desktop_probe_authoritative'
             diagnostics['desktop_probe_authoritative'] = True
             return diagnostics
-        if source == 'desktop_runtime_setup_probe' and not complete:
+        if source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'} and not complete:
             missing = []
             if capabilities.get('qwen_64k_yarn_support') != 'supported':
                 missing.append('qwen_64k_yarn_support')
@@ -796,6 +809,14 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
                 missing.extend([name for name in required if not (isinstance(kwarg_support, dict) and kwarg_support.get(name) is True)])
             if capabilities.get('yarn_enum_value') is None:
                 missing.append('yarn_enum_value')
+            if capabilities.get('constructor_signature_inspectable') is not True:
+                missing.append('constructor_signature_inspectable')
+            if not module_paths_match:
+                missing.append('llama_module_path')
+            if not authoritative_backend:
+                missing.append('backend')
+            if capabilities.get('gpu_offload_supported') is not True:
+                missing.append('gpu_offload_supported')
             diagnostics = _qwen_64k_rope_support_diagnostics(llama_cpp_module, llama_cls)
             diagnostics.update({
                 'supported': False,
@@ -3777,8 +3798,13 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
     if support:
         coerced['constructor_kwarg_support'] = support
 
+    def _coerce_bounded_schema_int(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**31 - 1:
+            return value
+        return None
+
     for field in ('q8_kv_cache_type_value', 'q4_kv_cache_type_value', 'f16_kv_cache_type_value'):
-        value = _coerce_optional_int_enum(probe.get(field))
+        value = _coerce_bounded_schema_int(probe.get(field))
         if value is not None and 0 <= value <= 2**31 - 1:
             coerced[field] = value
     if probe.get('llama_cpp_python_version'):
@@ -3792,7 +3818,7 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         coerced['qwen_64k_yarn_support'] = str(yarn_support)
     if probe.get('yarn_resolver_source'):
         coerced['yarn_resolver_source'] = str(probe.get('yarn_resolver_source'))
-    yarn_enum_value = _coerce_optional_int_enum(probe.get('yarn_enum_value'))
+    yarn_enum_value = _coerce_bounded_schema_int(probe.get('yarn_enum_value'))
     if yarn_enum_value is not None and 0 <= yarn_enum_value <= 2**31 - 1:
         coerced['yarn_enum_value'] = yarn_enum_value
 
@@ -3811,6 +3837,8 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         and str(probe.get('yarn_resolver_source') or '').lower() != 'unsupported'
     ):
         coerced['qwen_64k_yarn_support'] = 'supported'
+        coerced['yarn_enum_value'] = LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK
+        coerced['yarn_resolver_source'] = 'numeric_fallback'
         coerced['constructor_signature_inspectable'] = True
         coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
     return coerced

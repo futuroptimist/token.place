@@ -237,18 +237,17 @@ try:
     if gpu_offload_supported and backend == "cpu":
         backend = "metal" if sys.platform == "darwin" else "cuda"
 
-    constructor_kwarg_names = LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
     Llama = getattr(llama_cpp, "Llama", None)
     constructor_signature_inspectable = False
     constructor_has_var_kwargs = False
-    constructor_kwarg_support = {name: False for name in constructor_kwarg_names}
+    constructor_kwarg_support = {name: False for name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
     try:
         params = inspect.signature(getattr(Llama, "__init__", Llama)).parameters
         constructor_signature_inspectable = True
         constructor_has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         constructor_kwarg_support = {
             name: bool(name in params or constructor_has_var_kwargs)
-            for name in constructor_kwarg_names
+            for name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
         }
     except (TypeError, ValueError):
         pass
@@ -517,7 +516,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
 
     return RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),
-        gpu_offload_supported=bool(payload.get("gpu_offload_supported", False)),
+        gpu_offload_supported=payload.get("gpu_offload_supported") is True,
         detected_device=str(payload.get("detected_device", "cpu")),
         interpreter=str(payload.get("interpreter", sys.executable)),
         prefix=str(payload.get("prefix", sys.prefix)),
@@ -528,21 +527,21 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         dependency_target=str(payload.get("dependency_target", dependency_target_text)),
         pip_version=str(payload.get("pip_version", pip_version)),
         llama_cpp_python_version=str(payload.get("llama_cpp_python_version", "unknown")),
-        yarn_rope_supported=bool(payload.get("yarn_rope_supported", False)),
+        yarn_rope_supported=payload.get("yarn_rope_supported") is True,
         yarn_resolver_source=str(payload.get("yarn_resolver_source", "unsupported")),
-        rope_scaling_type_supported=bool(payload.get("rope_scaling_type_supported", False)),
-        yarn_ext_factor_supported=bool(payload.get("yarn_ext_factor_supported", False)),
-        rope_freq_scale_supported=bool(payload.get("rope_freq_scale_supported", False)),
-        yarn_orig_ctx_supported=bool(payload.get("yarn_orig_ctx_supported", False)),
+        rope_scaling_type_supported=payload.get("rope_scaling_type_supported") is True,
+        yarn_ext_factor_supported=payload.get("yarn_ext_factor_supported") is True,
+        rope_freq_scale_supported=payload.get("rope_freq_scale_supported") is True,
+        yarn_orig_ctx_supported=payload.get("yarn_orig_ctx_supported") is True,
         constructor_kwarg_support={
-            str(name): bool(value)
+            str(name): value
             for name, value in (payload.get("constructor_kwarg_support") or {}).items()
             if isinstance(name, str)
             and name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
             and isinstance(value, bool)
         } if isinstance(payload.get("constructor_kwarg_support"), dict) else {},
-        constructor_has_var_kwargs=bool(payload.get("constructor_has_var_kwargs", False)),
-        constructor_signature_inspectable=bool(payload.get("constructor_signature_inspectable", False)),
+        constructor_has_var_kwargs=payload.get("constructor_has_var_kwargs") is True,
+        constructor_signature_inspectable=payload.get("constructor_signature_inspectable") is True,
         qwen_64k_yarn_support=str(payload.get("qwen_64k_yarn_support", "unsupported")),
         yarn_enum_value=payload.get("yarn_enum_value") if isinstance(payload.get("yarn_enum_value"), int) and not isinstance(payload.get("yarn_enum_value"), bool) else None,
         q8_kv_cache_type_value=payload.get("q8_kv_cache_type_value") if isinstance(payload.get("q8_kv_cache_type_value"), int) and not isinstance(payload.get("q8_kv_cache_type_value"), bool) else None,

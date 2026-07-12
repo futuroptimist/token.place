@@ -396,3 +396,84 @@ def test_metrics_do_not_expose_high_cardinality_or_sensitive_values(relay_client
     logs = "\n".join(record.getMessage() + json.dumps(record.__dict__, default=str) for record in caplog.records)
     for value in sensitive_values:
         assert value not in logs
+
+
+def test_metrics_scrape_uses_bounded_relay_registry(relay_client) -> None:
+    """The relay scrape should not expose exporter defaults grouped by raw path."""
+
+    for idx in range(30):
+        relay_client.get(f"/unmatched-sensitive-{idx}?token=query-sensitive-{idx}")
+
+    body = _metric_body(relay_client)
+
+    assert "flask_http_request" not in body
+    assert "prometheus_flask_exporter" not in body
+    for idx in range(30):
+        assert f"unmatched-sensitive-{idx}" not in body
+        assert f"query-sensitive-{idx}" not in body
+
+
+def test_metrics_gauge_collection_auth_order_and_once_per_authorized_scrape(
+    relay_client,
+    monkeypatch,
+) -> None:
+    """Unauthorized scrapes should not collect gauges; authorized scrapes collect once."""
+
+    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", "metrics-secret")
+    calls = {"count": 0}
+
+    def spy_update_runtime_gauges() -> None:
+        calls["count"] += 1
+
+    monkeypatch.setattr(relay_module, "_update_runtime_gauges", spy_update_runtime_gauges)
+
+    unauthorized = relay_client.get("/metrics", headers={"Authorization": "Bearer wrong"})
+    assert unauthorized.status_code == 401
+    assert calls["count"] == 0
+
+    authorized = relay_client.get("/metrics", headers={"Authorization": "Bearer metrics-secret"})
+    assert authorized.status_code == 200
+    assert calls["count"] == 1
+
+
+def test_metrics_gauge_collection_failure_returns_503(relay_client, monkeypatch) -> None:
+    """Scrape collection failures should fail metrics without blocking relay traffic."""
+
+    def fail_update_runtime_gauges() -> None:
+        raise RuntimeError("synthetic scrape failure")
+
+    monkeypatch.setattr(relay_module, "_update_runtime_gauges", fail_update_runtime_gauges)
+
+    response = relay_client.get("/metrics")
+
+    assert response.status_code == 503
+    assert relay_client.get("/healthz").status_code == 200
+
+
+def test_structured_logs_keep_compat_http_path_normalized(relay_client, monkeypatch) -> None:
+    """Desktop-compatible http_path should carry only the normalized route group."""
+
+    log_records = []
+
+    def spy_info(message, *args, **kwargs):
+        log_records.append((message, kwargs.get("extra", {})))
+
+    monkeypatch.setattr(relay_module.LOGGER, "info", spy_info)
+    raw_values = {"raw-request-id-next", "agent-next-sensitive", "query-next-sensitive"}
+
+    response = relay_client.get(
+        "/api/v1/relay/servers/next?request_id=query-next-sensitive",
+        headers={
+            "X-Request-Id": "raw-request-id-next",
+            "User-Agent": "agent-next-sensitive",
+        },
+    )
+
+    assert response.status_code in {200, 404, 503}
+    http_logs = [extra for message, extra in log_records if message == "http.request"]
+    assert http_logs
+    assert http_logs[-1]["http_path"] == "/api/v1/relay/servers/next"
+    assert http_logs[-1]["http_route"] == "/api/v1/relay/servers/next"
+    serialized_logs = "\n".join(json.dumps(payload, default=str) for payload in http_logs)
+    for value in raw_values:
+        assert value not in serialized_logs

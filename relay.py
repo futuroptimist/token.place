@@ -14,11 +14,18 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata, resolve_asset_version
+from release_metadata import get_release_metadata, resolve_asset_version, resolve_deploy_ref
 from utils.llm.model_profiles import build_model_aliases
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -97,6 +104,10 @@ def setup_logging() -> logging.Logger:
 
 
 LOGGER = setup_logging()
+
+
+RELAY_METRICS_REGISTRY = CollectorRegistry()
+_METRICS_INITIALIZED = False
 
 
 DRAINING = threading.Event()
@@ -407,7 +418,12 @@ def create_app() -> Flask:
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
-    init_app(flask_app)
+    init_app(
+        flask_app,
+        metrics_registry=RELAY_METRICS_REGISTRY,
+        metrics_export_defaults=False,
+        metrics_path=None,
+    )
     LOGGER.info(
         "relay.app.initialized",
         extra={
@@ -422,14 +438,11 @@ app = create_app()
 
 
 def _get_request_counter() -> Counter:
-    metric_name = "tokenplace_relay_requests_total"
-    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(metric_name)
-    if existing is not None:
-        return existing  # type: ignore[return-value]
     return Counter(
-        metric_name,
+        "tokenplace_relay_requests_total",
         "Total HTTP requests processed by token.place relay",
         ["method", "endpoint", "status"],
+        registry=RELAY_METRICS_REGISTRY,
     )
 
 
@@ -450,11 +463,26 @@ HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
 BUILD_METADATA = get_release_metadata(None)
 
 
+class _NoopMetric:
+    def labels(self, *args, **kwargs):
+        return self
+
+    def inc(self, *args, **kwargs) -> None:
+        return None
+
+    def set(self, *args, **kwargs) -> None:
+        return None
+
+    def observe(self, *args, **kwargs) -> None:
+        return None
+
+
 def _collector(name: str, factory):
-    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
-    if existing is not None:
-        return existing
-    return factory()
+    try:
+        return factory()
+    except Exception:
+        LOGGER.exception("metrics.collector_construction_failed", extra={"metric": name})
+        return _NoopMetric()
 
 
 HTTP_REQUESTS_TOTAL = _collector(
@@ -463,6 +491,7 @@ HTTP_REQUESTS_TOTAL = _collector(
         "tokenplace_http_requests_total",
         "Bounded relay HTTP requests by normalized route, status class, provider mode, and outcome.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
+        registry=RELAY_METRICS_REGISTRY,
     ),
 )
 HTTP_REQUEST_DURATION_SECONDS = _collector(
@@ -472,51 +501,52 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         "Bounded relay HTTP request duration in seconds.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
         buckets=HTTP_DURATION_BUCKETS,
+        registry=RELAY_METRICS_REGISTRY,
     ),
 )
 RELAY_QUEUE_DEPTH = _collector(
     "tokenplace_relay_queue_depth",
-    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"]),
+    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_queued_request_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"]),
+    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODES_REGISTERED = _collector(
     "tokenplace_compute_nodes_registered",
-    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes."),
+    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODES_HEALTHY = _collector(
     "tokenplace_compute_nodes_healthy",
-    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics."),
+    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODE_LEASE_AGE_SECONDS = _collector(
     "tokenplace_compute_node_lease_age_seconds",
-    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity."),
+    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
     "tokenplace_compute_node_evictions_total",
-    lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"]),
+    lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"], registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_IN_FLIGHT_REQUESTS = _collector(
     "tokenplace_relay_in_flight_requests",
-    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes."),
+    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_in_flight_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request."),
+    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
     "tokenplace_relay_request_outcomes_total",
-    lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"]),
+    lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=RELAY_METRICS_REGISTRY),
 )
 BUILD_INFO = _collector(
     "tokenplace_build_info",
-    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"]),
+    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
 )
 INSTRUMENTATION_UP = _collector(
     "tokenplace_instrumentation_up",
-    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized."),
+    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", registry=RELAY_METRICS_REGISTRY),
 )
 
 
@@ -529,9 +559,11 @@ def _initialise_metric_labels() -> None:
     RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
-        BUILD_METADATA.get("ref", "unknown"),
+        BUILD_METADATA.get("ref") or resolve_deploy_ref() or "unknown",
     ).set(1)
     INSTRUMENTATION_UP.set(1)
+    global _METRICS_INITIALIZED
+    _METRICS_INITIALIZED = True
 
 
 def _normalise_status_class(status_code: int | str) -> str:
@@ -553,6 +585,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_servers_register": "/api/v1/relay/servers/register",
         "api_v1_relay_servers_unregister": "/api/v1/relay/servers/unregister",
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
+        "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
         "healthz": "/healthz",
         "livez": "/livez",
         "metrics": "/metrics",
@@ -660,20 +693,33 @@ def _update_runtime_gauges() -> None:
     oldest_lease_age = 0.0
     in_flight = 0
     oldest_in_flight_age = 0.0
+    server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
     with server_round_robin_lock:
-        servers = list(known_servers.values())
-    for payload in servers:
-        if not isinstance(payload, dict) or not payload.get(API_V1_SERVER_MARKER):
-            continue
+        for payload in known_servers.values():
+            if not isinstance(payload, dict) or not payload.get(API_V1_SERVER_MARKER):
+                continue
+            with api_v1_in_flight_requests_lock:
+                in_flight_entries = [
+                    dict(entry)
+                    for entry in (payload.get("api_v1_in_flight_requests") or {}).values()
+                    if isinstance(entry, dict)
+                ]
+            server_snapshots.append(
+                (
+                    payload.get("last_ping"),
+                    _api_v1_node_is_stale(payload, now_monotonic=now_mono),
+                    in_flight_entries,
+                )
+            )
+    for last_ping, is_stale, entries in server_snapshots:
         registered += 1
-        lease_age = _server_ping_age_seconds(payload.get("last_ping"))
+        lease_age = _server_ping_age_seconds(last_ping)
         oldest_lease_age = max(oldest_lease_age, lease_age if lease_age != float("inf") else 0.0)
-        if not _api_v1_node_is_stale(payload, now_monotonic=now_mono):
+        if not is_stale:
             healthy += 1
-        with api_v1_in_flight_requests_lock:
-            raw_in_flight = dict(payload.get("api_v1_in_flight_requests") or {})
-        for entry in raw_in_flight.values():
-            if not isinstance(entry, dict):
+        for entry in entries:
+            expires_at = entry.get("expires_at")
+            if isinstance(expires_at, (int, float)) and expires_at <= now_mono:
                 continue
             in_flight += 1
             started = entry.get("started_at_monotonic")
@@ -689,7 +735,16 @@ def _update_runtime_gauges() -> None:
     RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS.set(max(oldest_in_flight_age, 0.0))
 
 
-_initialise_metric_labels()
+try:
+    INSTRUMENTATION_UP.set(0)
+    _initialise_metric_labels()
+except Exception:
+    LOGGER.exception("metrics.initialization_failed")
+    try:
+        INSTRUMENTATION_UP.set(0)
+    except Exception:
+        pass
+
 
 
 def _load_server_registration_tokens():
@@ -1305,7 +1360,8 @@ def _record_request_start():
         try:
             _update_runtime_gauges()
         except Exception:
-            LOGGER.debug("metrics.gauge_update_failed")
+            LOGGER.exception("metrics.gauge_update_failed")
+            return Response("metrics unavailable\n", status=503, mimetype="text/plain")
     return None
 
 
@@ -1349,6 +1405,7 @@ def _log_request(response: Response):
             extra={
                 "http_method": request.method,
                 "http_route": route,
+                "http_path": route,
                 "http_status": int(status_code),
                 "status_class": status_class,
                 "duration_ms": round((duration or 0) * 1000, 2),
@@ -1362,6 +1419,16 @@ def _log_request(response: Response):
         response.headers.setdefault("Cache-Control", "no-store")
 
     return response
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    try:
+        payload = generate_latest(RELAY_METRICS_REGISTRY)
+    except Exception:
+        LOGGER.exception("metrics.serialize_failed")
+        return Response("metrics unavailable\n", status=503, mimetype="text/plain")
+    return Response(payload, mimetype=CONTENT_TYPE_LATEST)
 
 
 @app.route("/healthz", methods=["GET"])

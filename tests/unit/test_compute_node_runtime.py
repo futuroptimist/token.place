@@ -23,6 +23,7 @@ from utils.compute_node_runtime import (
     _completion_smoke_reason_from_api_v1_error,
     _readiness_smoke_model_id,
     _safe_completion_smoke_worker_diagnostics,
+    _qwen_64k_readiness_profile_recoverable,
 )
 
 
@@ -3175,3 +3176,14 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     assert model_manager.get_llm_instance.call_count == 3
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
     assert model_manager._qwen_64k_profile_recovery_count == 3
+
+
+def test_completion_smoke_cuda_oom_classification_is_qwen64k_recoverable():
+    category, reason, diagnostics = _classify_completion_smoke_exception(
+        RuntimeError('CUDA out of memory in cudaMalloc during completion smoke')
+    )
+
+    assert category == 'runtime_context_create_cuda_memory'
+    assert reason == 'runtime_completion_smoke_cuda_memory_allocation'
+    assert _qwen_64k_readiness_profile_recoverable(category) is True
+    assert diagnostics['exception_type'] == 'RuntimeError'

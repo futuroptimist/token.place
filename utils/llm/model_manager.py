@@ -199,9 +199,13 @@ def _resolve_yarn_rope_scaling_type(llama_cpp_module: Any, llama_cls: Any = None
             return value, source
 
     worker_capabilities = _safe_constructor_capability_payload(llama_cpp_module)
-    if worker_capabilities.get('yarn_resolver_source') == 'numeric_fallback':
+    worker_yarn_value = worker_capabilities.get('yarn_enum_value')
+    worker_yarn_source = worker_capabilities.get('yarn_resolver_source')
+    if worker_yarn_value is not None and worker_yarn_source in {'top_level_enum', 'nested_enum', 'llama_class_enum', 'numeric_fallback'}:
+        return worker_yarn_value, str(worker_yarn_source)
+    if worker_yarn_source == 'numeric_fallback':
         return (
-            worker_capabilities.get('yarn_enum_value', LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK),
+            LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK,
             'numeric_fallback',
         )
     worker_kwarg_support = worker_capabilities.get('constructor_kwarg_support')
@@ -768,7 +772,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
         required_supported = isinstance(kwarg_support, dict) and all(kwarg_support.get(name) is True for name in required)
         authoritative_backend = str(capabilities.get('backend') or '').lower() in {'cuda', 'metal'}
         authoritative = (
-            source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}
+            source == 'desktop_runtime_setup_probe'
             and authoritative_backend
             and capabilities.get('gpu_offload_supported') is True
             and bool(capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None))
@@ -3807,7 +3811,6 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         and str(probe.get('yarn_resolver_source') or '').lower() != 'unsupported'
     ):
         coerced['qwen_64k_yarn_support'] = 'supported'
-        coerced['yarn_enum_value'] = 2
         coerced['constructor_signature_inspectable'] = True
         coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
     return coerced

@@ -197,7 +197,10 @@ pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String
 
 pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
     if line.contains("TimeoutExpired") && line.contains("Command [") {
-        return "desktop.llama_cpp_worker.init_failed stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=30".to_string();
+        let timeout_seconds = parse_timeout_expired_seconds(line).unwrap_or(30);
+        return format!(
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_command category=worker_timeout timeout_seconds={timeout_seconds}"
+        );
     }
     let line = sanitize_log_line(line);
     let trimmed = line.trim();
@@ -231,6 +234,10 @@ fn sanitize_operator_diagnostic_token(token: &str) -> String {
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);
+    }
+
+    if is_windows_drive_path_like(token) || is_windows_extended_or_unc_path_like(token) {
+        return sanitize_path_display(token);
     }
 
     for separator in ['=', ':'] {
@@ -567,18 +574,52 @@ fn sanitize_url_display(value: &str) -> String {
 
 fn sanitize_path_display(value: &str) -> String {
     let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
-    let path = Path::new(trimmed);
     if trimmed.starts_with('/') && trimmed.split('/').filter(|part| !part.is_empty()).count() <= 2 {
         return "<path>".into();
     }
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let cross_platform_name = normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty());
+    let path = Path::new(trimmed);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty());
+        .filter(|name| !name.is_empty())
+        .or(cross_platform_name);
     match file_name {
         Some(name) => format!("<path:{name}>"),
         None => "<path>".into(),
     }
+}
+
+fn parse_timeout_expired_seconds(line: &str) -> Option<u64> {
+    let marker = "timed out after ";
+    let rest = line.split(marker).nth(1)?;
+    let digits: String = rest
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse::<u64>().ok()
+}
+
+fn is_windows_drive_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    trimmed.len() > 2
+        && trimmed.as_bytes()[1] == b':'
+        && (trimmed.as_bytes()[2] == b'/' || trimmed.as_bytes()[2] == b'\\')
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn is_windows_extended_or_unc_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    lower.starts_with("//?/c:/") || lower.starts_with("//?/unc/") || lower.starts_with("//")
 }
 
 fn is_path_like(value: &str) -> bool {
@@ -1079,9 +1120,15 @@ mod tests {
         assert!(!sanitized.contains("Alice"));
         assert!(!sanitized.contains("AppData"));
         assert!(!sanitized.contains("Command ["));
-        assert!(sanitized.contains("stage=llama_cpp_gpu_probe"));
+        assert!(sanitized.contains("stage=subprocess_command"));
         assert!(sanitized.contains("category=worker_timeout"));
         assert!(sanitized.contains("timeout_seconds=30"));
+
+        let custom_timeout = sanitize_operator_diagnostic_line(
+            r#"TimeoutExpired: Command ['C:\Users\Alice\python.exe'] timed out after 45 seconds"#,
+        );
+        assert!(custom_timeout.contains("timeout_seconds=45"));
+        assert!(!custom_timeout.contains("Alice"));
 
         let json = sanitize_operator_diagnostic_line(
             r#"{"path":"C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe","stage":"llama_cpp_gpu_probe"}"#,
@@ -1090,5 +1137,14 @@ mod tests {
         assert_eq!(parsed["path"], "<path:python.exe>");
         assert!(!json.contains("Alice"));
         assert!(!json.contains("AppData"));
+
+        let drive = sanitize_operator_diagnostic_line(
+            r#"python=C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe"#,
+        );
+        assert_eq!(drive, "python=<path:python.exe>");
+        let extended = sanitize_operator_diagnostic_line(
+            r#"\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe"#,
+        );
+        assert_eq!(extended, "<path:python.exe>");
     }
 }

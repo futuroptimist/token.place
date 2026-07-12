@@ -2109,3 +2109,26 @@ def test_probe_result_payload_preserves_native_capability_types():
     assert encoded['q4_kv_cache_type_value'] == 2
     assert encoded['f16_kv_cache_type_value'] == 1
     assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
+
+
+def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeypatch, tmp_path):
+    payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'detected_device': 'cuda',
+        'constructor_kwarg_support': {
+            'rope_scaling_type': True,
+            'unexpected_future_kwarg': True,
+        },
+    }
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *_, **__: Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.constructor_kwarg_support == {'rope_scaling_type': True}

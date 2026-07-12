@@ -8694,3 +8694,53 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
     assert profiles[0]['kwargs']['offload_kqv'] is True
     assert profiles[0]['kwargs']['n_batch'] == 256
     assert profiles[0]['kwargs']['n_ubatch'] == 128
+
+
+def test_legacy_flat_desktop_probe_reprobes_instead_of_inventing_yarn_enum(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {
+        'rope_scaling_type': True,
+        'rope_freq_scale': True,
+        'yarn_orig_ctx': True,
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/site/llama_cpp/__init__.py',
+            'yarn_rope_supported': True,
+            'yarn_resolver_source': 'numeric_fallback',
+            'constructor_kwarg_support': support,
+        },
+    )
+    capabilities = model_manager_module._safe_constructor_capability_payload(facade)
+    assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert 'yarn_enum_value' not in capabilities
+
+    probe_calls = []
+
+    def fake_child_probe(**kwargs):
+        probe_calls.append(kwargs)
+        return {
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/real/site/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'constructor_has_var_kwargs': False,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_resolver_source': 'top_level_enum',
+            'yarn_enum_value': 7,
+            'capability_source': 'worker_probe',
+        }
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fake_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert probe_calls
+    assert diagnostics['supported'] is True
+    assert diagnostics['yarn_enum_value'] == 7
+    assert diagnostics['capability_source'] == 'worker_probe'

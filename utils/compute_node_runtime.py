@@ -374,7 +374,7 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
     elif "metal" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom")):
         category = "metal_memory_allocation"
     elif "cuda" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom", "cudamalloc", "cublas")):
-        category = "cuda_memory_allocation"
+        category = "runtime_context_create_cuda_memory"
     elif "kv" in text and any(token in text for token in ("alloc", "cache", "memory", "out of memory", "oom")):
         category = "kv_cache_allocation"
     elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):

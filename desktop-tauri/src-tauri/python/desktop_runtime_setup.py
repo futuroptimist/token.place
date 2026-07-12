@@ -237,11 +237,7 @@ try:
     if gpu_offload_supported and backend == "cpu":
         backend = "metal" if sys.platform == "darwin" else "cuda"
 
-    constructor_kwarg_names = (
-        "type_k", "type_v", "flash_attn", "offload_kqv", "n_batch", "n_ubatch",
-        "rope_scaling_type", "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_fast",
-        "yarn_beta_slow", "yarn_orig_ctx", "rope_freq_base", "rope_freq_scale",
-    )
+    constructor_kwarg_names = LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
     Llama = getattr(llama_cpp, "Llama", None)
     constructor_signature_inspectable = False
     constructor_has_var_kwargs = False
@@ -541,7 +537,9 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         constructor_kwarg_support={
             str(name): bool(value)
             for name, value in (payload.get("constructor_kwarg_support") or {}).items()
-            if isinstance(name, str) and isinstance(value, bool)
+            if isinstance(name, str)
+            and name in LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS
+            and isinstance(value, bool)
         } if isinstance(payload.get("constructor_kwarg_support"), dict) else {},
         constructor_has_var_kwargs=bool(payload.get("constructor_has_var_kwargs", False)),
         constructor_signature_inspectable=bool(payload.get("constructor_signature_inspectable", False)),

@@ -958,6 +958,13 @@ class ComputeNodeRuntime:
                 "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
                 "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
                 "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+                "llama_cpp_capability_source": diagnostics.get("llama_cpp_capability_source") or yarn_diagnostics.get("capability_source"),
+                "llama_cpp_desktop_probe_authoritative": diagnostics.get("llama_cpp_desktop_probe_authoritative") or yarn_diagnostics.get("desktop_probe_authoritative"),
+                "llama_cpp_child_capability_reprobe_attempted": diagnostics.get("llama_cpp_child_capability_reprobe_attempted") if diagnostics.get("llama_cpp_child_capability_reprobe_attempted") is not None else yarn_diagnostics.get("child_probe_reprobe_attempted"),
+                "llama_cpp_child_capability_reprobe_skipped_reason": diagnostics.get("llama_cpp_child_capability_reprobe_skipped_reason") or yarn_diagnostics.get("child_probe_reprobe_skipped_reason"),
+                "llama_cpp_constructor_signature_inspectable": diagnostics.get("llama_cpp_constructor_signature_inspectable") if diagnostics.get("llama_cpp_constructor_signature_inspectable") is not None else yarn_diagnostics.get("constructor_signature_inspectable"),
+                "llama_cpp_qwen_64k_yarn_support": diagnostics.get("llama_cpp_qwen_64k_yarn_support") or yarn_diagnostics.get("qwen_64k_yarn_support"),
+                "llama_cpp_runtime_profile_backend": diagnostics.get("llama_cpp_runtime_profile_backend"),
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",

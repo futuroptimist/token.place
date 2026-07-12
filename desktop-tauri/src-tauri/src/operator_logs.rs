@@ -410,19 +410,95 @@ fn is_safe_token_csv_u64_or_null_key(key: &str) -> bool {
     )
 }
 
-fn is_safe_token_identifier_value(_key: &str, value: &str) -> bool {
-    is_bounded_token_identifier(value)
+fn is_safe_token_identifier_value(key: &str, value: &str) -> bool {
+    // Generic subprocess diagnostic JSON is untrusted: a bounded identifier
+    // shape is only a first gate, and only producer-defined token metadata
+    // values may bypass the default token/prompt redaction path.
+    if !value.is_empty() && !is_bounded_token_identifier(value) {
+        return false;
+    }
+
+    match unprefixed_readiness_token_key(key) {
+        "plain_completion_prompt_tokenization_error_category" => {
+            is_safe_tokenization_error_category(value)
+        }
+        "plain_completion_prompt_tokenization_method" => matches!(value, "" | "llama.tokenize"),
+        "plain_completion_prompt_tokenization_selected_variant" => {
+            value.is_empty() || is_safe_tokenization_variant(value)
+        }
+        _ => false,
+    }
 }
 
-fn is_safe_token_csv_identifier_value(_key: &str, value: &str) -> bool {
-    is_bounded_token_identifier_csv(value)
+fn is_safe_token_csv_identifier_value(key: &str, value: &str) -> bool {
+    if !is_bounded_token_identifier_csv(value) {
+        return false;
+    }
+
+    match unprefixed_readiness_token_key(key) {
+        "plain_completion_prompt_tokenization_variant_ids"
+        | "plain_completion_attempt_tokenization_variants" => {
+            validate_bounded_identifier_csv(value, is_safe_tokenization_variant)
+        }
+        "plain_completion_prompt_tokenization_special_values" => {
+            validate_bounded_identifier_csv(value, is_safe_tokenization_special_value)
+        }
+        _ => false,
+    }
+}
+
+fn unprefixed_readiness_token_key(key: &str) -> &str {
+    key.strip_prefix("api_v1_readiness_completion_smoke_")
+        .unwrap_or(key)
+}
+
+fn is_safe_tokenization_variant(value: &str) -> bool {
+    matches!(
+        value,
+        "tokenize_add_bos_false_special_false"
+            | "tokenize_add_bos_false_no_special"
+            | "tokenize_add_bos_false_special_true"
+    )
+}
+
+fn is_safe_tokenization_special_value(value: &str) -> bool {
+    matches!(value, "false" | "none" | "true")
+}
+
+fn is_safe_tokenization_error_category(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "context_length_exceeded"
+            | "context_window_exceeded"
+            | "tokenizer_unavailable"
+            | "method_shape"
+            | "tokenizer_special_rejected"
+            | "token_overflow"
+            | "prompt_tokenization_failure"
+            | "prompt_eval_failure"
+            | "prompt_eval_decode_failure"
+            | "prompt_eval_invalid_batch"
+            | "backend_allocation_failure"
+            | "backend_graph_compute_failure"
+            | "metal_graph_compute_failure"
+            | "kv_slot_unavailable"
+            | "decode_aborted"
+            | "backend_decode_failure"
+            | "prompt_eval_backend_failure"
+            | "prompt_eval_invalid_token_failure"
+            | "prompt_eval_state_failure"
+            | "prompt_eval_context_failure"
+            | "sampling_failure"
+    )
 }
 
 fn is_bounded_token_identifier(value: &str) -> bool {
-    value.len() <= 256
-        && value
-            .chars()
-            .all(|ch| !ch.is_control() && ch != ',' && ch != '"' && ch != '\\')
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'.' | b':' | b'/' | b'@' | b'+' | b'-')
+        })
 }
 
 fn is_bounded_token_identifier_csv(value: &str) -> bool {
@@ -678,9 +754,9 @@ mod tests {
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": false,
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "llama.tokenize",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_special_true",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special,tokenize_add_bos_false_special_true",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts": "50,28",
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,true",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,none,true",
         }).to_string());
         let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
 
@@ -713,9 +789,9 @@ mod tests {
             Some("llama.tokenize")
         );
         assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant"].as_str(), Some("tokenize_add_bos_false_special_false"));
-        assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids"].as_str(), Some("tokenize_add_bos_false_special_false,tokenize_add_bos_false_special_true"));
+        assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids"].as_str(), Some("tokenize_add_bos_false_special_false,tokenize_add_bos_false_no_special,tokenize_add_bos_false_special_true"));
         assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts"].as_str(), Some("50,28"));
-        assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values"].as_str(), Some("false,true"));
+        assert_eq!(payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values"].as_str(), Some("false,none,true"));
         assert!(!sanitized.contains("<redacted>"));
     }
 
@@ -785,7 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_operator_diagnostic_line_sanitizes_allowlisted_identifier_strings() {
+    fn sanitize_operator_diagnostic_line_redacts_semantically_invalid_allowlisted_identifier_strings(
+    ) {
         let sanitized = sanitize_operator_diagnostic_line(&serde_json::json!({
             "plain_completion_prompt_tokenization_method": "https://user:pass@example.com/private/model.gguf?token=secret",
             "plain_completion_prompt_tokenization_selected_variant": "/home/alice/private/model.gguf",
@@ -796,15 +873,15 @@ mod tests {
 
         assert_eq!(
             payload["plain_completion_prompt_tokenization_method"].as_str(),
-            Some("https://example.com")
+            Some("<redacted>")
         );
         assert_eq!(
             payload["plain_completion_prompt_tokenization_selected_variant"].as_str(),
-            Some("<path:model.gguf>")
+            Some("<redacted>")
         );
         assert_eq!(
             payload["plain_completion_prompt_tokenization_variant_ids"].as_str(),
-            Some("<path:model.gguf>")
+            Some("<redacted>")
         );
         assert_eq!(
             payload["plain_completion_prompt_tokenization_token_counts"].as_str(),
@@ -882,13 +959,17 @@ mod tests {
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": [28],
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts": "50,text",
             "plain_completion_prompt_tokenization_method": "llama tokenize",
-            "plain_completion_prompt_tokenization_selected_variant": "bad\"quote",
-            "plain_completion_prompt_tokenization_error_category": "bad\\slash",
+            "plain_completion_prompt_tokenization_selected_variant": "tok_abc123",
+            "plain_completion_prompt_tokenization_error_category": "SECRET_API_TOKEN",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "bad\u{0001}control",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": too_many_entries,
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "bad,comma",
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,bad\\slash",
-            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,bad\"quote",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "https://example.com/private/token",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,none,SECRET_API_TOKEN",
+            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,tok_abc123",
+            "plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tok_abc123",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category": "arbitrary_text",
+            "plain_completion_prompt_tokenization_special_values": "false,☃",
+            "api_v1_readiness_completion_smoke_plain_completion_attempt_tokenization_variants": "/home/alice/private/model.gguf",
         }).to_string());
         let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
 
@@ -896,6 +977,11 @@ mod tests {
             assert_eq!(value.as_str(), Some("<redacted>"));
         }
         assert!(!sanitized.contains("SECRET"));
+        assert!(!sanitized.contains("tok_abc123"));
+        assert!(!sanitized.contains("arbitrary_text"));
+        assert!(!sanitized.contains("☃"));
+        assert!(!sanitized.contains("/home/alice"));
+        assert!(!sanitized.contains("https://example.com/private"));
     }
 
     #[test]

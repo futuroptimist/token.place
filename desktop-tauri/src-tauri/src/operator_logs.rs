@@ -310,15 +310,17 @@ fn sanitize_safe_token_metadata(key: &str, value: &serde_json::Value) -> Option<
     if is_safe_token_identifier_or_null_key(key) {
         return Some(match value {
             serde_json::Value::Null => serde_json::Value::Null,
-            serde_json::Value::String(text) if is_bounded_token_identifier(text) => value.clone(),
+            serde_json::Value::String(text) if is_safe_token_identifier_value(key, text) => {
+                serde_json::Value::String(sanitize_operator_diagnostic_token(text))
+            }
             _ => redacted_json_value(),
         });
     }
     if is_safe_token_csv_identifier_or_null_key(key) {
         return Some(match value {
             serde_json::Value::Null => serde_json::Value::Null,
-            serde_json::Value::String(text) if is_bounded_token_csv_identifiers(text) => {
-                value.clone()
+            serde_json::Value::String(text) if is_safe_token_csv_identifier_value(key, text) => {
+                serde_json::Value::String(sanitize_operator_diagnostic_token(text))
             }
             _ => redacted_json_value(),
         });
@@ -326,7 +328,9 @@ fn sanitize_safe_token_metadata(key: &str, value: &serde_json::Value) -> Option<
     if is_safe_token_csv_u64_or_null_key(key) {
         return Some(match value {
             serde_json::Value::Null => serde_json::Value::Null,
-            serde_json::Value::String(text) if is_bounded_token_csv_u64s(text) => value.clone(),
+            serde_json::Value::String(text) if is_bounded_token_csv_u64s(text) => {
+                serde_json::Value::String(sanitize_operator_diagnostic_token(text))
+            }
             _ => redacted_json_value(),
         });
     }
@@ -407,17 +411,82 @@ fn is_safe_token_csv_u64_or_null_key(key: &str) -> bool {
     )
 }
 
-fn is_bounded_token_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'.' | b':' | b'/' | b'@' | b'+' | b'-')
-        })
+fn is_safe_token_identifier_value(key: &str, value: &str) -> bool {
+    match plain_completion_tokenization_metadata_key(key) {
+        Some("plain_completion_prompt_tokenization_error_category") => {
+            is_safe_tokenization_error_category(value)
+        }
+        Some("plain_completion_prompt_tokenization_method") => {
+            matches!(value, "" | "llama.tokenize")
+        }
+        Some("plain_completion_prompt_tokenization_selected_variant") => {
+            is_safe_tokenization_variant_id(value) || value.is_empty()
+        }
+        _ => false,
+    }
 }
 
-fn is_bounded_token_csv_identifiers(value: &str) -> bool {
-    value.len() <= 256 && validate_bounded_csv(value, |entry| is_bounded_token_identifier(entry))
+fn is_safe_token_csv_identifier_value(key: &str, value: &str) -> bool {
+    match plain_completion_tokenization_metadata_key(key) {
+        Some("plain_completion_prompt_tokenization_variant_ids")
+        | Some("plain_completion_attempt_tokenization_variants") => {
+            is_safe_tokenization_variant_csv(value)
+        }
+        Some("plain_completion_prompt_tokenization_special_values") => {
+            is_safe_tokenization_special_value_csv(value)
+        }
+        _ => false,
+    }
+}
+
+fn plain_completion_tokenization_metadata_key(key: &str) -> Option<&str> {
+    key.strip_prefix("api_v1_readiness_completion_smoke_")
+        .or(Some(key))
+}
+
+fn is_safe_tokenization_error_category(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "context_length_exceeded"
+            | "context_window_exceeded"
+            | "tokenizer_unavailable"
+            | "method_shape"
+            | "tokenizer_special_rejected"
+            | "token_overflow"
+            | "prompt_tokenization_failure"
+            | "prompt_eval_failure"
+            | "prompt_eval_decode_failure"
+            | "prompt_eval_invalid_batch"
+            | "backend_allocation_failure"
+            | "backend_graph_compute_failure"
+            | "metal_graph_compute_failure"
+            | "kv_slot_unavailable"
+            | "decode_aborted"
+            | "backend_decode_failure"
+            | "prompt_eval_backend_failure"
+            | "prompt_eval_invalid_token_failure"
+            | "prompt_eval_state_failure"
+            | "prompt_eval_context_failure"
+            | "sampling_failure"
+    )
+}
+
+fn is_safe_tokenization_variant_id(value: &str) -> bool {
+    matches!(
+        value,
+        "tokenize_add_bos_false_special_false"
+            | "tokenize_add_bos_false_no_special"
+            | "tokenize_add_bos_false_special_true"
+    )
+}
+
+fn is_safe_tokenization_variant_csv(value: &str) -> bool {
+    value.len() <= 256 && validate_bounded_csv(value, is_safe_tokenization_variant_id)
+}
+
+fn is_safe_tokenization_special_value_csv(value: &str) -> bool {
+    value.len() <= 256
+        && validate_bounded_csv(value, |entry| matches!(entry, "false" | "none" | "true"))
 }
 
 fn is_bounded_token_csv_u64s(value: &str) -> bool {
@@ -744,6 +813,9 @@ mod tests {
             "plain_completion_prompt_tokenization_error_category": "bad\\slash",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "bad\u{0001}control",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": too_many_entries,
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tok_abc123",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,tok_abc123",
+            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,tok_abc123",
         }).to_string());
         let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
 
@@ -751,6 +823,7 @@ mod tests {
             assert_eq!(value.as_str(), Some("<redacted>"));
         }
         assert!(!sanitized.contains("SECRET"));
+        assert!(!sanitized.contains("tok_abc123"));
     }
 
     #[test]

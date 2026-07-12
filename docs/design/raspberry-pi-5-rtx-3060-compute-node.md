@@ -35,15 +35,15 @@ Current repository state verified before writing:
 
 Verdict: technically plausible for token generation, but too immature for a production node today. Treat the Pi 5 + RTX 3060 as an experimental overflow node or proof of concept until the NVIDIA ARM64 kernel path, cold-boot recovery, thermal/electrical safety, and token.place CUDA capability registration are validated on the exact hardware.
 
-The strongest case for the design is lower whole-system power while preserving nearly desktop RTX 3060 decode speed when the full model and KV cache stay resident in VRAM. The weakest case is operational maturity: BCM2712 CUDA requires an out-of-tree NVIDIA open-kernel-module branch that was still open on 2026-07-12, and the physical PCIe/power topology is much less conventional than an x86 motherboard.
+The strongest case for the design is lower whole-system power while preserving nearly desktop RTX 3060 decode speed when the full model and KV cache stay resident in VRAM, based on community Pi-versus-x86 RTX 3060 measurements ([Pi result](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619397060), [x86 result](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619399420), [power discussion](https://www.jeffgeerling.com/blog/2025/big-gpus-dont-need-big-pcs/)). The weakest case is operational maturity: BCM2712 CUDA requires an out-of-tree NVIDIA open-kernel-module branch, and `NVIDIA/open-gpu-kernel-modules#972` was verified **open**, unmerged, and last updated 2026-04-04 when rechecked on 2026-07-12 ([PR](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/972)); the physical PCIe/power topology is also much less conventional than an x86 motherboard.
 
 A conventional x86 motherboard remains the better choice when production reliability, standard NVIDIA driver support, easier CUDA images/builds, serviceability, multiple PCIe lanes, or lower operator time are more important than shaving tens of watts from the host platform.
 
 | Dimension | Raspberry Pi 5 + RTX 3060 12GB | Reused x86 desktop + RTX 3060 12GB |
 | --- | --- | --- |
-| Decode speed | Expected near desktop if fully offloaded; estimate 45-50 tok/s Qwen3 8B at short/moderate context. | Known community Qwen3 8B Q4_K_M result around 49 tok/s; Llama 2 RTX 3060 comparison showed 61.53 tok/s. |
-| Prompt processing | PCIe x1 and ARM host likely slower; benchmark delta was roughly 10-12% in one RTX 3060 comparison. | Faster host CPU, memory, and PCIe; better for long prompts and reloads. |
-| Idle/load power | Inference comparison reported about 195.4W whole-system draw for Pi configuration. | Same comparison reported about 224W; idle is likely much higher on many desktops. |
+| Decode speed | Expected near desktop if fully offloaded; estimate 45-50 tok/s Qwen3 8B at short/moderate context from Pi RTX 3060 and CUDA comparisons ([RTX 3060 Pi](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619397060), [CUDA comparison](https://github.com/geerlingguy/ai-benchmarks/issues/46#issuecomment-3672239842)). | Known community Qwen3 8B Q4_K_M result around 49 tok/s ([Qiita](https://qiita.com/devgamesan/items/9b774786f653b2b911cc)); Llama 2 RTX 3060 comparison showed 61.53 tok/s ([x86 result](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619399420)). |
+| Prompt processing | PCIe x1 and ARM host likely slower; benchmark delta was roughly 10-12% in one RTX 3060 comparison ([discussion](https://www.jeffgeerling.com/blog/2025/big-gpus-dont-need-big-pcs/)). | Faster host CPU, memory, and PCIe; better for long prompts and reloads. |
+| Idle/load power | Inference comparison reported about 195.4W whole-system draw for Pi configuration ([power discussion](https://www.jeffgeerling.com/blog/2025/big-gpus-dont-need-big-pcs/)). | Same comparison reported about 224W; idle is likely much higher on many desktops ([power discussion](https://www.jeffgeerling.com/blog/2025/big-gpus-dont-need-big-pcs/)). |
 | Setup cost | Low if Pi/GPU are already owned; adapters, PSU, storage, support hardware still add real cost. | Often lowest if an old desktop already has PSU, case, cooling, and PCIe slot. |
 | Driver maturity | Experimental ARM64 CUDA on BCM2712 with patched modules and pinned stack. | Ordinary NVIDIA Linux/Windows CUDA path. |
 | Maintainability | High-maintenance kernel/driver/toolkit pinning; custom mechanical and power validation. | Standard OS updates, easier replacement parts, simpler runbooks. |
@@ -74,13 +74,15 @@ Approximate memory budget:
 
 | Item | Estimate | Basis and caveat |
 | --- | ---: | --- |
-| GGUF weights | about 4.7-5.0GB | Qwen3 8B Q4_K_M community/Hugging Face artifact class; verify exact file size before deployment. |
-| Runtime/CUDA/graph buffers | about 0.8-2.0GB | Workload-dependent; must be measured with `nvidia-smi` and llama.cpp backend logs. |
-| 8K KV cache, f16 K/V | about 1.125GB | 36 layers × 8 KV heads × 128 head dim × K+V × 2 bytes × 8,192 tokens = 1,207,959,552 bytes. |
-| 64K KV cache, f16 K/V | about 9.0GB | Leaves insufficient room for weights and runtime buffers on an RTX 3060 12GB. |
-| 64K KV cache, q8 K/V | about 4.5GB | May fit with weights and buffers, but requires validation on the exact runtime. |
-| 64K KV cache, q4 K/V | about 2.25GB | May fit with weights and buffers, but requires successful warm-load and soak validation. |
-| 8K total, f16 K/V | about 6.6-8.1GB | Estimated from weights, runtime buffers, and KV cache; validate allocator overhead and fragmentation on the exact stack. |
+| GGUF weights | about 4.7-5.0 GiB | Qwen3 8B Q4_K_M community/Hugging Face artifact class ([model card](https://huggingface.co/Qwen/Qwen3-8B-GGUF)); verify exact file size before deployment. |
+| Runtime/CUDA/graph buffers | about 0.8-2.0 GiB | Workload-dependent; must be measured with `nvidia-smi` and llama.cpp backend logs. |
+| 8K KV cache, f16 K/V | about 1.125 GiB | Architecture calculation: 36 layers × 2 K/V tensors × 8 KV heads × 128 dimensions × 2 bytes = **147,456 bytes/token**; × 8,192 tokens = 1,207,959,552 bytes, or 1.125 GiB. |
+| 64K KV cache, f16 K/V | about 9.0 GiB | Same architecture calculation × 65,536 tokens = 9.0 GiB; leaves insufficient room for weights and runtime buffers on an RTX 3060 12GB. |
+| 64K KV cache, q8 K/V | about 4.5 GiB | Half the f16 architecture estimate; may fit with weights and buffers, but requires validation on the exact runtime. |
+| 64K KV cache, q4 K/V | about 2.25 GiB | Quarter the f16 architecture estimate; may fit with weights and buffers, but requires successful warm-load and soak validation. |
+| 8K total, f16 K/V | about 6.6-8.1 GiB | Estimated from 4.7-5.0 GiB weights, 0.8-2.0 GiB runtime/CUDA/graph buffers, and 1.125 GiB KV cache; validate allocator overhead and fragmentation on the exact stack. |
+
+Architecture-based KV-cache sizing above is separate from the current `_qwen_64k_memory_estimate()` diagnostic in `utils/llm/model_manager.py`. That diagnostic conservatively uses 524,288 bytes/token for f16, 262,144 bytes/token for q8, and 131,072 bytes/token for q4; those constants are not derived from the Qwen3 8B dimensions above and produce 32 GiB, 16 GiB, and 8 GiB estimates at 64K. Do not change that runtime code in this design follow-up. Reconciling the conservative diagnostic with measured llama.cpp allocation on the exact stack is future work, and the initial recommendation remains to advertise only `8k-fast`.
 
 Capability registration must prevent the relay from scheduling unsupported context tiers. A Pi node that has only validated `8k-fast` must reject or avoid `64k-full` work even if the model profile lists `64k-full` as a general token.place tier.
 
@@ -88,12 +90,12 @@ Capability registration must prevent the relay from scheduling unsupported conte
 
 | Evidence | Result | Classification |
 | --- | --- | --- |
-| RTX 3060 Llama 2 7B Q4_K_M on Pi CM5 | 60.21 tok/s decode | Community direct measurement; 16GB CM5; Vulkan path. |
-| Matching RTX 3060 Llama 2 7B Q4_K_M on x86 | 61.53 tok/s decode | Community direct measurement; about 2.1% faster than Pi in that decode comparison. |
+| RTX 3060 Llama 2 7B Q4_K_M on Pi CM5 | 60.21 tok/s decode | Community direct measurement; 16GB CM5; Vulkan path ([Pi result](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619397060)). |
+| Matching RTX 3060 Llama 2 7B Q4_K_M on x86 | 61.53 tok/s decode | Community direct measurement; about 2.1% faster than Pi in that decode comparison ([x86 result](https://github.com/geerlingguy/ai-benchmarks/issues/40#issuecomment-3619399420)). |
 | Prompt-processing delta | Pi roughly 10-12% slower | Community comparison; affects long prompts and reload-heavy workloads more than steady decode. |
 | Whole-system inference draw | Pi configuration about 195.4W; desktop about 224W | Community measurement/discussion; not token.place hardware. |
-| Direct CUDA comparison using RTX 2080 Ti | Pi 59.45 tok/s; x86 60.51 tok/s | Community CUDA comparison with a different NVIDIA GPU. |
-| Desktop RTX 3060 Qwen3 8B Q4_K_M | Around 49 tok/s | Separate Qiita community benchmark; not the Pi host. |
+| Direct CUDA comparison using RTX 2080 Ti | Pi 59.45 tok/s; x86 60.51 tok/s | Community CUDA comparison with a different NVIDIA GPU ([ai-benchmarks #46](https://github.com/geerlingguy/ai-benchmarks/issues/46#issuecomment-3672239842)). |
+| Desktop RTX 3060 Qwen3 8B Q4_K_M | Around 49 tok/s | Separate Qiita community benchmark; not the Pi host ([Qiita](https://qiita.com/devgamesan/items/9b774786f653b2b911cc)). |
 | Estimated Pi Qwen3 short/moderate context | About 45-50 tok/s | Extrapolation until measured on proposed node. |
 | Estimated Pi Qwen3 near-filled 8K | About 38-45 tok/s | Extrapolation; KV/cache pressure and prompt length may reduce speed. |
 
@@ -109,7 +111,7 @@ Disclosure and limits:
 
 ### Option A: direct X1010 topology
 
-Topology: Raspberry Pi 5 PCIe FFC to Geekworm/SupTronics X1010 v1.1, open-ended physical x4 slot accepting an x16 GPU, electrical PCIe x1, independently supported RTX 3060, X1010 powered from a native PSU four-pin peripheral/Molex lead, Pi powered through X1010 pogo pins, GPU powered through native PCIe 6+2-pin lead, and a proper permanent ATX PS_ON bridge for AC-restoration behavior.
+Topology: Raspberry Pi 5 PCIe FFC to Geekworm/SupTronics X1010 v1.1 ([wiki](https://wiki.geekworm.com/X1010)), open-ended physical x4 slot accepting an x16 GPU ([open-ended-slot discussion](https://github.com/geerlingguy/raspberry-pi-pcie-devices/issues/613)), electrical PCIe x1, independently supported RTX 3060, X1010 powered from a native PSU four-pin peripheral/Molex lead, Pi powered through X1010 pogo pins, GPU powered through native PCIe 6+2-pin lead, and a proper permanent ATX PS_ON bridge for AC-restoration behavior.
 
 Advantages:
 
@@ -129,7 +131,7 @@ Prototype recommendation: use Option A if the goal is the smallest/cheapest proo
 
 ### Option B: powered OCuLink dock
 
-Topology: Pi PCIe-to-M.2 HAT, M.2 M-key-to-OCuLink adapter, short high-quality OCuLink cable, powered eGPU dock such as JMT or Minisforum DEG1, ATX/SFX PSU supplying slot and supplemental GPU power, and a separate supported Pi power source.
+Topology: Pi PCIe-to-M.2 HAT, M.2 M-key-to-OCuLink adapter, short high-quality OCuLink cable, powered eGPU dock such as Minisforum DEG1 ([listing](https://store.minisforum.com/products/minisforum-egpu-dock)) or JMT, ATX/SFX PSU supplying slot and supplemental GPU power, and a separate supported Pi power source.
 
 Advantages:
 
@@ -152,7 +154,7 @@ Additional topology constraints:
 - The AI HAT+ 2 is not part of this design and should not be proposed on the same lane.
 - PoE+ must not double-power a Pi already powered by X1010 pogo pins.
 - PCIe Gen 2 is the bring-up default.
-- `dtparam=pciex1_gen=3` is optional only after stability testing; Raspberry Pi documents Gen 3 as an unsupported/uncertified setting.
+- `dtparam=pciex1_gen=3` is optional only after stability testing; Raspberry Pi documents Gen 3 as an unsupported/uncertified setting ([documentation](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#pcie-gen-30)).
 
 ## 6. Bill of materials
 
@@ -160,31 +162,31 @@ Prices are volatile and were spot-checked on 2026-07-12. Use current street pric
 
 | Category | Part or example | Required/optional | Qty | Interface/connectors | Power requirement | Approx. current price | Price-check date | Source | Notes and compatibility risks |
 | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- |
-| Host | Raspberry Pi 5 8GB | Required | 1 | 40-pin, USB 3, GbE, PCIe FFC | 5V, high-current; through X1010 pogo pins in Option A or official PSU in Option B | $125 | 2026-07-12 | Raspberry Pi pricing reports | Volatile DRAM pricing; verify authorized-reseller availability. |
-| GPU | Used NVIDIA GeForce RTX 3060 12GB | Required | 1 | PCIe x16 edge, usually 1×8-pin; exact AIB varies | Reference board power around 170W | $245-300 used | 2026-07-12 | BestValueGPU/eBay snapshots | Must be 12GB, not 8GB; inspect fans, connectors, and mining wear. |
-| Direct adapter | Geekworm/SupTronics X1010 v1.1 | Option A required | 1 | Pi PCIe FFC to open-ended x4 slot | Native four-pin peripheral/Molex input; powers Pi via pogo pins | $28-30 | 2026-07-12 | Geekworm/Central Computer listing | Do not load GPU mechanically from PCB; slot-power certification unclear. |
-| OCuLink dock | Minisforum DEG1 or JMT powered dock | Option B required | 1 | OCuLink to powered x16 slot | ATX/SFX PSU | $109-140 | 2026-07-12 | Minisforum listing | Add M.2 HAT, OCuLink adapter, cable; validate sequencing. |
+| Host | Raspberry Pi 5 8GB | Required | 1 | 40-pin, USB 3, GbE, PCIe FFC | 5V, high-current; through X1010 pogo pins in Option A or official PSU in Option B | $175 | 2026-07-12 | [PiShop.us Raspberry Pi 5/8GB](https://www.pishop.us/product/raspberry-pi-5-8gb/) and [PiShop.us boards category](https://www.pishop.us/product-category/raspberry-pi/raspberry-pi-5/raspberry-pi-5-boards/) | Volatile DRAM pricing; PiShop.us listed Raspberry Pi 5/8GB at $175.00 on the recheck date. |
+| GPU | Used NVIDIA GeForce RTX 3060 12GB | Required | 1 | PCIe x16 edge, usually 1×8-pin; exact AIB varies | Reference board power around 170W ([NVIDIA family specs](https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3060-3060ti/)) | $245-300 used | 2026-07-12 | TBD — recheck before purchase | Must be 12GB, not 8GB; inspect fans, connectors, and mining wear. |
+| Direct adapter | Geekworm/SupTronics X1010 v1.1 | Option A required | 1 | Pi PCIe FFC to open-ended x4 slot | Native four-pin peripheral/Molex input; powers Pi via pogo pins | $28-30 | 2026-07-12 | [Geekworm X1010 wiki](https://wiki.geekworm.com/X1010), [Central Computer listing](https://www.centralcomputer.com/geekworm-x1010-pcie-ffc-to-standard-pcie-x4-slot-expansion-board-for-raspberry-pi-5.html) | Do not load GPU mechanically from PCB; slot-power certification unclear. |
+| OCuLink dock | Minisforum DEG1 or JMT powered dock | Option B required | 1 | OCuLink to powered x16 slot | ATX/SFX PSU | $109-140 | 2026-07-12 | [Minisforum DEG1 listing](https://store.minisforum.com/products/minisforum-egpu-dock) | Add M.2 HAT, OCuLink adapter, cable; validate sequencing. |
 | Pi M.2 HAT | PCIe-to-M.2 M-key HAT | Option B required | 1 | Pi FFC to M.2 M-key | Pi-side power only | TBD — recheck before purchase | 2026-07-12 | TBD | Must expose PCIe, not USB. |
 | M.2 to OCuLink | M-key to OCuLink adapter + cable | Option B required | 1 | M.2 M-key, OCuLink | Passive/low power | TBD — recheck before purchase | 2026-07-12 | TBD | Use short, known-good cable; signal quality matters. |
-| PSU | Quality 450-550W ATX/SFX, recommend 550W | Required | 1 | 24-pin ATX, PCIe 6+2, peripheral lead if Option A | AC mains; enough 12V headroom | $60-90 new | 2026-07-12 | Street-price search | Prefer 550W for connector availability and margin. |
-| GPU power cable | Native PCIe lead for exact PSU/card | Required | 1 | 6+2-pin PCIe | Up to card-specific supplemental draw | Included with PSU | 2026-07-12 | PSU vendor | No SATA/Molex-to-GPU adapters; never mix modular cables. |
-| X1010 power lead | Native four-pin peripheral lead | Option A required | 1 | PSU peripheral/Molex to X1010 | Slot/Pi power path | Included with PSU | 2026-07-12 | PSU vendor | Must be native PSU cable, not SATA adapter. |
-| PS_ON bridge | Proper 24-pin ATX jumper/bridge | Required for single-PSU unattended AC restore | 1 | 24-pin ATX | Low-voltage control | $5-10 | 2026-07-12 | Generic street price | Use molded bridge, not a paperclip. |
-| CPU cooling | Raspberry Pi Active Cooler | Required | 1 | Pi fan header | Pi 5V fan | $5-10 | 2026-07-12 | Authorized-reseller class | Preserve airflow in stand. |
-| Storage | USB 3 SSD, 256GB+ | Required | 1 | USB 3 | USB-powered or powered enclosure | $25-50 | 2026-07-12 | Street-price search | Model storage via USB because PCIe lane is GPU. High-endurance microSD is fallback. |
-| Networking | Ethernet cable | Required | 1 | RJ45 GbE | None | $3-10 | 2026-07-12 | Street-price search | Prefer wired networking for unattended node. |
-| Surge/UPS | Surge protector or small UPS | Optional but recommended | 1 | AC | Node load plus margin | $20-100 | 2026-07-12 | Street-price search | UPS improves AC-loss testing/recovery. |
-| GPU support | Bracket/stand/anti-sag support | Required | 1 | Mechanical | None | $10-30 | 2026-07-12 | Street-price search | No load on X1010 slot or Pi PCB. |
-| Fasteners | M2.5/M3 screws, standoffs, heat-set inserts, vibration feet | Required for custom stand | Assorted | Mechanical | None | $10-25 | 2026-07-12 | Street-price search | Exact sizes depend on selected card/adapter. |
-| FFC cable | Short PCIe FFC supplied with adapter | Required | 1 | Pi PCIe FFC | Signal only | Included | 2026-07-12 | X1010 docs/listing | 37mm-class supplied cables constrain stand geometry. |
-| Measurement | Thermal probes or wall-power meter | Optional validation | 1 | Probe/clamp/outlet | Battery/AC | $15-40 | 2026-07-12 | Street-price search | Needed for connector/PCB/PSU-lead validation. |
+| PSU | Quality 450-550W ATX/SFX, recommend 550W | Required | 1 | 24-pin ATX, PCIe 6+2, peripheral lead if Option A | AC mains; enough 12V headroom | $60-90 new | 2026-07-12 | TBD — recheck before purchase | Prefer 550W for connector availability and margin. |
+| GPU power cable | Native PCIe lead for exact PSU/card | Required | 1 | 6+2-pin PCIe | Up to card-specific supplemental draw | Included with PSU | 2026-07-12 | TBD — recheck before purchase | No SATA/Molex-to-GPU adapters; never mix modular cables. |
+| X1010 power lead | Native four-pin peripheral lead | Option A required | 1 | PSU peripheral/Molex to X1010 | Slot/Pi power path | Included with PSU | 2026-07-12 | TBD — recheck before purchase | Must be native PSU cable, not SATA adapter. |
+| PS_ON bridge | Proper 24-pin ATX jumper/bridge | Required for single-PSU unattended AC restore | 1 | 24-pin ATX | Low-voltage control | $5-10 | 2026-07-12 | TBD — recheck before purchase | Use molded bridge, not a paperclip. |
+| CPU cooling | Raspberry Pi Active Cooler | Required | 1 | Pi fan header | Pi 5V fan | $5-10 | 2026-07-12 | TBD — recheck before purchase | Preserve airflow in stand. |
+| Storage | USB 3 SSD, 256GB+ | Required | 1 | USB 3 | USB-powered or powered enclosure | $25-50 | 2026-07-12 | TBD — recheck before purchase | Model storage via USB because PCIe lane is GPU. High-endurance microSD is fallback. |
+| Networking | Ethernet cable | Required | 1 | RJ45 GbE | None | $3-10 | 2026-07-12 | TBD — recheck before purchase | Prefer wired networking for unattended node. |
+| Surge/UPS | Surge protector or small UPS | Optional but recommended | 1 | AC | Node load plus margin | $20-100 | 2026-07-12 | TBD — recheck before purchase | UPS improves AC-loss testing/recovery. |
+| GPU support | Bracket/stand/anti-sag support | Required | 1 | Mechanical | None | $10-30 | 2026-07-12 | TBD — recheck before purchase | No load on X1010 slot or Pi PCB. |
+| Fasteners | M2.5/M3 screws, standoffs, heat-set inserts, vibration feet | Required for custom stand | Assorted | Mechanical | None | $10-25 | 2026-07-12 | TBD — recheck before purchase | Exact sizes depend on selected card/adapter. |
+| FFC cable | Short PCIe FFC supplied with adapter | Required | 1 | Pi PCIe FFC | Signal only | Included | 2026-07-12 | [Geekworm X1010 wiki](https://wiki.geekworm.com/X1010), [Central Computer listing](https://www.centralcomputer.com/geekworm-x1010-pcie-ffc-to-standard-pcie-x4-slot-expansion-board-for-raspberry-pi-5.html) | 37mm-class supplied cables constrain stand geometry. |
+| Measurement | Thermal probes or wall-power meter | Optional validation | 1 | Probe/clamp/outlet | Battery/AC | $15-40 | 2026-07-12 | TBD — recheck before purchase | Needed for connector/PCB/PSU-lead validation. |
 
 Estimated subtotals:
 
 - Required Option A subtotal excluding already-owned Pi/GPU: about $156-245 (X1010, PSU, PS_ON bridge, cooler, USB SSD, Ethernet, support hardware, fasteners; excluding optional UPS/meter).
-- Estimated Option A total including representative used RTX 3060 and Pi: about $526-670.
+- Estimated Option A total including representative used RTX 3060 and $175 Pi: about $576-720.
 - OCuLink alternative subtotal excluding Pi/GPU: about $275-415 plus any unverified M.2/OCuLink adapter prices; recheck before purchase.
-- Volatile/TBD items: Pi 5 DRAM-linked pricing, used RTX 3060 condition/market price, M.2-to-OCuLink chain, exact AIB power connector requirements.
+- Volatile/TBD items: used RTX 3060 condition/market price, M.2-to-OCuLink chain, exact AIB power connector requirements.
 
 ## 7. Electrical and safety design
 
@@ -221,7 +223,7 @@ AC-loss recovery design:
 2. A proper permanent PS_ON bridge starts the PSU when AC returns.
 3. Pi firmware boots automatically.
 4. X1010 `POWER_OFF_ON_HALT=1` and `PSU_MAX_CURRENT=5000` settings should be evaluated against current X1010 documentation before use.
-5. For a two-supply OCuLink topology, GPU-before-Pi sequencing must be tested rather than assumed.
+5. For a two-supply OCuLink topology, GPU-before-Pi sequencing must be tested rather than assumed: qualify both simultaneous AC restoration and the selected GPU-before-Pi sequence, and accept unattended use only if the GPU enumerates all 12GB and registers successfully on every qualified cold cycle without recurring PCIe Advanced Error Reporting/NVRM errors or back-powering.
 
 ## 8. Potential 3D-printed stand
 
@@ -291,7 +293,7 @@ Why upstream support is problematic on BCM2712:
 
 - BCM2712 lacks normal I/O cache coherency expected by typical desktop/server PCIe GPU platforms.
 - Write-combined MMIO/VRAM BAR behavior needs non-standard handling.
-- The needed NVIDIA open-kernel-module PR, `NVIDIA/open-gpu-kernel-modules#972`, was still **open** on 2026-07-12 and targets non-standard Arm SoC PCIe integrations.
+- The needed NVIDIA open-kernel-module PR, [`NVIDIA/open-gpu-kernel-modules#972`](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/972), was verified **open**, unmerged, and last updated 2026-04-04 when rechecked on 2026-07-12; it targets non-standard Arm SoC PCIe integrations.
 - Kernel modules may need rebuilding after kernel or driver updates.
 - A kernel, driver, firmware, and CUDA toolkit update can break enumeration or CUDA even if `lspci` still sees the card.
 - The complete host stack should be pinned and backed up as an image.
@@ -317,7 +319,7 @@ Container responsibilities:
 - Model configuration and read-only bind-mounted GGUF.
 - Relay registration/polling, health/readiness checks, privacy-safe logs.
 
-Official NVIDIA CUDA images are available for ARM64, and NVIDIA Container Toolkit documents Linux ARM64/aarch64 support. However, an official prebuilt ARM64 CUDA wheel for the pinned `llama-cpp-python==0.3.32` should not be assumed. The upstream ARM CUDA-wheel PR `abetlen/llama-cpp-python#2039` was still **open** on 2026-07-12. The likely implementation path is a source build with the pinned version and verified flags such as `CMAKE_ARGS=-DGGML_CUDA=on FORCE_CMAKE=1`; do not present additional CMake flags as guaranteed until tested.
+Official NVIDIA CUDA images are available for ARM64 ([CUDA images](https://hub.docker.com/r/nvidia/cuda)), and NVIDIA Container Toolkit documents Linux ARM64/aarch64 support ([supported platforms](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/supported-platforms.html)). However, an official prebuilt ARM64 CUDA wheel for the pinned `llama_cpp_python==0.3.32` should not be assumed. The upstream ARM CUDA-wheel PR [`abetlen/llama-cpp-python#2039`](https://github.com/abetlen/llama-cpp-python/pull/2039) was verified **open**, unmerged, and last updated 2025-07-18 when rechecked on 2026-07-12. The likely implementation path is a source build with the pinned version and verified flags such as `CMAKE_ARGS=-DGGML_CUDA=on FORCE_CMAKE=1`; do not present additional CMake flags as guaranteed until tested.
 
 Future change matrix:
 
@@ -381,6 +383,7 @@ Operational requirements:
 - Registration cleanup: unregister or stop polling when readiness is lost.
 - Kernel/driver update policy: pin known-good stack; update only through staged image rebuild and cold-cycle requalification.
 - Boot-media recovery: keep a known-good Pi OS image and model/config backup; reflash rather than debug a corrupted SD/SSD in place.
+- Host watchdog bound: allow at most two automatic host reboots in a rolling 30-minute window; after that, leave the node offline/unregistered in a terminal state requiring operator intervention. Reset the reboot budget only after 24 hours of healthy operation.
 
 ## 12. Validation and acceptance plan
 
@@ -409,7 +412,7 @@ Operational requirements:
 
 ### Resilience
 
-- Run at least 20-50 cold AC-loss recovery cycles.
+- Run at least 20-50 cold AC-loss recovery cycles, including Option B two-supply tests for simultaneous AC restoration and the selected GPU-before-Pi sequence; every qualified cold cycle must enumerate all 12GB, register successfully, avoid recurring PCIe Advanced Error Reporting/NVRM errors, and show no back-powering.
 - Repeat Docker restarts and host reboots.
 - Test Gen 3 only after stable Gen 2 baseline.
 - Run sustained inference/thermal soak.
@@ -430,7 +433,7 @@ Go/no-go criteria:
 
 | Risk | Likelihood | Impact | Mitigation | Residual risk |
 | --- | --- | --- | --- | --- |
-| Unmerged/out-of-tree NVIDIA driver patch | High | High | Pin branch/driver/kernel; image backup; monitor NVIDIA/open-gpu-kernel-modules PR #972. | High until upstreamed and packaged. |
+| Unmerged/out-of-tree NVIDIA driver patch | High | High | Pin branch/driver/kernel; image backup; monitor [`NVIDIA/open-gpu-kernel-modules#972`](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/972), verified open/unmerged on 2026-07-12. | High until upstreamed and packaged. |
 | Kernel update breakage | High | High | Hold kernel/driver packages; staged updates only. | Medium-high. |
 | ARM64 CUDA dependency builds | Medium | High | Native ARM64 build cache; source-build pin; avoid QEMU release path initially. | Medium. |
 | PCIe Gen 3 signal integrity | Medium | Medium | Bring up Gen 2; Gen 3 only after soak. | Medium. |
@@ -467,11 +470,11 @@ Staged future implementation sequence:
 - Direct Pi-versus-x86 CUDA comparison: [ai-benchmarks #46](https://github.com/geerlingguy/ai-benchmarks/issues/46#issuecomment-3672239842).
 - NVIDIA ARM install walkthrough: [Jeff Geerling, NVIDIA graphics cards work on Pi 5 and Rockchip](https://www.jeffgeerling.com/blog/2025/nvidia-graphics-cards-work-on-pi-5-and-rockchip/).
 - Performance/power discussion: [Jeff Geerling, Big GPUs don't need big PCs](https://www.jeffgeerling.com/blog/2025/big-gpus-dont-need-big-pcs/).
-- Required open-kernel-module work, open on 2026-07-12: [NVIDIA/open-gpu-kernel-modules #972](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/972).
+- Required open-kernel-module work, verified open/unmerged on 2026-07-12 and last updated 2026-04-04: [NVIDIA/open-gpu-kernel-modules#972](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/972).
 - Raspberry Pi PCIe Gen 3 warning/configuration: [Raspberry Pi PCIe Gen 3 documentation](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#pcie-gen-30).
 - X1010 docs/listing/discussion: [Geekworm X1010 wiki](https://wiki.geekworm.com/X1010), [Central Computer listing](https://www.centralcomputer.com/geekworm-x1010-pcie-ffc-to-standard-pcie-x4-slot-expansion-board-for-raspberry-pi-5.html), [open-ended-slot discussion](https://github.com/geerlingguy/raspberry-pi-pcie-devices/issues/613).
 - RTX 3060 specifications: [NVIDIA RTX 3060 family](https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3060-3060ti/).
 - Container support/images: [NVIDIA Container Toolkit supported platforms](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/supported-platforms.html), [NVIDIA CUDA images](https://hub.docker.com/r/nvidia/cuda).
-- ARM64 CUDA wheel work, open on 2026-07-12: [llama-cpp-python #2039](https://github.com/abetlen/llama-cpp-python/pull/2039).
+- ARM64 CUDA wheel work, verified open/unmerged on 2026-07-12 and last updated 2025-07-18: [abetlen/llama-cpp-python#2039](https://github.com/abetlen/llama-cpp-python/pull/2039).
 - Qwen3 GGUF card: [Qwen/Qwen3-8B-GGUF](https://huggingface.co/Qwen/Qwen3-8B-GGUF).
 - Community RTX 3060 Qwen3 result: [Qiita community benchmark](https://qiita.com/devgamesan/items/9b774786f653b2b911cc).

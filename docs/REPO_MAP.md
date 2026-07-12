@@ -9,6 +9,8 @@ near-term, and target architecture.
   - Canonical 7-step plan and phase exit criteria.
 - [Tauri desktop design](design/tauri_desktop_client.md)
   - Forward-looking desktop strategy; desktop-tauri is currently MVP, not parity.
+- [Raspberry Pi 5 + RTX 3060 compute-node design](design/raspberry-pi-5-rtx-3060-compute-node.md)
+  - Experimental headless ARM64 CUDA compute-node proposal; design-only and unimplemented.
 - [Architecture](ARCHITECTURE.md)
   - Current and target architecture boundaries.
 - [Relay on sugarkube onboarding](relay_sugarkube_onboarding.md)

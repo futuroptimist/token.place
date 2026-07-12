@@ -254,7 +254,11 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
             let mut sanitized = serde_json::Map::new();
             for (key, value) in map {
                 let normalized = key.to_ascii_lowercase();
-                if normalized.contains("api_key")
+                if let Some(safe_token_metadata) =
+                    sanitize_safe_token_metadata_value(&normalized, value)
+                {
+                    sanitized.insert(key.clone(), safe_token_metadata);
+                } else if normalized.contains("api_key")
                     || normalized.contains("token")
                     || normalized.contains("prompt")
                     || normalized.contains("output")
@@ -262,7 +266,7 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
                     || normalized.contains("private_key")
                     || normalized.contains("payload")
                 {
-                    sanitized.insert(key.clone(), serde_json::Value::String("<redacted>".into()));
+                    sanitized.insert(key.clone(), redacted_json_value());
                 } else {
                     sanitized.insert(key.clone(), sanitize_operator_json_value(value));
                 }
@@ -282,6 +286,138 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
         _ => value.clone(),
     }
 }
+
+fn redacted_json_value() -> serde_json::Value {
+    serde_json::Value::String("<redacted>".into())
+}
+
+fn sanitize_safe_token_metadata_value(
+    normalized_key: &str,
+    value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let valid = if SAFE_TOKEN_INTEGER_OR_NULL_KEYS.contains(&normalized_key) {
+        value.is_null() || value.as_u64().is_some()
+    } else if SAFE_TOKEN_BOOL_OR_NULL_KEYS.contains(&normalized_key) {
+        value.is_null() || value.as_bool().is_some()
+    } else if SAFE_TOKEN_IDENTIFIER_OR_NULL_KEYS.contains(&normalized_key) {
+        value.is_null() || value.as_str().is_some_and(is_bounded_safe_token_identifier)
+    } else if SAFE_TOKEN_CSV_IDENTIFIER_OR_NULL_KEYS.contains(&normalized_key) {
+        value.is_null()
+            || value
+                .as_str()
+                .is_some_and(is_bounded_safe_token_identifier_csv)
+    } else if SAFE_TOKEN_CSV_INTEGER_OR_NULL_KEYS.contains(&normalized_key) {
+        value.is_null()
+            || value
+                .as_str()
+                .is_some_and(is_bounded_safe_token_integer_csv)
+    } else {
+        return None;
+    };
+
+    Some(if valid {
+        value.clone()
+    } else {
+        redacted_json_value()
+    })
+}
+
+fn is_bounded_safe_token_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'.' | b':' | b'/' | b'@' | b'+' | b'-')
+        })
+}
+
+fn is_bounded_safe_token_identifier_csv(value: &str) -> bool {
+    validate_bounded_csv(value, is_bounded_safe_token_identifier)
+}
+
+fn is_bounded_safe_token_integer_csv(value: &str) -> bool {
+    validate_bounded_csv(value, |entry| {
+        !entry.is_empty()
+            && entry.bytes().all(|byte| byte.is_ascii_digit())
+            && entry.parse::<u64>().is_ok()
+    })
+}
+
+fn validate_bounded_csv(value: &str, entry_validator: impl Fn(&str) -> bool) -> bool {
+    if value.len() > 256 {
+        return false;
+    }
+    let mut count = 0usize;
+    for entry in value.split(',') {
+        if entry.is_empty() || !entry_validator(entry) {
+            return false;
+        }
+        count += 1;
+        if count > 64 {
+            return false;
+        }
+    }
+    count > 0
+}
+
+const SAFE_TOKEN_INTEGER_OR_NULL_KEYS: &[&str] = &[
+    "context_window_tokens",
+    "prompt_tokens",
+    "requested_output_tokens",
+    "required_total_tokens",
+    "max_tokens",
+    "native_context_tokens",
+    "maximum_validated_context_tokens",
+    "requested_context_tokens",
+    "original_context_tokens",
+    "context_size_tokens",
+    "qwen_yarn_requested_context_tokens",
+    "qwen_yarn_original_context_tokens",
+    "plain_completion_prompt_token_count",
+    "plain_completion_prompt_tokenization_variant_count",
+    "plain_completion_prompt_tokenization_selected_token_count",
+    "api_v1_readiness_context_window_tokens",
+    "api_v1_readiness_prompt_tokens",
+    "api_v1_readiness_yarn_requested_context_tokens",
+    "api_v1_readiness_yarn_original_context_tokens",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_token_count",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count",
+];
+
+const SAFE_TOKEN_BOOL_OR_NULL_KEYS: &[&str] = &[
+    "plain_completion_accepts_max_tokens_kwarg",
+    "plain_completion_prompt_tokenization_special",
+    "plain_completion_prompt_tokenization_attempted",
+    "plain_completion_prompt_tokenization_selected_special",
+    "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_attempted",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special",
+];
+
+const SAFE_TOKEN_IDENTIFIER_OR_NULL_KEYS: &[&str] = &[
+    "plain_completion_prompt_tokenization_error_category",
+    "plain_completion_prompt_tokenization_method",
+    "plain_completion_prompt_tokenization_selected_variant",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_error_category",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant",
+];
+
+const SAFE_TOKEN_CSV_IDENTIFIER_OR_NULL_KEYS: &[&str] = &[
+    "plain_completion_prompt_tokenization_variant_ids",
+    "plain_completion_prompt_tokenization_special_values",
+    "plain_completion_attempt_tokenization_variants",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values",
+    "api_v1_readiness_completion_smoke_plain_completion_attempt_tokenization_variants",
+];
+
+const SAFE_TOKEN_CSV_INTEGER_OR_NULL_KEYS: &[&str] = &[
+    "plain_completion_prompt_tokenization_token_counts",
+    "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts",
+];
 
 fn sanitize_url_display(value: &str) -> String {
     let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
@@ -492,6 +628,181 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_preserves_safe_token_metadata() {
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "context_window_tokens": 65536,
+                "api_v1_readiness_yarn_requested_context_tokens": 65536,
+                "api_v1_readiness_yarn_original_context_tokens": 32768,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_token_count": 50,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 28,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count": 2,
+                "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": false,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "llama.tokenize",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tokenize_add_bos_false_special_false",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": "tokenize_add_bos_false_special_false,tokenize_add_bos_false_special_true",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts": "50,28",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,true",
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert_eq!(payload["context_window_tokens"].as_u64(), Some(65536));
+        assert_eq!(
+            payload["api_v1_readiness_yarn_requested_context_tokens"].as_u64(),
+            Some(65536)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_yarn_original_context_tokens"].as_u64(),
+            Some(32768)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_token_count"]
+                .as_u64(),
+            Some(50)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count"].as_u64(),
+            Some(28)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg"]
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload
+                ["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method"]
+                .as_str(),
+            Some("llama.tokenize")
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant"].as_str(),
+            Some("tokenize_add_bos_false_special_false")
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids"].as_str(),
+            Some("tokenize_add_bos_false_special_false,tokenize_add_bos_false_special_true")
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts"].as_str(),
+            Some("50,28")
+        );
+        assert_eq!(
+            payload["api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values"].as_str(),
+            Some("false,true")
+        );
+        assert!(!sanitized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_real_token_material() {
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "token": "SECRET_A",
+                "tokens": ["SECRET_B"],
+                "token_ids": [1, 2, 3],
+                "prompt_token_ids": ["SECRET_C"],
+                "access_token": "SECRET_D",
+                "refresh_token": {"nested": "SECRET_E"},
+                "cancel_token": 42,
+                "session_token": "SECRET_F",
+                "api_token": "SECRET_G"
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        for key in [
+            "token",
+            "tokens",
+            "token_ids",
+            "prompt_token_ids",
+            "access_token",
+            "refresh_token",
+            "cancel_token",
+            "session_token",
+            "api_token",
+        ] {
+            assert_eq!(payload[key].as_str(), Some("<redacted>"), "{key}");
+        }
+        assert!(!sanitized.contains("SECRET_"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_unsafe_safe_token_metadata_values() {
+        let many_entries = (0..65)
+            .map(|idx| format!("id{idx}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "context_window_tokens": "SECRET",
+                "api_v1_readiness_yarn_requested_context_tokens": -1,
+                "api_v1_readiness_yarn_original_context_tokens": 32768.5,
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": [28],
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_token_counts": "50,text",
+                "plain_completion_prompt_tokenization_method": "has spaces",
+                "plain_completion_prompt_tokenization_error_category": "has\"quote",
+                "plain_completion_prompt_tokenization_selected_variant": "has\\backslash",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "bad\u{0001}control",
+                "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": many_entries,
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+        let object = payload.as_object().expect("object");
+        for (key, value) in object {
+            assert_eq!(value.as_str(), Some("<redacted>"), "{key}");
+        }
+        assert!(!sanitized.contains("SECRET"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_preserves_nested_safe_metadata_and_redacts_nested_tokens()
+    {
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "outer": {
+                    "context_window_tokens": 65536,
+                    "token": "SECRET_A",
+                    "items": [
+                        {"api_v1_readiness_yarn_original_context_tokens": 32768},
+                        {"prompt_token_ids": ["SECRET_B"]}
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert_eq!(
+            payload["outer"]["context_window_tokens"].as_u64(),
+            Some(65536)
+        );
+        assert_eq!(payload["outer"]["token"].as_str(), Some("<redacted>"));
+        assert_eq!(
+            payload["outer"]["items"][0]["api_v1_readiness_yarn_original_context_tokens"].as_u64(),
+            Some(32768)
+        );
+        assert_eq!(
+            payload["outer"]["items"][1]["prompt_token_ids"].as_str(),
+            Some("<redacted>")
+        );
+        assert!(!sanitized.contains("SECRET_"));
     }
 
     #[test]

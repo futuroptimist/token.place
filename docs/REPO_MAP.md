@@ -13,6 +13,8 @@ near-term, and target architecture.
   - Current and target architecture boundaries.
 - [Relay on sugarkube onboarding](relay_sugarkube_onboarding.md)
   - Practical relay deployment guidance and links to environment runbooks.
+- [Raspberry Pi 5 + RTX 3060 compute-node design](design/raspberry-pi-5-rtx-3060-compute-node.md)
+  - Experimental docs-only proposal for a headless ARM64 CUDA overflow compute node; not a relay deployment plan.
 
 ## Applications
 

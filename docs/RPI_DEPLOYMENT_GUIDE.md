@@ -4,6 +4,8 @@ This guide combines the runbook, k3s cluster instructions and bill of materials 
 It documents how we built a three-node Raspberry Pi 5 cluster for token.place
  and captures some lessons learned along the way.
 
+> Looking for the experimental GPU compute-node concept instead of the existing Pi relay/cluster runbook? See [Raspberry Pi 5 + RTX 3060 compute-node design](design/raspberry-pi-5-rtx-3060-compute-node.md).
+
 ## ⚡ Quick-Start (Zero-touch Image)
 
 Download `token-place-lite.img.xz` from the [latest GitHub Release](https://github.com/futuroptimist/token.place/releases/latest) and flash it with Raspberry Pi Imager:

@@ -254,8 +254,7 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
             let mut sanitized = serde_json::Map::new();
             for (key, value) in map {
                 let normalized = key.to_ascii_lowercase();
-                if let Some(safe_token_metadata) = sanitize_safe_token_metadata(&normalized, value)
-                {
+                if let Some(safe_token_metadata) = sanitize_safe_token_metadata(key, value) {
                     sanitized.insert(key.clone(), safe_token_metadata);
                 } else if normalized.contains("api_key")
                     || normalized.contains("token")
@@ -411,91 +410,49 @@ fn is_safe_token_csv_u64_or_null_key(key: &str) -> bool {
     )
 }
 
-fn is_safe_token_identifier_value(key: &str, value: &str) -> bool {
-    match plain_completion_tokenization_metadata_key(key) {
-        Some("plain_completion_prompt_tokenization_error_category") => {
-            is_safe_tokenization_error_category(value)
-        }
-        Some("plain_completion_prompt_tokenization_method") => {
-            matches!(value, "" | "llama.tokenize")
-        }
-        Some("plain_completion_prompt_tokenization_selected_variant") => {
-            is_safe_tokenization_variant_id(value) || value.is_empty()
-        }
-        _ => false,
-    }
+fn is_safe_token_identifier_value(_key: &str, value: &str) -> bool {
+    is_bounded_token_identifier(value)
 }
 
-fn is_safe_token_csv_identifier_value(key: &str, value: &str) -> bool {
-    match plain_completion_tokenization_metadata_key(key) {
-        Some("plain_completion_prompt_tokenization_variant_ids")
-        | Some("plain_completion_attempt_tokenization_variants") => {
-            is_safe_tokenization_variant_csv(value)
-        }
-        Some("plain_completion_prompt_tokenization_special_values") => {
-            is_safe_tokenization_special_value_csv(value)
-        }
-        _ => false,
-    }
+fn is_safe_token_csv_identifier_value(_key: &str, value: &str) -> bool {
+    is_bounded_token_identifier_csv(value)
 }
 
-fn plain_completion_tokenization_metadata_key(key: &str) -> Option<&str> {
-    key.strip_prefix("api_v1_readiness_completion_smoke_")
-        .or(Some(key))
-}
-
-fn is_safe_tokenization_error_category(value: &str) -> bool {
-    matches!(
-        value,
-        "" | "context_length_exceeded"
-            | "context_window_exceeded"
-            | "tokenizer_unavailable"
-            | "method_shape"
-            | "tokenizer_special_rejected"
-            | "token_overflow"
-            | "prompt_tokenization_failure"
-            | "prompt_eval_failure"
-            | "prompt_eval_decode_failure"
-            | "prompt_eval_invalid_batch"
-            | "backend_allocation_failure"
-            | "backend_graph_compute_failure"
-            | "metal_graph_compute_failure"
-            | "kv_slot_unavailable"
-            | "decode_aborted"
-            | "backend_decode_failure"
-            | "prompt_eval_backend_failure"
-            | "prompt_eval_invalid_token_failure"
-            | "prompt_eval_state_failure"
-            | "prompt_eval_context_failure"
-            | "sampling_failure"
-    )
-}
-
-fn is_safe_tokenization_variant_id(value: &str) -> bool {
-    matches!(
-        value,
-        "tokenize_add_bos_false_special_false"
-            | "tokenize_add_bos_false_no_special"
-            | "tokenize_add_bos_false_special_true"
-    )
-}
-
-fn is_safe_tokenization_variant_csv(value: &str) -> bool {
-    value.len() <= 256 && validate_bounded_csv(value, is_safe_tokenization_variant_id)
-}
-
-fn is_safe_tokenization_special_value_csv(value: &str) -> bool {
+fn is_bounded_token_identifier(value: &str) -> bool {
     value.len() <= 256
-        && validate_bounded_csv(value, |entry| matches!(entry, "false" | "none" | "true"))
+        && value
+            .chars()
+            .all(|ch| !ch.is_control() && ch != ',' && ch != '"' && ch != '\\')
+}
+
+fn is_bounded_token_identifier_csv(value: &str) -> bool {
+    value.len() <= 256 && validate_bounded_identifier_csv(value, is_bounded_token_identifier)
 }
 
 fn is_bounded_token_csv_u64s(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
     value.len() <= 256
         && validate_bounded_csv(value, |entry| {
             !entry.is_empty()
                 && entry.bytes().all(|byte| byte.is_ascii_digit())
                 && entry.parse::<u64>().is_ok()
         })
+}
+
+fn validate_bounded_identifier_csv(value: &str, validate_entry: impl Fn(&str) -> bool) -> bool {
+    let mut count = 0usize;
+    for entry in value.split(',').filter(|entry| !entry.is_empty()) {
+        if !validate_entry(entry) {
+            return false;
+        }
+        count += 1;
+        if count > 64 {
+            return false;
+        }
+    }
+    true
 }
 
 fn validate_bounded_csv(value: &str, validate_entry: impl Fn(&str) -> bool) -> bool {
@@ -763,6 +720,122 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_operator_diagnostic_line_accepts_empty_and_sparse_safe_token_metadata() {
+        let sanitized = sanitize_operator_diagnostic_line(&serde_json::json!({
+            "plain_completion_prompt_tokenization_method": "",
+            "plain_completion_prompt_tokenization_selected_variant": "",
+            "plain_completion_prompt_tokenization_variant_ids": "",
+            "plain_completion_prompt_tokenization_special_values": ",false,,true,",
+            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,,tokenize_add_bos_false_special_true",
+            "plain_completion_prompt_tokenization_token_counts": "",
+        }).to_string());
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_method"].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_selected_variant"].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_variant_ids"].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_special_values"].as_str(),
+            Some(",false,,true,")
+        );
+        assert_eq!(
+            payload["plain_completion_attempt_tokenization_variants"].as_str(),
+            Some("tokenize_add_bos_false_special_false,,tokenize_add_bos_false_special_true")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_token_counts"].as_str(),
+            Some("")
+        );
+        assert!(!sanitized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_rejects_sparse_u64_csv_and_mixed_case_safe_keys() {
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "plain_completion_prompt_tokenization_token_counts": "50,,28",
+                "Context_Window_Tokens": 65536,
+                "Plain_Completion_Prompt_Tokenization_Method": "llama.tokenize",
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_token_counts"].as_str(),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload["Context_Window_Tokens"].as_str(),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload["Plain_Completion_Prompt_Tokenization_Method"].as_str(),
+            Some("<redacted>")
+        );
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_sanitizes_allowlisted_identifier_strings() {
+        let sanitized = sanitize_operator_diagnostic_line(&serde_json::json!({
+            "plain_completion_prompt_tokenization_method": "https://user:pass@example.com/private/model.gguf?token=secret",
+            "plain_completion_prompt_tokenization_selected_variant": "/home/alice/private/model.gguf",
+            "plain_completion_prompt_tokenization_variant_ids": "file:///Users/alice/private/model.gguf",
+            "plain_completion_prompt_tokenization_token_counts": "50,28",
+        }).to_string());
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_method"].as_str(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_selected_variant"].as_str(),
+            Some("<path:model.gguf>")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_variant_ids"].as_str(),
+            Some("<path:model.gguf>")
+        );
+        assert_eq!(
+            payload["plain_completion_prompt_tokenization_token_counts"].as_str(),
+            Some("50,28")
+        );
+        assert!(!sanitized.contains("user:pass"));
+        assert!(!sanitized.contains("/private/"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_preserves_null_for_safe_token_metadata_classes() {
+        let sanitized = sanitize_operator_diagnostic_line(
+            &serde_json::json!({
+                "context_window_tokens": null,
+                "plain_completion_accepts_max_tokens_kwarg": null,
+                "plain_completion_prompt_tokenization_method": null,
+                "plain_completion_prompt_tokenization_variant_ids": null,
+                "plain_completion_prompt_tokenization_token_counts": null,
+            })
+            .to_string(),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
+
+        assert!(payload["context_window_tokens"].is_null());
+        assert!(payload["plain_completion_accepts_max_tokens_kwarg"].is_null());
+        assert!(payload["plain_completion_prompt_tokenization_method"].is_null());
+        assert!(payload["plain_completion_prompt_tokenization_variant_ids"].is_null());
+        assert!(payload["plain_completion_prompt_tokenization_token_counts"].is_null());
+    }
+
+    #[test]
     fn sanitize_operator_diagnostic_line_redacts_real_token_material() {
         let sanitized = sanitize_operator_diagnostic_line(
             &serde_json::json!({
@@ -813,9 +886,9 @@ mod tests {
             "plain_completion_prompt_tokenization_error_category": "bad\\slash",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_method": "bad\u{0001}control",
             "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_variant_ids": too_many_entries,
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "tok_abc123",
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,tok_abc123",
-            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,tok_abc123",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_variant": "bad,comma",
+            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_special_values": "false,bad\\slash",
+            "plain_completion_attempt_tokenization_variants": "tokenize_add_bos_false_special_false,bad\"quote",
         }).to_string());
         let payload: serde_json::Value = serde_json::from_str(&sanitized).expect("json");
 
@@ -823,7 +896,6 @@ mod tests {
             assert_eq!(value.as_str(), Some("<redacted>"));
         }
         assert!(!sanitized.contains("SECRET"));
-        assert!(!sanitized.contains("tok_abc123"));
     }
 
     #[test]

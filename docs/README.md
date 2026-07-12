@@ -14,7 +14,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
   - Also see: [STREAMING_IMPLEMENTATION_GUIDE.md](STREAMING_IMPLEMENTATION_GUIDE.md),
     [CROSS_PLATFORM.md](CROSS_PLATFORM.md),
     [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md),
-    [design/tauri_desktop_client.md](design/tauri_desktop_client.md) (forward-looking desktop direction; `desktop/` is a deprecated legacy Electron prototype and desktop-tauri is still MVP)
+    [design/tauri_desktop_client.md](design/tauri_desktop_client.md) (forward-looking desktop direction; `desktop/` is a deprecated legacy Electron prototype and desktop-tauri is still MVP),
+    [design/raspberry-pi-5-rtx-3060-compute-node.md](design/raspberry-pi-5-rtx-3060-compute-node.md) (experimental docs-only Pi 5 + RTX 3060 compute-node proposal)
 - **Run or deploy the services**
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),

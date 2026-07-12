@@ -393,6 +393,161 @@ def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkey
         after_completed = 0.0
     assert after_completed == before_completed
 
+
+def _outcome_value(client, outcome: str) -> float:
+    return _metric_value(
+        _metric_body(client),
+        "tokenplace_relay_request_outcomes_total",
+        f'{{outcome="{outcome}"}}',
+    )
+
+
+def test_canonical_http_method_label_is_bounded(relay_client) -> None:
+    """Canonical HTTP metrics collapse caller-controlled methods into a fixed enum."""
+
+    before = _metric_body(relay_client)
+    try:
+        before_other = _metric_value(
+            before,
+            "tokenplace_http_requests_total",
+            '{method="other",outcome="failed",provider_mode="relay",route="other",status_class="4xx"}',
+        )
+    except AssertionError:
+        before_other = 0.0
+
+    for idx in range(20):
+        response = relay_client.open(f"/method-sensitive-{idx}", method=f"CUSTOM{idx}")
+        assert response.status_code == 404
+
+    body = _metric_body(relay_client)
+    assert (
+        _metric_value(
+            body,
+            "tokenplace_http_requests_total",
+            '{method="other",outcome="failed",provider_mode="relay",route="other",status_class="4xx"}',
+        )
+        == before_other + 20
+    )
+    canonical_method_lines = [
+        line
+        for line in body.splitlines()
+        if line.startswith("tokenplace_http_requests_total{")
+    ]
+    for idx in range(20):
+        assert f"CUSTOM{idx}" not in "\n".join(canonical_method_lines)
+
+
+def test_unknown_terminal_attempts_do_not_increment_outcomes(relay_client) -> None:
+    """Orphan cancellation and late/orphan responses are ignored for terminal outcomes."""
+
+    before = {outcome: _outcome_value(relay_client, outcome) for outcome in ("completed", "cancelled")}
+
+    relay_module._cancel_api_v1_request(
+        "client-missing",
+        "request-missing",
+        status="cancelled",
+        reason="requester_cancelled",
+    )
+    orphan_response = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-missing",
+            "request_id": "request-missing",
+            "ciphertext": "sealed-response",
+            "cipherkey": "sealed-key",
+            "iv": "sealed-iv",
+            "protocol": "e2ee_v1",
+        },
+    )
+
+    assert orphan_response.status_code == 200
+    assert _outcome_value(relay_client, "cancelled") == before["cancelled"]
+    assert _outcome_value(relay_client, "completed") == before["completed"]
+
+
+def test_node_stale_registered_then_evicted_and_expired_in_flight_excluded(relay_client) -> None:
+    """Gauge collection reports stale registered nodes and skips expired in-flight entries without mutation."""
+
+    before_evictions = _metric_value(
+        _metric_body(relay_client),
+        "tokenplace_compute_node_evictions_total",
+        '{reason="stale_lease"}',
+    )
+    _register_node(relay_client)
+    stale_payload = known_servers["server-key"]
+    stale_payload["last_ping"] = datetime.now() - timedelta(seconds=120)
+    stale_payload["api_v1_in_flight_requests"] = {
+        "expired-in-flight": {
+            "client_public_key": "client-key",
+            "started_at_monotonic": time.monotonic() - 10,
+            "expires_at": time.monotonic() - 1,
+        }
+    }
+
+    body = _metric_body(relay_client)
+    assert _metric_value(body, "tokenplace_compute_nodes_registered") == 1
+    assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+    assert _metric_value(body, "tokenplace_relay_in_flight_requests") == 0
+    assert "expired-in-flight" in stale_payload["api_v1_in_flight_requests"]
+
+    relay_client.get("/healthz")
+    body = _metric_body(relay_client)
+    assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
+    assert (
+        _metric_value(body, "tokenplace_compute_node_evictions_total", '{reason="stale_lease"}')
+        == before_evictions + 1
+    )
+
+
+def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, monkeypatch) -> None:
+    """Metrics failure paths log fixed reasons without exception text or tracebacks."""
+
+    secret = "secret-bearing-exception-value"
+
+    def fail_update_runtime_gauges() -> None:
+        raise RuntimeError(secret)
+
+    log_records = []
+
+    def spy_error(message, *args, **kwargs):
+        log_records.append({"message": message, **kwargs.get("extra", {})})
+
+    monkeypatch.setattr(relay_module, "_update_runtime_gauges", fail_update_runtime_gauges)
+    monkeypatch.setattr(relay_module.LOGGER, "error", spy_error)
+
+    response = relay_client.get("/metrics")
+
+    assert response.status_code == 503
+    serialized_logs = "\n".join(json.dumps(record, default=str) for record in log_records)
+    assert "metrics.gauge_update_failed" in serialized_logs
+    assert secret not in serialized_logs
+    assert secret not in response.get_data(as_text=True)
+
+
+def test_collector_construction_failure_keeps_instrumentation_down(monkeypatch) -> None:
+    """Collector construction failures use no-op metrics and do not mark instrumentation healthy."""
+
+    secret = "collector-secret-value"
+
+    def fail_factory():
+        raise RuntimeError(secret)
+
+    log_records = []
+
+    def spy_error(message, *args, **kwargs):
+        log_records.append({"message": message, **kwargs.get("extra", {})})
+
+    monkeypatch.setattr(relay_module, "_METRICS_CONSTRUCTION_FAILED", False)
+    monkeypatch.setattr(relay_module.LOGGER, "error", spy_error)
+
+    metric = relay_module._collector("tokenplace_test_failure_metric", fail_factory)
+    metric.labels("x").inc()
+
+    assert relay_module._METRICS_CONSTRUCTION_FAILED is True
+    serialized_logs = "\n".join(json.dumps(record, default=str) for record in log_records)
+    assert "metrics.collector_construction_failed" in serialized_logs
+    assert secret not in serialized_logs
+
 def test_metrics_do_not_expose_high_cardinality_or_sensitive_values(relay_client, caplog) -> None:
     """Synthetic identities and payload values do not become metric labels or logs."""
 

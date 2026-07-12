@@ -446,7 +446,8 @@ def _get_request_counter() -> Counter:
     )
 
 
-REQUEST_COUNTER = _get_request_counter()
+_METRICS_CONSTRUCTION_FAILED = False
+REQUEST_COUNTER = None
 
 PROVIDER_MODE_ENUM = ("relay", "direct", "unknown")
 OUTCOME_ENUM = (
@@ -478,11 +479,19 @@ class _NoopMetric:
 
 
 def _collector(name: str, factory):
+    global _METRICS_CONSTRUCTION_FAILED
     try:
         return factory()
     except Exception:
-        LOGGER.exception("metrics.collector_construction_failed", extra={"metric": name})
+        _METRICS_CONSTRUCTION_FAILED = True
+        LOGGER.error(
+            "metrics.collector_construction_failed",
+            extra={"metric": name, "reason": "collector_construction_failed"},
+        )
         return _NoopMetric()
+
+
+REQUEST_COUNTER = _collector("tokenplace_relay_requests_total", _get_request_counter)
 
 
 HTTP_REQUESTS_TOTAL = _collector(
@@ -551,6 +560,9 @@ INSTRUMENTATION_UP = _collector(
 
 
 def _initialise_metric_labels() -> None:
+    if _METRICS_CONSTRUCTION_FAILED:
+        INSTRUMENTATION_UP.set(0)
+        return
     for outcome in OUTCOME_ENUM:
         RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
     for reason in EVICTION_REASON_ENUM:
@@ -575,6 +587,14 @@ def _build_revision_label(metadata: dict[str, str]) -> str:
         or metadata.get("version")
         or "unknown"
     )
+
+
+CANONICAL_HTTP_METHOD_ENUM = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
+
+
+def _normalise_http_method(method: str | None) -> str:
+    method = method.upper() if isinstance(method, str) else ""
+    return method if method in CANONICAL_HTTP_METHOD_ENUM else "other"
 
 
 def _normalise_status_class(status_code: int | str) -> str:
@@ -653,14 +673,7 @@ def _record_request_terminal_outcome_once(
 
 
 def _is_relay_inference_route(route: str) -> bool:
-    return route in {
-        "/api/v1/relay/requests",
-        "/api/v1/relay/requests/cancel",
-        "/api/v1/relay/responses",
-        "/api/v1/relay/responses/retrieve",
-        "/api/v1/*",
-        "/api/v2/*",
-    }
+    return route == "/api/v1/relay/requests"
 
 
 def _terminal_outcome_from_status_reason(status: str, reason: str | None) -> str:
@@ -750,7 +763,7 @@ try:
     INSTRUMENTATION_UP.set(0)
     _initialise_metric_labels()
 except Exception:
-    LOGGER.exception("metrics.initialization_failed")
+    LOGGER.error("metrics.initialization_failed", extra={"reason": "initialization_failed"})
     try:
         INSTRUMENTATION_UP.set(0)
     except Exception:
@@ -1371,7 +1384,7 @@ def _record_request_start():
         try:
             _update_runtime_gauges()
         except Exception:
-            LOGGER.exception("metrics.gauge_update_failed")
+            LOGGER.error("metrics.gauge_update_failed", extra={"reason": "gauge_update_failed"})
             return Response("metrics unavailable\n", status=503, mimetype="text/plain")
     return None
 
@@ -1387,7 +1400,7 @@ def _log_request(response: Response):
 
     try:
         REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
-        HTTP_REQUESTS_TOTAL.labels(request.method, route, status_class, provider_mode, outcome).inc()
+        HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
             "metrics.increment_failed",
@@ -1399,7 +1412,7 @@ def _log_request(response: Response):
         duration = max(time.time() - g.request_start_time, 0)
     try:
         HTTP_REQUEST_DURATION_SECONDS.labels(
-            request.method,
+            _normalise_http_method(request.method),
             route,
             status_class,
             provider_mode,
@@ -1437,7 +1450,7 @@ def metrics():
     try:
         payload = generate_latest(RELAY_METRICS_REGISTRY)
     except Exception:
-        LOGGER.exception("metrics.serialize_failed")
+        LOGGER.error("metrics.serialize_failed", extra={"reason": "serialize_failed"})
         return Response("metrics unavailable\n", status=503, mimetype="text/plain")
     return Response(payload, mimetype=CONTENT_TYPE_LATEST)
 
@@ -2047,7 +2060,7 @@ def _sanitize_terminal_reason(value, status):
 
 def _mark_request_terminal(client_public_key, request_id, *, status="cancelled", reason=None):
     if not client_public_key or not request_id:
-        return
+        return False
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     expires_at = time.time() + max(TERMINAL_REQUEST_TTL_SECONDS, 1.0)
@@ -2055,9 +2068,9 @@ def _mark_request_terminal(client_public_key, request_id, *, status="cancelled",
     with client_terminal_request_ids_lock:
         terminal_ids = client_terminal_request_ids.setdefault(client_public_key, {})
         if request_id in terminal_ids:
-            return
+            return False
         terminal_ids[request_id] = {"status": status, "reason": reason, "expires_at": expires_at}
-    _record_request_terminal_outcome_once(
+    return _record_request_terminal_outcome_once(
         client_public_key,
         request_id,
         _terminal_outcome_from_status_reason(status, reason),
@@ -2196,9 +2209,9 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     removed = _remove_request_from_server_queues(client_public_key, request_id)
-    _remove_client_responses_for_request(client_public_key, request_id)
-    _clear_pending_request(client_public_key, request_id)
-    _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
+    response_removed = _remove_client_responses_for_request(client_public_key, request_id)
+    pending_removed = _clear_pending_request(client_public_key, request_id)
+    in_flight_removed = 0
     with server_round_robin_lock:
         with api_v1_in_flight_requests_lock:
             for server_payload in known_servers.values():
@@ -2207,8 +2220,11 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
                     continue
                 if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
                     in_flight_requests.pop(request_id, None)
+                    in_flight_removed += 1
                     if not in_flight_requests:
                         server_payload.pop("api_v1_in_flight_requests", None)
+    if removed or response_removed or pending_removed or in_flight_removed:
+        _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",
         extra={
@@ -2237,14 +2253,16 @@ def _mark_request_pending(client_public_key, request_id, *, cancel_token=None):
 
 def _clear_pending_request(client_public_key, request_id):
     if not client_public_key or not request_id:
-        return
+        return False
     with client_pending_request_ids_lock:
         pending_ids = client_pending_request_ids.get(client_public_key)
         if not pending_ids:
-            return
+            return False
+        existed = request_id in pending_ids
         pending_ids.pop(request_id, None)
         if not pending_ids:
             client_pending_request_ids.pop(client_public_key, None)
+        return existed
 
 
 def _clear_pending_requests_for_queued_items(queued_items):
@@ -2715,6 +2733,7 @@ def api_v1_relay_responses():
         if terminal is not None:
             status = terminal.get('status', 'cancelled')
             return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+        lifecycle_owned = False
         with server_round_robin_lock:
             with api_v1_in_flight_requests_lock:
                 for server_payload in known_servers.values():
@@ -2723,12 +2742,16 @@ def api_v1_relay_responses():
                         continue
                     if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
                         in_flight_requests.pop(request_id, None)
+                        lifecycle_owned = True
                         if not in_flight_requests:
                             server_payload.pop('api_v1_in_flight_requests', None)
                         break
+        lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
+    else:
+        lifecycle_owned = False
 
     _queue_client_response(client_public_key, envelope)
-    if isinstance(request_id, str) and request_id:
+    if isinstance(request_id, str) and request_id and lifecycle_owned:
         _record_request_terminal_outcome_once(client_public_key, request_id, "completed")
     LOGGER.info(
         "relay.api_v1.response_received",

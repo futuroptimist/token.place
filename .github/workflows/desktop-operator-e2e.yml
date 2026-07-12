@@ -22,6 +22,7 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'tests/unit/test_model_manager.py'
+      - 'tests/unit/test_desktop_runtime_setup.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -42,6 +43,7 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'tests/unit/test_model_manager.py'
+      - 'tests/unit/test_desktop_runtime_setup.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -144,6 +146,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+
+      - name: Run targeted Windows CUDA handoff regressions
+        run: |
+          python -m pytest tests/unit/test_desktop_runtime_setup.py tests/unit/test_model_manager.py -q -k "desktop_runtime or cuda or qwen_64k or windows_path or capability"
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py

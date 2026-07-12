@@ -546,7 +546,8 @@ fn validate_bounded_csv(value: &str, validate_entry: impl Fn(&str) -> bool) -> b
 }
 
 fn sanitize_url_display(value: &str) -> String {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
     let without_query = without_fragment
         .split('?')
@@ -563,7 +564,12 @@ fn sanitize_url_display(value: &str) -> String {
 }
 
 fn sanitize_path_display(value: &str) -> String {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let windows_like = is_windows_path_like(trimmed);
+    if windows_like {
+        return "<path>".into();
+    }
     let path = Path::new(trimmed);
     if trimmed.starts_with('/') && trimmed.split('/').filter(|part| !part.is_empty()).count() <= 2 {
         return "<path>".into();
@@ -578,12 +584,34 @@ fn sanitize_path_display(value: &str) -> String {
     }
 }
 
+fn is_windows_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with(r"\\?\c:\")
+        || lower.starts_with(r"\\?\unc\")
+        || lower.starts_with(r"\\")
+        || lower.starts_with(r"c:\")
+        || lower.starts_with("c:/")
+        || lower.contains(r"\users\")
+        || lower.contains("/users/")
+        || lower.contains(r"\appdata\")
+        || lower.contains("/appdata/")
+        || lower.contains(r"\programs\python\")
+        || lower.contains("/programs/python/")
+        || lower.contains(r"python311\python.exe")
+        || lower.contains("python311/python.exe")
+}
+
 fn is_path_like(value: &str) -> bool {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
-    trimmed.starts_with('/')
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    is_windows_path_like(trimmed)
+        || trimmed.starts_with('/')
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
         || trimmed.contains('/')
+        || trimmed.contains('\\')
         || (trimmed.len() > 2
             && trimmed.as_bytes()[1] == b':'
             && (trimmed.as_bytes()[2] == b'/' || trimmed.as_bytes()[2] == b'\\')
@@ -712,6 +740,19 @@ mod tests {
             lifecycle_index < second_sink_index,
             "lifecycle append must not be overwritten by subsequent sink writes: {raw}"
         );
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_windows_timeout_paths() {
+        let line = r#"desktop.llama_cpp_worker.init_failed stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=30 Command ['\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe', '-c', 'import llama_cpp'] cwd=C:\Users\Alice\AppData\Local\token.place desktop"#;
+        let sanitized = sanitize_operator_diagnostic_line(line);
+        assert!(!sanitized.contains("Alice"));
+        assert!(!sanitized.contains("AppData"));
+        assert!(!sanitized.contains("Python311"));
+        assert!(!sanitized.contains("import llama_cpp"));
+        assert!(sanitized.contains("stage=llama_cpp_gpu_probe"));
+        assert!(sanitized.contains("category=worker_timeout"));
+        assert!(sanitized.contains("timeout_seconds=30"));
     }
 
     #[test]

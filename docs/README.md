@@ -14,10 +14,12 @@ testing, and deploying token.place. For an expanded overview of every directory,
   - Also see: [STREAMING_IMPLEMENTATION_GUIDE.md](STREAMING_IMPLEMENTATION_GUIDE.md),
     [CROSS_PLATFORM.md](CROSS_PLATFORM.md),
     [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md),
+    [design/raspberry-pi-5-rtx-3060-compute-node.md](design/raspberry-pi-5-rtx-3060-compute-node.md),
     [design/tauri_desktop_client.md](design/tauri_desktop_client.md) (forward-looking desktop direction; `desktop/` is a deprecated legacy Electron prototype and desktop-tauri is still MVP)
 - **Run or deploy the services**
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),
+    [design/raspberry-pi-5-rtx-3060-compute-node.md](design/raspberry-pi-5-rtx-3060-compute-node.md),
     [docker-compose.yml](../docker-compose.yml), [k8s/](../k8s/),
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),

@@ -2,7 +2,7 @@
 
 This guide combines the runbook, k3s cluster instructions and bill of materials into a single place.
 It documents how we built a three-node Raspberry Pi 5 cluster for token.place
- and captures some lessons learned along the way.
+ and captures some lessons learned along the way. For the separate, unimplemented GPU overflow-node proposal, see [Raspberry Pi 5 + RTX 3060 compute-node design](design/raspberry-pi-5-rtx-3060-compute-node.md).
 
 ## ⚡ Quick-Start (Zero-touch Image)
 

@@ -171,7 +171,7 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
     assert len(attempts) == 2
     assert 'type_k' not in attempts[0]
     assert attempts[1]['type_k'] == 8
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 
 def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, monkeypatch):
@@ -683,3 +683,108 @@ def test_qwen64k_yarn_rope_freq_scale_fix_reproduces_old_decode_failure_and_pass
     assert diagnostics['api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special'] is False
     for value in diagnostics.values():
         assert not (isinstance(value, str) and any(marker in value for marker in UNSAFE_READINESS_SENTINELS))
+
+
+def test_qwen64k_packaged_profile_recovery_f16_decode_failure_then_q8_success():
+    """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
+    f16_runtime = _Qwen64kFakeRuntime.__new__(_Qwen64kFakeRuntime)
+    q8_runtime = _Qwen64kFakeRuntime()
+
+    class FailingF16(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                    "plain_completion_eval_return_code": -3,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            )
+
+    f16_runtime = FailingF16()
+    manager = _model_manager(f16_runtime)
+    recovery_calls = []
+
+    def _reinitialize(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
+        recovery_calls.append((failed_rt, category, decode_return_code))
+        manager._qwen_64k_first_readiness_failure_category = category
+        manager._qwen_64k_profile_recovery_count = 1
+        manager.get_llm_instance.return_value = q8_runtime
+        return q8_runtime
+
+    manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _reinitialize
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 42)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][0] is f16_runtime
+    assert recovery_calls[0][1] == "backend_graph_compute_failure"
+    assert recovery_calls[0][2] == -3
+    assert manager._qwen_64k_profile_recovery_count == 1
+    assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert manager.last_compute_diagnostics["api_v1_readiness_result"] == "passed"
+
+
+def test_qwen64k_packaged_profile_recovery_all_profiles_exhausted_fails_closed():
+    """All three profiles fail the smoke; ensure_api_v1_runtime_ready returns False, first failure preserved."""
+    class FailingRuntime(_Qwen64kFakeRuntime):
+        def create_chat_completion_from_rendered_prompt(self, messages, **_kwargs):
+            raise LlamaCppInferenceRequestError(
+                "llama_cpp request failed",
+                diagnostics={
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                    "plain_completion_eval_return_code": -3,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            )
+
+    f16_runtime = FailingRuntime()
+    q8_runtime = FailingRuntime()
+    q4_runtime = FailingRuntime()
+    manager = _model_manager(f16_runtime)
+    recovery_calls = []
+
+    def _reinitialize(failed_rt, category, decode_return_code=None, failure_diagnostics=None):
+        recovery_calls.append((failed_rt, category))
+        if len(recovery_calls) == 1:
+            manager._qwen_64k_first_readiness_failure_category = category
+            manager._qwen_64k_profile_recovery_count = 1
+            manager.get_llm_instance.return_value = q8_runtime
+            return q8_runtime
+        if len(recovery_calls) == 2:
+            manager._qwen_64k_profile_recovery_count = 2
+            manager.get_llm_instance.return_value = q4_runtime
+            return q4_runtime
+        manager._qwen_64k_profile_recovery_count = 3
+        return None
+
+    manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.side_effect = _reinitialize
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=manager,
+        relay_client=SimpleNamespace(
+            _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 42)
+        ),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.call_count == 3
+    assert recovery_calls[0][0] is f16_runtime
+    assert recovery_calls[1][0] is q8_runtime
+    assert recovery_calls[2][0] is q4_runtime
+    assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert manager._qwen_64k_profile_recovery_count == 3

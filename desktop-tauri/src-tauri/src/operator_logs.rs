@@ -197,6 +197,17 @@ pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String
 
 pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
     let line = sanitize_log_line(line);
+    let trimmed = line.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if trimmed.len() > 4096 {
+            return r#"{"type":"operator_log_json_token_truncated","safe_truncation":true}"#
+                .to_string();
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return serde_json::to_string(&sanitize_operator_json_value(&value))
+                .unwrap_or_else(|_| r#"{"type":"operator_log_json_sanitize_error"}"#.to_string());
+        }
+    }
     line.split_whitespace()
         .map(sanitize_operator_diagnostic_token)
         .collect::<Vec<_>>()
@@ -209,7 +220,11 @@ pub fn sanitize_operator_path_display(path: &Path) -> String {
 
 fn sanitize_operator_diagnostic_token(token: &str) -> String {
     if token.starts_with('{') || token.starts_with('[') {
-        return token.chars().take(4096).collect();
+        if token.len() <= 4096 {
+            return token.to_string();
+        }
+        return r#"{"type":"operator_log_json_token_truncated","safe_truncation":true}"#
+            .to_string();
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);
@@ -231,6 +246,41 @@ fn sanitize_operator_diagnostic_token(token: &str) -> String {
     }
 
     token.chars().take(4096).collect()
+}
+
+fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in map {
+                let normalized = key.to_ascii_lowercase();
+                if normalized.contains("api_key")
+                    || normalized.contains("token")
+                    || normalized.contains("prompt")
+                    || normalized.contains("output")
+                    || normalized.contains("response")
+                    || normalized.contains("private_key")
+                    || normalized.contains("payload")
+                {
+                    sanitized.insert(key.clone(), serde_json::Value::String("<redacted>".into()));
+                } else {
+                    sanitized.insert(key.clone(), sanitize_operator_json_value(value));
+                }
+            }
+            serde_json::Value::Object(sanitized)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .take(32)
+                .map(sanitize_operator_json_value)
+                .collect(),
+        ),
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(sanitize_operator_diagnostic_token(text))
+        }
+        _ => value.clone(),
+    }
 }
 
 fn sanitize_url_display(value: &str) -> String {
@@ -399,6 +449,48 @@ mod tests {
         assert!(
             lifecycle_index < second_sink_index,
             "lifecycle append must not be overwritten by subsequent sink writes: {raw}"
+        );
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_sanitizes_whole_json_before_tokenization() {
+        let sanitized = sanitize_operator_diagnostic_line(
+            r#"{"type":"x", "api_key":"secret value", "nested":{"token":"secret token"}, "safe":"hello world"}"#,
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&sanitized).expect("sanitized json remains parseable");
+
+        assert_eq!(
+            payload.get("api_key").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload
+                .get("nested")
+                .and_then(|nested| nested.get("token"))
+                .and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.get("safe").and_then(serde_json::Value::as_str),
+            Some("hello world")
+        );
+        assert!(!sanitized.contains("secret value"));
+        assert!(!sanitized.contains("secret token"));
+    }
+
+    #[test]
+    fn sanitize_operator_diagnostic_line_replaces_oversized_json_without_parsing() {
+        let oversized = format!(r#"{{"safe":"{}"}}"#, "x".repeat(5000));
+        let sanitized = sanitize_operator_diagnostic_line(&oversized);
+        let payload: serde_json::Value =
+            serde_json::from_str(&sanitized).expect("truncation marker json");
+
+        assert_eq!(
+            payload
+                .get("safe_truncation")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

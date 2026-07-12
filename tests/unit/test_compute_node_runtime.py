@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import call, MagicMock
 
@@ -122,6 +123,46 @@ def test_completion_smoke_worker_diagnostic_sanitizer_covers_safe_value_shapes()
     assert "assistant output" not in json.dumps(safe)
 
 
+def test_completion_smoke_worker_diagnostic_sanitizer_covers_new_edge_shapes():
+    safe = _safe_completion_smoke_worker_diagnostics(
+        {
+            "plain_completion_backend_state_sticky": "true",
+            "plain_completion_backend_recreation_required": "false",
+            "plain_completion_metal_command_buffer_status": "7",
+            "attempted_plain_completion_methods": "",
+            "plain_completion_attempt_safe_summaries": "",
+            "child_stderr_tail": "metal buffer failed redacted",
+        }
+    )
+
+    assert "plain_completion_backend_state_sticky" not in safe
+    assert "plain_completion_backend_recreation_required" not in safe
+    assert "plain_completion_metal_command_buffer_status" not in safe
+    assert safe["attempted_plain_completion_methods"] == ""
+    assert safe["plain_completion_attempt_safe_summaries"] == ""
+    assert safe["child_stderr_tail"] == "metal buffer failed redacted"
+
+
+def test_payload_helpers_reject_non_dict_and_compute_mode_cpu_fallback():
+    assert is_legacy_relay_payload(["not", "dict"]) is False
+    assert is_api_v1_relay_payload("not-dict") is False
+
+    manager = SimpleNamespace(
+        requested_compute_mode="cpu",
+        last_compute_diagnostics={"requested_mode": "gpu"},
+    )
+
+    assert compute_mode_diagnostics(manager) == {
+        "requested_mode": "cpu",
+        "effective_mode": "cpu",
+        "backend_available": "unknown",
+        "backend_selected": "cpu",
+        "backend_used": "cpu",
+        "n_gpu_layers": 0,
+        "fallback_reason": None,
+    }
+
+
 def test_completion_smoke_worker_diagnostic_sanitizer_drops_unsafe_shapes():
     unsafe = _safe_completion_smoke_worker_diagnostics(
         {
@@ -221,6 +262,9 @@ def test_completion_smoke_reason_from_api_v1_error_maps_runtime_reasons(error, e
         (RuntimeError("KV cache allocation failed"), "kv_cache_allocation", "runtime_completion_smoke_kv_cache_allocation"),
         (RuntimeError("failed to tokenize prompt"), "prompt_tokenization_failure", "runtime_completion_smoke_plain_completion_prompt_tokenization_failure"),
         (RuntimeError("llama_decode failed to eval prompt"), "prompt_eval_failure", "runtime_completion_smoke_plain_completion_eval_failure"),
+        (RuntimeError("llama_decode returned -3"), "backend_graph_compute_failure", "runtime_completion_smoke_backend_graph_compute_failure"),
+        (RuntimeError("llama_decode returned 2"), "decode_aborted", "runtime_completion_smoke_decode_aborted"),
+        (RuntimeError("llama_decode returned -4"), "backend_decode_failure", "runtime_completion_smoke_backend_decode_failure"),
         (RuntimeError("sampler failed with no logits"), "sampling_failure", "runtime_completion_smoke_plain_completion_sampling_failure"),
         (RuntimeError("unexpected keyword argument 'mirostat'"), "unsupported_generation_kwarg", "runtime_completion_smoke_plain_completion_unexpected_kwarg"),
         (RuntimeError("unclassified failure with prompt text"), "unknown_generation_exception", "runtime_completion_smoke_exception"),
@@ -233,6 +277,8 @@ def test_classify_completion_smoke_exception_uses_safe_specific_reasons(exc, exp
     assert reason == expected_reason
     assert diagnostics["exception_type"] == type(exc).__name__
     assert diagnostics["sanitized_error_summary"] == f"{type(exc).__name__}:redacted"
+    if "llama_decode returned" in str(exc):
+        assert diagnostics["plain_completion_eval_return_code"] == int(str(exc).rsplit(" ", 1)[-1])
     assert "prompt text" not in json.dumps(diagnostics)
 
 
@@ -2330,6 +2376,83 @@ class _Qwen64kRuntime(_ReadyRuntime):
         return {"prompt_tokens": 42}
 
 
+def _real_qwen_64k_model_manager(runtimes):
+    from utils.llm.model_manager import ModelManager
+
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = runtimes[0]
+    manager.use_mock_llm = False
+    manager.model_path = "/tmp/Qwen3-8B-Q4_K_M.gguf"
+    manager.model_profile = {
+        "provider": "qwen",
+        "thinking_mode": "disabled",
+        "profile_id": "qwen3-8b-q4-k-m",
+        "chat_template_policy": "gguf-jinja",
+        "rope_scaling_policy": {
+            "type": "yarn",
+            "required_for_tier": "64k-full",
+            "factor": 2.0,
+            "original_context_tokens": 32768,
+        },
+    }
+    manager.context_tier = "64k-full"
+    manager.context_window_tokens = 65536
+    manager.api_model_id = "qwen3-8b-instruct"
+    manager.last_yarn_rope_diagnostics = {
+        "supported": True,
+        "qwen_yarn_requested_context_tokens": 65536,
+        "qwen_yarn_original_context_tokens": 32768,
+    }
+    manager.download_model_if_needed = MagicMock(return_value=True)
+    manager.last_compute_diagnostics = {
+        "active_profile_id": "qwen3-8b-q4-k-m",
+        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+        "n_ctx": 65536,
+        "native_context_tokens": 32768,
+        "kv_cache_mode": {"type_k": 8, "type_v": 8, "flash_attn": True},
+        "backend_used": "metal",
+    }
+    manager.worker_state = "ready"
+    manager.last_worker_error_code = None
+    manager.last_runtime_init_error = None
+    manager.last_worker_restart_at_ms = None
+    manager.last_plain_completion_eval_return_code = None
+    manager.worker_restart_count = 0
+    manager._llm_generation = 0
+    manager._qwen_64k_profile_recovery_count = 0
+    manager._qwen_64k_first_readiness_failure_category = None
+    manager._qwen_64k_first_readiness_failure_diagnostics = {}
+    manager._qwen_64k_profile_attempt_ids = ["qwen64k_f16_fa_small_batch"]
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_runtime_profiles = [
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+    ]
+    close_calls = []
+    manager._close_llm_proxy = MagicMock(side_effect=lambda runtime: close_calls.append(runtime))
+    runtime_iter = iter(runtimes)
+
+    def _get_llm_instance():
+        try:
+            replacement = next(runtime_iter)
+        except StopIteration:
+            return None
+        manager._qwen_64k_selected_profile_id = manager._qwen_64k_runtime_profiles[
+            manager._qwen_64k_selected_profile_index
+        ]["profile_id"]
+        manager.llm = replacement
+        manager._qwen_64k_profile_attempt_ids.append(manager._qwen_64k_selected_profile_id)
+        manager.last_compute_diagnostics["qwen_64k_runtime_profile_id"] = manager._qwen_64k_selected_profile_id
+        return replacement
+
+    manager.get_llm_instance = MagicMock(side_effect=_get_llm_instance)
+    manager._test_close_calls = close_calls
+    return manager
+
+
 def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     from utils.llm.model_manager import LlamaCppInferenceRequestError
 
@@ -2368,6 +2491,337 @@ def test_qwen_64k_completion_smoke_worker_exception_gets_specific_safe_reason():
     assert "reason" not in worker_diagnostics
     assert "stderr_tail" not in worker_diagnostics
     assert "SECRET" not in json.dumps(diagnostics)
+
+
+def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
+    failed_runtime = _Qwen64kRuntime()
+    recovered_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, recovered_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": "runtime_completion_smoke_metal_memory_allocation",
+                    "exception_category": "runtime_metal_memory_allocation",
+                    "worker_diagnostics": {
+                        "generation_exception_category": "metal_memory_allocation",
+                        "plain_completion_backend_failure_category": "metal_command_buffer_out_of_memory",
+                        "plain_completion_eval_return_code": -3,
+                        "exception_type": "RuntimeError",
+                        "sanitized_error_summary": "RuntimeError:redacted",
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.llm is recovered_runtime
+    assert model_manager._qwen_64k_first_readiness_failure_category == "metal_command_buffer_out_of_memory"
+    assert (
+        model_manager._qwen_64k_first_readiness_failure_diagnostics["backend_failure_category"]
+        == "metal_command_buffer_out_of_memory"
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "decode_return_code", "internal_reason"),
+    [
+        ("decode_aborted", 2, "runtime_completion_smoke_decode_aborted"),
+        ("backend_decode_failure", -4, "runtime_completion_smoke_backend_decode_failure"),
+    ],
+)
+def test_qwen_64k_readiness_decode_failures_use_profile_recovery(
+    category,
+    decode_return_code,
+    internal_reason,
+):
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": internal_reason,
+                "exception_category": f"runtime_{category}",
+                "worker_diagnostics": {
+                    "generation_exception_category": category,
+                    "plain_completion_eval_return_code": decode_return_code,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager._qwen_64k_first_readiness_failure_diagnostics["eval_return_code"] == decode_return_code
+    relay_client._generate_api_v1_response_with_runtime_model.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_category", "decode_return_code"),
+    [
+        ("llama_decode returned -3", "backend_graph_compute_failure", -3),
+        ("llama_decode returned 2", "decode_aborted", 2),
+        ("llama_decode returned -4", "backend_decode_failure", -4),
+    ],
+)
+def test_qwen_64k_readiness_raw_decode_exception_uses_profile_recovery(
+    message,
+    expected_category,
+    decode_return_code,
+):
+    failed_runtime = _Qwen64kRuntime()
+    recovered_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, recovered_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        RuntimeError(message),
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager.llm is recovered_runtime
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == expected_category
+    assert diagnostics["api_v1_readiness_completion_smoke_plain_completion_eval_return_code"] == decode_return_code
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
+
+
+def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
+    failed_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, q8_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_decode_aborted",
+                "worker_diagnostics": {
+                    "generation_exception_category": "decode_aborted",
+                    "plain_completion_eval_return_code": 2,
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+        cancellation_predicate=lambda: True,
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 0
+    assert model_manager._qwen_64k_profile_recovery_count == 0
+    assert model_manager.last_plain_completion_eval_return_code == 2
+    assert model_manager.get_llm_instance.call_count == 1
+    assert model_manager.llm is None
+    assert q8_runtime not in model_manager._test_close_calls
+
+
+@pytest.mark.parametrize(
+    ("budget_value", "expected_attempts"),
+    [
+        (None, 3),
+        (0, 3),
+        (False, 3),
+        ("3", 3),
+        (99, 3),
+        (2, 2),
+    ],
+)
+def test_qwen_64k_readiness_profile_budget_validation_is_bounded(budget_value, expected_attempts):
+    runtimes = [_Qwen64kRuntime(), _Qwen64kRuntime(), _Qwen64kRuntime()]
+    model_manager = _real_qwen_64k_model_manager(runtimes)
+    if budget_value is None:
+        model_manager.qwen_64k_readiness_profile_attempt_budget = None
+    else:
+        model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(return_value=budget_value)
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_decode_aborted",
+                "worker_diagnostics": {
+                    "generation_exception_category": "decode_aborted",
+                    "plain_completion_eval_return_code": 2,
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    expected_with_fake = min(expected_attempts, 3)
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == expected_with_fake
+    assert len(model_manager._test_close_calls) == expected_with_fake
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count <= 3
+
+
+@pytest.mark.parametrize(
+    ("category", "decode_return_code"),
+    [("decode_aborted", 2), ("backend_decode_failure", -4)],
+)
+def test_qwen_64k_readiness_decode_recovery_uses_real_model_manager_lifecycle(
+    category, decode_return_code
+):
+    failed_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([failed_runtime, q8_runtime])
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": f"runtime_completion_smoke_{category}",
+                    "worker_diagnostics": {
+                        "generation_exception_category": category,
+                        "plain_completion_eval_return_code": decode_return_code,
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager._test_close_calls == [failed_runtime]
+    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager.last_plain_completion_eval_return_code == decode_return_code
+    assert model_manager.llm is q8_runtime
+    assert failed_runtime is not q8_runtime
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
+
+
+def test_qwen_64k_readiness_error_marks_profile_failed_and_redacted_summary():
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.last_compute_diagnostics = {
+        **model_manager.last_compute_diagnostics,
+        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+    }
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_worker_exception",
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "exception_type": "RuntimeError",
+                },
+            }
+        }
+    }
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"] == "failed"
+    assert diagnostics["api_v1_readiness_completion_smoke_generation_exception_category"] == "backend_graph_compute_failure"
+
+
+def test_qwen_64k_completion_smoke_exception_adds_redacted_summary_without_worker_summary():
+    from utils.llm.model_manager import LlamaCppInferenceRequestError
+
+    failed_runtime = _Qwen64kRuntime()
+    model_manager = _qwen_64k_model_manager(failed_runtime)
+    model_manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure.return_value = None
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+
+    def raise_without_summary(**_kwargs):
+        raise LlamaCppInferenceRequestError(
+            "llama_cpp request failed",
+            diagnostics={
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "exception_type": "RuntimeError",
+                }
+            },
+        )
+
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = raise_without_summary
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    diagnostics = model_manager.last_compute_diagnostics
+    assert diagnostics["api_v1_readiness_completion_smoke_exception_type"] == "RuntimeError"
+    assert diagnostics["api_v1_readiness_completion_smoke_safe_summary"] == "LlamaCppInferenceRequestError:redacted"
 
 
 def test_qwen_64k_completion_smoke_exception_promotes_safe_nested_worker_diagnostics():
@@ -2629,3 +3083,95 @@ def test_compute_node_runtime_has_single_authoritative_yarn_original_context_ass
             matching_dicts.append(count)
     assert matching_dicts
     assert all(count == 1 for count in matching_dicts)
+
+
+def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
+    """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
+    f16_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime])
+
+    # First generate_api_v1 call fails; second (Q8) passes
+    model_manager._relay_client = MagicMock()
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.side_effect = [
+        {
+            "api_v1_response": {
+                "error": {
+                    "code": "compute_node_inference_failed",
+                    "internal_reason": "runtime_completion_smoke_backend_decode_failure",
+                    "exception_category": "runtime_backend_graph_compute_failure",
+                    "worker_diagnostics": {
+                        "generation_exception_category": "backend_graph_compute_failure",
+                        "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                        "plain_completion_eval_return_code": -3,
+                        "exception_type": "RuntimeError",
+                        "sanitized_error_summary": "RuntimeError:redacted",
+                    },
+                }
+            }
+        },
+        {"api_v1_response": {"message": {"role": "assistant", "content": "ok"}}},
+    ]
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager._test_close_calls == [f16_runtime]
+    assert model_manager.llm is q8_runtime
+    assert f16_runtime is not q8_runtime
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
+    assert model_manager.download_model_if_needed.call_count == 1
+    assert model_manager._qwen_64k_profile_recovery_count == 1
+    assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+
+
+def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
+    """All three Metal profiles fail the smoke; ensure_api_v1_runtime_ready returns False."""
+    f16_runtime = _Qwen64kRuntime()
+    q8_runtime = _Qwen64kRuntime()
+    q4_runtime = _Qwen64kRuntime()
+
+    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime, q4_runtime])
+
+    relay_client = MagicMock()
+    relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
+    relay_client._generate_api_v1_response_with_runtime_model.return_value = {
+        "api_v1_response": {
+            "error": {
+                "code": "compute_node_inference_failed",
+                "internal_reason": "runtime_completion_smoke_backend_graph_compute_failure",
+                "exception_category": "runtime_backend_graph_compute_failure",
+                "worker_diagnostics": {
+                    "generation_exception_category": "backend_graph_compute_failure",
+                    "plain_completion_backend_failure_category": "backend_graph_compute_failure",
+                    "plain_completion_eval_return_code": -3,
+                    "exception_type": "RuntimeError",
+                    "sanitized_error_summary": "RuntimeError:redacted",
+                },
+            }
+        }
+    }
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager._test_close_calls == [f16_runtime, q8_runtime, q4_runtime]
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 3
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 3
+    assert model_manager.download_model_if_needed.call_count == 1
+    assert model_manager.get_llm_instance.call_count == 3
+    assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
+    assert model_manager._qwen_64k_profile_recovery_count == 3

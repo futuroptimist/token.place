@@ -14,6 +14,7 @@ use crate::python_runtime::{
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -301,6 +302,23 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_rejected_kwarg",
     "api_v1_readiness_completion_smoke_qwen_high_level_chat_fallback_category",
     "api_v1_readiness_completion_smoke_plain_completion_eval_return_code",
+    "api_v1_readiness_completion_smoke_plain_completion_first_failure_method",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_state_sticky",
+    "api_v1_readiness_completion_smoke_plain_completion_backend_recreation_required",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
+    "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
+    "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
+    "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
+    "api_v1_readiness_qwen_64k_runtime_profile_flash_attn",
+    "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_k",
+    "api_v1_readiness_qwen_64k_runtime_profile_type_v",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_batch",
+    "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch",
+    "api_v1_readiness_qwen_64k_runtime_profile_result",
+    "api_v1_readiness_qwen_64k_runtime_profile_failure_category",
     "api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback",
 ];
 
@@ -806,6 +824,16 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "last_error",
         "configured_relay_count",
         "registered_relay_count",
+        "api_v1_readiness_result",
+        "api_v1_readiness_error_code",
+        "api_v1_readiness_error_reason",
+        "api_v1_readiness_qwen_64k_runtime_profile_id",
+        "api_v1_readiness_qwen_64k_runtime_profile_result",
+        "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
+        "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category",
+        "api_v1_readiness_qwen_64k_first_readiness_failure_metal_error_category",
+        "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category",
+        "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     ] {
         if let Some(value) = map.get(key) {
             summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
@@ -818,12 +846,100 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         }
     }
 
-    summary.extend(safe_readiness_diagnostics_from_payload(payload));
-
-    serde_json::to_string(&Value::Object(summary))
+    let serialized = serde_json::to_string(&Value::Object(summary))
+        .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into());
+    if serialized.len() <= 3500 {
+        serialized
+    } else {
+        serde_json::to_string(&serde_json::json!({
+            "type": payload.get("type").and_then(Value::as_str).unwrap_or("bridge_event"),
+            "operator_session_id": payload.get("operator_session_id").and_then(Value::as_str).unwrap_or("unknown"),
+            "sequence": payload.get("sequence").and_then(Value::as_u64).unwrap_or(0),
+            "summary_truncated": true,
+        }))
         .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into())
+    }
 }
 
+fn readiness_operator_log_chunks(payload: &Value) -> Vec<String> {
+    let diagnostics = safe_readiness_diagnostics_from_payload(payload);
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let operator_session_id = payload
+        .get("operator_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let sequence = payload.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+    let mut chunks: Vec<Map<String, Value>> = Vec::new();
+    let mut current = Map::new();
+    let mut current_len = 0usize;
+    let mut sorted = BTreeMap::new();
+    for (key, value) in diagnostics {
+        sorted.insert(key, value);
+    }
+    for (key, value) in sorted {
+        let mut safe_value = value;
+        let mut pair_len = serde_json::to_string(&serde_json::json!({ &key: safe_value.clone() }))
+            .map(|text| text.len())
+            .unwrap_or(3500);
+        if pair_len > 2800 {
+            safe_value = serde_json::json!({
+                "omitted": true,
+                "reason": "diagnostic_value_too_large"
+            });
+            pair_len = serde_json::to_string(&serde_json::json!({ &key: safe_value.clone() }))
+                .map(|text| text.len())
+                .unwrap_or(128);
+        }
+        if !current.is_empty() && current_len.saturating_add(pair_len) > 2800 {
+            chunks.push(current);
+            current = Map::new();
+            current_len = 0;
+        }
+        current_len = current_len.saturating_add(pair_len);
+        current.insert(key, safe_value);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    let chunk_count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, diagnostics)| {
+            let event = serde_json::json!({
+                "type": "readiness_diagnostics",
+                "operator_session_id": operator_session_id,
+                "sequence": sequence,
+                "chunk_index": idx,
+                "chunk_count": chunk_count,
+                "diagnostics": diagnostics,
+            });
+            let serialized = serde_json::to_string(&event)
+                .unwrap_or_else(|_| "{\"type\":\"readiness_diagnostics_error\"}".into());
+            if serialized.len() <= 3500 {
+                serialized
+            } else {
+                serde_json::to_string(&serde_json::json!({
+                    "type": "readiness_diagnostics",
+                    "operator_session_id": operator_session_id,
+                    "sequence": sequence,
+                    "chunk_index": idx,
+                    "chunk_count": chunk_count,
+                    "diagnostics": {
+                        "chunk_omitted": {
+                            "omitted": true,
+                            "reason": "diagnostic_chunk_too_large"
+                        }
+                    },
+                }))
+                .unwrap_or_else(|_| "{\"type\":\"readiness_diagnostics_error\"}".into())
+            }
+        })
+        .collect()
+}
 fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
     if is_sensitive_bridge_log_key(key) {
         return Value::String("<redacted>".into());
@@ -1202,11 +1318,17 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
+        let parsed_for_log = serde_json::from_str::<Value>(&line).ok();
         append_operator_log_line(
             &log_sink,
             "desktop.compute_node.stdout",
             &redact_bridge_stdout_line(&line),
         );
+        if let Some(payload) = parsed_for_log.as_ref() {
+            for chunk in readiness_operator_log_chunks(payload) {
+                append_operator_log_line(&log_sink, "desktop.compute_node.readiness", &chunk);
+            }
+        }
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 let payload = with_log_file_path(payload, log_file_path.as_deref());
@@ -1594,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_bridge_stdout_payload_includes_safe_readiness_diagnostics() {
+    fn summarize_bridge_stdout_payload_excludes_readiness_diagnostics() {
         let summary = summarize_bridge_stdout_payload(&serde_json::json!({
             "type": "error",
             "last_error": "runtime_completion_smoke_plain_completion_worker_exception",
@@ -1616,77 +1738,33 @@ mod tests {
         }));
         let payload: Value = serde_json::from_str(&summary).expect("summary json");
 
+        assert!(summary.len() <= 3500);
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
         assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_method")
-                .and_then(Value::as_str),
-            Some("create_completion_keyword_prompt")
+            payload.get("last_error").and_then(Value::as_str),
+            Some("runtime_completion_smoke_plain_completion_worker_exception")
         );
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_method")
+            .is_none());
         assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_rejected_option")
-                .and_then(Value::as_str),
-            Some("temperature")
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_requested_context_tokens")
-                .and_then(Value::as_i64),
-            Some(65536)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_original_context_tokens")
-                .and_then(Value::as_i64),
-            Some(32768)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_context_multiplier")
-                .and_then(Value::as_f64),
-            Some(2.0)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_rope_freq_scale")
-                .and_then(Value::as_f64),
-            Some(0.5)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_ext_factor_overridden")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_rope_scaling_type_source")
-                .and_then(Value::as_str),
-            Some("enum")
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_yarn_configuration_valid")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count")
-                .and_then(Value::as_i64),
-            Some(28)
-        );
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
-                .and_then(Value::as_bool),
-            Some(true)
+            readiness_operator_log_chunks(&serde_json::json!({
+                "operator_session_id": "s1",
+                "sequence": 9,
+                "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+                "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
+                "api_v1_readiness_yarn_requested_context_tokens": 65536,
+                "api_v1_readiness_prompt_text": "unsafe",
+            }))
+            .into_iter()
+            .map(|chunk| {
+                assert!(chunk.len() <= 3500);
+                serde_json::from_str::<Value>(&chunk).expect("readiness chunk json")
+            })
+            .filter_map(|chunk| chunk.get("diagnostics").cloned())
+            .collect::<Vec<_>>()
+            .len(),
+            1
         );
     }
 
@@ -1713,12 +1791,12 @@ mod tests {
             .get("api_v1_readiness_completion_smoke_attempted_generation_kwargs")
             .is_none());
         assert!(payload.get("api_v1_readiness_prompt_text").is_none());
-        assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
+        // summarize_bridge_stdout_payload emits only lifecycle fields; readiness
+        // diagnostic keys (even safe booleans) go to readiness_operator_log_chunks,
+        // not to the stdout summary.
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_plain_completion_accepts_var_kwargs")
+            .is_none());
         assert!(payload
             .get("api_v1_readiness_yarn_requested_context_tokens")
             .is_none());
@@ -1728,12 +1806,71 @@ mod tests {
         assert!(payload
             .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count")
             .is_none());
+        assert!(payload
+            .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
+            .is_none());
+    }
+
+    #[test]
+    fn readiness_operator_log_chunks_reconstruct_safe_sorted_diagnostics() {
+        let payload = serde_json::json!({
+            "type": "status",
+            "operator_session_id": "s1",
+            "sequence": 12,
+            "api_v1_readiness_result": "failed",
+            "api_v1_readiness_error_code": "compute_node_inference_failed",
+            "api_v1_readiness_qwen_64k_runtime_profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "api_v1_readiness_qwen_64k_runtime_profile_result": "failed",
+            "api_v1_readiness_qwen_64k_runtime_profile_recovery_count": 1,
+            "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category": "backend_graph_compute_failure",
+            "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
+            "api_v1_readiness_completion_smoke_plain_completion_backend_failure_category": "backend_graph_compute_failure",
+            "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status": 5,
+            "api_v1_readiness_completion_smoke_safe_summary": "RuntimeError:redacted",
+            "api_v1_readiness_prompt_text": "unsafe prompt",
+            "api_v1_readiness_completion_smoke_attempted_generation_kwargs": ["max_tokens"],
+        });
+        let summary = summarize_bridge_stdout_payload(&payload);
+        assert!(summary.len() <= 3500);
+        let summary_payload: Value = serde_json::from_str(&summary).expect("summary json");
         assert_eq!(
-            payload
-                .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
-                .and_then(Value::as_bool),
-            Some(true)
+            summary_payload
+                .get("api_v1_readiness_qwen_64k_runtime_profile_id")
+                .and_then(Value::as_str),
+            Some("qwen64k_kv_q8_fa_small_batch")
         );
+        assert!(summary_payload
+            .get("api_v1_readiness_completion_smoke_method")
+            .is_none());
+
+        let chunks = readiness_operator_log_chunks(&payload);
+        assert!(!chunks.is_empty());
+        let expected = safe_readiness_diagnostics_from_payload(&payload);
+        let mut reconstructed = Map::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.len() <= 3500);
+            let event: Value = serde_json::from_str(chunk).expect("chunk json");
+            assert_eq!(
+                event.get("chunk_index").and_then(Value::as_u64),
+                Some(idx as u64)
+            );
+            assert_eq!(
+                event.get("chunk_count").and_then(Value::as_u64),
+                Some(chunks.len() as u64)
+            );
+            let diagnostics = event
+                .get("diagnostics")
+                .and_then(Value::as_object)
+                .expect("diagnostics object");
+            let keys: Vec<_> = diagnostics.keys().cloned().collect();
+            let mut sorted_keys = keys.clone();
+            sorted_keys.sort();
+            assert_eq!(keys, sorted_keys);
+            for (key, value) in diagnostics {
+                reconstructed.insert(key.clone(), value.clone());
+            }
+        }
+        assert_eq!(Value::Object(reconstructed), Value::Object(expected));
     }
 
     #[test]

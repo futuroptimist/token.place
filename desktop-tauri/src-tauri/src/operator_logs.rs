@@ -580,7 +580,8 @@ fn sanitize_path_display(value: &str) -> String {
 
 fn is_path_like(value: &str) -> bool {
     let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
-    trimmed.starts_with('/')
+    is_windows_sensitive_path_like(trimmed)
+        || trimmed.starts_with('/')
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
         || trimmed.contains('/')
@@ -610,7 +611,8 @@ fn sanitize_filename_component(value: &str) -> String {
 }
 
 fn sanitize_log_line(line: &str) -> String {
-    line.chars()
+    let normalized: String = line
+        .chars()
         .map(|ch| {
             if ch.is_control() && ch != '\t' {
                 ' '
@@ -618,9 +620,47 @@ fn sanitize_log_line(line: &str) -> String {
                 ch
             }
         })
-        .collect()
+        .collect();
+    sanitize_windows_paths_in_text(&normalized)
 }
 
+fn sanitize_windows_paths_in_text(line: &str) -> String {
+    let mut out = Vec::new();
+    for token in line.split_whitespace() {
+        if token.eq_ignore_ascii_case("command") || token.starts_with("Command") {
+            out.push("Command".to_string());
+            out.push("[<redacted>]".to_string());
+            break;
+        }
+        if is_windows_sensitive_path_like(token) {
+            out.push(sanitize_path_display(token));
+        } else {
+            out.push(token.to_string());
+        }
+    }
+    if out.is_empty() {
+        line.to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
+fn is_windows_sensitive_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let lower = trimmed
+        .replace(r"\\", r"\")
+        .replace('/', r"\")
+        .to_ascii_lowercase();
+    lower.contains(r"\users\")
+        || lower.contains(r"\appdata\")
+        || lower.contains(r"\programs\python\")
+        || lower.contains("python311")
+        || lower.starts_with(r"\\?\c:\")
+        || lower.starts_with(r"\\?\unc\")
+        || lower.starts_with(r"\\")
+        || (lower.len() > 3 && lower.as_bytes()[1] == b':' && lower.as_bytes()[2] == b'\\')
+}
 #[cfg(target_os = "macos")]
 fn quote_applescript_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
@@ -635,6 +675,17 @@ fn quote_powershell_single_string(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn windows_paths_and_timeoutexpired_commands_are_sanitized() {
+        let line = r#"TimeoutExpired Command ['\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe', '-c', 'secret'] stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=30"#;
+        let sanitized = sanitize_operator_diagnostic_line(line);
+        assert!(!sanitized.contains("Alice"));
+        assert!(!sanitized.contains("AppData"));
+        assert!(!sanitized.contains("Python311"));
+        assert!(!sanitized.contains("'-c'"));
+        assert!(sanitized.contains("Command [<redacted>]"));
+    }
 
     #[test]
     fn compute_operator_log_path_sanitizes_session_and_preserves_spaces_in_dir() {

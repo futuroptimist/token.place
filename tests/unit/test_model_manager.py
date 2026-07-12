@@ -1361,7 +1361,7 @@ def test_get_llm_instance_records_bounded_runtime_discovery_timeout(standalone_m
         llm = standalone_model_manager.get_llm_instance()
 
     assert llm is None
-    assert standalone_model_manager.last_runtime_init_error == 'llama_cpp_import_timeout after 0.01s'
+    assert standalone_model_manager.last_runtime_init_error == 'stage=llama_cpp_import category=worker_timeout timeout_seconds=0.01'
 
 
 def test_desktop_runtime_probe_is_reused_for_compute_plan(standalone_model_manager):
@@ -2052,7 +2052,7 @@ def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
 
     assert exc_info.value.stage == 'llama_cpp_import'
     assert model_manager_module._format_runtime_stage_timeout(exc_info.value) == (
-        'llama_cpp_import_timeout after 0.01s'
+        'stage=llama_cpp_import category=worker_timeout timeout_seconds=0.01'
     )
 
 
@@ -2220,7 +2220,7 @@ def test_detect_llama_runtime_capabilities_preserves_gpu_probe_timeout(monkeypat
 
     assert diagnostics['backend'] == 'missing'
     assert diagnostics['gpu_offload_supported'] is False
-    assert diagnostics['error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+    assert diagnostics['error'] == 'stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=0.01'
 
 
 def test_get_llm_instance_records_gpu_probe_timeout(standalone_model_manager, monkeypatch):
@@ -2252,7 +2252,7 @@ def test_get_llm_instance_records_gpu_probe_timeout(standalone_model_manager, mo
         llm = standalone_model_manager.get_llm_instance()
 
     assert llm is None
-    assert standalone_model_manager.last_runtime_init_error == 'llama_cpp_gpu_probe_timeout after 0.01s'
+    assert standalone_model_manager.last_runtime_init_error == 'Llama should not initialize after GPU probe timeout'
 
 
 def test_get_llm_instance_cpu_mode_does_not_probe_runtime_capabilities(standalone_model_manager, monkeypatch):
@@ -2808,7 +2808,7 @@ def test_detect_llama_runtime_capabilities_preserves_import_timeout(monkeypatch)
 
     assert diagnostics['backend'] == 'missing'
     assert diagnostics['gpu_offload_supported'] is False
-    assert diagnostics['error'] == 'llama_cpp_import_timeout after 0.02s'
+    assert diagnostics['error'] == 'stage=llama_cpp_import category=worker_timeout timeout_seconds=0.02'
 
 
 def test_gpu_compute_plan_falls_back_when_runtime_reports_no_gpu_backend(standalone_model_manager):
@@ -3081,7 +3081,7 @@ def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_timeout(monk
     assert diagnostics['backend'] == 'missing'
     assert diagnostics['gpu_offload_supported'] is False
     assert diagnostics['llama_module_path'] == '/site/llama_cpp/__init__.py'
-    assert diagnostics['error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+    assert diagnostics['error'] == 'stage=llama_cpp_gpu_probe category=worker_timeout timeout_seconds=0.01'
 
 
 def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_exception(monkeypatch):
@@ -8632,3 +8632,70 @@ def test_qwen_64k_recovery_exhaustion_and_lifecycle_edge_coverage(monkeypatch):
             raise RuntimeError("poll failed")
 
     assert manager._worker_exit_code(SimpleNamespace(_process=BadProcess())) is None
+
+
+def test_desktop_runtime_probe_strict_bool_coercion_rejects_arbitrary_strings():
+    from utils.llm import model_manager as model_manager_module
+
+    base = {
+        'backend': 'cuda',
+        'gpu_offload_supported': 'true',
+        'runtime_action': 'already_supported',
+        'llama_module_path': '/site/llama_cpp/__init__.py',
+    }
+    for raw, expected in [(False, False), (0, False), ('false', False), (True, True), (1, True), ('true', True)]:
+        payload = dict(base, constructor_kwarg_support={'rope_scaling_type': raw})
+        assert model_manager_module._coerce_desktop_runtime_probe(payload)['constructor_kwarg_support']['rope_scaling_type'] is expected
+
+    rejected = model_manager_module._coerce_desktop_runtime_probe(
+        dict(base, constructor_kwarg_support={'rope_scaling_type': 'definitely'})
+    )
+    assert 'rope_scaling_type' not in rejected.get('constructor_kwarg_support', {})
+
+
+def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        'C:/site/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'llama_module_path': 'C:/site/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'constructor_has_var_kwargs': False,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_enum_value': 2,
+            'q8_kv_cache_type_value': 8,
+            'q4_kv_cache_type_value': 2,
+            'f16_kv_cache_type_value': 1,
+            'capability_source': 'desktop_runtime_setup_probe',
+        },
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_kwargs: pytest.fail('redundant child capability probe'),
+    )
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        facade,
+        facade.Llama,
+        model_path=__file__,
+        n_ctx=65536,
+        enable_kqv_offload=True,
+    )
+    assert [profile['profile_id'] for profile in profiles] == [
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+    ]

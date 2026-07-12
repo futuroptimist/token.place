@@ -168,7 +168,7 @@ def test_macos_metal_already_supported_requires_yarn_for_qwen_64k(monkeypatch):
 
     assert installs
     assert result['runtime_action'] == 'installed_metal_reexec'
-    assert result['yarn_rope_supported'] == 'true'
+    assert result['yarn_rope_supported'] is True
     assert result['yarn_resolver_source'] == 'numeric_fallback'
 
 
@@ -184,7 +184,7 @@ def test_macos_metal_already_supported_skips_yarn_probe_for_qwen_8k(monkeypatch)
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT, context_tier='8k-fast')
 
     assert result['runtime_action'] == 'metal_already_supported'
-    assert result['yarn_rope_supported'] == 'false'
+    assert result['yarn_rope_supported'] is False
 
 def test_already_supported_runtime_prepends_dependency_target(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
@@ -1959,7 +1959,7 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
     )
 
     assert result['runtime_action'] == 'failed'
-    assert result['yarn_rope_supported'] == 'false'
+    assert result['yarn_rope_supported'] is False
     assert (
         'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed'
         in result['fallback_reason']
@@ -1997,7 +1997,7 @@ def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(m
 
     assert result['runtime_action'] == 'installed_cuda_reexec'
     assert result['selected_backend'] == 'cuda'
-    assert result['yarn_rope_supported'] == 'true'
+    assert result['yarn_rope_supported'] is True
 
 
 def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
@@ -2051,7 +2051,7 @@ def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monke
 
     assert len(installs) == 2
     assert result['runtime_action'] == 'installed_metal_reexec'
-    assert result['yarn_rope_supported'] == 'true'
+    assert result['yarn_rope_supported'] is True
 
 
 def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp_path):
@@ -2069,3 +2069,42 @@ def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp
 
     assert result['runtime_action'] == 'probe_only'
     assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
+
+
+def test_probe_result_payload_preserves_native_capability_types(monkeypatch):
+    support = {name: True for name in desktop_runtime_setup.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cuda',
+        gpu_offload_supported=True,
+        detected_device='cuda',
+        interpreter=sys.executable,
+        prefix=sys.prefix,
+        llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        constructor_kwarg_support=support,
+        constructor_has_var_kwargs=False,
+        constructor_signature_inspectable=True,
+        qwen_64k_yarn_support='supported',
+        yarn_enum_value=2,
+        q8_kv_cache_type_value=8,
+        q4_kv_cache_type_value=2,
+        f16_kv_cache_type_value=1,
+        yarn_rope_supported=True,
+        yarn_resolver_source='numeric_fallback',
+        rope_scaling_type_supported=True,
+        rope_freq_scale_supported=True,
+        yarn_orig_ctx_supported=True,
+    )
+
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    assert payload['gpu_offload_supported'] is True
+    assert payload['constructor_kwarg_support'] == support
+    assert payload['qwen_64k_yarn_support'] == 'supported'
+    assert payload['yarn_enum_value'] == 2
+    assert payload['q8_kv_cache_type_value'] == 8
+    assert payload['capability_source'] == 'desktop_runtime_setup_probe'
+    monkeypatch.delenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, raising=False)
+    desktop_runtime_setup._record_desktop_runtime_probe({'runtime_action': 'already_supported', **payload})
+    recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+    assert recorded['gpu_offload_supported'] is True
+    assert isinstance(recorded['yarn_enum_value'], int)
+    assert recorded['constructor_kwarg_support']['rope_scaling_type'] is True

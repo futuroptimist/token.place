@@ -8,8 +8,9 @@ use crate::operator_logs::{
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
-    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
-    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    resolve_python_launcher_resource_aware, resolve_runtime_import_root,
+    should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionContext,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -1081,8 +1082,20 @@ pub async fn start_compute_node(
         }
     };
     let launcher = if is_python_script(&bridge_script) {
-        match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
-            .await
+        match tokio::task::spawn_blocking({
+            let resource_dir = app.path().resource_dir().ok();
+            let exe_path = std::env::current_exe().ok();
+            move || {
+                resolve_python_launcher_resource_aware(PythonLauncherResolutionContext {
+                    override_env_var: "TOKEN_PLACE_SIDECAR_PYTHON",
+                    tauri_resource_dir: resource_dir.as_deref(),
+                    current_exe: exe_path.as_deref(),
+                    manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
+                    packaged: !cfg!(debug_assertions),
+                })
+            }
+        })
+        .await
         {
             Ok(result) => match result {
                 Ok(launcher) => Some(launcher),

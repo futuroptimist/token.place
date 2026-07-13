@@ -1,7 +1,8 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{
-    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
-    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    resolve_python_launcher_resource_aware, resolve_runtime_import_root,
+    should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionContext,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -260,9 +261,21 @@ pub async fn start_sidecar(
 
     let launcher = if is_python_script(&sidecar_script) {
         Some(
-            tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
-                .await
-                .map_err(|e| anyhow::anyhow!("python launcher resolver task failed: {e}"))??,
+            tokio::task::spawn_blocking({
+                let resource_dir = app.path().resource_dir().ok();
+                let exe_path = std::env::current_exe().ok();
+                move || {
+                    resolve_python_launcher_resource_aware(PythonLauncherResolutionContext {
+                        override_env_var: "TOKEN_PLACE_SIDECAR_PYTHON",
+                        tauri_resource_dir: resource_dir.as_deref(),
+                        current_exe: exe_path.as_deref(),
+                        manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
+                        packaged: !cfg!(debug_assertions),
+                    })
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("python launcher resolver task failed: {e}"))??,
         )
     } else {
         None

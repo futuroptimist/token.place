@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "cpython_version": "3.11.13",
+  "python_build_standalone_release": "20250612",
+  "python_build_standalone_build": "cpython-3.11.13+20250612-aarch64-apple-darwin-install_only",
+  "target_triple": "aarch64-apple-darwin",
+  "archive_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250612/cpython-3.11.13%2B20250612-aarch64-apple-darwin-install_only.tar.gz",
+  "archive_sha256": "e272f0baca8f5a3cef29cc9c7418b80d0316553062ad3235205a33992155043c",
+  "expected_archive_root": "python",
+  "expected_interpreter_path": "bin/python3",
+  "expected_architecture": "arm64",
+  "minimum_macos_version": "12.0",
+  "expected_packaged_runtime_path": "Contents/Resources/python-runtime/bin/python3",
+  "required_packages": {
+    "psutil": "7.1.0",
+    "requests": "2.32.5",
+    "python-dotenv": "1.1.1",
+    "cryptography": "46.0.1",
+    "Jinja2": "3.1.6",
+    "llama-cpp-python": "0.3.32"
+  },
+  "runtime_license_notice_metadata": {
+    "python_license": "PSF-2.0",
+    "python_build_standalone_project": "astral-sh/python-build-standalone",
+    "notices": [
+      "Bundle the PSF Python license and python-build-standalone distribution notices with the generated runtime."
+    ]
+  }
+}

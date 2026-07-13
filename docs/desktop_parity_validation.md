@@ -55,11 +55,11 @@ Do not make production two-node or round-robin claims until both Windows and mac
 ### macOS Metal prerequisites
 
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
-- Xcode Command Line Tools available for local source builds when a wheel is not sufficient.
+- Xcode Command Line Tools are optional for local developer source-build experiments only; packaged Apple Silicon releases use the bundled Python runtime and must not require CLT.
 - Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
 - Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. The runtime setup/status payload should show `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `llama_module_path`, `runtime_action`, and any pip/CMake tails from provisioning.
-- If Apple CLT Python lacks pip or build tooling, install/repair pip for that interpreter or install Xcode Command Line Tools, then rerun the packaged app. The app-managed dependency target is `.token_place_desktop_site`; validation should not require writing packages into the CLT Python prefix.
+- If a packaged Apple Silicon app reports a missing or invalid bundled runtime, reinstall token.place desktop from a complete DMG. Do not ask normal users to install or repair Python, Homebrew, Xcode, or Command Line Tools.
 
 ### Backend field meanings
 
@@ -225,8 +225,9 @@ payloads to persisted logs.
 
 ## macOS packaged Metal runtime validation
 
-For packaged `.app` builds, the bridge may launch with Apple Command Line Tools
-Python (for example `/Library/Developer/CommandLineTools/usr/bin/python3`) when
+For packaged Apple Silicon `.app` builds, the bridge launches only the bundled
+`Contents/Resources/python-runtime/bin/python3`; it must not probe Apple Command Line Tools
+Python or other system interpreters. Developer builds may use an override when
 that is the interpreter discovered by the launcher. The runtime setup must not
 install `llama-cpp-python` into that protected prefix. Instead, it installs into a
 writable desktop dependency target and adds that target to the same import path

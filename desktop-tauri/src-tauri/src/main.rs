@@ -163,8 +163,15 @@ fn sanitize_model_bridge_payload_field(key: &str, value: &Value) -> Value {
 }
 
 fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifactInfo, String> {
-    let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
-        .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
+    let resource_dir = app.path().resource_dir().ok();
+    let exe_path = std::env::current_exe().ok();
+    let launcher = python_runtime::resolve_python_launcher_for_context(
+        "TOKEN_PLACE_PYTHON",
+        resource_dir.as_deref(),
+        exe_path.as_deref(),
+        !cfg!(debug_assertions),
+    )
+    .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());

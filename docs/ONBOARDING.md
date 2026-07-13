@@ -94,3 +94,8 @@ Development dependencies live in [requirements.txt](../requirements.txt).
 static analysis failures surface before the broader CI workflow runs.
 
 Happy hacking!
+
+
+## macOS desktop release runtime
+
+The Apple Silicon token.place desktop release DMG includes its own Python 3.11 runtime and Metal `llama-cpp-python` dependencies inside the `.app`. End users do not need Python, Homebrew, Xcode, or Xcode Command Line Tools for the packaged app. A missing-runtime message means the app bundle is incomplete or damaged; reinstall token.place desktop. Developer builds may still use an explicit Python override while working locally.

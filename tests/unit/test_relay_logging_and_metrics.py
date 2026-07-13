@@ -516,11 +516,15 @@ def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkey
 
     monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", "metrics-secret")
     before = _metric_body(relay_client, headers={"Authorization": "Bearer metrics-secret"})
-    before_failed = _metric_value(
-        before,
-        'tokenplace_http_requests_total',
-        '{method="GET",outcome="failed",provider_mode="relay",route="/metrics",status_class="4xx"}',
-    )
+    before_failed = 0.0
+    try:
+        before_failed = _metric_value(
+            before,
+            'tokenplace_http_requests_total',
+            '{method="GET",outcome="failed",provider_mode="relay",route="/metrics",status_class="4xx"}',
+        )
+    except AssertionError:
+        pass
     before_completed = 0.0
     try:
         before_completed = _metric_value(
@@ -657,6 +661,77 @@ def test_node_stale_registered_then_evicted_and_expired_in_flight_excluded(relay
         _metric_value(body, "tokenplace_compute_node_evictions_total", '{reason="stale_lease"}')
         == before_evictions + 1
     )
+
+
+def test_stale_eviction_uses_terminal_lock_before_server_lock(relay_client, monkeypatch) -> None:
+    """Stale eviction must not acquire the terminal transition lock while holding the server lock."""
+
+    class TrackingLock:
+        def __init__(self, lock):
+            self._lock = lock
+            self.depth = 0
+            self.max_depth = 0
+
+        def acquire(self, *args, **kwargs):
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                self.depth += 1
+                self.max_depth = max(self.max_depth, self.depth)
+            return acquired
+
+        def release(self):
+            self.depth -= 1
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.release()
+            return False
+
+    class TerminalTrackingLock(TrackingLock):
+        def __init__(self, lock, server_lock):
+            super().__init__(lock)
+            self.server_lock = server_lock
+            self.acquired_while_server_lock_held = False
+
+        def acquire(self, *args, **kwargs):
+            if self.server_lock.depth and not self.depth:
+                self.acquired_while_server_lock_held = True
+            return super().acquire(*args, **kwargs)
+
+    server_lock = TrackingLock(relay_module.server_round_robin_lock)
+    terminal_lock = TerminalTrackingLock(relay_module.api_v1_terminal_transition_lock, server_lock)
+    monkeypatch.setattr(relay_module, "server_round_robin_lock", server_lock)
+    monkeypatch.setattr(relay_module, "api_v1_terminal_transition_lock", terminal_lock)
+
+    before = {
+        "cancelled": _outcome_value(relay_client, "cancelled"),
+        "completed": _outcome_value(relay_client, "completed"),
+    }
+    _register_node(relay_client)
+    _queue_request(relay_client, request_id="request-stale-eviction-lock-order")
+    known_servers["server-key"]["last_ping"] = datetime.now() - timedelta(seconds=120)
+
+    evicted = relay_module._evict_stale_servers()
+
+    assert evicted == ["server-key"]
+    assert terminal_lock.acquired_while_server_lock_held is False
+    assert "server-key" not in known_servers
+    assert "server-key" not in client_inference_requests
+    assert "client-key" not in client_pending_request_ids
+    assert "client-key" not in client_responses
+    assert (
+        relay_module._get_terminal_request(
+            "client-key",
+            "request-stale-eviction-lock-order",
+        )["status"]
+        == "cancelled"
+    )
+    assert _outcome_value(relay_client, "cancelled") == before["cancelled"] + 1
+    assert _outcome_value(relay_client, "completed") == before["completed"]
 
 
 def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, monkeypatch) -> None:

@@ -1185,6 +1185,7 @@ def _evict_stale_servers() -> list[str]:
     default_stale_after = _server_stale_seconds()
     now_monotonic = time.monotonic()
     evicted: list[str] = []
+    stale_candidates: list[str] = []
     with server_round_robin_lock:
         server_items = list(known_servers.items())
         for server_public_key, payload in server_items:
@@ -1223,8 +1224,38 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            if _unregister_server(server_public_key, eviction_reason="stale_lease"):
-                evicted.append(server_public_key)
+            stale_candidates.append(server_public_key)
+
+    for server_public_key in stale_candidates:
+        with api_v1_terminal_transition_lock:
+            with server_round_robin_lock:
+                payload = known_servers.get(server_public_key)
+                if not isinstance(payload, dict):
+                    continue
+                polling_until = payload.get("polling_until_monotonic")
+                if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+                    continue
+                in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+                if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+                    continue
+                stale_after = payload.get("last_ping_duration", default_stale_after)
+                if not isinstance(stale_after, (int, float)):
+                    stale_after = default_stale_after
+                stale_after = max(float(stale_after), 1.0)
+                if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
+                    continue
+                with api_v1_in_flight_requests_lock:
+                    in_flight_requests = payload.get("api_v1_in_flight_requests")
+                    if isinstance(in_flight_requests, dict):
+                        has_active_in_flight_requests = any(
+                            isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
+                            and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
+                            for entry in in_flight_requests.values()
+                        )
+                        if has_active_in_flight_requests:
+                            continue
+                if _unregister_server(server_public_key, eviction_reason="stale_lease"):
+                    evicted.append(server_public_key)
     return evicted
 
 

@@ -167,6 +167,44 @@ jobs:
           assert secret["valueFrom"]["secretKeyRef"]["key"] == "token"
           PY
 
+      - name: Template metrics ServiceMonitor render check
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set metrics.enabled=true \
+            --set metrics.auth.existingSecret=tokenplace-metrics \
+            --set serviceMonitor.enabled=true \
+            --set serviceMonitor.relabelings.environment=staging > /tmp/tokenplace-render-metrics.yaml
+
+          grep -n "kind: ServiceMonitor" /tmp/tokenplace-render-metrics.yaml
+          grep -n "release: kube-prometheus-stack" /tmp/tokenplace-render-metrics.yaml
+          grep -n "name: TOKENPLACE_METRICS_TOKEN" -A5 /tmp/tokenplace-render-metrics.yaml
+          grep -n "authorization:" -A5 /tmp/tokenplace-render-metrics.yaml
+          grep -n "targetLabel: environment" -A1 /tmp/tokenplace-render-metrics.yaml | grep -n 'replacement: "staging"'
+          ! grep -n "path: /metrics" /tmp/tokenplace-render.yaml
+
+          python3 - <<'PY'
+          import yaml
+
+          docs = list(yaml.safe_load_all(open("/tmp/tokenplace-render-metrics.yaml", encoding="utf-8")))
+          docs = [doc for doc in docs if doc]
+          service = next(d for d in docs if d.get("kind") == "Service")
+          monitor = next(d for d in docs if d.get("kind") == "ServiceMonitor")
+          deploy = next(d for d in docs if d.get("kind") == "Deployment")
+          endpoint = monitor["spec"]["endpoints"][0]
+          assert monitor["spec"]["selector"]["matchLabels"] == service["spec"]["selector"]
+          assert endpoint["port"] == "http"
+          assert endpoint["authorization"]["credentials"] == {"name": "tokenplace-metrics", "key": "token"}
+          relabels = {item["targetLabel"]: item["replacement"] for item in endpoint["relabelings"]}
+          assert set(relabels) == {"app", "environment", "release", "cluster"}
+          assert deploy["spec"]["replicas"] == 1
+          assert deploy["spec"]["strategy"]["type"] == "Recreate"
+          env = {item["name"]: item for item in deploy["spec"]["template"]["spec"]["containers"][0]["env"]}
+          assert env["RELAY_WORKERS"]["value"] == "1"
+          assert env["TOKENPLACE_METRICS_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "tokenplace-metrics", "key": "token"}
+          assert not any(doc.get("kind") == "Ingress" and "/metrics" in str(doc) for doc in docs)
+          PY
+
       - name: Template strategy-empty fallback smoke render
         run: |
 

@@ -111,10 +111,10 @@ jobs:
           grep -n -E '127\.0\.0\.1:(6000|\$\(RELAY_PORT\))' /tmp/tokenplace-render-port.yaml
 
       - name: Install Python dependencies for Helm assertions
-        run: pip3 install -r config/requirements_codex_verification.txt
+        run: python3 -m pip install -r config/requirements_codex_verification.txt
 
       - name: Run Helm chart metrics assertions
-        run: pytest -q tests/unit/test_tokenplace_chart_metrics.py
+        run: python3 -m pytest -q tests/unit/test_tokenplace_chart_metrics.py
 
       - name: Duplicate-env validation
         run: |

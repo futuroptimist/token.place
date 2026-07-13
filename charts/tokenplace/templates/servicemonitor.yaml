@@ -1,0 +1,55 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- if not .Values.metrics.enabled }}{{ fail "metrics.enabled=true is required when serviceMonitor.enabled=true" }}{{- end }}
+{{- $metricsPath := default "/metrics" .Values.metrics.path }}
+{{- $metricsSecret := required "metrics.auth.existingSecret is required when serviceMonitor.enabled=true" .Values.metrics.auth.existingSecret }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "tokenplace.fullname" . }}
+  labels:
+    {{- include "tokenplace.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "tokenplace.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ $metricsPath | quote }}
+      interval: {{ .Values.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout | quote }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $metricsSecret | quote }}
+          key: {{ .Values.metrics.auth.secretKey | quote }}
+      {{- $targetLabels := .Values.serviceMonitor.targetLabels | default dict }}
+      {{- if or $targetLabels.app $targetLabels.environment $targetLabels.release $targetLabels.cluster }}
+      relabelings:
+        {{- with $targetLabels.app }}
+        - action: replace
+          targetLabel: app
+          replacement: {{ . | quote }}
+        {{- end }}
+        {{- with $targetLabels.environment }}
+        - action: replace
+          targetLabel: environment
+          replacement: {{ . | quote }}
+        {{- end }}
+        {{- with $targetLabels.release }}
+        - action: replace
+          targetLabel: release
+          replacement: {{ . | quote }}
+        {{- end }}
+        {{- with $targetLabels.cluster }}
+        - action: replace
+          targetLabel: cluster
+          replacement: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+{{- end }}

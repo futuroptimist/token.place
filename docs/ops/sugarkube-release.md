@@ -66,8 +66,8 @@ helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version CHART_VE
 
 Replace `CHART_VERSION` with the version recorded in the successful
 `ci-helm.yml` run summary or in the Sugarkube app config/version file. The
-current token.place chart source is `0.1.3`; Sugarkube `docs/apps/tokenplace.version`
-should pin `0.1.3` unless an operator explicitly documents why a different
+current token.place chart source is `0.1.4`; Sugarkube `docs/apps/tokenplace.version`
+should pin `0.1.4` unless an operator explicitly documents why a different
 package is being held back.
 
 ## Cluster and tunnel guardrails

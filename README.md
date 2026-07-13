@@ -281,10 +281,66 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Chart metadata: chart package version `0.1.3` preserves `appVersion: "0.1.1"`; the historical `v0.1.0` Git tag and `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0` image remain examples of immutable release artifacts, not a current version-alignment requirement.
+- Chart metadata: chart package version `0.1.4` preserves `appVersion: "0.1.1"`; the historical `v0.1.0` Git tag and `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0` image remain examples of immutable release artifacts, not a current version-alignment requirement.
 - Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - Pre-publish gate: `ci-helm.yml` checks whether the current chart version already exists at `oci://ghcr.io/futuroptimist/charts/tokenplace`. It publishes only new chart versions when chart source files changed, skips unchanged already-published versions as a no-op, and fails changed chart source with an already-published version so maintainers bump `charts/tokenplace/Chart.yaml`.
+
+
+### Optional internal Prometheus scrape
+
+The canonical chart keeps metrics opt-in and internal. Existing installs render no
+`ServiceMonitor` and do not set `TOKENPLACE_METRICS_TOKEN` unless metrics are
+enabled. For staging or production, create a Kubernetes Secret in the same namespace
+as the `ServiceMonitor` and enable both chart toggles:
+
+```yaml
+metrics:
+  enabled: true
+  auth:
+    existingSecret: tokenplace-metrics
+    secretKey: token
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: kube-prometheus-stack
+  targetLabels:
+    app: tokenplace
+    environment: staging
+    release: main-REPLACE_SHORTSHA
+    cluster: sugarkube-staging
+```
+
+The chart wires the Secret into the relay as `TOKENPLACE_METRICS_TOKEN` and configures
+Prometheus Operator `authorization.credentials` on the `ServiceMonitor` endpoint,
+so Prometheus sends `Authorization: Bearer <secret value>` when scraping the named
+`http` Service port at `/metrics`. The chart does not create a `/metrics` Ingress
+path; if the public app Ingress is enabled, unauthenticated public `/metrics` probes
+must receive `401` from the relay whenever staging or production metrics are enabled.
+
+Useful verification commands after deployment:
+
+```bash
+# Confirm the installed chart and immutable image identity.
+helm -n tokenplace get values tokenplace --all | yq '.serviceMonitor.additionalLabels.release, .serviceMonitor.targetLabels, .image.tag'
+
+# Confirm Prometheus target discovery labels from inside the monitoring stack.
+kubectl -n monitoring exec deploy/kube-prometheus-stack-prometheus -- \
+  wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=active' | \
+  jq '.data.activeTargets[] | select(.labels.job | test("tokenplace")) | {health, scrapeUrl, labels}'
+
+# Prove internal authenticated scrape success from the token.place namespace.
+TOKEN=$(kubectl -n tokenplace get secret tokenplace-metrics -o jsonpath='{.data.token}' | base64 -d)
+kubectl -n tokenplace run tokenplace-metrics-check --rm -i --restart=Never --image=curlimages/curl -- \
+  curl -fsS -H "Authorization: Bearer ${TOKEN}" http://tokenplace:80/metrics | head
+
+# Prove public unauthenticated scrape denial when metrics auth is enabled.
+curl -i https://staging.token.place/metrics | head
+
+# Inspect bounded target relabeling output in Prometheus.
+kubectl -n monitoring exec deploy/kube-prometheus-stack-prometheus -- \
+  wget -qO- 'http://127.0.0.1:9090/api/v1/series?match[]=up{app="tokenplace"}' | jq '.data[]'
+```
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo. The current app-specific deploy command is:
 

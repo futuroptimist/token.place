@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "path": { "type": "string", "default": "/metrics", "pattern": "^/[^\\s]*$" },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string", "default": "" },
+            "secretKey": { "type": "string", "default": "token", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "interval": { "type": "string", "default": "30s" },
+        "scrapeTimeout": { "type": "string", "default": "10s" },
+        "additionalLabels": {
+          "type": "object",
+          "default": { "release": "kube-prometheus-stack" },
+          "additionalProperties": { "type": "string" }
+        },
+        "targetLabels": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "app": { "type": "string", "default": "tokenplace" },
+            "environment": { "type": "string", "default": "" },
+            "release": { "type": "string", "default": "" },
+            "cluster": { "type": "string", "default": "" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -75,6 +75,28 @@ jobs:
           grep -n "name: XDG_STATE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/state"'
           ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
 
+      - name: Template authenticated ServiceMonitor render check
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set metrics.enabled=true \
+            --set metrics.auth.existingSecret=tokenplace-metrics \
+            --set serviceMonitor.enabled=true \
+            --set serviceMonitor.targetLabels.environment=staging \
+            --set serviceMonitor.targetLabels.release=main-deadbee \
+            --set serviceMonitor.targetLabels.cluster=sugarkube-staging > /tmp/tokenplace-render-metrics.yaml
+
+          grep -n "kind: ServiceMonitor" /tmp/tokenplace-render-metrics.yaml
+          grep -n "release: kube-prometheus-stack" /tmp/tokenplace-render-metrics.yaml
+          grep -n "name: TOKENPLACE_METRICS_TOKEN" -A5 /tmp/tokenplace-render-metrics.yaml | grep -n "secretKeyRef"
+          grep -n "name: tokenplace-metrics" /tmp/tokenplace-render-metrics.yaml
+          grep -n "key: token" /tmp/tokenplace-render-metrics.yaml
+          grep -n "authorization:" -A4 /tmp/tokenplace-render-metrics.yaml | grep -n "credentials:"
+          grep -n "targetLabel: app" /tmp/tokenplace-render-metrics.yaml
+          grep -n "targetLabel: environment" /tmp/tokenplace-render-metrics.yaml
+          grep -n "targetLabel: release" /tmp/tokenplace-render-metrics.yaml
+          grep -n "targetLabel: cluster" /tmp/tokenplace-render-metrics.yaml
+
       - name: Template relay port override smoke render
         run: |
           helm template tokenplace charts/tokenplace \

@@ -57,6 +57,25 @@ service:
   type: ClusterIP
   port: 80
 
+metrics:
+  enabled: false
+  path: /metrics
+  auth:
+    existingSecret: ""
+    secretKey: token
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  additionalLabels:
+    release: kube-prometheus-stack
+  targetLabels:
+    app: tokenplace
+    environment: ""
+    release: ""
+    cluster: ""
+
 ingress:
   enabled: false
   className: ""

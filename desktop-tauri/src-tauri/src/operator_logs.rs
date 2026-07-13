@@ -208,16 +208,20 @@ pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
                 .unwrap_or_else(|_| r#"{"type":"operator_log_json_sanitize_error"}"#.to_string());
         }
     }
-    if line.contains("TimeoutExpired") && line.contains("Command [") {
-        let timeout_seconds = parse_timeout_expired_seconds(&line)
+    sanitize_operator_diagnostic_text(&line)
+}
+
+fn sanitize_operator_diagnostic_text(text: &str) -> String {
+    if text.contains("TimeoutExpired") && text.contains("Command [") {
+        let timeout_seconds = parse_timeout_expired_seconds(text)
             .map(|seconds| format!(" timeout_seconds={seconds}"))
             .unwrap_or_default();
-        let stage = parse_timeout_expired_stage(&line).unwrap_or("subprocess_timeout");
+        let stage = parse_timeout_expired_stage(text).unwrap_or("subprocess_timeout");
         return format!(
             "desktop.llama_cpp_worker.init_failed stage={stage} category=worker_timeout{timeout_seconds}"
         );
     }
-    line.split_whitespace()
+    text.split_whitespace()
         .map(sanitize_operator_diagnostic_token)
         .collect::<Vec<_>>()
         .join(" ")
@@ -292,7 +296,7 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
                 .collect(),
         ),
         serde_json::Value::String(text) => {
-            serde_json::Value::String(sanitize_operator_diagnostic_token(text))
+            serde_json::Value::String(sanitize_operator_diagnostic_text(text))
         }
         _ => value.clone(),
     }
@@ -1185,6 +1189,26 @@ mod tests {
         assert_eq!(parsed["path"], "<path:python.exe>");
         assert!(!json.contains("Alice"));
         assert!(!json.contains("AppData"));
+
+        let json_timeout = sanitize_operator_diagnostic_line(
+            r#"{"message":"TimeoutExpired: Command ['C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe', '-c', 'import llama_cpp'] timed out after 45 seconds","stderr":"prefix TimeoutExpired: Command ['D:\\Users\\Bob\\AppData\\Local\\app.exe'] timed out after 9 seconds","safe":"ok"}"#,
+        );
+        let parsed_timeout: serde_json::Value =
+            serde_json::from_str(&json_timeout).expect("timeout json remains parseable");
+        assert_eq!(
+            parsed_timeout["message"],
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=45"
+        );
+        assert_eq!(
+            parsed_timeout["stderr"],
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=9"
+        );
+        assert_eq!(parsed_timeout["safe"], "ok");
+        assert!(!json_timeout.contains("Alice"));
+        assert!(!json_timeout.contains("Bob"));
+        assert!(!json_timeout.contains("AppData"));
+        assert!(!json_timeout.contains("Command ["));
+        assert!(!json_timeout.contains("import llama_cpp"));
 
         let drive = sanitize_operator_diagnostic_line(
             r#"python=C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe"#,

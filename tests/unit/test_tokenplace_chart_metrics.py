@@ -19,7 +19,7 @@ def test_metrics_and_service_monitor_default_disabled_values() -> None:
     values = _values()
 
     assert values["metrics"]["enabled"] is False
-    assert values["metrics"]["path"] == "/metrics"
+    assert "path" not in values["metrics"]
     assert values["metrics"]["auth"]["existingSecret"] == ""
     assert values["metrics"]["auth"]["secretKey"] == "token"
     assert values["serviceMonitor"]["enabled"] is False
@@ -33,6 +33,7 @@ def test_metrics_token_is_injected_only_from_existing_secret() -> None:
     assert "{{- if .Values.metrics.enabled }}" in deployment
     assert 'required "metrics.auth.existingSecret is required when metrics.enabled=true"' in deployment
     assert '"TOKENPLACE_METRICS_TOKEN"' in deployment
+    assert '"TOKENPLACE_METRICS_DISABLED"' in deployment
     assert '"valueFrom" (dict "secretKeyRef"' in deployment
     assert ".Values.metrics.auth.secretKey" in deployment
     assert "TOKENPLACE_METRICS_TOKEN" not in _read("values.yaml")
@@ -48,7 +49,7 @@ def test_service_monitor_renders_only_when_enabled_and_selects_canonical_service
     assert "selector:\n    matchLabels:" in service_monitor
     assert 'include "tokenplace.selectorLabels"' in service_monitor
     assert "- port: http" in service_monitor
-    assert 'path: {{ $metricsPath | quote }}' in service_monitor
+    assert 'path: "/metrics"' in service_monitor
     assert "targetPort: http" in service
     assert "- name: http" in service
 
@@ -78,7 +79,7 @@ def test_service_monitor_bounded_relabeling_hooks() -> None:
     values = _values()
     service_monitor = _read("templates/servicemonitor.yaml")
 
-    assert set(values["serviceMonitor"]["targetLabels"]) == {"app", "environment", "release", "cluster"}
+    assert set(values["serviceMonitor"]["metricLabels"]) == {"app", "environment", "release", "cluster"}
     for label in ("app", "environment", "release", "cluster"):
         assert f"targetLabel: {label}" in service_monitor
     assert "sourceLabels" not in service_monitor
@@ -88,7 +89,7 @@ def test_ingress_does_not_create_public_metrics_path() -> None:
     ingress = _read("templates/ingress.yaml")
 
     assert "path: /metrics" not in ingress
-    assert "metrics.path" not in ingress
+    assert "metrics" not in ingress
     assert "serviceMonitor" not in ingress
 
 
@@ -101,3 +102,12 @@ def test_single_replica_recreate_one_worker_constraints_preserved() -> None:
     assert '"RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")' in deployment
     assert "replicas: {{ .Values.replicaCount }}" in deployment
     assert '$strategyType := default "Recreate" .Values.strategy.type' in deployment
+
+
+def test_service_monitor_rejects_reserved_additional_label_keys() -> None:
+    service_monitor = _read("templates/servicemonitor.yaml")
+    schema = _read("values.schema.json")
+
+    assert "serviceMonitor.additionalLabels must not override chart label" in service_monitor
+    assert "app.kubernetes.io/name" in schema
+    assert "helm.sh/chart" in schema

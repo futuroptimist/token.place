@@ -82,9 +82,9 @@ jobs:
             --set metrics.enabled=true \
             --set metrics.auth.existingSecret=tokenplace-metrics \
             --set serviceMonitor.enabled=true \
-            --set serviceMonitor.targetLabels.environment=staging \
-            --set serviceMonitor.targetLabels.release=main-deadbee \
-            --set serviceMonitor.targetLabels.cluster=sugarkube-staging > /tmp/tokenplace-render-metrics.yaml
+            --set serviceMonitor.metricLabels.environment=staging \
+            --set serviceMonitor.metricLabels.release=main-deadbee \
+            --set serviceMonitor.metricLabels.cluster=sugarkube-staging > /tmp/tokenplace-render-metrics.yaml
 
           grep -n "kind: ServiceMonitor" /tmp/tokenplace-render-metrics.yaml
           grep -n "release: kube-prometheus-stack" /tmp/tokenplace-render-metrics.yaml

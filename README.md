@@ -290,9 +290,10 @@ Artifact references:
 ### Optional internal Prometheus scrape
 
 The canonical chart keeps metrics opt-in and internal. Existing installs render no
-`ServiceMonitor` and do not set `TOKENPLACE_METRICS_TOKEN` unless metrics are
-enabled. For staging or production, create a Kubernetes Secret in the same namespace
-as the `ServiceMonitor` and enable both chart toggles:
+`ServiceMonitor`, set `TOKENPLACE_METRICS_DISABLED=1` so the relay fails closed,
+and do not set `TOKENPLACE_METRICS_TOKEN` unless metrics are enabled. For staging
+or production, create a Kubernetes Secret in the same namespace as the
+`ServiceMonitor` and enable both chart toggles:
 
 ```yaml
 metrics:
@@ -304,7 +305,7 @@ serviceMonitor:
   enabled: true
   additionalLabels:
     release: kube-prometheus-stack
-  targetLabels:
+  metricLabels:
     app: tokenplace
     environment: staging
     release: main-REPLACE_SHORTSHA
@@ -316,13 +317,15 @@ Prometheus Operator `authorization.credentials` on the `ServiceMonitor` endpoint
 so Prometheus sends `Authorization: Bearer <secret value>` when scraping the named
 `http` Service port at `/metrics`. The chart does not create a `/metrics` Ingress
 path; if the public app Ingress is enabled, unauthenticated public `/metrics` probes
-must receive `401` from the relay whenever staging or production metrics are enabled.
+must receive `401` from the relay when metrics are disabled or when staging/production
+metrics are enabled. Keep the Secret value non-empty; an explicitly empty
+`TOKENPLACE_METRICS_TOKEN` also fails closed.
 
 Useful verification commands after deployment:
 
 ```bash
 # Confirm the installed chart and immutable image identity.
-helm -n tokenplace get values tokenplace --all | yq '.serviceMonitor.additionalLabels.release, .serviceMonitor.targetLabels, .image.tag'
+helm -n tokenplace get values tokenplace --all | yq '.serviceMonitor.additionalLabels.release, .serviceMonitor.metricLabels, .image.tag'
 
 # Confirm Prometheus target discovery labels from inside the monitoring stack.
 kubectl -n monitoring exec deploy/kube-prometheus-stack-prometheus -- \

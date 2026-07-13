@@ -333,6 +333,15 @@ def test_ci_installs_playwright_chromium_with_system_dependencies() -> None:
     )
 
 
+def test_run_all_tests_invokes_playwright_with_selected_python() -> None:
+    runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
+
+    assert '"$PYTHON_CMD" -m playwright --version' in runner
+    assert '"$PYTHON_CMD" -m playwright install --with-deps chromium' in runner
+    assert '"$PYTHON_CMD" -m playwright install chromium' in runner
+    assert "command -v playwright" not in runner
+
+
 def test_run_all_tests_detects_macos_arm64_playwright_chromium_cache() -> None:
     runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
 

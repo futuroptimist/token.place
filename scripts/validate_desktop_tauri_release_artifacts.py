@@ -277,22 +277,26 @@ def _sha256(path: Path) -> str:
 
 
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
-    env = {
-        "HOME": tempfile.mkdtemp(prefix="token-place-home-"),
-        "PYTHONNOUSERSITE": "1",
-        "PATH": "/usr/bin:/bin",
-    }
-    for key in ("TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON"):
-        env.pop(key, None)
-    result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
-    output = f"{result.stdout}\n{result.stderr}"
-    forbidden = ("xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "/Users/runner", "/Library/Developer/CommandLineTools")
-    for marker in forbidden:
-        if marker in output:
-            _fail(f"embedded Python output leaked forbidden marker: {marker}")
-    if result.returncode != 0:
-        _fail(_format_command_failure([str(py), "-c", "<probe>"], result))
-    return output.strip()
+    home = tempfile.mkdtemp(prefix="token-place-home-")
+    try:
+        env = {
+            "HOME": home,
+            "PYTHONNOUSERSITE": "1",
+            "PATH": "/usr/bin:/bin",
+        }
+        for key in ("TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON"):
+            env.pop(key, None)
+        result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
+        output = f"{result.stdout}\n{result.stderr}"
+        forbidden = ("xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "/Users/runner", "/Library/Developer/CommandLineTools")
+        for marker in forbidden:
+            if marker in output:
+                _fail(f"embedded Python output leaked forbidden marker: {marker}")
+        if result.returncode != 0:
+            _fail(_format_command_failure([str(py), "-c", "<probe>"], result))
+        return output.strip()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 def _validate_macho_linkage(path: Path, app_path: Path) -> None:
     if platform.system() != "Darwin":
@@ -336,8 +340,18 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
     data = json.loads(out.splitlines()[-1])
     if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
         _fail("embedded runtime probe did not report Metal GPU offload")
-    for key in ("rope_scaling_type","rope_freq_scale","yarn_orig_ctx","flash_attn","offload_kqv","n_batch","n_ubatch"):
-        if not data.get(key): _fail(f"embedded runtime probe missing capability: {key}")
+    top_level_capabilities = {
+        "rope_scaling_type": "rope_scaling_type_supported",
+        "rope_freq_scale": "rope_freq_scale_supported",
+        "yarn_orig_ctx": "yarn_orig_ctx_supported",
+    }
+    for name, field in top_level_capabilities.items():
+        if not data.get(field):
+            _fail(f"embedded runtime probe missing capability: {name}")
+    constructor_support = data.get("constructor_kwarg_support") or {}
+    for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
+        if not constructor_support.get(key):
+            _fail(f"embedded runtime probe missing capability: {key}")
     for candidate in runtime.rglob("*"):
         if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
 

@@ -1,9 +1,14 @@
-import hashlib, io, json, tarfile
-from pathlib import Path
+import hashlib
 import importlib.util
+import io
+import json
+import tarfile
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'scripts' / 'prepare_embedded_python_runtime.py'
 spec = importlib.util.spec_from_file_location('prepare_embedded_python_runtime', SCRIPT)
+assert spec is not None
+assert spec.loader is not None
 prep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prep)
 
@@ -94,3 +99,34 @@ def test_extract_valid_archive(tmp_path):
     make_tar(archive, {'python/bin/python3': b'#!/bin/sh\n'})
     root = prep.extract_archive(archive, manifest(), tmp_path / 'valid')
     assert (root / 'bin' / 'python3').is_file()
+
+def test_runtime_capability_probe_uses_serialized_runtime_probe_field_names():
+    payload = {
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+
+    assert prep._missing_runtime_capabilities(payload) == []
+
+
+def test_runtime_capability_probe_reports_nested_constructor_gaps():
+    payload = {
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': False,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True},
+    }
+
+    assert prep._missing_runtime_capabilities(payload) == [
+        'rope_freq_scale',
+        'offload_kqv',
+        'n_batch',
+        'n_ubatch',
+    ]

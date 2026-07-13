@@ -2,7 +2,18 @@
 """Prepare the relocatable Apple Silicon CPython runtime bundled in the .app."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -60,7 +71,7 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
         members = tf.getmembers()
         if not members: raise RuntimePrepError("runtime archive is empty")
         for member in members: validate_tar_member(member, m["expected_archive_root"])
-        tf.extractall(extract_dir, filter="data")
+        tf.extractall(extract_dir, filter="data")  # nosec B202 - all members are validated before extraction
     runtime = extract_dir / m["expected_archive_root"]
     if not (runtime / m["expected_interpreter_path"]).is_file(): raise RuntimePrepError("archive missing expected interpreter")
     return runtime
@@ -82,18 +93,33 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "ensurepip", "--upgrade"])
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
     req = SRC_TAURI / "python" / "requirements_desktop_runtime.txt"
-    run([str(py), "-m", "pip", "install", "-r", str(req), f"llama-cpp-python=={m['required_packages']['llama-cpp-python']}", "diskcache==5.6.3", "numpy==2.3.3"], env={"PIP_CACHE_DIR": str(pip_cache), "CMAKE_ARGS":"-DGGML_METAL=on", "FORCE_CMAKE":"1"})
+    pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items())]
+    run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages], env={"PIP_CACHE_DIR": str(pip_cache), "CMAKE_ARGS":"-DGGML_METAL=on", "FORCE_CMAKE":"1"})
     run([str(py), "-m", "pip", "check"])
     run([str(py), "-c", "import " + ",".join(IMPORTS)])
+
+def _missing_runtime_capabilities(payload: dict) -> list[str]:
+    top_level = {
+        "rope_scaling_type": "rope_scaling_type_supported",
+        "rope_freq_scale": "rope_freq_scale_supported",
+        "yarn_orig_ctx": "yarn_orig_ctx_supported",
+    }
+    constructor = (payload.get("constructor_kwarg_support") or {})
+    missing = [name for name, field in top_level.items() if not payload.get(field)]
+    missing.extend(
+        name
+        for name in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch")
+        if not constructor.get(name)
+    )
+    return missing
 
 def probe_runtime(py: Path, m: dict) -> dict:
     code = "import json,importlib.metadata as im; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
     env = {"PYTHONPATH": str(SRC_TAURI / "python") + os.pathsep + str(SRC_TAURI.parent.parent)}
     payload = json.loads(run([str(py), "-c", code], env=env).stdout)
-    required = ["rope_scaling_type","rope_freq_scale","yarn_orig_ctx","flash_attn","offload_kqv","n_batch","n_ubatch"]
     if payload.get("backend") != "metal" or not payload.get("gpu_offload_supported"): raise RuntimePrepError("embedded llama_cpp runtime is not Metal-capable")
     if payload.get("llama_cpp_python_version") != m["required_packages"]["llama-cpp-python"]: raise RuntimePrepError("wrong llama-cpp-python version")
-    missing = [k for k in required if not payload.get(k)]
+    missing = _missing_runtime_capabilities(payload)
     if missing: raise RuntimePrepError("missing Qwen 64K runtime capabilities: " + ", ".join(missing))
     return payload
 

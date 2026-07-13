@@ -292,8 +292,15 @@ where
                 Err(err) => last_error = Some(err),
             },
             Err(_) => {
+                let code = if candidate.source == PythonLauncherSource::EnvironmentOverride {
+                    DESKTOP_PYTHON_OVERRIDE_INVALID
+                } else if candidate.source == PythonLauncherSource::BundledRuntime {
+                    DESKTOP_PYTHON_RUNTIME_INVALID
+                } else {
+                    DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING
+                };
                 last_error = Some(launcher_error(
-                    DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING,
+                    code,
                     PythonLauncherCategory::LauncherSpawnFailed,
                     Some(&candidate),
                     false,
@@ -428,14 +435,6 @@ pub fn resolve_python_launcher_resource_aware(
                 None,
             ));
         }
-    } else if opts.packaged && !cfg!(target_os = "windows") {
-        return Err(launcher_error(
-            DESKTOP_PYTHON_RUNTIME_INVALID,
-            PythonLauncherCategory::BundledRuntimeMissing,
-            None,
-            true,
-            None,
-        ));
     }
     resolve_python_launcher(opts.override_var_name).map_err(|_| {
         launcher_error(
@@ -963,6 +962,43 @@ mod tests {
         assert!(msg.contains(DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING));
         assert!(!msg.contains("Python 2.7.18"));
         assert!(!msg.contains("spawn failed: missing"));
+    }
+
+    #[test]
+    fn spawn_failure_uses_candidate_source_specific_error_code() {
+        let candidates = vec![PythonLauncher::new(
+            "/missing/bundled/python3",
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            "test",
+        )];
+
+        let err = resolve_python_launcher_with_probe("TOKEN_PLACE_TEST_PYTHON", candidates, |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        })
+        .expect_err("expected bundled runtime spawn failure");
+
+        assert_eq!(err.public_code, DESKTOP_PYTHON_RUNTIME_INVALID);
+        assert_eq!(err.category, PythonLauncherCategory::LauncherSpawnFailed);
+        assert_eq!(err.source, PythonLauncherSource::BundledRuntime);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn packaged_linux_retains_system_python_fallback() {
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: None,
+            current_exe_path: None,
+            manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
+            packaged: true,
+        })
+        .expect("packaged Linux should probe installed system Python");
+
+        assert_eq!(
+            launcher.source,
+            PythonLauncherSource::SystemDevelopmentRuntime
+        );
     }
 
     #[test]

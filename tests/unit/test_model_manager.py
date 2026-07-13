@@ -3190,10 +3190,107 @@ def test_llama_subprocess_request_error_is_typed_only_for_inference_stage():
 
     assert str(exc_info.value) == (
         'llama_cpp_init failed; child_exception_type=RuntimeError; '
-        'safe_error_category=runtime_init_unclassified'
+        'safe_error_category=runtime_init_unclassified; child_stderr_tail=<empty>'
     )
     assert not isinstance(exc_info.value, model_manager_module.LlamaCppInferenceRequestError)
 
+
+
+def test_init_safe_category_alias_survives_subprocess_wrappers():
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        stdout=StringIO(
+            'TOKEN_PLACE_LLAMA_CPP_JSON:'
+            '{"status":"error","error":"Failed to create llama_context",'
+            '"exception_type":"RuntimeError","safe_error_category":"cuda_memory_allocation"}\n'
+        )
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=5,
+            stage='llama_cpp_import',
+        )
+
+    assert exc_info.value.safe_error_category == 'runtime_context_create_cuda_memory'
+    assert model_manager_module._classify_runtime_context_create_error(exc_info.value) == 'runtime_context_create_cuda_memory'
+
+
+def test_init_safe_category_rejects_spoofed_child_category():
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        stdout=StringIO(
+            'TOKEN_PLACE_LLAMA_CPP_JSON:'
+            '{"status":"error","error":"Failed to create llama_context",'
+            '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_cuda_memory;prompt=SECRET"}\n'
+        )
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=5,
+            stage='llama_cpp_import',
+        )
+
+    assert exc_info.value.safe_error_category == 'runtime_context_create_failed'
+    assert 'SECRET' not in str(exc_info.value)
+
+
+def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm.model_manager import ModelManager
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if len(attempts) < 3:
+                raise ValueError('Failed to create llama_context')
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert len(attempts) == 3
+    assert attempts[2]['type_k'] == 2
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
 def test_llama_worker_render_complete_allows_testing_stories_model_without_metadata(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module

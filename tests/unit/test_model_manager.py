@@ -8727,54 +8727,75 @@ def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeyp
     assert diagnostics['child_probe_reprobe_attempted'] is False
 
 
-def test_legacy_flat_desktop_probe_reprobes_for_actual_yarn_enum(monkeypatch):
+def test_legacy_flat_desktop_probe_uses_mandated_yarn_bridge_without_reprobe(monkeypatch, tmp_path):
+    from utils.context_profiles import apply_context_profile
     from utils.llm import model_manager as model_manager_module
 
-    support = {
-        'rope_scaling_type': True,
-        'rope_freq_scale': True,
-        'yarn_orig_ctx': True,
+    module_path = '/site/llama_cpp/__init__.py'
+    flat_payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': 'true',
+        'runtime_action': 'already_supported',
+        'llama_module_path': module_path,
+        'yarn_rope_supported': 'true',
+        'yarn_resolver_source': 'numeric_fallback',
+        'rope_scaling_type_supported': 'true',
+        'rope_freq_scale_supported': 'true',
+        'yarn_orig_ctx_supported': 'true',
     }
     facade = model_manager_module._SubprocessLlamaCppModule(
-        '/site/llama_cpp/__init__.py',
-        desktop_runtime_probe={
-            'backend': 'cuda',
-            'gpu_offload_supported': True,
-            'llama_module_path': '/site/llama_cpp/__init__.py',
-            'yarn_rope_supported': True,
-            'yarn_resolver_source': 'numeric_fallback',
-            'constructor_kwarg_support': support,
-        },
+        module_path,
+        desktop_runtime_probe=flat_payload,
     )
     capabilities = model_manager_module._safe_constructor_capability_payload(facade)
     assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
-    assert 'yarn_enum_value' not in capabilities
     assert capabilities['qwen_64k_yarn_support'] == 'supported'
+    assert capabilities['yarn_enum_value'] == 2
     assert capabilities['constructor_signature_inspectable'] is True
+    assert capabilities['constructor_kwarg_support']['rope_scaling_type'] is True
+    assert capabilities['constructor_kwarg_support']['rope_freq_scale'] is True
+    assert capabilities['constructor_kwarg_support']['yarn_orig_ctx'] is True
+    for unobserved in ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch'):
+        assert unobserved not in capabilities['constructor_kwarg_support']
+        assert unobserved not in capabilities
 
-    probe_calls = []
+    def fail_child_probe(**_kwargs):
+        raise AssertionError('legacy desktop facade must not launch a child capability reprobe')
 
-    def fake_child_probe(**kwargs):
-        probe_calls.append(kwargs)
-        return {
-            'backend': 'cuda',
-            'gpu_offload_supported': True,
-            'llama_module_path': '/real/site/llama_cpp/__init__.py',
-            'constructor_kwarg_support': support,
-            'constructor_signature_inspectable': True,
-            'constructor_has_var_kwargs': False,
-            'qwen_64k_yarn_support': 'supported',
-            'yarn_resolver_source': 'top_level_enum',
-            'yarn_enum_value': 7,
-            'capability_source': 'worker_probe',
-        }
-
-    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fake_child_probe)
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_child_probe)
 
     diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
 
-    assert probe_calls
     assert diagnostics['supported'] is True
-    assert diagnostics['yarn_enum_value'] == 7
-    assert diagnostics['capability_source'] == 'worker_probe'
-    assert diagnostics['child_probe_reprobe_attempted'] is True
+    assert diagnostics['yarn_enum_value'] == 2
+    assert diagnostics['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    kwargs = manager._runtime_init_kwargs(facade.Llama, -1, facade)
+
+    assert kwargs['rope_scaling_type'] == 2
+    assert kwargs['rope_freq_scale'] == 0.5
+    assert kwargs['yarn_orig_ctx'] == 32768
+    assert 'type_k' not in kwargs
+    assert 'type_v' not in kwargs
+    assert 'flash_attn' not in kwargs
+    assert 'offload_kqv' not in kwargs
+    assert 'n_batch' not in kwargs
+    assert 'n_ubatch' not in kwargs
+    assert manager.last_yarn_rope_diagnostics['child_probe_reprobe_attempted'] is False

@@ -8,8 +8,9 @@ use crate::operator_logs::{
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
-    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
-    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    resolve_python_launcher_resource_aware, resolve_runtime_import_root,
+    should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -1081,8 +1082,18 @@ pub async fn start_compute_node(
         }
     };
     let launcher = if is_python_script(&bridge_script) {
-        match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
-            .await
+        let resource_dir = app.path().resource_dir().ok();
+        let current_exe = std::env::current_exe().ok();
+        match tokio::task::spawn_blocking(move || {
+            resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+                override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
+                tauri_resource_dir: resource_dir.as_deref(),
+                current_exe_path: current_exe.as_deref(),
+                manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
+                packaged: !cfg!(debug_assertions),
+            })
+        })
+        .await
         {
             Ok(result) => match result {
                 Ok(launcher) => Some(launcher),
@@ -1096,7 +1107,7 @@ pub async fn start_compute_node(
                             log_file_path.clone(),
                         );
                     }
-                    return Err(err);
+                    return Err(err.into());
                 }
             },
             Err(err) => {
@@ -1110,7 +1121,7 @@ pub async fn start_compute_node(
                         log_file_path.clone(),
                     );
                 }
-                return Err(err);
+                return Err(err.into());
             }
         }
     } else {
@@ -1129,7 +1140,7 @@ pub async fn start_compute_node(
                     log_file_path.clone(),
                 );
             }
-            return Err(err);
+            return Err(err.into());
         }
     };
     let exe_path = std::env::current_exe().ok();

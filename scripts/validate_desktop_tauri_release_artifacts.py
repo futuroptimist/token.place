@@ -275,6 +275,72 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+
+def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
+    env = {
+        "HOME": tempfile.mkdtemp(prefix="token-place-home-"),
+        "PYTHONNOUSERSITE": "1",
+        "PATH": "/usr/bin:/bin",
+    }
+    for key in ("TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON"):
+        env.pop(key, None)
+    result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
+    output = f"{result.stdout}\n{result.stderr}"
+    forbidden = ("xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "/Users/runner", "/Library/Developer/CommandLineTools")
+    for marker in forbidden:
+        if marker in output:
+            _fail(f"embedded Python output leaked forbidden marker: {marker}")
+    if result.returncode != 0:
+        _fail(_format_command_failure([str(py), "-c", "<probe>"], result))
+    return output.strip()
+
+def _validate_macho_linkage(path: Path, app_path: Path) -> None:
+    if platform.system() != "Darwin":
+        return
+    result = subprocess.run(["file", str(path)], check=False, capture_output=True, text=True)
+    if "Mach-O" not in result.stdout:
+        return
+    deps = _run(["otool", "-L", str(path)])
+    forbidden = ("/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", "/Users/runner", "/private/var/folders")
+    for dep in deps.splitlines()[1:]:
+        dep = dep.strip().split(" ", 1)[0]
+        if not dep or dep.startswith(("@loader_path", "@rpath", "@executable_path", "/usr/lib", "/System/Library")):
+            continue
+        if str(app_path) in dep:
+            continue
+        if any(marker in dep for marker in forbidden) or "Python.framework" in dep:
+            _fail(f"forbidden external Mach-O linkage in {path}: {dep}")
+
+def _validate_embedded_python_runtime(app_path: Path) -> None:
+    runtime = app_path / "Contents" / "Resources" / "python-runtime"
+    py = runtime / "bin" / "python3"
+    if not py.exists() or not os.access(py, os.X_OK):
+        _fail(f"embedded Python interpreter missing or not executable at exact packaged path: {py}")
+    if not (runtime / "embedded_python_runtime_provenance.json").is_file():
+        _fail("embedded runtime provenance missing")
+    for notice in ("LICENSE-PYTHON.txt", "LICENSE-python-build-standalone.txt"):
+        if not (runtime / notice).is_file():
+            _fail(f"embedded runtime notice missing: {notice}")
+    if platform.system() == "Darwin":
+        arch = _run(["lipo", "-archs", str(py)]).lower()
+        if "arm64" not in arch or ("x86_64" in arch and "arm64" not in arch):
+            _fail(f"embedded Python is not arm64: {arch}")
+    code = "import json,sys,os; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix}))"
+    payload = json.loads(_run_python_sanitized(py, code, app_path).splitlines()[-1])
+    for key in ("executable", "prefix"):
+        if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
+            _fail(f"embedded Python {key} escaped app bundle: {payload[key]}")
+    _run_python_sanitized(py, "import subprocess,sys; raise SystemExit(subprocess.run([sys.executable,'-m','pip','check']).returncode)", app_path)
+    probe = "import json,sys; sys.path.insert(0, '" + str((Path.cwd() / 'src-tauri' / 'python').resolve()) + "'); from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
+    out = _run_python_sanitized(py, probe, app_path)
+    data = json.loads(out.splitlines()[-1])
+    if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
+        _fail("embedded runtime probe did not report Metal GPU offload")
+    for key in ("rope_scaling_type","rope_freq_scale","yarn_orig_ctx","flash_attn","offload_kqv","n_batch","n_ubatch"):
+        if not data.get(key): _fail(f"embedded runtime probe missing capability: {key}")
+    for candidate in runtime.rglob("*"):
+        if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--app-path", required=True)
@@ -282,6 +348,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tauri-config", required=True)
     p.add_argument("--expected-icon", required=True)
     p.add_argument("--expect-signing", action="store_true")
+    p.add_argument("--require-embedded-python-runtime", action="store_true")
     p.add_argument("--expect-notarization", action="store_true")
     return p.parse_args()
 
@@ -384,6 +451,9 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    if args.require_embedded_python_runtime:
+        _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

@@ -630,3 +630,26 @@ def test_validator_hdiutil_plist_and_retry_edge_branches(monkeypatch, tmp_path) 
         raise AssertionError('expected zero-attempt attach helper call to exit')
 
     assert 'no attempts were run' in message
+
+def test_tauri_config_bundles_embedded_python_runtime_exactly() -> None:
+    config = json.loads(TAURI_CONFIG.read_text(encoding='utf-8'))
+    resources = config['bundle']['resources']
+    assert resources['python-runtime'] == 'python-runtime'
+
+
+def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'Prepare embedded macOS Python runtime' in text
+    assert 'python scripts/prepare_embedded_python_runtime.py' in text
+    assert 'src-tauri/python-runtime/bin/python3 -m pip check' in text
+    assert '--require-embedded-python-runtime' in text
+
+
+def test_validator_contains_embedded_runtime_guardrails() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'Contents" / "Resources" / "python-runtime' in text
+    assert 'TOKEN_PLACE_PYTHON' in text
+    assert 'TOKEN_PLACE_SIDECAR_PYTHON' in text
+    assert 'xcode-select' in text
+    assert 'otool' in text
+    assert 'embedded runtime probe did not report Metal GPU offload' in text

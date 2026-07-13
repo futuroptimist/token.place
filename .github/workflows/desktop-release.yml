@@ -205,6 +205,25 @@ jobs:
           raise RuntimeError("Failed to install llama-cpp-python for all configured plans")
           PY
 
+
+      - name: Cache embedded macOS Python archive and wheels
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/token-place/embedded-python
+          key: embedded-python-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt') }}
+
+      - name: Prepare embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          python scripts/prepare_embedded_python_runtime.py
+          test -x src-tauri/python-runtime/bin/python3
+          src-tauri/python-runtime/bin/python3 -m pip check
+
       - name: Build frontend assets
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
         # before Tauri's internal beforeBuildCommand hook on clean runners.
@@ -411,7 +430,7 @@ jobs:
             fi
           fi
 
-          python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+          python ../scripts/validate_desktop_tauri_release_artifacts.py               --require-embedded-python-runtime               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
 
       - name: Generate SHA256 checksums
         shell: bash

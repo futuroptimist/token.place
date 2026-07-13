@@ -24,19 +24,20 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": [
-      "python/desktop_gpu_packaging.py",
-      "python/desktop_runtime_setup.py",
-      "python/requirements_desktop_runtime.txt",
-      "python/compute_node_bridge.py",
-      "python/inference_sidecar.py",
-      "python/model_bridge.py",
-      "python/path_bootstrap.py",
-      "../../utils",
-      "../../config.py",
-      "../../encrypt.py",
-      "../../requirements.txt"
-    ],
+    "resources": {
+      "python-runtime": "python-runtime",
+      "python/desktop_gpu_packaging.py": "python/desktop_gpu_packaging.py",
+      "python/desktop_runtime_setup.py": "python/desktop_runtime_setup.py",
+      "python/requirements_desktop_runtime.txt": "python/requirements_desktop_runtime.txt",
+      "python/compute_node_bridge.py": "python/compute_node_bridge.py",
+      "python/inference_sidecar.py": "python/inference_sidecar.py",
+      "python/model_bridge.py": "python/model_bridge.py",
+      "python/path_bootstrap.py": "python/path_bootstrap.py",
+      "../../utils": "../../utils",
+      "../../config.py": "../../config.py",
+      "../../encrypt.py": "../../encrypt.py",
+      "../../requirements.txt": "../../requirements.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

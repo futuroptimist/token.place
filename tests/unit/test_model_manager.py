@@ -3220,6 +3220,158 @@ def test_init_safe_category_alias_survives_subprocess_wrappers():
     assert model_manager_module._classify_runtime_context_create_error(exc_info.value) == 'runtime_context_create_cuda_memory'
 
 
+def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(tmp_path, monkeypatch):
+    from io import StringIO
+
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm.model_manager import ModelManager
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"error","error":"Failed to create llama_context",'
+                '"exception_type":"RuntimeError","safe_error_category":"cuda_memory_allocation"}\n'
+            )
+            self.stderr = StringIO('')
+            self.returncode = 1
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', FakeProcess)
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as proxy_exc:
+        model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'secret-model.gguf'), timeout_seconds=1)
+
+    assert proxy_exc.value.safe_error_category == 'runtime_context_create_cuda_memory'
+    assert proxy_exc.value.child_stderr_tail in {'', '<empty>'}
+
+    attempts = []
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if len(attempts) == 1:
+                raise proxy_exc.value
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert len(attempts) == 2
+    assert 'type_k' not in attempts[0]
+    assert attempts[1]['type_k'] == 8
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+
+
+def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monkeypatch, tmp_path):
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeThread:
+        joins = []
+
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+            self._alive = True
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+        def join(self, timeout=None):
+            self.joins.append(timeout)
+            self._alive = False
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"error","error":"Failed to create llama_context",'
+                '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_failed"}\n'
+            )
+            self.stderr = StringIO('')
+            self.returncode = 1
+            self._token_place_stderr_tail = []
+            self.wait_timeouts = []
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            self._token_place_stderr_sequence = 1
+            self._token_place_stderr_tail.append((1, 'ggml_cuda: buffer allocation failed after init\n'))
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    created = []
+
+    def fake_popen(*args, **kwargs):
+        process = FakeProcess(*args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', FakeThread)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'secret-model.gguf'), timeout_seconds=1)
+
+    assert exc_info.value.safe_error_category == 'runtime_context_create_cuda_memory'
+    assert 'buffer allocation failed' in exc_info.value.child_stderr_tail
+    assert created[0].wait_timeouts and 0 <= created[0].wait_timeouts[0] <= 0.5
+    assert FakeThread.joins and 0 <= FakeThread.joins[-1] <= 0.5
+
+
 def test_init_safe_category_rejects_spoofed_child_category():
     from io import StringIO
 
@@ -7342,6 +7494,7 @@ def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
 
 def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
 
     attempts = []
     config = MagicMock(is_production=False)
@@ -7363,7 +7516,16 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     class FakeLlama:
         def __init__(self, **kwargs):
             attempts.append(dict(kwargs))
-            raise ValueError('Failed to create llama_context: Metal buffer size too large')
+            raise model_manager_module.LlamaCppRuntimeInitError(
+                'llama_cpp_import failed',
+                child_exception_type='SecretInitError',
+                safe_error_category='runtime_context_create_metal_buffer_limit',
+                child_stderr_tail=(
+                    'ggml_metal: buffer size too large; prompt=SECRET_PROMPT '
+                    'payload=SECRET_PAYLOAD output=SECRET_OUTPUT command=SECRET_COMMAND '
+                    'model_path=SECRET_MODEL traceback=SECRET_TRACEBACK'
+                ),
+            )
 
     fake_llama_cpp = SimpleNamespace(
         Llama=FakeLlama,
@@ -7378,8 +7540,53 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
 
     assert len(attempts) == 3
     assert manager.llm is None
+    assert manager.last_qwen_64k_init_failures
+    assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
+        'runtime_context_create_metal_buffer_limit',
+        'runtime_context_create_metal_buffer_limit',
+        'runtime_context_create_metal_buffer_limit',
+    ]
+    allowed_failure_keys = {
+        'profile_id',
+        'model_profile_id',
+        'safe_error_category',
+        'exception_type',
+        'context_tier',
+        'n_ctx',
+        'backend',
+        'llama_cpp_python_version',
+        'yarn_resolver_source',
+        'kv_cache_settings',
+        'memory_estimate',
+        'attempted_runtime_kwargs',
+    }
+    for failure in manager.last_qwen_64k_init_failures:
+        assert set(failure) <= allowed_failure_keys
+        assert set(failure['attempted_runtime_kwargs']) <= {
+            'n_ctx',
+            'type_k',
+            'type_v',
+            'flash_attn',
+            'offload_kqv',
+            'n_batch',
+            'n_ubatch',
+            'rope_scaling_type',
+            'rope_freq_scale',
+            'yarn_orig_ctx',
+        }
     assert 'Qwen 64K memory/KV/cache profile exhaustion before registration' in manager.last_runtime_init_error
     assert 'runtime_context_create_metal_buffer_limit' in manager.last_runtime_init_error
+    serialized = json.dumps(manager.last_qwen_64k_init_failures) + manager.last_runtime_init_error
+    for secret in (
+        'SecretInitError',
+        'SECRET_PROMPT',
+        'SECRET_PAYLOAD',
+        'SECRET_OUTPUT',
+        'SECRET_COMMAND',
+        'SECRET_MODEL',
+        'SECRET_TRACEBACK',
+    ):
+        assert secret not in serialized
 
 
 def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
@@ -7442,6 +7649,15 @@ def test_unrecognized_init_failure_is_not_context_create_retryable():
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
+def test_bare_cublas_alloc_failed_is_cuda_memory():
+    from utils.llm import model_manager as model_manager_module
+
+    assert (
+        model_manager_module._classify_runtime_context_create_error('CUBLAS_STATUS_ALLOC_FAILED')
+        == 'runtime_context_create_cuda_memory'
+    )
+
+
 def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_buffer_evidence():
     from utils.llm import model_manager as model_manager_module
 
@@ -7451,6 +7667,55 @@ def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_bu
 
     assert category == 'runtime_context_create_failed'
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_ggml_cuda_failed_to_load_model_is_not_memory_retryable_and_attempts_once(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        RuntimeError('ggml_cuda_init: failed to load model; invalid GGUF ABI')
+    )
+    assert category == 'runtime_init_unclassified'
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+    attempts = []
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            raise RuntimeError('ggml_cuda_init: failed to load model; invalid GGUF ABI')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 1
+    assert manager.llm is None
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_init_unclassified'
 
 
 def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines():

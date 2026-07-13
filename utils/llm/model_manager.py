@@ -55,11 +55,11 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',
 )
 # Retry context-create failures backed by safe Metal/KV/cache/buffer evidence.
-# Qwen 64K CUDA/Metal startup may also retry the exact generic
-# ``runtime_context_create_failed`` sentinel, but only inside the three-profile
-# F16 -> Q8 -> Q4 loop. If every generic attempt fails, the original generic
-# init exception is re-raised so corrupt GGUF/runtime/ABI causes are not
-# reported as memory-profile exhaustion.
+# ``runtime_context_create_failed`` remains excluded from these general retry
+# categories. Its sole exception is the bounded pre-registration Qwen 64K
+# CUDA/Metal F16 -> Q8 -> Q4 loop, capped at those three profiles. If every
+# generic attempt fails, the original generic init exception is re-raised so
+# corrupt GGUF/runtime/ABI causes are not reported as memory-profile exhaustion.
 QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
@@ -1906,13 +1906,14 @@ class _SubprocessLlamaProxy:
         self._stderr_reader_thread.start()
 
     def _drain_stderr_reader_bounded(self) -> None:
+        deadline = time.monotonic() + 0.5
         try:
-            self._process.wait(timeout=0.2)
+            self._process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except Exception:
             pass
         thread = getattr(self, '_stderr_reader_thread', None)
         if thread is not None and thread.is_alive():
-            thread.join(timeout=0.3)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def _stderr_cursor(self) -> int:
         return int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)

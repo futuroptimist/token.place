@@ -158,3 +158,43 @@ def test_runtime_capability_probe_requires_qwen_64k_yarn_support():
     }
 
     assert prep._missing_runtime_capabilities(payload) == ['qwen_64k_yarn_support']
+
+
+def test_install_packages_uses_shared_root_llama_cpp_pin_for_metal_plan(tmp_path, monkeypatch):
+    commands = []
+
+    class Plan:
+        package_spec = 'llama-cpp-python==0.3.32'
+        backend = 'metal'
+        only_binary = True
+
+        def pip_install_args(self):
+            return ['--only-binary', 'llama-cpp-python']
+
+        def pip_env(self):
+            return {'CMAKE_ARGS': '-DGGML_METAL=on'}
+
+    def fake_plan(*, platform, requirements_path):
+        assert platform == 'darwin'
+        assert requirements_path == prep.ROOT.parent / 'requirements.txt'
+        return Plan()
+
+    def fake_run(cmd, **kwargs):
+        commands.append((cmd, kwargs.get('env') or {}))
+        class Result:
+            stdout = ''
+        return Result()
+
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan', fake_plan)
+    monkeypatch.setattr(prep, 'run', fake_run)
+
+    prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'pip-cache')
+
+    install_command = commands[2][0]
+    install_env = commands[2][1]
+    assert install_command[:4] == [str(tmp_path / 'python3'), '-m', 'pip', 'install']
+    assert str(prep.SRC_TAURI / 'python' / 'requirements_desktop_runtime.txt') in install_command
+    assert 'llama-cpp-python==0.3.32' == install_command[-1]
+    assert 'numpy==2.3.3' in install_command
+    assert 'diskcache==5.6.3' in install_command
+    assert install_env['CMAKE_ARGS'] == '-DGGML_METAL=on'

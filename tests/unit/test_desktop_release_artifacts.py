@@ -693,3 +693,10 @@ def test_release_workflow_does_not_rebuild_llama_cpp_on_windows() -> None:
     install_step = install_step.split('- name: Cache embedded macOS Python archive and wheels', 1)[0]
     assert "if: runner.os != 'Windows'" in install_step
     assert 'llama_cpp_install_plan_fallbacks(platform=sys.platform' in install_step
+
+
+def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert "- os: macos-26" in workflow
+    assert "- os: macos-latest" not in workflow
+    assert 'test "$(uname -m)" = "arm64"' in workflow

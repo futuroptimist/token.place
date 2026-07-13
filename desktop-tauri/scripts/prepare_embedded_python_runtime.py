@@ -109,7 +109,7 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
     req = SRC_TAURI / "python" / "requirements_desktop_runtime.txt"
     pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items()) if name != "llama-cpp-python"]
-    plan = llama_cpp_install_plan(platform="darwin", requirements_path=req)
+    plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT.parent / "requirements.txt")
     if plan.package_spec != "llama-cpp-python==0.3.32" or plan.backend != "metal" or not plan.only_binary:
         raise RuntimePrepError("desktop GPU packaging plan must require the pinned Metal llama-cpp-python wheel")
     run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages, *plan.pip_install_args(), plan.package_spec], env={"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()})

@@ -215,6 +215,58 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+
+type NormalizedRuntimeError = { code: string; message: string; blocksPythonBridge: boolean };
+
+const PACKAGED_RUNTIME_MESSAGE =
+  'The bundled token.place runtime is missing or damaged. Reinstall token.place desktop. You do not need to install Python or Xcode Command Line Tools.';
+
+function normalizeDesktopRuntimeError(message: string | null | undefined): NormalizedRuntimeError | null {
+  if (!message) {
+    return null;
+  }
+  const knownCodes = [
+    'desktop_python_runtime_missing',
+    'desktop_python_runtime_invalid',
+    'desktop_python_override_invalid',
+    'desktop_python_development_dependency_missing',
+  ];
+  const code = knownCodes.find((candidate) => message.includes(candidate));
+  const rawLauncherFailure =
+    message.includes('xcode-select') ||
+    message.includes('No developer tools were found') ||
+    message.includes('CommandLineTools') ||
+    message.includes('attempted launcher') ||
+    message.includes('tried:');
+  if (!code && !rawLauncherFailure) {
+    return null;
+  }
+  if (code === 'desktop_python_override_invalid') {
+    return {
+      code,
+      message: 'The configured desktop Python override is invalid. Select a Python 3.11+ interpreter or unset the override.',
+      blocksPythonBridge: true,
+    };
+  }
+  if (code === 'desktop_python_development_dependency_missing') {
+    return {
+      code,
+      message: 'Desktop Python 3.11+ is unavailable for this development build. Install Python 3.11+ or set TOKEN_PLACE_PYTHON/TOKEN_PLACE_SIDECAR_PYTHON.',
+      blocksPythonBridge: true,
+    };
+  }
+  return {
+    code: code || 'desktop_python_runtime_invalid',
+    message: PACKAGED_RUNTIME_MESSAGE,
+    blocksPythonBridge: true,
+  };
+}
+
+function displayErrorMessage(message: string | null | undefined): string {
+  const runtimeError = normalizeDesktopRuntimeError(message);
+  return runtimeError ? `${runtimeError.message} Diagnostic code: ${runtimeError.code}` : message || '';
+}
+
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
   return value && value.trim() ? value : fallback;
 }
@@ -715,7 +767,7 @@ export function App() {
   useEffect(() => {
     invoke<BackendInfo>('detect_backend')
       .then(setBackend)
-      .catch((e) => setError(formatErrorMessage(e)));
+      .catch((e) => setError(displayErrorMessage(formatErrorMessage(e))));
 
     const initializeConfigAndArtifact = async () => {
       try {
@@ -723,7 +775,7 @@ export function App() {
         const normalizedConfig = normalizeDesktopConfig(loadedConfig);
         setConfig(normalizedConfig);
         if (JSON.stringify(loadedConfig) !== JSON.stringify(normalizedConfig)) {
-          invoke('save_config', { config: normalizedConfig }).catch((e) => setError(formatErrorMessage(e)));
+          invoke('save_config', { config: normalizedConfig }).catch((e) => setError(displayErrorMessage(formatErrorMessage(e))));
         }
         const nodeStatus = { ...defaultComputeStatus, ...(await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status')) };
         computeStatusRef.current = nodeStatus;
@@ -733,7 +785,7 @@ export function App() {
         setArtifact(info);
 
       } catch (e) {
-        setError(formatErrorMessage(e));
+        setError(displayErrorMessage(formatErrorMessage(e)));
       }
     };
 
@@ -760,7 +812,7 @@ export function App() {
         setStatus('canceled');
       } else if (payload.type === 'error') {
         setStatus('failed');
-        setError(payload.message ?? payload.code ?? 'unknown error');
+        setError(displayErrorMessage(payload.message ?? payload.code ?? 'unknown error'));
       }
     });
     return () => {
@@ -787,7 +839,7 @@ export function App() {
       if (payload.type === 'error') {
         const computeMessage =
           typeof payload.last_error === 'string'
-            ? payload.last_error
+            ? displayErrorMessage(payload.last_error)
             : typeof payload.message === 'string'
               ? payload.message
               : 'compute-node operator failed';
@@ -808,18 +860,22 @@ export function App() {
     };
   }, []);
 
+  const activeRuntimeError = normalizeDesktopRuntimeError(error) || normalizeDesktopRuntimeError(computeStatus.last_error);
+  const pythonBridgeBlocked = activeRuntimeError?.blocksPythonBridge ?? false;
+
   const canStart = useMemo(
     () =>
+      !pythonBridgeBlocked &&
       Boolean(config.model_path.trim()) &&
       Boolean(prompt.trim()) &&
       status !== 'starting' &&
       status !== 'streaming',
-    [config.model_path, prompt, status]
+    [config.model_path, prompt, status, pythonBridgeBlocked]
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
-    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
+    () => !pythonBridgeBlocked && Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode, pythonBridgeBlocked]
   );
   const operatorControlsDisabled = useMemo(
     () => isStartingComputeNode || isStoppingComputeNode,
@@ -841,7 +897,7 @@ export function App() {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      invoke('save_config', { config: configForSave(next) }).catch((e) => setError(formatErrorMessage(e)));
+      invoke('save_config', { config: configForSave(next) }).catch((e) => setError(displayErrorMessage(formatErrorMessage(e))));
       saveTimerRef.current = null;
     }, 300);
   };
@@ -863,7 +919,7 @@ export function App() {
         updateConfig({ ...config, model_path: path });
       }
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -879,7 +935,7 @@ export function App() {
         return next;
       });
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     } finally {
       setIsDownloadingModel(false);
     }
@@ -903,7 +959,7 @@ export function App() {
       });
     } catch (e) {
       setStatus('failed');
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -968,7 +1024,7 @@ export function App() {
         relay_runtime_state: 'failed',
         worker_state: 'failed',
         worker_alive: false,
-        last_error: message,
+        last_error: displayErrorMessage(message),
       };
       computeStatusRef.current = failedStatus;
       setComputeStatus(failedStatus);
@@ -1003,7 +1059,7 @@ export function App() {
       setOperatorLogText(logText);
       setIsDebugConsoleOpen(true);
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -1011,7 +1067,7 @@ export function App() {
     try {
       await invoke('reveal_operator_log');
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -1026,7 +1082,7 @@ export function App() {
       }
       await writeText.call(navigator.clipboard, logPath);
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -1034,7 +1090,7 @@ export function App() {
     try {
       await invoke('open_operator_debug_terminal');
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     }
   };
 
@@ -1047,7 +1103,7 @@ export function App() {
         final_output: output,
       });
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(displayErrorMessage(formatErrorMessage(e)));
     } finally {
       setIsForwarding(false);
     }
@@ -1066,7 +1122,7 @@ export function App() {
           onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
         />
         <button type="button" onClick={chooseModelPath}>Browse</button>
-        <button type="button" onClick={downloadModel} disabled={isDownloadingModel}>
+        <button type="button" onClick={downloadModel} disabled={isDownloadingModel || pythonBridgeBlocked}>
           {isDownloadingModel ? 'Downloading…' : 'Download'}
         </button>
       </div>
@@ -1264,7 +1320,7 @@ export function App() {
             />
           </section>
         )}
-        <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Last error: <code>{displayErrorMessage(computeStatus.last_error) || 'none'}</code></p>
       </section>
 
       <section style={{ marginTop: 14, borderTop: '1px solid #ddd', paddingTop: 12 }}>
@@ -1283,7 +1339,7 @@ export function App() {
         <p>Status: <strong>{status}</strong></p>
       </section>
 
-      {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
+      {error && <p style={{ color: 'crimson' }}>Error: {displayErrorMessage(error)}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
     </main>
   );

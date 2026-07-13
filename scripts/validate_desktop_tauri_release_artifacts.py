@@ -318,6 +318,65 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
         mount_temp_dir.cleanup()
 
 
+def _validate_embedded_python_runtime(app_path: Path) -> None:
+    runtime = app_path / "Contents" / "Resources" / "python-runtime"
+    py = runtime / "bin" / "python3"
+    if not py.exists() or not py.is_file():
+        _fail(f"missing embedded Python interpreter: {py}")
+    if not os.access(py, os.X_OK):
+        _fail(f"embedded Python interpreter is not executable: {py}")
+    provenance = runtime / "token-place-runtime-provenance.json"
+    if not provenance.exists():
+        _fail(f"missing embedded runtime provenance: {provenance}")
+    arch_out = _run(["lipo", "-archs", str(py)])
+    lower = arch_out.lower()
+    if "arm64" not in lower and "aarch64" not in lower:
+        _fail(f"embedded Python is not arm64: {arch_out}")
+    if "x86_64" in lower and "arm64" not in lower:
+        _fail(f"embedded Python is x86_64-only: {arch_out}")
+    env = os.environ.copy()
+    env.update({"HOME": tempfile.mkdtemp(prefix="token-place-empty-home-"), "PYTHONNOUSERSITE": "1", "PATH": "/usr/bin:/bin"})
+    env.pop("TOKEN_PLACE_PYTHON", None)
+    env.pop("TOKEN_PLACE_SIDECAR_PYTHON", None)
+    code = """
+import json, pathlib, sys
+mods=['psutil','requests','dotenv','cryptography','jinja2','numpy','diskcache','llama_cpp']
+for m in mods: __import__(m)
+root=pathlib.Path(sys.argv[1]).resolve()
+print(json.dumps({'executable': sys.executable, 'prefix': sys.prefix, 'ok': str(pathlib.Path(sys.executable).resolve()).startswith(str(root)) and str(pathlib.Path(sys.prefix).resolve()).startswith(str(root))}))
+"""
+    output = _run([str(py), "-c", code, str(runtime)], env=env)
+    forbidden = ["xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", ".local/lib/python"]
+    for token in forbidden:
+        if token in output:
+            _fail(f"embedded Python validation leaked forbidden output: {token}")
+    details = json.loads(output.strip().splitlines()[-1])
+    if not details.get("ok"):
+        _fail("embedded Python sys.executable/sys.prefix are not inside app bundle")
+    _run([str(py), "-m", "pip", "check"], env=env)
+    setup = app_path / "Contents" / "Resources" / "python" / "desktop_runtime_setup.py"
+    if setup.exists():
+        _run([str(py), str(setup), "probe", "--require-backend", "metal"], env=env)
+
+    if shutil.which("otool"):
+        for native in runtime.rglob("*"):
+            if not native.is_file():
+                continue
+            try:
+                deps = _run(["otool", "-L", str(native)])
+            except SystemExit:
+                continue
+            for dep in deps.splitlines()[1:]:
+                dep = dep.strip().split(" ", 1)[0]
+                if not dep or dep.startswith(("@loader_path", "@rpath", "/usr/lib", "/System/Library")):
+                    continue
+                if str(app_path) in dep:
+                    continue
+                bad_roots = ["/opt/homebrew", "/usr/local/Cellar", "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", "/tmp/", "/private/tmp/"]  # nosec B108 - these are forbidden dependency prefixes, not temp-file targets
+                if any(dep.startswith(root) for root in bad_roots) or "Python.framework" in dep:
+                    _fail(f"forbidden external Mach-O dependency for {native}: {dep}")
+
+
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
@@ -384,6 +443,8 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

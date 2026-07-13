@@ -2178,3 +2178,43 @@ describe('desktop app start failure handling', () => {
   });
 
 });
+
+it('normalizes raw macOS developer-tools Python failures and disables Python bridge actions', async () => {
+  cleanup();
+  invokeMock.mockReset();
+  listenMock.mockReset();
+  eventHandlers.clear();
+  listenMock.mockImplementation((event: string, handler: unknown) => {
+    eventHandlers.set(event, handler as (evt: { payload: Record<string, unknown> }) => void);
+    return Promise.resolve(() => {});
+  });
+  const rawFailure = `no usable Python 3 interpreter found for desktop Python subprocess (consulted override env var: TOKEN_PLACE_SIDECAR_PYTHON); tried: python3  -> status=1 stdout='' stderr='xcode-select: note: No developer tools were found, requesting install. If developer tools are located at a non-default location on disk, use sudo xcode-select --switch /Applications/Xcode.app to specify the Xcode that you wish to use for command line developer tools, and cancel the installation dialog.'; python  -> spawn failed: No such file or directory (/Users/alice/private/project)`;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === 'detect_backend') {
+      return Promise.resolve({ platform_label: 'macos', preferred_mode: 'auto', available_backend: 'metal', availability_label: 'Metal-capable platform (Apple Silicon)' });
+    }
+    if (command === 'load_config') {
+      return Promise.resolve({ model_path: '/tmp/model.gguf', relay_base_url: 'https://token.place', preferred_mode: 'auto' });
+    }
+    if (command === 'get_compute_node_status') {
+      return Promise.resolve({ ...({} as Record<string, unknown>), running: false, registered: false, last_error: rawFailure });
+    }
+    if (command === 'inspect_model_artifact') {
+      return Promise.reject(new Error(rawFailure));
+    }
+    return Promise.resolve(undefined);
+  });
+
+  render(<App />);
+
+  const friendly = await screen.findAllByText(/The bundled token\.place runtime is missing or damaged/);
+  expect(friendly.length).toBeGreaterThan(0);
+  expect(document.body.textContent).toContain('Diagnostic code: desktop_python_runtime_invalid');
+  expect(document.body.textContent).not.toContain('xcode-select');
+  expect(document.body.textContent).not.toContain('sudo');
+  expect(document.body.textContent).not.toContain('Xcode.app');
+  expect(document.body.textContent).not.toContain('/Users/alice');
+  expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
+  expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+  expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
+});

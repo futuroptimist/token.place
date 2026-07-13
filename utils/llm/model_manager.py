@@ -54,12 +54,27 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
     'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',
 )
-# Only retry context-create failures backed by safe Metal/KV/cache/buffer
-# evidence. A bare ``Failed to create llama_context`` remains classified as
-# ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
-# GGUF/runtime/ABI init causes are not masked as memory-profile exhaustion. The
-# packaged-runtime retry regression supplies sanitized ggml_metal/KV stderr
-# diagnostics, which exercises the intended bounded recovery path.
+# General context-create retries require safe Metal/CUDA/KV/cache/buffer
+# evidence. The pinned llama-cpp-python context-create sentinel is handled only
+# by the bounded pre-registration Qwen 64K GPU profile loop below, so unrelated
+# GGUF/runtime/ABI init causes are not promoted to broad retry categories.
+RUNTIME_INIT_SAFE_CATEGORY_ALIASES = {
+    'cuda_memory_allocation': 'runtime_context_create_cuda_memory',
+    'metal_memory_allocation': 'runtime_context_create_metal_memory',
+    'kv_cache_allocation': 'runtime_context_create_kv_cache_allocation',
+    'rope_yarn_eval_failure': 'runtime_context_create_rope_yarn_config',
+}
+RUNTIME_INIT_SAFE_CATEGORY_ALLOWLIST = {
+    'runtime_context_create_unsupported_kwarg',
+    'runtime_context_create_rope_yarn_config',
+    'runtime_context_create_kv_cache_allocation',
+    'runtime_context_create_metal_buffer_limit',
+    'runtime_context_create_metal_memory',
+    'runtime_context_create_cuda_memory',
+    'runtime_context_create_cuda_buffer_limit',
+    'runtime_context_create_failed',
+    'runtime_init_unclassified',
+}
 QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
@@ -413,7 +428,38 @@ def _build_qwen_64k_runtime_profiles(
         profiles[0]['diagnostics'].setdefault('skipped_profiles', []).extend(skipped_profiles)
     return profiles
 
+
+def _validate_runtime_init_safe_category(category: Any) -> Optional[str]:
+    text = str(category or '').strip()
+    if text in RUNTIME_INIT_SAFE_CATEGORY_ALIASES:
+        text = RUNTIME_INIT_SAFE_CATEGORY_ALIASES[text]
+    if text in RUNTIME_INIT_SAFE_CATEGORY_ALLOWLIST:
+        return text
+    return None
+
+
+def _safe_child_exception_type(value: Any) -> str:
+    text = str(value or 'RuntimeError').strip()
+    if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,80}', text):
+        return text
+    return 'RuntimeError'
+
+
+def _runtime_init_category_from_exception(error: Any, child_stderr: str = '') -> str:
+    existing = getattr(error, 'safe_error_category', None)
+    validated = _validate_runtime_init_safe_category(existing)
+    if validated:
+        if child_stderr and validated == 'runtime_context_create_failed':
+            refined = _classify_runtime_context_create_error(str(error), child_stderr)
+            if refined != 'runtime_context_create_failed' and refined != 'runtime_init_unclassified':
+                return refined
+        return validated
+    return _classify_runtime_context_create_error(error, child_stderr)
+
 def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -> str:
+    existing = _validate_runtime_init_safe_category(getattr(error, 'safe_error_category', None))
+    if existing:
+        return existing
     text = f'{error or ""}\n{child_stderr or ""}'.lower()
     if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported (?:parameter|kwarg|argument))', text):
         return 'runtime_context_create_unsupported_kwarg'
@@ -425,7 +471,11 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_metal_buffer_limit'
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
         return 'runtime_context_create_metal_memory'
-    if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'cublas')):
+    if (
+        any(term in text for term in ('cublas_status_alloc_failed', 'cudamalloc', 'cuda malloc', 'cuda out of memory', 'cuda error: out of memory'))
+        or ('cuda' in text and any(term in text for term in ('out of memory', 'oom', 'alloc failed', 'allocation failed', 'failed to allocate')))
+        or ('ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'buffer')))
+    ):
         return 'runtime_context_create_cuda_memory'
     if 'cuda' in text and any(term in text for term in ('buffer', 'resource', 'allocation')):
         return 'runtime_context_create_cuda_buffer_limit'
@@ -444,7 +494,7 @@ def _redact_paths_from_text(text: Any, *, limit: int = 2000) -> str:
 
 _CHILD_DIAGNOSTIC_ALLOWLIST = re.compile(
     r'(llama|llama_context|ggml|metal|kv|cache|alloc|memory|oom|buffer|rope|yarn|'
-    r'flash_attn|type_k|type_v|n_ctx|context|unsupported|keyword|argument|failed)',
+    r'flash_attn|type_k|type_v|n_ctx|context|unsupported|keyword|argument|failed|cublas)',
     re.IGNORECASE,
 )
 _CHILD_DIAGNOSTIC_SENSITIVE_FIELD_RE = re.compile(
@@ -927,6 +977,16 @@ def _stdlib_safe_path_order(entries: Iterable[str]) -> list[str]:
 
 DESKTOP_RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
 _LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
+
+
+class LlamaCppInitializationError(RuntimeError):
+    """Raised when llama.cpp initialization fails with validated safe metadata."""
+
+    def __init__(self, message: str, *, safe_error_category: str, child_exception_type: str = 'RuntimeError', child_stderr_tail: str = '') -> None:
+        self.safe_error_category = _validate_runtime_init_safe_category(safe_error_category) or 'runtime_init_unclassified'
+        self.child_exception_type = _safe_child_exception_type(child_exception_type)
+        self.child_stderr_tail = _sanitize_child_diagnostic_text(child_stderr_tail)
+        super().__init__(message)
 
 
 class LlamaCppInferenceRequestError(RuntimeError):
@@ -1674,14 +1734,21 @@ def _read_llama_subprocess_message(
             diagnostics = message.get('diagnostics')
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
-        category = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
-        error = f'{stage} failed; child_exception_type={message.get("exception_type") or "RuntimeError"}; safe_error_category={category}'
+        stderr_tail = _sanitize_child_diagnostic_text(message.get('stderr'))
+        child_category = _validate_runtime_init_safe_category(message.get('safe_error_category'))
+        category = child_category or _classify_runtime_context_create_error(raw_error, stderr_tail)
+        error = f'{stage} failed; child_exception_type={_safe_child_exception_type(message.get("exception_type"))}; safe_error_category={category}'
         traceback_text = str(message.get('traceback') or '').strip()
         if traceback_text:
             safe_tail = _sanitize_child_diagnostic_text(traceback_text)
             if safe_tail:
                 error = f"{error}; child_traceback_tail={safe_tail}"
-        raise RuntimeError(error)
+        raise LlamaCppInitializationError(
+            error,
+            safe_error_category=category,
+            child_exception_type=_safe_child_exception_type(message.get('exception_type')),
+            child_stderr_tail=stderr_tail,
+        )
     return message
 
 
@@ -1783,16 +1850,20 @@ class _SubprocessLlamaProxy:
             self.close()
             raise
         except Exception as exc:
+            self._drain_stderr_tail_reader()
             stderr_tail = _sanitize_child_diagnostic_text(_llama_subprocess_tail(self._process, '_token_place_stderr_tail'))
-            category = _classify_runtime_context_create_error(exc, stderr_tail)
+            category = _runtime_init_category_from_exception(exc, stderr_tail)
             if isinstance(exc, LlamaCppWorkerEOFError):
                 safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
             else:
                 safe_exc = _safe_parent_exception_message(exc, child_stderr=stderr_tail)
             self.close()
-            raise RuntimeError(
-                f"{safe_exc}; child_exception_type={type(exc).__name__}; "
-                f"safe_error_category={category}; child_stderr_tail={stderr_tail or '<empty>'}"
+            raise LlamaCppInitializationError(
+                f"{safe_exc}; child_exception_type={getattr(exc, 'child_exception_type', type(exc).__name__)}; "
+                f"safe_error_category={category}; child_stderr_tail={stderr_tail or '<empty>'}",
+                safe_error_category=category,
+                child_exception_type=getattr(exc, 'child_exception_type', type(exc).__name__),
+                child_stderr_tail=stderr_tail,
             ) from exc
 
     def _start_stderr_tail_reader(self) -> None:
@@ -1808,7 +1879,16 @@ class _SubprocessLlamaProxy:
                     tail.append((seq, line))
                     del tail[:-100]
 
-        threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True).start()
+        self._stderr_reader_thread = threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True)
+        self._stderr_reader_thread.start()
+
+    def _drain_stderr_tail_reader(self, timeout_seconds: float = 0.25) -> None:
+        thread = getattr(self, '_stderr_reader_thread', None)
+        if thread is not None and hasattr(thread, 'join'):
+            try:
+                thread.join(timeout=timeout_seconds)
+            except RuntimeError:
+                pass
 
     def _stderr_cursor(self) -> int:
         return int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
@@ -4765,7 +4845,7 @@ class ModelManager:
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
                                     break
                                 except Exception as init_exc:
-                                    category = _classify_runtime_context_create_error(init_exc)
+                                    category = _runtime_init_category_from_exception(init_exc)
                                     safe_failure = {
                                         'profile_id': profile_id,
                                         'model_profile_id': self.profile_id,
@@ -4796,7 +4876,14 @@ class ModelManager:
                                         },
                                     }
                                     profile_failures.append(safe_failure)
-                                    if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
+                                    self.last_qwen_64k_init_failures = list(profile_failures)
+                                    bare_context_retry = (
+                                        is_qwen_64k
+                                        and category == 'runtime_context_create_failed'
+                                        and len(profile_failures) < min(3, len(runtime_profiles))
+                                    )
+                                    if not is_qwen_64k or (category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES and not bare_context_retry):
+                                        self.last_qwen_64k_init_failures = list(profile_failures)
                                         raise
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):

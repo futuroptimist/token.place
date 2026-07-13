@@ -185,6 +185,28 @@ jobs:
           grep -n 'else if and (eq $strategyType "Recreate") $existingHasRollingUpdate' charts/tokenplace/templates/deployment.yaml
           grep -n 'rollingUpdate: null' charts/tokenplace/templates/deployment.yaml
 
+      - name: Template authenticated metrics ServiceMonitor render check
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set metrics.enabled=true \
+            --set metrics.auth.existingSecret=tokenplace-metrics \
+            --set serviceMonitor.enabled=true \
+            --set serviceMonitor.relabelings.environment=staging \
+            --set serviceMonitor.relabelings.release=v0.1.2 \
+            --set serviceMonitor.relabelings.cluster=sugarkube-staging > /tmp/tokenplace-render-metrics.yaml
+
+          grep -n "kind: ServiceMonitor" /tmp/tokenplace-render-metrics.yaml
+          grep -n "release: kube-prometheus-stack" /tmp/tokenplace-render-metrics.yaml
+          grep -n "port: http" /tmp/tokenplace-render-metrics.yaml
+          grep -n 'path: "/metrics"' /tmp/tokenplace-render-metrics.yaml
+          grep -n "bearerTokenSecret:" -A2 /tmp/tokenplace-render-metrics.yaml | grep -n 'name: "tokenplace-metrics"'
+          grep -n "name: TOKENPLACE_METRICS_TOKEN" -A5 /tmp/tokenplace-render-metrics.yaml | grep -n "secretKeyRef:"
+          ! grep -n "path: /metrics" /tmp/tokenplace-render-metrics.yaml
+          grep -n "replicas: 1" /tmp/tokenplace-render-metrics.yaml
+          grep -n "type: Recreate" /tmp/tokenplace-render-metrics.yaml
+          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render-metrics.yaml | grep -n 'value: "1"'
+
       - name: Capture chart metadata
         id: chart_meta
         run: |

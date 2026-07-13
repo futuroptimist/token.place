@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "replicaCount": { "type": "integer", "const": 1 },
+    "strategy": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "const": "Recreate" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "path": { "type": "string", "default": "/metrics", "pattern": "^/[-A-Za-z0-9_./]*$" },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "existingSecret": { "type": "string", "default": "" },
+            "secretKey": { "type": "string", "default": "token", "minLength": 1 }
+          },
+          "required": ["existingSecret", "secretKey"]
+        }
+      },
+      "required": ["enabled", "path", "auth"]
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "interval": { "type": "string", "default": "30s" },
+        "scrapeTimeout": { "type": "string", "default": "10s" },
+        "additionalLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "relabelings": {
+          "type": "object",
+          "properties": {
+            "app": { "type": "string" },
+            "environment": { "type": "string" },
+            "release": { "type": "string" },
+            "cluster": { "type": "string" }
+          },
+          "required": ["app", "environment", "release", "cluster"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["enabled", "interval", "scrapeTimeout", "additionalLabels", "relabelings"]
+    }
+  }
+}

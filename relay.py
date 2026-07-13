@@ -687,9 +687,13 @@ def _terminal_outcome_from_status_reason(status: str, reason: str | None) -> str
 
 
 def _metrics_token_is_valid() -> bool:
-    token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
-    if not token:
+    if os.environ.get("TOKENPLACE_METRICS_DISABLED", "").lower() in {"1", "true", "yes", "on"}:
+        return False
+    token = os.environ.get("TOKENPLACE_METRICS_TOKEN")
+    if token is None:
         return True
+    if token == "":
+        return False
     header = request.headers.get("Authorization", "")
     prefix = "Bearer "
     if not header.startswith(prefix):

@@ -71,7 +71,9 @@ def test_defaults_render_no_service_monitor_and_no_metrics_token() -> None:
     docs = _render()
     assert _kind(docs, "ServiceMonitor") == []
     deployment = _kind(docs, "Deployment")[0]
-    assert "TOKENPLACE_METRICS_TOKEN" not in _env_by_name(deployment)
+    env = _env_by_name(deployment)
+    assert "TOKENPLACE_METRICS_TOKEN" not in env
+    assert env["TOKENPLACE_METRICS_DISABLED"]["value"] == "1"
 
 
 def test_service_monitor_requires_metrics_enabled() -> None:
@@ -127,7 +129,9 @@ def test_extra_env_cannot_replace_chart_managed_metrics_secret_ref() -> None:
         "--set", "extraEnv[0].name=TOKENPLACE_METRICS_TOKEN",
         "--set", "extraEnv[0].value=plaintext",
     )
-    token_env = _env_by_name(_kind(docs, "Deployment")[0])["TOKENPLACE_METRICS_TOKEN"]
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    token_env = env["TOKENPLACE_METRICS_TOKEN"]
+    assert "TOKENPLACE_METRICS_DISABLED" not in env
     assert "value" not in token_env
     assert token_env["valueFrom"]["secretKeyRef"] == {"name": "tokenplace-metrics", "key": "token"}
 

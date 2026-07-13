@@ -44,7 +44,7 @@ node -v
 # install when that fails (as happens in GitHub Actions where apt is
 # unavailable).
 ensure_playwright_browsers() {
-    if ! command -v playwright >/dev/null 2>&1; then
+    if ! "$PYTHON_CMD" -m playwright --version >/dev/null 2>&1; then
         return
     fi
 
@@ -104,12 +104,12 @@ ensure_playwright_browsers() {
 
         # CI workflow already installs Playwright browser and system deps in a dedicated step.
         if [ "${CI:-}" = "true" ]; then
-            if ! playwright install chromium; then
+            if ! "$PYTHON_CMD" -m playwright install chromium; then
                 echo "Warning: playwright browser installation failed"
             fi
-        elif ! playwright install --with-deps chromium; then
+        elif ! "$PYTHON_CMD" -m playwright install --with-deps chromium; then
             echo "Warning: playwright install --with-deps failed; retrying without system deps"
-            if ! playwright install chromium; then
+            if ! "$PYTHON_CMD" -m playwright install chromium; then
                 echo "Warning: playwright browser installation failed"
             fi
         fi

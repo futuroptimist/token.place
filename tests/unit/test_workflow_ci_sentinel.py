@@ -305,7 +305,7 @@ def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
 
-    assert chart["version"] == "0.1.3"
+    assert chart["version"] == "0.1.4"
     assert values["image"]["tag"] == "main-latest"
     assert values["image"]["pullPolicy"] == "Always"
 
@@ -331,6 +331,15 @@ def test_ci_installs_playwright_chromium_with_system_dependencies() -> None:
         "relay landing-page real desktop-bridge guardrail does not fail when the "
         "runner image lacks Chromium shared libraries."
     )
+
+
+def test_run_all_tests_invokes_playwright_with_selected_python() -> None:
+    runner = Path("run_all_tests.sh").read_text(encoding="utf-8")
+
+    assert '"$PYTHON_CMD" -m playwright --version' in runner
+    assert '"$PYTHON_CMD" -m playwright install --with-deps chromium' in runner
+    assert '"$PYTHON_CMD" -m playwright install chromium' in runner
+    assert "command -v playwright" not in runner
 
 
 def test_run_all_tests_detects_macos_arm64_playwright_chromium_cache() -> None:

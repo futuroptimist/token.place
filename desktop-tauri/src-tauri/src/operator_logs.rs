@@ -1156,7 +1156,7 @@ mod tests {
         assert!(!sanitized.contains("Alice"));
         assert!(!sanitized.contains("AppData"));
         assert!(!sanitized.contains("Command ["));
-        assert!(sanitized.contains("stage=subprocess_command"));
+        assert!(sanitized.contains("stage=subprocess_timeout"));
         assert!(sanitized.contains("category=worker_timeout"));
         assert!(sanitized.contains("timeout_seconds=30"));
 

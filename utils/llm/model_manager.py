@@ -165,8 +165,8 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
     ):
         if field in capabilities:
             payload[field] = capabilities.get(field)
-    yarn_enum_value = _coerce_optional_int_enum(capabilities.get('yarn_enum_value'))
-    if yarn_enum_value is not None:
+    yarn_enum_value = capabilities.get('yarn_enum_value')
+    if isinstance(yarn_enum_value, int) and not isinstance(yarn_enum_value, bool):
         payload['yarn_enum_value'] = yarn_enum_value
     return payload
 
@@ -4823,6 +4823,7 @@ class ModelManager:
                                     'qwen_64k_runtime_profile_n_batch': applied_memory.get('n_batch'),
                                     'qwen_64k_runtime_profile_n_ubatch': applied_memory.get('n_ubatch'),
                                     'qwen_64k_runtime_profile_result': 'constructed',
+                                    'llama_cpp_runtime_profile_backend': memory_profile.get('backend'),
                                 })
                                 first_failure = getattr(self, '_qwen_64k_first_readiness_failure_diagnostics', {})
                                 if isinstance(first_failure, dict):
@@ -4833,6 +4834,12 @@ class ModelManager:
                                 compute_plan['yarn_rope_diagnostics'] = dict(yarn_diagnostics)
                                 compute_plan['yarn_rope_enum_location'] = yarn_diagnostics.get('yarn_enum_location')
                                 compute_plan['yarn_rope_accepted_constructor_kwargs'] = yarn_diagnostics.get('accepted_constructor_kwargs')
+                                compute_plan['llama_cpp_capability_source'] = yarn_diagnostics.get('capability_source')
+                                compute_plan['llama_cpp_desktop_probe_authoritative'] = yarn_diagnostics.get('desktop_probe_authoritative')
+                                compute_plan['llama_cpp_child_capability_reprobe_attempted'] = yarn_diagnostics.get('child_probe_reprobe_attempted')
+                                compute_plan['llama_cpp_child_capability_reprobe_skipped_reason'] = yarn_diagnostics.get('child_probe_reprobe_skipped_reason')
+                                compute_plan['llama_cpp_constructor_signature_inspectable'] = yarn_diagnostics.get('constructor_signature_inspectable')
+                                compute_plan['llama_cpp_qwen_64k_yarn_support'] = yarn_diagnostics.get('support_classification')
                             self.last_compute_diagnostics = compute_plan
                             if compute_plan['requested_mode'] == 'cpu':
                                 runtime_identity = {
@@ -4877,7 +4884,7 @@ class ModelManager:
                             else:
                                 self.log_error(
                                     f"Failed to initialize Llama model: {self.last_runtime_init_error}",
-                                    exc_info=True,
+                                    exc_info=False,
                                 )
                             return None
 

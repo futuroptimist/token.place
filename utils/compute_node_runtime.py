@@ -832,7 +832,7 @@ class ComputeNodeRuntime:
                     llm_runtime = get_llm_instance()
             except Exception as exc:
                 setattr(self.model_manager, 'last_runtime_init_error', str(exc))
-                _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
+                _log_error(f"Failed to initialize API v1 runtime for compute node: {type(exc).__name__}", exc_info=False)
                 return False
 
             if llm_runtime is None:
@@ -963,6 +963,13 @@ class ComputeNodeRuntime:
                 "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
                 "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
                 "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+                "llama_cpp_capability_source": yarn_diagnostics.get("capability_source"),
+                "llama_cpp_desktop_probe_authoritative": yarn_diagnostics.get("desktop_probe_authoritative"),
+                "llama_cpp_child_capability_reprobe_attempted": yarn_diagnostics.get("child_probe_reprobe_attempted"),
+                "llama_cpp_child_capability_reprobe_skipped_reason": yarn_diagnostics.get("child_probe_reprobe_skipped_reason"),
+                "llama_cpp_constructor_signature_inspectable": yarn_diagnostics.get("constructor_signature_inspectable"),
+                "llama_cpp_qwen_64k_yarn_support": yarn_diagnostics.get("support_classification"),
+                "llama_cpp_runtime_profile_backend": diagnostics.get("llama_cpp_runtime_profile_backend"),
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
@@ -1541,5 +1548,5 @@ class ComputeNodeRuntime:
         except Exception:
             _log_warning(
                 "Relay unregister request raised during shutdown; continuing stop",
-                exc_info=True,
+                exc_info=False,
             )

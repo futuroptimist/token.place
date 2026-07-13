@@ -6,14 +6,8 @@ kind: ServiceMonitor
 metadata:
   name: {{ include "tokenplace.fullname" . }}
   labels:
-    {{- include "tokenplace.labels" . | nindent 4 }}
-    {{- $reservedLabels := list "helm.sh/chart" "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/version" "app.kubernetes.io/managed-by" }}
-    {{- range $key, $_ := .Values.serviceMonitor.additionalLabels }}
-    {{- if has $key $reservedLabels }}{{ fail (printf "serviceMonitor.additionalLabels must not override chart label %q" $key) }}{{- end }}
-    {{- end }}
-    {{- with .Values.serviceMonitor.additionalLabels }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+    {{- $serviceMonitorLabels := mergeOverwrite (deepCopy (.Values.serviceMonitor.additionalLabels | default dict)) (include "tokenplace.labels" . | fromYaml) }}
+    {{- toYaml $serviceMonitorLabels | nindent 4 }}
 spec:
   namespaceSelector:
     matchNames:
@@ -31,25 +25,25 @@ spec:
         credentials:
           name: {{ $metricsSecret | quote }}
           key: {{ .Values.metrics.auth.secretKey | quote }}
-      {{- $metricLabels := .Values.serviceMonitor.metricLabels | default dict }}
-      {{- if or $metricLabels.app $metricLabels.environment $metricLabels.release $metricLabels.cluster }}
+      {{- $relabelings := .Values.serviceMonitor.relabelings | default dict }}
+      {{- if or $relabelings.app $relabelings.environment $relabelings.release $relabelings.cluster }}
       relabelings:
-        {{- with $metricLabels.app }}
+        {{- with $relabelings.app }}
         - action: replace
           targetLabel: app
           replacement: {{ . | quote }}
         {{- end }}
-        {{- with $metricLabels.environment }}
+        {{- with $relabelings.environment }}
         - action: replace
           targetLabel: environment
           replacement: {{ . | quote }}
         {{- end }}
-        {{- with $metricLabels.release }}
+        {{- with $relabelings.release }}
         - action: replace
           targetLabel: release
           replacement: {{ . | quote }}
         {{- end }}
-        {{- with $metricLabels.cluster }}
+        {{- with $relabelings.cluster }}
         - action: replace
           targetLabel: cluster
           replacement: {{ . | quote }}

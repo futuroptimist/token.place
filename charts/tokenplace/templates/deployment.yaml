@@ -125,9 +125,7 @@ spec:
           {{- if .Values.metrics.enabled }}
           {{- $metricsSecret := required "metrics.auth.existingSecret is required when metrics.enabled=true" .Values.metrics.auth.existingSecret }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_TOKEN" (dict "name" "TOKENPLACE_METRICS_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $metricsSecret "key" .Values.metrics.auth.secretKey))) }}
-          {{- $_ := unset $mergedEnv "TOKENPLACE_METRICS_DISABLED" }}
           {{- else }}
-          {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_DISABLED" (dict "name" "TOKENPLACE_METRICS_DISABLED" "value" "1") }}
           {{- $_ := unset $mergedEnv "TOKENPLACE_METRICS_TOKEN" }}
           {{- end }}
           image: {{ include "tokenplace.image" . }}

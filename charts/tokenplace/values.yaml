@@ -59,6 +59,7 @@ service:
 
 metrics:
   enabled: false
+  path: /metrics
   auth:
     existingSecret: ""
     secretKey: token
@@ -69,7 +70,7 @@ serviceMonitor:
   scrapeTimeout: 10s
   additionalLabels:
     release: kube-prometheus-stack
-  metricLabels:
+  relabelings:
     app: tokenplace
     environment: ""
     release: ""

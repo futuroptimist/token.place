@@ -172,6 +172,37 @@ health/diagnostics output after the compute test, and relay logs after the
 compute test. The exact compute-node launch command is operator/environment
 specific, so record the command actually used rather than inventing one here.
 
+
+## Optional metrics scrape verification
+
+When the canonical chart is deployed with `metrics.enabled=true` and
+`serviceMonitor.enabled=true`, keep the scrape internal and authenticated. The chart
+does not add a dedicated public `/metrics` Ingress path; if the existing catch-all `/`
+Prefix Ingress reaches `/metrics`, bearer authentication must reject unauthenticated
+public requests. Capture evidence with commands like these, adjusting namespace, Secret,
+Prometheus service account, hostname, release label, and image tag for the environment:
+
+```bash
+NS=tokenplace
+SECRET=tokenplace-metrics
+PROM_NS=monitoring
+PROM_SA=kube-prometheus-stack-prometheus
+PUBLIC_URL=https://staging.token.place
+PROM_POD=$(kubectl -n "$PROM_NS" get pod -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[0].metadata.name}')
+
+test -n "$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.token}')"
+kubectl auth can-i get secret/"$SECRET" --namespace "$NS" --as "system:serviceaccount:${PROM_NS}:${PROM_SA}"
+kubectl -n "$PROM_NS" exec "$PROM_POD" -- wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=active' | \
+  python3 -c 'import json,sys; targets=json.load(sys.stdin)["data"]["activeTargets"]; matches=[t for t in targets if t.get("labels",{}).get("app") == "tokenplace" and t.get("labels",{}).get("environment") and t.get("labels",{}).get("release") and t.get("labels",{}).get("cluster")]; assert matches and all(t["health"] == "up" for t in matches), matches'
+if curl -fsS "$PUBLIC_URL/metrics" | head -n 5 | grep -Eq '^(# HELP|# TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\{?)'; then
+  echo "public unauthenticated /metrics returned a Prometheus payload" >&2
+  exit 1
+fi
+helm -n "$NS" list --filter '^tokenplace$'
+kubectl -n "$NS" get deploy tokenplace -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n "$NS" get servicemonitor tokenplace -o jsonpath='{.metadata.labels.release}{"\n"}'
+```
+
 ## Production promotion gate
 
 Production uses the same GHCR image and OCI Helm chart path, with release and

@@ -1,113 +1,164 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
+from typing import Any
 
+import pytest
 import yaml
 
 CHART = Path("charts/tokenplace")
 
 
-def _read(relative: str) -> str:
-    return (CHART / relative).read_text(encoding="utf-8")
+def _helm_or_skip() -> str:
+    helm = shutil.which("helm")
+    if helm is None:
+        pytest.skip("helm is not installed")
+    return helm
 
 
-def _values() -> dict:
-    return yaml.safe_load(_read("values.yaml"))
+def _helm_template(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    helm = _helm_or_skip()
+    return subprocess.run(
+        [helm, "template", "tokenplace", str(CHART), "--namespace", "tokenplace", *args],
+        check=check,
+        text=True,
+        capture_output=True,
+    )
 
 
-def test_metrics_and_service_monitor_default_disabled_values() -> None:
-    values = _values()
-
-    assert values["metrics"]["enabled"] is False
-    assert "path" not in values["metrics"]
-    assert values["metrics"]["auth"]["existingSecret"] == ""
-    assert values["metrics"]["auth"]["secretKey"] == "token"
-    assert values["serviceMonitor"]["enabled"] is False
-    assert values["serviceMonitor"]["interval"] == "30s"
-    assert values["serviceMonitor"]["scrapeTimeout"] == "10s"
+def _render(*args: str) -> list[dict[str, Any]]:
+    rendered = _helm_template(*args).stdout
+    return [doc for doc in yaml.safe_load_all(rendered) if isinstance(doc, dict)]
 
 
-def test_metrics_token_is_injected_only_from_existing_secret() -> None:
-    deployment = _read("templates/deployment.yaml")
-
-    assert "{{- if .Values.metrics.enabled }}" in deployment
-    assert 'required "metrics.auth.existingSecret is required when metrics.enabled=true"' in deployment
-    assert '"TOKENPLACE_METRICS_TOKEN"' in deployment
-    assert '"TOKENPLACE_METRICS_DISABLED"' in deployment
-    assert '"valueFrom" (dict "secretKeyRef"' in deployment
-    assert ".Values.metrics.auth.secretKey" in deployment
-    assert "TOKENPLACE_METRICS_TOKEN" not in _read("values.yaml")
+def _kind(docs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    return [doc for doc in docs if doc.get("kind") == kind]
 
 
-def test_service_monitor_renders_only_when_enabled_and_selects_canonical_service() -> None:
-    service_monitor = _read("templates/servicemonitor.yaml")
-    service = _read("templates/service.yaml")
-
-    assert service_monitor.startswith("{{- if .Values.serviceMonitor.enabled }}")
-    assert 'fail "metrics.enabled=true is required when serviceMonitor.enabled=true"' in service_monitor
-    assert "kind: ServiceMonitor" in service_monitor
-    assert "selector:\n    matchLabels:" in service_monitor
-    assert 'include "tokenplace.selectorLabels"' in service_monitor
-    assert "- port: http" in service_monitor
-    assert 'path: "/metrics"' in service_monitor
-    assert "targetPort: http" in service
-    assert "- name: http" in service
+def _deployment_env(deployment: dict[str, Any]) -> list[dict[str, Any]]:
+    return deployment["spec"]["template"]["spec"]["containers"][0]["env"]
 
 
-def test_service_monitor_uses_supported_authorization_secret_reference() -> None:
-    service_monitor = _read("templates/servicemonitor.yaml")
-
-    assert "authorization:" in service_monitor
-    assert "type: Bearer" in service_monitor
-    assert "credentials:" in service_monitor
-    assert "name: {{ $metricsSecret | quote }}" in service_monitor
-    assert 'key: {{ .Values.metrics.auth.secretKey | quote }}' in service_monitor
-    assert "bearerTokenSecret" not in service_monitor
-    assert "bearerTokenFile" not in service_monitor
+def _env_by_name(deployment: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {entry["name"]: entry for entry in _deployment_env(deployment)}
 
 
-def test_service_monitor_release_discovery_label_is_configured_not_hard_coded() -> None:
-    values = _values()
-    service_monitor = _read("templates/servicemonitor.yaml")
-
-    assert values["serviceMonitor"]["additionalLabels"]["release"] == "kube-prometheus-stack"
-    assert "with .Values.serviceMonitor.additionalLabels" in service_monitor
-    assert "release: kube-prometheus-stack" not in service_monitor
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
 
 
-def test_service_monitor_bounded_relabeling_hooks() -> None:
-    values = _values()
-    service_monitor = _read("templates/servicemonitor.yaml")
+def _construct_mapping_no_duplicates(loader: yaml.Loader, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:  # type: ignore[attr-defined]
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
 
-    assert set(values["serviceMonitor"]["metricLabels"]) == {"app", "environment", "release", "cluster"}
-    for label in ("app", "environment", "release", "cluster"):
-        assert f"targetLabel: {label}" in service_monitor
-    assert "sourceLabels" not in service_monitor
+
+UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping_no_duplicates)
 
 
-def test_ingress_does_not_create_public_metrics_path() -> None:
-    ingress = _read("templates/ingress.yaml")
+def test_defaults_render_no_service_monitor_and_no_metrics_token() -> None:
+    docs = _render()
+    assert _kind(docs, "ServiceMonitor") == []
+    deployment = _kind(docs, "Deployment")[0]
+    assert "TOKENPLACE_METRICS_TOKEN" not in _env_by_name(deployment)
 
-    assert "path: /metrics" not in ingress
-    assert "metrics" not in ingress
-    assert "serviceMonitor" not in ingress
+
+def test_service_monitor_requires_metrics_enabled() -> None:
+    result = _helm_template(
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "metrics.auth.existingSecret=tokenplace-metrics",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "metrics.enabled=true is required when serviceMonitor.enabled=true" in result.stderr
+
+
+def test_metrics_path_override_fails_schema_validation() -> None:
+    result = _helm_template("--set", "metrics.path=/custom", check=False)
+    assert result.returncode != 0
+    assert "/metrics/path" in result.stderr
+
+
+def test_enabled_monitor_matches_service_and_uses_secret_authorization() -> None:
+    docs = _render(
+        "--set", "metrics.enabled=true",
+        "--set", "metrics.auth.existingSecret=tokenplace-metrics",
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "serviceMonitor.relabelings.environment=staging",
+        "--set", "serviceMonitor.relabelings.release=main-deadbee",
+        "--set", "serviceMonitor.relabelings.cluster=sugarkube-staging",
+    )
+    service = _kind(docs, "Service")[0]
+    monitor = _kind(docs, "ServiceMonitor")[0]
+    endpoint = monitor["spec"]["endpoints"][0]
+
+    assert monitor["spec"]["selector"]["matchLabels"] == service["spec"]["selector"]
+    assert endpoint["port"] == "http"
+    assert endpoint["path"] == "/metrics"
+    assert endpoint["authorization"]["credentials"] == {"name": "tokenplace-metrics", "key": "token"}
+
+    relabelings = endpoint["relabelings"]
+    assert {item["targetLabel"] for item in relabelings} == {"app", "environment", "release", "cluster"}
+    replacements = {item["targetLabel"]: item["replacement"] for item in relabelings}
+    assert replacements == {
+        "app": "tokenplace",
+        "environment": "staging",
+        "release": "main-deadbee",
+        "cluster": "sugarkube-staging",
+    }
+
+
+def test_extra_env_cannot_replace_chart_managed_metrics_secret_ref() -> None:
+    docs = _render(
+        "--set", "metrics.enabled=true",
+        "--set", "metrics.auth.existingSecret=tokenplace-metrics",
+        "--set", "extraEnv[0].name=TOKENPLACE_METRICS_TOKEN",
+        "--set", "extraEnv[0].value=plaintext",
+    )
+    token_env = _env_by_name(_kind(docs, "Deployment")[0])["TOKENPLACE_METRICS_TOKEN"]
+    assert "value" not in token_env
+    assert token_env["valueFrom"]["secretKeyRef"] == {"name": "tokenplace-metrics", "key": "token"}
+
+
+def test_no_public_metrics_ingress_path_is_added() -> None:
+    docs = _render("--set", "ingress.enabled=true", "--set", "ingress.host=token.place")
+    ingress = _kind(docs, "Ingress")[0]
+    paths = ingress["spec"]["rules"][0]["http"]["paths"]
+    assert [path["path"] for path in paths] == ["/"]
+    assert "/metrics" not in {path["path"] for path in paths}
 
 
 def test_single_replica_recreate_one_worker_constraints_preserved() -> None:
-    values = _values()
-    deployment = _read("templates/deployment.yaml")
+    docs = _render()
+    deployment = _kind(docs, "Deployment")[0]
+    env = _env_by_name(deployment)
 
-    assert values["replicaCount"] == 1
-    assert values["strategy"]["type"] == "Recreate"
-    assert '"RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")' in deployment
-    assert "replicas: {{ .Values.replicaCount }}" in deployment
-    assert '$strategyType := default "Recreate" .Values.strategy.type' in deployment
+    assert deployment["spec"]["replicas"] == 1
+    assert deployment["spec"]["strategy"]["type"] == "Recreate"
+    assert env["RELAY_WORKERS"]["value"] == "1"
 
 
-def test_service_monitor_rejects_reserved_additional_label_keys() -> None:
-    service_monitor = _read("templates/servicemonitor.yaml")
-    schema = _read("values.schema.json")
-
-    assert "serviceMonitor.additionalLabels must not override chart label" in service_monitor
-    assert "app.kubernetes.io/name" in schema
-    assert "helm.sh/chart" in schema
+def test_service_monitor_accepts_overlapping_additional_labels_without_duplicate_keys() -> None:
+    rendered = _helm_template(
+        "--set", "metrics.enabled=true",
+        "--set", "metrics.auth.existingSecret=tokenplace-metrics",
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "serviceMonitor.additionalLabels.app\\.kubernetes\\.io/name=overlap",
+        "--set", "serviceMonitor.additionalLabels.release=kube-prometheus-stack",
+    ).stdout
+    docs = [doc for doc in yaml.load_all(rendered, Loader=UniqueKeyLoader) if isinstance(doc, dict)]
+    monitor = _kind(docs, "ServiceMonitor")[0]
+    labels = monitor["metadata"]["labels"]
+    assert labels["app.kubernetes.io/name"] == "tokenplace"
+    assert labels["release"] == "kube-prometheus-stack"

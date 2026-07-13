@@ -29,11 +29,11 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Chart metadata: chart package version `0.1.4` preserves `appVersion: "0.1.1"`; the historical `v0.1.0` Git tag and `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0` image are immutable release-artifact examples, not a current alignment requirement.
+- Chart metadata: chart package version `0.1.3` preserves `appVersion: "0.1.1"`; the historical `v0.1.0` Git tag and `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0` image are immutable release-artifact examples, not a current alignment requirement.
 - Preferred tag for validation/sign-off: immutable `main-<shortsha>`
 - Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and must not be used for staging sign-off or production promotion
-- Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.4`; if chart `0.1.4` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.4` does not exist, proceed with publishing chart package version `0.1.4`.
+- Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.3`; if chart `0.1.3` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.3` does not exist, proceed with publishing chart package version `0.1.3`.
 
 ## Deployment commands (run from Sugarkube repo)
 

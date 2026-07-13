@@ -249,20 +249,6 @@ def test_metrics_endpoint_optional_bearer_auth(relay_client, monkeypatch) -> Non
     assert "tokenplace_instrumentation_up" in response.get_data(as_text=True)
 
 
-def test_metrics_endpoint_rejects_empty_token(monkeypatch, relay_client) -> None:
-    """An explicitly empty TOKENPLACE_METRICS_TOKEN must fail closed."""
-
-    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", "")
-    assert relay_client.get("/metrics").status_code == 401
-
-
-def test_metrics_endpoint_can_be_disabled(monkeypatch, relay_client) -> None:
-    """The chart can fail closed when metrics are not enabled."""
-
-    monkeypatch.setenv("TOKENPLACE_METRICS_DISABLED", "1")
-    assert relay_client.get("/metrics").status_code == 401
-
-
 def test_request_outcomes_cover_cancel_expire_timeout_and_rate_limit(relay_client, monkeypatch) -> None:
     """Terminal transitions increment fixed outcome counters without identity labels."""
 

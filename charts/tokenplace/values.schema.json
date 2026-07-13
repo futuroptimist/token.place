@@ -8,6 +8,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean", "default": false },
+        "path": { "type": "string", "const": "/metrics", "default": "/metrics" },
         "auth": {
           "type": "object",
           "additionalProperties": false,
@@ -28,20 +29,9 @@
         "additionalLabels": {
           "type": "object",
           "default": { "release": "kube-prometheus-stack" },
-          "propertyNames": {
-            "not": {
-              "enum": [
-                "helm.sh/chart",
-                "app.kubernetes.io/name",
-                "app.kubernetes.io/instance",
-                "app.kubernetes.io/version",
-                "app.kubernetes.io/managed-by"
-              ]
-            }
-          },
           "additionalProperties": { "type": "string" }
         },
-        "metricLabels": {
+        "relabelings": {
           "type": "object",
           "additionalProperties": false,
           "properties": {

@@ -14,11 +14,18 @@ from datetime import datetime
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from release_metadata import get_release_metadata, resolve_asset_version
+from release_metadata import get_release_metadata, resolve_asset_version, resolve_deploy_ref
 from utils.llm.model_profiles import build_model_aliases
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -97,6 +104,10 @@ def setup_logging() -> logging.Logger:
 
 
 LOGGER = setup_logging()
+
+
+RELAY_METRICS_REGISTRY = CollectorRegistry()
+_METRICS_INITIALIZED = False
 
 
 DRAINING = threading.Event()
@@ -407,7 +418,12 @@ def create_app() -> Flask:
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
-    init_app(flask_app)
+    init_app(
+        flask_app,
+        metrics_registry=RELAY_METRICS_REGISTRY,
+        metrics_export_defaults=False,
+        metrics_path=None,
+    )
     LOGGER.info(
         "relay.app.initialized",
         extra={
@@ -422,18 +438,337 @@ app = create_app()
 
 
 def _get_request_counter() -> Counter:
-    metric_name = "tokenplace_relay_requests_total"
-    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(metric_name)
-    if existing is not None:
-        return existing  # type: ignore[return-value]
     return Counter(
-        metric_name,
+        "tokenplace_relay_requests_total",
         "Total HTTP requests processed by token.place relay",
         ["method", "endpoint", "status"],
+        registry=RELAY_METRICS_REGISTRY,
     )
 
 
-REQUEST_COUNTER = _get_request_counter()
+_METRICS_CONSTRUCTION_FAILED = False
+REQUEST_COUNTER = None
+
+PROVIDER_MODE_ENUM = ("relay", "direct", "unknown")
+OUTCOME_ENUM = (
+    "completed",
+    "cancelled",
+    "expired",
+    "timed_out",
+    "rate_limited",
+    "dependency_failure",
+    "failed",
+)
+EVICTION_REASON_ENUM = ("stale_lease", "unregistered", "capacity_loss")
+HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
+BUILD_METADATA = get_release_metadata(None)
+
+
+class _NoopMetric:
+    def labels(self, *args, **kwargs):
+        return self
+
+    def inc(self, *args, **kwargs) -> None:
+        return None
+
+    def set(self, *args, **kwargs) -> None:
+        return None
+
+    def observe(self, *args, **kwargs) -> None:
+        return None
+
+
+def _collector(name: str, factory):
+    global _METRICS_CONSTRUCTION_FAILED
+    try:
+        return factory()
+    except Exception:
+        _METRICS_CONSTRUCTION_FAILED = True
+        LOGGER.error(
+            "metrics.collector_construction_failed",
+            extra={"metric": name, "reason": "collector_construction_failed"},
+        )
+        return _NoopMetric()
+
+
+REQUEST_COUNTER = _collector("tokenplace_relay_requests_total", _get_request_counter)
+
+
+HTTP_REQUESTS_TOTAL = _collector(
+    "tokenplace_http_requests_total",
+    lambda: Counter(
+        "tokenplace_http_requests_total",
+        "Bounded relay HTTP requests by normalized route, status class, provider mode, and outcome.",
+        ["method", "route", "status_class", "provider_mode", "outcome"],
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+HTTP_REQUEST_DURATION_SECONDS = _collector(
+    "tokenplace_http_request_duration_seconds",
+    lambda: Histogram(
+        "tokenplace_http_request_duration_seconds",
+        "Bounded relay HTTP request duration in seconds.",
+        ["method", "route", "status_class", "provider_mode", "outcome"],
+        buckets=HTTP_DURATION_BUCKETS,
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+RELAY_QUEUE_DEPTH = _collector(
+    "tokenplace_relay_queue_depth",
+    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _collector(
+    "tokenplace_relay_oldest_queued_request_age_seconds",
+    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
+)
+COMPUTE_NODES_REGISTERED = _collector(
+    "tokenplace_compute_nodes_registered",
+    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", registry=RELAY_METRICS_REGISTRY),
+)
+COMPUTE_NODES_HEALTHY = _collector(
+    "tokenplace_compute_nodes_healthy",
+    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", registry=RELAY_METRICS_REGISTRY),
+)
+COMPUTE_NODE_LEASE_AGE_SECONDS = _collector(
+    "tokenplace_compute_node_lease_age_seconds",
+    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", registry=RELAY_METRICS_REGISTRY),
+)
+COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
+    "tokenplace_compute_node_evictions_total",
+    lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"], registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_IN_FLIGHT_REQUESTS = _collector(
+    "tokenplace_relay_in_flight_requests",
+    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _collector(
+    "tokenplace_relay_oldest_in_flight_age_seconds",
+    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
+    "tokenplace_relay_request_outcomes_total",
+    lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=RELAY_METRICS_REGISTRY),
+)
+BUILD_INFO = _collector(
+    "tokenplace_build_info",
+    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
+)
+INSTRUMENTATION_UP = _collector(
+    "tokenplace_instrumentation_up",
+    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", registry=RELAY_METRICS_REGISTRY),
+)
+
+
+def _initialise_metric_labels() -> None:
+    if _METRICS_CONSTRUCTION_FAILED:
+        INSTRUMENTATION_UP.set(0)
+        return
+    for outcome in OUTCOME_ENUM:
+        RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
+    for reason in EVICTION_REASON_ENUM:
+        COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
+    RELAY_QUEUE_DEPTH.labels("relay").set(0)
+    RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
+    BUILD_INFO.labels(
+        BUILD_METADATA.get("version", "dev"),
+        _build_revision_label(BUILD_METADATA),
+    ).set(1)
+    INSTRUMENTATION_UP.set(1)
+    global _METRICS_INITIALIZED
+    _METRICS_INITIALIZED = True
+
+
+def _build_revision_label(metadata: dict[str, str]) -> str:
+    """Resolve the public build revision label for Prometheus build info."""
+
+    return (
+        metadata.get("ref")
+        or resolve_deploy_ref()
+        or metadata.get("version")
+        or "unknown"
+    )
+
+
+CANONICAL_HTTP_METHOD_ENUM = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
+
+
+def _normalise_http_method(method: str | None) -> str:
+    method = method.upper() if isinstance(method, str) else ""
+    return method if method in CANONICAL_HTTP_METHOD_ENUM else "other"
+
+
+def _normalise_status_class(status_code: int | str) -> str:
+    try:
+        return f"{int(status_code) // 100}xx"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _normalise_http_route() -> str:
+    if request.path.rstrip("/") == "/metrics":
+        return "/metrics"
+    endpoint = request.endpoint or "unknown"
+    route_map = {
+        "api_v1_relay_requests": "/api/v1/relay/requests",
+        "api_v1_relay_requests_cancel": "/api/v1/relay/requests/cancel",
+        "api_v1_relay_responses": "/api/v1/relay/responses",
+        "api_v1_relay_responses_retrieve": "/api/v1/relay/responses/retrieve",
+        "api_v1_relay_servers_register": "/api/v1/relay/servers/register",
+        "api_v1_relay_servers_unregister": "/api/v1/relay/servers/unregister",
+        "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
+        "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
+        "healthz": "/healthz",
+        "livez": "/livez",
+        "metrics": "/metrics",
+        "relay_diagnostics": "/relay/diagnostics",
+    }
+    if endpoint in route_map:
+        return route_map[endpoint]
+    if endpoint.startswith("v1.") or endpoint.startswith("openai_v1."):
+        return "/api/v1/*"
+    if endpoint.startswith("v2.") or endpoint.startswith("openai_v2."):
+        return "/api/v2/*"
+    return "other"
+
+
+def _outcome_for_response(response: Response) -> str:
+    explicit = getattr(g, "tokenplace_metric_outcome", None)
+    if explicit in OUTCOME_ENUM:
+        return explicit
+    if response.status_code == 429:
+        return "rate_limited"
+    if response.status_code >= 400:
+        return "failed"
+    return "completed"
+
+
+def _record_terminal_outcome(outcome: str) -> None:
+    if outcome not in OUTCOME_ENUM:
+        outcome = "failed"
+    try:
+        RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome).inc()
+    except Exception:
+        LOGGER.debug("metrics.outcome_increment_failed", extra={"outcome": outcome})
+
+
+def _record_request_terminal_outcome_once(
+    client_public_key: str | None,
+    request_id: str | None,
+    outcome: str,
+) -> bool:
+    """Record a terminal request outcome once for a client/request pair."""
+
+    if not client_public_key or not request_id:
+        return False
+    if outcome not in OUTCOME_ENUM:
+        outcome = "failed"
+    expires_at = time.time() + max(TERMINAL_REQUEST_TTL_SECONDS, 1.0)
+    with client_terminal_outcomes_lock:
+        recorded_ids = client_terminal_outcomes.setdefault(client_public_key, {})
+        if request_id in recorded_ids:
+            return False
+        recorded_ids[request_id] = expires_at
+    _record_terminal_outcome(outcome)
+    return True
+
+
+def _is_relay_inference_route(route: str) -> bool:
+    return route == "/api/v1/relay/requests"
+
+
+def _terminal_outcome_from_status_reason(status: str, reason: str | None) -> str:
+    if reason == "provider_timeout":
+        return "timed_out"
+    if status == "expired":
+        return "expired"
+    if status == "cancelled":
+        return "cancelled"
+    return "failed"
+
+
+def _metrics_token_is_valid() -> bool:
+    token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
+    if not token:
+        return True
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not header.startswith(prefix):
+        return False
+    return secrets.compare_digest(header[len(prefix):], token)
+
+
+def _update_runtime_gauges() -> None:
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    queue_depth = 0
+    oldest_queued_age = 0.0
+    with client_inference_requests_changed:
+        for queued_requests in client_inference_requests.values():
+            if not isinstance(queued_requests, list):
+                continue
+            queue_depth += len(queued_requests)
+            for item in queued_requests:
+                queued_at = item.get("_queued_at") if isinstance(item, dict) else None
+                if isinstance(queued_at, (int, float)):
+                    oldest_queued_age = max(oldest_queued_age, now_wall - float(queued_at))
+
+    registered = 0
+    healthy = 0
+    oldest_lease_age = 0.0
+    in_flight = 0
+    oldest_in_flight_age = 0.0
+    server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
+    with server_round_robin_lock:
+        for payload in known_servers.values():
+            if not isinstance(payload, dict) or not payload.get(API_V1_SERVER_MARKER):
+                continue
+            with api_v1_in_flight_requests_lock:
+                in_flight_entries = [
+                    dict(entry)
+                    for entry in (payload.get("api_v1_in_flight_requests") or {}).values()
+                    if isinstance(entry, dict)
+                ]
+            server_snapshots.append(
+                (
+                    payload.get("last_ping"),
+                    _api_v1_node_is_stale(payload, now_monotonic=now_mono),
+                    in_flight_entries,
+                )
+            )
+    for last_ping, is_stale, entries in server_snapshots:
+        registered += 1
+        lease_age = _server_ping_age_seconds(last_ping)
+        oldest_lease_age = max(oldest_lease_age, lease_age if lease_age != float("inf") else 0.0)
+        if not is_stale:
+            healthy += 1
+        for entry in entries:
+            expires_at = entry.get("expires_at")
+            if isinstance(expires_at, (int, float)) and expires_at <= now_mono:
+                continue
+            in_flight += 1
+            started = entry.get("started_at_monotonic")
+            if isinstance(started, (int, float)):
+                oldest_in_flight_age = max(oldest_in_flight_age, now_mono - float(started))
+
+    RELAY_QUEUE_DEPTH.labels("relay").set(queue_depth)
+    RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(max(oldest_queued_age, 0.0))
+    COMPUTE_NODES_REGISTERED.set(registered)
+    COMPUTE_NODES_HEALTHY.set(healthy)
+    COMPUTE_NODE_LEASE_AGE_SECONDS.set(max(oldest_lease_age, 0.0))
+    RELAY_IN_FLIGHT_REQUESTS.set(in_flight)
+    RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS.set(max(oldest_in_flight_age, 0.0))
+
+
+try:
+    INSTRUMENTATION_UP.set(0)
+    _initialise_metric_labels()
+except Exception:
+    LOGGER.error("metrics.initialization_failed", extra={"reason": "initialization_failed"})
+    try:
+        INSTRUMENTATION_UP.set(0)
+    except Exception:
+        pass
+
 
 
 def _load_server_registration_tokens():
@@ -500,6 +835,9 @@ client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
 client_terminal_request_ids = {}
 client_terminal_request_ids_lock = threading.Lock()
+api_v1_terminal_transition_lock = threading.RLock()
+client_terminal_outcomes: dict[str, dict[str, float]] = {}
+client_terminal_outcomes_lock = threading.Lock()
 TERMINAL_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300"))
 PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
 client_inference_requests_lock = threading.Lock()
@@ -847,6 +1185,7 @@ def _evict_stale_servers() -> list[str]:
     default_stale_after = _server_stale_seconds()
     now_monotonic = time.monotonic()
     evicted: list[str] = []
+    stale_candidates: list[str] = []
     with server_round_robin_lock:
         server_items = list(known_servers.items())
         for server_public_key, payload in server_items:
@@ -885,8 +1224,38 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            if _unregister_server(server_public_key):
-                evicted.append(server_public_key)
+            stale_candidates.append(server_public_key)
+
+    for server_public_key in stale_candidates:
+        with api_v1_terminal_transition_lock:
+            with server_round_robin_lock:
+                payload = known_servers.get(server_public_key)
+                if not isinstance(payload, dict):
+                    continue
+                polling_until = payload.get("polling_until_monotonic")
+                if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+                    continue
+                in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+                if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+                    continue
+                stale_after = payload.get("last_ping_duration", default_stale_after)
+                if not isinstance(stale_after, (int, float)):
+                    stale_after = default_stale_after
+                stale_after = max(float(stale_after), 1.0)
+                if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
+                    continue
+                with api_v1_in_flight_requests_lock:
+                    in_flight_requests = payload.get("api_v1_in_flight_requests")
+                    if isinstance(in_flight_requests, dict):
+                        has_active_in_flight_requests = any(
+                            isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
+                            and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
+                            for entry in in_flight_requests.values()
+                        )
+                        if has_active_in_flight_requests:
+                            continue
+                if _unregister_server(server_public_key, eviction_reason="stale_lease"):
+                    evicted.append(server_public_key)
     return evicted
 
 
@@ -953,7 +1322,7 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
-def _unregister_server(server_public_key: str) -> bool:
+def _unregister_server(server_public_key: str, *, eviction_reason: str = "unregistered") -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     _record_api_v1_server_unregistered(server_public_key)
@@ -1021,6 +1390,11 @@ def _unregister_server(server_public_key: str) -> bool:
             "cancelled_queue_depth": cancelled_queue_depth,
         },
     )
+    if removed and eviction_reason in EVICTION_REASON_ENUM:
+        try:
+            COMPUTE_NODE_EVICTIONS_TOTAL.labels(eviction_reason).inc()
+        except Exception:
+            LOGGER.debug("metrics.eviction_increment_failed", extra={"reason": eviction_reason})
     return removed
 
 
@@ -1036,45 +1410,81 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
 def _record_request_start():
     g.request_start_time = time.time()
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
+    if request.path.rstrip("/") == "/metrics" and not _metrics_token_is_valid():
+        return Response("unauthorized\n", status=401, mimetype="text/plain")
+    if request.path.rstrip("/") == "/metrics":
+        try:
+            _update_runtime_gauges()
+        except Exception:
+            LOGGER.error("metrics.gauge_update_failed", extra={"reason": "gauge_update_failed"})
+            return Response("metrics unavailable\n", status=503, mimetype="text/plain")
+    return None
 
 
 @app.after_request
 def _log_request(response: Response):
     endpoint = request.endpoint or "unknown"
     status_code = str(response.status_code)
+    route = _normalise_http_route()
+    status_class = _normalise_status_class(response.status_code)
+    outcome = _outcome_for_response(response)
+    provider_mode = "relay"
 
     try:
         REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+        HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
             "metrics.increment_failed",
-            extra={"endpoint": endpoint, "status": status_code},
+            extra={"route": route, "status_class": status_class, "outcome": outcome},
         )
 
     duration = None
     if hasattr(g, "request_start_time"):
         duration = max(time.time() - g.request_start_time, 0)
+    try:
+        HTTP_REQUEST_DURATION_SECONDS.labels(
+            _normalise_http_method(request.method),
+            route,
+            status_class,
+            provider_mode,
+            outcome,
+        ).observe(duration or 0.0)
+    except Exception:  # pragma: no cover - defensive metric observation
+        LOGGER.debug("metrics.duration_observe_failed", extra={"route": route})
+    if outcome == "rate_limited" and _is_relay_inference_route(route):
+        _record_terminal_outcome("rate_limited")
 
-    if endpoint not in IGNORED_LOG_ENDPOINTS:
+    if endpoint not in IGNORED_LOG_ENDPOINTS and request.path.rstrip("/") != "/metrics":
         LOGGER.info(
             "http.request",
             extra={
                 "http_method": request.method,
-                "http_path": request.path,
+                "http_route": route,
+                "http_path": route,
                 "http_status": int(status_code),
+                "status_class": status_class,
                 "duration_ms": round((duration or 0) * 1000, 2),
-                "request_id": getattr(g, "request_id", None),
-                "user_agent": request.headers.get("User-Agent"),
             },
         )
 
     if getattr(g, "request_id", None):
         response.headers.setdefault("X-Request-Id", g.request_id)
 
-    if endpoint == "metrics":
+    if request.path.rstrip("/") == "/metrics":
         response.headers.setdefault("Cache-Control", "no-store")
 
     return response
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    try:
+        payload = generate_latest(RELAY_METRICS_REGISTRY)
+    except Exception:
+        LOGGER.error("metrics.serialize_failed", extra={"reason": "serialize_failed"})
+        return Response("metrics unavailable\n", status=503, mimetype="text/plain")
+    return Response(payload, mimetype=CONTENT_TYPE_LATEST)
 
 
 @app.route("/healthz", methods=["GET"])
@@ -1682,14 +2092,21 @@ def _sanitize_terminal_reason(value, status):
 
 def _mark_request_terminal(client_public_key, request_id, *, status="cancelled", reason=None):
     if not client_public_key or not request_id:
-        return
+        return False
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     expires_at = time.time() + max(TERMINAL_REQUEST_TTL_SECONDS, 1.0)
     _prune_terminal_requests(now=time.time())
     with client_terminal_request_ids_lock:
         terminal_ids = client_terminal_request_ids.setdefault(client_public_key, {})
+        if request_id in terminal_ids:
+            return False
         terminal_ids[request_id] = {"status": status, "reason": reason, "expires_at": expires_at}
+    return _record_request_terminal_outcome_once(
+        client_public_key,
+        request_id,
+        _terminal_outcome_from_status_reason(status, reason),
+    )
 
 
 def _prune_terminal_requests(*, now=None):
@@ -1705,6 +2122,16 @@ def _prune_terminal_requests(*, now=None):
                     terminal_ids.pop(request_id, None)
             if not terminal_ids:
                 client_terminal_request_ids.pop(client_public_key, None)
+    with client_terminal_outcomes_lock:
+        for client_public_key, recorded_ids in list(client_terminal_outcomes.items()):
+            if not isinstance(recorded_ids, dict):
+                client_terminal_outcomes.pop(client_public_key, None)
+                continue
+            for request_id, expires_at in list(recorded_ids.items()):
+                if not isinstance(expires_at, (int, float)) or expires_at <= now:
+                    recorded_ids.pop(request_id, None)
+            if not recorded_ids:
+                client_terminal_outcomes.pop(client_public_key, None)
 
 
 def _get_terminal_request(client_public_key, request_id):
@@ -1748,7 +2175,6 @@ def _remove_request_from_server_queues(client_public_key, request_id):
                         "relay.api_v1.request_removed_from_queue",
                         extra={
                             "server_fingerprint": _safe_key_fingerprint(server_public_key),
-                            "request_id": request_id,
                         },
                     )
                     continue
@@ -1814,25 +2240,33 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
         return 0
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
-    removed = _remove_request_from_server_queues(client_public_key, request_id)
-    _remove_client_responses_for_request(client_public_key, request_id)
-    _clear_pending_request(client_public_key, request_id)
-    _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
-    with server_round_robin_lock:
-        with api_v1_in_flight_requests_lock:
-            for server_payload in known_servers.values():
-                in_flight_requests = server_payload.get("api_v1_in_flight_requests")
-                if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
-                    continue
-                if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
-                    in_flight_requests.pop(request_id, None)
-                    if not in_flight_requests:
-                        server_payload.pop("api_v1_in_flight_requests", None)
+    with api_v1_terminal_transition_lock:
+        removed = _remove_request_from_server_queues(client_public_key, request_id)
+        pending_removed = _clear_pending_request(client_public_key, request_id)
+        in_flight_removed = 0
+        with server_round_robin_lock:
+            with api_v1_in_flight_requests_lock:
+                for server_payload in known_servers.values():
+                    in_flight_requests = server_payload.get("api_v1_in_flight_requests")
+                    if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                        continue
+                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                        in_flight_requests.pop(request_id, None)
+                        in_flight_removed += 1
+                        if not in_flight_requests:
+                            server_payload.pop("api_v1_in_flight_requests", None)
+        lifecycle_removed = bool(removed or pending_removed or in_flight_removed)
+        if lifecycle_removed:
+            # A queued response means response acceptance already won the terminal
+            # transition. Removing a response alone must never authorize stale
+            # cancellation/expiration work that selected a request before taking
+            # api_v1_terminal_transition_lock.
+            _remove_client_responses_for_request(client_public_key, request_id)
+            _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",
         extra={
             "client_fingerprint": _safe_key_fingerprint(client_public_key),
-            "request_id": request_id,
             "status": status,
             "reason": reason or status,
             "removed_from_queue": removed,
@@ -1857,14 +2291,16 @@ def _mark_request_pending(client_public_key, request_id, *, cancel_token=None):
 
 def _clear_pending_request(client_public_key, request_id):
     if not client_public_key or not request_id:
-        return
+        return False
     with client_pending_request_ids_lock:
         pending_ids = client_pending_request_ids.get(client_public_key)
         if not pending_ids:
-            return
+            return False
+        existed = request_id in pending_ids
         pending_ids.pop(request_id, None)
         if not pending_ids:
             client_pending_request_ids.pop(client_public_key, None)
+        return existed
 
 
 def _clear_pending_requests_for_queued_items(queued_items):
@@ -2059,7 +2495,7 @@ def api_v1_relay_servers_register():
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
         known_servers[public_key]['capabilities'] = capabilities
-    LOGGER.info(log_event, extra={"server_public_key": public_key})
+    LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 
     return jsonify({
         'next_ping_in_x_seconds': lease_seconds,
@@ -2131,7 +2567,7 @@ def api_v1_relay_servers_poll():
         if capabilities is not None:
             server_payload['capabilities'] = capabilities
         server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
-    LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
+    LOGGER.info("server.heartbeat", extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 
     def _mark_claimed_request_terminal(claimed_request):
         if not isinstance(claimed_request, dict):
@@ -2201,6 +2637,7 @@ def api_v1_relay_servers_poll():
                     if isinstance(in_flight_requests, dict):
                         in_flight_requests[request_id] = {
                             'expires_at': time.monotonic() + _api_v1_in_flight_ttl_seconds(),
+                            'started_at_monotonic': time.monotonic(),
                             'client_public_key': first_request.get('client_public_key'),
                             'cancel_token': first_request.get('cancel_token'),
                         }
@@ -2210,10 +2647,7 @@ def api_v1_relay_servers_poll():
     LOGGER.info(
         "relay.api_v1.request_dispatched",
         extra={
-            "server_public_key": public_key,
-            "request_id": first_request.get("request_id"),
-            "queued_at_unix": queued_at,
-            "dispatched_at_unix": time.time(),
+            "server_fingerprint": _safe_key_fingerprint(public_key),
             "queue_wait_ms": queue_wait_ms,
         },
     )
@@ -2257,9 +2691,7 @@ def api_v1_relay_requests():
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
-            "server_public_key": server_public_key,
-            "request_id": envelope.get("request_id"),
-            "queued_at_unix": queued_at,
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "queue_depth": queue_depth,
         },
     )
@@ -2322,42 +2754,53 @@ def api_v1_relay_responses():
 
     request_id = envelope.get('request_id')
     if isinstance(request_id, str) and request_id:
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-        if _has_client_response_for_request(client_public_key, request_id):
-            LOGGER.info(
-                "relay.api_v1.duplicate_response_ignored",
-                extra={
-                    "client_fingerprint": _safe_key_fingerprint(client_public_key),
-                    "request_id": request_id,
-                },
-            )
-            return jsonify({'message': 'Response already queued for client'}), 200
-        _expire_pending_request_if_stale(client_public_key, request_id)
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-        with server_round_robin_lock:
-            with api_v1_in_flight_requests_lock:
-                for server_payload in known_servers.values():
-                    in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-                    if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
-                        continue
-                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
-                        in_flight_requests.pop(request_id, None)
-                        if not in_flight_requests:
-                            server_payload.pop('api_v1_in_flight_requests', None)
-                        break
-
-    _queue_client_response(client_public_key, envelope)
+        with api_v1_terminal_transition_lock:
+            terminal = _get_terminal_request(client_public_key, request_id)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if _has_client_response_for_request(client_public_key, request_id):
+                LOGGER.info(
+                    "relay.api_v1.duplicate_response_ignored",
+                    extra={
+                        "client_fingerprint": _safe_key_fingerprint(client_public_key),
+                    },
+                )
+                return jsonify({'message': 'Response already queued for client'}), 200
+            _expire_pending_request_if_stale(client_public_key, request_id)
+            terminal = _get_terminal_request(client_public_key, request_id)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            lifecycle_owned = False
+            with server_round_robin_lock:
+                with api_v1_in_flight_requests_lock:
+                    for server_payload in known_servers.values():
+                        in_flight_requests = server_payload.get('api_v1_in_flight_requests')
+                        if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
+                            continue
+                        if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                            in_flight_requests.pop(request_id, None)
+                            lifecycle_owned = True
+                            if not in_flight_requests:
+                                server_payload.pop('api_v1_in_flight_requests', None)
+                            break
+            lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
+            terminal = _get_terminal_request(client_public_key, request_id)
+            if terminal is not None:
+                status = terminal.get('status', 'cancelled')
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
+                terminal = _get_terminal_request(client_public_key, request_id)
+                status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            _queue_client_response(client_public_key, envelope)
+    else:
+        _queue_client_response(client_public_key, envelope)
     LOGGER.info(
         "relay.api_v1.response_received",
         extra={
             "client_fingerprint": _safe_key_fingerprint(client_public_key),
-            "request_id": request_id,
         },
     )
     return jsonify({'message': 'Response received and queued for client'}), 200
@@ -2389,7 +2832,7 @@ def api_v1_relay_responses_retrieve():
         if _is_request_pending(client_public_key, request_id):
             LOGGER.debug(
                 "relay.api_v1.response_pending",
-                extra={"client_fingerprint": _safe_key_fingerprint(client_public_key), "request_id": request_id},
+                extra={"client_fingerprint": _safe_key_fingerprint(client_public_key)},
             )
             return jsonify({"status": "pending"}), 202
         terminal = _get_terminal_request(client_public_key, request_id)
@@ -2404,7 +2847,6 @@ def api_v1_relay_responses_retrieve():
         "relay.api_v1.response_retrieved",
         extra={
             "client_fingerprint": _safe_key_fingerprint(client_public_key),
-            "request_id": request_id,
         },
     )
     return jsonify(response), 200

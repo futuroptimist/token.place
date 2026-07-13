@@ -507,7 +507,7 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_cuda_memory'
     if 'ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory')):
         return 'runtime_context_create_cuda_memory'
-    if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'cublas', 'buffer allocation failed')):
+    if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'buffer allocation failed')):
         return 'runtime_context_create_cuda_memory'
     if 'cuda' in text and any(term in text for term in ('buffer', 'resource', 'allocation')):
         return 'runtime_context_create_cuda_buffer_limit'

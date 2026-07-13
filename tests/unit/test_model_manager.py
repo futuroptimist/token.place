@@ -3492,6 +3492,56 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
     ]
 
 
+def test_qwen_64k_mixed_terminal_generic_context_create_preserves_original_error(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm.model_manager import ModelManager
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if len(attempts) == 1:
+                raise RuntimeError('cudaMalloc failed: out of memory')
+            raise ValueError('Failed to create llama_context')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 3
+    assert 'Failed to create llama_context' in manager.last_runtime_init_error
+    assert 'profile exhaustion' not in manager.last_runtime_init_error
+    assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
+        'runtime_context_create_cuda_memory',
+        'runtime_context_create_failed',
+        'runtime_context_create_failed',
+    ]
+
+
 def test_llama_worker_render_complete_allows_testing_stories_model_without_metadata(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -7643,6 +7693,17 @@ def test_unrecognized_init_failure_is_not_context_create_retryable():
 
     category = model_manager_module._classify_runtime_context_create_error(
         RuntimeError('invalid gguf header: missing tensor metadata')
+    )
+
+    assert category == 'runtime_init_unclassified'
+    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_cuda_cublas_not_initialized_is_not_memory_retryable():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        'CUDA error: CUBLAS_STATUS_NOT_INITIALIZED'
     )
 
     assert category == 'runtime_init_unclassified'

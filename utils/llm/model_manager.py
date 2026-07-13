@@ -4983,10 +4983,7 @@ class ModelManager:
                                 if (
                                     first_generic_profile_retry_exc is not None
                                     and profile_failures
-                                    and all(
-                                        failure.get('safe_error_category') == 'runtime_context_create_failed'
-                                        for failure in profile_failures
-                                    )
+                                    and profile_failures[-1].get('safe_error_category') == 'runtime_context_create_failed'
                                 ):
                                     raise first_generic_profile_retry_exc
                                 raise RuntimeError(

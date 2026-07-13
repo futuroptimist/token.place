@@ -4668,6 +4668,56 @@ class ModelManager:
             self.log_info(f"Model file {self.file_name} already exists.")
             return True
 
+    def _publish_qwen_64k_init_failure_readiness_diagnostics(
+        self,
+        *,
+        compute_plan: Dict[str, Any],
+        profile_failures: list[Dict[str, Any]],
+        current_profile_id: Optional[str] = None,
+    ) -> None:
+        """Publish scalar-only readiness diagnostics for pre-registration Qwen 64K init failures."""
+        if not profile_failures:
+            return
+
+        latest_failure = profile_failures[-1]
+        attempted_kwargs = latest_failure.get('attempted_runtime_kwargs')
+        if not isinstance(attempted_kwargs, dict):
+            attempted_kwargs = {}
+        memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
+        applied_memory = memory_profile.get('applied') if isinstance(memory_profile, dict) and isinstance(memory_profile.get('applied'), dict) else {}
+        profile_id = current_profile_id or latest_failure.get('profile_id')
+        attempted_profile_ids = [
+            str(failure.get('profile_id'))
+            for failure in profile_failures
+            if isinstance(failure.get('profile_id'), str) and failure.get('profile_id')
+        ] or list(getattr(self, '_qwen_64k_profile_attempt_ids', []) or [])
+
+        diagnostics = dict(compute_plan) if isinstance(compute_plan, dict) else {}
+        diagnostics.update({
+            'api_v1_runtime_ready': False,
+            'api_v1_readiness_result': 'failed',
+            'api_v1_readiness_error_code': 'compute_node_runtime_init_failed',
+            'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
+            'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
+            'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
+            'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
+            'api_v1_readiness_qwen_64k_runtime_profile_flash_attn': attempted_kwargs.get('flash_attn', applied_memory.get('flash_attn')),
+            'api_v1_readiness_qwen_64k_runtime_profile_offload_kqv': attempted_kwargs.get('offload_kqv', applied_memory.get('offload_kqv')),
+            'api_v1_readiness_qwen_64k_runtime_profile_type_k': attempted_kwargs.get('type_k', applied_memory.get('type_k')),
+            'api_v1_readiness_qwen_64k_runtime_profile_type_v': attempted_kwargs.get('type_v', applied_memory.get('type_v')),
+            'api_v1_readiness_qwen_64k_runtime_profile_n_batch': attempted_kwargs.get('n_batch', applied_memory.get('n_batch')),
+            'api_v1_readiness_qwen_64k_runtime_profile_n_ubatch': attempted_kwargs.get('n_ubatch', applied_memory.get('n_ubatch')),
+            'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
+            'api_v1_readiness_qwen_64k_runtime_profile_failure_category': latest_failure.get('safe_error_category'),
+        })
+        n_ctx = attempted_kwargs.get('n_ctx') or latest_failure.get('n_ctx')
+        if n_ctx is not None:
+            diagnostics['api_v1_readiness_yarn_requested_context_tokens'] = n_ctx
+        backend = latest_failure.get('backend') or diagnostics.get('backend_used')
+        if isinstance(backend, str):
+            diagnostics['api_v1_readiness_backend_used'] = backend
+        self.last_compute_diagnostics = diagnostics
+
     def get_llm_instance(self):
         """
         Gets the Llama instance, initializing it if necessary (thread-safe),
@@ -4903,6 +4953,12 @@ class ModelManager:
                                     }
                                     profile_failures.append(safe_failure)
                                     self.last_qwen_64k_init_failures = profile_failures
+                                    if is_qwen_64k:
+                                        self._publish_qwen_64k_init_failure_readiness_diagnostics(
+                                            compute_plan=compute_plan,
+                                            profile_failures=profile_failures,
+                                            current_profile_id=profile_id,
+                                        )
                                     generic_profile_retry = (
                                         is_qwen_64k
                                         and category == 'runtime_context_create_failed'
@@ -4919,6 +4975,11 @@ class ModelManager:
                                     continue
                             if llm_instance is None:
                                 self.last_qwen_64k_init_failures = profile_failures
+                                if is_qwen_64k:
+                                    self._publish_qwen_64k_init_failure_readiness_diagnostics(
+                                        compute_plan=compute_plan,
+                                        profile_failures=profile_failures,
+                                    )
                                 if (
                                     first_generic_profile_retry_exc is not None
                                     and profile_failures

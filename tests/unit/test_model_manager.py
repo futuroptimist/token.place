@@ -2,6 +2,7 @@
 Unit tests for the model manager module.
 """
 import logging
+import importlib.util
 import os
 import queue
 import subprocess
@@ -7626,7 +7627,38 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
         }
     assert 'Qwen 64K memory/KV/cache profile exhaustion before registration' in manager.last_runtime_init_error
     assert 'runtime_context_create_metal_buffer_limit' in manager.last_runtime_init_error
-    serialized = json.dumps(manager.last_qwen_64k_init_failures) + manager.last_runtime_init_error
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics['api_v1_runtime_ready'] is False
+    assert diagnostics['api_v1_readiness_result'] == 'failed'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_metal_buffer_limit'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
+        'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+    )
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert diagnostics['api_v1_readiness_backend_used'] == 'metal'
+    assert diagnostics['api_v1_readiness_yarn_requested_context_tokens'] == 65536
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_type_k'] == 2
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_type_v'] == 2
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_flash_attn'] is True
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_offload_kqv'] is True
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_n_batch'] == 256
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_n_ubatch'] == 128
+    bridge_path = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python' / 'compute_node_bridge.py'
+    spec = importlib.util.spec_from_file_location('desktop_compute_node_bridge_for_model_manager_test', bridge_path)
+    bridge = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(bridge)
+    safe_diagnostics = bridge._safe_readiness_diagnostics(manager)
+    assert safe_diagnostics
+    assert safe_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
+    assert safe_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_metal_buffer_limit'
+    serialized = (
+        json.dumps(manager.last_qwen_64k_init_failures)
+        + manager.last_runtime_init_error
+        + json.dumps(diagnostics, sort_keys=True)
+        + json.dumps(safe_diagnostics, sort_keys=True)
+    )
     for secret in (
         'SecretInitError',
         'SECRET_PROMPT',

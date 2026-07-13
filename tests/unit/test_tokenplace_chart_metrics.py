@@ -89,7 +89,7 @@ def test_service_monitor_requires_metrics_enabled() -> None:
 def test_metrics_path_override_fails_schema_validation() -> None:
     result = _helm_template("--set", "metrics.path=/custom", check=False)
     assert result.returncode != 0
-    assert "metrics.path" in result.stderr
+    assert any(path in result.stderr for path in ("metrics.path", "/metrics/path"))
     assert "/metrics" in result.stderr
 
 

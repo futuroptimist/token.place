@@ -54,12 +54,12 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
     'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale',
 )
-# Only retry context-create failures backed by safe Metal/KV/cache/buffer
-# evidence. A bare ``Failed to create llama_context`` remains classified as
-# ``runtime_context_create_failed`` but is intentionally non-retryable so corrupt
-# GGUF/runtime/ABI init causes are not masked as memory-profile exhaustion. The
-# packaged-runtime retry regression supplies sanitized ggml_metal/KV stderr
-# diagnostics, which exercises the intended bounded recovery path.
+# Retry context-create failures backed by safe Metal/KV/cache/buffer evidence.
+# Qwen 64K CUDA/Metal startup may also retry the exact generic
+# ``runtime_context_create_failed`` sentinel, but only inside the three-profile
+# F16 -> Q8 -> Q4 loop. If every generic attempt fails, the original generic
+# init exception is re-raised so corrupt GGUF/runtime/ABI causes are not
+# reported as memory-profile exhaustion.
 QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_memory',
     'runtime_context_create_kv_cache_allocation',
@@ -496,7 +496,16 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_metal_buffer_limit'
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
         return 'runtime_context_create_metal_memory'
-    if any(term in text for term in ('cublas_status_alloc_failed', 'cudamalloc', 'cuda oom', 'cuda out of memory', 'ggml_cuda')) and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed')):
+    cuda_allocation_markers = (
+        'cublas_status_alloc_failed',
+        'cudamalloc',
+        'cuda malloc',
+        'cuda oom',
+        'cuda out of memory',
+    )
+    if any(term in text for term in cuda_allocation_markers):
+        return 'runtime_context_create_cuda_memory'
+    if 'ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory')):
         return 'runtime_context_create_cuda_memory'
     if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'cublas', 'buffer allocation failed')):
         return 'runtime_context_create_cuda_memory'
@@ -4834,6 +4843,7 @@ class ModelManager:
                                 else:
                                     runtime_profiles = [None]
                             profile_failures = []
+                            first_generic_profile_retry_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
                             for runtime_profile in runtime_profiles:
@@ -4898,6 +4908,8 @@ class ModelManager:
                                         and compute_plan.get('backend_used') in {'cuda', 'metal'}
                                         and len(profile_failures) < 3
                                     )
+                                    if generic_profile_retry and first_generic_profile_retry_exc is None:
+                                        first_generic_profile_retry_exc = init_exc
                                     if not is_qwen_64k or (category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES and not generic_profile_retry):
                                         raise
                                     close = getattr(init_exc, 'close', None)
@@ -4906,6 +4918,15 @@ class ModelManager:
                                     continue
                             if llm_instance is None:
                                 self.last_qwen_64k_init_failures = profile_failures
+                                if (
+                                    first_generic_profile_retry_exc is not None
+                                    and profile_failures
+                                    and all(
+                                        failure.get('safe_error_category') == 'runtime_context_create_failed'
+                                        for failure in profile_failures
+                                    )
+                                ):
+                                    raise first_generic_profile_retry_exc
                                 raise RuntimeError(
                                     'Qwen 64K memory/KV/cache profile exhaustion before registration; '
                                     f'failures={profile_failures}'

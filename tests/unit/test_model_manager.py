@@ -3292,6 +3292,54 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
     assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
+def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm.model_manager import ModelManager
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            raise ValueError('Failed to create llama_context')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 3
+    assert 'Failed to create llama_context' in manager.last_runtime_init_error
+    assert 'profile exhaustion' not in manager.last_runtime_init_error
+    assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
+        'runtime_context_create_failed',
+        'runtime_context_create_failed',
+        'runtime_context_create_failed',
+    ]
+
+
 def test_llama_worker_render_complete_allows_testing_stories_model_without_metadata(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -6149,6 +6197,16 @@ def test_subprocess_worker_cuda_oom_classification_uses_safe_category(message):
 
     assert namespace['_classify_generation_exception'](exc) == 'cuda_memory_allocation'
     assert namespace['_sanitize_error_summary'](exc).endswith(':cuda_memory_allocation')
+
+
+def test_runtime_context_create_generic_ggml_cuda_failure_is_not_cuda_memory():
+    from utils.llm import model_manager as model_manager_module
+
+    category = model_manager_module._classify_runtime_context_create_error(
+        RuntimeError('ggml_cuda_init: failed to load CUDA backend; Failed to create llama_context')
+    )
+
+    assert category == 'runtime_context_create_failed'
 
 
 def test_subprocess_worker_generic_cuda_text_is_not_allocation_failure():

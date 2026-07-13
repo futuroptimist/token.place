@@ -150,6 +150,7 @@ jobs:
         run: |
           python -m pytest tests/unit/test_desktop_runtime_setup.py -q
           python -m pytest tests/unit/test_model_manager.py -q
+          python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
 
       - name: Upload desktop relay parity logs on failure (Windows)

@@ -208,7 +208,20 @@ pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
                 .unwrap_or_else(|_| r#"{"type":"operator_log_json_sanitize_error"}"#.to_string());
         }
     }
-    line.split_whitespace()
+    sanitize_operator_diagnostic_text(&line)
+}
+
+fn sanitize_operator_diagnostic_text(text: &str) -> String {
+    if text.contains("TimeoutExpired") && text.contains("Command ") {
+        let timeout_seconds = parse_timeout_expired_seconds(text)
+            .map(|seconds| format!(" timeout_seconds={seconds}"))
+            .unwrap_or_default();
+        let stage = parse_timeout_expired_stage(text).unwrap_or("subprocess_timeout");
+        return format!(
+            "desktop.llama_cpp_worker.init_failed stage={stage} category=worker_timeout{timeout_seconds}"
+        );
+    }
+    text.split_whitespace()
         .map(sanitize_operator_diagnostic_token)
         .collect::<Vec<_>>()
         .join(" ")
@@ -228,6 +241,10 @@ fn sanitize_operator_diagnostic_token(token: &str) -> String {
     }
     if token.starts_with("http://") || token.starts_with("https://") {
         return sanitize_url_display(token);
+    }
+
+    if is_windows_drive_path_like(token) || is_windows_extended_or_unc_path_like(token) {
+        return sanitize_path_display(token);
     }
 
     for separator in ['=', ':'] {
@@ -279,7 +296,7 @@ fn sanitize_operator_json_value(value: &serde_json::Value) -> serde_json::Value 
                 .collect(),
         ),
         serde_json::Value::String(text) => {
-            serde_json::Value::String(sanitize_operator_diagnostic_token(text))
+            serde_json::Value::String(sanitize_operator_diagnostic_text(text))
         }
         _ => value.clone(),
     }
@@ -564,25 +581,114 @@ fn sanitize_url_display(value: &str) -> String {
 
 fn sanitize_path_display(value: &str) -> String {
     let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
-    let path = Path::new(trimmed);
     if trimmed.starts_with('/') && trimmed.split('/').filter(|part| !part.is_empty()).count() <= 2 {
         return "<path>".into();
     }
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let cross_platform_name = normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty());
+    let path = Path::new(trimmed);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty());
+    let file_name = cross_platform_name.or(file_name);
     match file_name {
         Some(name) => format!("<path:{name}>"),
         None => "<path>".into(),
     }
 }
 
+fn parse_timeout_expired_seconds(line: &str) -> Option<u64> {
+    let marker = "timed out after ";
+    let rest = line.split(marker).nth(1)?;
+    let digits: String = rest
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse::<u64>().ok()
+}
+
+fn parse_timeout_expired_stage(line: &str) -> Option<&'static str> {
+    const ALLOWED: &[&str] = &[
+        "llama_cpp_gpu_probe",
+        "desktop_runtime_probe",
+        "runtime_import_probe",
+        "pip_install",
+        "subprocess_timeout",
+    ];
+    for marker in ["stage=", "stage:"] {
+        if let Some(rest) = line.split(marker).nth(1) {
+            let stage = rest
+                .trim_start_matches(|ch: char| matches!(ch, '"' | '\'' | '[' | '('))
+                .split(|ch: char| !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
+                .next()
+                .unwrap_or("");
+            if let Some(allowed) = ALLOWED.iter().copied().find(|allowed| *allowed == stage) {
+                return Some(allowed);
+            }
+        }
+    }
+    None
+}
+
+fn is_windows_drive_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    trimmed.len() > 2
+        && trimmed.as_bytes()[1] == b':'
+        && (trimmed.as_bytes()[2] == b'/' || trimmed.as_bytes()[2] == b'\\')
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn is_windows_extended_or_unc_path_like(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    (lower.len() > 5
+        && (lower.starts_with("//?/") || lower.starts_with("/?/"))
+        && lower
+            .strip_prefix("//?/")
+            .or_else(|| lower.strip_prefix("/?/"))
+            .is_some_and(|rest| {
+                rest.len() > 2
+                    && rest.as_bytes()[1] == b':'
+                    && rest.as_bytes()[2] == b'/'
+                    && rest.as_bytes()[0].is_ascii_alphabetic()
+            }))
+        || lower.starts_with("//?/unc/")
+        || lower.starts_with("//")
+}
+
 fn is_path_like(value: &str) -> bool {
-    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let trimmed =
+        value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
+    let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
     trimmed.starts_with('/')
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
+        || trimmed.starts_with("\\")
+        || (lower.len() > 5
+            && (lower.starts_with("//?/") || lower.starts_with("/?/"))
+            && lower
+                .strip_prefix("//?/")
+                .or_else(|| lower.strip_prefix("/?/"))
+                .is_some_and(|rest| {
+                    rest.len() > 2
+                        && rest.as_bytes()[1] == b':'
+                        && rest.as_bytes()[2] == b'/'
+                        && rest.as_bytes()[0].is_ascii_alphabetic()
+                }))
+        || lower.starts_with("//?/unc/")
+        || lower.starts_with("//")
+        || lower.contains("/users/")
+        || lower.contains("/appdata/")
+        || lower.contains("/programs/python/")
         || trimmed.contains('/')
         || (trimmed.len() > 2
             && trimmed.as_bytes()[1] == b':'
@@ -1058,5 +1164,72 @@ mod tests {
         sink.append_line("desktop.compute_node.stderr", "bridge stderr line");
         let raw = fs::read_to_string(path).expect("log");
         assert!(raw.contains("desktop.compute_node.stderr bridge stderr line"));
+    }
+    #[test]
+    fn sanitize_operator_diagnostic_line_redacts_windows_timeout_paths() {
+        let raw = r#"TimeoutExpired: Command ['\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe', '-c', 'import llama_cpp'] timed out after 30 seconds C:\Users\Alice\AppData\Local\token.place desktop"#;
+        let sanitized = sanitize_operator_diagnostic_line(raw);
+        assert!(!sanitized.contains("Alice"));
+        assert!(!sanitized.contains("AppData"));
+        assert!(!sanitized.contains("Command ["));
+        assert!(!sanitized.contains("Command '["));
+        assert!(sanitized.contains("stage=subprocess_timeout"));
+        assert!(sanitized.contains("category=worker_timeout"));
+        assert!(sanitized.contains("timeout_seconds=30"));
+
+        let custom_timeout = sanitize_operator_diagnostic_line(
+            r#"TimeoutExpired: Command ['C:\Users\Alice\python.exe'] timed out after 45 seconds"#,
+        );
+        assert!(custom_timeout.contains("timeout_seconds=45"));
+        assert!(!custom_timeout.contains("Alice"));
+
+        let quoted_python_timeout = sanitize_operator_diagnostic_line(
+            r#"subprocess.TimeoutExpired: Command '['C:\Users\Alice\python.exe', '-c', 'import llama_cpp']' timed out after 12 seconds"#,
+        );
+        assert_eq!(
+            quoted_python_timeout,
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=12"
+        );
+        assert!(!quoted_python_timeout.contains("Alice"));
+        assert!(!quoted_python_timeout.contains("Command '['"));
+        assert!(!quoted_python_timeout.contains("import llama_cpp"));
+
+        let json = sanitize_operator_diagnostic_line(
+            r#"{"path":"C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe","stage":"llama_cpp_gpu_probe"}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parseable json");
+        assert_eq!(parsed["path"], "<path:python.exe>");
+        assert!(!json.contains("Alice"));
+        assert!(!json.contains("AppData"));
+
+        let json_timeout = sanitize_operator_diagnostic_line(
+            r#"{"message":"TimeoutExpired: Command ['C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe', '-c', 'import llama_cpp'] timed out after 45 seconds","stderr":"prefix TimeoutExpired: Command ['D:\\Users\\Bob\\AppData\\Local\\app.exe'] timed out after 9 seconds","safe":"ok"}"#,
+        );
+        let parsed_timeout: serde_json::Value =
+            serde_json::from_str(&json_timeout).expect("timeout json remains parseable");
+        assert_eq!(
+            parsed_timeout["message"],
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=45"
+        );
+        assert_eq!(
+            parsed_timeout["stderr"],
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=9"
+        );
+        assert_eq!(parsed_timeout["safe"], "ok");
+        assert!(!json_timeout.contains("Alice"));
+        assert!(!json_timeout.contains("Bob"));
+        assert!(!json_timeout.contains("AppData"));
+        assert!(!json_timeout.contains("Command ["));
+        assert!(!json_timeout.contains("Command '["));
+        assert!(!json_timeout.contains("import llama_cpp"));
+
+        let drive = sanitize_operator_diagnostic_line(
+            r#"python=C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe"#,
+        );
+        assert_eq!(drive, "python=<path:python.exe>");
+        let extended = sanitize_operator_diagnostic_line(
+            r#"\\?\C:\Users\Alice\AppData\Local\Programs\Python\Python311\python.exe"#,
+        );
+        assert_eq!(extended, "<path:python.exe>");
     }
 }

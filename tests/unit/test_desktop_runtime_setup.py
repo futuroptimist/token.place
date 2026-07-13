@@ -2069,3 +2069,66 @@ def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp
 
     assert result['runtime_action'] == 'probe_only'
     assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
+
+
+def test_probe_result_payload_preserves_native_capability_types():
+    support = {name: True for name in desktop_runtime_setup.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cuda',
+        gpu_offload_supported=True,
+        detected_device='cuda',
+        interpreter=sys.executable,
+        prefix=sys.prefix,
+        llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        llama_cpp_python_version='0.3.32',
+        yarn_rope_supported=True,
+        yarn_resolver_source='numeric_fallback',
+        rope_scaling_type_supported=True,
+        yarn_ext_factor_supported=True,
+        rope_freq_scale_supported=True,
+        yarn_orig_ctx_supported=True,
+        constructor_kwarg_support=support,
+        constructor_has_var_kwargs=False,
+        constructor_signature_inspectable=True,
+        qwen_64k_yarn_support='supported',
+        yarn_enum_value=2,
+        q8_kv_cache_type_value=8,
+        q4_kv_cache_type_value=2,
+        f16_kv_cache_type_value=1,
+    )
+
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    encoded = json.loads(json.dumps(payload))
+
+    assert encoded['gpu_offload_supported'] is True
+    assert encoded['constructor_kwarg_support'] == support
+    assert encoded['constructor_signature_inspectable'] is True
+    assert encoded['qwen_64k_yarn_support'] == 'supported'
+    assert encoded['yarn_enum_value'] == 2
+    assert encoded['q8_kv_cache_type_value'] == 8
+    assert encoded['q4_kv_cache_type_value'] == 2
+    assert encoded['f16_kv_cache_type_value'] == 1
+    assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
+
+
+def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeypatch, tmp_path):
+    payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'detected_device': 'cuda',
+        'constructor_kwarg_support': {
+            'rope_scaling_type': True,
+            'unexpected_future_kwarg': True,
+        },
+    }
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *_, **__: Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.constructor_kwarg_support == {'rope_scaling_type': True}

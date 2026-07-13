@@ -5806,7 +5806,7 @@ def test_qwen_64k_runtime_init_guard_rejects_supported_probe_without_yarn_value(
     )
 
 
-def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
+def test_desktop_runtime_probe_rejects_string_yarn_enum_value():
     from utils.llm import model_manager as model_manager_module
 
     coerced = model_manager_module._coerce_desktop_runtime_probe({
@@ -5821,7 +5821,7 @@ def test_desktop_runtime_probe_coerces_string_yarn_enum_value():
         'yarn_enum_value': '2',
     })
 
-    assert coerced['yarn_enum_value'] == 2
+    assert 'yarn_enum_value' not in coerced
     assert coerced['llama_cpp_python_version'] == '0.3.32'
     assert coerced['constructor_has_var_kwargs'] is True
     assert coerced['constructor_signature_inspectable'] is False
@@ -6030,6 +6030,41 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
     summary = namespace['_sanitize_error_summary'](RuntimeError('Metal failed to allocate KV cache for /tmp/model.gguf'))
 
     assert summary == 'RuntimeError:metal_memory_allocation'
+
+
+@pytest.mark.parametrize(
+    'message',
+    [
+        'CUDA error: out of memory',
+        'cudaMalloc failed',
+        'CUBLAS_STATUS_ALLOC_FAILED',
+        'ggml_cuda: failed to allocate device buffer',
+    ],
+)
+def test_subprocess_worker_cuda_oom_classification_uses_safe_category(message):
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    exc = RuntimeError(message)
+
+    assert namespace['_classify_generation_exception'](exc) == 'cuda_memory_allocation'
+    assert namespace['_sanitize_error_summary'](exc).endswith(':cuda_memory_allocation')
+
+
+def test_subprocess_worker_generic_cuda_text_is_not_allocation_failure():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    exc = RuntimeError('CUDA backend initialized')
+
+    assert namespace['_classify_generation_exception'](exc) != 'cuda_memory_allocation'
+    assert namespace['_sanitize_error_summary'](exc) != 'RuntimeError:cuda_memory_allocation'
 
 
 def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
@@ -8632,3 +8667,210 @@ def test_qwen_64k_recovery_exhaustion_and_lifecycle_edge_coverage(monkeypatch):
             raise RuntimeError("poll failed")
 
     assert manager._worker_exit_code(SimpleNamespace(_process=BadProcess())) is None
+
+
+def test_desktop_runtime_probe_strict_bool_coercion_rejects_truthy_strings():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._coerce_strict_bool(False) is False
+    assert model_manager_module._coerce_strict_bool(0) is False
+    assert model_manager_module._coerce_strict_bool('false') is False
+    assert model_manager_module._coerce_strict_bool(True) is True
+    assert model_manager_module._coerce_strict_bool(1) is True
+    assert model_manager_module._coerce_strict_bool('true') is True
+    assert model_manager_module._coerce_strict_bool('yes') is None
+
+
+def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        'C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'runtime_action': 'already_supported',
+            'llama_module_path': 'C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'constructor_has_var_kwargs': False,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_enum_value': 2,
+            'q8_kv_cache_type_value': 8,
+            'q4_kv_cache_type_value': 2,
+            'f16_kv_cache_type_value': 1,
+            'capability_source': 'desktop_runtime_setup_probe',
+        },
+    )
+
+    def fail_probe(**_kwargs):
+        raise AssertionError('unexpected secondary probe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_probe)
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        facade,
+        facade.Llama,
+        model_path=__file__,
+        n_ctx=65536,
+    )
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
+    assert [profile['profile_id'] for profile in profiles] == [
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+    ]
+    assert profiles[0]['diagnostics']['backend'] == 'cuda'
+    assert profiles[0]['kwargs']['flash_attn'] is True
+    assert profiles[0]['kwargs']['offload_kqv'] is True
+    assert profiles[0]['kwargs']['n_batch'] == 256
+    assert profiles[0]['kwargs']['n_ubatch'] == 128
+
+
+def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/runtime/actual/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/runtime/other/llama_cpp/__init__.py',
+            'constructor_kwarg_support': support,
+            'constructor_signature_inspectable': True,
+            'qwen_64k_yarn_support': 'supported',
+            'yarn_enum_value': 2,
+            'capability_source': 'desktop_runtime_setup_probe',
+        },
+    )
+
+    def fail_probe(**_kwargs):
+        raise AssertionError('unexpected secondary probe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
+    assert 'llama_module_path' in diagnostics['missing_required_kwargs']
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+
+
+def test_legacy_flat_desktop_probe_uses_mandated_yarn_bridge_without_reprobe(monkeypatch, tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = '/site/llama_cpp/__init__.py'
+    flat_payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': 'true',
+        'runtime_action': 'already_supported',
+        'llama_module_path': module_path,
+        'yarn_rope_supported': 'true',
+        'yarn_resolver_source': 'numeric_fallback',
+        'rope_scaling_type_supported': 'true',
+        'rope_freq_scale_supported': 'true',
+        'yarn_orig_ctx_supported': 'true',
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        module_path,
+        desktop_runtime_probe=flat_payload,
+    )
+    capabilities = model_manager_module._safe_constructor_capability_payload(facade)
+    assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert capabilities['qwen_64k_yarn_support'] == 'supported'
+    assert capabilities['yarn_enum_value'] == 2
+    assert capabilities['constructor_signature_inspectable'] is True
+    assert capabilities['constructor_kwarg_support']['rope_scaling_type'] is True
+    assert capabilities['constructor_kwarg_support']['rope_freq_scale'] is True
+    assert capabilities['constructor_kwarg_support']['yarn_orig_ctx'] is True
+    for unobserved in ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch'):
+        assert unobserved not in capabilities['constructor_kwarg_support']
+        assert unobserved not in capabilities
+
+    def fail_child_probe(**_kwargs):
+        raise AssertionError('legacy desktop facade must not launch a child capability reprobe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['yarn_enum_value'] == 2
+    assert diagnostics['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    kwargs = manager._runtime_init_kwargs(facade.Llama, -1, facade)
+
+    assert kwargs['rope_scaling_type'] == 2
+    assert kwargs['rope_freq_scale'] == 0.5
+    assert kwargs['yarn_orig_ctx'] == 32768
+    assert 'type_k' not in kwargs
+    assert 'type_v' not in kwargs
+    assert 'flash_attn' not in kwargs
+    assert 'offload_kqv' not in kwargs
+    assert 'n_batch' not in kwargs
+    assert 'n_ubatch' not in kwargs
+    assert manager.last_yarn_rope_diagnostics['child_probe_reprobe_attempted'] is False
+
+
+@pytest.mark.parametrize('resolver_source', ['top_level_enum', 'nested_enum', 'llama_class_enum', 'arbitrary'])
+def test_legacy_flat_desktop_probe_exported_enum_without_value_fails_closed(monkeypatch, resolver_source):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = '/site/llama_cpp/__init__.py'
+    flat_payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': 'true',
+        'runtime_action': 'already_supported',
+        'llama_module_path': module_path,
+        'yarn_rope_supported': 'true',
+        'yarn_resolver_source': resolver_source,
+        'rope_scaling_type_supported': 'true',
+        'rope_freq_scale_supported': 'true',
+        'yarn_orig_ctx_supported': 'true',
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        module_path,
+        desktop_runtime_probe=flat_payload,
+    )
+    capabilities = model_manager_module._safe_constructor_capability_payload(facade)
+
+    assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert capabilities.get('yarn_enum_value') is None
+    assert capabilities.get('qwen_64k_yarn_support') != 'supported'
+
+    def fail_child_probe(**_kwargs):
+        raise AssertionError('incomplete legacy desktop probe must fail closed without child reprobe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
+    assert 'yarn_enum_value' in diagnostics['missing_required_kwargs']
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_incomplete_fail_closed'

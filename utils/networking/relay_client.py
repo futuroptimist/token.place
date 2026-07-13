@@ -97,6 +97,21 @@ def _classify_safe_generation_exception(exc: BaseException) -> str:
     text = f"{type(exc).__name__} {exc}".lower()
     if "metal" in text and any(term in text for term in ("alloc", "memory", "out of memory", "oom")):
         return "metal_memory_allocation"
+    cuda_markers = (
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "cudamalloc",
+        "cuda malloc",
+        "cublas_status_alloc_failed",
+        "cublas alloc",
+    )
+    cuda_generic_allocation_markers = ("allocation failed", "failed to allocate")
+    if (
+        any(marker in text for marker in cuda_markers)
+        or ("cuda" in text and any(marker in text for marker in cuda_generic_allocation_markers))
+        or ("ggml_cuda" in text and any(term in text for term in ("alloc", "memory", "oom")))
+    ):
+        return "cuda_memory_allocation"
     if "kv" in text and any(term in text for term in ("alloc", "cache", "memory", "out of memory", "oom")):
         return "kv_cache_allocation"
     if "yarn" in text or ("rope" in text and any(term in text for term in ("scal", "freq", "eval"))):
@@ -204,6 +219,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     },
     "generation_exception_category": {
         "metal_memory_allocation",
+        "cuda_memory_allocation",
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
@@ -282,7 +298,7 @@ _SAFE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
 _SAFE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
+    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|cuda_memory_allocation|kv_cache_allocation|"
     r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|"
     r"prompt_eval_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|"
     r"prompt_eval_state_failure|prompt_eval_context_failure|sampling_failure)$"

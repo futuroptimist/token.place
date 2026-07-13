@@ -48,6 +48,9 @@ def _log_warning(message: str, *, exc_info: bool = False) -> None:
 
 _COMPLETION_SMOKE_REASON_BY_CATEGORY = {
     "metal_memory_allocation": "runtime_completion_smoke_metal_memory_allocation",
+    "cuda_memory_allocation": "runtime_completion_smoke_cuda_memory_allocation",
+    "runtime_context_create_cuda_memory": "runtime_completion_smoke_cuda_memory_allocation",
+    "runtime_context_create_cuda_buffer_limit": "runtime_completion_smoke_cuda_buffer_limit",
     "kv_cache_allocation": "runtime_completion_smoke_kv_cache_allocation",
     "rope_yarn_eval_failure": "runtime_completion_smoke_rope_yarn_eval_failure",
     "unsupported_render_kwarg": "runtime_completion_smoke_render_template_unexpected_kwarg",
@@ -176,6 +179,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     },
     "generation_exception_category": {
         "metal_memory_allocation",
+        "cuda_memory_allocation",
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
@@ -254,7 +258,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
+    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|cuda_memory_allocation|kv_cache_allocation|"
     r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|"
     r"prompt_eval_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|"
     r"prompt_eval_state_failure|prompt_eval_context_failure|sampling_failure)$"
@@ -370,6 +374,8 @@ def _classify_completion_smoke_exception(exc: BaseException) -> Tuple[str, str, 
         category = "worker_dead"
     elif "metal" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom")):
         category = "metal_memory_allocation"
+    elif "cuda" in text and any(token in text for token in ("alloc", "memory", "out of memory", "oom", "cudamalloc", "cublas")):
+        category = "runtime_context_create_cuda_memory"
     elif "kv" in text and any(token in text for token in ("alloc", "cache", "memory", "out of memory", "oom")):
         category = "kv_cache_allocation"
     elif "yarn" in text or ("rope" in text and any(token in text for token in ("eval", "scal", "freq"))):
@@ -827,7 +833,7 @@ class ComputeNodeRuntime:
                     llm_runtime = get_llm_instance()
             except Exception as exc:
                 setattr(self.model_manager, 'last_runtime_init_error', str(exc))
-                _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
+                _log_error(f"Failed to initialize API v1 runtime for compute node: {type(exc).__name__}", exc_info=False)
                 return False
 
             if llm_runtime is None:
@@ -958,6 +964,13 @@ class ComputeNodeRuntime:
                 "api_v1_readiness_kv_cache_mode": diagnostics.get("kv_cache_mode"),
                 "api_v1_readiness_llama_cpp_python_version": yarn_diagnostics.get("llama_cpp_python_version"),
                 "api_v1_readiness_backend_used": diagnostics.get("backend_used"),
+                "llama_cpp_capability_source": yarn_diagnostics.get("capability_source"),
+                "llama_cpp_desktop_probe_authoritative": yarn_diagnostics.get("desktop_probe_authoritative"),
+                "llama_cpp_child_capability_reprobe_attempted": yarn_diagnostics.get("child_probe_reprobe_attempted"),
+                "llama_cpp_child_capability_reprobe_skipped_reason": yarn_diagnostics.get("child_probe_reprobe_skipped_reason"),
+                "llama_cpp_constructor_signature_inspectable": yarn_diagnostics.get("constructor_signature_inspectable"),
+                "llama_cpp_qwen_64k_yarn_support": yarn_diagnostics.get("support_classification"),
+                "llama_cpp_runtime_profile_backend": diagnostics.get("llama_cpp_runtime_profile_backend"),
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
@@ -978,6 +991,7 @@ class ComputeNodeRuntime:
                 "qwen_64k_first_readiness_failure_backend_state_sticky",
                 "qwen_64k_first_readiness_failure_backend_recreation_required",
                 "qwen_64k_first_readiness_failure_metal_command_buffer_status",
+                "qwen_64k_first_readiness_failure_cuda_error_category",
                 "qwen_64k_first_readiness_failure_eval_return_code",
             ):
                 if _key in diagnostics:
@@ -1535,5 +1549,5 @@ class ComputeNodeRuntime:
         except Exception:
             _log_warning(
                 "Relay unregister request raised during shutdown; continuing stop",
-                exc_info=True,
+                exc_info=False,
             )

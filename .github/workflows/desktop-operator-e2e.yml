@@ -137,8 +137,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies
         run: |
@@ -147,6 +145,12 @@ jobs:
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
+
+      - name: Run Windows CUDA capability handoff regressions (fakes)
+        run: |
+          python -m pytest tests/unit/test_desktop_runtime_setup.py -q
+          python -m pytest tests/unit/test_model_manager.py -q
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
 
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()
@@ -168,8 +172,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
-          cache: 'pip'
-          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies (macOS, Python 3.9 inspect)
         run: |

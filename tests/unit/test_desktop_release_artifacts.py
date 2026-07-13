@@ -685,3 +685,11 @@ def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, t
     assert captured['env']['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
     assert 'TOKEN_PLACE_PYTHON' not in captured['env']
     assert 'TOKEN_PLACE_SIDECAR_PYTHON' not in captured['env']
+
+
+def test_release_workflow_does_not_rebuild_llama_cpp_on_windows() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    install_step = text.split('- name: Install desktop llama-cpp runtime with platform GPU backend', 1)[1]
+    install_step = install_step.split('- name: Cache embedded macOS Python archive and wheels', 1)[0]
+    assert "if: runner.os != 'Windows'" in install_step
+    assert 'llama_cpp_install_plan_fallbacks(platform=sys.platform' in install_step

@@ -143,6 +143,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 

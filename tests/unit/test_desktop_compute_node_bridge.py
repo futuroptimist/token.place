@@ -4998,3 +4998,14 @@ def test_warm_load_failure_stderr_marks_safe_readiness_diagnostics_unavailable(c
         "desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics unavailable=true"
         in err
     )
+
+
+def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
+    workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
+    workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['desktop-operator-packaged-e2e-windows']['steps']
+    step_names = [step.get('name') for step in steps]
+    rust_index = step_names.index('Set up Rust')
+    cargo_index = step_names.index('Run Windows CUDA capability handoff regressions (fakes)')
+    assert rust_index < cargo_index
+    assert steps[rust_index]['uses'] == 'dtolnay/rust-toolchain@stable'

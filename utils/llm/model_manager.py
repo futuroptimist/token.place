@@ -783,7 +783,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             == _canonical_path_for_compare(facade_module_path)
         )
         authoritative = (
-            source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}
+            source == 'desktop_runtime_setup_probe'
             and authoritative_backend
             and capabilities.get('gpu_offload_supported') is True
             and module_paths_match
@@ -801,7 +801,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             diagnostics['child_probe_reprobe_skipped_reason'] = 'desktop_probe_authoritative'
             diagnostics['desktop_probe_authoritative'] = True
             return diagnostics
-        if source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'} and not complete:
+        if source == 'desktop_runtime_setup_probe' and not complete:
             missing = []
             if capabilities.get('qwen_64k_yarn_support') != 'supported':
                 missing.append('qwen_64k_yarn_support')
@@ -3837,8 +3837,7 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         and str(probe.get('yarn_resolver_source') or '').lower() != 'unsupported'
     ):
         coerced['qwen_64k_yarn_support'] = 'supported'
-        coerced['yarn_enum_value'] = LLAMA_ROPE_SCALING_TYPE_YARN_NUMERIC_FALLBACK
-        coerced['yarn_resolver_source'] = 'numeric_fallback'
+        coerced['yarn_resolver_source'] = 'legacy_requires_child_probe'
         coerced['constructor_signature_inspectable'] = True
         coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
     return coerced

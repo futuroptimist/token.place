@@ -8727,7 +8727,7 @@ def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeyp
     assert diagnostics['child_probe_reprobe_attempted'] is False
 
 
-def test_legacy_flat_desktop_probe_synthesizes_mandated_yarn_bridge(monkeypatch):
+def test_legacy_flat_desktop_probe_reprobes_for_actual_yarn_enum(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     support = {
@@ -8748,7 +8748,7 @@ def test_legacy_flat_desktop_probe_synthesizes_mandated_yarn_bridge(monkeypatch)
     )
     capabilities = model_manager_module._safe_constructor_capability_payload(facade)
     assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
-    assert capabilities['yarn_enum_value'] == 2
+    assert 'yarn_enum_value' not in capabilities
     assert capabilities['qwen_64k_yarn_support'] == 'supported'
     assert capabilities['constructor_signature_inspectable'] is True
 
@@ -8773,7 +8773,8 @@ def test_legacy_flat_desktop_probe_synthesizes_mandated_yarn_bridge(monkeypatch)
 
     diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
 
-    assert not probe_calls
+    assert probe_calls
     assert diagnostics['supported'] is True
-    assert diagnostics['yarn_enum_value'] == 2
-    assert diagnostics['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert diagnostics['yarn_enum_value'] == 7
+    assert diagnostics['capability_source'] == 'worker_probe'
+    assert diagnostics['child_probe_reprobe_attempted'] is True

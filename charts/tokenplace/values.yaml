@@ -57,6 +57,27 @@ service:
   type: ClusterIP
   port: 80
 
+
+metrics:
+  enabled: false
+  path: /metrics
+  auth:
+    existingSecret: ""
+    secretKey: token
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  # Keep below interval so Prometheus can complete a scrape before the next one.
+  scrapeTimeout: 10s
+  additionalLabels:
+    release: kube-prometheus-stack
+  relabelings:
+    app: tokenplace
+    environment: dev
+    release: ""
+    cluster: ""
+
 ingress:
   enabled: false
   className: ""

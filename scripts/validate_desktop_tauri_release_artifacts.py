@@ -283,12 +283,11 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "HOME": home,
             "PYTHONNOUSERSITE": "1",
             "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(app_path / "Contents" / "Resources" / "python"),
         }
-        for key in ("TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON"):
-            env.pop(key, None)
         result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
         output = f"{result.stdout}\n{result.stderr}"
-        forbidden = ("xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "/Users/runner", "/Library/Developer/CommandLineTools")
+        forbidden = ("/usr/bin/python3", "xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Users/runner", "/Library/Developer/CommandLineTools", "site.USER_SITE")
         for marker in forbidden:
             if marker in output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
@@ -329,17 +328,25 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
         arch = _run(["lipo", "-archs", str(py)]).lower()
         if "arm64" not in arch or ("x86_64" in arch and "arm64" not in arch):
             _fail(f"embedded Python is not arm64: {arch}")
-    code = "import json,sys,os; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix}))"
+    code = "import importlib.metadata as im,json,platform,sys; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'version':sys.version_info[:2],'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix,'llama_cpp_python_version':im.version('llama-cpp-python')}))"
     payload = json.loads(_run_python_sanitized(py, code, app_path).splitlines()[-1])
+    if payload.get("version") != [3, 11]:
+        _fail(f"embedded Python is not CPython 3.11: {payload.get('version')}")
+    if payload.get("machine") != "arm64":
+        _fail(f"embedded Python is not arm64: {payload.get('machine')}")
+    if payload.get("llama_cpp_python_version") != "0.3.32":
+        _fail("embedded runtime has wrong llama-cpp-python version")
     for key in ("executable", "prefix"):
         if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
             _fail(f"embedded Python {key} escaped app bundle: {payload[key]}")
     _run_python_sanitized(py, "import subprocess,sys; raise SystemExit(subprocess.run([sys.executable,'-m','pip','check']).returncode)", app_path)
-    probe = "import json,sys; sys.path.insert(0, '" + str((Path.cwd() / 'src-tauri' / 'python').resolve()) + "'); from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
+    probe = "import json; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
     out = _run_python_sanitized(py, probe, app_path)
     data = json.loads(out.splitlines()[-1])
     if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
         _fail("embedded runtime probe did not report Metal GPU offload")
+    if data.get("qwen_64k_yarn_support") != "supported":
+        _fail("embedded runtime probe missing capability: qwen_64k_yarn_support")
     top_level_capabilities = {
         "rope_scaling_type": "rope_scaling_type_supported",
         "rope_freq_scale": "rope_freq_scale_supported",
@@ -352,6 +359,11 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
     for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
         if not constructor_support.get(key):
             _fail(f"embedded runtime probe missing capability: {key}")
+    model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
+    if model_bridge.is_file():
+        _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge)!r}, 'inspect']).returncode)", app_path)
+    else:
+        _fail("packaged model_bridge.py missing from app resources")
     for candidate in runtime.rglob("*"):
         if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
 

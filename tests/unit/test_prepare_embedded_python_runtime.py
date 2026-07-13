@@ -111,6 +111,7 @@ def test_extract_valid_archive(tmp_path):
 
 def test_runtime_capability_probe_uses_serialized_runtime_probe_field_names():
     payload = {
+        'qwen_64k_yarn_support': 'supported',
         'rope_scaling_type_supported': True,
         'rope_freq_scale_supported': True,
         'yarn_orig_ctx_supported': True,
@@ -127,6 +128,7 @@ def test_runtime_capability_probe_uses_serialized_runtime_probe_field_names():
 
 def test_runtime_capability_probe_reports_nested_constructor_gaps():
     payload = {
+        'qwen_64k_yarn_support': 'supported',
         'rope_scaling_type_supported': True,
         'rope_freq_scale_supported': False,
         'yarn_orig_ctx_supported': True,
@@ -139,3 +141,20 @@ def test_runtime_capability_probe_reports_nested_constructor_gaps():
         'n_batch',
         'n_ubatch',
     ]
+
+
+def test_runtime_capability_probe_requires_qwen_64k_yarn_support():
+    payload = {
+        'qwen_64k_yarn_support': 'unsupported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+
+    assert prep._missing_runtime_capabilities(payload) == ['qwen_64k_yarn_support']

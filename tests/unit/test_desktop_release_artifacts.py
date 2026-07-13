@@ -648,8 +648,40 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
 def test_validator_contains_embedded_runtime_guardrails() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'Contents" / "Resources" / "python-runtime' in text
-    assert 'TOKEN_PLACE_PYTHON' in text
-    assert 'TOKEN_PLACE_SIDECAR_PYTHON' in text
+    assert '"PYTHONPATH": str(app_path / "Contents" / "Resources" / "python")' in text
     assert 'xcode-select' in text
     assert 'otool' in text
     assert 'embedded runtime probe did not report Metal GPU offload' in text
+
+
+def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'PYTHONPATH": str(app_path / "Contents" / "Resources" / "python")' in text
+    assert "Path.cwd() / 'src-tauri' / 'python'" not in text
+    assert "qwen_64k_yarn_support" in text
+    assert "model_bridge.py" in text
+    assert "'inspect'" in text
+
+
+def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = tmp_path / 'python3'
+    py.write_text('#!/bin/sh\n', encoding='utf-8')
+    captured = {}
+
+    def fake_run(cmd, *, check, capture_output, text, env):
+        captured['env'] = env
+        return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON', '/usr/bin/python3')
+    monkeypatch.setenv('TOKEN_PLACE_SIDECAR_PYTHON', '/usr/bin/python3')
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert captured['env']['PYTHONNOUSERSITE'] == '1'
+    assert captured['env']['PATH'] == '/usr/bin:/bin'
+    assert captured['env']['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
+    assert 'TOKEN_PLACE_PYTHON' not in captured['env']
+    assert 'TOKEN_PLACE_SIDECAR_PYTHON' not in captured['env']

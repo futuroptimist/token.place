@@ -123,7 +123,10 @@ def _missing_runtime_capabilities(payload: dict) -> list[str]:
         "yarn_orig_ctx": "yarn_orig_ctx_supported",
     }
     constructor = (payload.get("constructor_kwarg_support") or {})
-    missing = [name for name, field in top_level.items() if not payload.get(field)]
+    missing = []
+    if payload.get("qwen_64k_yarn_support") != "supported":
+        missing.append("qwen_64k_yarn_support")
+    missing.extend(name for name, field in top_level.items() if not payload.get(field))
     missing.extend(
         name
         for name in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch")
@@ -157,6 +160,10 @@ def existing_valid(m: dict) -> bool:
     try:
         data=json.loads(prov.read_text());
         if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal": return False
+        installed = data.get("installed_packages") or {}
+        for name, version in m["required_packages"].items():
+            if installed.get(name) != version:
+                return False
         prove_interpreter(py, OUTPUT, m); probe_runtime(py, m); return True
     except Exception: return False
 

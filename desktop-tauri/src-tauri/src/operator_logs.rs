@@ -212,7 +212,7 @@ pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
 }
 
 fn sanitize_operator_diagnostic_text(text: &str) -> String {
-    if text.contains("TimeoutExpired") && text.contains("Command [") {
+    if text.contains("TimeoutExpired") && text.contains("Command ") {
         let timeout_seconds = parse_timeout_expired_seconds(text)
             .map(|seconds| format!(" timeout_seconds={seconds}"))
             .unwrap_or_default();
@@ -1172,6 +1172,7 @@ mod tests {
         assert!(!sanitized.contains("Alice"));
         assert!(!sanitized.contains("AppData"));
         assert!(!sanitized.contains("Command ["));
+        assert!(!sanitized.contains("Command '["));
         assert!(sanitized.contains("stage=subprocess_timeout"));
         assert!(sanitized.contains("category=worker_timeout"));
         assert!(sanitized.contains("timeout_seconds=30"));
@@ -1181,6 +1182,17 @@ mod tests {
         );
         assert!(custom_timeout.contains("timeout_seconds=45"));
         assert!(!custom_timeout.contains("Alice"));
+
+        let quoted_python_timeout = sanitize_operator_diagnostic_line(
+            r#"subprocess.TimeoutExpired: Command '['C:\Users\Alice\python.exe', '-c', 'import llama_cpp']' timed out after 12 seconds"#,
+        );
+        assert_eq!(
+            quoted_python_timeout,
+            "desktop.llama_cpp_worker.init_failed stage=subprocess_timeout category=worker_timeout timeout_seconds=12"
+        );
+        assert!(!quoted_python_timeout.contains("Alice"));
+        assert!(!quoted_python_timeout.contains("Command '['"));
+        assert!(!quoted_python_timeout.contains("import llama_cpp"));
 
         let json = sanitize_operator_diagnostic_line(
             r#"{"path":"C:\\Users\\Alice\\AppData\\Local\\Programs\\Python\\Python311\\python.exe","stage":"llama_cpp_gpu_probe"}"#,
@@ -1208,6 +1220,7 @@ mod tests {
         assert!(!json_timeout.contains("Bob"));
         assert!(!json_timeout.contains("AppData"));
         assert!(!json_timeout.contains("Command ["));
+        assert!(!json_timeout.contains("Command '["));
         assert!(!json_timeout.contains("import llama_cpp"));
 
         let drive = sanitize_operator_diagnostic_line(

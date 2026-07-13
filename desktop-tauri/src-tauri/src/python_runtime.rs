@@ -490,7 +490,7 @@ pub fn resolve_python_launcher_resource_aware(
                                 )
                             })?;
                         metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
-                            .map(|_| candidate)
+                            .map(|_| candidate.clone())
                             .map_err(|category| {
                                 launcher_error(
                                     DESKTOP_PYTHON_RUNTIME_INVALID,

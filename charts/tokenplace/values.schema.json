@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1, "maximum": 1},
+    "strategy": {"type": "object", "properties": {"type": {"type": "string", "enum": ["Recreate", "RollingUpdate"]}}, "additionalProperties": true},
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "path": {"type": "string", "pattern": "^/[-A-Za-z0-9_./]*$"},
+        "auth": {
+          "type": "object",
+          "properties": {
+            "existingSecret": {"type": "string"},
+            "secretKey": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespace": {"type": "string", "minLength": 1},
+        "interval": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
+        "scrapeTimeout": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
+        "additionalLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "targetLabels": {
+          "type": "object",
+          "properties": {
+            "app": {"type": "string", "minLength": 1},
+            "environment": {"type": "string"},
+            "release": {"type": "string"},
+            "cluster": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

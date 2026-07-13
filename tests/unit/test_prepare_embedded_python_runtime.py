@@ -25,8 +25,17 @@ def manifest(**overrides):
         'expected_interpreter_path': 'bin/python3',
         'expected_architecture': 'arm64',
         'minimum_macos_version': '12.0',
-        'expected_packaged_runtime_path': 'Contents/Resources/python-runtime',
-        'required_packages': {'llama-cpp-python': '0.3.32'},
+        'expected_packaged_runtime_path': 'Contents/Resources/python-runtime/bin/python3',
+        'required_packages': {
+            'psutil': '7.1.0',
+            'requests': '2.32.5',
+            'python-dotenv': '1.1.1',
+            'cryptography': '46.0.1',
+            'Jinja2': '3.1.6',
+            'numpy': '2.3.3',
+            'diskcache': '5.6.3',
+            'llama-cpp-python': '0.3.32',
+        },
         'runtime_notices': [],
     }
     m.update(overrides)

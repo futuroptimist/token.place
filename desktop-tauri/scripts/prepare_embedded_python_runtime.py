@@ -23,6 +23,9 @@ MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest.json"
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
+if str(SRC_TAURI / "python") not in sys.path:
+    sys.path.insert(0, str(SRC_TAURI / "python"))
+from desktop_gpu_packaging import llama_cpp_install_plan  # noqa: E402
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -31,11 +34,23 @@ def load_manifest(path: Path = MANIFEST) -> dict:
     if m.get("schema_version") != 1: raise RuntimePrepError("unsupported embedded runtime manifest schema_version")
     if not str(m.get("archive_url", "")).startswith("https://"): raise RuntimePrepError("archive_url must be HTTPS")
     sha = str(m.get("sha256", ""))
-    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha.lower()): raise RuntimePrepError("sha256 must be a lowercase 64-character hex digest")
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha): raise RuntimePrepError("sha256 must be a lowercase 64-character hex digest")
     if m.get("target_triple") != "aarch64-apple-darwin": raise RuntimePrepError("manifest target_triple must be aarch64-apple-darwin")
-    if m.get("expected_packaged_runtime_path") != "Contents/Resources/python-runtime": raise RuntimePrepError("unexpected packaged runtime path")
+    if m.get("expected_packaged_runtime_path") != "Contents/Resources/python-runtime/bin/python3": raise RuntimePrepError("unexpected packaged runtime path")
     for key in ["cpython_version","python_build_standalone_release","python_build_standalone_build","expected_archive_root","expected_interpreter_path","expected_architecture","minimum_macos_version","required_packages","runtime_notices"]:
         if key not in m: raise RuntimePrepError(f"missing manifest field: {key}")
+    if "latest" in str(m["archive_url"]).lower(): raise RuntimePrepError("archive_url must not use latest")
+    expected_packages = {
+        "psutil": "7.1.0",
+        "requests": "2.32.5",
+        "python-dotenv": "1.1.1",
+        "cryptography": "46.0.1",
+        "Jinja2": "3.1.6",
+        "numpy": "2.3.3",
+        "diskcache": "5.6.3",
+        "llama-cpp-python": "0.3.32",
+    }
+    if m.get("required_packages") != expected_packages: raise RuntimePrepError("required_packages must match exact embedded runtime package map")
     return m
 
 def sha256(path: Path) -> str:
@@ -93,8 +108,11 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "ensurepip", "--upgrade"])
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
     req = SRC_TAURI / "python" / "requirements_desktop_runtime.txt"
-    pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items())]
-    run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages], env={"PIP_CACHE_DIR": str(pip_cache), "CMAKE_ARGS":"-DGGML_METAL=on", "FORCE_CMAKE":"1"})
+    pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items()) if name != "llama-cpp-python"]
+    plan = llama_cpp_install_plan(platform="darwin", requirements_path=req)
+    if plan.package_spec != "llama-cpp-python==0.3.32" or plan.backend != "metal" or not plan.only_binary:
+        raise RuntimePrepError("desktop GPU packaging plan must require the pinned Metal llama-cpp-python wheel")
+    run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages, *plan.pip_install_args(), plan.package_spec], env={"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()})
     run([str(py), "-m", "pip", "check"])
     run([str(py), "-c", "import " + ",".join(IMPORTS)])
 

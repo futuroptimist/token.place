@@ -49,6 +49,14 @@ impl PythonLauncher {
         cmd
     }
 
+    fn command_for_metadata_probe(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        cmd.arg("-c");
+        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:2]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
+        cmd
+    }
+
     pub fn command_for_script(&self, script_path: &str) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
@@ -196,6 +204,42 @@ fn is_python_311_version(stdout: &str, stderr: &str) -> bool {
 }
 fn output_status_code(output: &std::process::Output) -> Option<i32> {
     output.status.code()
+}
+
+fn json_string_field<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after_key = payload.split(&needle).nth(1)?;
+    let after_colon = after_key.split_once(':')?.1.trim_start();
+    let after_quote = after_colon.strip_prefix('"')?;
+    after_quote.split('"').next()
+}
+
+fn metadata_probe_is_valid(
+    stdout: &str,
+    runtime_root: &Path,
+    expected_machine: &str,
+) -> Result<(), PythonLauncherCategory> {
+    let payload = stdout.trim();
+    if !(payload.contains("\"version\"") && payload.contains("[3, 11]")) {
+        return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
+    }
+    if json_string_field(payload, "machine") != Some(expected_machine) {
+        return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
+    }
+    let runtime_root = runtime_root
+        .canonicalize()
+        .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+    for key in ["executable", "prefix"] {
+        let value = json_string_field(payload, key)
+            .ok_or(PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+        let resolved = Path::new(value)
+            .canonicalize()
+            .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+        if !resolved.starts_with(&runtime_root) {
+            return Err(PythonLauncherCategory::BundledRuntimeProbeFailed);
+        }
+    }
+    Ok(())
 }
 
 fn launcher_error(
@@ -363,6 +407,13 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
     ))
 }
 
+fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
+    Path::new(&candidate.program)
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
 pub fn resolve_python_launcher_resource_aware(
     opts: PythonLauncherResolutionOptions<'_>,
 ) -> Result<PythonLauncher, PythonLauncherError> {
@@ -399,10 +450,56 @@ pub fn resolve_python_launcher_resource_aware(
                     ));
                 }
             } else {
-                return match candidate.command_for_version_check().output() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&candidate.program)
+                        .map(|m| m.permissions().mode() & 0o111 == 0)
+                        .unwrap_or(true)
+                    {
+                        return Err(launcher_error(
+                            DESKTOP_PYTHON_RUNTIME_INVALID,
+                            PythonLauncherCategory::BundledRuntimeNotExecutable,
+                            Some(&candidate),
+                            opts.packaged,
+                            None,
+                        ));
+                    }
+                }
+                return match candidate.command_for_metadata_probe().output() {
                     Ok(output) => {
-                        validate_launcher_with_output(&candidate, &output, opts.packaged, true)
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
+                            return Err(launcher_error(
+                                DESKTOP_PYTHON_RUNTIME_INVALID,
+                                PythonLauncherCategory::AppleDeveloperToolsStub,
+                                Some(&candidate),
+                                opts.packaged,
+                                output_status_code(&output),
+                            ));
+                        }
+                        let runtime_root = bundled_runtime_root_from_candidate(&candidate)
+                            .ok_or_else(|| {
+                                launcher_error(
+                                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                                    PythonLauncherCategory::BundledRuntimeProbeFailed,
+                                    Some(&candidate),
+                                    opts.packaged,
+                                    output_status_code(&output),
+                                )
+                            })?;
+                        metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
                             .map(|_| candidate)
+                            .map_err(|category| {
+                                launcher_error(
+                                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                                    category,
+                                    Some(&candidate),
+                                    opts.packaged,
+                                    output_status_code(&output),
+                                )
+                            })
                     }
                     Err(_) => Err(launcher_error(
                         if opts.packaged {
@@ -1244,7 +1341,13 @@ mod tests {
         let resources = temp.path().join("App.app/Contents/Resources");
         let py = resources.join("python-runtime/bin/python3");
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
-        std::fs::write(&py, "#!/bin/sh\necho 'Python 3.11.13'\n").unwrap();
+        let runtime_root = resources.join("python-runtime");
+        let probe = format!(
+            r#"{{"version":[3,11],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
+            py.display(),
+            runtime_root.display()
+        );
+        std::fs::write(&py, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", probe)).unwrap();
         let mut perms = std::fs::metadata(&py).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&py, perms).unwrap();

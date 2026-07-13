@@ -179,6 +179,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
     },
     "generation_exception_category": {
         "metal_memory_allocation",
+        "cuda_memory_allocation",
         "kv_cache_allocation",
         "rope_yarn_eval_failure",
         "unsupported_generation_kwarg",
@@ -257,7 +258,7 @@ _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_ENUM_VALUES = {
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,128}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_COMPLETION_SMOKE_WORKER_DIAGNOSTIC_REDACTED_SUMMARY_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|kv_cache_allocation|"
+    r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:(?:redacted|metal_memory_allocation|cuda_memory_allocation|kv_cache_allocation|"
     r"rope_yarn_eval_failure|unsupported_kwarg|prompt_tokenization_failure|prompt_eval_failure|"
     r"prompt_eval_decode_failure|prompt_eval_backend_failure|prompt_eval_invalid_token_failure|"
     r"prompt_eval_state_failure|prompt_eval_context_failure|sampling_failure)$"

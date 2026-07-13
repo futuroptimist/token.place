@@ -535,6 +535,7 @@ def safe_plain_completion_decode_failure_category_and_code(exc: Any) -> Tuple[Op
 _FATAL_CURRENT_WORKER_GENERATION_CATEGORIES = {
     'backend_allocation_failure',
     'backend_graph_compute_failure',
+    'cuda_memory_allocation',
     'metal_graph_compute_failure',
     'kv_slot_unavailable',
     'decode_aborted',
@@ -563,6 +564,7 @@ _QWEN_64K_PROFILE_RECOVERABLE_FAILURE_CATEGORIES = {
     'unknown_metal_backend_failure',
     'runtime_context_create_cuda_memory',
     'runtime_context_create_cuda_buffer_limit',
+    'cuda_memory_allocation',
 }
 
 
@@ -2097,8 +2099,23 @@ def _extract_unsupported_generation_kwarg(message, attempted=None):
 
 def _sanitize_error_summary(message):
     text = str(message or '').lower()
+    cuda_allocation_markers = (
+        'cuda out of memory',
+        'cuda error: out of memory',
+        'cudamalloc',
+        'cuda malloc',
+        'cublas_status_alloc_failed',
+        'cublas alloc',
+    )
+    cuda_generic_allocation_markers = ('allocation failed', 'failed to allocate')
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
         return type(message).__name__ + ':metal_memory_allocation'
+    if (
+        any(marker in text for marker in cuda_allocation_markers)
+        or ('cuda' in text and any(marker in text for marker in cuda_generic_allocation_markers))
+        or ('ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom')))
+    ):
+        return type(message).__name__ + ':cuda_memory_allocation'
     if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
         return type(message).__name__ + ':kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
@@ -2145,8 +2162,23 @@ def _classify_generation_exception(exc):
     if decode_category is not None:
         return decode_category
     text = str(exc or '').lower()
+    cuda_allocation_markers = (
+        'cuda out of memory',
+        'cuda error: out of memory',
+        'cudamalloc',
+        'cuda malloc',
+        'cublas_status_alloc_failed',
+        'cublas alloc',
+    )
+    cuda_generic_allocation_markers = ('allocation failed', 'failed to allocate')
     if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'out of memory', 'oom')):
         return 'metal_memory_allocation'
+    if (
+        any(marker in text for marker in cuda_allocation_markers)
+        or ('cuda' in text and any(marker in text for marker in cuda_generic_allocation_markers))
+        or ('ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom')))
+    ):
+        return 'cuda_memory_allocation'
     if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'out of memory', 'oom')):
         return 'kv_cache_allocation'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'eval'))):
@@ -3131,6 +3163,7 @@ for line in sys.stdin:
             fatal_plain_completion_categories = {
                 'backend_allocation_failure',
                 'backend_graph_compute_failure',
+                'cuda_memory_allocation',
                 'metal_graph_compute_failure',
                 'kv_slot_unavailable',
                 'decode_aborted',
@@ -3185,6 +3218,9 @@ for line in sys.stdin:
                         plain_capabilities['plain_completion_backend_state_sticky'] = True
                         plain_capabilities['plain_completion_backend_recreation_required'] = True
                     if category == 'backend_allocation_failure':
+                        plain_capabilities['plain_completion_backend_recreation_required'] = True
+                    if category == 'cuda_memory_allocation':
+                        plain_capabilities['plain_completion_backend_failure_category'] = 'cuda_memory_allocation'
                         plain_capabilities['plain_completion_backend_recreation_required'] = True
                     if category not in fatal_plain_completion_categories and _reset_plain_completion_state(llama):
                         plain_capabilities['plain_completion_reset_after_failure_count'] += 1
@@ -3827,22 +3863,34 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         coerced['capability_source'] = source
 
     # Compatibility bridge for deployed flat desktop probes. Do not invent
-    # unobserved performance/KV kwargs. The pinned llama-cpp-python==0.3.32
-    # path has a verified numeric YaRN enum value of 2; launching another
-    # native import here would recreate the Windows timeout failure this
-    # desktop facade is designed to avoid.
+    # unobserved performance/KV kwargs or assume exported enum sources map to
+    # value 2. Only the old probe's explicit verified numeric-fallback path is
+    # accepted here; launching another native import would recreate the Windows
+    # timeout failure this desktop facade is designed to avoid.
     legacy_yarn = _coerce_strict_bool(probe.get('yarn_rope_supported'))
     required_supported = all(support.get(name) is True for name in ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'))
+    legacy_resolver = str(probe.get('yarn_resolver_source') or '').strip().lower()
     if (
         coerced.get('qwen_64k_yarn_support') is None
+        and coerced.get('yarn_enum_value') is None
         and legacy_yarn is True
         and required_supported
-        and str(probe.get('yarn_resolver_source') or '').lower() != 'unsupported'
+        and legacy_resolver == 'numeric_fallback'
+        and probe.get('yarn_enum_value') is None
     ):
         coerced['qwen_64k_yarn_support'] = 'supported'
         coerced['yarn_enum_value'] = 2
-        coerced['yarn_resolver_source'] = str(probe.get('yarn_resolver_source') or 'legacy_numeric_yarn')
+        coerced['yarn_resolver_source'] = 'numeric_fallback'
         coerced['constructor_signature_inspectable'] = True
+        coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
+    elif (
+        coerced.get('capability_source') is None
+        and (
+            legacy_yarn is not None
+            or probe.get('yarn_resolver_source') is not None
+            or any(probe.get(f'{name}_supported') is not None for name in ('rope_scaling_type', 'rope_freq_scale', 'yarn_orig_ctx'))
+        )
+    ):
         coerced['capability_source'] = 'desktop_runtime_setup_probe_legacy'
     return coerced
 

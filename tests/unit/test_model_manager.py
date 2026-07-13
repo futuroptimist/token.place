@@ -6032,6 +6032,41 @@ def test_subprocess_worker_error_summary_keeps_safe_category_hint():
     assert summary == 'RuntimeError:metal_memory_allocation'
 
 
+@pytest.mark.parametrize(
+    'message',
+    [
+        'CUDA error: out of memory',
+        'cudaMalloc failed',
+        'CUBLAS_STATUS_ALLOC_FAILED',
+        'ggml_cuda: failed to allocate device buffer',
+    ],
+)
+def test_subprocess_worker_cuda_oom_classification_uses_safe_category(message):
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    exc = RuntimeError(message)
+
+    assert namespace['_classify_generation_exception'](exc) == 'cuda_memory_allocation'
+    assert namespace['_sanitize_error_summary'](exc).endswith(':cuda_memory_allocation')
+
+
+def test_subprocess_worker_generic_cuda_text_is_not_allocation_failure():
+    from utils.llm import model_manager as model_manager_module
+
+    namespace = {}
+    worker_code = model_manager_module._LLAMA_CPP_RUNTIME_WORKER_CODE
+    exec(worker_code.split('def _metadata_value', 1)[0], namespace)
+
+    exc = RuntimeError('CUDA backend initialized')
+
+    assert namespace['_classify_generation_exception'](exc) != 'cuda_memory_allocation'
+    assert namespace['_sanitize_error_summary'](exc) != 'RuntimeError:cuda_memory_allocation'
+
+
 def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     from utils.llm import model_manager as model_manager_module
 
@@ -8799,3 +8834,43 @@ def test_legacy_flat_desktop_probe_uses_mandated_yarn_bridge_without_reprobe(mon
     assert 'n_batch' not in kwargs
     assert 'n_ubatch' not in kwargs
     assert manager.last_yarn_rope_diagnostics['child_probe_reprobe_attempted'] is False
+
+
+@pytest.mark.parametrize('resolver_source', ['top_level_enum', 'nested_enum', 'llama_class_enum', 'arbitrary'])
+def test_legacy_flat_desktop_probe_exported_enum_without_value_fails_closed(monkeypatch, resolver_source):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = '/site/llama_cpp/__init__.py'
+    flat_payload = {
+        'backend': 'cuda',
+        'gpu_offload_supported': 'true',
+        'runtime_action': 'already_supported',
+        'llama_module_path': module_path,
+        'yarn_rope_supported': 'true',
+        'yarn_resolver_source': resolver_source,
+        'rope_scaling_type_supported': 'true',
+        'rope_freq_scale_supported': 'true',
+        'yarn_orig_ctx_supported': 'true',
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        module_path,
+        desktop_runtime_probe=flat_payload,
+    )
+    capabilities = model_manager_module._safe_constructor_capability_payload(facade)
+
+    assert capabilities['capability_source'] == 'desktop_runtime_setup_probe_legacy'
+    assert capabilities.get('yarn_enum_value') is None
+    assert capabilities.get('qwen_64k_yarn_support') != 'supported'
+
+    def fail_child_probe(**_kwargs):
+        raise AssertionError('incomplete legacy desktop probe must fail closed without child reprobe')
+
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', fail_child_probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
+    assert 'yarn_enum_value' in diagnostics['missing_required_kwargs']
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_incomplete_fail_closed'

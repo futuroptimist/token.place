@@ -589,8 +589,8 @@ fn sanitize_path_display(value: &str) -> String {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .or(cross_platform_name);
+        .filter(|name| !name.is_empty());
+    let file_name = cross_platform_name.or(file_name);
     match file_name {
         Some(name) => format!("<path:{name}>"),
         None => "<path>".into(),
@@ -645,11 +645,17 @@ fn is_windows_extended_or_unc_path_like(value: &str) -> bool {
         value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '(' | '[' | ']'));
     let normalized = trimmed.replace("\\\\", "\\").replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
-    (lower.len() > 6
-        && lower.starts_with("//?/")
-        && lower.as_bytes().get(5) == Some(&b':')
-        && lower.as_bytes().get(6) == Some(&b'/')
-        && lower.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic))
+    (lower.len() > 5
+        && (lower.starts_with("//?/") || lower.starts_with("/?/"))
+        && lower
+            .strip_prefix("//?/")
+            .or_else(|| lower.strip_prefix("/?/"))
+            .is_some_and(|rest| {
+                rest.len() > 2
+                    && rest.as_bytes()[1] == b':'
+                    && rest.as_bytes()[2] == b'/'
+                    && rest.as_bytes()[0].is_ascii_alphabetic()
+            }))
         || lower.starts_with("//?/unc/")
         || lower.starts_with("//")
 }
@@ -663,11 +669,17 @@ fn is_path_like(value: &str) -> bool {
         || trimmed.starts_with("~/")
         || trimmed.starts_with("file://")
         || trimmed.starts_with("\\")
-        || (lower.len() > 6
-            && lower.starts_with("//?/")
-            && lower.as_bytes().get(5) == Some(&b':')
-            && lower.as_bytes().get(6) == Some(&b'/')
-            && lower.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic))
+        || (lower.len() > 5
+            && (lower.starts_with("//?/") || lower.starts_with("/?/"))
+            && lower
+                .strip_prefix("//?/")
+                .or_else(|| lower.strip_prefix("/?/"))
+                .is_some_and(|rest| {
+                    rest.len() > 2
+                        && rest.as_bytes()[1] == b':'
+                        && rest.as_bytes()[2] == b'/'
+                        && rest.as_bytes()[0].is_ascii_alphabetic()
+                }))
         || lower.starts_with("//?/unc/")
         || lower.starts_with("//")
         || lower.contains("/users/")

@@ -304,6 +304,7 @@ def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
 
 
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
+    py_for_subprocess = py if py.is_absolute() else py.absolute()
     home = tempfile.mkdtemp(prefix="token-place-home-")
     try:
         app_data = Path(home) / "token.place"
@@ -319,7 +320,7 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
         }
         probe_cwd = app_path / "Contents" / "Resources" / "python"
         result = subprocess.run(
-            [str(py), "-c", code],
+            [str(py_for_subprocess), "-c", code],
             check=False,
             capture_output=True,
             text=True,
@@ -333,7 +334,7 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             if marker in scan_output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
         if result.returncode != 0:
-            _fail(_format_command_failure([str(py), "-c", "<probe>"], result))
+            _fail(_format_command_failure([str(py_for_subprocess), "-c", "<probe>"], result))
         return output.strip()
     finally:
         shutil.rmtree(home, ignore_errors=True)

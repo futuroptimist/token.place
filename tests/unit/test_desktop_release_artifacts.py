@@ -774,6 +774,29 @@ def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeyp
     assert seen['cwd'] == str(resources_python)
 
 
+def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_cwd(
+    monkeypatch, tmp_path
+) -> None:
+    validator = _load_release_artifact_validator()
+    app = Path('src-tauri/target/aarch64-apple-darwin/release/bundle/macos/token.place desktop.app')
+    resources_python = tmp_path / app / 'Contents' / 'Resources' / 'python'
+    resources_python.mkdir(parents=True)
+    py = app / 'Contents' / 'Resources' / 'python-runtime' / 'bin' / 'python3'
+    seen = {}
+
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
+        seen['cmd'] = cmd
+        seen['cwd'] = cwd
+        return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert seen['cmd'][0] == str((tmp_path / py).absolute())
+    assert seen['cwd'] == str(app / 'Contents' / 'Resources' / 'python')
+
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'Users' / 'runner' / 'work' / 'token.place desktop.app'

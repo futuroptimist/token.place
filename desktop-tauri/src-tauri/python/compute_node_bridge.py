@@ -796,6 +796,12 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
+    original_model_arg = str(args.model)
+    model_path_was_relative = not os.path.isabs(original_model_arg)
+    if model_path_was_relative:
+        args.model = os.path.abspath(original_model_arg)
+    parent_model_path_exists = os.path.exists(args.model)
+
     runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -804,6 +810,10 @@ def run(args: argparse.Namespace) -> int:
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"llama_cpp_python_version={runtime_setup.get('llama_cpp_python_version', 'unknown')} "
+        f"llama_cpp_python_installed_version={runtime_setup.get('llama_cpp_python_installed_version', 'unknown')} "
+        f"llama_cpp_python_required_version={runtime_setup.get('llama_cpp_python_required_version', 'unknown')} "
+        f"llama_cpp_python_version_match={runtime_setup.get('llama_cpp_python_version_match', 'unknown')} "
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
         f"python_version={runtime_setup.get('python_version', 'unknown')} "
         f"prefix={runtime_setup.get('prefix', runtime_setup.get('interpreter_prefix', 'unknown'))} "
@@ -880,7 +890,8 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} context_tier={args.context_tier} "
+        f"model_path_was_relative={model_path_was_relative} parent_model_path_exists={parent_model_path_exists} "
+        f"mode={args.mode} context_tier={args.context_tier} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -940,6 +951,8 @@ def run(args: argparse.Namespace) -> int:
         )
 
     runtime.model_manager.model_path = args.model
+    runtime.model_manager.parent_model_path_exists = parent_model_path_exists
+    runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
@@ -1100,7 +1113,9 @@ def run(args: argparse.Namespace) -> int:
             "cmake_args": runtime_setup.get("cmake_args"),
             "pip_stdout_tail": runtime_setup.get("pip_stdout_tail"),
             "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
-            "model_path": args.model,
+            "model_path_was_relative": model_path_was_relative,
+            "parent_model_path_exists": parent_model_path_exists,
+            "child_model_path_exists": os.path.exists(args.model),
             "context_tier": context_profile.profile_id,
             "context_window_tokens": context_profile.total_context_tokens,
             "last_error": relay_errors or current_last_error,

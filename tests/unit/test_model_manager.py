@@ -3445,6 +3445,59 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
     assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
+
+def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm.model_manager import ModelManager
+
+    attempts = []
+    closed = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class ClosableCudaInitError(RuntimeError):
+        def close(self):
+            closed.append('closed')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if len(attempts) == 1:
+                raise ClosableCudaInitError('cudaMalloc failed: out of memory')
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    assert len(attempts) == 2
+    assert closed == ['closed']
+    assert attempts[1]['type_k'] == 8
+
+
 def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp_path):
     from utils.context_profiles import apply_context_profile
     from utils.llm.model_manager import ModelManager
@@ -3488,6 +3541,71 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
         'runtime_context_create_failed',
+        'runtime_context_create_failed',
+        'runtime_context_create_failed',
+    ]
+
+
+def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_preserves_original_error(tmp_path):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm.model_manager import ModelManager
+
+    attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            raise ValueError('Failed to create llama_context')
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    short_profiles = [
+        {
+            'profile_id': 'qwen64k_f16_fa_small_batch',
+            'runtime_kwargs': {},
+            'diagnostics': {'profile_id': 'qwen64k_f16_fa_small_batch', 'applied': {}, 'backend': 'cuda'},
+        },
+        {
+            'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'runtime_kwargs': {'type_k': 8, 'type_v': 8},
+            'diagnostics': {
+                'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+                'applied': {'type_k': 8, 'type_v': 8},
+                'backend': 'cuda',
+            },
+        },
+    ]
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}), \
+         patch.object(model_manager_module, '_build_qwen_64k_runtime_profiles', return_value=short_profiles):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 2
+    assert 'Failed to create llama_context' in manager.last_runtime_init_error
+    assert 'profile exhaustion' not in manager.last_runtime_init_error
+    assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
         'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
@@ -7747,6 +7865,62 @@ def test_bare_cublas_alloc_failed_is_cuda_memory():
 
     assert (
         model_manager_module._classify_runtime_context_create_error('CUBLAS_STATUS_ALLOC_FAILED')
+        == 'runtime_context_create_cuda_memory'
+    )
+
+
+def test_cuda_allocation_and_buffer_limit_classifier_branches():
+    from utils.llm import model_manager as model_manager_module
+
+    assert (
+        model_manager_module._classify_runtime_context_create_error(
+            'CUDA driver reported allocation failed while creating context'
+        )
+        == 'runtime_context_create_cuda_memory'
+    )
+    assert (
+        model_manager_module._classify_runtime_context_create_error(
+            'CUDA resource buffer too large for context'
+        )
+        == 'runtime_context_create_cuda_buffer_limit'
+    )
+
+
+def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs():
+    manager = object.__new__(ModelManager)
+    manager.last_compute_diagnostics = {'existing': 'unchanged'}
+    manager._qwen_64k_profile_attempt_ids = ['qwen64k_f16_fa_small_batch']
+    manager.last_qwen_64k_memory_profile_diagnostics = {
+        'applied': {
+            'type_k': 8,
+            'type_v': 8,
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': 256,
+            'n_ubatch': 128,
+        }
+    }
+
+    manager._publish_qwen_64k_init_failure_readiness_diagnostics(
+        compute_plan={'backend_used': 'cuda'},
+        profile_failures=[],
+    )
+    assert manager.last_compute_diagnostics == {'existing': 'unchanged'}
+
+    manager._publish_qwen_64k_init_failure_readiness_diagnostics(
+        compute_plan={'backend_used': 'cuda'},
+        profile_failures=[{
+            'profile_id': 'qwen64k_f16_fa_small_batch',
+            'safe_error_category': 'runtime_context_create_cuda_memory',
+            'attempted_runtime_kwargs': 'not-a-dict',
+        }],
+    )
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_type_k'] == 8
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
+    assert (
+        diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category']
         == 'runtime_context_create_cuda_memory'
     )
 

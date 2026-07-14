@@ -4591,6 +4591,18 @@ class ModelManager:
         os.makedirs(self.models_dir, exist_ok=True)
         return self.models_dir
 
+    def _profile_has_pinned_artifact(self) -> bool:
+        return (
+            self.model_profile.get('artifact_size_bytes') is not None
+            or self.model_profile.get('artifact_sha256') is not None
+        )
+
+    def _is_selected_model_path(self, file_path: str) -> bool:
+        try:
+            return os.path.abspath(str(file_path)) == os.path.abspath(str(self.model_path))
+        except (TypeError, ValueError):
+            return False
+
     def download_file_in_chunks(self, file_path: str, url: str, chunk_size_mb: int) -> bool:
         """
         Download a file in chunks with progress reporting.
@@ -4603,13 +4615,7 @@ class ModelManager:
         Returns:
             bool: True if download was successful, False otherwise
         """
-        pinned_artifact = (
-            os.path.basename(str(file_path)) == self.model_profile.get('filename')
-            and (
-                self.model_profile.get('artifact_size_bytes') is not None
-                or self.model_profile.get('artifact_sha256') is not None
-            )
-        )
+        pinned_artifact = self._profile_has_pinned_artifact() and self._is_selected_model_path(file_path)
         expected_size = self.model_profile.get('artifact_size_bytes') if pinned_artifact else None
         expected_sha256 = self.model_profile.get('artifact_sha256') if pinned_artifact else None
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
@@ -4735,13 +4741,7 @@ class ModelManager:
             return False, 'missing'
         expected_size = self.model_profile.get('artifact_size_bytes')
         expected_sha256 = self.model_profile.get('artifact_sha256')
-        pinned_artifact = (
-            os.path.basename(str(self.model_path)) == self.model_profile.get('filename')
-            and (
-                self.model_profile.get('artifact_size_bytes') is not None
-                or self.model_profile.get('artifact_sha256') is not None
-            )
-        )
+        pinned_artifact = self._profile_has_pinned_artifact()
         if not pinned_artifact:
             return True, 'valid'
         try:

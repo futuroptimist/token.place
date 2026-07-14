@@ -339,6 +339,64 @@ class TestModelManager:
         assert manager.url == 'https://example.com/custom.gguf'
         assert manager.canonical_family_url == 'https://example.com/family'
 
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_custom_filename_download_still_verifies_checksum(self, mock_get):
+        """A model.filename override must not disable profile pin verification."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'custom-qwen.gguf',
+            'model.url': 'https://mirror.example/custom-qwen.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = '0' * 64
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '8'
+        mock_response.iter_content.return_value = [b'GGUF', b'bad!']
+        mock_get.return_value = mock_response
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not os.path.exists(manager.model_path)
+        assert not list(Path(manager.models_dir).glob('custom-qwen.gguf.tmp.*'))
+        mock_response.close.assert_called_once()
+
+    def test_pinned_qwen_custom_filename_existing_artifact_still_verifies_checksum(self):
+        """Existing custom-named Qwen artifacts remain bound to profile metadata."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'custom-qwen.gguf',
+            'model.url': 'https://mirror.example/custom-qwen.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(b'GGUFbad!')
+
+        valid, reason = manager._validate_existing_model_artifact(hash_if_suspect=True)
+
+        assert valid is False
+        assert reason == 'checksum_mismatch'
+        assert Path(manager.model_path).read_bytes() == b'GGUFbad!'
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist
@@ -413,7 +471,7 @@ class TestModelManager:
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')
     def test_download_model_if_needed_existing(self, mock_download, mock_exists, model_manager):
-        """Test download_model_if_needed when model already exists."""
+        """Pinned existing artifacts with invalid metadata receive a bounded repair."""
         # Setup mocks
         mock_exists.return_value = True  # Model already exists
 
@@ -423,8 +481,12 @@ class TestModelManager:
         # Check the result
         assert result is True
 
-        # Verify mock calls
-        mock_download.assert_not_called()
+        # Verify pinned metadata is not bypassed for an invalid existing artifact.
+        mock_download.assert_called_once_with(
+            model_manager.model_path,
+            'https://example.com/model.gguf',
+            1
+        )
 
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.create_models_directory')

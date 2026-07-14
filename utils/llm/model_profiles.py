@@ -37,6 +37,9 @@ class _ModelProfileRequired(TypedDict):
 class ModelProfile(_ModelProfileRequired, total=False):
     license: str
     gguf_repo: str
+    artifact_revision: str
+    artifact_size_bytes: int
+    artifact_sha256: str
     rope_scaling_policy: Optional[Dict[str, Any]]
 
 

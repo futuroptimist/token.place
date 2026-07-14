@@ -8,6 +8,7 @@ import concurrent.futures
 import inspect
 import json
 import math
+import ntpath
 import os
 import queue
 import re
@@ -777,6 +778,16 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 
     return normalized or ["https://token.place"]
 
+
+def _canonicalize_parent_model_path(path_text: Any) -> Tuple[str, bool, bool]:
+    raw = str(path_text or '')
+    is_abs = os.path.isabs(raw) or ntpath.isabs(raw)
+    if is_abs:
+        canonical = raw
+    else:
+        canonical = str(Path(raw).resolve())
+    return canonical, not is_abs, Path(canonical).exists()
+
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
@@ -810,6 +821,9 @@ def run(args: argparse.Namespace) -> int:
         f"base_prefix={runtime_setup.get('base_prefix', 'unknown')} "
         f"dependency_target={runtime_setup.get('dependency_target', 'unknown')} "
         f"pip={runtime_setup.get('pip_version', 'unknown')} "
+        f"llama_cpp_python_version={runtime_setup.get('llama_cpp_python_version', 'unknown')} "
+        f"llama_cpp_python_required_version={runtime_setup.get('llama_cpp_python_required_version', 'unknown')} "
+        f"llama_cpp_python_version_match={runtime_setup.get('llama_cpp_python_version_match', 'unknown')} "
         f"install_command={runtime_setup.get('install_command_summary', 'none')} "
         f"install_backend={runtime_setup.get('install_backend', 'none')} "
         f"cmake_args={runtime_setup.get('cmake_args', 'none')} "
@@ -869,6 +883,8 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    canonical_model_path, model_path_was_relative, parent_model_path_exists = _canonicalize_parent_model_path(args.model)
+    args.model = canonical_model_path
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -880,7 +896,9 @@ def run(args: argparse.Namespace) -> int:
     print(
         "desktop.compute_node_bridge.start "
         f"operator_session_id={bridge_session_id} "
-        f"model={args.model} mode={args.mode} context_tier={args.context_tier} "
+        f"model_path_was_relative={model_path_was_relative} "
+        f"parent_model_path_exists={parent_model_path_exists} "
+        f"mode={args.mode} context_tier={args.context_tier} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",

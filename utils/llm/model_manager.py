@@ -18,6 +18,8 @@ import queue
 import signal
 import threading
 import sysconfig
+import hashlib
+import uuid
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Any, Optional, Iterable, Tuple
@@ -48,6 +50,7 @@ QWEN_64K_UBATCH_TOKENS = 128
 QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
+GGUF_MAGIC = b'GGUF'
 
 LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
@@ -76,6 +79,11 @@ _INIT_SAFE_CATEGORY_ALIASES = {
 }
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
+    'runtime_model_path_unavailable',
+    'runtime_model_load_failed',
+    'runtime_model_vocab_failed',
+    'runtime_batch_create_failed',
+    'runtime_model_artifact_invalid',
     'runtime_context_create_failed',
     'runtime_context_create_unsupported_kwarg',
     'runtime_context_create_rope_yarn_config',
@@ -513,6 +521,40 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_cuda_buffer_limit'
     if 'failed to create llama_context' in text or 'llamacontext' in text:
         return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
+
+
+def _classify_runtime_initialization_error(error: Any, child_stderr: str = '') -> str:
+    if isinstance(error, LlamaCppRuntimeInitError):
+        return _refine_init_category(error.safe_error_category, error=str(error), child_stderr=child_stderr or error.child_stderr_tail)
+    text = f'{error or ""}\n{child_stderr or ""}'.lower()
+    marker = re.search(r'safe_error_category=([a-z0-9_]+)', text)
+    if marker:
+        marker_category = _validated_init_safe_category(marker.group(1))
+        if marker_category != 'runtime_init_unclassified':
+            return marker_category
+    if any(term in text for term in ('no such file', 'not found', 'could not open', 'cannot open')) and any(term in text for term in ('model', 'gguf', 'path')):
+        return 'runtime_model_path_unavailable'
+    if 'invalid magic' in text or ('gguf' in text and any(term in text for term in ('magic', 'invalid', 'corrupt', 'truncated'))):
+        return 'runtime_model_artifact_invalid'
+    if 'vocab' in text and any(term in text for term in ('failed', 'load', 'missing', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'batch' in text and any(term in text for term in ('failed', 'create', 'alloc')):
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('failed to load model', 'llama_model_load', 'model load failed')):
+        return 'runtime_model_load_failed'
+    context_category = _classify_runtime_context_create_error(error, child_stderr)
+    if context_category in {
+        'runtime_context_create_unsupported_kwarg',
+        'runtime_context_create_rope_yarn_config',
+        'runtime_context_create_kv_cache_allocation',
+        'runtime_context_create_metal_memory',
+        'runtime_context_create_metal_buffer_limit',
+        'runtime_context_create_cuda_memory',
+        'runtime_context_create_cuda_buffer_limit',
+        'runtime_context_create_failed',
+    }:
+        return context_category
     return 'runtime_init_unclassified'
 
 
@@ -1757,7 +1799,7 @@ def _read_llama_subprocess_message(
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         child_category = _validated_init_safe_category(message.get('safe_error_category'))
-        classified = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
+        classified = _classify_runtime_initialization_error(raw_error, str(message.get('stderr') or ''))
         category = child_category if child_category != 'runtime_init_unclassified' else classified
         raise LlamaCppRuntimeInitError(
             f'{stage} failed',
@@ -1874,11 +1916,11 @@ class _SubprocessLlamaProxy:
                 child_exception_type = exc.child_exception_type
                 safe_exc = 'llama_cpp_import failed'
             elif isinstance(exc, LlamaCppWorkerEOFError):
-                category = _classify_runtime_context_create_error(exc, stderr_tail)
+                category = _classify_runtime_initialization_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
                 safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
             else:
-                category = _classify_runtime_context_create_error(exc, stderr_tail)
+                category = _classify_runtime_initialization_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
                 safe_exc = _safe_parent_exception_message(exc, child_stderr=stderr_tail)
             self.close()
@@ -2317,6 +2359,33 @@ def _classify_generation_exception(exc):
     if _extract_unsupported_generation_kwarg(str(exc or '')) is not None:
         return 'unsupported_generation_kwarg'
     return 'unknown_generation_exception'
+
+def _classify_runtime_init_exception(exc):
+    text = str(exc or '').lower()
+    if any(term in text for term in ('no such file', 'not found', 'could not open', 'cannot open')) and any(term in text for term in ('model', 'gguf', 'path')):
+        return 'runtime_model_path_unavailable'
+    if 'invalid magic' in text or ('gguf' in text and any(term in text for term in ('magic', 'invalid', 'corrupt', 'truncated'))):
+        return 'runtime_model_artifact_invalid'
+    if 'vocab' in text and any(term in text for term in ('failed', 'load', 'missing', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'batch' in text and any(term in text for term in ('failed', 'create', 'alloc')):
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('failed to load model', 'llama_model_load', 'model load failed')):
+        return 'runtime_model_load_failed'
+    generation_category = _classify_generation_exception(exc)
+    if generation_category == 'cuda_memory_allocation':
+        return 'runtime_context_create_cuda_memory'
+    if generation_category == 'metal_memory_allocation':
+        return 'runtime_context_create_metal_memory'
+    if generation_category == 'kv_cache_allocation':
+        return 'runtime_context_create_kv_cache_allocation'
+    if generation_category == 'rope_yarn_eval_failure':
+        return 'runtime_context_create_rope_yarn_config'
+    if any(term in text for term in ('unexpected keyword argument', 'unsupported parameter', 'unsupported argument')):
+        return 'runtime_context_create_unsupported_kwarg'
+    if 'failed to create llama_context' in text or 'llamacontext' in text:
+        return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
 
 def _plain_completion_method_shape_category(exc):
     text = str(exc or '').lower()
@@ -3091,9 +3160,9 @@ try:
     _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
     if _token_place_model_path is None and isinstance(init_kwargs, dict):
         _token_place_model_path = init_kwargs.get('model_path')
-    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None), 'child_model_path_exists': os.path.exists(str(_token_place_model_path or ''))})
 except Exception as exc:
-    _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_generation_exception(exc), 'traceback': traceback.format_exc()})
+    _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_runtime_init_exception(exc), 'traceback': traceback.format_exc()})
     raise SystemExit(1)
 
 for line in sys.stdin:
@@ -4065,6 +4134,7 @@ class ModelManager:
         # do not overwrite it and the first Metal failure remains observable.
         self._qwen_64k_first_readiness_failure_category: Optional[str] = None
         self._qwen_64k_first_readiness_failure_diagnostics: Dict[str, Any] = {}
+        self.last_model_artifact_validation: Dict[str, Any] = {}
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
@@ -4086,6 +4156,20 @@ class ModelManager:
             'context_tier': getattr(self, 'context_tier', '8k-fast'),
             'context_window_tokens': config.get('model.context_size', 8192),
         }
+
+    def _pinned_artifact_metadata_applies(self) -> bool:
+        return (
+            self.file_name == self.model_profile.get('filename')
+            and self.url == self.model_profile.get('download_url')
+            and bool(self.model_profile.get('artifact_size_bytes'))
+            and bool(self.model_profile.get('artifact_sha256'))
+        )
+
+    def _expected_artifact_size(self) -> Optional[int]:
+        return self.model_profile.get('artifact_size_bytes') if self._pinned_artifact_metadata_applies() else None
+
+    def _expected_artifact_sha256(self) -> Optional[str]:
+        return self.model_profile.get('artifact_sha256') if self._pinned_artifact_metadata_applies() else None
 
     def _runtime_capabilities(self=None) -> Dict[str, Any]:
         probe = _coerce_desktop_runtime_probe(getattr(self, 'desktop_runtime_probe', None))
@@ -4572,6 +4656,10 @@ class ModelManager:
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
         response = None
+        final_path = Path(file_path)
+        tmp_path = final_path.with_name(f'.{final_path.name}.{uuid.uuid4().hex}.tmp')
+        expected_size = self._expected_artifact_size()
+        expected_sha256 = self._expected_artifact_sha256()
 
         try:
             response = requests.get(url, stream=True, timeout=self.download_timeout)
@@ -4584,11 +4672,23 @@ class ModelManager:
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
             return False
 
         total_size_in_bytes = int(response.headers.get('content-length', 0))
         if total_size_in_bytes == 0:
             self.log_error("Error: Content-Length header is missing or zero.")
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
+            return False
+        if isinstance(expected_size, int) and total_size_in_bytes != expected_size:
+            self.log_error("Error: Content-Length does not match pinned model artifact size.")
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
             return False
 
         total_size_in_mb = total_size_in_bytes / (1024 * 1024)
@@ -4596,17 +4696,20 @@ class ModelManager:
         start_time = time.time()
         times = []
         bytes_downloaded = []
+        digest = hashlib.sha256()
+        first_bytes = b''
 
         try:
-            with open(file_path, 'wb') as file:
+            with open(tmp_path, 'wb') as file:
                 for data in response.iter_content(chunk_size=chunk_size_bytes):
                     if not data:
                         self.log_warning("Warning: Received empty data chunk.")
                         continue
 
+                    if len(first_bytes) < len(GGUF_MAGIC):
+                        first_bytes += data[: len(GGUF_MAGIC) - len(first_bytes)]
+                    digest.update(data)
                     file.write(data)
-                    file.flush()
-                    os.fsync(file.fileno())
 
                     elapsed_time = time.time() - start_time
                     progress += len(data)
@@ -4630,8 +4733,14 @@ class ModelManager:
                             end='\r',
                             file=sys.stderr,
                         )  # pragma: no cover
+                file.flush()
+                os.fsync(file.fileno())
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return False
         finally:
             if response is not None:
@@ -4639,12 +4748,64 @@ class ModelManager:
                 if callable(close):
                     close()
 
-        if os.path.exists(file_path) and os.path.getsize(file_path) == total_size_in_bytes:
-            self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
+        actual_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+        if (
+            actual_size == total_size_in_bytes
+            and (not isinstance(expected_size, int) or actual_size == expected_size)
+            and (not self._pinned_artifact_metadata_applies() or first_bytes == GGUF_MAGIC)
+            and (not expected_sha256 or digest.hexdigest().lower() == str(expected_sha256).lower())
+        ):
+            os.replace(tmp_path, final_path)
+            self.last_model_artifact_validation = {
+                'ready': True,
+                'category': 'model_artifact_valid',
+                'bytes': actual_size,
+                'sha256_verified': bool(expected_sha256),
+            }
+            self.log_info(f"File Size Immediately After Download: {actual_size} bytes")
             return True
         else:
-            self.log_error("Download failed or file size does not match.")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.last_model_artifact_validation = {
+                'ready': False,
+                'category': 'model_artifact_invalid',
+                'bytes': actual_size,
+                'sha256_verified': False,
+            }
+            self.log_error("Download failed model artifact validation.")
             return False
+
+    def _validate_existing_model_artifact(self, file_path: str, *, hash_suspect: bool = False) -> bool:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return False
+        expected_size = self._expected_artifact_size()
+        expected_sha256 = self._expected_artifact_sha256()
+        try:
+            size = path.stat().st_size
+            with path.open('rb') as handle:
+                magic = handle.read(len(GGUF_MAGIC))
+        except OSError:
+            return False
+        if isinstance(expected_size, int) and size != expected_size:
+            self.last_model_artifact_validation = {'ready': False, 'category': 'model_artifact_invalid', 'bytes': size}
+            return False
+        if self._pinned_artifact_metadata_applies() and magic != GGUF_MAGIC:
+            self.last_model_artifact_validation = {'ready': False, 'category': 'model_artifact_invalid', 'bytes': size}
+            return False
+        if hash_suspect and expected_sha256:
+            digest = hashlib.sha256()
+            with path.open('rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            if digest.hexdigest().lower() != str(expected_sha256).lower():
+                self.last_model_artifact_validation = {'ready': False, 'category': 'model_artifact_invalid', 'bytes': size}
+                return False
+        self.last_model_artifact_validation = {'ready': True, 'category': 'model_artifact_valid', 'bytes': size}
+        return True
 
     def download_model_if_needed(self) -> bool:
         """
@@ -4665,8 +4826,19 @@ class ModelManager:
                 self.log_error("Download failed or file is empty.")
                 return False
         else:
-            self.log_info(f"Model file {self.file_name} already exists.")
-            return True
+            if not self._pinned_artifact_metadata_applies():
+                self.log_info(f"Model file {self.file_name} already exists.")
+                return True
+            if self._validate_existing_model_artifact(self.model_path):
+                self.log_info(f"Model file {self.file_name} already exists.")
+                return True
+            canonical_path = Path(self.models_dir) / self.file_name
+            if Path(self.model_path) == canonical_path:
+                self.log_warning("Managed model artifact is invalid; attempting one bounded repair download.")
+                return self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb)
+            self.log_error("User-selected model artifact is invalid; refusing automatic repair.")
+            self.last_model_artifact_validation = {'ready': False, 'category': 'model_artifact_invalid', 'managed': False}
+            return False
 
     def _publish_qwen_64k_init_failure_readiness_diagnostics(
         self,
@@ -4921,7 +5093,7 @@ class ModelManager:
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
                                     break
                                 except Exception as init_exc:
-                                    category = _classify_runtime_context_create_error(init_exc)
+                                    category = _classify_runtime_initialization_error(init_exc)
                                     safe_failure = {
                                         'profile_id': profile_id,
                                         'model_profile_id': self.profile_id,
@@ -4959,15 +5131,7 @@ class ModelManager:
                                             profile_failures=profile_failures,
                                             current_profile_id=profile_id,
                                         )
-                                    generic_profile_retry = (
-                                        is_qwen_64k
-                                        and category == 'runtime_context_create_failed'
-                                        and compute_plan.get('backend_used') in {'cuda', 'metal'}
-                                        and len(profile_failures) < 3
-                                    )
-                                    if generic_profile_retry and first_generic_profile_retry_exc is None:
-                                        first_generic_profile_retry_exc = init_exc
-                                    if not is_qwen_64k or (category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES and not generic_profile_retry):
+                                    if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
                                         raise
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):

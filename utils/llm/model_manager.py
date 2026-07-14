@@ -69,6 +69,7 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_buffer_limit',
     'runtime_context_create_cuda_memory',
     'runtime_context_create_cuda_buffer_limit',
+    'runtime_context_create_failed',
 }
 
 _INIT_SAFE_CATEGORY_ALIASES = {
@@ -497,8 +498,6 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_unsupported_kwarg'
     if 'model path' in text and any(term in text for term in ('not found', 'unavailable', 'does not exist', 'no such file')):
         return 'runtime_model_path_unavailable'
-    if 'failed to load model' in text or 'llama_model_load' in text:
-        return 'runtime_model_load_failed'
     if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
         return 'runtime_model_vocab_failed'
     if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
@@ -530,6 +529,20 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_failed'
     return 'runtime_init_unclassified'
 
+
+
+def _classify_runtime_initialization_error(error: Any, child_stderr: str = '') -> str:
+    """Classify constructor/init failures with a bounded, path-free category set."""
+    text = f'{error or ""}\n{child_stderr or ""}'.lower()
+    if 'failed to load model' in text or 'llama_model_load' in text:
+        return 'runtime_model_load_failed'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('abi', 'incompatible gguf', 'unsupported gguf')):
+        return 'runtime_model_load_failed'
+    return _classify_runtime_context_create_error(error, child_stderr)
 
 def _redact_paths_from_text(text: Any, *, limit: int = 2000) -> str:
     redacted = str(text or '')
@@ -5005,6 +5018,7 @@ class ModelManager:
                                 else:
                                     runtime_profiles = [None]
                             profile_failures = []
+                            first_context_create_init_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
                             for runtime_profile in runtime_profiles:
@@ -5031,7 +5045,7 @@ class ModelManager:
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
                                     break
                                 except Exception as init_exc:
-                                    category = _classify_runtime_context_create_error(init_exc)
+                                    category = _classify_runtime_initialization_error(init_exc)
                                     safe_failure = {
                                         'profile_id': profile_id,
                                         'model_profile_id': self.profile_id,
@@ -5069,6 +5083,8 @@ class ModelManager:
                                             profile_failures=profile_failures,
                                             current_profile_id=profile_id,
                                         )
+                                    if is_qwen_64k and category == 'runtime_context_create_failed' and first_context_create_init_exc is None:
+                                        first_context_create_init_exc = init_exc
                                     if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
                                         raise
                                     close = getattr(init_exc, 'close', None)
@@ -5082,6 +5098,8 @@ class ModelManager:
                                         compute_plan=compute_plan,
                                         profile_failures=profile_failures,
                                     )
+                                if first_context_create_init_exc is not None:
+                                    raise first_context_create_init_exc
                                 raise RuntimeError(
                                     'Qwen 64K memory/KV/cache profile exhaustion before registration; '
                                     f'failures={profile_failures}'

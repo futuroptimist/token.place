@@ -13,9 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from packaging.specifiers import SpecifierSet
-from packaging.version import InvalidVersion, Version
-
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
     LLAMA_CPP_CPU_WHEEL_INDEX_URL,
@@ -813,6 +810,11 @@ def _required_llama_cpp_spec(requirements_path: Path) -> tuple[str, str]:
 def _llama_cpp_version_matches(installed: str, package_spec: str) -> str:
     version_text = str(installed or "").strip()
     if not version_text or version_text == "unknown":
+        return "unknown"
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import InvalidVersion, Version
+    except ModuleNotFoundError:
         return "unknown"
     try:
         spec_text = package_spec.split("llama-cpp-python", 1)[1]

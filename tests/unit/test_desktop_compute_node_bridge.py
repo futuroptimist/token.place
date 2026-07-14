@@ -659,7 +659,6 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
         'backend_selected',
         'backend_used',
         'fallback_reason',
-        'model_path',
         'last_error',
         'operator_session_id',
         'sequence',

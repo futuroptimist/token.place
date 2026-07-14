@@ -27,7 +27,7 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
-def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, resolver='unsupported'):
+def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, resolver='unsupported', version='0.3.32'):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,
         gpu_offload_supported=gpu,
@@ -36,7 +36,7 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
         prefix=sys.prefix,
         llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
         error=error,
-        llama_cpp_python_version='0.3.16',
+        llama_cpp_python_version=version,
         yarn_rope_supported=yarn,
         yarn_resolver_source=resolver,
         rope_scaling_type_supported=yarn,
@@ -1934,6 +1934,9 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
 
 
 def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -1965,7 +1968,7 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
         in result['fallback_reason']
     )
     assert 'resolver=unsupported' in result['fallback_reason']
-    assert 'version=0.3.16' in result['fallback_reason']
+    assert 'version=0.3.32' in result['fallback_reason']
     assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
     assert 'rope_scaling_type_supported=False' in result['fallback_reason']
     assert 'rope_freq_scale_supported=False' in result['fallback_reason']
@@ -1974,6 +1977,9 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
 
 
 def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -2001,6 +2007,9 @@ def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(m
 
 
 def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     dependency_target = tmp_path / 'desktop-site'
@@ -2055,6 +2064,9 @@ def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monke
 
 
 def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
     monkeypatch.setattr(

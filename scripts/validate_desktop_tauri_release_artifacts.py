@@ -278,14 +278,27 @@ def _sha256(path: Path) -> str:
 
 def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
     redacted = output
-    allowed_paths = {str(app_path)}
+    allowed_paths = {str(app_path), str(app_path.absolute())}
     try:
         allowed_paths.add(str(app_path.resolve()))
+    except OSError:
+        pass
+    try:
+        allowed_paths.add(os.path.realpath(app_path))
     except OSError:
         pass
     for allowed in sorted(allowed_paths, key=len, reverse=True):
         if allowed:
             redacted = redacted.replace(allowed, "<app-bundle>")
+
+    # CI builds can run probes from an app bundle under host-specific absolute
+    # paths (for example /Users/runner/...).  Those app-local paths are expected
+    # in sys.executable/sys.prefix output and should not trip the host-path leak
+    # scan.  Redact any absolute prefix ending at the same .app bundle name while
+    # leaving other runner/cache/Homebrew paths visible to the forbidden-marker
+    # checks below.
+    app_name = re.escape(app_path.name)
+    redacted = re.sub(rf"/[^\n\r]*?{app_name}", "<app-bundle>", redacted)
     return redacted
 
 

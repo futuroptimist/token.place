@@ -762,6 +762,22 @@ def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_p
     assert '/Users/runner/.cache/pip' in redacted
 
 
+def test_redact_allowed_app_locations_accepts_same_app_under_ci_absolute_prefix(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'relative' / 'token.place desktop.app'
+    output = (
+        '/Users/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/'
+        'aarch64-apple-darwin/release/bundle/macos/token.place desktop.app/'
+        'Contents/Resources/python-runtime/bin/python3\n'
+        '/Users/runner/.cache/pip'
+    )
+
+    redacted = validator._redact_allowed_app_locations(output, app)
+
+    assert '<app-bundle>/Contents/Resources/python-runtime/bin/python3' in redacted
+    assert '/Users/runner/.cache/pip' in redacted
+
+
 def test_run_python_sanitized_formats_probe_failures_without_raw_code(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'

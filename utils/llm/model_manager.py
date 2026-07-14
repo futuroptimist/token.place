@@ -4720,9 +4720,16 @@ class ModelManager:
             return False
 
         if os.path.exists(tmp_path) and actual_size == total_size_in_bytes:
-            os.replace(tmp_path, file_path)
-            self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
-            return True
+            try:
+                os.replace(tmp_path, file_path)
+                self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
+                return True
+            except OSError as e:
+                self.log_error(
+                    f"Download failed while replacing final artifact: exception_type={type(e).__name__}"
+                )
+                self._remove_partial_download(tmp_path)
+                return False
         else:
             self.log_error("Download failed or file size does not match.")
             self._remove_partial_download(tmp_path)

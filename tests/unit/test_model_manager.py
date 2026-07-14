@@ -397,6 +397,108 @@ class TestModelManager:
         assert reason == 'checksum_mismatch'
         assert Path(manager.model_path).read_bytes() == b'GGUFbad!'
 
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_download_size_mismatch_cleans_temp_and_preserves_final(self, mock_get):
+        """Pinned managed downloads reject wrong sizes without replacing an existing final file."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 12
+        manager.model_profile['artifact_sha256'] = None
+        Path(manager.model_path).write_bytes(b'original-final')
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '8'
+        mock_response.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = mock_response
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert Path(manager.model_path).read_bytes() == b'original-final'
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+        mock_response.close.assert_called_once()
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_download_bad_magic_and_replace_failure_clean_temp(self, mock_get, monkeypatch):
+        """Pinned managed downloads clean their unique temp file on magic and replace failures."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = None
+
+        bad_magic = MagicMock()
+        bad_magic.status_code = 200
+        bad_magic.headers.get.return_value = '8'
+        bad_magic.iter_content.return_value = [b'NOPE', b'tiny']
+        mock_get.return_value = bad_magic
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+        good_magic = MagicMock()
+        good_magic.status_code = 200
+        good_magic.headers.get.return_value = '8'
+        good_magic.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = good_magic
+        monkeypatch.setattr('utils.llm.model_manager.os.replace', MagicMock(side_effect=OSError('replace failed')))
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+    def test_existing_artifact_validation_unavailable_and_unmanaged_invalid_refusal(self, monkeypatch):
+        """Unavailable artifacts fail safely, and unmanaged invalid files are not repaired."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        explicit_path = os.path.join(temp_dir, 'operator-selected.gguf')
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_path = explicit_path
+        Path(manager.model_path).write_bytes(b'BAD!')
+
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+        assert manager.download_model_if_needed() is False
+        assert manager.download_file_in_chunks.call_count == 0
+        assert manager.last_runtime_init_error == 'model_artifact_invalid:bad_magic'
+        assert Path(manager.model_path).read_bytes() == b'BAD!'
+
+        monkeypatch.setattr('utils.llm.model_manager.os.path.exists', lambda _path: True)
+        monkeypatch.setattr('utils.llm.model_manager.os.path.getsize', MagicMock(side_effect=OSError('stat failed')))
+        valid, reason = manager._validate_existing_model_artifact(hash_if_suspect=True)
+        assert (valid, reason) == (False, 'unavailable')
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist

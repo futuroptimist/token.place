@@ -304,6 +304,7 @@ def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
 
 
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
+    app_for_subprocess = app_path if app_path.is_absolute() else app_path.absolute()
     py_for_subprocess = py if py.is_absolute() else py.absolute()
     home = tempfile.mkdtemp(prefix="token-place-home-")
     try:
@@ -312,13 +313,13 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "HOME": home,
             "PYTHONNOUSERSITE": "1",
             "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(app_path / "Contents" / "Resources" / "python"),
+            "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
             "XDG_CACHE_HOME": str(app_data / "cache"),
             "XDG_CONFIG_HOME": str(app_data / "config"),
             "XDG_DATA_HOME": str(app_data / "data"),
         }
-        probe_cwd = app_path / "Contents" / "Resources" / "python"
+        probe_cwd = app_for_subprocess / "Contents" / "Resources" / "python"
         result = subprocess.run(
             [str(py_for_subprocess), "-c", code],
             check=False,
@@ -328,7 +329,7 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
         )
         output = f"{result.stdout}\n{result.stderr}"
-        scan_output = _redact_allowed_app_locations(output, app_path)
+        scan_output = _redact_allowed_app_locations(output, app_for_subprocess)
         forbidden = ("/usr/bin/python3", "xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Users/runner", "/Library/Developer/CommandLineTools", "site.USER_SITE")
         for marker in forbidden:
             if marker in scan_output:
@@ -403,7 +404,8 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
             _fail(f"embedded runtime probe missing capability: {key}")
     model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
     if model_bridge.is_file():
-        _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge)!r}, 'inspect']).returncode)", app_path)
+        model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()
+        _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge_for_subprocess)!r}, 'inspect']).returncode)", app_path)
     else:
         _fail("packaged model_bridge.py missing from app resources")
     for candidate in runtime.rglob("*"):

@@ -648,7 +648,7 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
 def test_validator_contains_embedded_runtime_guardrails() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'Contents" / "Resources" / "python-runtime' in text
-    assert '"PYTHONPATH": str(app_path / "Contents" / "Resources" / "python")' in text
+    assert '"PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
     assert 'xcode-select' in text
     assert 'otool' in text
     assert 'embedded runtime probe did not report Metal GPU offload' in text
@@ -656,7 +656,7 @@ def test_validator_contains_embedded_runtime_guardrails() -> None:
 
 def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
-    assert 'PYTHONPATH": str(app_path / "Contents" / "Resources" / "python")' in text
+    assert 'PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
     assert "Path.cwd() / 'src-tauri' / 'python'" not in text
     assert "qwen_64k_yarn_support" in text
     assert "model_bridge.py" in text
@@ -682,7 +682,7 @@ def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, t
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
-    assert captured['env']['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
+    assert captured['env']['PYTHONPATH'] == str((app / 'Contents' / 'Resources' / 'python').absolute())
     assert 'TOKEN_PLACE_PYTHON' not in captured['env']
     assert 'TOKEN_PLACE_SIDECAR_PYTHON' not in captured['env']
 
@@ -722,7 +722,7 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
         assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
         assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
         assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
-        assert cwd == str(app / 'Contents' / 'Resources' / 'python')
+        assert cwd == str((app / 'Contents' / 'Resources' / 'python').absolute())
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
     monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
@@ -771,7 +771,7 @@ def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeyp
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
-    assert seen['cwd'] == str(resources_python)
+    assert seen['cwd'] == str(resources_python.absolute())
 
 
 def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_cwd(
@@ -795,7 +795,7 @@ def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_c
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert seen['cmd'][0] == str((tmp_path / py).absolute())
-    assert seen['cwd'] == str(app / 'Contents' / 'Resources' / 'python')
+    assert seen['cwd'] == str((tmp_path / app / 'Contents' / 'Resources' / 'python').absolute())
 
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -828,6 +828,65 @@ def test_redact_allowed_app_locations_accepts_same_app_under_ci_absolute_prefix(
     assert '/Users/runner/work/token.place/token.place/desktop-tauri/<app-bundle>' not in redacted
     assert '/Users/runner/.cache/pip' in redacted
 
+
+
+def test_validate_embedded_python_runtime_absolutizes_packaged_model_bridge(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = Path('src-tauri/target/aarch64-apple-darwin/release/bundle/macos/token.place desktop.app')
+    app_root = tmp_path / app
+    runtime = app_root / 'Contents' / 'Resources' / 'python-runtime'
+    resources_python = app_root / 'Contents' / 'Resources' / 'python'
+    (runtime / 'bin').mkdir(parents=True)
+    resources_python.mkdir(parents=True)
+    py = runtime / 'bin' / 'python3'
+    py.write_text('#!/bin/sh\n', encoding='utf-8')
+    py.chmod(0o755)
+    (runtime / 'embedded_python_runtime_provenance.json').write_text('{}', encoding='utf-8')
+    (runtime / 'LICENSE-PYTHON.txt').write_text('PSF', encoding='utf-8')
+    (runtime / 'LICENSE-python-build-standalone.txt').write_text('PBS', encoding='utf-8')
+    model_bridge = resources_python / 'model_bridge.py'
+    model_bridge.write_text('', encoding='utf-8')
+    calls = []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda candidate, app_path: None)
+
+    def fake_run_python_sanitized(_py_arg, code, _app_path_arg):
+        calls.append(code)
+        if 'sys.version_info' in code:
+            return json.dumps({
+                'version': [3, 11],
+                'machine': 'arm64',
+                'executable': str(py),
+                'prefix': str(runtime),
+                'llama_cpp_python_version': '0.3.32',
+            })
+        if '_probe_llama_runtime' in code:
+            return json.dumps({
+                'backend': 'metal',
+                'gpu_offload_supported': True,
+                'qwen_64k_yarn_support': 'supported',
+                'rope_scaling_type_supported': True,
+                'rope_freq_scale_supported': True,
+                'yarn_orig_ctx_supported': True,
+                'constructor_kwarg_support': {
+                    'flash_attn': True,
+                    'offload_kqv': True,
+                    'n_batch': True,
+                    'n_ubatch': True,
+                },
+            })
+        return 'ok'
+
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python_sanitized)
+
+    validator._validate_embedded_python_runtime(app)
+
+    bridge_calls = [code for code in calls if 'model_bridge.py' in code]
+    assert bridge_calls
+    assert str(model_bridge.absolute()) in bridge_calls[-1]
+    assert f"{str(app / 'Contents' / 'Resources' / 'python' / 'model_bridge.py')!r}" not in bridge_calls[-1]
 
 def test_run_python_sanitized_formats_probe_failures_without_raw_code(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()

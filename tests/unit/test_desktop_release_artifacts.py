@@ -701,3 +701,85 @@ def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime(
     assert "- os: macos-26" in workflow
     assert "- os: macos-latest" not in workflow
     assert 'test "$(uname -m)" = "arm64"' in workflow
+
+
+def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = tmp_path / 'python3'
+    created_home = {}
+
+    def fake_mkdtemp(*, prefix):
+        home = tmp_path / f'{prefix}abc'
+        home.mkdir()
+        created_home['path'] = home
+        return str(home)
+
+    def fake_run(cmd, *, check, capture_output, text, env):
+        assert env['HOME'] == str(created_home['path'])
+        return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
+
+    monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    try:
+        validator._run_python_sanitized(py, 'print(1)', app)
+        assert False
+    except SystemExit as exc:
+        assert 'forbidden marker' in str(exc)
+    assert not created_home['path'].exists()
+
+
+def test_run_python_sanitized_formats_probe_failures_without_raw_code(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = tmp_path / 'python3'
+
+    def fake_run(cmd, *, check, capture_output, text, env):
+        return subprocess.CompletedProcess(cmd, 7, 'stdout', 'stderr')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    try:
+        validator._run_python_sanitized(py, 'secret code body', app)
+        assert False
+    except SystemExit as exc:
+        message = str(exc)
+    assert '<probe>' in message
+    assert 'secret code body' not in message
+
+
+def test_validate_macho_linkage_rejects_forbidden_external_dependency(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    binary = app / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'bad.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, check=False, capture_output=True, text=True):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator, '_run', lambda cmd: f'{binary}:\n/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)')
+
+    try:
+        validator._validate_macho_linkage(binary, app)
+        assert False
+    except SystemExit as exc:
+        assert 'forbidden external Mach-O linkage' in str(exc)
+
+
+def test_validate_embedded_python_runtime_fails_incomplete_app_before_publication(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources').mkdir(parents=True)
+    try:
+        validator._validate_embedded_python_runtime(app)
+        assert False
+    except SystemExit as exc:
+        assert 'embedded Python interpreter missing' in str(exc)

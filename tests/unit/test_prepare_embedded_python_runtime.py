@@ -276,3 +276,155 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     assert (pip_build / '__init__.py').is_file()
     assert not test_dir.exists()
     assert not pycache.exists()
+
+
+def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):
+    p = tmp_path / 'm.json'
+    cases = [
+        (manifest(archive_url='https://example.test/latest/runtime.tar.gz'), 'latest'),
+        (manifest(sha256='A' * 64), 'lowercase'),
+        (manifest(required_packages={**manifest()['required_packages'], 'numpy': '9.9.9'}), 'required_packages'),
+        ({k: v for k, v in manifest().items() if k != 'runtime_notices'}, 'missing manifest field'),
+        (manifest(expected_packaged_runtime_path='Contents/Resources/python-runtime'), 'packaged runtime path'),
+    ]
+    for data, expected in cases:
+        p.write_text(json.dumps(data), encoding='utf-8')
+        try:
+            prep.load_manifest(p)
+            assert False, f'expected failure containing {expected}'
+        except prep.RuntimePrepError as exc:
+            assert expected in str(exc)
+
+
+def test_validate_tar_member_rejects_escaping_symlink_and_hardlink():
+    for link_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+        info = tarfile.TarInfo('python/bin/python3')
+        info.type = link_type
+        info.linkname = '../outside'
+        try:
+            prep.validate_tar_member(info, 'python')
+            assert False
+        except prep.RuntimePrepError as exc:
+            assert 'escapes extraction root' in str(exc)
+
+
+def test_prove_interpreter_rejects_wrong_version_architecture_and_paths(tmp_path, monkeypatch):
+    py = tmp_path / 'runtime' / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('#!/bin/sh\n', encoding='utf-8')
+    runtime = tmp_path / 'runtime'
+
+    class Result:
+        def __init__(self, payload):
+            self.stdout = json.dumps(payload)
+
+    payloads = [
+        {'version': [2, 7], 'machine': 'arm64', 'executable': str(py), 'prefix': str(runtime)},
+        {'version': [3, 11], 'machine': 'x86_64', 'executable': str(py), 'prefix': str(runtime)},
+        {'version': [3, 11], 'machine': 'arm64', 'executable': '/tmp/outside/python3', 'prefix': str(runtime)},
+        {'version': [3, 11], 'machine': 'arm64', 'executable': str(py), 'prefix': '/tmp/outside'},
+    ]
+    expected = ['not Python 3.11', 'wrong architecture', 'executable is outside', 'prefix is outside']
+    for payload, message in zip(payloads, expected, strict=True):
+        monkeypatch.setattr(prep, 'run', lambda *_, _payload=payload, **__: Result(_payload))
+        try:
+            prep.prove_interpreter(py, runtime, manifest())
+            assert False
+        except prep.RuntimePrepError as exc:
+            assert message in str(exc)
+
+
+def test_probe_runtime_rejects_backend_version_and_missing_capabilities(tmp_path, monkeypatch):
+    py = tmp_path / 'python3'
+
+    class Result:
+        def __init__(self, payload):
+            self.stdout = json.dumps(payload)
+
+    valid_payload = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'llama_cpp_python_version': '0.3.32',
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+    cases = [
+        ({**valid_payload, 'backend': 'cpu'}, 'not Metal-capable'),
+        ({**valid_payload, 'gpu_offload_supported': False}, 'not Metal-capable'),
+        ({**valid_payload, 'llama_cpp_python_version': '0.0.1'}, 'wrong llama-cpp-python version'),
+        ({**valid_payload, 'qwen_64k_yarn_support': 'unsupported'}, 'missing Qwen 64K runtime capabilities'),
+    ]
+    for payload, message in cases:
+        monkeypatch.setattr(prep, 'run', lambda *_, _payload=payload, **__: Result(_payload))
+        try:
+            prep.probe_runtime(py, manifest())
+            assert False
+        except prep.RuntimePrepError as exc:
+            assert message in str(exc)
+    monkeypatch.setattr(prep, 'run', lambda *_, **__: Result(valid_payload))
+    assert prep.probe_runtime(py, manifest()) == valid_payload
+
+
+def test_existing_valid_rejects_missing_or_damaged_provenance(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    assert prep.existing_valid(manifest()) is False
+    output.mkdir()
+    (output / prep.PROVENANCE).write_text(json.dumps({'source_archive_sha256': 'bad', 'expected_backend': 'metal'}), encoding='utf-8')
+    (output / 'bin').mkdir()
+    (output / 'bin' / 'python3').write_text('#!/bin/sh\n', encoding='utf-8')
+    assert prep.existing_valid(manifest()) is False
+
+
+def test_existing_valid_accepts_matching_provenance_after_full_validation(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    (output / 'bin').mkdir(parents=True)
+    (output / 'bin' / 'python3').write_text('#!/bin/sh\n', encoding='utf-8')
+    packages = manifest()['required_packages']
+    (output / prep.PROVENANCE).write_text(json.dumps({
+        'source_archive_sha256': '0' * 64,
+        'expected_backend': 'metal',
+        'installed_packages': packages,
+    }), encoding='utf-8')
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: None)
+    monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: {'backend': 'metal'})
+    assert prep.existing_valid(manifest()) is True
+
+
+def test_prepare_reuses_valid_existing_runtime_without_download(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(prep, 'OUTPUT', tmp_path / 'python-runtime')
+    monkeypatch.setattr(prep, 'load_manifest', lambda: manifest())
+    monkeypatch.setattr(prep, 'existing_valid', lambda m: True)
+    monkeypatch.setattr(prep, 'download_verified', lambda *_: (_ for _ in ()).throw(AssertionError('downloaded')))
+    prep.prepare(tmp_path / 'cache')
+    assert 'already valid' in capsys.readouterr().out
+
+
+def test_prepare_keeps_old_runtime_when_validation_fails(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    output.mkdir()
+    (output / 'keep.txt').write_text('old runtime', encoding='utf-8')
+    archive = tmp_path / 'runtime.tar.gz'
+    make_tar(archive, {'python/bin/python3': b'#!/bin/sh\n'})
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    monkeypatch.setattr(prep, 'load_manifest', lambda: manifest())
+    monkeypatch.setattr(prep, 'existing_valid', lambda m: False)
+    monkeypatch.setattr(prep, 'download_verified', lambda m, cache: archive)
+    monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: None)
+    monkeypatch.setattr(prep, 'install_packages', lambda py, m, cache: (_ for _ in ()).throw(prep.RuntimePrepError('install failed')))
+
+    try:
+        prep.prepare(tmp_path / 'cache')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'install failed' in str(exc)
+    assert (output / 'keep.txt').read_text(encoding='utf-8') == 'old runtime'

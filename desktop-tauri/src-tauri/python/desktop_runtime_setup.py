@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+from packaging.requirements import Requirement
+from packaging.version import InvalidVersion, Version
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
@@ -801,6 +803,45 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     }
 
 
+
+def _required_llama_cpp_version(requirements_path: Path) -> str:
+    spec = llama_cpp_requirement_spec(requirements_path)
+    req = Requirement(spec)
+    pins = [str(item.version) for item in req.specifier if item.operator == "=="]
+    if not pins:
+        raise ValueError(f"llama-cpp-python requirement is not exactly pinned in {requirements_path}")
+    return pins[0]
+
+
+def _llama_cpp_version_matches(installed: Any, required: Any) -> bool:
+    installed_text = str(installed or "").strip()
+    required_text = str(required or "").strip()
+    if not installed_text or installed_text.lower() == "unknown" or not required_text:
+        return False
+    try:
+        return Version(installed_text) == Version(required_text)
+    except InvalidVersion:
+        return installed_text == required_text
+
+
+def _qwen64k_probe_satisfies_pin(probe: RuntimeProbe, required_version: str) -> bool:
+    return _llama_cpp_version_matches(probe.llama_cpp_python_version, required_version)
+
+
+def _version_fields(probe: RuntimeProbe, required_version: str) -> Dict[str, Any]:
+    return {
+        "llama_cpp_python_required_version": required_version or "unknown",
+        "llama_cpp_python_version_match": _qwen64k_probe_satisfies_pin(probe, required_version),
+    }
+
+
+def _version_mismatch_reason(probe: RuntimeProbe, required_version: str) -> str:
+    return (
+        "Qwen 64K requires packaged llama-cpp-python pin; "
+        f"installed_version={probe.llama_cpp_python_version or 'unknown'}; "
+        f"required_version={required_version or 'unknown'}"
+    )
+
 def _qwen_64k_runtime_repair_failed_reason(probe: RuntimeProbe) -> str:
     return (
         "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed; "
@@ -1058,22 +1099,41 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         }
 
     last_error = ""
+    requirements_path = _resolve_requirements_path(target_root)
+    required_llama_cpp_version = ""
+    if qwen_64k_required:
+        try:
+            required_llama_cpp_version = _required_llama_cpp_version(requirements_path)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return {
+                "selected_backend": "cpu",
+                "fallback_reason": f"Qwen 64K llama-cpp-python pin resolution failed: {exc}",
+                "runtime_action": "version_mismatch_failed",
+                **_probe_result_payload(before),
+                "llama_cpp_python_required_version": "unknown",
+                "llama_cpp_python_version_match": False,
+            }
 
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
-        if not qwen_64k_required or before.yarn_rope_supported:
+        version_ok = (not qwen_64k_required) or _qwen64k_probe_satisfies_pin(before, required_llama_cpp_version)
+        if not qwen_64k_required or (before.yarn_rope_supported and version_ok):
             return {
                 "selected_backend": before.backend,
                 "fallback_reason": "",
                 "runtime_action": _already_supported_action(before.backend),
                 **_probe_result_payload(before),
+                **(_version_fields(before, required_llama_cpp_version) if qwen_64k_required else {}),
             }
-        # Metal/CUDA import and offload are not enough for Qwen 64K. Continue
+        # Metal/CUDA import/offload are not enough for Qwen 64K. Continue
         # into deterministic reinstall/upgrade so stale packaged sites are repaired.
-        last_error = (
-            "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; "
-            f"installed runtime lacks support; resolver={before.yarn_resolver_source}; "
-            f"version={before.llama_cpp_python_version}; module={before.llama_module_path}"
-        )
+        if not version_ok:
+            last_error = _version_mismatch_reason(before, required_llama_cpp_version)
+        else:
+            last_error = (
+                "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; "
+                f"installed runtime lacks support; resolver={before.yarn_resolver_source}; "
+                f"version={before.llama_cpp_python_version}; module={before.llama_module_path}"
+            )
 
     policy = _runtime_bootstrap_policy()
     expected_backend = policy.expected_backend
@@ -1127,7 +1187,6 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             **_probe_result_payload(before),
         }
 
-    requirements_path = _resolve_requirements_path(target_root)
     install_diagnostics: Dict[str, str] = {}
 
     if expected_backend == "cuda":
@@ -1147,15 +1206,17 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                     )
                     after = _probe_runtime(target_root)
                     if after.gpu_offload_supported and after.backend == "cuda":
-                        if not qwen_64k_required or after.yarn_rope_supported:
+                        after_version_ok = (not qwen_64k_required) or _qwen64k_probe_satisfies_pin(after, required_llama_cpp_version)
+                        if not qwen_64k_required or (after.yarn_rope_supported and after_version_ok):
                             return {
                                 "selected_backend": "cuda",
                                 "fallback_reason": "installed CUDA runtime; re-executing sidecar",
                                 "runtime_action": "installed_cuda_reexec",
                                 **_probe_result_payload(after),
+                                **(_version_fields(after, required_llama_cpp_version) if qwen_64k_required else {}),
                                 **install_diagnostics,
                             }
-                        last_error = _qwen_64k_runtime_repair_failed_reason(after)
+                        last_error = _qwen_64k_runtime_repair_failed_reason(after) if after_version_ok else _version_mismatch_reason(after, required_llama_cpp_version)
                         _record_source_repair_failure(last_error)
                     source_detail = _summarize_install_error(source_log)
                     if not last_error:
@@ -1226,6 +1287,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend
         accepted_source_probe = plan_satisfied and after.backend != plan.backend
         if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
+            if qwen_64k_required and not _qwen64k_probe_satisfies_pin(after, required_llama_cpp_version):
+                last_error = _version_mismatch_reason(after, required_llama_cpp_version)
+                continue
             if qwen_64k_required and not after.yarn_rope_supported:
                 last_error = _qwen_64k_runtime_repair_failed_reason(after)
                 continue
@@ -1257,6 +1321,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 "fallback_reason": reason,
                 "runtime_action": _installed_reexec_action(plan.backend),
                 **_probe_result_payload(after),
+                **(_version_fields(after, required_llama_cpp_version) if qwen_64k_required else {}),
                 **install_diagnostics,
             }
 
@@ -1318,8 +1383,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
     return {
         "selected_backend": "cpu",
         "fallback_reason": reason,
-        "runtime_action": _install_failure_action(expected_backend),
+        "runtime_action": "version_mismatch_failed" if qwen_64k_required and required_llama_cpp_version and not _qwen64k_probe_satisfies_pin(before, required_llama_cpp_version) else _install_failure_action(expected_backend),
         **_probe_result_payload(before),
+        **(_version_fields(before, required_llama_cpp_version) if qwen_64k_required else {}),
         **install_diagnostics,
     }
 

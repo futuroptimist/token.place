@@ -1115,7 +1115,7 @@ def run(args: argparse.Namespace) -> int:
             "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
             "model_path_was_relative": model_path_was_relative,
             "parent_model_path_exists": parent_model_path_exists,
-            "child_model_path_exists": os.path.exists(args.model),
+            "child_model_path_exists": getattr(runtime.model_manager, "child_model_path_exists", False),
             "context_tier": context_profile.profile_id,
             "context_window_tokens": context_profile.total_context_tokens,
             "last_error": relay_errors or current_last_error,

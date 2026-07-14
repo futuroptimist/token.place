@@ -566,6 +566,59 @@ class TestModelManager:
         assert model_manager.download_model_if_needed() is True
         assert model_manager.last_model_artifact_validation == {'valid': True, 'reason': 'valid'}
 
+    def test_existing_managed_artifact_fast_path_does_not_hash_every_warm_start(self):
+        """Warm starts validate pinned size and GGUF magic without hashing the full GGUF."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(data)
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': True, 'reason': 'valid'}
+        manager.download_file_in_chunks.assert_not_called()
+
+    def test_suspect_managed_artifact_hashes_and_repairs_checksum_mismatch(self):
+        """Exact model-load evidence makes the managed artifact suspect and enables one hash repair."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(data)
+        manager.last_runtime_init_error = 'runtime_model_load_failed'
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': False, 'reason': 'checksum_mismatch'}
+        manager.download_file_in_chunks.assert_called_once_with(manager.model_path, manager.url, manager.chunk_size_mb)
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist
@@ -2902,8 +2955,8 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
 
     message = str(exc_info.value)
-    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
-    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'llama_cpp_model_initialization subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=7' in message
     assert 'stdout llama_context clue before exit' in message
     assert 'stderr llama_context clue before exit' in message
@@ -2952,15 +3005,15 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
     message = str(exc_info.value)
-    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
-    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'llama_cpp_model_initialization subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=9' in message
     assert 'program=' in message
     assert 'command=' in message
     assert 'cwd=' in message
     assert 'import_root=' in message
     assert 'module_path_hint=' in message
-    assert 'stage=llama_cpp_import' in message
+    assert 'stage=llama_cpp_model_initialization' in message
     assert 'TOKEN_PLACE_LLAMA_CPP_JSON' not in message
     assert 'secret prompt' not in message
     assert 'generated text' not in message
@@ -3020,7 +3073,7 @@ def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
-    assert exc_info.value.stage == 'llama_cpp_import'
+    assert exc_info.value.stage == 'llama_cpp_model_initialization'
     assert created and created[0].terminated and created[0].killed
 
 
@@ -7216,6 +7269,47 @@ def test_subprocess_worker_enable_thinking_rejected_no_metadata_fails_closed_wit
     assert diag.get('render_rejected_generation_kwarg') == 'enable_thinking'
     assert diag.get('rejected_generation_kwarg') == 'enable_thinking'
     assert 'plaintext must not appear' not in str(diag)
+
+
+def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_spaces(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'fake site-packages child exists'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "import os\n"
+        "class Llama:\n"
+        "    def __init__(self, model_path=None, **_kwargs):\n"
+        "        assert os.path.isabs(model_path)\n"
+        "        assert os.path.exists(model_path)\n"
+        "        assert os.getcwd() != os.path.dirname(model_path)\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}]}\n",
+        encoding='utf-8',
+    )
+    parent_cwd = tmp_path / 'parent cwd with spaces'
+    model_dir = parent_cwd / 'models with spaces'
+    model_dir.mkdir(parents=True)
+    (model_dir / 'mock.gguf').write_bytes(b'GGUFtiny')
+    other_worker_cwd = tmp_path / 'worker cwd with spaces'
+    other_worker_cwd.mkdir()
+
+    monkeypatch.chdir(parent_cwd)
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(fake_site))
+    monkeypatch.setenv('PYTHONPATH', str(fake_site))
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_PYTHON_ROOT', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_PROBE_REPO_ROOT', raising=False)
+    monkeypatch.setattr(model_manager_module, '_llama_cpp_probe_sys_path_entries', lambda: [str(fake_site)])
+    monkeypatch.setattr(model_manager_module, '_llama_cpp_probe_subprocess_cwd', lambda: str(other_worker_cwd))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=os.path.join('models with spaces', 'mock.gguf'), timeout_seconds=5)
+    try:
+        assert proxy.child_model_path_exists is True
+    finally:
+        proxy.close()
 
 
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):

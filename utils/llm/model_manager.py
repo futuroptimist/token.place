@@ -1785,13 +1785,18 @@ def _read_llama_subprocess_message(
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         child_category = _validated_init_safe_category(message.get('safe_error_category'))
-        classified = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
-        category = child_category if child_category != 'runtime_init_unclassified' else classified
+        if stage == 'llama_cpp_model_initialization':
+            category = child_category
+            child_stderr_tail = ''
+        else:
+            classified = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
+            category = child_category if child_category != 'runtime_init_unclassified' else classified
+            child_stderr_tail = str(message.get('stderr') or '')
         raise LlamaCppRuntimeInitError(
             f'{stage} failed',
             child_exception_type=message.get('exception_type') or 'RuntimeError',
             safe_error_category=category,
-            child_stderr_tail=str(message.get('stderr') or ''),
+            child_stderr_tail=child_stderr_tail,
         )
     return message
 
@@ -1888,14 +1893,15 @@ class _SubprocessLlamaProxy:
         except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
             self.close()
             raise RuntimeError(
-                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
             ) from exc
         try:
-            _read_llama_subprocess_message(
+            init_message = _read_llama_subprocess_message(
                 self._process,
                 timeout_seconds=self._timeout_seconds,
-                stage='llama_cpp_import',
+                stage='llama_cpp_model_initialization',
             )
+            self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
         except LlamaCppRuntimeStageTimeout:
             self.close()
             raise
@@ -1905,11 +1911,11 @@ class _SubprocessLlamaProxy:
             if isinstance(exc, LlamaCppRuntimeInitError):
                 category = _refine_init_category(exc.safe_error_category, error=exc, child_stderr=stderr_tail)
                 child_exception_type = exc.child_exception_type
-                safe_exc = 'llama_cpp_import failed'
+                safe_exc = 'llama_cpp_model_initialization failed'
             elif isinstance(exc, LlamaCppWorkerEOFError):
                 category = _classify_runtime_context_create_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
-                safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+                safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
             else:
                 category = _classify_runtime_context_create_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
@@ -2201,7 +2207,7 @@ class _SubprocessLlamaCppModule:
 
 
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
-import importlib, inspect, json, os, re, sys, traceback
+import importlib, inspect, json, os, re, sys
 
 def _jsonable(value):
     if hasattr(value, 'model_dump'):
@@ -2217,6 +2223,37 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+
+
+def _classify_initialization_exception(exc):
+    text = str(exc or '').lower()
+    if 'model path' in text and any(term in text for term in ('not found', 'unavailable', 'does not exist', 'no such file')):
+        return 'runtime_model_path_unavailable'
+    if any(term in text for term in ('failed to load model', 'llama_model_load', 'could not load model')):
+        return 'runtime_model_load_failed'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('abi', 'undefined symbol', 'incompatible gguf', 'unsupported gguf')):
+        return 'runtime_model_load_failed'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported (?:parameter|kwarg|argument))', text):
+        return 'runtime_context_create_unsupported_kwarg'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'orig', 'context'))):
+        return 'runtime_context_create_rope_yarn_config'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'oom', 'failed')):
+        return 'runtime_context_create_kv_cache_allocation'
+    if 'metal' in text and any(term in text for term in ('buffer', 'graph', 'max size', 'too large')):
+        return 'runtime_context_create_metal_buffer_limit'
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
+        return 'runtime_context_create_metal_memory'
+    if any(term in text for term in ('cublas_status_alloc_failed', 'cudamalloc', 'cuda malloc', 'cuda oom', 'cuda out of memory', 'cuda allocation failed')):
+        return 'runtime_context_create_cuda_memory'
+    if 'cuda' in text and any(term in text for term in ('buffer', 'resource')):
+        return 'runtime_context_create_cuda_buffer_limit'
+    if 'failed to create llama_context' in text or 'llamacontext' in text:
+        return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
 
 def _extract_unsupported_generation_kwarg(message, attempted=None):
     attempted_set = set(str(key) for key in attempted) if attempted is not None else None
@@ -3117,16 +3154,26 @@ try:
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
-    llama_cpp = importlib.import_module('llama_cpp')
     init_args = init_payload.get('args', [])
-    llama = llama_cpp.Llama(*init_args, **init_payload.get('kwargs', {}))
     init_kwargs = init_payload.get('kwargs', {})
     _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
     if _token_place_model_path is None and isinstance(init_kwargs, dict):
         _token_place_model_path = init_kwargs.get('model_path')
-    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+    child_model_path_exists = (
+        os.path.exists(_token_place_model_path)
+        if isinstance(_token_place_model_path, str)
+        else False
+    )
+    llama_cpp = importlib.import_module('llama_cpp')
+    llama = llama_cpp.Llama(*init_args, **init_kwargs)
+    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None), 'child_model_path_exists': child_model_path_exists})
 except Exception as exc:
-    _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_generation_exception(exc), 'traceback': traceback.format_exc()})
+    _emit({
+        'status': 'error',
+        'exception_type': type(exc).__name__,
+        'safe_error_category': _classify_initialization_exception(exc),
+        'child_model_path_exists': bool(locals().get('child_model_path_exists', False)),
+    })
     raise SystemExit(1)
 
 for line in sys.stdin:
@@ -4781,7 +4828,19 @@ class ModelManager:
         """
         self.create_models_directory()
 
-        valid, reason = self._validate_existing_model_artifact(hash_if_suspect=True)
+        # Downloads are always streamed through SHA-256 validation when pinned.
+        # Warm starts keep startup bounded with pinned size + GGUF magic; the
+        # full existing-file hash is reserved for exact suspect evidence from
+        # a managed canonical artifact so every launch does not hash 5 GB.
+        suspect_existing_artifact = (
+            self._is_managed_canonical_model_path()
+            and str(getattr(self, 'last_runtime_init_error', '') or '').startswith((
+                'model_artifact_invalid:',
+                'runtime_model_load_failed',
+                'runtime_model_vocab_failed',
+            ))
+        )
+        valid, reason = self._validate_existing_model_artifact(hash_if_suspect=suspect_existing_artifact)
         self.last_model_artifact_validation = {'valid': valid, 'reason': reason}
         if not valid and reason == 'missing':
             self.log_info(f"Downloading {self.file_name}...")

@@ -165,7 +165,7 @@ def probe_runtime(py: Path, m: dict) -> dict:
 
 def clean(runtime: Path) -> None:
     for p in runtime.rglob("*"):
-        if p.is_dir() and p.name in {"__pycache__", "tests", "test", "build"}: shutil.rmtree(p, ignore_errors=True)
+        if p.is_dir() and p.name in {"__pycache__", "tests", "test"}: shutil.rmtree(p, ignore_errors=True)
         elif p.is_file() and (p.suffix == ".pyc" or p.name.endswith(".pyo")): p.unlink(missing_ok=True)
 
 def provenance(m: dict, packages: dict) -> dict:

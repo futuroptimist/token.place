@@ -174,10 +174,10 @@ def test_install_packages_uses_shared_root_llama_cpp_pin_for_metal_plan(tmp_path
         def pip_env(self):
             return {'CMAKE_ARGS': '-DGGML_METAL=on'}
 
-    def fake_plan(*, platform, requirements_path):
+    def fake_fallbacks(*, platform, requirements_path):
         assert platform == 'darwin'
         assert requirements_path == prep.ROOT.parent / 'requirements.txt'
-        return Plan()
+        return [Plan()]
 
     def fake_run(cmd, **kwargs):
         commands.append((cmd, kwargs.get('env') or {}))
@@ -185,16 +185,75 @@ def test_install_packages_uses_shared_root_llama_cpp_pin_for_metal_plan(tmp_path
             stdout = ''
         return Result()
 
-    monkeypatch.setattr(prep, 'llama_cpp_install_plan', fake_plan)
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', fake_fallbacks)
     monkeypatch.setattr(prep, 'run', fake_run)
 
     prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'pip-cache')
 
-    install_command = commands[2][0]
-    install_env = commands[2][1]
-    assert install_command[:4] == [str(tmp_path / 'python3'), '-m', 'pip', 'install']
-    assert str(prep.SRC_TAURI / 'python' / 'requirements_desktop_runtime.txt') in install_command
-    assert 'llama-cpp-python==0.3.32' == install_command[-1]
-    assert 'numpy==2.3.3' in install_command
-    assert 'diskcache==5.6.3' in install_command
-    assert install_env['CMAKE_ARGS'] == '-DGGML_METAL=on'
+    # commands[0]: ensurepip, commands[1]: pip upgrade
+    # commands[2]: install non-llama packages (from -r requirements + pinned_packages)
+    # commands[3]: install llama-cpp-python with Metal plan
+    non_llama_cmd = commands[2][0]
+    assert non_llama_cmd[:4] == [str(tmp_path / 'python3'), '-m', 'pip', 'install']
+    assert str(prep.SRC_TAURI / 'python' / 'requirements_desktop_runtime.txt') in non_llama_cmd
+    assert 'numpy==2.3.3' in non_llama_cmd
+    assert 'diskcache==5.6.3' in non_llama_cmd
+    assert 'llama-cpp-python==0.3.32' not in non_llama_cmd
+
+    llama_cmd = commands[3][0]
+    llama_env = commands[3][1]
+    assert llama_cmd[:4] == [str(tmp_path / 'python3'), '-m', 'pip', 'install']
+    assert 'llama-cpp-python==0.3.32' == llama_cmd[-1]
+    assert str(prep.SRC_TAURI / 'python' / 'requirements_desktop_runtime.txt') not in llama_cmd
+    assert llama_env['CMAKE_ARGS'] == '-DGGML_METAL=on'
+
+
+def test_install_packages_falls_back_to_source_metal_build(tmp_path, monkeypatch):
+    """When the prebuilt Metal wheel fails, the source Metal build plan is tried."""
+    commands = []
+    attempt_counts = []
+
+    class WheelPlan:
+        package_spec = 'llama-cpp-python==0.3.32'
+        backend = 'metal'
+        only_binary = True
+
+        def pip_install_args(self):
+            return ['--only-binary', 'llama-cpp-python']
+
+        def pip_env(self):
+            return {}
+
+    class SourcePlan:
+        package_spec = 'llama-cpp-python==0.3.32'
+        backend = 'metal'
+        only_binary = False
+
+        def pip_install_args(self):
+            return ['--no-binary', 'llama-cpp-python']
+
+        def pip_env(self):
+            return {'CMAKE_ARGS': '-DGGML_METAL=on', 'FORCE_CMAKE': '1'}
+
+    def fake_fallbacks(*, platform, requirements_path):
+        return [WheelPlan(), SourcePlan()]
+
+    def fake_run(cmd, **kwargs):
+        if 'llama-cpp-python==0.3.32' in cmd and '--only-binary' in cmd:
+            import subprocess as _sp
+            raise _sp.CalledProcessError(2, cmd, '', 'no matching distribution')
+        commands.append((cmd, kwargs.get('env') or {}))
+        class Result:
+            stdout = ''
+        return Result()
+
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', fake_fallbacks)
+    monkeypatch.setattr(prep, 'run', fake_run)
+
+    prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'pip-cache')
+
+    # The source Metal build plan command should be present.
+    source_cmd = commands[-3][0]
+    assert '--no-binary' in source_cmd
+    assert 'llama-cpp-python==0.3.32' == source_cmd[-1]
+    assert commands[-3][1]['CMAKE_ARGS'] == '-DGGML_METAL=on'

@@ -25,7 +25,7 @@ PROVENANCE = "embedded_python_runtime_provenance.json"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
 if str(SRC_TAURI / "python") not in sys.path:
     sys.path.insert(0, str(SRC_TAURI / "python"))
-from desktop_gpu_packaging import llama_cpp_install_plan  # noqa: E402
+from desktop_gpu_packaging import llama_cpp_install_plan, llama_cpp_install_plan_fallbacks  # noqa: E402
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -94,7 +94,10 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy(); env.update(kw.pop("env", {}) or {})
     env["PYTHONNOUSERSITE"] = "1"
-    return subprocess.run(cmd, text=True, capture_output=True, check=True, env=env, **kw)
+    result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env, **kw)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
 
 def prove_interpreter(py: Path, runtime: Path, m: dict) -> None:
     code = "import json,platform,sys; print(json.dumps({'version':sys.version_info[:2],'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix}))"
@@ -109,10 +112,26 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
     req = SRC_TAURI / "python" / "requirements_desktop_runtime.txt"
     pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items()) if name != "llama-cpp-python"]
-    plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT.parent / "requirements.txt")
-    if plan.package_spec != "llama-cpp-python==0.3.32" or plan.backend != "metal" or not plan.only_binary:
-        raise RuntimePrepError("desktop GPU packaging plan must require the pinned Metal llama-cpp-python wheel")
-    run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages, *plan.pip_install_args(), plan.package_spec], env={"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()})
+    # Install all non-llama packages first, independently of the llama wheel index.
+    run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages, "--upgrade", "--no-cache-dir"], env={"PIP_CACHE_DIR": str(pip_cache)})
+    # Try each Metal-capable plan in order: prebuilt wheel first, then Metal source build.
+    plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT.parent / "requirements.txt")
+    metal_plans = [p for p in plans if p.backend == "metal"]
+    if not metal_plans:
+        raise RuntimePrepError("no Metal install plan available for darwin")
+    expected_spec = f"llama-cpp-python=={m['required_packages']['llama-cpp-python']}"
+    last_err: Exception | None = None
+    for plan in metal_plans:
+        if plan.package_spec != expected_spec:
+            raise RuntimePrepError(f"install plan package spec mismatch: expected {expected_spec}, got {plan.package_spec}")
+        try:
+            run([str(py), "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec], env={"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()})
+            last_err = None
+            break
+        except subprocess.CalledProcessError as e:
+            last_err = e
+    if last_err is not None:
+        raise RuntimePrepError(f"failed to install {expected_spec} with any Metal plan: {last_err}")
     run([str(py), "-m", "pip", "check"])
     run([str(py), "-c", "import " + ",".join(IMPORTS)])
 
@@ -186,5 +205,10 @@ def main() -> int:
     ap=argparse.ArgumentParser(); ap.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("TOKEN_PLACE_EMBEDDED_PYTHON_CACHE", Path.home()/".cache/token-place/embedded-python")))
     args=ap.parse_args()
     try: prepare(args.cache_dir); return 0
+    except subprocess.CalledProcessError as e:
+        print(f"embedded runtime preparation failed: {e}", file=sys.stderr)
+        if e.stdout: print(e.stdout, file=sys.stderr)
+        if e.stderr: print(e.stderr, file=sys.stderr)
+        return 1
     except Exception as e: print(f"embedded runtime preparation failed: {e}", file=sys.stderr); return 1
 if __name__ == "__main__": raise SystemExit(main())

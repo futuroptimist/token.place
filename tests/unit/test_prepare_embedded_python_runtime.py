@@ -427,6 +427,8 @@ def test_prepare_keeps_old_runtime_when_validation_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'load_manifest', lambda: manifest())
     monkeypatch.setattr(prep, 'existing_valid', lambda m: False)
     monkeypatch.setattr(prep, 'download_verified', lambda m, cache: archive)
+    monkeypatch.setattr(prep, 'normalize_python_build_standalone_macos_runtime', lambda runtime, manifest: None)
+    monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: None)
     monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: None)
     monkeypatch.setattr(prep, 'install_packages', lambda py, m, cache: (_ for _ in ()).throw(prep.RuntimePrepError('install failed')))
 

@@ -27,7 +27,7 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
-def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, resolver='unsupported'):
+def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, resolver='unsupported', version='0.3.32'):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,
         gpu_offload_supported=gpu,
@@ -36,7 +36,7 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
         prefix=sys.prefix,
         llama_module_path='C:/Python/Lib/site-packages/llama_cpp/__init__.py',
         error=error,
-        llama_cpp_python_version='0.3.16',
+        llama_cpp_python_version=version,
         yarn_rope_supported=yarn,
         yarn_resolver_source=resolver,
         rope_scaling_type_supported=yarn,
@@ -1494,8 +1494,7 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert result['runtime_action'] == 'failed'
     assert result['selected_backend'] == 'cpu'
     assert '[Errno 2]' not in result['fallback_reason']
-    assert 'requirements file not found' in result['fallback_reason']
-    assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
+    assert 'simulated pip source build failure' in result['fallback_reason']
 
 
 def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_missing(tmp_path):
@@ -1965,7 +1964,7 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
         in result['fallback_reason']
     )
     assert 'resolver=unsupported' in result['fallback_reason']
-    assert 'version=0.3.16' in result['fallback_reason']
+    assert 'version=0.3.32' in result['fallback_reason']
     assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
     assert 'rope_scaling_type_supported=False' in result['fallback_reason']
     assert 'rope_freq_scale_supported=False' in result['fallback_reason']

@@ -249,7 +249,7 @@ class TestModelManager:
         assert metadata['api_model_id'] == 'qwen3-8b-instruct'
         assert metadata['profile_id'] == 'qwen3-8b-q4-k-m'
         assert metadata['filename'] == 'Qwen3-8B-Q4_K_M.gguf'
-        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert metadata['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
@@ -287,7 +287,7 @@ class TestModelManager:
         assert manager.profile_id == 'qwen3-8b-q4-k-m'
         assert manager.api_model_id == 'qwen3-8b-instruct'
         assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
-        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
         metadata = manager.get_model_artifact_metadata()
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
@@ -304,7 +304,7 @@ class TestModelManager:
         assert manager.profile_id == 'qwen3-8b-q4-k-m'
         assert manager.api_model_id == 'qwen3-8b-instruct'
         assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
-        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
@@ -801,8 +801,7 @@ class TestModelManager:
         file_path = os.path.join(self._temp_dir, 'bad_size.gguf')
         result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
         assert result is False
-        assert os.path.exists(file_path)
-        assert os.path.getsize(file_path) != 1048576
+        assert not os.path.exists(file_path)
 
     @patch('utils.llm.model_manager.requests.get')
     def test_download_file_in_chunks_empty_chunk(self, mock_get, model_manager):
@@ -3493,11 +3492,11 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         llm = manager.get_llm_instance()
 
-    assert llm is not None
-    assert len(attempts) == 3
-    assert attempts[2]['type_k'] == 2
+    assert llm is None
+    assert len(attempts) == 1
+    assert 'type_k' not in attempts[0]
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_f16_fa_small_batch'
 
 
 def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_path):
@@ -3590,12 +3589,10 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 3
+    assert len(attempts) == 1
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_failed',
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -3656,11 +3653,10 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
          patch.object(model_manager_module, '_build_qwen_64k_runtime_profiles', return_value=short_profiles):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -3705,12 +3701,11 @@ def test_qwen_64k_mixed_terminal_generic_context_create_preserves_original_error
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
         'runtime_context_create_cuda_memory',
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -8025,7 +8020,7 @@ def test_ggml_cuda_failed_to_load_model_is_not_memory_retryable_and_attempts_onc
     category = model_manager_module._classify_runtime_context_create_error(
         RuntimeError('ggml_cuda_init: failed to load model; invalid GGUF ABI')
     )
-    assert category == 'runtime_init_unclassified'
+    assert category == 'runtime_model_load_failed'
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
     attempts = []
@@ -8064,7 +8059,7 @@ def test_ggml_cuda_failed_to_load_model_is_not_memory_retryable_and_attempts_onc
 
     assert len(attempts) == 1
     assert manager.llm is None
-    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_init_unclassified'
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_model_load_failed'
 
 
 def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines():

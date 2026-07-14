@@ -81,7 +81,8 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     assert result['selected_backend'] == 'cpu'
     recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
     assert recorded['runtime_action'] == 'skipped'
-    assert recorded['llama_module_path'] == result['llama_module_path']
+    assert 'llama_module_path' not in recorded
+    assert 'llama_module_path' not in result
 
 
 def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
@@ -284,7 +285,7 @@ def test_macos_metal_source_install_clean_cpu_probe_reexecs_auto(monkeypatch):
     assert result['runtime_action'] == 'installed_metal_reexec'
     assert 're-executing sidecar for hardware probe' in result['fallback_reason']
     assert result['detected_device'] == 'cpu'
-    assert result['llama_module_path'].endswith('llama_cpp/__init__.py')
+    assert 'llama_module_path' not in result
     auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result)
     hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', result)
     assert auto_message is None
@@ -538,7 +539,7 @@ def test_macos_bootstrap_disabled_missing_llama_cpp_fails_before_probe_only(monk
     assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'failed'
     assert 'desktop model runtime dependency unavailable' in result['fallback_reason']
-    assert 'llama_module_path=' in result['fallback_reason']
+    assert 'llama_module_path=' not in result['fallback_reason']
     assert invoked['pip'] is False
 
 def test_macos_missing_runtime_failure_message_is_fatal_for_auto_and_hybrid(monkeypatch):
@@ -2202,3 +2203,170 @@ def test_qwen_64k_compatible_runtime_after_dependency_provision_is_already_suppo
     assert result['llama_cpp_python_installed_version'] == '0.3.32'
     assert result['llama_cpp_python_required_version'] == '0.3.32'
     assert result['llama_cpp_python_version_match'] == 'match'
+
+
+def test_qwen_64k_stale_cuda_0316_repairs_to_0322_reexec(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    probes = iter([
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='0.3.16'),
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='0.3.32'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *_args: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert result['llama_cpp_python_installed_version'] == '0.3.32'
+    assert result['llama_cpp_python_version_match'] == 'match'
+
+
+def test_qwen_64k_unknown_version_never_already_supported(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='unknown'
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] != 'already_supported'
+    assert result['llama_cpp_python_version_match'] == 'unknown'
+
+
+@pytest.mark.parametrize(('backend', 'action'), [('cuda', 'already_supported'), ('metal', 'metal_already_supported')])
+def test_qwen_64k_exact_0322_cuda_and_metal_fast_paths(monkeypatch, tmp_path, backend, action):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin') if backend == 'metal' else _SysStub)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend=backend, gpu=True, device=backend, yarn=True, resolver='numeric_fallback', version='0.3.32'
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == action
+    assert result['llama_cpp_python_version_match'] == 'match'
+
+
+def test_qwen_64k_local_0322_build_satisfies_exact_requirement(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='0.3.32+local'
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['llama_cpp_python_installed_version'] == '0.3.32+local'
+    assert result['llama_cpp_python_version_match'] == 'match'
+
+
+def test_qwen_64k_stale_post_install_probe_does_not_reexec(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    probes = iter([
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='0.3.16'),
+        _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback', version='0.3.16'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *_args: (True, 'ok'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert not result['runtime_action'].startswith('installed_')
+    assert result['runtime_action'] == 'failed'
+    assert result['llama_cpp_python_installed_version'] == '0.3.16'
+    assert result['llama_cpp_python_version_match'] == 'mismatch'
+
+
+def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    sentinel = 'C:/SECRET/SENTINEL/llama_cpp/__init__.py'
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: desktop_runtime_setup.RuntimeProbe(
+            backend='cuda',
+            gpu_offload_supported=True,
+            detected_device='cuda',
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path=sentinel,
+            llama_cpp_python_version='0.3.16',
+            yarn_rope_supported=True,
+            yarn_resolver_source='numeric_fallback',
+            rope_scaling_type_supported=True,
+            yarn_ext_factor_supported=True,
+            yarn_orig_ctx_supported=True,
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+    emitted = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
+    assert result['runtime_action'] == 'version_mismatch_failed'
+    assert result['llama_cpp_python_version_match'] == 'mismatch'
+    assert sentinel not in result['fallback_reason']
+    assert sentinel not in json.dumps(result, sort_keys=True)
+    assert sentinel not in emitted

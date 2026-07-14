@@ -779,7 +779,6 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "interpreter_prefix": probe.prefix,
         "dependency_target": probe.dependency_target,
         "pip_version": probe.pip_version,
-        "llama_module_path": probe.llama_module_path,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
         "backend": probe.backend,
         "gpu_offload_supported": probe.gpu_offload_supported,
@@ -1166,7 +1165,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 "fallback_reason": (
                     f"desktop model runtime dependency unavailable ({before.error or 'llama_cpp missing'}); "
                     f"interpreter={before.interpreter}; import_root={target_root}; "
-                    f"prefix={before.prefix}; llama_module_path={before.llama_module_path}; "
+                    f"prefix={before.prefix}; "
                     "install llama-cpp-python for the desktop runtime before registering with the relay"
                 ),
                 "runtime_action": "failed",
@@ -1180,7 +1179,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 (f"{last_error}; " if last_error else "")
                 + f"{disabled_reason}; platform={policy.platform}; arch={policy.arch}; "
                 f"expected_backend={expected_backend}; interpreter={before.interpreter}; "
-                f"prefix={before.prefix}; llama_module_path={before.llama_module_path}"
+                f"prefix={before.prefix}"
             ),
             "runtime_action": "version_mismatch_failed" if fatal_version_mismatch else action,
             **_probe_result_payload(before),

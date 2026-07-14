@@ -1395,10 +1395,10 @@ def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optio
         if isinstance(parsed, dict):
             diagnostics = parsed
     logger.info(
-        "llama_cpp runtime process stage complete stage=%s duration_ms=%s module_path=%s",
+        "llama_cpp runtime process stage complete stage=%s duration_ms=%s module_path_present=%s",
         stage,
         duration_ms,
-        diagnostics.get('module_path') or diagnostics.get('llama_module_path') or 'unknown',
+        bool(diagnostics.get('module_path') or diagnostics.get('llama_module_path')),
     )
     return diagnostics
 
@@ -1613,8 +1613,8 @@ def _import_llama_cpp_subprocess_module(
 
     logger.info(
         "llama_cpp parent import skipped; using subprocess runtime facade "
-        "module_path_hint=%s interpreter=%s thread=%s",
-        module_path_hint or 'unknown',
+        "module_path_hint_present=%s interpreter=%s thread=%s",
+        bool(module_path_hint),
         sys.executable,
         threading.current_thread().name,
     )
@@ -5103,7 +5103,7 @@ class ModelManager:
                 # Double-check after acquiring lock
                 if self.llm is None:
                     if not os.path.exists(self.model_path):
-                        self.log_error(f"Error: Model file {self.model_path} does not exist. LLM not initialized.")
+                        self.log_error("Error: Model file does not exist. LLM not initialized.")
                         return None
                     else:
                         try:
@@ -5117,7 +5117,7 @@ class ModelManager:
                             self._imported_llama_cpp_module_path = getattr(llama_cpp, '__file__', None)
                             self.log_info(
                                 "llama_cpp runtime located "
-                                f"module_path={self._imported_llama_cpp_module_path or 'unknown'}"
+                                f"module_path_present={bool(self._imported_llama_cpp_module_path)}"
                             )
                             Llama = llama_cpp.Llama
 
@@ -5151,8 +5151,8 @@ class ModelManager:
                                             'insufficient GPU memory headroom for safe offload'
                                         )
 
-                            self.log_info(f"About to instantiate Llama model from {self.model_path}...")
-                            self.log_info(f"Llama init started for {self.model_path}.")
+                            self.log_info("About to instantiate Llama model.")
+                            self.log_info("Llama init started.")
                             runtime_profiles = [None]
                             is_qwen_64k = (
                                 self.model_profile.get('provider') == 'qwen'
@@ -5365,7 +5365,7 @@ class ModelManager:
                                 f"offloaded_layers={compute_plan['offloaded_layers']} "
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
-                                f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
+                                f"llama_module_path_present={bool(runtime_identity.get('llama_module_path'))} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.worker_state = 'ready'

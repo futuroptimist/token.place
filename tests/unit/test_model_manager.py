@@ -942,14 +942,14 @@ class TestModelManager:
         assert llm == mock_llama
         messages = [record.getMessage() for record in caplog.records]
         assert 'Locating llama_cpp runtime for model initialization...' in messages
-        assert any(message.startswith('llama_cpp runtime located module_path=') for message in messages)
+        assert any(message.startswith('llama_cpp runtime located module_path_present=') for message in messages)
         assert 'Selecting compute plan for model initialization...' in messages
         assert any(
             message.startswith('Selected compute plan for model initialization ')
             for message in messages
         )
-        assert any(message.startswith('About to instantiate Llama model from ') for message in messages)
-        assert any(message.startswith('Llama init started for ') for message in messages)
+        assert 'About to instantiate Llama model.' in messages
+        assert 'Llama init started.' in messages
         assert 'Llama init completed successfully.' in messages
 
 
@@ -1628,7 +1628,7 @@ class TestModelManager:
         assert 'offloaded_layers=0' in summary
         assert 'kv_cache=cpu' in summary
         assert 'interpreter=' in summary
-        assert 'llama_module_path=' in summary
+        assert 'llama_module_path_present=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
 
 
@@ -8198,6 +8198,126 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
         'SECRET_TRACEBACK',
     ):
         assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ('message', 'expected_category'),
+    [
+        ('model path not found: /tmp/SECRET_MODEL.gguf', 'runtime_model_path_unavailable'),
+        ('failed to load model from /tmp/SECRET_MODEL.gguf', 'runtime_model_load_failed'),
+        ('vocab load failed for SECRET_PAYLOAD', 'runtime_model_vocab_failed'),
+        ('failed to create batch for SECRET_KEY', 'runtime_batch_create_failed'),
+        ('undefined symbol: llama_model_load_from_file ABI SECRET_PAYLOAD', 'runtime_model_load_failed'),
+        ('unknown ValueError SECRET_PROMPT SECRET_KEY SECRET_PAYLOAD /tmp/SECRET_MODEL.gguf', 'runtime_init_unclassified'),
+    ],
+)
+def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
+    tmp_path, monkeypatch, message, expected_category, caplog
+):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'fake site with spaces'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "MESSAGE = " + repr(message) + "\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        raise ValueError(MESSAGE)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.filename': 'mock.gguf',
+        'model.url': 'https://example.com/mock.gguf',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'model.download_chunk_size_mb': 1,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_bytes(b'GGUFfake')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: model_manager_module._import_llama_cpp_subprocess_module(
+            module_path_hint=str(fake_pkg / '__init__.py'),
+            timeout_seconds=5,
+            desktop_runtime_probe={
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'llama_cpp_python_version': '0.3.32',
+                'constructor_kwarg_support': {
+                    'rope_scaling_type': True,
+                    'rope_freq_scale': True,
+                    'yarn_orig_ctx': True,
+                    'type_k': True,
+                    'type_v': True,
+                    'flash_attn': True,
+                    'offload_kqv': True,
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        '_runtime_capabilities',
+        lambda _runtime=None: {
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_cpp_python_version': '0.3.32',
+            'yarn_resolver_source': 'numeric_fallback',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True,
+                'rope_freq_scale': True,
+                'yarn_orig_ctx': True,
+                'type_k': True,
+                'type_v': True,
+                'flash_attn': True,
+                'offload_kqv': True,
+            },
+        },
+    )
+
+    with caplog.at_level('INFO'):
+        assert manager.get_llm_instance() is None
+
+    assert manager.llm is None
+    assert manager.last_qwen_64k_init_failures
+    assert [failure['profile_id'] for failure in manager.last_qwen_64k_init_failures] == [
+        'qwen64k_f16_fa_small_batch'
+    ]
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == expected_category
+    assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
+        'qwen64k_f16_fa_small_batch'
+    )
+    serialized = (
+        str(manager.last_runtime_init_error)
+        + json.dumps(manager.last_qwen_64k_init_failures, sort_keys=True)
+        + json.dumps(manager.last_compute_diagnostics, sort_keys=True)
+        + '\n'.join(record.getMessage() for record in caplog.records)
+    )
+    for forbidden in (
+        str(Path(manager.model_path)),
+        'SECRET_PROMPT',
+        'SECRET_KEY',
+        'SECRET_PAYLOAD',
+        'SECRET_MODEL',
+        message,
+    ):
+        assert forbidden not in serialized
 
 
 def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():

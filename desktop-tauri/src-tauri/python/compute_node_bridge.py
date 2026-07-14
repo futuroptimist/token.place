@@ -837,13 +837,10 @@ def run(args: argparse.Namespace) -> int:
         f"cmake_args={runtime_setup.get('cmake_args', 'none')} "
         f"pip_stdout_tail={runtime_setup.get('pip_stdout_tail', 'none')} "
         f"pip_stderr_tail={runtime_setup.get('pip_stderr_tail', 'none')} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
-    repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
-        runtime_setup.get("llama_module_path", "")
-    )
+    repo_llama_cpp_shim_imported = runtime_setup.get("runtime_action") == "shadowed_repo_llama_cpp"
     print(
         "desktop.runtime_setup.import_guard "
         f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
@@ -1101,7 +1098,6 @@ def run(args: argparse.Namespace) -> int:
             "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
             "interpreter": runtime_setup.get("interpreter", sys.executable),
-            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "dependency_target": runtime_setup.get("dependency_target", "unknown"),
             "python_version": runtime_setup.get("python_version", "unknown"),
             "prefix": runtime_setup.get("prefix", runtime_setup.get("interpreter_prefix", "unknown")),

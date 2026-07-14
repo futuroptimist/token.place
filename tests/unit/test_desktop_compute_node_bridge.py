@@ -4030,10 +4030,10 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
         'cmake_args=-DGGML_METAL=on -DGGML_NATIVE=off',
         'pip_stdout_tail=building wheel',
         'pip_stderr_tail=Metal headers missing',
-        'llama_module_path=/deps/llama_cpp/__init__.py',
         'fallback_reason=Metal failed; using CPU runtime',
     ):
         assert marker in stderr
+    assert 'llama_module_path=/deps/llama_cpp/__init__.py' not in stderr
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = events[0]
     assert started['last_error'] is None
@@ -4043,6 +4043,7 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     assert started['install_command_summary'].startswith('python -m pip install')
     assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert started['pip_stderr_tail'] == 'Metal headers missing'
+    assert 'llama_module_path' not in started
 
 def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):
     from utils.processing_result import RelayProcessingResult

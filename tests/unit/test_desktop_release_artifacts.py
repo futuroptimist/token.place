@@ -731,6 +731,37 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
     assert not created_home['path'].exists()
 
 
+def test_run_python_sanitized_allows_paths_inside_runner_app_bundle(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Users' / 'runner' / 'work' / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = app / 'Contents' / 'Resources' / 'python-runtime' / 'bin' / 'python3'
+
+    def fake_run(cmd, *, check, capture_output, text, env):
+        payload = {
+            'executable': str(py),
+            'prefix': str(app / 'Contents' / 'Resources' / 'python-runtime'),
+        }
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    output = validator._run_python_sanitized(py, 'print(1)', app)
+
+    assert '/Users/runner' in output
+
+
+def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Users' / 'runner' / 'work' / 'token.place desktop.app'
+    output = f"{app}/Contents/Resources/python-runtime/bin/python3\n/Users/runner/.cache/pip"
+
+    redacted = validator._redact_allowed_app_locations(output, app)
+
+    assert '<app-bundle>/Contents/Resources/python-runtime/bin/python3' in redacted
+    assert '/Users/runner/.cache/pip' in redacted
+
+
 def test_run_python_sanitized_formats_probe_failures_without_raw_code(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'

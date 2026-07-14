@@ -276,6 +276,19 @@ def _sha256(path: Path) -> str:
 
 
 
+def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
+    redacted = output
+    allowed_paths = {str(app_path)}
+    try:
+        allowed_paths.add(str(app_path.resolve()))
+    except OSError:
+        pass
+    for allowed in sorted(allowed_paths, key=len, reverse=True):
+        if allowed:
+            redacted = redacted.replace(allowed, "<app-bundle>")
+    return redacted
+
+
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     home = tempfile.mkdtemp(prefix="token-place-home-")
     try:
@@ -287,9 +300,10 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
         }
         result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
         output = f"{result.stdout}\n{result.stderr}"
+        scan_output = _redact_allowed_app_locations(output, app_path)
         forbidden = ("/usr/bin/python3", "xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Users/runner", "/Library/Developer/CommandLineTools", "site.USER_SITE")
         for marker in forbidden:
-            if marker in output:
+            if marker in scan_output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
         if result.returncode != 0:
             _fail(_format_command_failure([str(py), "-c", "<probe>"], result))

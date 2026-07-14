@@ -102,7 +102,13 @@ jobs:
         run: npm ci
 
       - name: Install desktop llama-cpp runtime with platform GPU backend
-        if: runner.os != 'Windows'
+        # The release matrix currently builds macOS and Windows artifacts only.
+        # macOS prepares and validates its bundled interpreter in the dedicated
+        # embedded-runtime step below; Windows intentionally keeps its existing
+        # packaging path. Keep this Linux-only guard so future Linux desktop
+        # packaging can reuse the shared setup without making macOS release
+        # builds compile/install llama-cpp into the runner Python.
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           python -m pip install --upgrade pip

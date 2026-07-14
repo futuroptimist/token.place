@@ -340,22 +340,64 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
+def _parse_otool_rpaths(load_commands: str) -> list[str]:
+    rpaths: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for follow in lines[index + 1:index + 6]:
+                stripped = follow.strip()
+                if stripped.startswith("path "):
+                    rpaths.append(stripped.split("path ", 1)[1].split(" (", 1)[0])
+                    break
+    return rpaths
+
+
+def _validate_macho_ref(ref: str, owner: Path, app_path: Path, *, install_id: bool = False, rpath: bool = False) -> None:
+    if not ref:
+        return
+    lower = ref.lower()
+    forbidden = (
+        "/opt/homebrew", "/usr/local/cellar", "pyenv", "commandlinetools",
+        "/applications/xcode.app", "python.framework", "/users/runner",
+        "/private/var/folders", "/" + "tmp/", "/var/" + "tmp/", "libssl.3.dylib", "libcrypto.3.dylib",
+    )
+    if any(marker in lower for marker in forbidden):
+        _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
+    if ref.startswith(("@loader_path", "@rpath", "@executable_path")):
+        if rpath and not ref.startswith(("@loader_path", "@executable_path")):
+            _fail(f"forbidden external Mach-O LC_RPATH in {owner}: {ref}")
+        return
+    if ref.startswith(("/usr/lib/", "/System/Library/")):
+        return
+    try:
+        if Path(ref).resolve().is_relative_to(app_path.resolve()):
+            return
+    except OSError:
+        pass
+    if ref.startswith("/"):
+        _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
+    if install_id and ref.startswith("/"):
+        _fail(f"absolute Mach-O install ID in {owner}: {ref}")
+
+
 def _validate_macho_linkage(path: Path, app_path: Path) -> None:
     if platform.system() != "Darwin":
         return
     result = subprocess.run(["file", str(path)], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        _fail(_format_command_failure(["file", str(path)], result))
     if "Mach-O" not in result.stdout:
         return
+    _run(["lipo", "-archs", str(path)])
     deps = _run(["otool", "-L", str(path)])
-    forbidden = ("/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", "/Users/runner", "/private/var/folders")
     for dep in deps.splitlines()[1:]:
-        dep = dep.strip().split(" ", 1)[0]
-        if not dep or dep.startswith(("@loader_path", "@rpath", "@executable_path", "/usr/lib", "/System/Library")):
-            continue
-        if str(app_path) in dep:
-            continue
-        if any(marker in dep for marker in forbidden) or "Python.framework" in dep:
-            _fail(f"forbidden external Mach-O linkage in {path}: {dep}")
+        _validate_macho_ref(dep.strip().split(" ", 1)[0], path, app_path)
+    install_id = _run(["otool", "-D", str(path)]).splitlines()
+    if len(install_id) > 1:
+        _validate_macho_ref(install_id[1].strip(), path, app_path, install_id=True)
+    for rpath in _parse_otool_rpaths(_run(["otool", "-l", str(path)])):
+        _validate_macho_ref(rpath, path, app_path, rpath=True)
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:
     runtime = app_path / "Contents" / "Resources" / "python-runtime"
@@ -414,7 +456,8 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--app-path", required=True)
-    p.add_argument("--dmg-path", required=True)
+    p.add_argument("--dmg-path")
+    p.add_argument("--app-only", action="store_true")
     p.add_argument("--tauri-config", required=True)
     p.add_argument("--expected-icon", required=True)
     p.add_argument("--expect-signing", action="store_true")
@@ -458,20 +501,24 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
-    dmg_path = Path(args.dmg_path)
+    dmg_path = Path(args.dmg_path) if args.dmg_path else None
     tauri_config = Path(args.tauri_config)
     expected_icon = Path(args.expected_icon)
 
-    for candidate in (app_path.name, dmg_path.name, str(dmg_path)):
+    dmg_candidates = (dmg_path.name, str(dmg_path)) if dmg_path is not None else ()
+    for candidate in (app_path.name, *dmg_candidates):
         for stale in STALE_BRANDS:
             if stale.lower() in candidate.lower():
                 _fail(f"stale Electron branding detected: {stale} in {candidate}")
 
-    if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
-        _fail(f"dmg artifact missing or invalid: {dmg_path}")
-    if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
-        _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-    _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
+    if not args.app_only:
+        if dmg_path is None:
+            _fail("--dmg-path is required unless --app-only is set")
+        if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
+            _fail(f"dmg artifact missing or invalid: {dmg_path}")
+        if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
+            _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
+        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")

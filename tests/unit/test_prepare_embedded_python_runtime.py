@@ -187,6 +187,7 @@ def test_install_packages_uses_shared_root_llama_cpp_pin_for_metal_plan(tmp_path
 
     monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', fake_fallbacks)
     monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep, '_validate_candidate_install', lambda py, m, runtime: None)
 
     prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'pip-cache')
 
@@ -228,6 +229,7 @@ def test_install_packages_falls_back_to_source_metal_build(tmp_path, monkeypatch
         package_spec = 'llama-cpp-python==0.3.32'
         backend = 'metal'
         only_binary = False
+        force_cmake = True
 
         def pip_install_args(self):
             return ['--no-binary', 'llama-cpp-python']
@@ -249,14 +251,17 @@ def test_install_packages_falls_back_to_source_metal_build(tmp_path, monkeypatch
 
     monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', fake_fallbacks)
     monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep, '_validate_candidate_install', lambda py, m, runtime: None)
 
     prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'pip-cache')
 
     # The source Metal build plan command should be present.
-    source_cmd = commands[-3][0]
-    assert '--no-binary' in source_cmd
+    source_cmd, source_env = next((cmd, env) for cmd, env in commands if '--no-binary' in cmd)
     assert 'llama-cpp-python==0.3.32' == source_cmd[-1]
-    assert commands[-3][1]['CMAKE_ARGS'] == '-DGGML_METAL=on'
+    assert source_env['CMAKE_ARGS'] == '-DGGML_METAL=on'
+    assert source_env['CMAKE_OSX_ARCHITECTURES'] == 'arm64'
+    assert source_env['CMAKE_OSX_DEPLOYMENT_TARGET'] == '12.0'
+    assert source_env['MACOSX_DEPLOYMENT_TARGET'] == '12.0'
 
 
 def test_clean_preserves_pip_internal_build_package(tmp_path):
@@ -393,10 +398,12 @@ def test_existing_valid_accepts_matching_provenance_after_full_validation(tmp_pa
         'source_archive_sha256': '0' * 64,
         'expected_backend': 'metal',
         'installed_packages': packages,
+        'build_profile': prep.BUILD_PROFILE,
     }), encoding='utf-8')
     monkeypatch.setattr(prep, 'OUTPUT', output)
     monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: None)
     monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: {'backend': 'metal'})
+    monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: None)
     assert prep.existing_valid(manifest()) is True
 
 
@@ -428,3 +435,101 @@ def test_prepare_keeps_old_runtime_when_validation_fails(tmp_path, monkeypatch):
     except prep.RuntimePrepError as exc:
         assert 'install failed' in str(exc)
     assert (output / 'keep.txt').read_text(encoding='utf-8') == 'old runtime'
+
+
+def test_install_packages_rejects_non_relocatable_wheel_uninstalls_and_tries_source(tmp_path, monkeypatch):
+    events = []
+
+    class WheelPlan:
+        package_spec = 'llama-cpp-python==0.3.32'
+        backend = 'metal'
+        force_cmake = False
+        def pip_install_args(self): return ['--only-binary', 'llama-cpp-python']
+        def pip_env(self): return {}
+
+    class SourcePlan:
+        package_spec = 'llama-cpp-python==0.3.32'
+        backend = 'metal'
+        force_cmake = True
+        def pip_install_args(self): return ['--no-binary', 'llama-cpp-python']
+        def pip_env(self): return {'CMAKE_ARGS': '-DLLAMA_OPENSSL=OFF -DGGML_OPENMP=OFF', 'FORCE_CMAKE': '1'}
+
+    def fake_run(cmd, **kwargs):
+        if 'pip' in cmd and 'install' in cmd and 'llama-cpp-python==0.3.32' in cmd:
+            events.append(('install', tuple(cmd), kwargs.get('env') or {}))
+        if 'pip' in cmd and 'uninstall' in cmd:
+            events.append(('uninstall', tuple(cmd), kwargs.get('env') or {}))
+        class Result: stdout = ''
+        return Result()
+
+    validations = {'count': 0}
+    def fake_validate(py, m, runtime):
+        validations['count'] += 1
+        if validations['count'] == 1:
+            raise prep.RuntimePrepError('/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib')
+
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', lambda **_: [WheelPlan(), SourcePlan()])
+    monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep, '_validate_candidate_install', fake_validate)
+    monkeypatch.setattr(prep, '_uninstall_llama_cpp', lambda py: events.append(('uninstall', (), {})))
+
+    prep.install_packages(tmp_path / 'runtime' / 'bin' / 'python3', manifest(), tmp_path / 'cache')
+
+    assert [event[0] for event in events].count('install') == 2
+    assert ('uninstall', (), {}) in events
+    source_install = [event for event in events if event[0] == 'install'][-1]
+    assert '--no-binary' in source_install[1]
+    assert source_install[2]['CMAKE_OSX_ARCHITECTURES'] == 'arm64'
+
+
+def test_install_packages_ignores_cpu_plans(tmp_path, monkeypatch):
+    class CpuPlan:
+        package_spec = 'llama-cpp-python'
+        backend = 'cpu'
+        force_cmake = False
+        def pip_install_args(self): return []
+        def pip_env(self): return {}
+
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', lambda **_: [CpuPlan()])
+    monkeypatch.setattr(prep, 'run', lambda *_, **__: type('Result', (), {'stdout': ''})())
+    try:
+        prep.install_packages(tmp_path / 'python3', manifest(), tmp_path / 'cache')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'no Metal install plan' in str(exc)
+
+
+def test_audit_macho_runtime_rejects_homebrew_openssl(monkeypatch, tmp_path):
+    binary = tmp_path / 'python-runtime' / 'lib' / 'libllama-common.0.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    def fake_otool(cmd):
+        if cmd[0] == 'lipo': return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{binary}:\n/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib (compatibility version 3.0.0, current version 3.0.0)'
+        return ''
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+    try:
+        prep.audit_macho_runtime(tmp_path / 'python-runtime')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'forbidden Mach-O reference' in str(exc)
+
+
+def test_existing_valid_rejects_forbidden_linkage(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    (output / 'bin').mkdir(parents=True)
+    (output / 'bin' / 'python3').write_text('#!/bin/sh\n', encoding='utf-8')
+    (output / prep.PROVENANCE).write_text(json.dumps({
+        'source_archive_sha256': '0' * 64,
+        'expected_backend': 'metal',
+        'installed_packages': manifest()['required_packages'],
+        'build_profile': prep.BUILD_PROFILE,
+    }), encoding='utf-8')
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: None)
+    monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: {})
+    monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: (_ for _ in ()).throw(prep.RuntimePrepError('forbidden')))
+    assert prep.existing_valid(manifest()) is False

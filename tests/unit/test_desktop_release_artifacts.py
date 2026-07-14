@@ -922,7 +922,18 @@ def test_validate_macho_linkage_rejects_forbidden_external_dependency(monkeypatc
         raise AssertionError(cmd)
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
-    monkeypatch.setattr(validator, '_run', lambda cmd: f'{binary}:\n/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)')
+    def fake_tool(cmd):
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{binary}:\n/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[:2] == ['otool', '-D']:
+            return f'{binary}:\n@rpath/bad.dylib'
+        if cmd[:2] == ['otool', '-l']:
+            return ''
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator, '_run', fake_tool)
 
     try:
         validator._validate_macho_linkage(binary, app)
@@ -940,3 +951,87 @@ def test_validate_embedded_python_runtime_fails_incomplete_app_before_publicatio
         assert False
     except SystemExit as exc:
         assert 'embedded Python interpreter missing' in str(exc)
+
+
+
+def test_validate_macho_linkage_rejects_homebrew_openssl_dependency(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    binary = app / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libllama-common.0.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, check=False, capture_output=True, text=True):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+
+    def fake_tool(cmd):
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return (
+                f'{binary}:\n'
+                '/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib '
+                '(compatibility version 3.0.0, current version 3.0.0)'
+            )
+        if cmd[:2] == ['otool', '-D']:
+            return f'{binary}:\n@rpath/libllama-common.0.dylib'
+        if cmd[:2] == ['otool', '-l']:
+            return ''
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator, '_run', fake_tool)
+
+    try:
+        validator._validate_macho_linkage(binary, app)
+        assert False
+    except SystemExit as exc:
+        assert '/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib' in str(exc)
+
+
+def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_dependencies(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    binary = app / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libok.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, check=False, capture_output=True, text=True):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+
+    def fake_tool(cmd):
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return (
+                f'{binary}:\n'
+                '@loader_path/libllama.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
+                '@rpath/libggml.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
+                '/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
+                '/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit '
+                '(compatibility version 45.0.0, current version 2575.40.3)'
+            )
+        if cmd[:2] == ['otool', '-D']:
+            return f'{binary}:\n@rpath/libok.dylib'
+        if cmd[:2] == ['otool', '-l']:
+            return 'cmd LC_RPATH\ncmdsize 32\npath @loader_path/.. (offset 12)'
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator, '_run', fake_tool)
+
+    validator._validate_macho_linkage(binary, app)
+
+
+def test_workflow_validates_app_before_creating_dmg() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    app_only_index = text.index('--app-only')
+    hdiutil_index = text.index('hdiutil create -volname "token.place desktop"')
+    final_validator_index = text.rindex('--dmg-path "${dmg_path}"')
+    assert app_only_index < hdiutil_index < final_validator_index

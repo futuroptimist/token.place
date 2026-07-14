@@ -22,6 +22,7 @@ SRC_TAURI = ROOT / "src-tauri"
 MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest.json"
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
+BUILD_PROFILE = "metal-relocatable-no-openssl-v1"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
 if str(SRC_TAURI / "python") not in sys.path:
     sys.path.insert(0, str(SRC_TAURI / "python"))
@@ -107,6 +108,95 @@ def prove_interpreter(py: Path, runtime: Path, m: dict) -> None:
     for key in ["executable", "prefix"]:
         if not Path(data[key]).resolve().is_relative_to(runtime.resolve()): raise RuntimePrepError(f"{key} is outside generated runtime")
 
+def _is_macho_file(path: Path) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    result = subprocess.run(["file", str(path)], text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimePrepError(f"file inspection failed for {path}: {result.stderr.strip()}")
+    return "Mach-O" in result.stdout
+
+def _otool(cmd: list[str]) -> str:
+    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimePrepError(f"native linkage inspection failed ({' '.join(cmd)}): {result.stderr.strip()}")
+    return result.stdout
+
+def _allowed_runtime_ref(value: str) -> bool:
+    return value.startswith(("@loader_path", "@rpath", "@executable_path", "/usr/lib/", "/System/Library/"))
+
+def _forbidden_native_ref(value: str) -> bool:
+    lower = value.lower()
+    markers = (
+        "/opt/homebrew", "/usr/local/cellar", "pyenv", "commandlinetools",
+        "/applications/xcode.app", "python.framework", "/users/runner",
+        "/private/var/folders", "/" + "tmp/", "/var/" + "tmp/", "token-place-python-runtime-",
+        "libssl.3.dylib", "libcrypto.3.dylib",
+    )
+    return any(marker in lower for marker in markers)
+
+def _validate_native_ref(value: str, owner: Path, *, install_id: bool = False, rpath: bool = False) -> None:
+    if not value:
+        return
+    if _forbidden_native_ref(value):
+        raise RuntimePrepError(f"forbidden Mach-O reference in {owner}: {value}")
+    if value.startswith("/") and not value.startswith(("/usr/lib/", "/System/Library/")):
+        raise RuntimePrepError(f"absolute non-system Mach-O reference in {owner}: {value}")
+    if install_id and value.startswith("/"):
+        raise RuntimePrepError(f"absolute Mach-O install ID in {owner}: {value}")
+    if rpath and not value.startswith(("@loader_path", "@executable_path")):
+        raise RuntimePrepError(f"non-relocatable Mach-O LC_RPATH in {owner}: {value}")
+
+def _parse_otool_rpaths(load_commands: str) -> list[str]:
+    rpaths: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for follow in lines[index + 1:index + 6]:
+                stripped = follow.strip()
+                if stripped.startswith("path "):
+                    rpaths.append(stripped.split("path ", 1)[1].split(" (", 1)[0])
+                    break
+    return rpaths
+
+def audit_macho_runtime(runtime: Path) -> None:
+    if platform.system() != "Darwin":
+        return
+    for path in runtime.rglob("*"):
+        if not path.is_file() or not _is_macho_file(path):
+            continue
+        archs = _otool(["lipo", "-archs", str(path)])
+        if "arm64" not in archs:
+            raise RuntimePrepError(f"Mach-O file is not arm64: {path}")
+        deps = _otool(["otool", "-L", str(path)]).splitlines()[1:]
+        for dep_line in deps:
+            dep = dep_line.strip().split(" ", 1)[0]
+            _validate_native_ref(dep, path)
+        install_id = _otool(["otool", "-D", str(path)]).splitlines()
+        if len(install_id) > 1:
+            _validate_native_ref(install_id[1].strip(), path, install_id=True)
+        for rpath in _parse_otool_rpaths(_otool(["otool", "-l", str(path)])):
+            _validate_native_ref(rpath, path, rpath=True)
+
+def _uninstall_llama_cpp(py: Path) -> None:
+    run([str(py), "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
+    code = """
+import importlib.util, pathlib, sysconfig
+site = pathlib.Path(sysconfig.get_paths()['purelib'])
+stale=[]
+for pattern in ('llama_cpp*','libllama*','libggml*','libmtmd*'):
+    stale.extend(str(p) for p in site.rglob(pattern))
+if importlib.util.find_spec('llama_cpp') is not None or stale:
+    raise SystemExit('stale llama-cpp-python files remain: ' + ','.join(stale[:20]))
+"""
+    run([str(py), "-c", code])
+
+def _validate_candidate_install(py: Path, m: dict, runtime: Path) -> None:
+    run([str(py), "-m", "pip", "check"])
+    run([str(py), "-c", "import " + ",".join(IMPORTS)])
+    probe_runtime(py, m)
+    audit_macho_runtime(runtime)
+
 def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "ensurepip", "--upgrade"])
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
@@ -124,16 +214,26 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     for plan in metal_plans:
         if plan.package_spec != expected_spec:
             raise RuntimePrepError(f"install plan package spec mismatch: expected {expected_spec}, got {plan.package_spec}")
+        env = {"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()}
+        if getattr(plan, "force_cmake", False):
+            env.update({
+                "CMAKE_OSX_ARCHITECTURES": m["expected_architecture"],
+                "CMAKE_OSX_DEPLOYMENT_TARGET": m["minimum_macos_version"],
+                "MACOSX_DEPLOYMENT_TARGET": m["minimum_macos_version"],
+            })
         try:
-            run([str(py), "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec], env={"PIP_CACHE_DIR": str(pip_cache), **plan.pip_env()})
+            run([str(py), "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec], env=env)
+            _validate_candidate_install(py, m, py.parents[1])
             last_err = None
             break
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, RuntimePrepError) as e:
             last_err = e
+            try:
+                _uninstall_llama_cpp(py)
+            except Exception as uninstall_error:
+                last_err = RuntimePrepError(f"{e}; additionally failed to remove rejected llama-cpp-python: {uninstall_error}")
     if last_err is not None:
-        raise RuntimePrepError(f"failed to install {expected_spec} with any Metal plan: {last_err}")
-    run([str(py), "-m", "pip", "check"])
-    run([str(py), "-c", "import " + ",".join(IMPORTS)])
+        raise RuntimePrepError(f"failed to install {expected_spec} with any relocatable Metal plan: {last_err}")
 
 def _missing_runtime_capabilities(payload: dict) -> list[str]:
     top_level = {
@@ -171,19 +271,19 @@ def clean(runtime: Path) -> None:
 def provenance(m: dict, packages: dict) -> dict:
     try: commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT.parent, text=True).strip()
     except Exception: commit = "unknown"
-    return {"cpython_version":m["cpython_version"],"target_triple":m["target_triple"],"source_archive_sha256":m["sha256"],"installed_packages":packages,"expected_backend":"metal","build_timestamp":datetime.now(timezone.utc).isoformat(),"repository_commit":commit}
+    return {"cpython_version":m["cpython_version"],"target_triple":m["target_triple"],"source_archive_sha256":m["sha256"],"installed_packages":packages,"expected_backend":"metal","build_profile":BUILD_PROFILE,"build_timestamp":datetime.now(timezone.utc).isoformat(),"repository_commit":commit}
 
 def existing_valid(m: dict) -> bool:
     prov = OUTPUT / PROVENANCE; py = OUTPUT / "bin" / "python3"
     if not prov.is_file() or not py.is_file(): return False
     try:
         data=json.loads(prov.read_text());
-        if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal": return False
+        if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal" or data.get("build_profile") != BUILD_PROFILE: return False
         installed = data.get("installed_packages") or {}
         for name, version in m["required_packages"].items():
             if installed.get(name) != version:
                 return False
-        prove_interpreter(py, OUTPUT, m); probe_runtime(py, m); return True
+        prove_interpreter(py, OUTPUT, m); probe_runtime(py, m); audit_macho_runtime(OUTPUT); return True
     except Exception: return False
 
 def prepare(cache_dir: Path) -> None:
@@ -193,7 +293,7 @@ def prepare(cache_dir: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="token-place-python-runtime-", dir=str(OUTPUT.parent)) as td:
         tmp=Path(td); extracted=extract_archive(archive,m,tmp); staging=tmp/"python-runtime"; shutil.move(str(extracted), staging)
         py=staging/"bin"/"python3"; py.chmod(py.stat().st_mode | 0o755)
-        prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging)
+        prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
         packages=json.loads(run([str(py),"-c","import json,importlib.metadata as im; print(json.dumps({d.metadata['Name']: d.version for d in im.distributions()}))"]).stdout)
         (staging/PROVENANCE).write_text(json.dumps(provenance(m, packages), indent=2, sort_keys=True)+"\n")
         for notice in m["runtime_notices"]: (staging/notice["path"]).write_text(f"{notice['name']} redistribution notice: {notice['license']}\nSee upstream distribution for complete license text.\n")

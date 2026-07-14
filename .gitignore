@@ -64,3 +64,5 @@ integration_tests/*
 # Generated macOS embedded Python runtime for Tauri bundles
 desktop-tauri/src-tauri/python-runtime/*
 !desktop-tauri/src-tauri/python-runtime/.gitkeep
+# Desktop runtime dependency target
+.token_place_desktop_site/

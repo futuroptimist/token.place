@@ -25,7 +25,7 @@ PROVENANCE = "embedded_python_runtime_provenance.json"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
 if str(SRC_TAURI / "python") not in sys.path:
     sys.path.insert(0, str(SRC_TAURI / "python"))
-from desktop_gpu_packaging import llama_cpp_install_plan, llama_cpp_install_plan_fallbacks  # noqa: E402
+from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks  # noqa: E402
 
 class RuntimePrepError(RuntimeError): pass
 

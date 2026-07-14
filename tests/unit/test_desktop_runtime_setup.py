@@ -1969,7 +1969,8 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
     )
     assert 'resolver=unsupported' in result['fallback_reason']
     assert 'version=0.3.32' in result['fallback_reason']
-    assert 'module=C:/Python/Lib/site-packages/llama_cpp/__init__.py' in result['fallback_reason']
+    assert 'module=' not in result['fallback_reason']
+    assert 'C:/Python/Lib/site-packages/llama_cpp/__init__.py' not in result['fallback_reason']
     assert 'rope_scaling_type_supported=False' in result['fallback_reason']
     assert 'rope_freq_scale_supported=False' in result['fallback_reason']
     assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
@@ -2163,3 +2164,41 @@ def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeyp
     probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
 
     assert probe.constructor_kwarg_support == {'rope_scaling_type': True}
+
+
+def test_qwen_64k_runtime_repair_failed_reason_omits_module_path():
+    probe = _probe(backend='cuda', gpu=True, device='cuda', yarn=False)
+
+    reason = desktop_runtime_setup._qwen_64k_runtime_repair_failed_reason(
+        probe,
+        version_match='match',
+    )
+
+    assert 'module=' not in reason
+    assert probe.llama_module_path not in reason
+    assert 'version=0.3.32' in reason
+    assert 'version_match=match' in reason
+    assert 'rope_scaling_type_supported=False' in reason
+
+
+def test_qwen_64k_compatible_runtime_after_dependency_provision_is_already_supported(monkeypatch, tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements_path)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='cuda', gpu=True, device='cuda', yarn=True, resolver='numeric_fallback'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+    os.environ.pop('TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON', None)
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['selected_backend'] == 'cuda'
+    assert result['llama_cpp_python_installed_version'] == '0.3.32'
+    assert result['llama_cpp_python_required_version'] == '0.3.32'
+    assert result['llama_cpp_python_version_match'] == 'match'

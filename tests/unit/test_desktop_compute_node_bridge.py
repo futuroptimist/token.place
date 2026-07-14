@@ -5047,3 +5047,45 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
         'SECRET_CIPHERTEXT',
     ):
         assert secret not in err
+
+
+def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsys, monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: calls.append('dependencies') or {'ok': 'true', 'action': 'installed'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda _mode, _context: calls.append('runtime') or {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    class ChildPathRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.child_model_path_exists = True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_urls=[],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    assert calls[:2] == ['dependencies', 'runtime']
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert any(event.get('child_model_path_exists') is True for event in events if event.get('type') == 'status')

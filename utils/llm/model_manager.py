@@ -4161,6 +4161,7 @@ class ModelManager:
 
         # LLM instance and lock for thread safety
         self.llm = None
+        self.child_model_path_exists = False
         self.llm_lock = Lock()
         self._llm_generation = 0
         self.worker_restart_count = 0
@@ -5275,6 +5276,7 @@ class ModelManager:
                                             'refusing to run with a Llama fallback template'
                                         )
                             self.llm = llm_instance
+                            self.child_model_path_exists = bool(getattr(llm_instance, 'child_model_path_exists', False))
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
                             compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)

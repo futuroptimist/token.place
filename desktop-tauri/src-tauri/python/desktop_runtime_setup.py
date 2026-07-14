@@ -833,11 +833,11 @@ def _version_payload(probe: RuntimeProbe, required_version: str, package_spec: s
     }
 
 
-def _qwen_64k_runtime_repair_failed_reason(probe: RuntimeProbe) -> str:
+def _qwen_64k_runtime_repair_failed_reason(probe: RuntimeProbe, *, version_match: str = "unknown") -> str:
     return (
         "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed; "
         f"resolver={probe.yarn_resolver_source}; version={probe.llama_cpp_python_version}; "
-        f"module={probe.llama_module_path}; "
+        f"version_match={version_match}; "
         f"rope_scaling_type_supported={probe.rope_scaling_type_supported}; "
         f"yarn_ext_factor_supported={probe.yarn_ext_factor_supported}; "
         f"rope_freq_scale_supported={probe.rope_freq_scale_supported}; "
@@ -1127,7 +1127,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             "Qwen 64K requires YaRN/RoPE support in llama-cpp-python; "
             f"installed runtime lacks pinned support; required_version={required_version}; "
             f"version_match={before_version_payload.get('llama_cpp_python_version_match')}; resolver={before.yarn_resolver_source}; "
-            f"version={before.llama_cpp_python_version}; module={before.llama_module_path}"
+            f"version={before.llama_cpp_python_version}"
         )
 
     policy = _runtime_bootstrap_policy()
@@ -1227,9 +1227,11 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                                 **install_diagnostics,
                             }
                         last_error = (
-                            _qwen_64k_runtime_repair_failed_reason(after)
-                            + f"; required_version={required_version}; "
-                            f"version_match={after_version_payload.get('llama_cpp_python_version_match')}"
+                            _qwen_64k_runtime_repair_failed_reason(
+                                after,
+                                version_match=str(after_version_payload.get('llama_cpp_python_version_match') or 'unknown'),
+                            )
+                            + f"; required_version={required_version}"
                         )
                         _record_source_repair_failure(last_error)
                     source_detail = _summarize_install_error(source_log)
@@ -1305,9 +1307,11 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             after_version_ok = after_version_payload.get("llama_cpp_python_version_match") == "match"
             if qwen_64k_required and (not after.yarn_rope_supported or not after_version_ok):
                 last_error = (
-                    _qwen_64k_runtime_repair_failed_reason(after)
-                    + f"; required_version={required_version}; "
-                    f"version_match={after_version_payload.get('llama_cpp_python_version_match')}"
+                    _qwen_64k_runtime_repair_failed_reason(
+                        after,
+                        version_match=str(after_version_payload.get('llama_cpp_python_version_match') or 'unknown'),
+                    )
+                    + f"; required_version={required_version}"
                 )
                 continue
             if verified_backend:

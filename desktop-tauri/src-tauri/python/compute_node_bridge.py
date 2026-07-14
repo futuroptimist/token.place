@@ -802,6 +802,18 @@ def run(args: argparse.Namespace) -> int:
         args.model = os.path.abspath(original_model_arg)
     parent_model_path_exists = os.path.exists(args.model)
 
+    dependency_setup = ensure_desktop_python_dependencies()
+    if dependency_setup.get("ok") != "true":
+        missing = dependency_setup.get("missing") or "unknown"
+        detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
+        emit_startup_error(
+            "desktop runtime dependency preflight failed "
+            f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
+            f"import_root={dependency_setup.get('import_root', 'unknown')} "
+            f"missing={missing}): {detail}"
+        )
+        return 1
+
     runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -829,17 +841,6 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
-    dependency_setup = ensure_desktop_python_dependencies()
-    if dependency_setup.get("ok") != "true":
-        missing = dependency_setup.get("missing") or "unknown"
-        detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
-        emit_startup_error(
-            "desktop runtime dependency preflight failed "
-            f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
-            f"import_root={dependency_setup.get('import_root', 'unknown')} "
-            f"missing={missing}): {detail}"
-        )
-        return 1
     repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
         runtime_setup.get("llama_module_path", "")
     )

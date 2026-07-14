@@ -792,12 +792,17 @@ def test_redact_allowed_app_locations_accepts_same_app_under_ci_absolute_prefix(
         '/Users/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/'
         'aarch64-apple-darwin/release/bundle/macos/token.place desktop.app/'
         'Contents/Resources/python-runtime/bin/python3\n'
+        '/Users/runner/work/token.place/token.place/desktop-tauri/'
+        'src-tauri/target/aarch64-apple-darwin/release/bundle/macos/'
+        'token.place desktop.app/Contents/Resources/python-runtime\n'
         '/Users/runner/.cache/pip'
     )
 
     redacted = validator._redact_allowed_app_locations(output, app)
 
     assert '<app-bundle>/Contents/Resources/python-runtime/bin/python3' in redacted
+    assert '<app-bundle>/Contents/Resources/python-runtime' in redacted
+    assert '/Users/runner/work/token.place/token.place/desktop-tauri/<app-bundle>' not in redacted
     assert '/Users/runner/.cache/pip' in redacted
 
 

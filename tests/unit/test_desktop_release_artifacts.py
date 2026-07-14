@@ -718,6 +718,10 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
 
     def fake_run(cmd, *, check, capture_output, text, env):
         assert env['HOME'] == str(created_home['path'])
+        assert env['TOKEN_PLACE_MODELS_DIR'] == str(created_home['path'] / 'token.place' / 'models')
+        assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
+        assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
+        assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
     monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)

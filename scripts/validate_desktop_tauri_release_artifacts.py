@@ -305,11 +305,16 @@ def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     home = tempfile.mkdtemp(prefix="token-place-home-")
     try:
+        app_data = Path(home) / "token.place"
         env = {
             "HOME": home,
             "PYTHONNOUSERSITE": "1",
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(app_path / "Contents" / "Resources" / "python"),
+            "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
+            "XDG_CACHE_HOME": str(app_data / "cache"),
+            "XDG_CONFIG_HOME": str(app_data / "config"),
+            "XDG_DATA_HOME": str(app_data / "data"),
         }
         result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
         output = f"{result.stdout}\n{result.stderr}"

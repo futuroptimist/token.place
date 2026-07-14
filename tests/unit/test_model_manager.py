@@ -2,6 +2,7 @@
 Unit tests for the model manager module.
 """
 import logging
+import hashlib
 import importlib.util
 import os
 import queue
@@ -583,8 +584,9 @@ class TestModelManager:
         manager = ModelManager(mock_config)
         data = b'GGUFtiny'
         manager.model_profile['artifact_size_bytes'] = len(data)
-        manager.model_profile['artifact_sha256'] = '0' * 64
+        manager.model_profile['artifact_sha256'] = hashlib.sha256(data).hexdigest()
         Path(manager.model_path).write_bytes(data)
+        manager._write_artifact_verification_receipt(manager.model_profile['artifact_sha256'])
         manager.download_file_in_chunks = MagicMock(return_value=True)
 
         assert manager.download_model_if_needed() is True
@@ -612,6 +614,32 @@ class TestModelManager:
         manager.model_profile['artifact_sha256'] = '0' * 64
         Path(manager.model_path).write_bytes(data)
         manager.last_runtime_init_error = 'runtime_model_load_failed'
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': False, 'reason': 'checksum_mismatch'}
+        manager.download_file_in_chunks.assert_called_once_with(manager.model_path, manager.url, manager.chunk_size_mb)
+
+    def test_unverified_managed_artifact_hashes_before_accepting_fresh_warm_start(self):
+        """Fresh processes verify a pinned artifact once before trusting receipt-backed warm starts."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(data)
         manager.download_file_in_chunks = MagicMock(return_value=True)
 
         assert manager.download_model_if_needed() is True

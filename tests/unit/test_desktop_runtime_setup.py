@@ -1601,7 +1601,7 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography,packaging'
 
 
 def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
@@ -1644,7 +1644,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, None, object(), object(), object(), None])
+    sequence = iter([None, None, None, None, None, object(), object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -1652,7 +1652,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'cryptography'
+    assert result['missing'] == 'packaging'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(

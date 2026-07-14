@@ -4804,6 +4804,8 @@ class ModelManager:
         if os.path.exists(tmp_path) and actual_size == total_size_in_bytes:
             try:
                 os.replace(tmp_path, file_path)
+                if expected_sha256:
+                    self._write_artifact_verification_receipt(str(expected_sha256))
                 self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
                 return True
             except OSError as e:
@@ -4829,6 +4831,52 @@ class ModelManager:
             and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
         )
 
+    def _artifact_verification_receipt_path(self) -> str:
+        return f"{self.model_path}.sha256.verified.json"
+
+    def _artifact_stat_fingerprint(self) -> Dict[str, Any]:
+        stat = os.stat(self.model_path)
+        return {
+            'size_bytes': stat.st_size,
+            'mtime_ns': getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000)),
+        }
+
+    def _read_artifact_verification_receipt(self, expected_sha256: str) -> bool:
+        try:
+            with open(self._artifact_verification_receipt_path(), 'r', encoding='utf-8') as receipt_file:
+                receipt = json.load(receipt_file)
+            fingerprint = self._artifact_stat_fingerprint()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return (
+            receipt.get('profile_id') == self.profile_id
+            and receipt.get('artifact_sha256') == str(expected_sha256).lower()
+            and receipt.get('size_bytes') == fingerprint['size_bytes']
+            and receipt.get('mtime_ns') == fingerprint['mtime_ns']
+        )
+
+    def _write_artifact_verification_receipt(self, expected_sha256: str) -> None:
+        try:
+            fingerprint = self._artifact_stat_fingerprint()
+            receipt = {
+                'profile_id': self.profile_id,
+                'artifact_sha256': str(expected_sha256).lower(),
+                **fingerprint,
+            }
+            receipt_path = self._artifact_verification_receipt_path()
+            tmp_receipt = f"{receipt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            with open(tmp_receipt, 'w', encoding='utf-8') as receipt_file:
+                json.dump(receipt, receipt_file, sort_keys=True)
+                receipt_file.flush()
+                os.fsync(receipt_file.fileno())
+            os.replace(tmp_receipt, receipt_path)
+        except OSError:
+            try:
+                if 'tmp_receipt' in locals():
+                    os.unlink(tmp_receipt)
+            except OSError:
+                pass
+
     def _validate_existing_model_artifact(self, *, hash_if_suspect: bool = False) -> tuple[bool, str]:
         if not os.path.exists(self.model_path):
             return False, 'missing'
@@ -4842,13 +4890,19 @@ class ModelManager:
             with open(self.model_path, 'rb') as file:
                 if file.read(4) != GGUF_MAGIC:
                     return False, 'bad_magic'
-                if pinned_artifact and hash_if_suspect and expected_sha256:
+                needs_checksum = (
+                    pinned_artifact
+                    and expected_sha256
+                    and (hash_if_suspect or not self._read_artifact_verification_receipt(str(expected_sha256)))
+                )
+                if needs_checksum:
                     file.seek(0)
                     digest = hashlib.sha256()
                     for chunk in iter(lambda: file.read(1024 * 1024), b''):
                         digest.update(chunk)
                     if digest.hexdigest().lower() != str(expected_sha256).lower():
                         return False, 'checksum_mismatch'
+                    self._write_artifact_verification_receipt(str(expected_sha256))
         except OSError:
             return False, 'unavailable'
         return True, 'valid'
@@ -4864,9 +4918,9 @@ class ModelManager:
         self.create_models_directory()
 
         # Downloads are always streamed through SHA-256 validation when pinned.
-        # Warm starts keep startup bounded with pinned size + GGUF magic; the
-        # full existing-file hash is reserved for exact suspect evidence from
-        # a managed canonical artifact so every launch does not hash 5 GB.
+        # Warm starts validate pinned size + GGUF magic plus a stat-bound
+        # checksum receipt; a missing/stale receipt or exact suspect evidence
+        # triggers a full hash without repeating that 5 GB hash every launch.
         suspect_existing_artifact = (
             self._is_managed_canonical_model_path()
             and str(getattr(self, 'last_runtime_init_error', '') or '').startswith((

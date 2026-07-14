@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -504,11 +505,17 @@ def test_audit_macho_runtime_rejects_homebrew_openssl(monkeypatch, tmp_path):
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b'macho')
     monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
     def fake_otool(cmd):
         if cmd[0] == 'lipo': return 'arm64'
         if cmd[:2] == ['otool', '-L']:
             return f'{binary}:\n/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib (compatibility version 3.0.0, current version 3.0.0)'
+        if cmd[:2] == ['otool', '-l']:
+            return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/libllama-common.0.dylib (offset 24)'
         return ''
     monkeypatch.setattr(prep, '_otool', fake_otool)
     try:
@@ -761,15 +768,19 @@ def test_audit_still_rejects_original_install_libpython_reference(monkeypatch, t
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b'macho')
     monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
-    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
 
     def fake_otool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
         if cmd[:2] == ['otool', '-L']:
             return f'{binary}:\n/install/lib/libpython3.11.dylib (compatibility version 3.11.0, current version 3.11.0)'
-        if cmd[:2] == ['otool', '-D']:
-            return f'{binary}:\n/install/lib/libpython3.11.dylib\n'
+        if cmd[:2] == ['otool', '-l']:
+            return 'cmd LC_ID_DYLIB\ncmdsize 56\nname /install/lib/libpython3.11.dylib (offset 24)'
         return ''
 
     monkeypatch.setattr(prep, '_otool', fake_otool)
@@ -778,3 +789,85 @@ def test_audit_still_rejects_original_install_libpython_reference(monkeypatch, t
         assert False
     except prep.RuntimePrepError as exc:
         assert 'absolute' in str(exc)
+
+def test_parse_otool_install_ids_handles_spaces_and_rejects_bad_blocks():
+    assert prep._parse_otool_install_ids(
+        'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 80\nname @rpath/lib with spaces.dylib (offset 24)\n'
+    ) == ['@rpath/lib with spaces.dylib']
+    assert prep._parse_otool_install_ids('Load command 0\ncmd LC_LOAD_DYLIB\n') == []
+    for load_commands in (
+        'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 48\n',
+        'Load command 0\ncmd LC_ID_DYLIB\nname @rpath/a.dylib (offset 24)\nLoad command 1\ncmd LC_ID_DYLIB\nname @rpath/b.dylib (offset 24)\n',
+    ):
+        try:
+            prep._parse_otool_install_ids(load_commands)
+            assert False
+        except prep.RuntimePrepError:
+            pass
+
+
+def test_audit_macho_runtime_allows_bundle_and_executable_without_install_id(monkeypatch, tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    bundle = runtime / 'lib/python3.11/site-packages/ada92cb5d92a588d1b93__mypyc.cpython-311-darwin.so'
+    executable = runtime / 'bin/python3.11'
+    bundle.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    bundle.write_bytes(b'macho')
+    executable.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            description = 'Mach-O 64-bit bundle arm64' if str(cmd[1]).endswith('.so') else 'Mach-O 64-bit executable arm64'
+            return subprocess.CompletedProcess(cmd, 0, description, '')
+        raise AssertionError(cmd)
+
+    calls = []
+
+    def fake_otool(cmd):
+        calls.append(cmd[:2])
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{cmd[2]}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[:2] == ['otool', '-l']:
+            return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
+        if cmd[:2] == ['otool', '-D']:
+            raise AssertionError('generic otool -D must not be used')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+    prep.audit_macho_runtime(runtime)
+    assert ['otool', '-D'] not in calls
+
+
+def test_audit_macho_runtime_requires_real_dylib_install_id(monkeypatch, tmp_path):
+    binary = tmp_path / 'python-runtime/lib/libexample.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+        raise AssertionError(cmd)
+
+    def fake_otool(cmd):
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{binary}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[:2] == ['otool', '-l']:
+            return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
+        if cmd[:2] == ['otool', '-D']:
+            raise AssertionError('generic otool -D must not be used')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+    try:
+        prep.audit_macho_runtime(tmp_path / 'python-runtime')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'missing LC_ID_DYLIB' in str(exc)

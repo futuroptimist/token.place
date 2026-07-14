@@ -928,9 +928,9 @@ def test_validate_macho_linkage_rejects_forbidden_external_dependency(monkeypatc
         if cmd[:2] == ['otool', '-L']:
             return f'{binary}:\n/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)'
         if cmd[:2] == ['otool', '-D']:
-            return f'{binary}:\n@rpath/bad.dylib'
+            raise AssertionError('generic otool -D should not be used')
         if cmd[:2] == ['otool', '-l']:
-            return ''
+            return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/bad.dylib (offset 24)'
         raise AssertionError(cmd)
 
     monkeypatch.setattr(validator, '_run', fake_tool)
@@ -977,9 +977,9 @@ def test_validate_macho_linkage_rejects_homebrew_openssl_dependency(monkeypatch,
                 '(compatibility version 3.0.0, current version 3.0.0)'
             )
         if cmd[:2] == ['otool', '-D']:
-            return f'{binary}:\n@rpath/libllama-common.0.dylib'
+            raise AssertionError('generic otool -D should not be used')
         if cmd[:2] == ['otool', '-l']:
-            return ''
+            return 'cmd LC_ID_DYLIB\ncmdsize 64\nname @rpath/libllama-common.0.dylib (offset 24)'
         raise AssertionError(cmd)
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
@@ -1018,9 +1018,9 @@ def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_depende
                 '(compatibility version 45.0.0, current version 2575.40.3)'
             )
         if cmd[:2] == ['otool', '-D']:
-            return f'{binary}:\n@rpath/libok.dylib'
+            raise AssertionError('generic otool -D should not be used')
         if cmd[:2] == ['otool', '-l']:
-            return 'cmd LC_RPATH\ncmdsize 32\npath @loader_path/.. (offset 12)'
+            return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/libok.dylib (offset 24)\ncmd LC_RPATH\ncmdsize 32\npath @loader_path/.. (offset 12)'
         raise AssertionError(cmd)
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
@@ -1035,3 +1035,60 @@ def test_workflow_validates_app_before_creating_dmg() -> None:
     hdiutil_index = text.index('hdiutil create -volname "token.place desktop"')
     final_validator_index = text.rindex('--dmg-path "${dmg_path}"')
     assert app_only_index < hdiutil_index < final_validator_index
+
+def test_validate_macho_linkage_allows_bundle_without_install_id_and_skips_otool_d(monkeypatch, tmp_path):
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    bundle = app / 'Contents/Resources/python-runtime/lib/python3.11/site-packages/ada92cb5d92a588d1b93__mypyc.cpython-311-darwin.so'
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_run_file(cmd, check=False, capture_output=True, text=True):
+        assert cmd[0] == 'file'
+        return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit bundle arm64', '')
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{bundle}:\n@loader_path/libexample.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[:2] == ['otool', '-l']:
+            return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
+        if cmd[:2] == ['otool', '-D']:
+            raise AssertionError('generic otool -D must not be used')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run_file)
+    monkeypatch.setattr(validator, '_run', fake_run)
+    validator._validate_macho_linkage(bundle, app)
+
+
+def test_validate_macho_linkage_rejects_absolute_install_id_inside_app(monkeypatch, tmp_path):
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    dylib = app / 'Contents/Resources/python-runtime/lib/libexample.dylib'
+    dylib.parent.mkdir(parents=True)
+    dylib.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_run_file(cmd, check=False, capture_output=True, text=True):
+        assert cmd[0] == 'file'
+        return subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', '')
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{dylib}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[:2] == ['otool', '-l']:
+            return f'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 80\nname {dylib} (offset 24)\n'
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run_file)
+    monkeypatch.setattr(validator, '_run', fake_run)
+    try:
+        validator._validate_macho_linkage(dylib, app)
+        assert False
+    except SystemExit as exc:
+        assert 'absolute Mach-O install ID' in str(exc)

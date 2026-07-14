@@ -353,9 +353,49 @@ def _parse_otool_rpaths(load_commands: str) -> list[str]:
     return rpaths
 
 
+def _parse_otool_install_ids(load_commands: str) -> list[str]:
+    ids: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "cmd LC_ID_DYLIB":
+            continue
+        name: str | None = None
+        next_command = len(lines)
+        for cursor in range(index + 1, len(lines)):
+            if lines[cursor].lstrip().startswith("Load command "):
+                next_command = cursor
+                break
+        for follow in lines[index + 1:next_command]:
+            stripped = follow.strip()
+            if stripped.startswith("name "):
+                value = stripped.removeprefix("name ")
+                suffix = value.rfind(" (offset ")
+                name = value[:suffix] if suffix != -1 else value
+                break
+        if name is None:
+            _fail("malformed LC_ID_DYLIB load command without name")
+        ids.append(name)
+    if len(ids) > 1:
+        _fail("multiple LC_ID_DYLIB load commands found")
+    return ids
+
+
+def _macho_file_kind(file_description: str) -> str:
+    lower = file_description.lower()
+    if "dynamically linked shared library" in lower or "dylib" in lower:
+        return "dylib"
+    if "bundle" in lower:
+        return "bundle"
+    if "executable" in lower:
+        return "executable"
+    return "other"
+
+
 def _validate_macho_ref(ref: str, owner: Path, app_path: Path, *, install_id: bool = False, rpath: bool = False) -> None:
     if not ref:
         return
+    if install_id and ref.startswith("/"):
+        _fail(f"absolute Mach-O install ID in {owner}: {ref}")
     lower = ref.lower()
     forbidden = (
         "/opt/homebrew", "/usr/local/cellar", "pyenv", "commandlinetools",
@@ -377,8 +417,6 @@ def _validate_macho_ref(ref: str, owner: Path, app_path: Path, *, install_id: bo
         pass
     if ref.startswith("/"):
         _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
-    if install_id and ref.startswith("/"):
-        _fail(f"absolute Mach-O install ID in {owner}: {ref}")
 
 
 def _validate_macho_linkage(path: Path, app_path: Path) -> None:
@@ -389,14 +427,19 @@ def _validate_macho_linkage(path: Path, app_path: Path) -> None:
         _fail(_format_command_failure(["file", str(path)], result))
     if "Mach-O" not in result.stdout:
         return
+    file_description = result.stdout
     _run(["lipo", "-archs", str(path)])
     deps = _run(["otool", "-L", str(path)])
     for dep in deps.splitlines()[1:]:
         _validate_macho_ref(dep.strip().split(" ", 1)[0], path, app_path)
-    install_id = _run(["otool", "-D", str(path)]).splitlines()
-    if len(install_id) > 1:
-        _validate_macho_ref(install_id[1].strip(), path, app_path, install_id=True)
-    for rpath in _parse_otool_rpaths(_run(["otool", "-l", str(path)])):
+    load_commands = _run(["otool", "-l", str(path)])
+    install_ids = _parse_otool_install_ids(load_commands)
+    kind = _macho_file_kind(file_description)
+    if kind == "dylib" and len(install_ids) != 1:
+        _fail(f"Mach-O dylib is missing LC_ID_DYLIB: {path}")
+    for install_id in install_ids:
+        _validate_macho_ref(install_id, path, app_path, install_id=True)
+    for rpath in _parse_otool_rpaths(load_commands):
         _validate_macho_ref(rpath, path, app_path, rpath=True)
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:

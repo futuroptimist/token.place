@@ -115,9 +115,37 @@ def _python_major_minor(m: dict) -> tuple[int, int]:
         raise RuntimePrepError("manifest cpython_version must include major.minor")
     return int(parts[0]), int(parts[1])
 
+def _parse_otool_install_ids(load_commands: str) -> list[str]:
+    ids: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "cmd LC_ID_DYLIB":
+            continue
+        name: str | None = None
+        next_command = len(lines)
+        for cursor in range(index + 1, len(lines)):
+            if lines[cursor].lstrip().startswith("Load command "):
+                next_command = cursor
+                break
+        for follow in lines[index + 1:next_command]:
+            stripped = follow.strip()
+            if stripped.startswith("name "):
+                value = stripped.removeprefix("name ")
+                suffix = value.rfind(" (offset ")
+                name = value[:suffix] if suffix != -1 else value
+                break
+        if name is None:
+            raise RuntimePrepError("malformed LC_ID_DYLIB load command without name")
+        ids.append(name)
+    if len(ids) > 1:
+        raise RuntimePrepError("multiple LC_ID_DYLIB load commands found")
+    return ids
+
 def _otool_install_id(path: Path) -> str:
-    lines = _otool(["otool", "-D", str(path)]).splitlines()
-    return lines[1].strip() if len(lines) > 1 else ""
+    ids = _parse_otool_install_ids(_otool(["otool", "-l", str(path)]))
+    if len(ids) != 1:
+        raise RuntimePrepError(f"expected exactly one libpython install ID in {path}")
+    return ids[0]
 
 def _otool_load_deps(path: Path) -> list[str]:
     deps: list[str] = []
@@ -250,12 +278,28 @@ def _parse_otool_rpaths(load_commands: str) -> list[str]:
                     break
     return rpaths
 
+def _macho_file_kind(file_description: str) -> str:
+    lower = file_description.lower()
+    if "dynamically linked shared library" in lower or "dylib" in lower:
+        return "dylib"
+    if "bundle" in lower:
+        return "bundle"
+    if "executable" in lower:
+        return "executable"
+    return "other"
+
 def audit_macho_runtime(runtime: Path) -> None:
     if platform.system() != "Darwin":
         return
     for path in runtime.rglob("*"):
-        if not path.is_file() or not _is_macho_file(path):
+        if not path.is_file():
             continue
+        result = subprocess.run(["file", str(path)], text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise RuntimePrepError(f"file inspection failed for {path}: {result.stderr.strip()}")
+        if "Mach-O" not in result.stdout:
+            continue
+        file_description = result.stdout
         archs = _otool(["lipo", "-archs", str(path)])
         if "arm64" not in archs:
             raise RuntimePrepError(f"Mach-O file is not arm64: {path}")
@@ -263,10 +307,14 @@ def audit_macho_runtime(runtime: Path) -> None:
         for dep_line in deps:
             dep = dep_line.strip().split(" ", 1)[0]
             _validate_native_ref(dep, path)
-        install_id = _otool(["otool", "-D", str(path)]).splitlines()
-        if len(install_id) > 1:
-            _validate_native_ref(install_id[1].strip(), path, install_id=True)
-        for rpath in _parse_otool_rpaths(_otool(["otool", "-l", str(path)])):
+        load_commands = _otool(["otool", "-l", str(path)])
+        install_ids = _parse_otool_install_ids(load_commands)
+        kind = _macho_file_kind(file_description)
+        if kind == "dylib" and len(install_ids) != 1:
+            raise RuntimePrepError(f"Mach-O dylib is missing LC_ID_DYLIB: {path}")
+        for install_id in install_ids:
+            _validate_native_ref(install_id, path, install_id=True)
+        for rpath in _parse_otool_rpaths(load_commands):
             _validate_native_ref(rpath, path, rpath=True)
 
 def _uninstall_llama_cpp(py: Path) -> None:

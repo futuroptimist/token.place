@@ -499,6 +499,73 @@ class TestModelManager:
         valid, reason = manager._validate_existing_model_artifact(hash_if_suspect=True)
         assert (valid, reason) == (False, 'unavailable')
 
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_validation_covers_temp_read_and_final_disappearance(self, mock_get, monkeypatch):
+        """Transactional download validation cleans temp files on late validation failures."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = None
+
+        response = MagicMock()
+        response.status_code = 200
+        response.headers.get.return_value = '8'
+        response.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = response
+
+        real_open = open
+
+        def fail_magic_read(path, mode='r', *args, **kwargs):
+            if path != manager.model_path and 'rb' in mode:
+                raise OSError('magic read failed')
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr('builtins.open', fail_magic_read)
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+        monkeypatch.setattr('builtins.open', real_open)
+        exists_calls = {'tmp': 0}
+        real_exists = os.path.exists
+
+        def disappear_before_replace(path):
+            if str(path).startswith(f"{manager.model_path}.tmp."):
+                exists_calls['tmp'] += 1
+                return exists_calls['tmp'] < 2
+            return real_exists(path)
+
+        response.iter_content.return_value = [b'GGUF', b'tiny']
+        monkeypatch.setattr('utils.llm.model_manager.os.path.exists', disappear_before_replace)
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+
+    def test_selected_model_path_and_valid_existing_fast_path_edge_cases(self, model_manager):
+        """Cover safe comparison failures and the valid existing-artifact fast path."""
+
+        class UnstringablePath:
+            def __str__(self):
+                raise TypeError('path unavailable')
+
+        assert model_manager._is_selected_model_path(UnstringablePath()) is False
+        model_manager.model_profile['artifact_size_bytes'] = 8
+        model_manager.model_profile['artifact_sha256'] = None
+        Path(model_manager.model_path).write_bytes(b'GGUFtiny')
+
+        assert model_manager.download_model_if_needed() is True
+        assert model_manager.last_model_artifact_validation == {'valid': True, 'reason': 'valid'}
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist

@@ -2123,6 +2123,25 @@ def test_probe_result_payload_preserves_native_capability_types():
     assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
 
 
+def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkeypatch):
+    real_import = __import__
+
+    def import_without_packaging(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith('packaging.'):
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr('builtins.__import__', import_without_packaging)
+
+    assert (
+        desktop_runtime_setup._llama_cpp_version_matches(
+            '0.3.32',
+            'llama-cpp-python==0.3.32',
+        )
+        == 'unknown'
+    )
+
+
 def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeypatch, tmp_path):
     payload = {
         'backend': 'cuda',

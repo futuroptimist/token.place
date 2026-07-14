@@ -316,7 +316,15 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "XDG_CONFIG_HOME": str(app_data / "config"),
             "XDG_DATA_HOME": str(app_data / "data"),
         }
-        result = subprocess.run([str(py), "-c", code], check=False, capture_output=True, text=True, env=env)
+        probe_cwd = app_path / "Contents" / "Resources" / "python"
+        result = subprocess.run(
+            [str(py), "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
+        )
         output = f"{result.stdout}\n{result.stderr}"
         scan_output = _redact_allowed_app_locations(output, app_path)
         forbidden = ("/usr/bin/python3", "xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Users/runner", "/Library/Developer/CommandLineTools", "site.USER_SITE")

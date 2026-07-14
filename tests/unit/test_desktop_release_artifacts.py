@@ -671,7 +671,7 @@ def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, t
     py.write_text('#!/bin/sh\n', encoding='utf-8')
     captured = {}
 
-    def fake_run(cmd, *, check, capture_output, text, env):
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
         captured['env'] = env
         return subprocess.CompletedProcess(cmd, 0, 'ok', '')
 
@@ -716,12 +716,13 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
         created_home['path'] = home
         return str(home)
 
-    def fake_run(cmd, *, check, capture_output, text, env):
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
         assert env['HOME'] == str(created_home['path'])
         assert env['TOKEN_PLACE_MODELS_DIR'] == str(created_home['path'] / 'token.place' / 'models')
         assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
         assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
         assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
+        assert cwd == str(app / 'Contents' / 'Resources' / 'python')
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
     monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
@@ -741,7 +742,7 @@ def test_run_python_sanitized_allows_paths_inside_runner_app_bundle(monkeypatch,
     (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
     py = app / 'Contents' / 'Resources' / 'python-runtime' / 'bin' / 'python3'
 
-    def fake_run(cmd, *, check, capture_output, text, env):
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
         payload = {
             'executable': str(py),
             'prefix': str(app / 'Contents' / 'Resources' / 'python-runtime'),
@@ -753,6 +754,24 @@ def test_run_python_sanitized_allows_paths_inside_runner_app_bundle(monkeypatch,
     output = validator._run_python_sanitized(py, 'print(1)', app)
 
     assert '/Users/runner' in output
+
+
+def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Users' / 'runner' / 'work' / 'token.place desktop.app'
+    resources_python = app / 'Contents' / 'Resources' / 'python'
+    resources_python.mkdir(parents=True)
+    py = app / 'Contents' / 'Resources' / 'python-runtime' / 'bin' / 'python3'
+    seen = {}
+
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
+        seen['cwd'] = cwd
+        return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+
+    assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert seen['cwd'] == str(resources_python)
 
 
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
@@ -788,7 +807,7 @@ def test_run_python_sanitized_formats_probe_failures_without_raw_code(monkeypatc
     (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
     py = tmp_path / 'python3'
 
-    def fake_run(cmd, *, check, capture_output, text, env):
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
         return subprocess.CompletedProcess(cmd, 7, 'stdout', 'stderr')
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)

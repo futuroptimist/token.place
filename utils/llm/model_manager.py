@@ -4592,7 +4592,10 @@ class ModelManager:
         """
         pinned_artifact = (
             os.path.basename(str(file_path)) == self.model_profile.get('filename')
-            and self.url == self.model_profile.get('download_url')
+            and (
+                self.model_profile.get('artifact_size_bytes') is not None
+                or self.model_profile.get('artifact_sha256') is not None
+            )
         )
         expected_size = self.model_profile.get('artifact_size_bytes') if pinned_artifact else None
         expected_sha256 = self.model_profile.get('artifact_sha256') if pinned_artifact else None
@@ -4609,23 +4612,23 @@ class ModelManager:
             self.log_error(f"Error: Unable to start download request: {e}")
             return False
 
-        if response.status_code != 200:
-            self.log_error(f"Error: Unable to download file, status code {response.status_code}")
-            return False
-
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        if total_size_in_bytes == 0:
-            self.log_error("Error: Content-Length header is missing or zero.")
-            return False
-
-        total_size_in_mb = total_size_in_bytes / (1024 * 1024)
-        progress = 0
-        digest = hashlib.sha256()
-        start_time = time.time()
-        times = []
-        bytes_downloaded = []
-
         try:
+            if response.status_code != 200:
+                self.log_error(f"Error: Unable to download file, status code {response.status_code}")
+                return False
+
+            total_size_in_bytes = int(response.headers.get('content-length', 0))
+            if total_size_in_bytes == 0:
+                self.log_error("Error: Content-Length header is missing or zero.")
+                return False
+
+            total_size_in_mb = total_size_in_bytes / (1024 * 1024)
+            progress = 0
+            digest = hashlib.sha256()
+            start_time = time.time()
+            times = []
+            bytes_downloaded = []
+
             with open(tmp_path, 'wb') as file:
                 for data in response.iter_content(chunk_size=chunk_size_bytes):
                     if not data:
@@ -4661,10 +4664,7 @@ class ModelManager:
                 os.fsync(file.fileno())
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._remove_partial_download(tmp_path)
             return False
         finally:
             if response is not None:
@@ -4675,33 +4675,25 @@ class ModelManager:
         actual_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
         if expected_size is not None and actual_size != int(expected_size):
             self.log_error("Download failed artifact size validation.")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._remove_partial_download(tmp_path)
             return False
         if actual_size != total_size_in_bytes:
             self.log_error("Download failed or Content-Length does not match.")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._remove_partial_download(tmp_path)
             return False
         if expected_size is not None or expected_sha256:
             try:
                 with open(tmp_path, 'rb') as check_file:
                     if check_file.read(4) != GGUF_MAGIC:
                         self.log_error("Download failed GGUF magic validation.")
-                        os.unlink(tmp_path)
+                        self._remove_partial_download(tmp_path)
                         return False
             except OSError:
+                self._remove_partial_download(tmp_path)
                 return False
         if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():
             self.log_error("Download failed SHA-256 validation.")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._remove_partial_download(tmp_path)
             return False
 
         if os.path.exists(tmp_path) and actual_size == total_size_in_bytes:
@@ -4710,11 +4702,14 @@ class ModelManager:
             return True
         else:
             self.log_error("Download failed or file size does not match.")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._remove_partial_download(tmp_path)
             return False
+
+    def _remove_partial_download(self, tmp_path: str) -> None:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     def _is_managed_canonical_model_path(self) -> bool:
         return (
@@ -4729,7 +4724,10 @@ class ModelManager:
         expected_sha256 = self.model_profile.get('artifact_sha256')
         pinned_artifact = (
             os.path.basename(str(self.model_path)) == self.model_profile.get('filename')
-            and self.url == self.model_profile.get('download_url')
+            and (
+                self.model_profile.get('artifact_size_bytes') is not None
+                or self.model_profile.get('artifact_sha256') is not None
+            )
         )
         if not pinned_artifact:
             return True, 'valid'
@@ -4761,7 +4759,7 @@ class ModelManager:
         """
         self.create_models_directory()
 
-        valid, reason = self._validate_existing_model_artifact(hash_if_suspect=False)
+        valid, reason = self._validate_existing_model_artifact(hash_if_suspect=True)
         self.last_model_artifact_validation = {'valid': valid, 'reason': reason}
         if not valid and reason == 'missing':
             self.log_info(f"Downloading {self.file_name}...")
@@ -5007,7 +5005,6 @@ class ModelManager:
                                 else:
                                     runtime_profiles = [None]
                             profile_failures = []
-                            first_generic_profile_retry_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
                             for runtime_profile in runtime_profiles:
@@ -5072,10 +5069,7 @@ class ModelManager:
                                             profile_failures=profile_failures,
                                             current_profile_id=profile_id,
                                         )
-                                    generic_profile_retry = False
-                                    if generic_profile_retry and first_generic_profile_retry_exc is None:
-                                        first_generic_profile_retry_exc = init_exc
-                                    if not is_qwen_64k or (category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES and not generic_profile_retry):
+                                    if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
                                         raise
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):
@@ -5088,12 +5082,6 @@ class ModelManager:
                                         compute_plan=compute_plan,
                                         profile_failures=profile_failures,
                                     )
-                                if (
-                                    first_generic_profile_retry_exc is not None
-                                    and profile_failures
-                                    and profile_failures[-1].get('safe_error_category') == 'runtime_context_create_failed'
-                                ):
-                                    raise first_generic_profile_retry_exc
                                 raise RuntimeError(
                                     'Qwen 64K memory/KV/cache profile exhaustion before registration; '
                                     f'failures={profile_failures}'

@@ -1074,7 +1074,10 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
     except (FileNotFoundError, OSError, ValueError) as exc:
         required_package_spec = "llama-cpp-python==unknown"
         required_version = "unknown"
-        version_resolution_error = f"llama_cpp_python_required_version_unresolved: {exc}"
+        version_resolution_error = (
+            "llama_cpp_python_required_version_unresolved: "
+            f"{type(exc).__name__}"
+        )
     before_version_payload = _version_payload(before, required_version, required_package_spec)
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {

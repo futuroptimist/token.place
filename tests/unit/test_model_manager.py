@@ -2955,7 +2955,7 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
 
     message = str(exc_info.value)
-    assert 'llama_cpp_model_initialization subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
     assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=7' in message
     assert 'stdout llama_context clue before exit' in message
@@ -3005,7 +3005,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
     message = str(exc_info.value)
-    assert 'llama_cpp_model_initialization subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
     assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=9' in message
     assert 'program=' in message
@@ -3013,7 +3013,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
     assert 'cwd=' in message
     assert 'import_root=' in message
     assert 'module_path_hint=' in message
-    assert 'stage=llama_cpp_model_initialization' in message
+    assert 'stage=llama_cpp_import' in message
     assert 'TOKEN_PLACE_LLAMA_CPP_JSON' not in message
     assert 'secret prompt' not in message
     assert 'generated text' not in message
@@ -3073,7 +3073,7 @@ def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
-    assert exc_info.value.stage == 'llama_cpp_model_initialization'
+    assert exc_info.value.stage == 'llama_cpp_import'
     assert created and created[0].terminated and created[0].killed
 
 
@@ -3153,6 +3153,7 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
         def __init__(self):
             self._lines = iter([
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py","child_model_path_exists":true}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"Hi"}}]},"done":false}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"lo"}}]},"done":false}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","done":true}\n',
@@ -3199,7 +3200,7 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
     chunks = list(proxy.create_chat_completion(messages=[], stream=True))
 
     assert [chunk['choices'][0]['delta']['content'] for chunk in chunks] == ['Hi', 'lo']
-    assert created[0].stdin.writes[1]['kwargs']['stream'] is True
+    assert created[0].stdin.writes[2]['kwargs']['stream'] is True
 
 
 def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(monkeypatch):
@@ -3632,6 +3633,8 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
             self._alive = True
 
         def start(self):
+            if self._target is not None:
+                self._target()
             return None
 
         def is_alive(self):
@@ -3645,6 +3648,7 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
         def __init__(self, *_args, **_kwargs):
             self.stdin = FakeStdin()
             self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n'
                 'TOKEN_PLACE_LLAMA_CPP_JSON:'
                 '{"status":"error","error":"Failed to create llama_context",'
                 '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_failed"}\n'
@@ -7371,7 +7375,8 @@ def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     assert os.path.exists(tmpfile)
     assert popen_calls[0].command == [sys.executable, '-u', tmpfile]
     assert popen_calls[0]._token_place_command == [sys.executable, '<runtime-worker-script>']
-    assert '"method": "__init__"' in popen_calls[0].stdin.writes[0]
+    assert '"method": "__import__"' in popen_calls[0].stdin.writes[0]
+    assert '"method": "__init__"' in popen_calls[0].stdin.writes[1]
 
     proxy.close()
 

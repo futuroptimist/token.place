@@ -1889,6 +1889,24 @@ class _SubprocessLlamaProxy:
         self._stderr_reader_thread: Optional[threading.Thread] = None
         self._start_stderr_tail_reader()
         try:
+            self._send({'method': '__import__'}, check_health=False)
+            _read_llama_subprocess_message(
+                self._process,
+                timeout_seconds=self._timeout_seconds,
+                stage='llama_cpp_import',
+            )
+        except Exception as exc:
+            self._drain_stderr_reader_bounded()
+            safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+            self.close()
+            if isinstance(exc, LlamaCppRuntimeStageTimeout):
+                raise
+            if isinstance(exc, LlamaCppWorkerEOFError):
+                raise LlamaCppWorkerEOFError(safe_exc) from exc
+            if isinstance(exc, (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError)):
+                raise RuntimeError(safe_exc) from exc
+            raise
+        try:
             self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
         except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
             self.close()
@@ -3154,8 +3172,26 @@ try:
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
+    emit_import_handshake = isinstance(init_payload, dict) and init_payload.get('method') == '__import__'
+    llama_cpp = importlib.import_module('llama_cpp')
+    if emit_import_handshake:
+        _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+        init_line = sys.stdin.readline()
+        if not init_line:
+            raise RuntimeError('llama_cpp subprocess missing init payload')
+        init_payload = json.loads(init_line)
     init_args = init_payload.get('args', [])
     init_kwargs = init_payload.get('kwargs', {})
+except Exception as exc:
+    _emit({
+        'status': 'error',
+        'exception_type': type(exc).__name__,
+        'safe_error_category': _classify_initialization_exception(exc),
+        'child_model_path_exists': False,
+    })
+    raise SystemExit(1)
+
+try:
     _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
     if _token_place_model_path is None and isinstance(init_kwargs, dict):
         _token_place_model_path = init_kwargs.get('model_path')
@@ -3164,7 +3200,6 @@ try:
         if isinstance(_token_place_model_path, str)
         else False
     )
-    llama_cpp = importlib.import_module('llama_cpp')
     llama = llama_cpp.Llama(*init_args, **init_kwargs)
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None), 'child_model_path_exists': child_model_path_exists})
 except Exception as exc:

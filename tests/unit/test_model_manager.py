@@ -3221,6 +3221,32 @@ def test_init_safe_category_alias_survives_subprocess_wrappers():
     assert model_manager_module._classify_runtime_context_create_error(exc_info.value) == 'runtime_context_create_cuda_memory'
 
 
+def test_invalid_child_exception_type_falls_back_to_runtime_error():
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        stdout=StringIO(
+            'TOKEN_PLACE_LLAMA_CPP_JSON:'
+            '{"status":"error","error":"Failed to create llama_context",'
+            '"exception_type":"RuntimeError; prompt=SECRET",'
+            '"safe_error_category":"cuda_memory_allocation"}\n'
+        )
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=5,
+            stage='llama_cpp_import',
+        )
+
+    assert exc_info.value.child_exception_type == 'RuntimeError'
+    assert 'prompt=SECRET' not in str(exc_info.value)
+    assert exc_info.value.safe_error_category == 'runtime_context_create_cuda_memory'
+
+
 def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(tmp_path, monkeypatch):
     from io import StringIO
 
@@ -3371,6 +3397,34 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
     assert 'buffer allocation failed' in exc_info.value.child_stderr_tail
     assert created[0].wait_timeouts and 0 <= created[0].wait_timeouts[0] <= 0.5
     assert FakeThread.joins and 0 <= FakeThread.joins[-1] <= 0.5
+
+
+def test_bounded_stderr_drain_joins_reader_when_process_wait_raises():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeThread:
+        join_timeouts = []
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd='fake-llama', timeout=timeout)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._process = FakeProcess()
+    proxy._stderr_reader_thread = FakeThread()
+
+    proxy._drain_stderr_reader_bounded()
+
+    assert FakeThread.join_timeouts and 0 <= FakeThread.join_timeouts[-1] <= 0.5
 
 
 def test_init_safe_category_rejects_spoofed_child_category():
@@ -7923,6 +7977,34 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
         diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category']
         == 'runtime_context_create_cuda_memory'
     )
+
+
+def test_qwen_64k_failure_readiness_publisher_falls_back_to_attempted_profile_ids():
+    manager = object.__new__(ModelManager)
+    manager.last_compute_diagnostics = {}
+    manager._qwen_64k_profile_attempt_ids = [
+        'qwen64k_f16_fa_small_batch',
+        'qwen64k_kv_q8_fa_small_batch',
+    ]
+    manager.last_qwen_64k_memory_profile_diagnostics = {'applied': {}}
+
+    manager._publish_qwen_64k_init_failure_readiness_diagnostics(
+        compute_plan={'backend_used': 'cuda'},
+        profile_failures=[{
+            'profile_id': '',
+            'safe_error_category': 'runtime_context_create_failed',
+            'attempted_runtime_kwargs': {'n_ctx': 65536},
+        }],
+        current_profile_id='qwen64k_kv_q8_fa_small_batch',
+    )
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
+        'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch'
+    )
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_failed'
+    assert diagnostics['api_v1_readiness_yarn_requested_context_tokens'] == 65536
 
 
 def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_buffer_evidence():

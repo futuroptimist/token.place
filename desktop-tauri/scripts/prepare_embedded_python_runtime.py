@@ -22,7 +22,7 @@ SRC_TAURI = ROOT / "src-tauri"
 MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest.json"
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
-BUILD_PROFILE = "metal-relocatable-no-openssl-v1"
+BUILD_PROFILE = "metal-relocatable-no-openssl-libpython-rpath-v2"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
 if str(SRC_TAURI / "python") not in sys.path:
     sys.path.insert(0, str(SRC_TAURI / "python"))
@@ -107,6 +107,97 @@ def prove_interpreter(py: Path, runtime: Path, m: dict) -> None:
     if data["machine"] != m["expected_architecture"]: raise RuntimePrepError("bundled interpreter has wrong architecture")
     for key in ["executable", "prefix"]:
         if not Path(data[key]).resolve().is_relative_to(runtime.resolve()): raise RuntimePrepError(f"{key} is outside generated runtime")
+
+
+def _python_major_minor(m: dict) -> tuple[int, int]:
+    parts = str(m["cpython_version"]).split(".")
+    if len(parts) < 2:
+        raise RuntimePrepError("manifest cpython_version must include major.minor")
+    return int(parts[0]), int(parts[1])
+
+def _otool_install_id(path: Path) -> str:
+    lines = _otool(["otool", "-D", str(path)]).splitlines()
+    return lines[1].strip() if len(lines) > 1 else ""
+
+def _otool_load_deps(path: Path) -> list[str]:
+    deps: list[str] = []
+    for line in _otool(["otool", "-L", str(path)]).splitlines()[1:]:
+        dep = line.strip().split(" ", 1)[0]
+        if dep:
+            deps.append(dep)
+    return deps
+
+def _install_name_tool(args: list[str]) -> None:
+    run(["install_name_tool", *args])
+
+def _ensure_owner_write(path: Path) -> None:
+    mode = path.stat().st_mode
+    if not mode & 0o200:
+        path.chmod(mode | 0o200)
+
+def _unique_runtime_macho_files(runtime: Path) -> list[Path]:
+    seen: set[Path] = set()
+    files: list[Path] = []
+    runtime_resolved = runtime.resolve()
+    for path in runtime.rglob("*"):
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if not resolved.is_relative_to(runtime_resolved):
+            raise RuntimePrepError(f"Mach-O candidate escapes staged runtime: {path}")
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _is_macho_file(resolved):
+            files.append(resolved)
+    return files
+
+def _add_rpath_if_missing(path: Path, rpath: str) -> None:
+    existing = _parse_otool_rpaths(_otool(["otool", "-l", str(path)]))
+    if rpath not in existing:
+        _ensure_owner_write(path)
+        _install_name_tool(["-add_rpath", rpath, str(path)])
+
+def _normalize_stale_libpython_loads(runtime: Path, old_id: str, normalized_id: str, major: int, minor: int) -> None:
+    bin_dir = (runtime / "bin").resolve()
+    dynload_dir = (runtime / "lib" / f"python{major}.{minor}" / "lib-dynload").resolve()
+    for path in _unique_runtime_macho_files(runtime):
+        deps = _otool_load_deps(path)
+        if old_id not in deps:
+            continue
+        if deps.count(old_id) > 1:
+            raise RuntimePrepError(f"duplicate stale libpython load command in {path}")
+        if path.parent.resolve() == bin_dir:
+            required_rpath = "@executable_path/../lib"
+        elif path.parent.resolve() == dynload_dir:
+            required_rpath = "@loader_path/../.."
+        else:
+            raise RuntimePrepError(f"stale libpython dependency has ambiguous runtime-relative layout: {path}")
+        _ensure_owner_write(path)
+        _install_name_tool(["-change", old_id, normalized_id, str(path)])
+        _add_rpath_if_missing(path, required_rpath)
+        if old_id in _otool_load_deps(path):
+            raise RuntimePrepError(f"failed to normalize stale libpython dependency in {path}")
+
+def normalize_python_build_standalone_macos_runtime(runtime: Path, manifest: dict) -> None:
+    if platform.system() != "Darwin":
+        return
+    major, minor = _python_major_minor(manifest)
+    libpython = runtime / "lib" / f"libpython{major}.{minor}.dylib"
+    if not libpython.is_file():
+        raise RuntimePrepError(f"missing bundled libpython dylib: {libpython}")
+    old_id = f"/install/lib/libpython{major}.{minor}.dylib"
+    normalized_id = f"@rpath/libpython{major}.{minor}.dylib"
+    current = _otool_install_id(libpython)
+    if current == old_id:
+        _ensure_owner_write(libpython)
+        _install_name_tool(["-id", normalized_id, str(libpython)])
+        reread = _otool_install_id(libpython)
+        if reread != normalized_id:
+            raise RuntimePrepError(f"failed to normalize libpython install ID: {reread}")
+    elif current != normalized_id:
+        raise RuntimePrepError(f"unexpected libpython install ID: {current}")
+    _normalize_stale_libpython_loads(runtime, old_id, normalized_id, major, minor)
 
 def _is_macho_file(path: Path) -> bool:
     if platform.system() != "Darwin":
@@ -293,7 +384,7 @@ def prepare(cache_dir: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="token-place-python-runtime-", dir=str(OUTPUT.parent)) as td:
         tmp=Path(td); extracted=extract_archive(archive,m,tmp); staging=tmp/"python-runtime"; shutil.move(str(extracted), staging)
         py=staging/"bin"/"python3"; py.chmod(py.stat().st_mode | 0o755)
-        prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
+        normalize_python_build_standalone_macos_runtime(staging, m); audit_macho_runtime(staging); prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
         packages=json.loads(run([str(py),"-c","import json,importlib.metadata as im; print(json.dumps({d.metadata['Name']: d.version for d in im.distributions()}))"]).stdout)
         (staging/PROVENANCE).write_text(json.dumps(provenance(m, packages), indent=2, sort_keys=True)+"\n")
         for notice in m["runtime_notices"]: (staging/notice["path"]).write_text(f"{notice['name']} redistribution notice: {notice['license']}\nSee upstream distribution for complete license text.\n")

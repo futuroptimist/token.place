@@ -533,3 +533,248 @@ def test_existing_valid_rejects_forbidden_linkage(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: {})
     monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: (_ for _ in ()).throw(prep.RuntimePrepError('forbidden')))
     assert prep.existing_valid(manifest()) is False
+
+
+def test_normalize_libpython_install_id_rewrites_exact_build_prefix(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    lib = runtime / 'lib' / 'libpython3.11.dylib'
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(b'macho')
+    ids = {lib: '/install/lib/libpython3.11.dylib'}
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_otool_install_id', lambda path: ids[path])
+    monkeypatch.setattr(prep, '_normalize_stale_libpython_loads', lambda *args: None)
+
+    def fake_install(args):
+        mutations.append(args)
+        assert args == ['-id', '@rpath/libpython3.11.dylib', str(lib)]
+        ids[lib] = '@rpath/libpython3.11.dylib'
+
+    monkeypatch.setattr(prep, '_install_name_tool', fake_install)
+
+    prep.normalize_python_build_standalone_macos_runtime(runtime, manifest())
+
+    assert mutations == [['-id', '@rpath/libpython3.11.dylib', str(lib)]]
+
+
+def test_normalize_libpython_install_id_is_idempotent(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    lib = runtime / 'lib' / 'libpython3.11.dylib'
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(b'macho')
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_otool_install_id', lambda path: '@rpath/libpython3.11.dylib')
+    monkeypatch.setattr(prep, '_normalize_stale_libpython_loads', lambda *args: None)
+    monkeypatch.setattr(prep, '_install_name_tool', lambda args: mutations.append(args))
+
+    prep.normalize_python_build_standalone_macos_runtime(runtime, manifest())
+
+    assert mutations == []
+
+
+def test_normalize_libpython_install_id_rejects_unexpected_absolute_id(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    lib = runtime / 'lib' / 'libpython3.11.dylib'
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(b'macho')
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_otool_install_id', lambda path: '/elsewhere/lib/libpython3.11.dylib')
+
+    try:
+        prep.normalize_python_build_standalone_macos_runtime(runtime, manifest())
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'unexpected libpython install ID' in str(exc)
+
+
+def test_normalize_stale_libpython_load_rewrites_interpreter_rpath_once(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    py = runtime / 'bin' / 'python3.11'
+    py.parent.mkdir(parents=True)
+    py.write_bytes(b'macho')
+    deps = {py.resolve(): ['/install/lib/libpython3.11.dylib']}
+    rpaths = {py.resolve(): []}
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_parse_otool_rpaths', lambda out: rpaths[py.resolve()])
+    monkeypatch.setattr(prep, '_otool', lambda cmd: '')
+
+    def fake_install(args):
+        mutations.append(args)
+        if args[:3] == ['-change', '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib']:
+            deps[py.resolve()] = ['@rpath/libpython3.11.dylib']
+        if args[:2] == ['-add_rpath', '@executable_path/../lib']:
+            rpaths[py.resolve()].append('@executable_path/../lib')
+
+    monkeypatch.setattr(prep, '_install_name_tool', fake_install)
+
+    prep._normalize_stale_libpython_loads(runtime, '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib', 3, 11)
+
+    assert ['-change', '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib', str(py.resolve())] in mutations
+    assert ['-add_rpath', '@executable_path/../lib', str(py.resolve())] in mutations
+
+    mutations.clear()
+    prep._normalize_stale_libpython_loads(runtime, '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib', 3, 11)
+    assert mutations == []
+
+
+def test_normalize_stale_libpython_load_adds_dynload_rpath_without_duplicate(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    ext = runtime / 'lib' / 'python3.11' / 'lib-dynload' / '_ssl.cpython-311-darwin.so'
+    ext.parent.mkdir(parents=True)
+    ext.write_bytes(b'macho')
+    deps = {ext.resolve(): ['/install/lib/libpython3.11.dylib']}
+    rpaths = {ext.resolve(): ['@loader_path/../..']}
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_parse_otool_rpaths', lambda out: rpaths[ext.resolve()])
+    monkeypatch.setattr(prep, '_otool', lambda cmd: '')
+
+    def fake_install(args):
+        mutations.append(args)
+        if args[0] == '-change':
+            deps[ext.resolve()] = ['@rpath/libpython3.11.dylib']
+
+    monkeypatch.setattr(prep, '_install_name_tool', fake_install)
+
+    prep._normalize_stale_libpython_loads(runtime, '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib', 3, 11)
+
+    assert any(args[0] == '-change' for args in mutations)
+    assert not any(args[:2] == ['-add_rpath', '@loader_path/../..'] for args in mutations)
+
+
+def test_normalize_stale_libpython_load_rejects_ambiguous_layout_and_arbitrary_install(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    other = runtime / 'lib' / 'other.dylib'
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b'macho')
+    deps = {other.resolve(): ['/install/lib/libpython3.11.dylib']}
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_install_name_tool', lambda args: mutations.append(args))
+
+    try:
+        prep._normalize_stale_libpython_loads(runtime, '/install/lib/libpython3.11.dylib', '@rpath/libpython3.11.dylib', 3, 11)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'ambiguous' in str(exc)
+    assert mutations == []
+
+    assert prep._forbidden_native_ref('/install/lib/libother.dylib') is False
+    try:
+        prep._validate_native_ref('/install/lib/libother.dylib', other)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'absolute non-system' in str(exc)
+
+
+def test_unique_runtime_macho_files_rejects_symlink_escape(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    outside = tmp_path / 'outside.dylib'
+    outside.write_bytes(b'macho')
+    (runtime / 'escape.dylib').symlink_to(outside)
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+
+    try:
+        prep._unique_runtime_macho_files(runtime)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'escapes staged runtime' in str(exc)
+
+
+def test_prepare_normalizes_and_audits_before_install_packages(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    archive = tmp_path / 'runtime.tar.gz'
+    make_tar(archive, {'python/bin/python3': b'#!/bin/sh\n', 'python/lib/libpython3.11.dylib': b'macho'})
+    events = []
+
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    monkeypatch.setattr(prep, 'load_manifest', lambda: manifest())
+    monkeypatch.setattr(prep, 'existing_valid', lambda m: False)
+    monkeypatch.setattr(prep, 'download_verified', lambda m, cache: archive)
+    monkeypatch.setattr(prep, 'normalize_python_build_standalone_macos_runtime', lambda runtime, m: events.append('normalize'))
+    monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: events.append('audit'))
+    monkeypatch.setattr(prep, 'prove_interpreter', lambda py, runtime, m: events.append('prove'))
+    monkeypatch.setattr(prep, 'install_packages', lambda py, m, cache: events.append('install'))
+    monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: events.append('probe'))
+    monkeypatch.setattr(prep, 'run', lambda *_, **__: type('Result', (), {'stdout': '{}'})())
+
+    prep.prepare(tmp_path / 'cache')
+
+    assert events[:4] == ['normalize', 'audit', 'prove', 'install']
+
+
+def test_prepare_baseline_normalization_failure_does_not_install_or_uninstall(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    archive = tmp_path / 'runtime.tar.gz'
+    make_tar(archive, {'python/bin/python3': b'#!/bin/sh\n', 'python/lib/libpython3.11.dylib': b'macho'})
+    calls = []
+
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+    monkeypatch.setattr(prep, 'load_manifest', lambda: manifest())
+    monkeypatch.setattr(prep, 'existing_valid', lambda m: False)
+    monkeypatch.setattr(prep, 'download_verified', lambda m, cache: archive)
+    monkeypatch.setattr(prep, 'normalize_python_build_standalone_macos_runtime', lambda runtime, m: (_ for _ in ()).throw(prep.RuntimePrepError('bad id')))
+    monkeypatch.setattr(prep, 'install_packages', lambda *args: calls.append('install'))
+    monkeypatch.setattr(prep, '_uninstall_llama_cpp', lambda *args: calls.append('uninstall'))
+
+    try:
+        prep.prepare(tmp_path / 'cache')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'bad id' in str(exc)
+    assert calls == []
+
+
+def test_build_profile_rejects_previous_profile(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    (output / 'bin').mkdir(parents=True)
+    (output / 'bin' / 'python3').write_text('#!/bin/sh\n', encoding='utf-8')
+    (output / prep.PROVENANCE).write_text(json.dumps({
+        'source_archive_sha256': '0' * 64,
+        'expected_backend': 'metal',
+        'installed_packages': manifest()['required_packages'],
+        'build_profile': 'metal-relocatable-no-openssl-v1',
+    }), encoding='utf-8')
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+
+    assert prep.existing_valid(manifest()) is False
+
+
+def test_audit_still_rejects_original_install_libpython_reference(monkeypatch, tmp_path):
+    binary = tmp_path / 'python-runtime' / 'lib' / 'libpython3.11.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+
+    def fake_otool(cmd):
+        if cmd[0] == 'lipo':
+            return 'arm64'
+        if cmd[:2] == ['otool', '-L']:
+            return f'{binary}:\n/install/lib/libpython3.11.dylib (compatibility version 3.11.0, current version 3.11.0)'
+        if cmd[:2] == ['otool', '-D']:
+            return f'{binary}:\n/install/lib/libpython3.11.dylib\n'
+        return ''
+
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+    try:
+        prep.audit_macho_runtime(tmp_path / 'python-runtime')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'absolute' in str(exc)

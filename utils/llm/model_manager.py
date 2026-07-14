@@ -4615,7 +4615,11 @@ class ModelManager:
         Returns:
             bool: True if download was successful, False otherwise
         """
-        pinned_artifact = self._profile_has_pinned_artifact() and self._is_selected_model_path(file_path)
+        pinned_artifact = (
+            self._profile_has_pinned_artifact()
+            and self._is_managed_canonical_model_path()
+            and self._is_selected_model_path(file_path)
+        )
         expected_size = self.model_profile.get('artifact_size_bytes') if pinned_artifact else None
         expected_sha256 = self.model_profile.get('artifact_sha256') if pinned_artifact else None
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
@@ -4741,17 +4745,15 @@ class ModelManager:
             return False, 'missing'
         expected_size = self.model_profile.get('artifact_size_bytes')
         expected_sha256 = self.model_profile.get('artifact_sha256')
-        pinned_artifact = self._profile_has_pinned_artifact()
-        if not pinned_artifact:
-            return True, 'valid'
+        pinned_artifact = self._profile_has_pinned_artifact() and self._is_managed_canonical_model_path()
         try:
             actual_size = os.path.getsize(self.model_path)
-            if expected_size is not None and actual_size != int(expected_size):
+            if pinned_artifact and expected_size is not None and actual_size != int(expected_size):
                 return False, 'size_mismatch'
             with open(self.model_path, 'rb') as file:
                 if file.read(4) != GGUF_MAGIC:
                     return False, 'bad_magic'
-                if hash_if_suspect and expected_sha256:
+                if pinned_artifact and hash_if_suspect and expected_sha256:
                     file.seek(0)
                     digest = hashlib.sha256()
                     for chunk in iter(lambda: file.read(1024 * 1024), b''):

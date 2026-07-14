@@ -5000,6 +5000,56 @@ def test_warm_load_failure_stderr_marks_safe_readiness_diagnostics_unavailable(c
     )
 
 
+def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            'api_v1_readiness_result': 'failed',
+            'api_v1_readiness_qwen_64k_runtime_profile_id': 'qwen64k_kv_q4_fa_small_batch',
+            'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': (
+                'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+            ),
+            'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
+            'api_v1_readiness_qwen_64k_runtime_profile_failure_category': 'runtime_context_create_cuda_memory',
+            'api_v1_readiness_qwen_64k_runtime_profile_flash_attn': True,
+            'api_v1_readiness_qwen_64k_runtime_profile_offload_kqv': True,
+            'api_v1_readiness_qwen_64k_runtime_profile_type_k': 2,
+            'api_v1_readiness_qwen_64k_runtime_profile_type_v': 2,
+            'api_v1_readiness_qwen_64k_runtime_profile_n_batch': 256,
+            'api_v1_readiness_qwen_64k_runtime_profile_n_ubatch': 128,
+            'prompt': 'SECRET_PROMPT',
+            'stderr': 'SECRET_STDERR',
+            'traceback': 'SECRET_TRACEBACK',
+            'model_path': 'SECRET_MODEL_PATH',
+            'command': 'SECRET_COMMAND',
+            'payload': 'SECRET_PAYLOAD',
+            'output': 'SECRET_OUTPUT',
+            'key': 'SECRET_KEY',
+            'ciphertext': 'SECRET_CIPHERTEXT',
+        }
+    )
+
+    compute_node_bridge._emit_safe_readiness_diagnostics_stderr(manager)
+    err = capsys.readouterr().err
+
+    assert 'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics' in err
+    assert 'unavailable=true' not in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_id=qwen64k_kv_q4_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_failure_category=runtime_context_create_cuda_memory' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids=qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch' in err
+    for secret in (
+        'SECRET_PROMPT',
+        'SECRET_STDERR',
+        'SECRET_TRACEBACK',
+        'SECRET_MODEL_PATH',
+        'SECRET_COMMAND',
+        'SECRET_PAYLOAD',
+        'SECRET_OUTPUT',
+        'SECRET_KEY',
+        'SECRET_CIPHERTEXT',
+    ):
+        assert secret not in err
+
+
 def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
     workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
     workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))

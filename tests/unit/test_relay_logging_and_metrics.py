@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -43,6 +44,8 @@ def relay_client():
     api_v1_recently_unregistered_servers.clear()
     api_v1_filtered_round_robin_next_positions.clear()
     relay_module.server_round_robin_next_index = 0
+    os.environ.pop("TOKENPLACE_METRICS_DISABLED", None)
+    os.environ.pop("TOKENPLACE_METRICS_TOKEN", None)
     with app.test_client() as client:
         yield client
     known_servers.clear()
@@ -247,6 +250,24 @@ def test_metrics_endpoint_optional_bearer_auth(relay_client, monkeypatch) -> Non
     response = relay_client.get("/metrics", headers={"Authorization": "Bearer metrics-secret"})
     assert response.status_code == 200
     assert "tokenplace_instrumentation_up" in response.get_data(as_text=True)
+
+
+def test_metrics_endpoint_disabled_flag_rejects_scrapes(relay_client, monkeypatch) -> None:
+    """TOKENPLACE_METRICS_DISABLED makes chart-disabled /metrics fail closed."""
+
+    monkeypatch.setenv("TOKENPLACE_METRICS_DISABLED", "1")
+    response = relay_client.get("/metrics")
+    assert response.status_code == 401
+    assert "tokenplace_instrumentation_up" not in response.get_data(as_text=True)
+
+
+def test_metrics_endpoint_rejects_explicit_empty_token(relay_client, monkeypatch) -> None:
+    """An explicitly empty token must not disable authentication fail-open."""
+
+    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", "")
+    response = relay_client.get("/metrics")
+    assert response.status_code == 401
+    assert "tokenplace_instrumentation_up" not in response.get_data(as_text=True)
 
 
 def test_request_outcomes_cover_cancel_expire_timeout_and_rate_limit(relay_client, monkeypatch) -> None:

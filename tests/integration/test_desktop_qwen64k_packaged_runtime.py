@@ -54,7 +54,13 @@ def _config(tmp_path):
     return config
 
 
-def _write_fake_llama_cpp_runtime(root: Path, *, completion_error: str | None = None) -> None:
+def _write_fake_llama_cpp_runtime(
+    root: Path,
+    *,
+    completion_error: str | None = None,
+    init_failure_message: str = 'Failed to create llama_context',
+    init_failure_stderr: str = 'ggml_metal: KV cache allocation failed while creating llama_context',
+) -> None:
     package = root / 'llama_cpp'
     package.mkdir(parents=True)
     completion_branch = (
@@ -64,7 +70,7 @@ def _write_fake_llama_cpp_runtime(root: Path, *, completion_error: str | None = 
     )
     (package / '__init__.py').write_text(
         """
-import json, os, sys
+import atexit, json, os, sys
 __version__ = '0.3.32-test'
 GGML_USE_METAL = True
 GGML_TYPE_Q8_0 = 8
@@ -81,8 +87,13 @@ class Llama:
             with open(path, 'a', encoding='utf-8') as handle:
                 handle.write(json.dumps(kwargs, sort_keys=True) + '\\n')
         if os.environ.get('TOKEN_PLACE_FAIL_ALL_PROFILES') == '1' or 'type_k' not in kwargs:
-            print('ggml_metal: KV cache allocation failed while creating llama_context', file=sys.stderr, flush=True)
-            raise ValueError('Failed to create llama_context')
+            stderr = os.environ.get('TOKEN_PLACE_INIT_FAILURE_STDERR', INIT_FAILURE_STDERR)
+            delayed_stderr = os.environ.get('TOKEN_PLACE_INIT_FAILURE_DELAYED_STDERR', '')
+            if delayed_stderr:
+                atexit.register(lambda: print(delayed_stderr, file=sys.stderr, flush=True))
+            if stderr:
+                print(stderr, file=sys.stderr, flush=True)
+            raise ValueError(os.environ.get('TOKEN_PLACE_INIT_FAILURE_MESSAGE', INIT_FAILURE_MESSAGE))
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
         path = os.environ.get('TOKEN_PLACE_RENDER_ATTEMPTS_JSONL')
         if path:
@@ -132,6 +143,9 @@ class Llama:
 """,
         encoding='utf-8',
     )
+    text = (package / '__init__.py').read_text(encoding='utf-8')
+    text = text.replace("GGML_USE_METAL = True", "GGML_USE_METAL = True\nINIT_FAILURE_MESSAGE = " + repr(init_failure_message) + "\nINIT_FAILURE_STDERR = " + repr(init_failure_stderr))
+    (package / '__init__.py').write_text(text, encoding='utf-8')
 
 
 def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_path, monkeypatch):
@@ -171,6 +185,100 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
     assert len(attempts) == 2
     assert 'type_k' not in attempts[0]
     assert attempts[1]['type_k'] == 8
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+
+
+def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(
+        runtime_root,
+        init_failure_message='cuda allocation failed',
+        init_failure_stderr='',
+    )
+    attempts_file = tmp_path / 'attempts.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
+
+    manager = ModelManager(_config(tmp_path))
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.model_path).write_text('fake')
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        str(runtime_root / 'llama_cpp' / '__init__.py'),
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
+                'n_batch': True, 'n_ubatch': True,
+            },
+            'yarn_enum_value': 2,
+            'qwen_64k_yarn_support': 'supported',
+            'q8_kv_cache_type_value': 8,
+            'q4_kv_cache_type_value': 2,
+            'llama_cpp_python_version': '0.3.32-test',
+        },
+    )
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
+    assert len(attempts) == 2
+    assert 'type_k' not in attempts[0]
+    assert attempts[1]['type_k'] == 8
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+
+
+def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_to_q8(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'runtime'
+    _write_fake_llama_cpp_runtime(
+        runtime_root,
+        init_failure_message='Failed to create llama_context',
+        init_failure_stderr='',
+    )
+    attempts_file = tmp_path / 'attempts.jsonl'
+    monkeypatch.syspath_prepend(str(runtime_root))
+    monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
+    monkeypatch.setenv(
+        'TOKEN_PLACE_INIT_FAILURE_DELAYED_STDERR',
+        'ggml_cuda: buffer allocation failed while creating llama_context',
+    )
+
+    manager = ModelManager(_config(tmp_path))
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.model_path).write_text('fake')
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        str(runtime_root / 'llama_cpp' / '__init__.py'),
+        desktop_runtime_probe={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_ext_factor': True, 'yarn_orig_ctx': True,
+                'type_k': True, 'type_v': True, 'flash_attn': True, 'offload_kqv': True,
+                'n_batch': True, 'n_ubatch': True,
+            },
+            'yarn_enum_value': 2,
+            'qwen_64k_yarn_support': 'supported',
+            'q8_kv_cache_type_value': 8,
+            'q4_kv_cache_type_value': 2,
+            'llama_cpp_python_version': '0.3.32-test',
+        },
+    )
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is not None
+
+    attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
+    assert len(attempts) == 2
+    assert 'type_k' not in attempts[0]
+    assert attempts[1]['type_k'] == 8
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 

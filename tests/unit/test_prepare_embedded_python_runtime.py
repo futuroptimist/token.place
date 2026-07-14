@@ -257,3 +257,22 @@ def test_install_packages_falls_back_to_source_metal_build(tmp_path, monkeypatch
     assert '--no-binary' in source_cmd
     assert 'llama-cpp-python==0.3.32' == source_cmd[-1]
     assert commands[-3][1]['CMAKE_ARGS'] == '-DGGML_METAL=on'
+
+
+def test_clean_preserves_pip_internal_build_package(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    pip_build = runtime / 'lib' / 'python3.11' / 'site-packages' / 'pip' / '_internal' / 'operations' / 'build'
+    pip_build.mkdir(parents=True)
+    (pip_build / '__init__.py').write_text('# required pip module\n')
+    test_dir = runtime / 'lib' / 'python3.11' / 'site-packages' / 'somepkg' / 'tests'
+    test_dir.mkdir(parents=True)
+    (test_dir / 'test_sample.py').write_text('def test_sample(): pass\n')
+    pycache = runtime / 'lib' / 'python3.11' / 'site-packages' / 'somepkg' / '__pycache__'
+    pycache.mkdir(parents=True)
+    (pycache / 'module.pyc').write_bytes(b'cache')
+
+    prep.clean(runtime)
+
+    assert (pip_build / '__init__.py').is_file()
+    assert not test_dir.exists()
+    assert not pycache.exists()

@@ -380,6 +380,49 @@ def _parse_otool_install_ids(load_commands: str) -> list[str]:
     return ids
 
 
+def _macho_archs(path: Path) -> list[str]:
+    archs = _run(["lipo", "-archs", str(path)]).split()
+    if not archs:
+        _fail(f"Mach-O file has no architectures: {path}")
+    if "arm64" not in archs:
+        _fail(f"Mach-O file is not arm64: {path}")
+    return archs
+
+
+def _parse_otool_libraries(output: str, owner: Path, architecture: str | None) -> list[str]:
+    owner_text = str(owner)
+    expected_headers = {f"{owner_text}:"}
+    if architecture is not None:
+        expected_headers.add(f"{owner_text} (architecture {architecture}):")
+    deps: list[str] = []
+    saw_header = False
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        stripped = raw_line.strip()
+        is_header = stripped.endswith(":") and not raw_line[:1].isspace()
+        if is_header:
+            if stripped not in expected_headers:
+                _fail(f"unexpected otool -L header for {owner.name}")
+            if saw_header:
+                _fail(f"duplicate otool -L header for {owner.name}")
+            saw_header = True
+            continue
+        if not saw_header:
+            _fail(f"dependency before otool -L header for {owner.name}")
+        if not raw_line[:1].isspace():
+            _fail(f"malformed otool -L record for {owner.name}")
+        metadata = " (compatibility version "
+        if metadata in stripped:
+            stripped = stripped[:stripped.index(metadata)]
+        if not stripped:
+            _fail(f"malformed empty otool -L dependency for {owner.name}")
+        deps.append(stripped)
+    if not saw_header:
+        _fail(f"missing otool -L header for {owner.name}")
+    return deps
+
+
 def _macho_file_kind(file_description: str) -> str:
     lower = file_description.lower()
     if "dynamically linked shared library" in lower or "dylib" in lower:
@@ -419,6 +462,15 @@ def _validate_macho_ref(ref: str, owner: Path, app_path: Path, *, install_id: bo
         _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
 
 
+def _safe_macho_ref(value: str) -> str:
+    return Path(value).name or value[:80]
+
+def _macho_relative(path: Path, app_path: Path) -> Path:
+    try:
+        return path.relative_to(app_path)
+    except ValueError:
+        return Path(path.name)
+
 def _validate_macho_linkage(path: Path, app_path: Path) -> None:
     if platform.system() != "Darwin":
         return
@@ -428,19 +480,38 @@ def _validate_macho_linkage(path: Path, app_path: Path) -> None:
     if "Mach-O" not in result.stdout:
         return
     file_description = result.stdout
-    _run(["lipo", "-archs", str(path)])
-    deps = _run(["otool", "-L", str(path)])
-    for dep in deps.splitlines()[1:]:
-        _validate_macho_ref(dep.strip().split(" ", 1)[0], path, app_path)
-    load_commands = _run(["otool", "-l", str(path)])
-    install_ids = _parse_otool_install_ids(load_commands)
+    archs = _macho_archs(path)
+    for arch in archs:
+        deps = _parse_otool_libraries(_run(["otool", "-arch", arch, "-L", str(path)]), path, arch)
+        for dep in deps:
+            try:
+                _validate_macho_ref(dep, path, app_path)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=dependency ref={_safe_macho_ref(dep)}")
+    load_commands_by_arch = {arch: _run(["otool", "-arch", arch, "-l", str(path)]) for arch in archs}
+    install_ids_by_arch = {arch: _parse_otool_install_ids(output) for arch, output in load_commands_by_arch.items()}
     kind = _macho_file_kind(file_description)
-    if kind == "dylib" and len(install_ids) != 1:
-        _fail(f"Mach-O dylib is missing LC_ID_DYLIB: {path}")
-    for install_id in install_ids:
-        _validate_macho_ref(install_id, path, app_path, install_id=True)
-    for rpath in _parse_otool_rpaths(load_commands):
-        _validate_macho_ref(rpath, path, app_path, rpath=True)
+    normalized_ids: list[str] = []
+    for arch, install_ids in install_ids_by_arch.items():
+        if kind == "dylib" and len(install_ids) != 1:
+            _fail(f"Mach-O dylib is missing LC_ID_DYLIB: {path} [arch={arch} category=install_id]")
+        for install_id in install_ids:
+            try:
+                _validate_macho_ref(install_id, path, app_path, install_id=True)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=install_id ref={_safe_macho_ref(install_id)}")
+            normalized_ids.append(install_id)
+    if kind == "dylib" and len(set(normalized_ids)) != 1:
+        _fail(f"Mach-O dylib install IDs differ by architecture: {path}")
+    for arch, load_commands in load_commands_by_arch.items():
+        for rpath in _parse_otool_rpaths(load_commands):
+            try:
+                _validate_macho_ref(rpath, path, app_path, rpath=True)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}")
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:
     runtime = app_path / "Contents" / "Resources" / "python-runtime"

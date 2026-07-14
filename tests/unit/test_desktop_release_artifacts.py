@@ -925,11 +925,11 @@ def test_validate_macho_linkage_rejects_forbidden_external_dependency(monkeypatc
     def fake_tool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{binary}:\n/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)'
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{binary}:\n\t/opt/homebrew/lib/libbad.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D should not be used')
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/bad.dylib (offset 24)'
         raise AssertionError(cmd)
 
@@ -939,7 +939,7 @@ def test_validate_macho_linkage_rejects_forbidden_external_dependency(monkeypatc
         validator._validate_macho_linkage(binary, app)
         assert False
     except SystemExit as exc:
-        assert 'forbidden external Mach-O linkage' in str(exc)
+        assert 'category=dependency ref=libbad.dylib' in str(exc)
 
 
 def test_validate_embedded_python_runtime_fails_incomplete_app_before_publication(tmp_path) -> None:
@@ -970,15 +970,15 @@ def test_validate_macho_linkage_rejects_homebrew_openssl_dependency(monkeypatch,
     def fake_tool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
+        if cmd[0] == 'otool' and '-L' in cmd:
             return (
                 f'{binary}:\n'
-                '/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib '
+                '\t/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib '
                 '(compatibility version 3.0.0, current version 3.0.0)'
             )
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D should not be used')
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'cmd LC_ID_DYLIB\ncmdsize 64\nname @rpath/libllama-common.0.dylib (offset 24)'
         raise AssertionError(cmd)
 
@@ -989,7 +989,7 @@ def test_validate_macho_linkage_rejects_homebrew_openssl_dependency(monkeypatch,
         validator._validate_macho_linkage(binary, app)
         assert False
     except SystemExit as exc:
-        assert '/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib' in str(exc)
+        assert 'category=dependency ref=libssl.3.dylib' in str(exc)
 
 
 def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_dependencies(monkeypatch, tmp_path) -> None:
@@ -1008,18 +1008,18 @@ def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_depende
     def fake_tool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
+        if cmd[0] == 'otool' and '-L' in cmd:
             return (
                 f'{binary}:\n'
-                '@loader_path/libllama.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
-                '@rpath/libggml.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
-                '/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
-                '/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit '
+                '\t@loader_path/libllama.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
+                '\t@rpath/libggml.dylib (compatibility version 0.0.0, current version 0.0.0)\n'
+                '\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
+                '\t/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit '
                 '(compatibility version 45.0.0, current version 2575.40.3)'
             )
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D should not be used')
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/libok.dylib (offset 24)\ncmd LC_RPATH\ncmdsize 32\npath @loader_path/.. (offset 12)'
         raise AssertionError(cmd)
 
@@ -1051,11 +1051,11 @@ def test_validate_macho_linkage_allows_bundle_without_install_id_and_skips_otool
     def fake_run(cmd):
         if cmd[:2] == ['lipo', '-archs']:
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{bundle}:\n@loader_path/libexample.dylib (compatibility version 1.0.0, current version 1.0.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{bundle}:\n\t@loader_path/libexample.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D must not be used')
         raise AssertionError(cmd)
 
@@ -1068,7 +1068,7 @@ def test_validate_macho_linkage_rejects_absolute_install_id_inside_app(monkeypat
     validator = _load_release_artifact_validator()
     app = tmp_path / 'Example.app'
     dylib = app / 'Contents/Resources/python-runtime/lib/libexample.dylib'
-    dylib.parent.mkdir(parents=True)
+    dylib.parent.mkdir(parents=True, exist_ok=True)
     dylib.write_bytes(b'macho')
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
 
@@ -1079,9 +1079,9 @@ def test_validate_macho_linkage_rejects_absolute_install_id_inside_app(monkeypat
     def fake_run(cmd):
         if cmd[:2] == ['lipo', '-archs']:
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{dylib}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{dylib}:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return f'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 80\nname {dylib} (offset 24)\n'
         raise AssertionError(cmd)
 
@@ -1091,4 +1091,53 @@ def test_validate_macho_linkage_rejects_absolute_install_id_inside_app(monkeypat
         validator._validate_macho_linkage(dylib, app)
         assert False
     except SystemExit as exc:
-        assert 'absolute Mach-O install ID' in str(exc)
+        assert 'category=install_id ref=libexample.dylib' in str(exc)
+
+
+def test_validate_macho_linkage_handles_universal_bundle_and_matching_dylib_ids(monkeypatch, tmp_path):
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    bundle = app / 'Contents/Resources/python-runtime/lib/python3.11/site-packages/ada92cb5d92a588d1b93__mypyc.cpython-311-darwin.so'
+    dylib = app / 'Contents/Resources/python-runtime/lib/libexample.dylib'
+    bundle.parent.mkdir(parents=True)
+    dylib.parent.mkdir(parents=True, exist_ok=True)
+    bundle.write_bytes(b'macho')
+    dylib.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    def fake_file(cmd, check=False, capture_output=True, text=True):
+        if cmd[0] == 'file':
+            kind = 'bundle' if str(cmd[1]).endswith('.so') else 'dynamically linked shared library'
+            return subprocess.CompletedProcess(cmd, 0, f'Mach-O universal binary {kind}', '')
+        raise AssertionError(cmd)
+
+    ids = {'x86_64': '@rpath/libexample.dylib', 'arm64': '@rpath/libexample.dylib'}
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'x86_64 arm64'
+        if cmd[0] == 'otool' and '-L' in cmd:
+            path = Path(cmd[-1])
+            arch = cmd[cmd.index('-arch') + 1]
+            return f'{path} (architecture {arch}):\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
+        if cmd[0] == 'otool' and '-l' in cmd:
+            path = Path(cmd[-1])
+            if path == bundle:
+                return 'Load command 0\ncmd LC_RPATH\ncmdsize 32\npath @loader_path (offset 12)\n'
+            arch = cmd[cmd.index('-arch') + 1]
+            return f'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 64\nname {ids[arch]} (offset 24)\n'
+        if cmd[0] == 'otool' and '-D' in cmd:
+            raise AssertionError('generic otool -D must not be used')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_file)
+    monkeypatch.setattr(validator, '_run', fake_run)
+    validator._validate_macho_linkage(bundle, app)
+    validator._validate_macho_linkage(dylib, app)
+
+    ids['arm64'] = '@rpath/libdifferent.dylib'
+    try:
+        validator._validate_macho_linkage(dylib, app)
+        assert False
+    except SystemExit as exc:
+        assert 'install IDs differ by architecture' in str(exc)

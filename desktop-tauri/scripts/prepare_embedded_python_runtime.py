@@ -142,18 +142,71 @@ def _parse_otool_install_ids(load_commands: str) -> list[str]:
     return ids
 
 def _otool_install_id(path: Path) -> str:
-    ids = _parse_otool_install_ids(_otool(["otool", "-l", str(path)]))
-    if len(ids) != 1:
+    ids_by_arch = _otool_install_ids_by_arch(path)
+    flat_ids = [ids[0] for ids in ids_by_arch.values() if ids]
+    if not ids_by_arch or any(len(ids) != 1 for ids in ids_by_arch.values()) or len(set(flat_ids)) != 1:
         raise RuntimePrepError(f"expected exactly one libpython install ID in {path}")
-    return ids[0]
+    return flat_ids[0]
+
+def _macho_archs(path: Path) -> list[str]:
+    archs = _otool(["lipo", "-archs", str(path)]).split()
+    if not archs:
+        raise RuntimePrepError(f"Mach-O file has no architectures: {path}")
+    if "arm64" not in archs:
+        raise RuntimePrepError(f"Mach-O file is not arm64: {path}")
+    return archs
+
+def _parse_otool_libraries(output: str, owner: Path, architecture: str | None) -> list[str]:
+    owner_text = str(owner)
+    expected_headers = {f"{owner_text}:"}
+    if architecture is not None:
+        expected_headers.add(f"{owner_text} (architecture {architecture}):")
+    metadata = " (compatibility version "
+    deps: list[str] = []
+    saw_header = False
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        stripped = raw_line.strip()
+        is_header = stripped.endswith(":") and not raw_line[:1].isspace()
+        if is_header:
+            if stripped not in expected_headers:
+                raise RuntimePrepError(f"unexpected otool -L header for {owner.name}")
+            if saw_header:
+                raise RuntimePrepError(f"duplicate otool -L header for {owner.name}")
+            saw_header = True
+            continue
+        if not saw_header:
+            raise RuntimePrepError(f"dependency before otool -L header for {owner.name}")
+        if not raw_line[:1].isspace():
+            raise RuntimePrepError(f"malformed otool -L record for {owner.name}")
+        if metadata in stripped:
+            stripped = stripped[:stripped.index(metadata)]
+        if not stripped:
+            raise RuntimePrepError(f"malformed empty otool -L dependency for {owner.name}")
+        deps.append(stripped)
+    if not saw_header:
+        raise RuntimePrepError(f"missing otool -L header for {owner.name}")
+    return deps
+
+def _otool_load_deps_by_arch(path: Path) -> dict[str, list[str]]:
+    return {
+        arch: _parse_otool_libraries(
+            _otool(["otool", "-arch", arch, "-L", str(path)]),
+            path,
+            arch,
+        )
+        for arch in _macho_archs(path)
+    }
+
+def _otool_load_commands_by_arch(path: Path) -> dict[str, str]:
+    return {arch: _otool(["otool", "-arch", arch, "-l", str(path)]) for arch in _macho_archs(path)}
+
+def _otool_install_ids_by_arch(path: Path) -> dict[str, list[str]]:
+    return {arch: _parse_otool_install_ids(output) for arch, output in _otool_load_commands_by_arch(path).items()}
 
 def _otool_load_deps(path: Path) -> list[str]:
-    deps: list[str] = []
-    for line in _otool(["otool", "-L", str(path)]).splitlines()[1:]:
-        dep = line.strip().split(" ", 1)[0]
-        if dep:
-            deps.append(dep)
-    return deps
+    return [dep for deps in _otool_load_deps_by_arch(path).values() for dep in deps]
 
 def _install_name_tool(args: list[str]) -> None:
     run(["install_name_tool", *args])
@@ -181,19 +234,30 @@ def _unique_runtime_macho_files(runtime: Path) -> list[Path]:
     return files
 
 def _add_rpath_if_missing(path: Path, rpath: str) -> None:
-    existing = _parse_otool_rpaths(_otool(["otool", "-l", str(path)]))
-    if rpath not in existing:
-        _ensure_owner_write(path)
-        _install_name_tool(["-add_rpath", rpath, str(path)])
+    existing_by_arch = {
+        arch: _parse_otool_rpaths(load_commands)
+        for arch, load_commands in _otool_load_commands_by_arch(path).items()
+    }
+    if all(rpath in existing for existing in existing_by_arch.values()):
+        return
+    _ensure_owner_write(path)
+    _install_name_tool(["-add_rpath", rpath, str(path)])
+    verified_by_arch = {
+        arch: _parse_otool_rpaths(load_commands)
+        for arch, load_commands in _otool_load_commands_by_arch(path).items()
+    }
+    if any(rpath not in verified for verified in verified_by_arch.values()):
+        raise RuntimePrepError(f"failed to add required LC_RPATH to every architecture in {path}")
 
 def _normalize_stale_libpython_loads(runtime: Path, old_id: str, normalized_id: str, major: int, minor: int) -> None:
     bin_dir = (runtime / "bin").resolve()
     dynload_dir = (runtime / "lib" / f"python{major}.{minor}" / "lib-dynload").resolve()
     for path in _unique_runtime_macho_files(runtime):
-        deps = _otool_load_deps(path)
-        if old_id not in deps:
+        deps_by_arch = _otool_load_deps_by_arch(path)
+        stale_archs = [arch for arch, deps in deps_by_arch.items() if old_id in deps]
+        if not stale_archs:
             continue
-        if deps.count(old_id) > 1:
+        if any(deps_by_arch[arch].count(old_id) > 1 for arch in stale_archs):
             raise RuntimePrepError(f"duplicate stale libpython load command in {path}")
         if path.parent.resolve() == bin_dir:
             required_rpath = "@executable_path/../lib"
@@ -204,7 +268,7 @@ def _normalize_stale_libpython_loads(runtime: Path, old_id: str, normalized_id: 
         _ensure_owner_write(path)
         _install_name_tool(["-change", old_id, normalized_id, str(path)])
         _add_rpath_if_missing(path, required_rpath)
-        if old_id in _otool_load_deps(path):
+        if any(old_id in deps for deps in _otool_load_deps_by_arch(path).values()):
             raise RuntimePrepError(f"failed to normalize stale libpython dependency in {path}")
 
 def normalize_python_build_standalone_macos_runtime(runtime: Path, manifest: dict) -> None:
@@ -288,6 +352,9 @@ def _macho_file_kind(file_description: str) -> str:
         return "executable"
     return "other"
 
+def _safe_macho_ref(value: str) -> str:
+    return Path(value).name or value[:80]
+
 def audit_macho_runtime(runtime: Path) -> None:
     if platform.system() != "Darwin":
         return
@@ -300,22 +367,37 @@ def audit_macho_runtime(runtime: Path) -> None:
         if "Mach-O" not in result.stdout:
             continue
         file_description = result.stdout
-        archs = _otool(["lipo", "-archs", str(path)])
-        if "arm64" not in archs:
-            raise RuntimePrepError(f"Mach-O file is not arm64: {path}")
-        deps = _otool(["otool", "-L", str(path)]).splitlines()[1:]
-        for dep_line in deps:
-            dep = dep_line.strip().split(" ", 1)[0]
-            _validate_native_ref(dep, path)
-        load_commands = _otool(["otool", "-l", str(path)])
-        install_ids = _parse_otool_install_ids(load_commands)
+        deps_by_arch = _otool_load_deps_by_arch(path)
+        for arch, deps in deps_by_arch.items():
+            for dep in deps:
+                try:
+                    _validate_native_ref(dep, path)
+                except RuntimePrepError as exc:
+                    rel = path.relative_to(runtime)
+                    raise RuntimePrepError(f"native audit failed in {rel}: arch={arch} category=dependency ref={_safe_macho_ref(dep)}") from exc
+        load_commands_by_arch = _otool_load_commands_by_arch(path)
+        install_ids_by_arch = {arch: _parse_otool_install_ids(output) for arch, output in load_commands_by_arch.items()}
         kind = _macho_file_kind(file_description)
-        if kind == "dylib" and len(install_ids) != 1:
-            raise RuntimePrepError(f"Mach-O dylib is missing LC_ID_DYLIB: {path}")
-        for install_id in install_ids:
-            _validate_native_ref(install_id, path, install_id=True)
-        for rpath in _parse_otool_rpaths(load_commands):
-            _validate_native_ref(rpath, path, rpath=True)
+        normalized_ids: list[str] = []
+        for arch, install_ids in install_ids_by_arch.items():
+            if kind == "dylib" and len(install_ids) != 1:
+                raise RuntimePrepError(f"Mach-O dylib is missing LC_ID_DYLIB: {path} [arch={arch} category=install_id]")
+            for install_id in install_ids:
+                try:
+                    _validate_native_ref(install_id, path, install_id=True)
+                except RuntimePrepError as exc:
+                    rel = path.relative_to(runtime)
+                    raise RuntimePrepError(f"native audit failed in {rel}: arch={arch} category=install_id ref={_safe_macho_ref(install_id)}") from exc
+                normalized_ids.append(install_id)
+        if kind == "dylib" and len(set(normalized_ids)) != 1:
+            raise RuntimePrepError(f"Mach-O dylib install IDs differ by architecture: {path}")
+        for arch, load_commands in load_commands_by_arch.items():
+            for rpath in _parse_otool_rpaths(load_commands):
+                try:
+                    _validate_native_ref(rpath, path, rpath=True)
+                except RuntimePrepError as exc:
+                    rel = path.relative_to(runtime)
+                    raise RuntimePrepError(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}") from exc
 
 def _uninstall_llama_cpp(py: Path) -> None:
     run([str(py), "-m", "pip", "uninstall", "-y", "llama-cpp-python"])

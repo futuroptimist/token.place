@@ -512,9 +512,9 @@ def test_audit_macho_runtime_rejects_homebrew_openssl(monkeypatch, tmp_path):
     monkeypatch.setattr(prep.subprocess, 'run', fake_run)
     def fake_otool(cmd):
         if cmd[0] == 'lipo': return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{binary}:\n/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib (compatibility version 3.0.0, current version 3.0.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{binary}:\n\t/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib (compatibility version 3.0.0, current version 3.0.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'cmd LC_ID_DYLIB\ncmdsize 48\nname @rpath/libllama-common.0.dylib (offset 24)'
         return ''
     monkeypatch.setattr(prep, '_otool', fake_otool)
@@ -522,7 +522,7 @@ def test_audit_macho_runtime_rejects_homebrew_openssl(monkeypatch, tmp_path):
         prep.audit_macho_runtime(tmp_path / 'python-runtime')
         assert False
     except prep.RuntimePrepError as exc:
-        assert 'forbidden Mach-O reference' in str(exc)
+        assert 'category=dependency ref=libssl.3.dylib' in str(exc)
 
 
 def test_existing_valid_rejects_forbidden_linkage(tmp_path, monkeypatch):
@@ -610,8 +610,9 @@ def test_normalize_stale_libpython_load_rewrites_interpreter_rpath_once(tmp_path
 
     monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
-    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_otool_load_deps_by_arch', lambda path: {'arm64': deps[path]})
     monkeypatch.setattr(prep, '_parse_otool_rpaths', lambda out: rpaths[py.resolve()])
+    monkeypatch.setattr(prep, '_otool_load_commands_by_arch', lambda path: {'arm64': ''})
     monkeypatch.setattr(prep, '_otool', lambda cmd: '')
 
     def fake_install(args):
@@ -644,8 +645,9 @@ def test_normalize_stale_libpython_load_adds_dynload_rpath_without_duplicate(tmp
 
     monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
-    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_otool_load_deps_by_arch', lambda path: {'arm64': deps[path]})
     monkeypatch.setattr(prep, '_parse_otool_rpaths', lambda out: rpaths[ext.resolve()])
+    monkeypatch.setattr(prep, '_otool_load_commands_by_arch', lambda path: {'arm64': ''})
     monkeypatch.setattr(prep, '_otool', lambda cmd: '')
 
     def fake_install(args):
@@ -671,7 +673,7 @@ def test_normalize_stale_libpython_load_rejects_ambiguous_layout_and_arbitrary_i
 
     monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
-    monkeypatch.setattr(prep, '_otool_load_deps', lambda path: deps[path])
+    monkeypatch.setattr(prep, '_otool_load_deps_by_arch', lambda path: {'arm64': deps[path]})
     monkeypatch.setattr(prep, '_install_name_tool', lambda args: mutations.append(args))
 
     try:
@@ -777,9 +779,9 @@ def test_audit_still_rejects_original_install_libpython_reference(monkeypatch, t
     def fake_otool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{binary}:\n/install/lib/libpython3.11.dylib (compatibility version 3.11.0, current version 3.11.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{binary}:\n\t/install/lib/libpython3.11.dylib (compatibility version 3.11.0, current version 3.11.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'cmd LC_ID_DYLIB\ncmdsize 56\nname /install/lib/libpython3.11.dylib (offset 24)'
         return ''
 
@@ -788,7 +790,7 @@ def test_audit_still_rejects_original_install_libpython_reference(monkeypatch, t
         prep.audit_macho_runtime(tmp_path / 'python-runtime')
         assert False
     except prep.RuntimePrepError as exc:
-        assert 'absolute' in str(exc)
+        assert 'category=dependency ref=libpython3.11.dylib' in str(exc)
 
 def test_parse_otool_install_ids_handles_spaces_and_rejects_bad_blocks():
     assert prep._parse_otool_install_ids(
@@ -828,11 +830,11 @@ def test_audit_macho_runtime_allows_bundle_and_executable_without_install_id(mon
         calls.append(cmd[:2])
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{cmd[2]}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{cmd[-1]}:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D must not be used')
         raise AssertionError(cmd)
 
@@ -856,11 +858,11 @@ def test_audit_macho_runtime_requires_real_dylib_install_id(monkeypatch, tmp_pat
     def fake_otool(cmd):
         if cmd[0] == 'lipo':
             return 'arm64'
-        if cmd[:2] == ['otool', '-L']:
-            return f'{binary}:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
-        if cmd[:2] == ['otool', '-l']:
+        if cmd[0] == 'otool' and '-L' in cmd:
+            return f'{binary}:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)'
+        if cmd[0] == 'otool' and '-l' in cmd:
             return 'Load command 0\ncmd LC_RPATH\ncmdsize 48\npath @loader_path (offset 12)\n'
-        if cmd[:2] == ['otool', '-D']:
+        if cmd[0] == 'otool' and '-D' in cmd:
             raise AssertionError('generic otool -D must not be used')
         raise AssertionError(cmd)
 
@@ -871,3 +873,133 @@ def test_audit_macho_runtime_requires_real_dylib_install_id(monkeypatch, tmp_pat
         assert False
     except prep.RuntimePrepError as exc:
         assert 'missing LC_ID_DYLIB' in str(exc)
+
+
+def test_parse_otool_libraries_preserves_spaces_and_rejects_mismatched_arch(tmp_path):
+    owner = tmp_path / 'python-runtime' / 'lib' / 'path with spaces' / 'libexample.dylib'
+    output = (
+        f'\n{owner} (architecture arm64):\n'
+        '\t@loader_path/lib with spaces.dylib '
+        '(compatibility version 1.0.0, current version 1.0.0)\n'
+    )
+    assert prep._parse_otool_libraries(output, owner, 'arm64') == ['@loader_path/lib with spaces.dylib']
+    try:
+        prep._parse_otool_libraries(output, owner, 'x86_64')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'unexpected otool -L header' in str(exc)
+
+
+def test_universal_mypyc_bundle_loads_are_parsed_per_architecture(monkeypatch, tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    bundle = runtime / 'lib/python3.11/site-packages/ada92cb5d92a588d1b93__mypyc.cpython-311-darwin.so'
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit bundle x86_64] [arm64:Mach-O 64-bit bundle arm64]', '')
+        raise AssertionError(cmd)
+
+    calls = []
+
+    def fake_otool(cmd):
+        calls.append(cmd)
+        if cmd[0] == 'lipo':
+            return 'x86_64 arm64'
+        if cmd[0] == 'otool' and '-L' in cmd:
+            arch = cmd[cmd.index('-arch') + 1]
+            return (
+                f'{bundle} (architecture {arch}):\n'
+                '\t/usr/lib/libSystem.B.dylib '
+                '(compatibility version 1.0.0, current version 1292.100.5)\n'
+            )
+        if cmd[0] == 'otool' and '-l' in cmd:
+            return 'Load command 0\ncmd LC_RPATH\ncmdsize 32\npath @loader_path (offset 12)\n'
+        if cmd[0] == 'otool' and '-D' in cmd:
+            raise AssertionError('generic otool -D must not be used')
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+
+    prep.audit_macho_runtime(runtime)
+    deps = prep._otool_load_deps_by_arch(bundle)
+    assert deps == {'x86_64': ['/usr/lib/libSystem.B.dylib'], 'arm64': ['/usr/lib/libSystem.B.dylib']}
+    assert all(str(bundle) not in arch_deps for arch_deps in deps.values())
+    assert not any(cmd[0] == 'otool' and '-D' in cmd for cmd in calls)
+
+
+def test_universal_dylib_install_ids_must_match_by_arch(monkeypatch, tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    dylib = runtime / 'lib/libexample.dylib'
+    dylib.parent.mkdir(parents=True)
+    dylib.write_bytes(b'macho')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+
+    def fake_run(cmd, *, text=True, capture_output=True, check=False):
+        if cmd[0] == 'file':
+            return subprocess.CompletedProcess(cmd, 0, 'Mach-O universal binary with 2 architectures: dynamically linked shared library', '')
+        raise AssertionError(cmd)
+
+    ids = {'x86_64': '@rpath/libexample.dylib', 'arm64': '@rpath/libexample.dylib'}
+
+    def fake_otool(cmd):
+        if cmd[0] == 'lipo':
+            return 'x86_64 arm64'
+        if cmd[0] == 'otool' and '-L' in cmd:
+            arch = cmd[cmd.index('-arch') + 1]
+            return f'{dylib} (architecture {arch}):\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
+        if cmd[0] == 'otool' and '-l' in cmd:
+            arch = cmd[cmd.index('-arch') + 1]
+            return f'Load command 0\ncmd LC_ID_DYLIB\ncmdsize 64\nname {ids[arch]} (offset 24)\n'
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
+    monkeypatch.setattr(prep, '_otool', fake_otool)
+    prep.audit_macho_runtime(runtime)
+
+    ids['arm64'] = '@rpath/libdifferent.dylib'
+    try:
+        prep.audit_macho_runtime(runtime)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'install IDs differ by architecture' in str(exc)
+
+
+def test_stale_libpython_duplicate_within_one_arch_fails_but_repeated_by_arch_allowed(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    py = runtime / 'bin' / 'python3.11'
+    py.parent.mkdir(parents=True)
+    py.write_bytes(b'macho')
+    old = '/install/lib/libpython3.11.dylib'
+    new = '@rpath/libpython3.11.dylib'
+    deps_by_arch = {'x86_64': [old], 'arm64': [old]}
+    rpaths = []
+    mutations = []
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+    monkeypatch.setattr(prep, '_otool_load_deps_by_arch', lambda path: deps_by_arch)
+    monkeypatch.setattr(prep, '_otool_load_commands_by_arch', lambda path: {'x86_64': '', 'arm64': ''})
+    monkeypatch.setattr(prep, '_parse_otool_rpaths', lambda output: rpaths)
+
+    def fake_install(args):
+        mutations.append(args)
+        if args[0] == '-change':
+            deps_by_arch['x86_64'] = [new]
+            deps_by_arch['arm64'] = [new]
+        if args[0] == '-add_rpath':
+            rpaths.append(args[1])
+
+    monkeypatch.setattr(prep, '_install_name_tool', fake_install)
+    prep._normalize_stale_libpython_loads(runtime, old, new, 3, 11)
+    assert [args[0] for args in mutations].count('-change') == 1
+
+    deps_by_arch['arm64'] = [old, old]
+    try:
+        prep._normalize_stale_libpython_loads(runtime, old, new, 3, 11)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'duplicate stale libpython load command' in str(exc)

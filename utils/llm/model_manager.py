@@ -14,6 +14,8 @@ import importlib.metadata
 import inspect
 import subprocess
 import tempfile
+import hashlib
+import uuid
 import queue
 import signal
 import threading
@@ -76,6 +78,10 @@ _INIT_SAFE_CATEGORY_ALIASES = {
 }
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
+    'runtime_model_path_unavailable',
+    'runtime_model_load_failed',
+    'runtime_model_vocab_failed',
+    'runtime_batch_create_failed',
     'runtime_context_create_failed',
     'runtime_context_create_unsupported_kwarg',
     'runtime_context_create_rope_yarn_config',
@@ -2233,6 +2239,39 @@ def _sanitize_error_summary(message):
     return type(message).__name__ + ':redacted'
 
 
+
+def _classify_initialization_exception(exc):
+    text = str(exc or '').lower()
+    if isinstance(exc, FileNotFoundError) or any(term in text for term in ('no such file', 'cannot open model', 'model path does not exist', 'failed to open')):
+        return 'runtime_model_path_unavailable'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'parse')):
+        return 'runtime_model_vocab_failed'
+    if 'batch' in text and any(term in text for term in ('fail', 'create', 'alloc')):
+        return 'runtime_batch_create_failed'
+    if 'failed to load model' in text or 'llama_model_load' in text or ('model' in text and 'load' in text and 'fail' in text):
+        return 'runtime_model_load_failed'
+    if 'unexpected keyword argument' in text or 'unsupported' in text and ('kwarg' in text or 'argument' in text):
+        return 'runtime_context_create_unsupported_kwarg'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'orig', 'context'))):
+        return 'runtime_context_create_rope_yarn_config'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'oom', 'failed')):
+        return 'runtime_context_create_kv_cache_allocation'
+    if 'metal' in text and any(term in text for term in ('buffer', 'graph', 'max size', 'too large')):
+        return 'runtime_context_create_metal_buffer_limit'
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
+        return 'runtime_context_create_metal_memory'
+    if any(term in text for term in ('cublas_status_alloc_failed', 'cudamalloc', 'cuda malloc', 'cuda oom', 'cuda out of memory')):
+        return 'runtime_context_create_cuda_memory'
+    if 'ggml_cuda' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory')):
+        return 'runtime_context_create_cuda_memory'
+    if 'cuda' in text and any(term in text for term in ('out of memory', 'oom', 'cudamalloc', 'alloc failed', 'allocation failed', 'buffer allocation failed')):
+        return 'runtime_context_create_cuda_memory'
+    if 'cuda' in text and any(term in text for term in ('buffer', 'resource', 'allocation')):
+        return 'runtime_context_create_cuda_buffer_limit'
+    if 'failed to create llama_context' in text or 'llamacontext' in text:
+        return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
+
 def _worker_safe_plain_completion_eval_return_code(exc):
     # This helper intentionally mirrors the parent-module parser. It lives
     # inside _LLAMA_CPP_RUNTIME_WORKER_CODE so the standalone subprocess can
@@ -3086,14 +3125,19 @@ try:
     init_payload = json.loads(init_line)
     llama_cpp = importlib.import_module('llama_cpp')
     init_args = init_payload.get('args', [])
-    llama = llama_cpp.Llama(*init_args, **init_payload.get('kwargs', {}))
     init_kwargs = init_payload.get('kwargs', {})
+    init_model_path = init_kwargs.get('model_path') if isinstance(init_kwargs, dict) else None
+    if init_model_path is None and isinstance(init_args, list) and init_args:
+        init_model_path = init_args[0]
+    if init_model_path is not None and not os.path.exists(str(init_model_path)) and not _testing_render_template_fallback_allowed(init_model_path):
+        raise FileNotFoundError('model path does not exist')
+    llama = llama_cpp.Llama(*init_args, **init_kwargs)
     _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
     if _token_place_model_path is None and isinstance(init_kwargs, dict):
         _token_place_model_path = init_kwargs.get('model_path')
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
 except Exception as exc:
-    _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_generation_exception(exc), 'traceback': traceback.format_exc()})
+    _emit({'status': 'error', 'error': type(exc).__name__ + ':redacted', 'exception_type': type(exc).__name__, 'safe_error_category': _classify_initialization_exception(exc)})
     raise SystemExit(1)
 
 for line in sys.stdin:
@@ -4351,8 +4395,16 @@ class ModelManager:
         """
 
         n_ctx = int(self.config.get('model.context_size', 8192))
+        path_was_relative = not os.path.isabs(str(self.model_path))
+        parent_model_path_exists = os.path.exists(self.model_path)
+        canonical_model_path = os.path.abspath(self.model_path)
+        self.last_model_path_boundary_diagnostics = {
+            'path_was_relative': path_was_relative,
+            'parent_model_path_exists': parent_model_path_exists,
+            'parent_child_model_path_identity_preserved': True,
+        }
         kwargs: Dict[str, Any] = {
-            'model_path': self.model_path,
+            'model_path': canonical_model_path,
             'n_gpu_layers': n_gpu_layers,
             'n_ctx': n_ctx,
             'verbose': llama_cpp_verbose_logging_enabled(),
@@ -4558,78 +4610,116 @@ class ModelManager:
         os.makedirs(self.models_dir, exist_ok=True)
         return self.models_dir
 
+
+    def _canonical_managed_model_path(self) -> str:
+        return os.path.abspath(os.path.join(self.models_dir, self.file_name))
+
+    def _is_managed_canonical_model_path(self, file_path: Optional[str] = None) -> bool:
+        try:
+            return os.path.normcase(os.path.abspath(file_path or self.model_path)) == os.path.normcase(self._canonical_managed_model_path())
+        except (TypeError, ValueError, OSError):
+            return False
+
+    def _expected_model_artifact_metadata(self) -> Dict[str, Any]:
+        profile_filename = self.model_profile.get('filename')
+        profile_url = self.model_profile.get('download_url')
+        # Explicit user/test artifact overrides are not the pinned managed Qwen artifact.
+        if self.file_name != profile_filename or self.url != profile_url:
+            return {'size_bytes': None, 'sha256': None}
+        size = self.model_profile.get('size_bytes')
+        sha = self.model_profile.get('sha256')
+        return {
+            'size_bytes': int(size) if isinstance(size, int) or (isinstance(size, str) and str(size).isdigit()) else None,
+            'sha256': str(sha).lower() if isinstance(sha, str) and sha else None,
+        }
+
+    def _validate_gguf_magic(self, file_path: str) -> bool:
+        try:
+            with open(file_path, 'rb') as fh:
+                return fh.read(4) == b'GGUF'
+        except OSError:
+            return False
+
+    def _validate_existing_model_artifact(self, *, diagnose_hash: bool = False) -> tuple[bool, str]:
+        if not os.path.exists(self.model_path):
+            return False, 'missing'
+        meta = self._expected_model_artifact_metadata()
+        try:
+            actual_size = os.path.getsize(self.model_path)
+        except OSError:
+            return False, 'stat_failed'
+        if meta['size_bytes'] is not None and actual_size != meta['size_bytes']:
+            return False, 'size_mismatch'
+        if not self._validate_gguf_magic(self.model_path):
+            return False, 'bad_magic'
+        if diagnose_hash and meta['sha256']:
+            digest = hashlib.sha256()
+            try:
+                with open(self.model_path, 'rb') as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                        digest.update(chunk)
+            except OSError:
+                return False, 'hash_read_failed'
+            if digest.hexdigest().lower() != meta['sha256']:
+                return False, 'checksum_mismatch'
+        return True, 'valid'
+
     def download_file_in_chunks(self, file_path: str, url: str, chunk_size_mb: int) -> bool:
-        """
-        Download a file in chunks with progress reporting.
-
-        Args:
-            file_path: The path to save the file to
-            url: The URL to download from
-            chunk_size_mb: The chunk size in MB
-
-        Returns:
-            bool: True if download was successful, False otherwise
-        """
-        chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
+        """Transactionally download and verify a model artifact."""
+        chunk_size_bytes = max(1, chunk_size_mb) * 1024 * 1024
         response = None
-
+        final_path = os.path.abspath(file_path)
+        tmp_path = os.path.join(os.path.dirname(final_path) or '.', f'.{os.path.basename(final_path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
+        meta = self._expected_model_artifact_metadata()
+        expected_size = meta['size_bytes']
+        expected_sha = meta['sha256']
+        progress = 0
+        digest = hashlib.sha256()
         try:
             response = requests.get(url, stream=True, timeout=self.download_timeout)
-        except requests.Timeout as e:
-            self.log_error(f"Error: Download request timed out: {e}")
-            return False
-        except requests.RequestException as e:
-            self.log_error(f"Error: Unable to start download request: {e}")
-            return False
-
-        if response.status_code != 200:
-            self.log_error(f"Error: Unable to download file, status code {response.status_code}")
-            return False
-
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        if total_size_in_bytes == 0:
-            self.log_error("Error: Content-Length header is missing or zero.")
-            return False
-
-        total_size_in_mb = total_size_in_bytes / (1024 * 1024)
-        progress = 0
-        start_time = time.time()
-        times = []
-        bytes_downloaded = []
-
-        try:
-            with open(file_path, 'wb') as file:
+            if response.status_code != 200:
+                self.log_error(f"Error: Unable to download file, status code {response.status_code}")
+                return False
+            header_length = response.headers.get('content-length')
+            if not header_length or not str(header_length).isdigit() or int(header_length) <= 0:
+                self.log_error("Error: Content-Length header is missing or invalid.")
+                return False
+            content_length = int(header_length)
+            if expected_size is not None and content_length != expected_size:
+                self.log_error("Error: Download Content-Length does not match pinned artifact size.")
+                return False
+            with open(tmp_path, 'wb') as file:
+                first = True
                 for data in response.iter_content(chunk_size=chunk_size_bytes):
                     if not data:
-                        self.log_warning("Warning: Received empty data chunk.")
                         continue
-
+                    if first and data[:4] != b'GGUF':
+                        self.log_error("Error: Downloaded artifact does not start with GGUF magic.")
+                        return False
+                    first = False
+                    digest.update(data)
                     file.write(data)
-                    file.flush()
-                    os.fsync(file.fileno())
-
-                    elapsed_time = time.time() - start_time
                     progress += len(data)
-                    times.append(elapsed_time)
-                    bytes_downloaded.append(progress)
-
-                    # Keep only the last 10 seconds of data
-                    times = [t for t in times if elapsed_time - t <= 10]
-                    bytes_downloaded = bytes_downloaded[-len(times):]
-
-                    # Calculate speed and estimated time remaining
-                    speed = sum(bytes_downloaded) / sum(times) if times else 0
-                    eta = (total_size_in_bytes - progress) / speed if speed else 0
-
-                    downloaded_mb = progress / (1024 * 1024)
-                    done = int(50 * progress / total_size_in_bytes)
-                    if not self.config.is_production:
-                        # Progress output is cosmetic and difficult to test
-                        print(
-                            f'\r[{"=" * done}{" " * (50-done)}] {progress * 100 / total_size_in_bytes:.2f}% ({downloaded_mb:.2f}/{total_size_in_mb:.2f} MB) ETA: {eta:.2f}s',
-                            end='\r',
-                            file=sys.stderr,
-                        )  # pragma: no cover
+                file.flush()
+                os.fsync(file.fileno())
+            if progress != content_length:
+                self.log_error("Download failed or byte count does not match Content-Length.")
+                return False
+            if expected_size is not None and progress != expected_size:
+                self.log_error("Download failed or byte count does not match pinned artifact size.")
+                return False
+            if expected_sha and digest.hexdigest().lower() != expected_sha:
+                self.log_error("Download failed checksum validation.")
+                return False
+            if not self._validate_gguf_magic(tmp_path):
+                self.log_error("Downloaded artifact failed GGUF magic validation.")
+                return False
+            os.replace(tmp_path, final_path)
+            self.log_info(f"File Size Immediately After Download: {os.path.getsize(final_path)} bytes")
+            return True
+        except (requests.Timeout, requests.RequestException) as e:
+            self.log_error(f"Error: Unable to download file: {e}")
+            return False
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
             return False
@@ -4638,35 +4728,38 @@ class ModelManager:
                 close = getattr(response, 'close', None)
                 if callable(close):
                     close()
-
-        if os.path.exists(file_path) and os.path.getsize(file_path) == total_size_in_bytes:
-            self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
-            return True
-        else:
-            self.log_error("Download failed or file size does not match.")
-            return False
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def download_model_if_needed(self) -> bool:
-        """
-        Download the model file if it doesn't exist.
-
-        Returns:
-            bool: True if the model file exists (either already present or successfully downloaded),
-                 False if download failed
-        """
+        """Download the model if missing and validate managed artifacts."""
         self.create_models_directory()
 
-        if not os.path.exists(self.model_path):
-            self.log_info(f"Downloading {self.file_name}...")
-            if self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb):
-                self.log_info("Download completed!")
+        if os.path.exists(self.model_path):
+            valid, reason = self._validate_existing_model_artifact(diagnose_hash=False)
+            if valid:
+                self.log_info(f"Model file {self.file_name} already exists and passed artifact validation.")
                 return True
-            else:
-                self.log_error("Download failed or file is empty.")
+            self.log_error(f"Model artifact validation failed: {reason}")
+            if not self._is_managed_canonical_model_path():
+                self.last_runtime_init_error = 'model_artifact_invalid'
                 return False
+            self.log_info("Attempting one bounded repair download for managed canonical model artifact.")
         else:
-            self.log_info(f"Model file {self.file_name} already exists.")
-            return True
+            self.log_info(f"Downloading {self.file_name}...")
+
+        if self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb):
+            valid, reason = self._validate_existing_model_artifact(diagnose_hash=False)
+            if valid:
+                self.log_info("Download completed and artifact validation passed!")
+                return True
+            self.log_error(f"Downloaded artifact validation failed after install: {reason}")
+            return False
+        self.log_error("Download failed or artifact validation failed.")
+        return False
 
     def _publish_qwen_64k_init_failure_readiness_diagnostics(
         self,

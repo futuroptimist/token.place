@@ -317,6 +317,8 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
         tmpdir = scratch / "tmp"
         for path in (app_data, home_dir, pycache, tmpdir):
             path.mkdir(parents=True, exist_ok=True)
+        # env is a complete replacement for the subprocess environment. Host
+        # interpreter overrides are intentionally not inherited by probes.
         env = {
             "HOME": str(home_dir),
             "TMPDIR": str(tmpdir),
@@ -404,20 +406,25 @@ def _describe_app_tree_changes(before: dict[str, AppTreeEntry], after: dict[str,
 
 def _run_with_app_mutation_guard(app_path: Path, action_name: str, action) -> None:
     before = _app_tree_fingerprint(app_path)
-    action()
+    action_error: BaseException | None = None
+    try:
+        action()
+    except BaseException as exc:
+        action_error = exc
     after = _app_tree_fingerprint(app_path)
     changes = _describe_app_tree_changes(before, after)
     if changes:
         sample = "\n".join(f"- {change}" for change in changes[:50])
         suffix = "" if len(changes) <= 50 else f"\n... {len(changes) - 50} more changes"
         _fail(f"{action_name} mutated app bundle {app_path}; executable probes must be non-mutating.\n{sample}{suffix}")
+    if action_error is not None:
+        raise action_error
 
 
 def _codesign_verify(app_path: Path) -> None:
     if platform.system() == "Darwin":
         if shutil.which("codesign") is None:
-            print("::warning::codesign not found in PATH; skipping ad-hoc signature verification on this macOS machine.")
-            return
+            _fail("codesign not found in PATH on this macOS machine; cannot verify ad-hoc signature")
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
 
@@ -790,6 +797,8 @@ def main() -> None:
             with _copy_app_for_runtime_validation(app_path) as probe_dir:
                 probe_app = Path(probe_dir) / app_path.name
                 _validate_embedded_python_runtime_non_mutating(probe_app)
+
+    _codesign_verify(app_path)
 
     if args.expect_notarization:
         _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])

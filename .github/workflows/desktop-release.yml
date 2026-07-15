@@ -412,7 +412,9 @@ jobs:
 
       - name: Install macOS validation test dependencies
         if: runner.os == 'macOS'
-        run: python -m pip install --upgrade pip pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'pytest>=8.1'
 
       - name: Validate macOS staged artifact guardrails
         if: runner.os == 'macOS'

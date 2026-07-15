@@ -279,6 +279,8 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
         return 'hdiutil info snapshot'
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: '')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
 
@@ -675,16 +677,23 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
         captured['env'] = env
         return subprocess.CompletedProcess(cmd, 0, 'ok', '')
 
-    monkeypatch.setenv('TOKEN_PLACE_PYTHON', '/usr/bin/python3')
-    monkeypatch.setenv('TOKEN_PLACE_SIDECAR_PYTHON', '/usr/bin/python3')
+    forbidden_parent_env = {
+        'PYTHONHOME': '/bad/pythonhome',
+        'PYTHONSTARTUP': '/bad/startup.py',
+        'PYTHONUSERBASE': '/bad/userbase',
+        'TOKEN_PLACE_PYTHON': '/usr/bin/python3',
+        'TOKEN_PLACE_SIDECAR_PYTHON': '/usr/bin/python3',
+    }
+    for key, value in forbidden_parent_env.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
     assert captured['env']['PYTHONPATH'] == str((app / 'Contents' / 'Resources' / 'python').absolute())
-    assert 'TOKEN_PLACE_PYTHON' not in captured['env']
-    assert 'TOKEN_PLACE_SIDECAR_PYTHON' not in captured['env']
+    for key in forbidden_parent_env:
+        assert key not in captured['env']
 
 
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
@@ -710,7 +719,8 @@ def test_release_workflow_installs_pytest_before_macos_probe() -> None:
     assert install_index < validate_index
     install_step = workflow[install_index:validate_index]
     assert "if: runner.os == 'macOS'" in install_step
-    assert 'python -m pip install --upgrade pip pytest' in install_step
+    assert 'python -m pip install --upgrade pip' in install_step
+    assert "python -m pip install 'pytest>=8.1'" in install_step
 
 
 def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypatch, tmp_path) -> None:
@@ -1350,6 +1360,8 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     handle = MountHandle()
     cleanup_calls = []
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: '')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: handle)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: cleanup_calls.append((dmg, path)))
 
@@ -1417,8 +1429,36 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
     validator.main()
 
     assert dmg_calls == [(dmg, True)]
-    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 1
+    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
+
+
+def test_codesign_verify_fails_on_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: None)
+
+    try:
+        validator._codesign_verify(app)
+        assert False
+    except SystemExit as exc:
+        assert 'codesign not found in PATH on this macOS machine' in str(exc)
+
+
+def test_codesign_verify_skips_outside_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd))
+
+    validator._codesign_verify(app)
+
+    assert calls == []
 
 
 def test_validator_dmg_contents_rejects_missing_signed_preview_phrase(monkeypatch, tmp_path) -> None:
@@ -1658,7 +1698,13 @@ def test_app_tree_fingerprint_reports_mutations(tmp_path) -> None:
     changes = '\n'.join(validator._describe_app_tree_changes(base, validator._app_tree_fingerprint(app)))
     assert 'unsealed Python bytecode' in changes
     assert 'removed: Contents/Resources/file.txt' in changes
-    assert 'rewritten: Contents/Resources/tool' in changes or 'chmodded: Contents/Resources/tool' in changes
+    assert 'rewritten: Contents/Resources/tool' in changes
+    mode_only = app / 'Contents' / 'Resources' / 'mode-only'
+    mode_only.write_text('same', encoding='utf-8')
+    before_mode = validator._app_tree_fingerprint(app)
+    mode_only.chmod(0o755)
+    mode_changes = validator._describe_app_tree_changes(before_mode, validator._app_tree_fingerprint(app))
+    assert 'chmodded: Contents/Resources/mode-only' in mode_changes
     assert 'retargeted symlink: Contents/Resources/link' in changes
 
 

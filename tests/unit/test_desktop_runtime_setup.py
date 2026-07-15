@@ -2391,3 +2391,34 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
     assert sentinel not in emitted
+
+
+def test_probe_result_payload_carries_private_identity_but_public_result_redacts(tmp_path, monkeypatch):
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# llama_cpp')
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='metal',
+        gpu_offload_supported=True,
+        detected_device='metal',
+        interpreter=sys.executable,
+        prefix=sys.prefix,
+        llama_module_path=str(module_path),
+        llama_cpp_python_version='0.3.32',
+        qwen_64k_yarn_support='supported',
+        yarn_enum_value=2,
+        constructor_signature_inspectable=True,
+        constructor_kwarg_support={name: True for name in desktop_runtime_setup.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS},
+    )
+
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    public = desktop_runtime_setup._record_desktop_runtime_probe(dict(payload))
+    private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    assert 'llama_module_path' not in payload
+    assert payload['llama_module_path_present'] is True
+    assert desktop_runtime_setup.validate_llama_module_identity(payload['llama_module_identity'])
+    assert 'llama_module_identity' not in public
+    assert str(module_path) not in json.dumps(public)
+    assert private['llama_module_identity'] == payload['llama_module_identity']
+    assert str(module_path) not in json.dumps(private)

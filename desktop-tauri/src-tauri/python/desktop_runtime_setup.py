@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import re
 import os
 import platform as platform_module
 import subprocess
@@ -51,6 +53,40 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
+_LLAMA_MODULE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _canonical_llama_module_identity_path(module_path: Any) -> Optional[str]:
+    if not module_path:
+        return None
+    try:
+        path_text = _strip_windows_extended_path_prefix(str(module_path))
+        canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
+    except (TypeError, ValueError, OSError):
+        try:
+            canonical = os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))
+        except (TypeError, ValueError, OSError):
+            return None
+    return canonical.replace('\\', '/')
+
+
+def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
+    canonical = _canonical_llama_module_identity_path(module_path)
+    if not canonical or canonical in {'missing', 'unknown'}:
+        return None
+    digest = hashlib.sha256(f'token.place.llama_cpp.module_path.v1\0{canonical}'.encode('utf-8')).hexdigest()
+    return f'sha256:{digest}'
+
+
+def validate_llama_module_identity(identity: Any) -> Optional[str]:
+    if not isinstance(identity, str):
+        return None
+    text = identity.strip()
+    if _LLAMA_MODULE_IDENTITY_RE.fullmatch(text):
+        return text
+    return None
 
 
 @dataclass(frozen=True)
@@ -780,6 +816,8 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "dependency_target": probe.dependency_target,
         "pip_version": probe.pip_version,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
+        "llama_module_path_present": bool(probe.llama_module_path and probe.llama_module_path not in {"missing", "unknown"}),
+        "llama_module_identity": llama_module_identity_from_path(probe.llama_module_path),
         "backend": probe.backend,
         "gpu_offload_supported": probe.gpu_offload_supported,
         "constructor_kwarg_support": dict(probe.constructor_kwarg_support),
@@ -1422,6 +1460,8 @@ def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
         os.environ.pop(RUNTIME_PROBE_ENV, None)
         return result
     public_result = dict(result)
+    public_result.pop("llama_module_identity", None)
+    public_result.pop("llama_module_path", None)
     for key in (
         "yarn_rope_supported",
         "rope_scaling_type_supported",

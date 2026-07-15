@@ -375,6 +375,7 @@ jobs:
             rm -rf "${dmg_stage_dir}"
             mkdir -p "${dmg_stage_dir}"
             cp -R "${app_path}" "${dmg_stage_dir}/"
+            codesign --verify --deep --strict --verbose=4 "${dmg_stage_dir}/$(basename "${app_path}")"
             cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"
             ln -s /Applications "${dmg_stage_dir}/Applications"
             rm -f "${dmg_path}"

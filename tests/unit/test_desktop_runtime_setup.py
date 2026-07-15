@@ -2391,3 +2391,27 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
     assert sentinel not in emitted
+
+
+
+def test_probe_result_payload_uses_private_llama_module_identity_without_raw_path(tmp_path):
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    probe = _probe(backend='metal', gpu=True, device='metal', yarn=True, resolver='top_level_enum')
+    probe = desktop_runtime_setup.RuntimeProbe(
+        **{**probe.__dict__,
+           'llama_module_path': str(module_path),
+           'qwen_64k_yarn_support': 'supported',
+           'yarn_enum_value': 2,
+           'constructor_signature_inspectable': True,
+           'constructor_kwarg_support': {'rope_scaling_type': True, 'rope_freq_scale': True, 'yarn_orig_ctx': True}}
+    )
+
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+
+    assert payload['llama_module_path_present'] is True
+    assert payload['llama_module_identity'].startswith('sha256:')
+    assert len(payload['llama_module_identity']) == 71
+    assert 'llama_module_path' not in payload
+    assert str(module_path) not in json.dumps(payload)

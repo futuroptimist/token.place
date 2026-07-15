@@ -203,6 +203,28 @@ def _coerce_strict_bool(value: Any) -> Optional[bool]:
     return None
 
 
+
+LLAMA_MODULE_IDENTITY_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
+LLAMA_MODULE_IDENTITY_DOMAIN = 'token.place.llama_module_identity.v1\0'
+
+
+def _validate_llama_module_identity(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if LLAMA_MODULE_IDENTITY_RE.fullmatch(text) else None
+
+
+def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
+    canonical = _canonical_path_for_compare(module_path)
+    if not canonical or canonical.lower() in {'unknown', 'missing'}:
+        return None
+    canonical = canonical.replace('\\', '/')
+    digest = hashlib.sha256(
+        (LLAMA_MODULE_IDENTITY_DOMAIN + canonical).encode('utf-8', 'surrogatepass')
+    ).hexdigest()
+    return 'sha256:' + digest
+
 def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any]:
     capabilities = getattr(llama_cpp_module, '__token_place_worker_capabilities__', None)
     if not isinstance(capabilities, dict):
@@ -232,11 +254,16 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         'qwen_64k_yarn_support',
         'yarn_resolver_source',
         'llama_module_path',
+        'llama_module_path_present',
+        'llama_module_identity_match',
         'child_probe_reprobe_attempted',
         'child_probe_reprobe_skipped_reason',
     ):
         if field in capabilities:
             payload[field] = capabilities.get(field)
+    identity = _validate_llama_module_identity(capabilities.get('llama_module_identity'))
+    if identity:
+        payload['llama_module_identity'] = identity
     yarn_enum_value = capabilities.get('yarn_enum_value')
     if isinstance(yarn_enum_value, int) and not isinstance(yarn_enum_value, bool):
         payload['yarn_enum_value'] = yarn_enum_value
@@ -787,7 +814,9 @@ def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> st
     safe_fields = (
         'active_profile_id',
         'active_context_tier',
-        'llama_module_path',
+        'llama_module_path_present',
+        'llama_module_identity_match',
+        'incomplete_probe_fields',
         'llama_cpp_python_version',
         'missing_reason',
         'yarn_resolver_source',
@@ -797,7 +826,7 @@ def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> st
         'constructor_kwargs_attempted',
     )
     return ', '.join(
-        f'{field}={diagnostics.get(field) or "unknown"}'
+        f'{field}={"unknown" if diagnostics.get(field) is None else diagnostics.get(field)}'
         for field in safe_fields
     )
 
@@ -853,7 +882,7 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
             unknown_missing_reasons.append(f'missing constructor kwargs: {", ".join(missing_kwargs)}')
         missing_reasons = unknown_missing_reasons
     supported = support_classification in {'supported', 'unknown'} and not missing_reasons and yarn_value is not None
-    return {
+    diagnostics = {
         'supported': supported,
         'support_classification': support_classification,
         'yarn_enum_value': yarn_value,
@@ -863,7 +892,12 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
         'constructor_kwarg_support': kwarg_support,
         'missing_required_kwargs': missing_kwargs,
         'missing_reason': '; '.join(missing_reasons) if missing_reasons else None,
-        'llama_module_path': worker_capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None),
+        'llama_module_path_present': bool(
+            worker_capabilities.get('llama_module_path_present')
+            or worker_capabilities.get('llama_module_path')
+            or getattr(llama_cpp_module, '__file__', None)
+        ),
+        'llama_module_identity_match': worker_capabilities.get('llama_module_identity_match'),
         'llama_cpp_python_version': worker_capabilities.get('llama_cpp_python_version') or _llama_cpp_python_version(llama_cpp_module),
         'constructor_has_var_kwargs': constructor_has_var_kwargs,
         'constructor_signature_inspectable': worker_capabilities.get('constructor_signature_inspectable'),
@@ -876,6 +910,11 @@ def _qwen_64k_rope_support_diagnostics(llama_cpp_module: Any, llama_cls: Any) ->
             list(required_kwargs) if supported else []
         ),
     }
+    if diagnostics['capability_source'] not in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}:
+        diagnostics['llama_module_path'] = worker_capabilities.get('llama_module_path') or getattr(llama_cpp_module, '__file__', None)
+    else:
+        diagnostics['llama_module_path'] = 'unknown'
+    return diagnostics
 
 
 def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> Dict[str, Any]:
@@ -888,12 +927,25 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
         authoritative_backend = str(capabilities.get('backend') or '').lower() in {'cuda', 'metal'}
         capability_module_path = capabilities.get('llama_module_path')
         facade_module_path = getattr(llama_cpp_module, '__file__', None)
-        module_paths_match = (
+        capability_identity = _validate_llama_module_identity(capabilities.get('llama_module_identity'))
+        facade_identity = llama_module_identity_from_path(facade_module_path)
+        identity_match = bool(capability_identity and facade_identity and capability_identity == facade_identity)
+        legacy_path_match = (
             bool(capability_module_path)
+            and str(capability_module_path).strip().lower() not in {'unknown', 'missing'}
             and bool(facade_module_path)
             and _canonical_path_for_compare(capability_module_path)
             == _canonical_path_for_compare(facade_module_path)
         )
+        module_paths_match = identity_match or legacy_path_match
+        if (
+            capability_identity
+            and capability_module_path
+            and str(capability_module_path).strip().lower() not in {'unknown', 'missing'}
+        ):
+            module_paths_match = module_paths_match and capability_identity == llama_module_identity_from_path(
+                capability_module_path
+            )
         authoritative = (
             source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'}
             and authoritative_backend
@@ -912,6 +964,8 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             diagnostics['child_probe_reprobe_attempted'] = False
             diagnostics['child_probe_reprobe_skipped_reason'] = 'desktop_probe_authoritative'
             diagnostics['desktop_probe_authoritative'] = True
+            diagnostics['llama_module_identity_match'] = identity_match
+            diagnostics['llama_module_path_present'] = bool(facade_module_path or capability_module_path)
             return diagnostics
         if source in {'desktop_runtime_setup_probe', 'desktop_runtime_setup_probe_legacy'} and not complete:
             missing = []
@@ -924,7 +978,9 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             if capabilities.get('constructor_signature_inspectable') is not True:
                 missing.append('constructor_signature_inspectable')
             if not module_paths_match:
-                missing.append('llama_module_path')
+                missing.append('llama_module_identity' if source == 'desktop_runtime_setup_probe' else 'llama_module_path')
+                if source == 'desktop_runtime_setup_probe':
+                    missing.append('llama_module_path')
             if not authoritative_backend:
                 missing.append('backend')
             if capabilities.get('gpu_offload_supported') is not True:
@@ -937,6 +993,9 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
                 'child_probe_reprobe_attempted': False,
                 'child_probe_reprobe_skipped_reason': 'desktop_probe_incomplete_fail_closed',
                 'desktop_probe_authoritative': False,
+                'incomplete_probe_fields': sorted(set(missing)),
+                'llama_module_path_present': bool(facade_module_path or capability_module_path),
+                'llama_module_identity_match': identity_match,
             })
             return diagnostics
         probe = _probe_llama_cpp_capabilities_in_subprocess(timeout_seconds=getattr(llama_cpp_module, '_timeout_seconds', None))
@@ -4018,6 +4077,7 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
     gpu_bool = _coerce_strict_bool(probe.get('gpu_offload_supported', True if backend in {'cuda', 'metal'} else False))
     gpu_supported = bool(gpu_bool)
     module_path = str(probe.get('llama_module_path') or '').strip()
+    module_identity = _validate_llama_module_identity(probe.get('llama_module_identity'))
     if not backend or backend == 'missing' or action in {'failed', 'unavailable', 'shadowed_repo_llama_cpp'}:
         return None
     if error and action not in {'already_supported', 'metal_already_supported'}:
@@ -4032,6 +4092,12 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         'error': None,
         'runtime_action': action or 'unknown',
     }
+    path_present = _coerce_strict_bool(probe.get('llama_module_path_present'))
+    coerced['llama_module_path_present'] = (
+        path_present
+        if path_present is not None
+        else bool(module_path and module_path.lower() not in {'unknown', 'missing'})
+    )
     support: Dict[str, bool] = {}
     raw_support = probe.get('constructor_kwarg_support')
     if isinstance(raw_support, dict):
@@ -4063,6 +4129,8 @@ def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
         value = _coerce_bounded_schema_int(probe.get(field))
         if value is not None and 0 <= value <= 2**31 - 1:
             coerced[field] = value
+    if module_identity:
+        coerced['llama_module_identity'] = module_identity
     if probe.get('llama_cpp_python_version'):
         coerced['llama_cpp_python_version'] = str(probe.get('llama_cpp_python_version'))
     for field in ('constructor_has_var_kwargs', 'constructor_signature_inspectable'):
@@ -4219,8 +4287,8 @@ class ModelManager:
                 if self is not None:
                     self.log_warning(
                         "Desktop runtime probe module path mismatch; refusing to reuse probe "
-                        f"desktop_probe_path={probe_module_path} "
-                        f"imported_path={imported_module_path}"
+                        f"desktop_probe_path_present={bool(probe_module_path)} "
+                        f"imported_path_present={bool(imported_module_path)}"
                     )
                 return {
                     'backend': 'cpu',
@@ -4234,8 +4302,8 @@ class ModelManager:
             if self is not None:
                 self.log_info(
                     "Using desktop runtime probe diagnostics for compute plan "
-                    f"backend={probe['backend']} interpreter={probe['interpreter']} "
-                    f"llama_module_path={probe['llama_module_path']} "
+                    f"backend={probe['backend']} interpreter_present={bool(probe.get('interpreter'))} "
+                    f"llama_module_path_present={bool(probe.get('llama_module_path_present') or probe.get('llama_module_path'))} "
                     f"runtime_action={probe.get('runtime_action', 'unknown')}"
                 )
             return probe

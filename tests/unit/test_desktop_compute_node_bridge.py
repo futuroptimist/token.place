@@ -647,6 +647,7 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     assert started['offloaded_layers'] == 0
     assert started['kv_cache_device'] == 'cpu'
     assert started['use_mock_llm'] is False
+    assert started['llama_repo_stub_imported'] is False
     required_status_fields = {
         'running',
         'registered',

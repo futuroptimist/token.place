@@ -151,6 +151,10 @@ interface ComputeNodeStatus {
   context_tier: string | null;
   context_window_tokens: number | null;
   readiness_diagnostics: ReadinessDiagnostics;
+  startup_phase?: string | null;
+  startup_elapsed_ms?: number | null;
+  startup_deadline_ms?: number | null;
+  runtime_provisioning_state?: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -664,6 +668,10 @@ function mergeComputeStatusEvent(
       payload.type === 'started'
         ? {}
         : readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
+    startup_phase: typeof payload.startup_phase === 'string' ? payload.startup_phase : stoppedBase.startup_phase ?? null,
+    startup_elapsed_ms: typeof payload.startup_elapsed_ms === 'number' ? payload.startup_elapsed_ms : stoppedBase.startup_elapsed_ms ?? null,
+    startup_deadline_ms: typeof payload.startup_deadline_ms === 'number' ? payload.startup_deadline_ms : stoppedBase.startup_deadline_ms ?? null,
+    runtime_provisioning_state: typeof payload.runtime_provisioning_state === 'string' ? payload.runtime_provisioning_state : stoppedBase.runtime_provisioning_state ?? null,
   };
 }
 
@@ -778,7 +786,7 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
+      if (payload.type === 'started' || payload.type === 'status' || payload.type === 'error' || payload.type === 'stopped') {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'stopped') {
@@ -822,12 +830,12 @@ export function App() {
     [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
   const operatorControlsDisabled = useMemo(
-    () => isStartingComputeNode || isStoppingComputeNode,
-    [isStartingComputeNode, isStoppingComputeNode]
+    () => isStoppingComputeNode,
+    [isStoppingComputeNode]
   );
   const operatorEditControlsDisabled = useMemo(
-    () => computeStatus.running || operatorControlsDisabled,
-    [computeStatus.running, operatorControlsDisabled]
+    () => computeStatus.running || isStartingComputeNode || operatorControlsDisabled,
+    [computeStatus.running, isStartingComputeNode, operatorControlsDisabled]
   );
   const canChangeContextTier = useMemo(
     () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
@@ -1184,6 +1192,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{formatRegisteredLabel(computeStatus, normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length)}</strong></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
+        <p style={{ marginBottom: 0 }}>Startup phase: <code>{computeStatus.startup_phase || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms</p>
         <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
         <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>

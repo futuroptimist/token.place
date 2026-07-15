@@ -36,6 +36,7 @@ try:
         ensure_desktop_llama_runtime,
         ensure_desktop_python_dependencies,
         maybe_reexec_for_runtime_refresh,
+        set_startup_status_callback,
     )
 except ModuleNotFoundError:
     def desktop_gpu_runtime_failure_message(_mode: str, _runtime_setup: Dict[str, str]) -> None:
@@ -725,6 +726,40 @@ def _structured_startup_error_payload(
     return payload
 
 
+def _structured_provisioning_payload(
+    args: argparse.Namespace,
+    phase: str,
+    *,
+    elapsed_ms: int = 0,
+    deadline_ms: int = 0,
+    state: str = "provisioning",
+) -> Dict[str, Any]:
+    return {
+        "type": "status",
+        "running": True,
+        "registered": False,
+        "worker_alive": False,
+        "worker_state": "provisioning",
+        "relay_runtime_state": state,
+        "warm_load_state": "not_started",
+        "warm_load_enabled": _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT),
+        "active_relay_url": _normalize_relay_urls(getattr(args, "relay_url", "https://token.place"), getattr(args, "relay_urls", None))[0],
+        "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
+        "effective_mode": "pending",
+        "backend_available": "pending",
+        "backend_selected": "pending",
+        "backend_used": "pending",
+        "context_tier": _startup_context_tier(args),
+        "runtime_path": _runtime_path_from_env(),
+        "relay_runtime_path": "bridge",
+        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+        "startup_phase": phase,
+        "startup_elapsed_ms": elapsed_ms,
+        "startup_deadline_ms": deadline_ms,
+        "runtime_provisioning_state": state,
+    }
+
+
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -793,8 +828,26 @@ def run(args: argparse.Namespace) -> int:
             payload.setdefault("updated_at_ms", int(time.time() * 1000))
             emit(payload)
 
+    startup_started = time.monotonic()
+
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
+
+    def emit_provisioning(update: Dict[str, Any] | None = None) -> None:
+        update = update or {}
+        phase = str(update.get("startup_phase") or "provisioning")
+        elapsed_ms = int((time.monotonic() - startup_started) * 1000)
+        payload = _structured_provisioning_payload(
+            args,
+            phase,
+            elapsed_ms=elapsed_ms,
+            deadline_ms=int(update.get("startup_deadline_ms") or 0),
+            state=str(update.get("runtime_provisioning_state") or "provisioning"),
+        )
+        emit_operator_event(payload)
+
+    set_startup_status_callback(emit_provisioning)
+    emit_provisioning({"startup_phase": "spawned", "runtime_provisioning_state": "provisioning"})
 
     original_model_arg = str(args.model)
     model_path_was_relative = not os.path.isabs(original_model_arg)
@@ -802,6 +855,7 @@ def run(args: argparse.Namespace) -> int:
         args.model = os.path.abspath(original_model_arg)
     parent_model_path_exists = os.path.exists(args.model)
 
+    emit_provisioning({"startup_phase": "dependency_check", "startup_deadline_ms": 300000})
     dependency_setup = ensure_desktop_python_dependencies()
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
@@ -814,6 +868,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    emit_provisioning({"startup_phase": "runtime_probe", "startup_deadline_ms": 1800000})
     runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(

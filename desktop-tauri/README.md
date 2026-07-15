@@ -283,3 +283,22 @@ tooling, install/repair pip for that interpreter or install Xcode Command Line
 Tools, then rerun packaged startup; the app-managed dependency target remains
 under `.token_place_desktop_site` and should not require writing into the CLT
 Python prefix.
+
+### Windows Qwen3 8B Q4 64K packaged validation
+
+For the next Win11 CUDA staging run, validate the packaged operator with a clean
+managed dependency target and the 64K profile:
+
+```powershell
+$env:TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET = "$env:TEMP\token-place-clean-desktop-site"
+Remove-Item -Recurse -Force $env:TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET -ErrorAction SilentlyContinue
+.\token.place.exe
+```
+
+Start Operator with the Qwen3 8B Q4 GGUF, `64k-full`, and GPU/auto mode. The
+safe local status sequence should be: spawned/provisioning (real operator log
+path visible, Running=yes, Registered=no, Worker alive=no, Stop enabled),
+dependency_check or runtime_probe, optional cuda_source_build,
+runtime_verification, optional reexec, model_preflight/warm_load, and finally
+ready/registered. Do not treat mocked CI as proof of Win11 CUDA success; this
+sequence must be confirmed on NVIDIA CUDA hardware.

@@ -1290,6 +1290,33 @@ pub async fn start_compute_node(
                 log_file_path: log_file_path.clone(),
                 readiness_diagnostics: Map::new(),
             };
+            let provisioning_payload = serde_json::json!({
+                "type": "status",
+                "running": true,
+                "registered": false,
+                "worker_alive": false,
+                "worker_state": "provisioning",
+                "relay_runtime_state": "provisioning",
+                "warm_load_state": "not_started",
+                "runtime_provisioning_state": "provisioning",
+                "startup_phase": "spawned",
+                "startup_elapsed_ms": 0,
+                "startup_deadline_ms": 0,
+                "active_relay_url": primary_relay_url.clone(),
+                "configured_relay_urls": relay_base_urls.clone(),
+                "registered_relay_count": 0,
+                "configured_relay_count": relay_base_urls.len(),
+                "requested_mode": format!("{:?}", request.mode).to_lowercase(),
+                "context_tier": normalize_context_tier(&request.context_tier),
+                "context_window_tokens": context_profile(&normalize_context_tier(&request.context_tier)).map(|profile| profile.total_context_tokens),
+                "runtime_path": "bridge",
+                "relay_runtime_path": "bridge",
+                "operator_session_id": session_id.clone(),
+                "sequence": 0,
+                "updated_at_ms": current_time_ms(),
+                "log_file_path": log_file_path.clone(),
+            });
+            let _ = app.emit("compute_node_event", provisioning_payload);
             true
         }
     };

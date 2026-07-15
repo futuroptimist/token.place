@@ -31,8 +31,11 @@ except ModuleNotFoundError:
         return {"ok": "false", "action": "desktop_runtime_setup_missing", "missing": "unknown"}
 
 
-def _run_dependency_preflight() -> Dict[str, Any]:
-    result = ensure_desktop_python_dependencies()
+def _run_dependency_preflight(*, read_only: bool = False) -> Dict[str, Any]:
+    try:
+        result = ensure_desktop_python_dependencies(read_only=read_only)
+    except TypeError:
+        result = ensure_desktop_python_dependencies()
     if result.get("ok") == "true":
         return {"ok": True}
     missing = result.get("missing") or "unknown"
@@ -148,9 +151,12 @@ def _get_model_manager(*, allow_inspect_fallback: bool = False):
 
 
 def inspect_model() -> int:
-    preflight = _run_dependency_preflight()
+    preflight = _run_dependency_preflight(read_only=True)
     if not preflight.get("ok", False):
-        return _response(**preflight)
+        manager, error_status = _get_model_manager(allow_inspect_fallback=True)
+        if error_status is not None:
+            return _response(**error_status)
+        return _response(True, payload=manager.get_model_artifact_metadata())
     manager, error_status = _get_model_manager(allow_inspect_fallback=True)
     if error_status is not None:
         return _response(**error_status)

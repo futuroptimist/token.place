@@ -370,11 +370,19 @@ jobs:
             if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
               signing_flag="--expect-signing"
             fi
-            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${app_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+            codesign --verify --deep --strict --verbose=4 "${app_path}"
+            probe_dir="$(mktemp -d)"
+            trap 'rm -rf "${probe_dir}"' EXIT
+            cp -R "${app_path}" "${probe_dir}/"
+            probe_app="${probe_dir}/$(basename "${app_path}")"
+            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${probe_app}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+            codesign --verify --deep --strict --verbose=4 "${app_path}"
 
             rm -rf "${dmg_stage_dir}"
             mkdir -p "${dmg_stage_dir}"
             cp -R "${app_path}" "${dmg_stage_dir}/"
+            staged_app="${dmg_stage_dir}/$(basename "${app_path}")"
+            codesign --verify --deep --strict --verbose=4 "${staged_app}"
             cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"
             ln -s /Applications "${dmg_stage_dir}/Applications"
             rm -f "${dmg_path}"

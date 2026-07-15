@@ -306,27 +306,39 @@ def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     app_for_subprocess = app_path if app_path.is_absolute() else app_path.absolute()
     py_for_subprocess = py if py.is_absolute() else py.absolute()
-    home = tempfile.mkdtemp(prefix="token-place-home-")
+    home = tempfile.mkdtemp(prefix="token-place-python-probe-")
     try:
         app_data = Path(home) / "token.place"
+        pycache_prefix = Path(home) / "pycache"
+        tmpdir = Path(home) / "tmp"
+        pip_cache = app_data / "pip-cache"
+        for writable_dir in (app_data, pycache_prefix, tmpdir, pip_cache):
+            writable_dir.mkdir(parents=True, exist_ok=True)
         env = {
             "HOME": home,
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
+            "PYTHONPYCACHEPREFIX": str(pycache_prefix),
+            "TMPDIR": str(tmpdir),
+            "PIP_CACHE_DIR": str(pip_cache),
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
+            "TOKEN_PLACE_MODEL_DIR": str(app_data / "models"),
+            "TOKEN_PLACE_CACHE_DIR": str(app_data / "cache"),
             "XDG_CACHE_HOME": str(app_data / "cache"),
             "XDG_CONFIG_HOME": str(app_data / "config"),
             "XDG_DATA_HOME": str(app_data / "data"),
         }
-        probe_cwd = app_for_subprocess / "Contents" / "Resources" / "python"
+        probe_cwd = Path(home) / "cwd"
+        probe_cwd.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            [str(py_for_subprocess), "-c", code],
+            [str(py_for_subprocess), "-B", "-c", code],
             check=False,
             capture_output=True,
             text=True,
             env=env,
-            cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
+            cwd=str(probe_cwd),
         )
         output = f"{result.stdout}\n{result.stderr}"
         scan_output = _redact_allowed_app_locations(output, app_for_subprocess)
@@ -335,10 +347,64 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             if marker in scan_output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
         if result.returncode != 0:
-            _fail(_format_command_failure([str(py_for_subprocess), "-c", "<probe>"], result))
+            _fail(_format_command_failure([str(py_for_subprocess), "-B", "-c", "<probe>"], result))
         return output.strip()
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+def _app_tree_fingerprint(app_path: Path) -> dict[str, dict[str, object]]:
+    fingerprint: dict[str, dict[str, object]] = {}
+    for path in sorted(app_path.rglob("*"), key=lambda item: str(item.relative_to(app_path))):
+        rel = path.relative_to(app_path).as_posix()
+        st = path.lstat()
+        entry: dict[str, object] = {"mode": st.st_mode & 0o111}
+        if path.is_symlink():
+            entry.update({"type": "symlink", "target": os.readlink(path)})
+        elif path.is_file():
+            entry.update({"type": "file", "sha256": _sha256(path)})
+        elif path.is_dir():
+            entry.update({"type": "dir"})
+        else:
+            entry.update({"type": "other"})
+        fingerprint[rel] = entry
+    return fingerprint
+
+def _describe_app_tree_mutations(before: dict[str, dict[str, object]], after: dict[str, dict[str, object]]) -> list[str]:
+    changes: list[str] = []
+    before_paths = set(before)
+    after_paths = set(after)
+    for rel in sorted(after_paths - before_paths):
+        note = " (unsealed Python bytecode)" if rel.endswith(".pyc") or "/__pycache__/" in rel else ""
+        changes.append(f"added: {rel}{note}")
+    for rel in sorted(before_paths - after_paths):
+        changes.append(f"removed: {rel}")
+    for rel in sorted(before_paths & after_paths):
+        old = before[rel]
+        new = after[rel]
+        if old.get("type") != new.get("type"):
+            changes.append(f"type changed: {rel} ({old.get('type')} -> {new.get('type')})")
+            continue
+        if old.get("type") == "file" and old.get("sha256") != new.get("sha256"):
+            changes.append(f"rewritten: {rel}")
+        if old.get("mode") != new.get("mode"):
+            changes.append(f"chmodded: {rel}")
+        if old.get("type") == "symlink" and old.get("target") != new.get("target"):
+            changes.append(f"retargeted symlink: {rel} ({old.get('target')} -> {new.get('target')})")
+    return changes
+
+def _assert_app_tree_unchanged(before: dict[str, dict[str, object]], app_path: Path, context: str) -> None:
+    after = _app_tree_fingerprint(app_path)
+    changes = _describe_app_tree_mutations(before, after)
+    if changes:
+        preview = "\n".join(changes[:50])
+        if len(changes) > 50:
+            preview += f"\n... {len(changes) - 50} more changes"
+        _fail(f"{context} mutated app bundle {app_path}; executable probes must not create unsealed files:\n{preview}")
+
+def _verify_existing_macos_signature(app_path: Path) -> None:
+    if platform.system() == "Darwin":
+        _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
 def _parse_otool_rpaths(load_commands: str) -> list[str]:
     rpaths: list[str] = []
@@ -514,6 +580,7 @@ def _validate_macho_linkage(path: Path, app_path: Path) -> None:
                 _fail(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}")
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:
+    mutation_guard = _app_tree_fingerprint(app_path)
     runtime = app_path / "Contents" / "Resources" / "python-runtime"
     py = runtime / "bin" / "python3"
     if not py.exists() or not os.access(py, os.X_OK):
@@ -566,6 +633,7 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
         _fail("packaged model_bridge.py missing from app resources")
     for candidate in runtime.rglob("*"):
         if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
+    _assert_app_tree_unchanged(mutation_guard, app_path, "embedded Python runtime validation")
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -580,7 +648,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
+def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embedded_python_runtime: bool = False) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
@@ -599,6 +667,10 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
             missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
             if missing:
                 _fail(f"DMG preview README missing required phrases: {missing}")
+            mounted_app = apps[0]
+            _verify_existing_macos_signature(mounted_app)
+            if require_embedded_python_runtime:
+                _validate_embedded_python_runtime(mounted_app)
             if expect_signing:
                 if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
                     _fail(
@@ -632,7 +704,7 @@ def main() -> None:
             _fail(f"dmg artifact missing or invalid: {dmg_path}")
         if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
             _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
+        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -683,17 +755,18 @@ def main() -> None:
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
 
-    if args.require_embedded_python_runtime:
+    _verify_existing_macos_signature(app_path)
+
+    if args.require_embedded_python_runtime and args.app_only:
         _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
-        _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])
         if args.expect_notarization:
             _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
         else:
             print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")
     else:
-        print("::warning::Signing credentials not configured; macOS artifact is preview/dev-only and may fail Gatekeeper.")
+        print("::warning::Apple Developer signing credentials not configured; verified existing ad-hoc signature for preview/dev-only macOS artifact.")
 
 
 if __name__ == "__main__":

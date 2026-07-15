@@ -951,6 +951,89 @@ def test_install_outcome_heartbeat_failure_action_is_fatal_for_windows_qwen64k(m
     assert runtime_action in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
 
 
+def test_cuda_source_repair_lock_timeout_returns_structured_failure(monkeypatch, tmp_path):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+
+    class TimeoutLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            raise TimeoutError('managed-site lock wait timed out')
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', TimeoutLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *_args, **_kwargs: pytest.fail('source repair must not run without the lock'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'install_timeout'
+    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert 'timed out' in result['fallback_reason']
+
+
+def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, tmp_path):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python==0.3.32',
+            cmake_args='-DGGML_CUDA=on',
+            force_cmake=True,
+            index_url=None,
+            only_binary=False,
+            no_binary=False,
+        )
+    ])
+
+    class CancelledLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            raise TimeoutError('managed-site lock wait cancelled')
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', CancelledLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: pytest.fail('pip install must not run without the lock'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'install_cancelled'
+    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert 'cancelled' in result['fallback_reason']
+
+
 def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 

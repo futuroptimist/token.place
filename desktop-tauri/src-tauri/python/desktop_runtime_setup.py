@@ -1176,6 +1176,22 @@ def _install_outcome_action(log_output: str, expected_backend: Optional[str]) ->
     return _install_failure_action(expected_backend)
 
 
+def _lock_failure_install_log(exc: BaseException) -> str:
+    """Represent managed-site lock failures as installer-style diagnostics."""
+
+    message = str(exc)
+    if "cancelled" in message:
+        outcome = "cancelled"
+    elif "heartbeat failed" in message:
+        outcome = "heartbeat_failed"
+    else:
+        outcome = "timed_out"
+    return (
+        "command=managed-site-lock; returncode=none; "
+        f"outcome={outcome}; stderr_tail={type(exc).__name__}: {message}"
+    )
+
+
 def _cpu_fallback_action(expected_backend: Optional[str]) -> str:
     if expected_backend == "metal":
         return "metal_cpu_fallback"
@@ -1356,13 +1372,17 @@ def _ensure_desktop_llama_runtime_impl(
                 if heartbeat is not None:
                     source_repair_kwargs["heartbeat"] = heartbeat
                 source_after_probe: Optional[RuntimeProbe] = None
-                with _ManagedSiteMutationLock(dependency_target, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
-                    source_after_probe = _probe_runtime(target_root)
-                    source_ok, source_log = _run_windows_cuda_source_repair(
-                        requirements_path,
-                        dependency_target,
-                        **source_repair_kwargs,
-                    )
+                try:
+                    with _ManagedSiteMutationLock(dependency_target, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
+                        source_after_probe = _probe_runtime(target_root)
+                        source_ok, source_log = _run_windows_cuda_source_repair(
+                            requirements_path,
+                            dependency_target,
+                            **source_repair_kwargs,
+                        )
+                except (TimeoutError, OSError) as exc:
+                    source_ok = False
+                    source_log = _lock_failure_install_log(exc)
                 if source_ok:
                     _clear_source_repair_failure()
                     install_diagnostics = _install_diagnostics_payload(
@@ -1465,9 +1485,13 @@ def _ensure_desktop_llama_runtime_impl(
         if heartbeat is not None:
             pip_kwargs["heartbeat"] = heartbeat
         after_probe_hint: Optional[RuntimeProbe] = None
-        with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
-            after_probe_hint = _probe_runtime(target_root)
-            ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
+        try:
+            with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
+                after_probe_hint = _probe_runtime(target_root)
+                ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
+        except (TimeoutError, OSError) as exc:
+            ok = False
+            log_output = _lock_failure_install_log(exc)
         install_diagnostics = _install_diagnostics_payload(
             log_output, backend=plan.backend, cmake_args=plan.cmake_args or ""
         )

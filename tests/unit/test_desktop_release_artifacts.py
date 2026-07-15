@@ -1141,3 +1141,127 @@ def test_validate_macho_linkage_handles_universal_bundle_and_matching_dylib_ids(
         assert False
     except SystemExit as exc:
         assert 'install IDs differ by architecture' in str(exc)
+
+
+def test_validator_parse_otool_libraries_rejects_structural_errors(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    owner = tmp_path / 'Example.app' / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
+    valid_header = f'{owner} (architecture arm64):'
+    cases = [
+        f'{valid_header}\n{valid_header}\n',
+        '\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
+        f'{valid_header}\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
+        '\n',
+    ]
+    for output in cases:
+        try:
+            validator._parse_otool_libraries(output, owner, 'arm64')
+            assert False
+        except SystemExit:
+            pass
+
+
+def test_validator_arch_and_install_id_parsers_reject_bad_shapes(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    binary = tmp_path / 'Example.app' / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+
+    monkeypatch.setattr(validator, '_run', lambda cmd: '')
+    try:
+        validator._macho_archs(binary)
+        assert False
+    except SystemExit as exc:
+        assert 'no architectures' in str(exc)
+
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'x86_64')
+    try:
+        validator._macho_archs(binary)
+        assert False
+    except SystemExit as exc:
+        assert 'not arm64' in str(exc)
+
+    try:
+        validator._parse_otool_install_ids('Load command 0\ncmd LC_ID_DYLIB\ncmdsize 48\n')
+        assert False
+    except SystemExit as exc:
+        assert 'without name' in str(exc)
+    try:
+        validator._parse_otool_install_ids(
+            'Load command 0\ncmd LC_ID_DYLIB\nname @rpath/a.dylib (offset 24)\n'
+            'Load command 1\ncmd LC_ID_DYLIB\nname @rpath/b.dylib (offset 24)\n'
+        )
+        assert False
+    except SystemExit as exc:
+        assert 'multiple LC_ID_DYLIB' in str(exc)
+
+
+def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    owner = app / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
+    owner.parent.mkdir(parents=True)
+    owner.write_text('x')
+
+    validator._validate_macho_ref('', owner, app)
+    assert validator._macho_file_kind('plain text') == 'other'
+    try:
+        validator._validate_macho_ref('/usr/lib/libSystem.B.dylib', owner, app, install_id=True)
+        assert False
+    except SystemExit as exc:
+        assert 'absolute Mach-O install ID' in str(exc)
+    try:
+        validator._validate_macho_ref('@rpath/libexample.dylib', owner, app, rpath=True)
+        assert False
+    except SystemExit as exc:
+        assert 'forbidden external Mach-O LC_RPATH' in str(exc)
+
+
+def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 3, 'out', 'err'),
+    )
+    try:
+        validator._run(['bad'])
+        assert False
+    except SystemExit as exc:
+        assert 'Command failed (bad)' in str(exc)
+
+    payload = tmp_path / 'payload'
+    payload.write_bytes(b'abc')
+    assert validator._sha256(payload) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+
+
+def test_validate_macho_linkage_rejects_file_and_lipo_failures(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    binary = app / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, '', 'file failed'),
+    )
+    try:
+        validator._validate_macho_linkage(binary, app)
+        assert False
+    except SystemExit as exc:
+        assert 'Command failed (file ' in str(exc)
+
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, 'Mach-O 64-bit dynamically linked shared library arm64', ''),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: (_ for _ in ()).throw(SystemExit('lipo failed')))
+    try:
+        validator._validate_macho_linkage(binary, app)
+        assert False
+    except SystemExit as exc:
+        assert 'lipo failed' in str(exc)

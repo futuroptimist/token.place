@@ -1005,3 +1005,145 @@ def test_stale_libpython_duplicate_within_one_arch_fails_but_repeated_by_arch_al
         assert False
     except prep.RuntimePrepError as exc:
         assert 'duplicate stale libpython load command' in str(exc)
+
+
+def test_parse_otool_libraries_rejects_structural_errors(tmp_path):
+    owner = tmp_path / 'python-runtime' / 'lib' / 'libexample.dylib'
+    valid_header = f'{owner} (architecture arm64):'
+    cases = [
+        f'{valid_header}\n{valid_header}\n',
+        '\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
+        f'{valid_header}\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
+        '\n\n',
+    ]
+    for output in cases:
+        try:
+            prep._parse_otool_libraries(output, owner, 'arm64')
+            assert False
+        except prep.RuntimePrepError:
+            pass
+
+
+def test_macho_arch_helpers_reject_empty_and_non_arm64(monkeypatch, tmp_path):
+    binary = tmp_path / 'libexample.dylib'
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(prep, '_otool', lambda cmd: '')
+    try:
+        prep._macho_archs(binary)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'no architectures' in str(exc)
+
+    monkeypatch.setattr(prep, '_otool', lambda cmd: 'x86_64')
+    try:
+        prep._macho_archs(binary)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'not arm64' in str(exc)
+
+
+def test_otool_install_id_requires_one_identical_id_per_arch(monkeypatch, tmp_path):
+    binary = tmp_path / 'libpython3.11.dylib'
+    binary.write_bytes(b'macho')
+    for ids_by_arch in ({}, {'arm64': []}, {'x86_64': ['@rpath/a.dylib'], 'arm64': ['@rpath/b.dylib']}):
+        monkeypatch.setattr(prep, '_otool_install_ids_by_arch', lambda path, value=ids_by_arch: value)
+        try:
+            prep._otool_install_id(binary)
+            assert False
+        except prep.RuntimePrepError as exc:
+            assert 'expected exactly one libpython install ID' in str(exc)
+
+    monkeypatch.setattr(
+        prep,
+        '_otool_install_ids_by_arch',
+        lambda path: {'x86_64': ['@rpath/libpython3.11.dylib'], 'arm64': ['@rpath/libpython3.11.dylib']},
+    )
+    assert prep._otool_install_id(binary) == '@rpath/libpython3.11.dylib'
+
+
+def test_prepare_runtime_small_helpers_cover_failure_paths(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(prep, 'run', lambda cmd: called.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''))
+    prep._install_name_tool(['-id', '@rpath/libexample.dylib', 'libexample.dylib'])
+    assert called == [['install_name_tool', '-id', '@rpath/libexample.dylib', 'libexample.dylib']]
+
+    readonly = tmp_path / 'readonly'
+    readonly.write_text('x')
+    readonly.chmod(0o400)
+    prep._ensure_owner_write(readonly)
+    assert readonly.stat().st_mode & 0o200
+
+    assert prep._allowed_runtime_ref('@loader_path/libok.dylib')
+    assert prep._allowed_runtime_ref('/usr/lib/libSystem.B.dylib')
+    prep._validate_native_ref('', tmp_path / 'owner')
+    try:
+        prep._validate_native_ref('/usr/lib/libSystem.B.dylib', tmp_path / 'owner', install_id=True)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'absolute Mach-O install ID' in str(exc)
+    try:
+        prep._validate_native_ref('@rpath/libexample.dylib', tmp_path / 'owner', rpath=True)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'non-relocatable Mach-O LC_RPATH' in str(exc)
+    assert prep._macho_file_kind('ASCII text') == 'other'
+
+
+def test_prepare_runtime_run_download_and_macho_file_errors(monkeypatch, tmp_path):
+    successful = subprocess.CompletedProcess(['cmd'], 0, 'ok', '')
+    captured_env = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured_env.update(kwargs.get('env', {}))
+        return successful
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_subprocess_run)
+    assert prep.run(['cmd']).stdout == 'ok'
+    assert captured_env['PYTHONNOUSERSITE'] == '1'
+
+    def failing_subprocess_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 2, 'out', 'err')
+
+    monkeypatch.setattr(prep.subprocess, 'run', failing_subprocess_run)
+    try:
+        prep.run(['bad'])
+        assert False
+    except subprocess.CalledProcessError as exc:
+        assert exc.returncode == 2
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    try:
+        prep._is_macho_file(tmp_path / 'broken')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'file inspection failed' in str(exc)
+    try:
+        prep._otool(['otool', '-l', 'broken'])
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'native linkage inspection failed' in str(exc)
+
+    payload = tmp_path / 'payload'
+    payload.write_bytes(b'runtime')
+    digest = hashlib.sha256(b'runtime').hexdigest()
+
+    def fake_urlretrieve(url, filename):
+        Path(filename).write_bytes(b'runtime')
+
+    monkeypatch.setattr(prep.urllib.request, 'urlretrieve', fake_urlretrieve)
+    target = prep.download_verified({'archive_url': 'https://example.test/runtime.tar.gz', 'sha256': digest}, tmp_path)
+    assert target.read_bytes() == b'runtime'
+
+
+def test_load_manifest_success_and_python_version_failure(tmp_path, monkeypatch):
+    manifest_path = tmp_path / 'manifest.json'
+    manifest_path.write_text(json.dumps(manifest()), encoding='utf-8')
+    monkeypatch.setattr(prep, 'MANIFEST', manifest_path)
+    loaded = prep.load_manifest()
+    assert loaded['expected_architecture'] == 'arm64'
+
+    try:
+        prep._python_major_minor({'cpython_version': '3'})
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'major.minor' in str(exc)

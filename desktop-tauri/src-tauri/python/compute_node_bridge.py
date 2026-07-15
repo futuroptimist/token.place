@@ -726,6 +726,7 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
         "worker_generation": 0,
         "worker_restart_count": 0,
         "worker_alive": False,
+        "use_mock_llm": False,
         "last_worker_error_code": None,
         "last_worker_exit_code": None,
         "last_worker_restart_at_ms": None,

@@ -159,6 +159,8 @@ def inspect_model() -> int:
     manager, error_status = _get_model_manager(allow_inspect_fallback=True)
     if error_status is not None:
         return _response(**error_status)
+    if manager is None:
+        return _response(True, payload=_fallback_model_metadata())
     return _response(True, payload=manager.get_model_artifact_metadata())
 
 

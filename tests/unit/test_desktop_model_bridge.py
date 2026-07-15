@@ -441,3 +441,14 @@ def test_inspect_preflight_error_status_and_none_manager_fallback(capsys, monkey
     monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, None))
     assert model_bridge.inspect_model() == 0
     assert json.loads(capsys.readouterr().out)['payload']['filename'].endswith('.gguf')
+
+
+def test_inspect_successful_preflight_none_manager_uses_safe_fallback(capsys, monkeypatch):
+    monkeypatch.setattr(model_bridge, '_run_dependency_preflight', lambda mutate=False: {'ok': True})
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, None))
+
+    assert model_bridge.inspect_model() == 0
+
+    payload = json.loads(capsys.readouterr().out)['payload']
+    assert payload['filename'].endswith('.gguf')
+    assert payload['active_profile_id'] == payload['profile_id']

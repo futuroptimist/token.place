@@ -279,6 +279,8 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
         return 'hdiutil info snapshot'
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: '')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
 
@@ -663,7 +665,7 @@ def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
     assert "'inspect'" in text
 
 
-def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, tmp_path) -> None:
+def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
     (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
@@ -675,16 +677,23 @@ def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, t
         captured['env'] = env
         return subprocess.CompletedProcess(cmd, 0, 'ok', '')
 
-    monkeypatch.setenv('TOKEN_PLACE_PYTHON', '/usr/bin/python3')
-    monkeypatch.setenv('TOKEN_PLACE_SIDECAR_PYTHON', '/usr/bin/python3')
+    forbidden_parent_env = {
+        'PYTHONHOME': '/bad/pythonhome',
+        'PYTHONSTARTUP': '/bad/startup.py',
+        'PYTHONUSERBASE': '/bad/userbase',
+        'TOKEN_PLACE_PYTHON': '/usr/bin/python3',
+        'TOKEN_PLACE_SIDECAR_PYTHON': '/usr/bin/python3',
+    }
+    for key, value in forbidden_parent_env.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
     assert captured['env']['PYTHONPATH'] == str((app / 'Contents' / 'Resources' / 'python').absolute())
-    assert 'TOKEN_PLACE_PYTHON' not in captured['env']
-    assert 'TOKEN_PLACE_SIDECAR_PYTHON' not in captured['env']
+    for key in forbidden_parent_env:
+        assert key not in captured['env']
 
 
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
@@ -703,6 +712,22 @@ def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime(
     assert 'test "$(uname -m)" = "arm64"' in workflow
 
 
+def test_release_workflow_installs_pytest_before_macos_probe() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    install_index = workflow.index('- name: Install macOS validation test dependencies')
+    validate_index = workflow.index('- name: Validate macOS staged artifact guardrails')
+    assert install_index < validate_index
+    install_step = workflow[install_index:validate_index]
+    assert "if: runner.os == 'macOS'" in install_step
+    assert 'python -m pip install --upgrade pip' in install_step
+    assert "python -m pip install 'pytest>=8.1'" in install_step
+    validate_step = workflow[validate_index:]
+    assert (
+        "python -m pytest --confcutdir=tests/integration "
+        "tests/integration/test_macos_release_probe.py -q"
+    ) in validate_step
+
+
 def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
@@ -717,12 +742,13 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
         return str(home)
 
     def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
-        assert env['HOME'] == str(created_home['path'])
+        assert env['HOME'] == str(created_home['path'] / 'home')
+        assert Path(env['HOME']).is_dir()
         assert env['TOKEN_PLACE_MODELS_DIR'] == str(created_home['path'] / 'token.place' / 'models')
         assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
         assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
         assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
-        assert cwd == str((app / 'Contents' / 'Resources' / 'python').absolute())
+        assert not Path(cwd).resolve().is_relative_to(app.resolve())
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
     monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
@@ -771,7 +797,7 @@ def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeyp
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
-    assert seen['cwd'] == str(resources_python.absolute())
+    assert not Path(seen['cwd']).resolve().is_relative_to(app.resolve())
 
 
 def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_cwd(
@@ -795,7 +821,7 @@ def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_c
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert seen['cmd'][0] == str((tmp_path / py).absolute())
-    assert seen['cwd'] == str((tmp_path / app / 'Contents' / 'Resources' / 'python').absolute())
+    assert not Path(seen['cwd']).resolve().is_relative_to((tmp_path / app).resolve())
 
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -1311,7 +1337,9 @@ def test_validator_app_only_main_validates_app_without_dmg(monkeypatch, tmp_path
 
     validator.main()
 
-    assert embedded_calls == [app]
+    assert len(embedded_calls) == 1
+    assert embedded_calls[0].name == app.name
+    assert embedded_calls[0] != app
     assert dmg_calls == []
 
 
@@ -1337,6 +1365,8 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     handle = MountHandle()
     cleanup_calls = []
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: '')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: handle)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: cleanup_calls.append((dmg, path)))
 
@@ -1391,19 +1421,49 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
             expect_notarization=True,
         ),
     )
-    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, *, expect_signing: dmg_calls.append((path, expect_signing)))
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, **kwargs: dmg_calls.append((path, kwargs.get('expect_signing'))))
 
     def fake_run(cmd):
         run_calls.append(cmd)
         return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
 
     monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
 
     validator.main()
 
     assert dmg_calls == [(dmg, True)]
-    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)] in run_calls
+    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
+
+
+def test_codesign_verify_fails_on_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: None)
+
+    try:
+        validator._codesign_verify(app)
+        assert False
+    except SystemExit as exc:
+        assert 'codesign not found in PATH on this macOS machine' in str(exc)
+
+
+def test_codesign_verify_skips_outside_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd))
+
+    validator._codesign_verify(app)
+
+    assert calls == []
 
 
 def test_validator_dmg_contents_rejects_missing_signed_preview_phrase(monkeypatch, tmp_path) -> None:
@@ -1586,3 +1646,210 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: calls.append(str(path)))
     validator._validate_embedded_python_runtime(app)
     assert any('model_bridge.py' in code for code in calls)
+
+
+def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locations(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = app / 'Contents' / 'Resources' / 'python-runtime' / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('#!/bin/sh\n', encoding='utf-8')
+    captured = {}
+
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
+        assert Path(env['HOME']).is_dir()
+        assert Path(env['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET']).is_dir()
+        captured.update(cmd=cmd, env=env, cwd=cwd)
+        return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert captured['cmd'][1] == '-B'
+    env = captured['env']
+    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert env['PATH'] == '/usr/bin:/bin'
+    assert env['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
+    writable_keys = [
+        'PYTHONPYCACHEPREFIX',
+        'TMPDIR',
+        'PIP_CACHE_DIR',
+        'HOME',
+        'XDG_CACHE_HOME',
+        'XDG_CONFIG_HOME',
+        'XDG_DATA_HOME',
+        'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET',
+        'TOKEN_PLACE_MODELS_DIR',
+        'HF_HOME',
+        'TRANSFORMERS_CACHE',
+    ]
+    for key in writable_keys:
+        assert not Path(env[key]).resolve().is_relative_to(app.resolve()), key
+    assert not Path(captured['cwd']).resolve().is_relative_to(app.resolve())
+
+
+def test_run_python_sanitized_real_import_and_child_import_do_not_create_pycache(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    pkg = app / 'Contents' / 'Resources' / 'python'
+    pkg.mkdir(parents=True)
+    (pkg / 'probe_module.py').write_text('VALUE = 42\n', encoding='utf-8')
+    code = "import probe_module, subprocess, sys; assert probe_module.VALUE == 42; subprocess.check_call([sys.executable, '-c', 'import probe_module; assert probe_module.VALUE == 42'])"
+    validator._run_python_sanitized(Path(__import__('sys').executable), code, app)
+    assert not list(pkg.rglob('__pycache__'))
+    assert not list(pkg.rglob('*.pyc'))
+
+
+def test_app_tree_fingerprint_reports_mutations(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'x.app'
+    d = app / 'Contents' / 'Resources'
+    d.mkdir(parents=True)
+    f = d / 'file.txt'; f.write_text('one', encoding='utf-8')
+    exe = d / 'tool'; exe.write_text('tool', encoding='utf-8'); exe.chmod(0o644)
+    link = d / 'link'; link.symlink_to('file.txt')
+    base = validator._app_tree_fingerprint(app)
+    pyc = d / '__pycache__' / 'm.cpython-311.pyc'; pyc.parent.mkdir(); pyc.write_bytes(b'pyc')
+    f.unlink()
+    exe.write_text('changed', encoding='utf-8'); exe.chmod(0o755)
+    link.unlink(); link.symlink_to('tool')
+    changes = '\n'.join(validator._describe_app_tree_changes(base, validator._app_tree_fingerprint(app)))
+    assert 'unsealed Python bytecode' in changes
+    assert 'removed: Contents/Resources/file.txt' in changes
+    assert 'rewritten: Contents/Resources/tool' in changes
+    mode_only = app / 'Contents' / 'Resources' / 'mode-only'
+    mode_only.write_text('same', encoding='utf-8')
+    before_mode = validator._app_tree_fingerprint(app)
+    mode_only.chmod(0o755)
+    mode_changes = validator._describe_app_tree_changes(before_mode, validator._app_tree_fingerprint(app))
+    assert 'chmodded: Contents/Resources/mode-only' in mode_changes
+    assert 'retargeted symlink: Contents/Resources/link' in changes
+
+
+def test_mutation_guard_fails_for_mutating_probe(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'x.app'; app.mkdir()
+    try:
+        validator._run_with_app_mutation_guard(app, 'test probe', lambda: (app / '__pycache__' / 'x.pyc').parent.mkdir() or (app / '__pycache__' / 'x.pyc').write_bytes(b'x'))
+        assert False
+    except SystemExit as exc:
+        assert 'unsealed Python bytecode' in str(exc)
+
+
+def test_codesign_verification_is_ad_hoc_and_not_spctl_gated(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'x.app'; app.mkdir()
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd) or '')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    validator._codesign_verify(app)
+    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)] in calls
+    assert not any(cmd and cmd[0] in {'spctl', 'notarytool', 'stapler'} for cmd in calls)
+
+
+def test_dmg_validation_runs_against_mounted_app(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'; mount.mkdir()
+    mounted_app = mount / 'mounted.app'; mounted_app.mkdir()
+    (mount / 'README BEFORE OPENING.txt').write_text('ad-hoc signed not notarized Apple could not verify Privacy & Security Developer ID notarization', encoding='utf-8')
+    class Handle:
+        name = str(mount)
+        def cleanup(self): pass
+    seen = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: Handle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda app: seen.append(('runtime', app)))
+    monkeypatch.setattr(validator, '_codesign_verify', lambda app: seen.append(('codesign', app)))
+    dmg = tmp_path / 'token.place-desktop-x-apple-silicon.dmg'; dmg.write_bytes(b'dmg')
+    validator._validate_dmg_contents(dmg, expect_signing=False, require_embedded_python_runtime=True)
+    assert ('runtime', mounted_app) in seen
+    assert ('codesign', mounted_app) in seen
+
+
+def test_validator_main_macos_require_runtime_without_dmg_validates_disposable_copy(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    runtime_apps = []
+    codesign_apps = []
+    run_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=False,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=True,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+
+    def fake_run(cmd):
+        run_calls.append(cmd)
+        return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
+
+    def fake_runtime(probe_app):
+        runtime_apps.append(probe_app)
+        assert probe_app != app
+        assert probe_app.name == app.name
+        assert probe_app.exists()
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', fake_runtime)
+    original_codesign = validator._codesign_verify
+    monkeypatch.setattr(validator, '_codesign_verify', lambda probe_app: codesign_apps.append(probe_app) or original_codesign(probe_app))
+
+    validator.main()
+
+    assert len(runtime_apps) == 1
+    assert runtime_apps[0].parent != app.parent
+    assert codesign_apps.count(app) == 2
+    assert runtime_apps[0] in codesign_apps
+
+
+def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg.write_bytes(b'dmg')
+    dmg_calls = []
+    runtime_apps = []
+    run_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=str(dmg),
+            app_only=False,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=True,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, **kwargs: dmg_calls.append((path, kwargs)))
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda probe_app: runtime_apps.append(probe_app))
+
+    def fake_run(cmd):
+        run_calls.append(cmd)
+        return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    validator.main()
+
+    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
+    assert runtime_apps == []
+    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2

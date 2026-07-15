@@ -1807,6 +1807,27 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         assert invoked == {"pip": True, "source_repair": False}
 
 
+def test_resolve_desktop_dependency_target_prefers_env_override(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    override_target = tmp_path / 'external-desktop-site'
+    home_dir.mkdir()
+    probes = []
+
+    def _fake_writable(candidate):
+        probes.append(candidate)
+        return True, None
+
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(override_target))
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == override_target
+    assert probes == [override_target]
+
 def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'runtime'
     home_dir = tmp_path / 'home'

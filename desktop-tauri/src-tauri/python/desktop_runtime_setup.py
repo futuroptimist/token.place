@@ -107,6 +107,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "version_mismatch_failed",
         "install_timeout",
         "install_cancelled",
+        "install_heartbeat_failed",
         "provisioning_cancelled",
         "cuda_install_failed",
     }
@@ -1169,7 +1170,7 @@ def _install_outcome_action(log_output: str, expected_backend: Optional[str]) ->
     if outcome == "cancelled":
         return "install_cancelled"
     if outcome == "timed_out":
-        return "install_timed_out"
+        return "install_timeout"
     if outcome == "heartbeat_failed":
         return "install_heartbeat_failed"
     return _install_failure_action(expected_backend)

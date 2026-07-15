@@ -922,6 +922,35 @@ def test_windows_runtime_bootstrap_defaults_to_probe_only_without_opt_in(monkeyp
     assert invoked['source_repair'] is False
 
 
+
+def test_install_outcome_timeout_action_is_fatal_for_windows_qwen64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    runtime_action = desktop_runtime_setup._install_outcome_action('outcome=timed_out; stderr_tail=empty', 'cuda')
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'gpu',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': runtime_action,
+            'fallback_reason': 'llama-cpp-python install timed out',
+        },
+    )
+
+    assert runtime_action == 'install_timeout'
+    assert runtime_action in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert message is not None
+    assert 'action=install_timeout' in message
+
+
+def test_install_outcome_heartbeat_failure_action_is_fatal_for_windows_qwen64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    runtime_action = desktop_runtime_setup._install_outcome_action('outcome=heartbeat_failed; stderr_tail=empty', 'cuda')
+
+    assert runtime_action == 'install_heartbeat_failed'
+    assert runtime_action in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+
+
 def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 

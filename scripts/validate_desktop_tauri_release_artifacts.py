@@ -315,7 +315,8 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
         home_dir = scratch / "home"
         pycache = scratch / "pycache"
         tmpdir = scratch / "tmp"
-        for path in (app_data, home_dir, pycache, tmpdir):
+        dependency_target = app_data / "desktop-site"
+        for path in (app_data, dependency_target, home_dir, pycache, tmpdir):
             path.mkdir(parents=True, exist_ok=True)
         # env is a complete replacement for the subprocess environment. Host
         # interpreter overrides are intentionally not inherited by probes.
@@ -328,6 +329,7 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "PYTHONPYCACHEPREFIX": str(pycache),
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
+            "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(dependency_target),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
             "TOKEN_PLACE_MODEL_DIR": str(app_data / "models"),
             "TOKEN_PLACE_CACHE_DIR": str(app_data / "cache"),

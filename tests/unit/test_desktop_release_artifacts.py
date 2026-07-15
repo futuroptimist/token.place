@@ -1653,6 +1653,8 @@ def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locat
     captured = {}
 
     def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
+        assert Path(env['HOME']).is_dir()
+        assert Path(env['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET']).is_dir()
         captured.update(cmd=cmd, env=env, cwd=cwd)
         return subprocess.CompletedProcess(cmd, 0, 'ok', '')
 
@@ -1664,7 +1666,19 @@ def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locat
     assert env['PYTHONNOUSERSITE'] == '1'
     assert env['PATH'] == '/usr/bin:/bin'
     assert env['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
-    writable_keys = ['PYTHONPYCACHEPREFIX', 'TMPDIR', 'PIP_CACHE_DIR', 'HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'TOKEN_PLACE_MODELS_DIR', 'HF_HOME', 'TRANSFORMERS_CACHE']
+    writable_keys = [
+        'PYTHONPYCACHEPREFIX',
+        'TMPDIR',
+        'PIP_CACHE_DIR',
+        'HOME',
+        'XDG_CACHE_HOME',
+        'XDG_CONFIG_HOME',
+        'XDG_DATA_HOME',
+        'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET',
+        'TOKEN_PLACE_MODELS_DIR',
+        'HF_HOME',
+        'TRANSFORMERS_CACHE',
+    ]
     for key in writable_keys:
         assert not Path(env[key]).resolve().is_relative_to(app.resolve()), key
     assert not Path(captured['cwd']).resolve().is_relative_to(app.resolve())

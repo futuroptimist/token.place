@@ -578,7 +578,25 @@ def _tail_text(raw: str, *, limit: int = INSTALL_LOG_TAIL_MAX_CHARS) -> str:
 
 
 def _command_summary(cmd: list[str]) -> str:
-    return " ".join(str(part) for part in cmd)
+    safe_parts: list[str] = []
+    redact_next = False
+    for part in cmd:
+        text = str(part)
+        if redact_next:
+            safe_parts.append("<path>")
+            redact_next = False
+            continue
+        if text in {"--target", "-r"}:
+            safe_parts.append(text)
+            redact_next = True
+            continue
+        if text == sys.executable:
+            safe_parts.append("<python>")
+        elif os.sep in text or (os.altsep and os.altsep in text):
+            safe_parts.append("<path>")
+        else:
+            safe_parts.append(text)
+    return " ".join(safe_parts)
 
 
 def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
@@ -605,18 +623,6 @@ def _run_pip_install(
     cancellation_predicate: Optional[Any] = None,
     heartbeat: Optional[Any] = None,
 ) -> tuple[bool, str]:
-    if getattr(subprocess.run, "__module__", "subprocess") != "subprocess":
-        try:
-            install = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env, timeout=timeout_seconds)
-            stdout_tail = _tail_text(getattr(install, "stdout", "") or "")
-            stderr_tail = _tail_text(getattr(install, "stderr", "") or "")
-            detail = f"command={_command_summary(cmd)}; returncode={install.returncode}; stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
-            return install.returncode == 0, detail
-        except subprocess.TimeoutExpired as exc:
-            stdout = _tail_text(exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-            stderr = _tail_text(exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
-            return False, f"pip install timed out after {timeout_seconds}s; command={_command_summary(cmd)}; stdout_tail={stdout or 'empty'}; stderr_tail={stderr or 'empty'}"
-
     start = time.monotonic()
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
@@ -648,7 +654,7 @@ def _run_pip_install(
     try:
         process = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as exc:
-        return False, f"pip install failed to start; command={_command_summary(cmd)}; error={exc}"
+        return False, f"pip install failed to start; command={_command_summary(cmd)}; error={type(exc).__name__}"
 
     threads = [
         threading.Thread(target=reader, args=(process.stdout, stdout_chunks), daemon=True),
@@ -687,7 +693,6 @@ def _run_pip_install(
         f"stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
     )
     return outcome == "completed" and returncode == 0, detail
-
 
 def _source_build_repair(
     requirements_path: Path,
@@ -1637,34 +1642,43 @@ def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Pat
 
 
 class _ManagedSiteMutationLock:
-    def __init__(self, target: Path, *, timeout_seconds: float = PIP_INSTALL_TIMEOUT_SECONDS, cancellation_predicate: Optional[Any] = None):
+    def __init__(self, target: Path, *, timeout_seconds: float = PIP_INSTALL_TIMEOUT_SECONDS, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None):
         self.path = target / ".token_place_desktop_site.lock"
         self.timeout_seconds = timeout_seconds
         self.cancellation_predicate = cancellation_predicate
+        self.heartbeat = heartbeat
         self._handle: Any = None
 
     def __enter__(self) -> "_ManagedSiteMutationLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(self.path, "a+")
         deadline = time.monotonic() + self.timeout_seconds
-        while True:
-            if self.cancellation_predicate is not None and self.cancellation_predicate():
-                self._close_handle()
-                raise TimeoutError("managed-site lock wait cancelled")
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    self._handle.seek(0)
-                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                if time.monotonic() >= deadline:
-                    self._close_handle()
-                    raise TimeoutError("managed-site lock wait timed out")
-                time.sleep(0.1)
+        started_at = time.monotonic()
+        last_heartbeat = 0.0
+        try:
+            while True:
+                if self.cancellation_predicate is not None and self.cancellation_predicate():
+                    raise TimeoutError("managed-site lock wait cancelled")
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        self._handle.seek(0)
+                        msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self
+                except OSError:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise TimeoutError("managed-site lock wait timed out")
+                    if self.heartbeat is not None and now - last_heartbeat >= 5:
+                        last_heartbeat = now
+                        self.heartbeat({"startup_elapsed_ms": int((now - started_at) * 1000), "startup_deadline_ms": int(self.timeout_seconds * 1000)})
+                    time.sleep(0.1)
+        except BaseException:
+            self._close_handle()
+            raise
 
     def _close_handle(self) -> None:
         if self._handle is None:
@@ -1712,6 +1726,15 @@ def _requirements_for_missing(requirements_path: Path, missing: list[str]) -> li
         return []
     return specs
 
+def _existing_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    env_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
+    candidates = [Path(env_target)] if env_target else []
+    candidates.extend([_desktop_dependency_target(runtime_root), Path.home() / ".token_place_desktop_site"])
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate, None
+    return None, "no existing desktop dependency target"
+
 def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, mutate: bool = True, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None) -> Dict[str, str]:
     """Ensure baseline desktop bridge Python dependencies are importable."""
 
@@ -1719,12 +1742,15 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     requirements_path = _resolve_desktop_requirements_path(root)
     required_modules = ("psutil", "requests", "dotenv", "cryptography")
 
-    target_dir, target_error = _resolve_desktop_dependency_target(root)
+    if mutate:
+        target_dir, target_error = _resolve_desktop_dependency_target(root)
+    else:
+        target_dir, target_error = _existing_desktop_dependency_target(root)
     if target_dir is not None:
         target_dir_str = str(target_dir)
         os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
         if target_dir_str not in sys.path:
-            sys.path.insert(0, target_dir_str)
+            sys.path.insert(1 if sys.path else 0, target_dir_str)
 
     missing = _module_missing(required_modules)
     if not missing:
@@ -1757,13 +1783,13 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     env = os.environ.copy()
     env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
     try:
-        with _ManagedSiteMutationLock(target_dir, cancellation_predicate=cancellation_predicate):
+        with _ManagedSiteMutationLock(target_dir, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
             missing = _module_missing(required_modules)
             if not missing:
                 return {"ok": "true", "action": "already_satisfied_post_lock", "missing": "", "dependency_target": target_dir_str}
             specs = _requirements_for_missing(requirements_path, missing)
             if not specs:
-                specs = ["-r", str(requirements_path)]
+                return {"ok": "false", "action": "missing_requirement_unmapped", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str}
             cmd = [
                 sys.executable,
                 "-m",

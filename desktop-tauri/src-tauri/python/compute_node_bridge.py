@@ -842,6 +842,8 @@ def run(args: argparse.Namespace) -> int:
             payload = dict(payload)
             payload.setdefault("operator_session_id", bridge_session_id)
             payload.setdefault("sequence", status_sequence)
+            if os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE") is not None or os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+                os.environ["TOKENPLACE_OPERATOR_EVENT_SEQUENCE"] = str(status_sequence)
             payload.setdefault("updated_at_ms", int(time.time() * 1000))
             emit(payload)
 

@@ -1414,37 +1414,33 @@ def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(mon
     assert 'repo-local shim' in result['fallback_reason']
 
 
-def test_run_pip_install_success_failure_and_timeout(monkeypatch):
-    class _OkResult:
-        returncode = 0
-        stdout = 'ok output'
-        stderr = ''
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+def test_run_pip_install_success_failure_and_timeout():
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "print('ok output')"],
+        os.environ.copy(),
+    )
     assert ok is True
     assert 'returncode=0' in output
+    assert 'outcome=completed' in output
     assert 'stdout_tail=ok output' in output
 
-    class _FailResult:
-        returncode = 1
-        stdout = 'fallback stdout'
-        stderr = 'real stderr'
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import sys; print('fallback stdout'); print('real stderr', file=sys.stderr); sys.exit(1)"],
+        os.environ.copy(),
+    )
     assert ok is False
     assert 'returncode=1' in output
+    assert 'outcome=completed' in output
     assert 'stdout_tail=fallback stdout' in output
     assert 'stderr_tail=real stderr' in output
 
-    def _timeout(*_args, **_kwargs):
-        raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        os.environ.copy(),
+        timeout_seconds=1,
+    )
     assert ok is False
-    assert 'pip install timed out after 12s' in output
+    assert 'outcome=timed_out' in output
     assert 'stdout_tail=empty' in output
     assert 'stderr_tail=empty' in output
 

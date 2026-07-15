@@ -954,9 +954,13 @@ def run(args: argparse.Namespace) -> int:
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
-        runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
+        private_probe = json.loads(os.getenv("TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON", "{}"))
+        runtime.model_manager.desktop_runtime_probe = dict(private_probe if isinstance(private_probe, dict) else runtime_setup)
     except Exception:
-        pass
+        try:
+            runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
+        except Exception:
+            pass
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
     runtime_path = _runtime_path_from_env()

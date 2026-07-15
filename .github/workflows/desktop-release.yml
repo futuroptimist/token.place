@@ -370,11 +370,18 @@ jobs:
             if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
               signing_flag="--expect-signing"
             fi
-            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${app_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+            codesign --verify --deep --strict --verbose=4 "${app_path}"
+            runtime_probe_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/token-place-runtime-probe.XXXXXX")"
+            runtime_probe_app="${runtime_probe_dir}/$(basename "${app_path}")"
+            cp -R "${app_path}" "${runtime_probe_app}"
+            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${runtime_probe_app}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+            codesign --verify --deep --strict --verbose=4 "${app_path}"
 
             rm -rf "${dmg_stage_dir}"
             mkdir -p "${dmg_stage_dir}"
             cp -R "${app_path}" "${dmg_stage_dir}/"
+            staged_app="${dmg_stage_dir}/$(basename "${app_path}")"
+            codesign --verify --deep --strict --verbose=4 "${staged_app}"
             cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"
             ln -s /Applications "${dmg_stage_dir}/Applications"
             rm -f "${dmg_path}"
@@ -441,6 +448,8 @@ jobs:
             if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
               echo "::warning::APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed in this workflow yet; skipping strict Gatekeeper notarization enforcement."
             fi
+          else
+            echo "Apple Developer credentials absent; validating the required ad-hoc preview signature."
           fi
 
           python ../scripts/validate_desktop_tauri_release_artifacts.py               --require-embedded-python-runtime               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}

@@ -1431,3 +1431,158 @@ def test_validator_dmg_contents_rejects_missing_signed_preview_phrase(monkeypatc
         assert False
     except SystemExit as exc:
         assert 'configured Apple signing identity' in str(exc)
+
+
+def _minimal_validator_app(validator, tmp_path: Path) -> tuple[Path, Path, Path]:
+    app = tmp_path / 'token.place desktop.app'
+    contents = app / 'Contents'
+    macos = contents / 'MacOS'
+    resources = contents / 'Resources'
+    macos.mkdir(parents=True)
+    resources.mkdir()
+    executable = macos / 'token-place-desktop-tauri'
+    executable.write_bytes(b'exe')
+    icon = tmp_path / 'icon.icns'
+    icon.write_bytes(b'icon')
+    (resources / 'token-icon.icns').write_bytes(b'icon')
+    (contents / 'Info.plist').write_bytes(
+        validator.plistlib.dumps(
+            {
+                'CFBundleName': 'token.place desktop',
+                'CFBundleDisplayName': 'token.place desktop',
+                'CFBundleExecutable': executable.name,
+                'CFBundleIconFile': 'token-icon',
+            }
+        )
+    )
+    tauri_config = tmp_path / 'tauri.conf.json'
+    tauri_config.write_text(
+        json.dumps({'bundle': {'icon': ['icons/icon.icns', 'icons/icon.ico', 'icons/128x128@2x.png']}}),
+        encoding='utf-8',
+    )
+    return app, tauri_config, icon
+
+
+def test_validator_main_rejects_app_and_dmg_shape_errors(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+
+    def set_args(**overrides):
+        values = {
+            'app_path': str(app),
+            'dmg_path': None,
+            'app_only': False,
+            'tauri_config': str(tauri_config),
+            'expected_icon': str(icon),
+            'expect_signing': False,
+            'require_embedded_python_runtime': False,
+            'expect_notarization': False,
+        }
+        values.update(overrides)
+        monkeypatch.setattr(validator, '_parse_args', lambda: validator.argparse.Namespace(**values))
+
+    for overrides, expected in (
+        ({}, '--dmg-path is required'),
+        ({'dmg_path': str(tmp_path / 'artifact.zip')}, 'dmg artifact missing'),
+        ({'dmg_path': str(tmp_path / 'wrong.dmg')}, 'DMG filename must match'),
+    ):
+        set_args(**overrides)
+        if overrides.get('dmg_path'):
+            Path(overrides['dmg_path']).write_bytes(b'dmg')
+        try:
+            validator.main()
+            assert False
+        except SystemExit as exc:
+            assert expected in str(exc)
+
+    bad_name = tmp_path / 'token.place-desktop-test.dmg'
+    bad_name.write_bytes(b'dmg')
+    set_args(dmg_path=str(bad_name))
+    try:
+        validator.main()
+        assert False
+    except SystemExit as exc:
+        assert 'DMG filename must match' in str(exc)
+
+    set_args(app_only=True, app_path=str(tmp_path / 'missing.app'))
+    try:
+        validator.main()
+        assert False
+    except SystemExit as exc:
+        assert 'app bundle missing' in str(exc)
+
+    set_args(app_only=True, expected_icon=str(tmp_path / 'missing.icns'))
+    try:
+        validator.main()
+        assert False
+    except SystemExit as exc:
+        assert 'expected icon missing' in str(exc)
+
+
+def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+    py.chmod(0o755)
+
+    try:
+        validator._validate_embedded_python_runtime(app)
+        assert False
+    except SystemExit as exc:
+        assert 'embedded runtime provenance missing' in str(exc)
+
+    (runtime / 'embedded_python_runtime_provenance.json').write_text('{}')
+    try:
+        validator._validate_embedded_python_runtime(app)
+        assert False
+    except SystemExit as exc:
+        assert 'embedded runtime notice missing' in str(exc)
+
+    for notice in ('LICENSE-PYTHON.txt', 'LICENSE-python-build-standalone.txt'):
+        (runtime / notice).write_text('notice')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'x86_64' if cmd[:2] == ['lipo', '-archs'] else '')
+    try:
+        validator._validate_embedded_python_runtime(app)
+        assert False
+    except SystemExit as exc:
+        assert 'embedded Python is not arm64' in str(exc)
+
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True},
+    }
+    calls = []
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(
+        validator,
+        '_run_python_sanitized',
+        lambda _python, code, app_path: calls.append(code) or json.dumps(payload if 'version_info' in code else probe),
+    )
+
+    try:
+        validator._validate_embedded_python_runtime(app)
+        assert False
+    except SystemExit as exc:
+        assert 'packaged model_bridge.py missing' in str(exc)
+
+    (app / 'Contents' / 'Resources' / 'python').mkdir()
+    (app / 'Contents' / 'Resources' / 'python' / 'model_bridge.py').write_text('print("inspect")')
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: calls.append(str(path)))
+    validator._validate_embedded_python_runtime(app)
+    assert any('model_bridge.py' in code for code in calls)

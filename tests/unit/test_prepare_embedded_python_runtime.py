@@ -1210,3 +1210,139 @@ def test_normalize_python_runtime_is_noop_outside_darwin(monkeypatch, tmp_path):
     prep.normalize_python_build_standalone_macos_runtime(tmp_path / 'missing-runtime', manifest())
 
     assert calls == []
+
+
+def test_more_native_audit_helper_error_paths(monkeypatch, tmp_path):
+    owner = tmp_path / 'runtime' / 'libexample.dylib'
+    owner.parent.mkdir()
+    owner.write_text('x')
+
+    install_ids_by_arch = {'arm64': ['@rpath/libexample.dylib']}
+    load_deps_by_arch = {'arm64': ['@loader_path/libSystem.B.dylib']}
+    monkeypatch.setattr(prep, '_otool_load_commands_by_arch', lambda path: {'arm64': 'cmd LC_ID_DYLIB\nname @rpath/libexample.dylib (offset 24)'})
+    monkeypatch.setattr(prep, '_otool_load_deps_by_arch', lambda path: load_deps_by_arch)
+    assert prep._otool_install_ids_by_arch(owner) == install_ids_by_arch
+    assert prep._otool_load_deps(owner) == ['@loader_path/libSystem.B.dylib']
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Linux')
+    assert prep._is_macho_file(owner) is False
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout='ASCII text\n', stderr=''),
+    )
+    assert prep._is_macho_file(owner) is False
+
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 7, stdout='', stderr='bad otool'),
+    )
+    try:
+        prep._otool(['otool', '-arch', 'arm64', '-L', str(owner)])
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'native linkage inspection failed' in str(exc)
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Linux')
+    prep.audit_macho_runtime(tmp_path / 'runtime')
+
+
+def test_install_packages_validates_candidates_and_handles_rejections(monkeypatch, tmp_path):
+    py = tmp_path / 'runtime' / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+    calls = []
+
+    class Plan:
+        backend = 'metal'
+        package_spec = 'llama-cpp-python==0.3.32'
+        force_cmake = True
+
+        def pip_env(self):
+            return {'CMAKE_ARGS': '-DGGML_METAL=ON'}
+
+        def pip_install_args(self):
+            return ['--no-binary', 'llama-cpp-python']
+
+    def fake_run(cmd, env=None):
+        calls.append((cmd, env))
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+
+    monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep, 'probe_runtime', lambda _python, m: calls.append((['probe'], None)))
+    monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: calls.append((['audit', str(runtime)], None)))
+
+    prep._validate_candidate_install(py, manifest(), py.parents[1])
+    assert [cmd for cmd, _env in calls] == [
+        [str(py), '-m', 'pip', 'check'],
+        [str(py), '-c', 'import ' + ','.join(prep.IMPORTS)],
+        ['probe'],
+        ['audit', str(py.parents[1])],
+    ]
+
+    calls.clear()
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', lambda **kwargs: [Plan()])
+    prep.install_packages(py, manifest(), tmp_path / 'pip-cache')
+    install_envs = [env for cmd, env in calls if 'llama-cpp-python==0.3.32' in cmd]
+    assert install_envs[-1]['CMAKE_OSX_ARCHITECTURES'] == 'arm64'
+    assert install_envs[-1]['MACOSX_DEPLOYMENT_TARGET'] == manifest()['minimum_macos_version']
+
+    class BadPlan(Plan):
+        package_spec = 'llama-cpp-python==0.0.1'
+
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', lambda **kwargs: [BadPlan()])
+    try:
+        prep.install_packages(py, manifest(), tmp_path / 'pip-cache')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'install plan package spec mismatch' in str(exc)
+
+
+def test_install_packages_reports_uninstall_failure_and_main_errors(monkeypatch, tmp_path, capsys):
+    py = tmp_path / 'runtime' / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+
+    class Plan:
+        backend = 'metal'
+        package_spec = 'llama-cpp-python==0.3.32'
+        force_cmake = False
+
+        def pip_env(self):
+            return {}
+
+        def pip_install_args(self):
+            return []
+
+    monkeypatch.setattr(prep, 'run', lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, stdout='', stderr=''))
+    monkeypatch.setattr(prep, 'llama_cpp_install_plan_fallbacks', lambda **kwargs: [Plan()])
+    monkeypatch.setattr(prep, '_validate_candidate_install', lambda _python, m, runtime: (_ for _ in ()).throw(prep.RuntimePrepError('non-relocatable')))
+    monkeypatch.setattr(prep, '_uninstall_llama_cpp', lambda _python: (_ for _ in ()).throw(prep.RuntimePrepError('uninstall failed')))
+
+    try:
+        prep.install_packages(py, manifest(), tmp_path / 'pip-cache')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'additionally failed to remove rejected llama-cpp-python' in str(exc)
+
+    monkeypatch.setattr(prep.subprocess, 'check_output', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no git')))
+    assert prep.provenance(manifest(), {})['repository_commit'] == 'unknown'
+
+    monkeypatch.setattr(prep.sys, 'argv', ['prepare_embedded_python_runtime.py'])
+    monkeypatch.setattr(
+        prep,
+        'prepare',
+        lambda cache_dir: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(2, ['pip'], output='pip-out', stderr='pip-err')
+        ),
+    )
+    assert prep.main() == 1
+    err = capsys.readouterr().err
+    assert 'pip-out' in err and 'pip-err' in err
+
+    monkeypatch.setattr(prep, 'prepare', lambda cache_dir: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert prep.main() == 1
+    assert 'boom' in capsys.readouterr().err

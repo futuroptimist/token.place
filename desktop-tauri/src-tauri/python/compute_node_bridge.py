@@ -954,7 +954,18 @@ def run(args: argparse.Namespace) -> int:
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
-        runtime.model_manager.desktop_runtime_probe = dict(runtime_setup)
+        private_runtime_setup = dict(runtime_setup)
+        raw_private_probe = os.environ.get("TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON", "").strip()
+        if raw_private_probe:
+            try:
+                parsed_private_probe = json.loads(raw_private_probe)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_private_probe = None
+            if isinstance(parsed_private_probe, dict):
+                identity = parsed_private_probe.get("llama_module_identity")
+                if isinstance(identity, str):
+                    private_runtime_setup["llama_module_identity"] = identity
+        runtime.model_manager.desktop_runtime_probe = private_runtime_setup
     except Exception:
         pass
 

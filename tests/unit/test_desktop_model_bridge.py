@@ -430,3 +430,14 @@ def test_inspect_uses_preflight_failure_manager_without_second_lookup(capsys, mo
     assert status == 0
     assert calls['count'] == 1
     assert json.loads(capsys.readouterr().out)['payload'] == {'filename': 'model.gguf'}
+
+
+def test_inspect_preflight_error_status_and_none_manager_fallback(capsys, monkeypatch):
+    monkeypatch.setattr(model_bridge, '_run_dependency_preflight', lambda mutate=False: {'ok': False, 'error': 'deps missing'})
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, {'ok': False, 'error': 'manager failed'}))
+    assert model_bridge.inspect_model() == 1
+    assert json.loads(capsys.readouterr().out)['error'] == 'manager failed'
+
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, None))
+    assert model_bridge.inspect_model() == 0
+    assert json.loads(capsys.readouterr().out)['payload']['filename'].endswith('.gguf')

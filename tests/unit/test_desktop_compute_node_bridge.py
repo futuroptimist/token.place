@@ -5116,3 +5116,47 @@ def test_run_defaults_bad_operator_event_sequence_to_zero(monkeypatch, capsys):
 
     assert events[0]['sequence'] == 1
     assert events[0]['worker_state'] == 'provisioning'
+
+
+def test_provisioning_extra_updates_readiness_diagnostics(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    def deps(**kwargs):
+        kwargs['heartbeat']({'startup_elapsed_ms': 5000, 'startup_deadline_ms': 10000, 'unsafe': 'drop'})
+        return {'ok': 'false', 'missing': 'psutil', 'action': 'install_cancelled'}
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', deps)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    install = next(event for event in events if event.get('startup_phase') == 'dependency_install')
+    assert install['startup_elapsed_ms'] == 5000
+    assert install['startup_deadline_ms'] == 10000
+    assert install['readiness_diagnostics']['startup_elapsed_ms'] == 5000
+    assert 'unsafe' not in install
+    assert os.environ['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == str(events[-1]['sequence'])
+
+
+def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda **_kwargs: {'ok': 'true'})
+
+    def runtime(*args, **kwargs):
+        if kwargs:
+            raise TypeError('unexpected keyword argument cancellation_predicate')
+        return {'runtime_action': 'already_supported', 'selected_backend': 'cpu'}
+
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', runtime)
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
+    _install_fake_runtime_module(monkeypatch)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+    phases = [json.loads(line).get('startup_phase') for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert 'runtime_probe' in phases
+    assert 'runtime_verification' in phases

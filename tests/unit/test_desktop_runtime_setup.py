@@ -2497,3 +2497,184 @@ def test_ensure_desktop_python_dependencies_maps_compat_timeout_to_timeout_actio
     result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
 
     assert result['action'] == 'install_timeout'
+
+
+def test_small_helpers_cover_redaction_truncation_and_requirements_edges(tmp_path, monkeypatch):
+    assert desktop_runtime_setup._tail_text('abcdef', limit=3) == '...def'
+    cmd = [sys.executable, '-m', 'pip', 'install', '/tmp/local.whl', 'pkg==1']
+    summary = desktop_runtime_setup._command_summary(cmd)
+    assert '<python>' in summary
+    assert '<path>' in summary
+    assert 'pkg==1' in summary
+
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('\n# comment\nrequests==2\npython-dotenv==1\n', encoding='utf-8')
+    assert desktop_runtime_setup._requirements_for_missing(requirements, ['dotenv']) == ['python-dotenv==1']
+    assert desktop_runtime_setup._requirements_for_missing(tmp_path / 'missing.txt', ['requests']) == []
+
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', lambda: tmp_path / 'home')
+    assert desktop_runtime_setup._existing_desktop_dependency_target(tmp_path) == (None, 'no existing desktop dependency target')
+
+
+class _KillFailProcess:
+    pid = 999999
+
+    def kill(self):
+        raise RuntimeError('kill failed')
+
+
+def test_terminate_process_tree_falls_back_when_group_kill_fails(monkeypatch):
+    calls = []
+
+    def fail_killpg(_pid, _sig):
+        calls.append('killpg')
+        raise OSError('no group')
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
+    monkeypatch.setattr(desktop_runtime_setup.os, 'killpg', fail_killpg)
+    desktop_runtime_setup._terminate_process_tree(_KillFailProcess())
+    assert calls == ['killpg']
+
+
+def test_lock_cancel_and_exit_no_handle_paths(tmp_path):
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(
+        tmp_path / 'site' / '.lock',
+        timeout_seconds=1,
+        cancellation_predicate=lambda: True,
+    )
+    with pytest.raises(TimeoutError, match='cancelled'):
+        lock.__enter__()
+    assert lock._handle is None
+    lock.__exit__(None, None, None)
+
+
+def test_read_only_dependency_preflight_reports_missing_without_target_creation(tmp_path, monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: tmp_path / 'requirements.txt')
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', lambda: tmp_path / 'home')
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: ['requests'])
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(mutate=False)
+
+    assert result['action'] == 'missing_read_only'
+    assert result['dependency_target'] == ''
+    assert not (tmp_path / 'desktop-python-site').exists()
+
+
+def test_dependency_preflight_post_lock_satisfied_and_unmapped(tmp_path, monkeypatch):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('requests==2\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    missing_sequences = iter([['requests'], []])
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: next(missing_sequences))
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies()
+    assert result['action'] == 'already_satisfied_post_lock'
+
+    missing_sequences = iter([['not_allowlisted'], ['not_allowlisted']])
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: next(missing_sequences))
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies()
+    assert result['action'] == 'missing_requirement_unmapped'
+
+
+def test_pip_install_start_failure_and_wait_timeout(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_a, **_k: (_ for _ in ()).throw(OSError('boom')))
+    ok, detail = desktop_runtime_setup._run_pip_install([sys.executable, '-m', 'pip'], os.environ.copy())
+    assert ok is False
+    assert 'failed to start' in detail
+
+    class Stream:
+        def readline(self):
+            return ''
+        def close(self):
+            raise RuntimeError('close failed')
+
+    class Proc:
+        pid = 999999
+        stdout = Stream()
+        stderr = Stream()
+        def __init__(self):
+            self.waits = 0
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            raise desktop_runtime_setup.subprocess.TimeoutExpired(['pip'], timeout)
+        def kill(self):
+            pass
+
+    proc = Proc()
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_a, **_k: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: None)
+    ok, detail = desktop_runtime_setup._run_pip_install([sys.executable, '-m', 'pip'], os.environ.copy())
+    assert ok is True
+    assert 'returncode=0' in detail
+
+
+def test_runtime_install_threads_cancellation_and_heartbeat_kwargs(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    target = tmp_path / 'site'
+    target.mkdir()
+    captured = []
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooling'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [desktop_runtime_setup.LlamaCppInstallPlan(platform='win32', force_cmake=True, index_url=None, only_binary=False, backend='cuda', package_spec='llama-cpp-python==0.3.32', no_binary=True, cmake_args='-DGGML_CUDA=on')])
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda cmd, env, **kwargs: captured.append(kwargs) or (False, 'outcome=cancelled'))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'system', lambda: 'Windows')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+
+    cancel = lambda: False
+    heartbeat = lambda _extra: None
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', context_tier='8k', cancellation_predicate=cancel, heartbeat=heartbeat)
+
+    assert result['runtime_action'] in {'runtime_repair_failed', 'version_mismatch_failed', 'failed'}
+    assert captured
+    assert captured[0]['cancellation_predicate'] is cancel
+    assert captured[0]['heartbeat'] is heartbeat
+
+
+def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
+    events = []
+    times = iter([0.0, 0.0, 5.1, 5.2, 6.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'nt')
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+        calls = 0
+        @classmethod
+        def locking(cls, _fd, mode, _size):
+            cls.calls += 1
+            if mode == cls.LK_NBLCK:
+                raise OSError('busy')
+
+    monkeypatch.setitem(sys.modules, 'msvcrt', FakeMsvcrt)
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(tmp_path / '.lock', timeout_seconds=6, heartbeat=events.append)
+    with pytest.raises(TimeoutError):
+        lock.__enter__()
+    assert events == [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 6000}]
+    assert lock._handle is None
+
+    # Cover the Windows unlock path on __exit__ with an already-held fake handle.
+    class Handle:
+        def seek(self, _pos):
+            pass
+        def fileno(self):
+            return 1
+        def close(self):
+            pass
+    lock._handle = Handle()
+    FakeMsvcrt.locking = classmethod(lambda cls, _fd, _mode, _size: None)
+    lock.__exit__(None, None, None)
+    assert lock._handle is None

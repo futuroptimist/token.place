@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 WORKFLOW = Path('.github/workflows/desktop-release.yml')
 TAURI_CONFIG = Path('desktop-tauri/src-tauri/tauri.conf.json')
@@ -281,6 +285,7 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
+    monkeypatch.setattr(validator, '_verify_codesign_strict', lambda app: None)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
@@ -722,7 +727,10 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
         assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
         assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
         assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
-        assert cwd == str((app / 'Contents' / 'Resources' / 'python').absolute())
+        assert cwd == str(created_home['path'])
+        assert cmd[1] == '-B'
+        assert env['PYTHONDONTWRITEBYTECODE'] == '1'
+        assert not Path(env['PYTHONPYCACHEPREFIX']).is_relative_to(app)
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
     monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
@@ -771,7 +779,8 @@ def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeyp
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
-    assert seen['cwd'] == str(resources_python.absolute())
+    assert seen['cwd'] != str(resources_python.absolute())
+    assert not Path(seen['cwd']).is_relative_to(app)
 
 
 def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_cwd(
@@ -795,7 +804,7 @@ def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_c
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert seen['cmd'][0] == str((tmp_path / py).absolute())
-    assert seen['cwd'] == str((tmp_path / app / 'Contents' / 'Resources' / 'python').absolute())
+    assert seen['cwd'] != str((tmp_path / app / 'Contents' / 'Resources' / 'python').absolute())
 
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -1339,6 +1348,7 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: handle)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: cleanup_calls.append((dmg, path)))
+    monkeypatch.setattr(validator, '_verify_codesign_strict', lambda app: None)
 
     dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg.write_bytes(b'dmg')
@@ -1391,7 +1401,8 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
             expect_notarization=True,
         ),
     )
-    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, *, expect_signing: dmg_calls.append((path, expect_signing)))
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, **kwargs: dmg_calls.append((path, kwargs['expect_signing'])))
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
 
     def fake_run(cmd):
         run_calls.append(cmd)
@@ -1402,7 +1413,7 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
     validator.main()
 
     assert dmg_calls == [(dmg, True)]
-    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)] in run_calls
+    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)] in run_calls
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
 
 
@@ -1425,6 +1436,7 @@ def test_validator_dmg_contents_rejects_missing_signed_preview_phrase(monkeypatc
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+    monkeypatch.setattr(validator, '_verify_codesign_strict', lambda app: None)
 
     try:
         validator._validate_dmg_contents(tmp_path / 'token.place-desktop-test-apple-silicon.dmg', expect_signing=True)
@@ -1586,3 +1598,141 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: calls.append(str(path)))
     validator._validate_embedded_python_runtime(app)
     assert any('model_bridge.py' in code for code in calls)
+
+def test_run_python_sanitized_imports_app_module_without_bytecode_in_parent_or_child(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    package_dir = app / 'Contents' / 'Resources' / 'python'
+    package_dir.mkdir(parents=True)
+    (package_dir / 'probe_module.py').write_text('VALUE = 42\n', encoding='utf-8')
+    code = "import probe_module, subprocess, sys; subprocess.check_call([sys.executable, '-c', 'import probe_module']); print(probe_module.VALUE)"
+
+    assert validator._run_python_sanitized(Path(sys.executable), code, app).splitlines()[-1] == '42'
+    assert not list(package_dir.rglob('__pycache__'))
+    assert not list(package_dir.rglob('*.pyc'))
+
+
+def test_app_tree_fingerprint_reports_mutations(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    resources = app / 'Contents' / 'Resources'
+    resources.mkdir(parents=True)
+    keep = resources / 'keep.txt'
+    keep.write_text('before', encoding='utf-8')
+    remove = resources / 'remove.txt'
+    remove.write_text('remove', encoding='utf-8')
+    executable = resources / 'tool'
+    executable.write_text('tool', encoding='utf-8')
+    executable.chmod(0o644)
+    link = resources / 'link'
+    link.symlink_to('keep.txt')
+    before = validator._app_tree_fingerprint(app)
+
+    (resources / '__pycache__').mkdir()
+    (resources / '__pycache__' / 'new.cpython-312.pyc').write_bytes(b'pyc')
+    remove.unlink()
+    keep.write_text('after', encoding='utf-8')
+    executable.chmod(0o755)
+    link.unlink()
+    link.symlink_to('tool')
+
+    changes = validator._describe_app_tree_mutations(before, validator._app_tree_fingerprint(app))
+    assert any('unsealed Python bytecode' in change for change in changes)
+    assert any(change.startswith('removed: Contents/Resources/remove.txt') for change in changes)
+    assert any(change.startswith('rewritten: Contents/Resources/keep.txt') for change in changes)
+    assert any(change.startswith('chmodded: Contents/Resources/tool') for change in changes)
+    assert any(change.startswith('retargeted symlink: Contents/Resources/link') for change in changes)
+
+
+def test_validate_embedded_python_runtime_mutation_guard_rejects_pyc(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+    py.chmod(0o755)
+    (runtime / 'embedded_python_runtime_provenance.json').write_text('{}')
+    (runtime / 'LICENSE-PYTHON.txt').write_text('x')
+    (runtime / 'LICENSE-python-build-standalone.txt').write_text('x')
+    py_resources = app / 'Contents' / 'Resources' / 'python'
+    py_resources.mkdir(parents=True)
+    (py_resources / 'model_bridge.py').write_text('x')
+    calls = {'count': 0}
+
+    def fake_probe(_py, code, _app):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            return json.dumps({'version': [3, 11], 'machine': 'arm64', 'executable': str(py), 'prefix': str(runtime), 'llama_cpp_python_version': '0.3.32'})
+        if '_probe_llama_runtime' in code:
+            (py_resources / '__pycache__').mkdir()
+            (py_resources / '__pycache__' / 'model_bridge.cpython-311.pyc').write_bytes(b'bad')
+            return json.dumps({'backend': 'metal', 'gpu_offload_supported': True, 'qwen_64k_yarn_support': 'supported', 'rope_scaling_type_supported': True, 'rope_freq_scale_supported': True, 'yarn_orig_ctx_supported': True, 'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True}})
+        return 'ok'
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_probe)
+    with pytest.raises(SystemExit) as exc:
+        validator._validate_embedded_python_runtime(app)
+    assert 'unsealed Python bytecode' in str(exc.value)
+
+
+def test_preview_signature_verification_not_gated_on_paid_signing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd) or '')
+    validator._verify_codesign_strict(app)
+    assert calls == [['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]]
+
+
+def test_workflow_probes_disposable_copy_and_verifies_staged_and_source_apps() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'runtime_probe_app=' in text
+    assert '--app-path "${runtime_probe_app}"' in text
+    assert 'codesign --verify --deep --strict --verbose=4 "${app_path}"' in text
+    assert 'codesign --verify --deep --strict --verbose=4 "${staged_app}"' in text
+    assert 'Apple Developer credentials absent; validating the required ad-hoc preview signature.' in text
+    assert 'spctl' not in text
+    assert 'notarization/stapling is not performed' in text
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='requires real macOS codesign and hdiutil')
+def test_macos_sanitized_probe_preserves_ad_hoc_signature_and_dmg_mount(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Fixture.app'
+    (app / 'Contents' / 'MacOS').mkdir(parents=True)
+    resources_python = app / 'Contents' / 'Resources' / 'python'
+    resources_python.mkdir(parents=True)
+    exe = app / 'Contents' / 'MacOS' / 'Fixture'
+    exe.write_text('#!/bin/sh\nexit 0\n')
+    exe.chmod(0o755)
+    (app / 'Contents' / 'Info.plist').write_bytes(validator.plistlib.dumps({'CFBundleIdentifier': 'place.token.fixture', 'CFBundleExecutable': 'Fixture'}))
+    (resources_python / 'fixture_module.py').write_text('VALUE=1\n')
+    validator._run(['codesign', '--force', '--deep', '--sign', '-', str(app)])
+    validator._verify_codesign_strict(app)
+    before = validator._app_tree_fingerprint(app)
+    validator._run_python_sanitized(Path(sys.executable), 'import fixture_module; print(fixture_module.VALUE)', app)
+    validator._assert_app_tree_unchanged(app, before)
+    assert not list(app.rglob('*.pyc'))
+    validator._verify_codesign_strict(app)
+    (resources_python / '__pycache__').mkdir()
+    (resources_python / '__pycache__' / 'fixture_module.cpython-312.pyc').write_bytes(b'bad')
+    with pytest.raises(SystemExit):
+        validator._assert_app_tree_unchanged(app, before)
+    (resources_python / '__pycache__' / 'fixture_module.cpython-312.pyc').unlink()
+    (resources_python / '__pycache__').rmdir()
+    stage = tmp_path / 'stage'
+    stage.mkdir()
+    shutil.copytree(app, stage / app.name, symlinks=True)
+    readme = stage / 'README BEFORE OPENING.txt'
+    readme.write_text('ad-hoc signed not notarized Apple could not verify Privacy & Security Developer ID notarization')
+    dmg = tmp_path / 'token.place-desktop-fixture-apple-silicon.dmg'
+    validator._run(['hdiutil', 'create', '-volname', 'fixture', '-srcfolder', str(stage), '-ov', '-format', 'UDZO', str(dmg)])
+    seen = []
+    old_validate = validator._validate_embedded_python_runtime
+    validator._validate_embedded_python_runtime = lambda mounted_app: seen.append(mounted_app)
+    validator._validate_dmg_contents(dmg, expect_signing=False, require_embedded_python_runtime=True)
+    assert seen and str(seen[0]).startswith('/private/var/') or seen
+    validator._validate_embedded_python_runtime = old_validate

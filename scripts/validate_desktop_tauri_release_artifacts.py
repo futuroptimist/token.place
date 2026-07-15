@@ -309,24 +309,39 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     home = tempfile.mkdtemp(prefix="token-place-home-")
     try:
         app_data = Path(home) / "token.place"
+        pycache_prefix = Path(home) / "pycache-prefix"
+        tmpdir = Path(home) / "tmp"
+        for path in (app_data, pycache_prefix, tmpdir):
+            path.mkdir(parents=True, exist_ok=True)
         env = {
             "HOME": home,
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
+            "PYTHONPYCACHEPREFIX": str(pycache_prefix),
+            "TMPDIR": str(tmpdir),
+            "TEMP": str(tmpdir),
+            "TMP": str(tmpdir),
+            "PIP_CACHE_DIR": str(app_data / "pip-cache"),
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
+            "TOKEN_PLACE_CACHE_DIR": str(app_data / "cache"),
+            "HF_HOME": str(app_data / "hf-home"),
+            "HUGGINGFACE_HUB_CACHE": str(app_data / "hf-cache"),
+            "TRANSFORMERS_CACHE": str(app_data / "transformers-cache"),
             "XDG_CACHE_HOME": str(app_data / "cache"),
             "XDG_CONFIG_HOME": str(app_data / "config"),
             "XDG_DATA_HOME": str(app_data / "data"),
         }
-        probe_cwd = app_for_subprocess / "Contents" / "Resources" / "python"
+        for key in ("PYTHONHOME", "PYTHONEXECUTABLE", "PYTHONUSERBASE", "PYTHONSTARTUP", "VIRTUAL_ENV", "CONDA_PREFIX"):
+            env.pop(key, None)
         result = subprocess.run(
-            [str(py_for_subprocess), "-c", code],
+            [str(py_for_subprocess), "-B", "-c", code],
             check=False,
             capture_output=True,
             text=True,
             env=env,
-            cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
+            cwd=home,
         )
         output = f"{result.stdout}\n{result.stderr}"
         scan_output = _redact_allowed_app_locations(output, app_for_subprocess)
@@ -335,10 +350,64 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             if marker in scan_output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
         if result.returncode != 0:
-            _fail(_format_command_failure([str(py_for_subprocess), "-c", "<probe>"], result))
+            _fail(_format_command_failure([str(py_for_subprocess), "-B", "-c", "<probe>"], result))
         return output.strip()
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+def _app_tree_fingerprint(app_path: Path) -> dict[str, dict[str, object]]:
+    fingerprint: dict[str, dict[str, object]] = {}
+    for path in sorted(app_path.rglob("*")):
+        rel = path.relative_to(app_path).as_posix()
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            continue
+        mode = st.st_mode & 0o777
+        if path.is_symlink():
+            fingerprint[rel] = {"type": "symlink", "mode": mode, "target": os.readlink(path)}
+        elif path.is_file():
+            fingerprint[rel] = {"type": "file", "mode": mode, "sha256": _sha256(path), "executable": bool(mode & 0o111)}
+        elif path.is_dir():
+            fingerprint[rel] = {"type": "dir", "mode": mode}
+        else:
+            fingerprint[rel] = {"type": "other", "mode": mode}
+    return fingerprint
+
+
+def _describe_app_tree_mutations(before: dict[str, dict[str, object]], after: dict[str, dict[str, object]]) -> list[str]:
+    changes: list[str] = []
+    before_keys = set(before)
+    after_keys = set(after)
+    for rel in sorted(after_keys - before_keys):
+        marker = " (unsealed Python bytecode)" if rel.endswith(".pyc") or "/__pycache__/" in f"/{rel}" else ""
+        changes.append(f"added: {rel}{marker}")
+    for rel in sorted(before_keys - after_keys):
+        changes.append(f"removed: {rel}")
+    for rel in sorted(before_keys & after_keys):
+        old = before[rel]
+        new = after[rel]
+        if old.get("type") != new.get("type"):
+            changes.append(f"type changed: {rel} ({old.get('type')} -> {new.get('type')})")
+        elif old.get("type") == "file" and old.get("sha256") != new.get("sha256"):
+            changes.append(f"rewritten: {rel}")
+        elif old.get("type") == "symlink" and old.get("target") != new.get("target"):
+            changes.append(f"retargeted symlink: {rel} ({old.get('target')} -> {new.get('target')})")
+        if old.get("mode") != new.get("mode"):
+            changes.append(f"chmodded: {rel} ({old.get('mode')!r} -> {new.get('mode')!r})")
+    return changes
+
+
+def _assert_app_tree_unchanged(app_path: Path, before: dict[str, dict[str, object]]) -> None:
+    changes = _describe_app_tree_mutations(before, _app_tree_fingerprint(app_path))
+    if changes:
+        _fail("Executable app validation mutated the signed app bundle; post-sign unsealed files are forbidden:\n" + "\n".join(changes[:50]))
+
+
+def _verify_codesign_strict(app_path: Path) -> None:
+    if platform.system() == "Darwin":
+        _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
 def _parse_otool_rpaths(load_commands: str) -> list[str]:
     rpaths: list[str] = []
@@ -514,59 +583,62 @@ def _validate_macho_linkage(path: Path, app_path: Path) -> None:
                 _fail(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}")
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:
-    runtime = app_path / "Contents" / "Resources" / "python-runtime"
-    py = runtime / "bin" / "python3"
-    if not py.exists() or not os.access(py, os.X_OK):
-        _fail(f"embedded Python interpreter missing or not executable at exact packaged path: {py}")
-    if not (runtime / "embedded_python_runtime_provenance.json").is_file():
-        _fail("embedded runtime provenance missing")
-    for notice in ("LICENSE-PYTHON.txt", "LICENSE-python-build-standalone.txt"):
-        if not (runtime / notice).is_file():
-            _fail(f"embedded runtime notice missing: {notice}")
-    if platform.system() == "Darwin":
-        arch = _run(["lipo", "-archs", str(py)]).lower()
-        if "arm64" not in arch or ("x86_64" in arch and "arm64" not in arch):
-            _fail(f"embedded Python is not arm64: {arch}")
-    code = "import importlib.metadata as im,json,platform,sys; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'version':sys.version_info[:2],'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix,'llama_cpp_python_version':im.version('llama-cpp-python')}))"
-    payload = json.loads(_run_python_sanitized(py, code, app_path).splitlines()[-1])
-    if payload.get("version") != [3, 11]:
-        _fail(f"embedded Python is not CPython 3.11: {payload.get('version')}")
-    if payload.get("machine") != "arm64":
-        _fail(f"embedded Python is not arm64: {payload.get('machine')}")
-    if payload.get("llama_cpp_python_version") != "0.3.32":
-        _fail("embedded runtime has wrong llama-cpp-python version")
-    for key in ("executable", "prefix"):
-        if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
-            _fail(f"embedded Python {key} escaped app bundle: {payload[key]}")
-    _run_python_sanitized(py, "import subprocess,sys; raise SystemExit(subprocess.run([sys.executable,'-m','pip','check']).returncode)", app_path)
-    probe = "import json; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
-    out = _run_python_sanitized(py, probe, app_path)
-    data = json.loads(out.splitlines()[-1])
-    if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
-        _fail("embedded runtime probe did not report Metal GPU offload")
-    if data.get("qwen_64k_yarn_support") != "supported":
-        _fail("embedded runtime probe missing capability: qwen_64k_yarn_support")
-    top_level_capabilities = {
-        "rope_scaling_type": "rope_scaling_type_supported",
-        "rope_freq_scale": "rope_freq_scale_supported",
-        "yarn_orig_ctx": "yarn_orig_ctx_supported",
-    }
-    for name, field in top_level_capabilities.items():
-        if not data.get(field):
-            _fail(f"embedded runtime probe missing capability: {name}")
-    constructor_support = data.get("constructor_kwarg_support") or {}
-    for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
-        if not constructor_support.get(key):
-            _fail(f"embedded runtime probe missing capability: {key}")
-    model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
-    if model_bridge.is_file():
-        model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()
-        _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge_for_subprocess)!r}, 'inspect']).returncode)", app_path)
-    else:
-        _fail("packaged model_bridge.py missing from app resources")
-    for candidate in runtime.rglob("*"):
-        if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
-
+    mutation_guard = _app_tree_fingerprint(app_path)
+    try:
+        runtime = app_path / "Contents" / "Resources" / "python-runtime"
+        py = runtime / "bin" / "python3"
+        if not py.exists() or not os.access(py, os.X_OK):
+            _fail(f"embedded Python interpreter missing or not executable at exact packaged path: {py}")
+        if not (runtime / "embedded_python_runtime_provenance.json").is_file():
+            _fail("embedded runtime provenance missing")
+        for notice in ("LICENSE-PYTHON.txt", "LICENSE-python-build-standalone.txt"):
+            if not (runtime / notice).is_file():
+                _fail(f"embedded runtime notice missing: {notice}")
+        if platform.system() == "Darwin":
+            arch = _run(["lipo", "-archs", str(py)]).lower()
+            if "arm64" not in arch or ("x86_64" in arch and "arm64" not in arch):
+                _fail(f"embedded Python is not arm64: {arch}")
+        code = "import importlib.metadata as im,json,platform,sys; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'version':sys.version_info[:2],'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix,'llama_cpp_python_version':im.version('llama-cpp-python')}))"
+        payload = json.loads(_run_python_sanitized(py, code, app_path).splitlines()[-1])
+        if payload.get("version") != [3, 11]:
+            _fail(f"embedded Python is not CPython 3.11: {payload.get('version')}")
+        if payload.get("machine") != "arm64":
+            _fail(f"embedded Python is not arm64: {payload.get('machine')}")
+        if payload.get("llama_cpp_python_version") != "0.3.32":
+            _fail("embedded runtime has wrong llama-cpp-python version")
+        for key in ("executable", "prefix"):
+            if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
+                _fail(f"embedded Python {key} escaped app bundle: {payload[key]}")
+        _run_python_sanitized(py, "import subprocess,sys; raise SystemExit(subprocess.run([sys.executable,'-m','pip','check']).returncode)", app_path)
+        probe = "import json; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
+        out = _run_python_sanitized(py, probe, app_path)
+        data = json.loads(out.splitlines()[-1])
+        if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
+            _fail("embedded runtime probe did not report Metal GPU offload")
+        if data.get("qwen_64k_yarn_support") != "supported":
+            _fail("embedded runtime probe missing capability: qwen_64k_yarn_support")
+        top_level_capabilities = {
+            "rope_scaling_type": "rope_scaling_type_supported",
+            "rope_freq_scale": "rope_freq_scale_supported",
+            "yarn_orig_ctx": "yarn_orig_ctx_supported",
+        }
+        for name, field in top_level_capabilities.items():
+            if not data.get(field):
+                _fail(f"embedded runtime probe missing capability: {name}")
+        constructor_support = data.get("constructor_kwarg_support") or {}
+        for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
+            if not constructor_support.get(key):
+                _fail(f"embedded runtime probe missing capability: {key}")
+        model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
+        if model_bridge.is_file():
+            model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()
+            _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge_for_subprocess)!r}, 'inspect']).returncode)", app_path)
+        else:
+            _fail("packaged model_bridge.py missing from app resources")
+        for candidate in runtime.rglob("*"):
+            if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
+    finally:
+        _assert_app_tree_unchanged(app_path, mutation_guard)
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--app-path", required=True)
@@ -580,7 +652,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
+def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embedded_python_runtime: bool = False) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
@@ -599,6 +671,10 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
             missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
             if missing:
                 _fail(f"DMG preview README missing required phrases: {missing}")
+            mounted_app = apps[0]
+            _verify_codesign_strict(mounted_app)
+            if require_embedded_python_runtime:
+                _validate_embedded_python_runtime(mounted_app)
             if expect_signing:
                 if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
                     _fail(
@@ -632,7 +708,7 @@ def main() -> None:
             _fail(f"dmg artifact missing or invalid: {dmg_path}")
         if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
             _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
+        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -683,17 +759,18 @@ def main() -> None:
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
 
-    if args.require_embedded_python_runtime:
+    if args.require_embedded_python_runtime and args.app_only:
         _validate_embedded_python_runtime(app_path)
 
+    _verify_codesign_strict(app_path)
+
     if args.expect_signing:
-        _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])
         if args.expect_notarization:
             _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
         else:
             print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")
     else:
-        print("::warning::Signing credentials not configured; macOS artifact is preview/dev-only and may fail Gatekeeper.")
+        print("::warning::Apple Developer credentials not configured; requiring ad-hoc signature verification only for this preview build.")
 
 
 if __name__ == "__main__":

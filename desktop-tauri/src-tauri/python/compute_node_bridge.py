@@ -788,6 +788,27 @@ def run(args: argparse.Namespace) -> int:
         with emit_lock:
             status_sequence += 1
             payload = dict(payload)
+            if payload.get("type") in {"started", "status"}:
+                payload.setdefault("running", True)
+                payload.setdefault("registered", False)
+                payload.setdefault("relay_runtime_state", "provisioning")
+                payload.setdefault("runtime_path", _runtime_path_from_env())
+                payload.setdefault("relay_runtime_path", "bridge")
+                payload.setdefault("active_relay_url", _normalize_relay_urls(getattr(args, "relay_url", "https://token.place"), getattr(args, "relay_urls", None))[0])
+                payload.setdefault("requested_mode", _normalize_compute_mode_local(getattr(args, "mode", "auto")))
+                payload.setdefault("effective_mode", "pending")
+                payload.setdefault("backend_available", "pending")
+                payload.setdefault("backend_selected", "pending")
+                payload.setdefault("backend_used", "pending")
+                payload.setdefault("fallback_reason", None)
+                payload.setdefault("last_error", None)
+                payload.setdefault("worker_state", "provisioning")
+                payload.setdefault("worker_generation", None)
+                payload.setdefault("worker_restart_count", None)
+                payload.setdefault("worker_alive", False)
+                payload.setdefault("last_worker_error_code", None)
+                payload.setdefault("last_worker_exit_code", None)
+                payload.setdefault("last_worker_restart_at_ms", None)
             payload.setdefault("operator_session_id", bridge_session_id)
             payload.setdefault("sequence", status_sequence)
             payload.setdefault("updated_at_ms", int(time.time() * 1000))
@@ -796,6 +817,43 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
+    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+            emit_operator_event({
+                "type": "started",
+            "running": True,
+            "registered": False,
+            "worker_alive": False,
+            "offloaded_layers": 0,
+            "kv_cache_device": "cpu",
+            "worker_state": "provisioning",
+            "relay_runtime_state": "provisioning",
+            "runtime_provisioning_state": "dependency_check",
+            "startup_phase": "dependency_check",
+            "startup_elapsed_ms": 0,
+            "startup_deadline_ms": 300000,
+            "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+            "active_relay_url": _normalize_relay_urls(
+                getattr(args, "relay_url", "https://token.place"),
+                getattr(args, "relay_urls", None),
+            )[0],
+            "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
+            "context_tier": _startup_context_tier(args),
+            "effective_mode": "pending",
+            "backend_available": "pending",
+            "backend_selected": "pending",
+            "backend_used": "pending",
+            "fallback_reason": None,
+            "last_error": None,
+            "warm_load_state": "not_started",
+            "runtime_path": _runtime_path_from_env(),
+            "relay_runtime_path": "bridge",
+            "worker_generation": None,
+            "worker_restart_count": None,
+            "last_worker_error_code": None,
+            "last_worker_exit_code": None,
+            "last_worker_restart_at_ms": None,
+        })
+
     original_model_arg = str(args.model)
     model_path_was_relative = not os.path.isabs(original_model_arg)
     if model_path_was_relative:
@@ -803,6 +861,19 @@ def run(args: argparse.Namespace) -> int:
     parent_model_path_exists = os.path.exists(args.model)
 
     dependency_setup = ensure_desktop_python_dependencies()
+    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+            emit_operator_event({
+                "type": "status",
+            "running": True,
+            "registered": False,
+            "worker_alive": False,
+            "worker_state": "provisioning",
+            "relay_runtime_state": "provisioning",
+            "runtime_provisioning_state": dependency_setup.get("action", "dependency_check"),
+            "startup_phase": "runtime_probe",
+            "startup_elapsed_ms": 1,
+            "startup_deadline_ms": 1800000,
+        })
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
         detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"

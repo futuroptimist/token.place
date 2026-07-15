@@ -193,7 +193,7 @@ def _packaged_env(
     env["HOME"] = str(home_dir)
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
-    env["PYTHONPATH"] = str(resources_root / "python")
+    env["PYTHONPATH"] = os.pathsep.join([str(resources_root / "python"), str(resources_root)])
     if extra_env:
         env.update(extra_env)
     return env
@@ -209,6 +209,7 @@ def run_desktop_dependency_preflight(tmp_root: Path, *, resources_root: Path | N
             "-c",
             (
                 "import json, pathlib, sys; "
+                "sys.path.insert(0, r'" + str(resources_root) + "'); "
                 "sys.path.insert(0, r'" + str(resources_root / 'python') + "'); "
                 "import desktop_runtime_setup as mod; "
                 "print(json.dumps(mod.ensure_desktop_python_dependencies()))"
@@ -282,6 +283,8 @@ def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | Non
             (
                 "import pathlib,sys; "
                 "python_dir=pathlib.Path(r'" + str(model_bridge.parent) + "'); "
+                "resources_dir=python_dir.parent; "
+                "sys.path.insert(0,str(resources_dir)); "
                 "sys.path.insert(0,str(python_dir)); "
                 "import desktop_runtime_setup as mod; "
                 "payload=mod.ensure_desktop_python_dependencies(); "

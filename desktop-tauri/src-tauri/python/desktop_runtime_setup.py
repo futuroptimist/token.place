@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import ntpath
+import hashlib
 import platform as platform_module
 import subprocess
 import sys
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from utils.llm.llama_module_identity import (
-    llama_module_identity_from_path,
+    canonical_llama_module_identity_input as _shared_canonical_llama_module_identity_input,
     strip_windows_extended_path_prefix,
     valid_llama_module_identity,
 )
@@ -47,6 +49,54 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
 )
 
 
+def _raw_path_sentinel(module_path: Any) -> bool:
+    if module_path is None:
+        return True
+    try:
+        text = str(module_path).strip()
+    except (TypeError, ValueError, OSError):
+        return True
+    return text == "" or text.lower() in {"missing", "unknown"}
+
+
+def _looks_like_windows_path(path_text: str) -> bool:
+    stripped = path_text.strip()
+    return (
+        stripped.startswith("\\")
+        or stripped.startswith("\\?\\")
+        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in {"\\", "/"})
+    )
+
+def _canonical_windows_path_for_identity(path_text: str) -> str:
+    stripped = _strip_windows_extended_path_prefix(path_text.strip())
+    if stripped.startswith('\\?/'):
+        stripped = stripped[3:]
+    if stripped.startswith('/'):
+        canonical = _shared_canonical_llama_module_identity_input(stripped)
+        return canonical or os.path.normpath(stripped).replace("\\", "/")
+    normalized = ntpath.normpath(stripped).replace("\\", "/")
+    return normalized.lower()
+
+
+def _canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
+    if _raw_path_sentinel(module_path):
+        return None
+    path_text = str(module_path)
+    if _looks_like_windows_path(path_text):
+        return _canonical_windows_path_for_identity(path_text)
+    canonical = _shared_canonical_llama_module_identity_input(module_path)
+    if not canonical or canonical.strip().lower() in {"missing", "unknown"}:
+        return None
+    return canonical
+
+
+def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
+    canonical = _canonical_llama_module_identity_input(module_path)
+    if not canonical:
+        return None
+    digest = hashlib.sha256(f"token.place.llama_cpp.module_path.v1\0{canonical}".encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
 
 def _strip_windows_extended_path_prefix(path_text: str) -> str:
     return strip_windows_extended_path_prefix(path_text)
@@ -57,6 +107,8 @@ def _safe_resolve_path(path_text: str | Path) -> Path:
 
 
 def _valid_llama_module_identity(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
     return valid_llama_module_identity(value)
 
 

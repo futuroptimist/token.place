@@ -2,14 +2,14 @@
 Model manager module for handling LLM model downloading, initialization and inference.
 """
 import os
+import ntpath
 import time
 import logging
 import math
 import hashlib
 import uuid
 from utils.llm.llama_module_identity import (
-    canonical_llama_module_identity_input,
-    llama_module_identity_from_path,
+    canonical_llama_module_identity_input as _shared_canonical_llama_module_identity_input,
     llama_module_identity_supplied,
     valid_llama_module_identity,
 )
@@ -228,6 +228,11 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         value = capabilities.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             payload[key] = value
+    valid_identity = _valid_llama_module_identity(capabilities.get('llama_module_identity'))
+    if valid_identity is not None:
+        payload['llama_module_identity'] = valid_identity
+    elif llama_module_identity_supplied(capabilities.get('llama_module_identity')) or capabilities.get('llama_module_identity_malformed') is True:
+        payload['llama_module_identity_malformed'] = True
     for field in (
         'capability_source',
         'backend',
@@ -238,10 +243,8 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         'qwen_64k_yarn_support',
         'yarn_resolver_source',
         'llama_module_path',
-        'llama_module_identity',
         'llama_module_path_present',
         'llama_module_identity_match',
-        'llama_module_identity_malformed',
         'child_probe_reprobe_attempted',
         'child_probe_reprobe_skipped_reason',
     ):
@@ -929,7 +932,12 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
         identities_match = bool(capability_identity and facade_identity and capability_identity == facade_identity)
         if capability_identity and capability_module_path and str(capability_module_path).strip() not in {'missing', 'unknown'}:
             identities_match = identities_match and capability_identity == llama_module_identity_from_path(capability_module_path)
-        module_paths_match = identities_match or (not capability_identity_supplied and concrete_paths_match)
+        legacy_path_fallback_allowed = (
+            source == 'desktop_runtime_setup_probe_legacy'
+            and not capability_identity_supplied
+            and not capability_identity_malformed
+        )
+        module_paths_match = identities_match or (legacy_path_fallback_allowed and concrete_paths_match)
         capabilities['llama_module_identity_match'] = identities_match
         capabilities['llama_module_identity_malformed'] = capability_identity_malformed
         try:
@@ -966,7 +974,7 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             if capabilities.get('constructor_signature_inspectable') is not True:
                 missing.append('constructor_signature_inspectable')
             if not module_paths_match:
-                if capability_identity_malformed:
+                if capability_identity_malformed or (source == 'desktop_runtime_setup_probe' and not capability_identity_supplied):
                     missing.append('llama_module_identity')
                 elif capability_identity_supplied:
                     missing.append('llama_module_identity_match')
@@ -1160,11 +1168,58 @@ def _sanitize_subprocess_path_env(env: Dict[str, str], pythonpath_entries: list[
 
 
 
+def _raw_path_sentinel(module_path: Any) -> bool:
+    if module_path is None:
+        return True
+    try:
+        text = str(module_path).strip()
+    except (TypeError, ValueError, OSError):
+        return True
+    return text == '' or text.lower() in {'missing', 'unknown'}
+
+
+def _looks_like_windows_path(path_text: str) -> bool:
+    stripped = path_text.strip()
+    return (
+        stripped.startswith("\\")
+        or stripped.startswith("\\?\\")
+        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in {"\\", "/"})
+    )
+
+def _canonical_windows_path_for_identity(path_text: str) -> str:
+    stripped = _strip_windows_extended_path_prefix(path_text.strip())
+    if stripped.startswith('\\?/'):
+        stripped = stripped[3:]
+    if stripped.startswith('/'):
+        canonical = _shared_canonical_llama_module_identity_input(stripped)
+        return canonical or os.path.normpath(stripped).replace("\\", "/")
+    normalized = ntpath.normpath(stripped).replace("\\", "/")
+    return normalized.lower()
+
+
 def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
-    return canonical_llama_module_identity_input(module_path)
+    if _raw_path_sentinel(module_path):
+        return None
+    path_text = str(module_path)
+    if _looks_like_windows_path(path_text):
+        return _canonical_windows_path_for_identity(path_text)
+    canonical = _shared_canonical_llama_module_identity_input(module_path)
+    if not canonical or canonical.strip().lower() in {'missing', 'unknown'}:
+        return None
+    return canonical
+
+
+def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
+    canonical = _canonical_path_for_compare(module_path)
+    if not canonical:
+        return None
+    digest = hashlib.sha256(f"token.place.llama_cpp.module_path.v1\0{canonical}".encode('utf-8')).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _valid_llama_module_identity(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
     return valid_llama_module_identity(value)
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:

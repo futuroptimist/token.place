@@ -9938,6 +9938,8 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
             'gpu_offload_supported': True,
             'runtime_action': 'already_supported',
             'llama_module_path': 'C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py',
+            'llama_module_path_present': True,
+            'llama_module_identity': model_manager_module.llama_module_identity_from_path('C:/Users/Alice/AppData/Local/Programs/Python/Python311/Lib/site-packages/llama_cpp/__init__.py'),
             'constructor_kwarg_support': support,
             'constructor_signature_inspectable': True,
             'constructor_has_var_kwargs': False,
@@ -9987,6 +9989,8 @@ def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeyp
             'backend': 'cuda',
             'gpu_offload_supported': True,
             'llama_module_path': '/runtime/other/llama_cpp/__init__.py',
+            'llama_module_path_present': True,
+            'llama_module_identity': model_manager_module.llama_module_identity_from_path('/runtime/actual/llama_cpp/__init__.py'),
             'constructor_kwarg_support': support,
             'constructor_signature_inspectable': True,
             'qwen_64k_yarn_support': 'supported',
@@ -10004,7 +10008,7 @@ def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeyp
 
     assert diagnostics['supported'] is False
     assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
-    assert 'llama_module_path' in diagnostics['missing_required_kwargs']
+    assert 'llama_module_identity_match' in diagnostics['missing_required_kwargs']
     assert diagnostics['child_probe_reprobe_attempted'] is False
 
 
@@ -10214,3 +10218,71 @@ def test_qwen_yarn_diagnostics_preserve_false_and_empty_values():
     assert 'child_probe_reprobe_attempted=False' in formatted
     assert 'constructor_kwargs_attempted=[]' in formatted
     assert "incomplete_probe_fields=['llama_module_identity']" in formatted
+
+
+def test_modern_probe_rejects_concrete_path_fallback_when_identity_missing(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', lambda **_: (_ for _ in ()).throw(AssertionError('unexpected secondary probe')))
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path), desktop_runtime_probe={
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'metal_already_supported',
+        'llama_module_path': str(module_path),
+        'llama_module_path_present': True,
+        'constructor_kwarg_support': support,
+        'constructor_signature_inspectable': True,
+        'qwen_64k_yarn_support': 'supported',
+        'yarn_enum_value': 2,
+        'capability_source': 'desktop_runtime_setup_probe',
+    })
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+    assert diagnostics['incomplete_probe_fields'] == ['llama_module_identity']
+
+
+def test_legacy_probe_allows_concrete_path_only_match(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    monkeypatch.setattr(model_manager_module, '_probe_llama_cpp_capabilities_in_subprocess', lambda **_: (_ for _ in ()).throw(AssertionError('unexpected secondary probe')))
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path), desktop_runtime_probe={
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'metal_already_supported',
+        'llama_module_path': str(module_path),
+        'llama_module_path_present': True,
+        'constructor_kwarg_support': support,
+        'constructor_signature_inspectable': True,
+        'qwen_64k_yarn_support': 'supported',
+        'yarn_enum_value': 2,
+        'capability_source': 'desktop_runtime_setup_probe_legacy',
+    })
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['desktop_probe_authoritative'] is True
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+
+
+def test_llama_module_identity_consumer_rejects_sentinels_and_normalizes_windows():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module.llama_module_identity_from_path('unknown') is None
+    assert model_manager_module.llama_module_identity_from_path('missing') is None
+    base = r'C:\Users\Alice\Runtime\Lib\site-packages\llama_cpp\__init__.py'
+    prefixed = r'\\?\C:\Users\Alice\Runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'
+    mixed = r'c:/users/alice/runtime/lib/site-packages/LLAMA_CPP/__init__.py'
+    assert model_manager_module.llama_module_identity_from_path(base) == model_manager_module.llama_module_identity_from_path(prefixed)
+    assert model_manager_module.llama_module_identity_from_path(base) == model_manager_module.llama_module_identity_from_path(mixed)

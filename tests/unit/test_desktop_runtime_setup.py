@@ -2432,3 +2432,17 @@ def test_llama_module_identity_canonicalizes_symlink_dotdot(tmp_path):
     other.parent.mkdir(parents=True)
     other.write_text('# other')
     assert desktop_runtime_setup.llama_module_identity_from_path(real) != desktop_runtime_setup.llama_module_identity_from_path(other)
+
+
+def test_llama_module_identity_rejects_raw_path_sentinels():
+    assert desktop_runtime_setup.llama_module_identity_from_path('unknown') is None
+    assert desktop_runtime_setup.llama_module_identity_from_path('missing') is None
+    assert desktop_runtime_setup.llama_module_identity_from_path('') is None
+
+
+def test_llama_module_identity_windows_normalization_is_deterministic():
+    base = r'C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py'
+    prefixed = r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'
+    mixed = r'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/LLAMA_CPP/__init__.py'
+    assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(prefixed)
+    assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(mixed)

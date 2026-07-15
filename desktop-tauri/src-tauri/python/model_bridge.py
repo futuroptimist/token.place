@@ -32,7 +32,11 @@ except ModuleNotFoundError:
 
 
 def _run_dependency_preflight() -> Dict[str, Any]:
-    result = ensure_desktop_python_dependencies()
+
+    try:
+        result = ensure_desktop_python_dependencies(read_only=True)
+    except TypeError:
+        result = ensure_desktop_python_dependencies()
     if result.get("ok") == "true":
         return {"ok": True}
     missing = result.get("missing") or "unknown"

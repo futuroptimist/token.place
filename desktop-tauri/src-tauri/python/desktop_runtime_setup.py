@@ -181,7 +181,8 @@ if python_root and python_root not in sys.path:
 
 dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
 if dependency_target and dependency_target not in sys.path:
-    sys.path.insert(0, dependency_target)
+    insert_at = 1 if python_root else 0
+    sys.path.insert(insert_at, dependency_target)
 
 bootstrap_script = os.environ.get("TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT", "").strip()
 if bootstrap_script:

@@ -1374,12 +1374,12 @@ def _ensure_desktop_llama_runtime_impl(
                 source_after_probe: Optional[RuntimeProbe] = None
                 try:
                     with _ManagedSiteMutationLock(dependency_target, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
-                        source_after_probe = _probe_runtime(target_root)
                         source_ok, source_log = _run_windows_cuda_source_repair(
                             requirements_path,
                             dependency_target,
                             **source_repair_kwargs,
                         )
+                        source_after_probe = _probe_runtime(target_root)
                 except (TimeoutError, OSError) as exc:
                     source_ok = False
                     source_log = _lock_failure_install_log(exc)
@@ -1487,8 +1487,8 @@ def _ensure_desktop_llama_runtime_impl(
         after_probe_hint: Optional[RuntimeProbe] = None
         try:
             with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
-                after_probe_hint = _probe_runtime(target_root)
                 ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
+                after_probe_hint = _probe_runtime(target_root)
         except (TimeoutError, OSError) as exc:
             ok = False
             log_output = _lock_failure_install_log(exc)

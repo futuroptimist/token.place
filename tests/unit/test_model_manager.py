@@ -6006,7 +6006,7 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
     assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
     assert 'active_profile_id=qwen3-8b-q4-k-m' in manager.last_runtime_init_error
     assert 'active_context_tier=64k-full' in manager.last_runtime_init_error
-    assert 'llama_module_path=unknown' in manager.last_runtime_init_error
+    assert 'llama_module_path_present=unknown' in manager.last_runtime_init_error
     assert 'llama_cpp_python_version=' in manager.last_runtime_init_error
     assert 'missing constructor kwargs' in manager.last_runtime_init_error
 
@@ -10120,3 +10120,111 @@ def test_legacy_flat_desktop_probe_exported_enum_without_value_fails_closed(monk
     assert 'yarn_enum_value' in diagnostics['missing_required_kwargs']
     assert diagnostics['child_probe_reprobe_attempted'] is False
     assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_incomplete_fail_closed'
+
+
+def _complete_desktop_probe_for_identity(model_manager_module, module_path, identity=None, source='desktop_runtime_setup_probe'):
+    support = {name: True for name in model_manager_module.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    return {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'llama_module_path_present': True,
+        'llama_module_identity': identity if identity is not None else model_manager_module.llama_module_identity_from_path(module_path),
+        'llama_cpp_python_version': '0.3.32',
+        'constructor_kwarg_support': support,
+        'constructor_has_var_kwargs': False,
+        'constructor_signature_inspectable': True,
+        'yarn_resolver_source': 'top_level_enum',
+        'yarn_enum_value': 2,
+        'qwen_64k_yarn_support': 'supported',
+        'capability_source': source,
+    }
+
+
+def test_qwen_64k_desktop_probe_identity_authorizes_subprocess_facade_without_reprobe(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'runtime' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        str(module_path),
+        desktop_runtime_probe=_complete_desktop_probe_for_identity(model_manager_module, module_path),
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_: pytest.fail('desktop authoritative probe must not reprobe'),
+    )
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is True
+    assert diagnostics['desktop_probe_authoritative'] is True
+    assert diagnostics['child_probe_reprobe_attempted'] is False
+
+
+def test_qwen_64k_desktop_probe_missing_or_bad_identity_fails_closed_without_reprobe(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'runtime' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    other_path = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other_path.parent.mkdir(parents=True)
+    other_path.write_text('# other')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_: pytest.fail('incomplete desktop probe must fail closed without reprobe'),
+    )
+
+    for identity in (None, 'sha256:not-valid', model_manager_module.llama_module_identity_from_path(other_path)):
+        probe = _complete_desktop_probe_for_identity(model_manager_module, module_path, identity=identity)
+        if identity is None:
+            probe.pop('llama_module_identity')
+        facade = model_manager_module._SubprocessLlamaCppModule(str(module_path), desktop_runtime_probe=probe)
+        diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+        assert diagnostics['supported'] is False
+        assert diagnostics['child_probe_reprobe_attempted'] is False
+        assert diagnostics['missing_reason'] == 'runtime_desktop_capability_probe_incomplete'
+        assert 'llama_module_identity' in diagnostics['incomplete_probe_fields'] or 'llama_module_identity_match' in diagnostics['incomplete_probe_fields']
+        formatted = model_manager_module._format_qwen_yarn_unsupported_diagnostics(diagnostics)
+        assert str(module_path) not in formatted
+        if identity:
+            assert identity not in formatted
+        assert 'child_probe_reprobe_attempted=False' in formatted
+
+
+def test_qwen_64k_legacy_desktop_probe_still_requires_concrete_path_match(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'runtime' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    wrong = tmp_path / 'wrong' / 'llama_cpp' / '__init__.py'
+    wrong.parent.mkdir(parents=True)
+    wrong.write_text('# wrong')
+    probe = _complete_desktop_probe_for_identity(model_manager_module, module_path, source='desktop_runtime_setup_probe_legacy')
+    probe.pop('llama_module_identity')
+    probe['llama_module_path'] = str(wrong)
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path), desktop_runtime_probe=probe)
+
+    diagnostics = model_manager_module._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+
+    assert diagnostics['supported'] is False
+    assert 'llama_module_path' in diagnostics['incomplete_probe_fields']
+
+
+def test_qwen_diagnostic_formatter_preserves_false_and_empty_values():
+    from utils.llm import model_manager as model_manager_module
+
+    formatted = model_manager_module._format_qwen_yarn_unsupported_diagnostics({
+        'child_probe_reprobe_attempted': False,
+        'constructor_kwargs_attempted': [],
+        'incomplete_probe_fields': ['llama_module_identity'],
+    })
+
+    assert 'child_probe_reprobe_attempted=False' in formatted
+    assert 'constructor_kwargs_attempted=[]' in formatted
+    assert "incomplete_probe_fields=['llama_module_identity']" in formatted

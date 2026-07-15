@@ -822,8 +822,8 @@ export function App() {
     [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
   const operatorControlsDisabled = useMemo(
-    () => isStartingComputeNode || isStoppingComputeNode,
-    [isStartingComputeNode, isStoppingComputeNode]
+    () => (isStartingComputeNode && !computeStatus.running) || isStoppingComputeNode,
+    [isStartingComputeNode, isStoppingComputeNode, computeStatus.running]
   );
   const operatorEditControlsDisabled = useMemo(
     () => computeStatus.running || operatorControlsDisabled,

@@ -91,12 +91,14 @@ def test_download_returns_metadata_when_download_succeeds(capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': metadata}
 
 
-def test_inspect_fails_when_dependency_preflight_fails(capsys):
+def test_inspect_uses_read_only_fallback_when_dependency_preflight_fails(capsys):
     with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': False, 'error': 'deps bad'}):
         status = model_bridge.inspect_model()
 
-    assert status == 1
-    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['ok'] is True
+    assert payload['payload']['api_model_id'] == 'qwen3-8b-instruct'
 
 
 def test_get_model_manager_reports_missing_dependency(capsys):

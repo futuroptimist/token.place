@@ -680,6 +680,46 @@ def _sanitize_context_profile_import_error(exc: BaseException) -> str:
         detail = f"{detail[:237]}..."
     return detail
 
+
+def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, started_at: float) -> Dict[str, Any]:
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    return {
+        "type": "started",
+        "running": True,
+        "registered": False,
+        "registered_relay_count": 0,
+        "registered_relay_urls": [],
+        "active_relay_urls": [],
+        "relay_runtime_state": "provisioning",
+        "runtime_provisioning_state": "provisioning",
+        "startup_phase": phase,
+        "startup_elapsed_ms": elapsed_ms,
+        "startup_deadline_ms": 0,
+        "active_relay_url": _normalize_relay_urls(getattr(args, "relay_url", "https://token.place"), getattr(args, "relay_urls", None))[0],
+        "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
+        "effective_mode": "pending",
+        "backend_available": "pending",
+        "backend_selected": "pending",
+        "backend_used": "pending",
+        "fallback_reason": None,
+        "context_tier": _startup_context_tier(args),
+        "model_path": str(getattr(args, "model", "")),
+        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+        "last_error": None,
+        "warm_load_state": "provisioning",
+        "warm_load_enabled": _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT),
+        "warm_load_duration_ms": None,
+        "runtime_path": _runtime_path_from_env(),
+        "relay_runtime_path": "bridge",
+        "worker_state": "provisioning",
+        "worker_alive": False,
+        "readiness_diagnostics": {
+            "runtime_provisioning_state": "provisioning",
+            "startup_phase": phase,
+            "startup_elapsed_ms": elapsed_ms,
+        },
+    }
+
 def _structured_startup_error_payload(
     args: argparse.Namespace,
     message: str,
@@ -780,7 +820,8 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
-    status_sequence = 0
+    startup_started_at = time.monotonic()
+    status_sequence = int(os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") or "0")
     emit_lock = threading.Lock()
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:
@@ -796,13 +837,29 @@ def run(args: argparse.Namespace) -> int:
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
+    def emit_provisioning(phase: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        payload = _structured_provisioning_payload(args, phase=phase, started_at=startup_started_at)
+        if extra:
+            safe_extra = {k: v for k, v in extra.items() if k in {"startup_elapsed_ms", "startup_deadline_ms"}}
+            payload.update(safe_extra)
+            payload.setdefault("readiness_diagnostics", {}).update(safe_extra)
+        emit_operator_event(payload)
+
     original_model_arg = str(args.model)
     model_path_was_relative = not os.path.isabs(original_model_arg)
     if model_path_was_relative:
         args.model = os.path.abspath(original_model_arg)
     parent_model_path_exists = os.path.exists(args.model)
 
-    dependency_setup = ensure_desktop_python_dependencies()
+    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+        emit_provisioning("dependency_check")
+    try:
+        dependency_setup = ensure_desktop_python_dependencies(cancellation_predicate=stop_requested, heartbeat=lambda extra: emit_provisioning("dependency_install", extra))
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            dependency_setup = ensure_desktop_python_dependencies()
+        else:
+            raise
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
         detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
@@ -814,7 +871,11 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+        emit_provisioning("runtime_probe")
     runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
+    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
+        emit_provisioning("runtime_verification")
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "

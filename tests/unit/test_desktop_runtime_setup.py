@@ -1602,7 +1602,7 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv,cryptography,packaging'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
 
 
 def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
@@ -1645,7 +1645,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, None, None, object(), object(), object(), object(), None])
+    sequence = iter([None, None, None, None, object(), object(), object(), None, object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -1653,7 +1653,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'packaging'
+    assert result['missing'] == 'cryptography'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
@@ -2125,7 +2125,7 @@ def test_probe_result_payload_preserves_native_capability_types():
     assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
 
 
-def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkeypatch):
+def test_llama_cpp_version_match_uses_stdlib_when_packaging_is_unavailable(monkeypatch):
     real_import = __import__
 
     def import_without_packaging(name, globals=None, locals=None, fromlist=(), level=0):
@@ -2140,7 +2140,7 @@ def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkey
             '0.3.32',
             'llama-cpp-python==0.3.32',
         )
-        == 'unknown'
+        == 'match'
     )
 
 

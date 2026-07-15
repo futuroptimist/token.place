@@ -101,7 +101,26 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Cache embedded Python archive and wheels
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/token-place/embedded-python
+            ~/Library/Caches/pip
+          key: embedded-python-${{ runner.os }}-${{ matrix.tauri_target }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt', 'requirements.txt') }}
+
+      - name: Prepare embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ../desktop-tauri/scripts/prepare_embedded_python_runtime.py
+          test -x src-tauri/python-runtime/bin/python3
+          src-tauri/python-runtime/bin/python3 -m pip check
+
       - name: Install desktop llama-cpp runtime with platform GPU backend
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           python -m pip install --upgrade pip

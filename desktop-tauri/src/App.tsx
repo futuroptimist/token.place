@@ -211,8 +211,33 @@ const defaultComputeStatus: ComputeNodeStatus = {
   readiness_diagnostics: {},
 };
 
+const PACKAGED_RUNTIME_REINSTALL_MESSAGE = 'The bundled token.place runtime is missing or damaged. Reinstall token.place desktop. You do not need to install Python or Xcode Command Line Tools.';
+const PYTHON_RUNTIME_ERROR_CODES = [
+  'desktop_python_runtime_missing',
+  'desktop_python_runtime_invalid',
+  'desktop_python_override_invalid',
+  'desktop_python_development_dependency_missing',
+];
+
+function normalizeDesktopPythonError(raw: string): { message: string; code: string | null; blocksPythonBridge: boolean } {
+  const code = PYTHON_RUNTIME_ERROR_CODES.find((candidate) => raw.includes(candidate)) ?? null;
+  const hasAppleStubLeak = /xcode-select|No developer tools were found|CommandLineTools|Xcode\.app|attempted launcher|stdout=|stderr=|TOKEN_PLACE_(?:SIDECAR_)?PYTHON/i.test(raw);
+  if (code === 'desktop_python_runtime_missing' || code === 'desktop_python_runtime_invalid' || hasAppleStubLeak) {
+    return { message: PACKAGED_RUNTIME_REINSTALL_MESSAGE, code: code ?? 'desktop_python_runtime_invalid', blocksPythonBridge: true };
+  }
+  if (code === 'desktop_python_override_invalid') {
+    return { message: 'The configured desktop Python override is invalid. Use a Python 3.11+ interpreter or clear the override.', code, blocksPythonBridge: true };
+  }
+  if (code === 'desktop_python_development_dependency_missing') {
+    return { message: 'Desktop development Python is unavailable. Install Python 3.11+ or set the documented override variable.', code, blocksPythonBridge: true };
+  }
+  return { message: raw, code: null, blocksPythonBridge: false };
+}
+
 function formatErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const raw = error instanceof Error ? error.message : String(error);
+  const normalized = normalizeDesktopPythonError(raw);
+  return normalized.code ? `${normalized.message} Diagnostic code: ${normalized.code}` : normalized.message;
 }
 
 function displayStatusValue(value: string | null | undefined, fallback: string): string {
@@ -694,6 +719,8 @@ export function App() {
   const [artifact, setArtifact] = useState<ModelArtifactInfo | null>(null);
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
+  const normalizedError = normalizeDesktopPythonError(error);
+  const pythonBridgeUnavailable = normalizedError.blocksPythonBridge;
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const [isStoppingComputeNode, setIsStoppingComputeNode] = useState(false);
@@ -810,16 +837,17 @@ export function App() {
 
   const canStart = useMemo(
     () =>
+      !pythonBridgeUnavailable &&
       Boolean(config.model_path.trim()) &&
       Boolean(prompt.trim()) &&
       status !== 'starting' &&
       status !== 'streaming',
-    [config.model_path, prompt, status]
+    [config.model_path, prompt, status, pythonBridgeUnavailable]
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
-    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
+    () => !pythonBridgeUnavailable && Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode, pythonBridgeUnavailable]
   );
   const operatorControlsDisabled = useMemo(
     () => isStartingComputeNode || isStoppingComputeNode,
@@ -1066,7 +1094,7 @@ export function App() {
           onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
         />
         <button type="button" onClick={chooseModelPath}>Browse</button>
-        <button type="button" onClick={downloadModel} disabled={isDownloadingModel}>
+        <button type="button" onClick={downloadModel} disabled={isDownloadingModel || pythonBridgeUnavailable}>
           {isDownloadingModel ? 'Downloading…' : 'Download'}
         </button>
       </div>
@@ -1264,7 +1292,7 @@ export function App() {
             />
           </section>
         )}
-        <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error ? formatErrorMessage(computeStatus.last_error) : 'none'}</code></p>
       </section>
 
       <section style={{ marginTop: 14, borderTop: '1px solid #ddd', paddingTop: 12 }}>
@@ -1283,7 +1311,7 @@ export function App() {
         <p>Status: <strong>{status}</strong></p>
       </section>
 
-      {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
+      {error && <p style={{ color: 'crimson' }}>Error: {formatErrorMessage(error)}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
     </main>
   );

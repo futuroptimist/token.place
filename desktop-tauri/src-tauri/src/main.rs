@@ -163,14 +163,23 @@ fn sanitize_model_bridge_payload_field(key: &str, value: &Value) -> Value {
 }
 
 fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifactInfo, String> {
-    let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
-        .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
+    let exe_path = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let launcher = python_runtime::resolve_python_launcher_resource_aware(
+        python_runtime::PythonLauncherResolutionContext {
+            override_env_var: "TOKEN_PLACE_PYTHON",
+            tauri_resource_dir: resource_dir.as_deref(),
+            current_exe: exe_path.as_deref(),
+            manifest_dir,
+            packaged: !cfg!(debug_assertions),
+        },
+    )
+    .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
     let import_root = configure_runtime_pythonpath(&mut bridge_command, &bridge_script);
-    let exe_path = std::env::current_exe().ok();
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let (selected_resource_root, selected_layout) = python_runtime::describe_resource_layout(
         &bridge_script,
         exe_path.as_deref(),

@@ -78,6 +78,39 @@ describe('desktop app start failure handling', () => {
     });
   });
 
+
+
+  it('hides raw Apple developer-tools Python diagnostics and disables Python actions', async () => {
+    const rawFailure = "no usable Python 3 interpreter found for desktop Python subprocess (consulted override env var: TOKEN_PLACE_SIDECAR_PYTHON); tried: python3  -> status=1 stdout='' stderr='xcode-select: note: No developer tools were found, requesting install. If developer tools are located at a non-default location on disk, use sudo xcode-select --switch /Applications/Xcode.app. /Users/alice/.pyenv/shims/python3'; python  -> spawn failed: No such file or directory";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'detect_backend') {
+        return Promise.resolve({ platform_label: 'macos', preferred_mode: 'auto', available_backend: 'metal', availability_label: 'Metal-capable platform (Apple Silicon)' });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({ model_path: '/tmp/model.gguf', relay_base_url: 'https://token.place', preferred_mode: 'auto' });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({ running: false, registered: false, active_relay_url: '', requested_mode: 'auto', effective_mode: 'cpu', backend_available: 'unknown', backend_selected: 'cpu', backend_used: 'cpu', fallback_reason: null, model_path: '', last_error: rawFailure });
+      }
+      if (command === 'inspect_model_artifact') {
+        return Promise.reject(rawFailure);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+    const friendly = await screen.findAllByText(/The bundled token.place runtime is missing or damaged/);
+    expect(friendly[0].textContent).toContain('Diagnostic code: desktop_python_runtime_invalid');
+    expect(document.body.textContent).not.toContain('xcode-select');
+    expect(document.body.textContent).not.toContain('sudo');
+    expect(document.body.textContent).not.toContain('Xcode.app');
+    expect(document.body.textContent).not.toContain('/Users/alice');
+    expect(document.body.textContent).not.toContain('TOKEN_PLACE_SIDECAR_PYTHON');
+    expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getAllByRole('textbox')[1], { target: { value: 'hello' } });
+    expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
+  });
   it('normalizes untrusted relay URLs and preferred mode from persisted config', () => {
     expect(
       normalizeDesktopConfig({

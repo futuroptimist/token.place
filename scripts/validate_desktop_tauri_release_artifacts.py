@@ -318,6 +318,88 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
         mount_temp_dir.cleanup()
 
 
+
+def _validate_embedded_python_runtime(app_path: Path) -> None:
+    runtime = app_path / "Contents" / "Resources" / "python-runtime"
+    python = runtime / "bin" / "python3"
+    provenance = runtime / "embedded_runtime_provenance.json"
+    if not python.exists() or not python.is_file():
+        _fail(f"embedded Python interpreter missing at exact packaged path: {python}")
+    if not os.access(python, os.X_OK):
+        _fail(f"embedded Python interpreter is not executable: {python}")
+    if not provenance.exists():
+        _fail(f"embedded runtime provenance missing: {provenance}")
+    arch_out = _run(["lipo", "-archs", str(python)])
+    if "arm64" not in arch_out.lower():
+        _fail(f"embedded Python is not arm64: {arch_out}")
+    if "x86_64" in arch_out.lower() and "arm64" not in arch_out.lower():
+        _fail(f"embedded Python is x86_64-only: {arch_out}")
+    env = {
+        "HOME": tempfile.mkdtemp(prefix="token-place-empty-home-"),
+        "PYTHONNOUSERSITE": "1",
+        "PATH": "/usr/bin:/bin",
+    }
+    code = """
+import json, os, pathlib, platform, subprocess, sys
+mods=['psutil','requests','dotenv','cryptography','jinja2','numpy','diskcache','llama_cpp']
+for mod in mods: __import__(mod)
+root=pathlib.Path(sys.argv[1]).resolve()
+assert pathlib.Path(sys.executable).resolve().is_relative_to(root)
+assert pathlib.Path(sys.prefix).resolve().is_relative_to(root)
+subprocess.run([sys.executable,'-m','pip','check'], check=True)
+print(json.dumps({'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))
+"""
+    try:
+        result = subprocess.run(
+            [str(python), "-c", code, str(runtime)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    finally:
+        shutil.rmtree(env["HOME"], ignore_errors=True)
+    combined = f"{result.stdout}\n{result.stderr}"
+    forbidden = (
+        "xcode-select",
+        "No developer tools were found",
+        "CommandLineTools",
+        "/opt/homebrew",
+        "/usr/local/Cellar",
+        "/Users/runner",
+        "site-packages --user",
+        "/usr/bin/python3",
+    )
+    leaks = [marker for marker in forbidden if marker in combined]
+    if leaks:
+        _fail(f"embedded runtime validation output contained forbidden markers: {leaks}")
+    if result.returncode != 0:
+        _fail(_format_command_failure([str(python), "-c", "<embedded-runtime-probe>"], result))
+    bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
+    if bridge.exists():
+        inspect = subprocess.run([str(python), str(bridge), "inspect"], check=False, capture_output=True, text=True, env=env)
+        output = f"{inspect.stdout}\n{inspect.stderr}"
+        if "/usr/bin/python3" in output or "xcode-select" in output:
+            _fail("model bridge inspect leaked system Python lookup diagnostics")
+        if inspect.returncode != 0:
+            _fail(_format_command_failure([str(python), str(bridge), "inspect"], inspect))
+    if platform.system() == "Darwin":
+        for macho in runtime.rglob("*"):
+            if macho.is_file() and os.access(macho, os.X_OK):
+                deps = subprocess.run(["otool", "-L", str(macho)], check=False, capture_output=True, text=True)
+                if deps.returncode != 0:
+                    continue
+                forbidden_linkage_markers = (
+                    "/opt/homebrew",
+                    "/Library/Developer/CommandLineTools",
+                    "/Applications/Xcode.app",
+                    "/Users/runner",
+                    "/tmp/",  # nosec B108 - forbidden linkage marker, not a temp path allocation.
+                )
+                bad = [m for m in forbidden_linkage_markers if m in deps.stdout]
+                if bad:
+                    _fail(f"embedded Mach-O dependency has forbidden external linkage {bad}: {macho}")
+
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
@@ -384,6 +466,8 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

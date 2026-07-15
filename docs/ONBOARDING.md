@@ -94,3 +94,13 @@ Development dependencies live in [requirements.txt](../requirements.txt).
 static analysis failures surface before the broader CI workflow runs.
 
 Happy hacking!
+
+
+## macOS packaged desktop runtime
+
+Release DMGs for Apple Silicon macOS include their own Python 3.11 runtime under
+`Contents/Resources/python-runtime`. End users do not need Python, Homebrew,
+Xcode, or Xcode Command Line Tools. A missing-runtime message means the app is
+incomplete or damaged and should be fixed by reinstalling. Developer builds may
+still set `TOKEN_PLACE_PYTHON` or `TOKEN_PLACE_SIDECAR_PYTHON` to a Python 3.11+
+interpreter.

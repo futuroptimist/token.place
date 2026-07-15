@@ -1164,6 +1164,16 @@ def _install_failure_action(expected_backend: Optional[str]) -> str:
         return "metal_install_failed"
     return "failed"
 
+def _install_outcome_action(log_output: str, expected_backend: Optional[str]) -> str:
+    outcome = _extract_install_detail_value(log_output or "", "outcome")
+    if outcome == "cancelled":
+        return "install_cancelled"
+    if outcome == "timed_out":
+        return "install_timed_out"
+    if outcome == "heartbeat_failed":
+        return "install_heartbeat_failed"
+    return _install_failure_action(expected_backend)
+
 
 def _cpu_fallback_action(expected_backend: Optional[str]) -> str:
     if expected_backend == "metal":
@@ -1328,6 +1338,7 @@ def _ensure_desktop_llama_runtime_impl(
     install_diagnostics: Dict[str, str] = {}
 
     attempted_cuda_source_build = False
+    cuda_source_build_suppressed = False
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
         if should_repair:
@@ -1343,17 +1354,20 @@ def _ensure_desktop_llama_runtime_impl(
                     source_repair_kwargs["cancellation_predicate"] = cancellation_predicate
                 if heartbeat is not None:
                     source_repair_kwargs["heartbeat"] = heartbeat
-                source_ok, source_log = _run_windows_cuda_source_repair(
-                    requirements_path,
-                    dependency_target,
-                    **source_repair_kwargs,
-                )
+                source_after_probe: Optional[RuntimeProbe] = None
+                with _ManagedSiteMutationLock(dependency_target, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
+                    source_after_probe = _probe_runtime(target_root)
+                    source_ok, source_log = _run_windows_cuda_source_repair(
+                        requirements_path,
+                        dependency_target,
+                        **source_repair_kwargs,
+                    )
                 if source_ok:
                     _clear_source_repair_failure()
                     install_diagnostics = _install_diagnostics_payload(
                         source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
                     )
-                    after = _probe_runtime(target_root)
+                    after = source_after_probe or _probe_runtime(target_root)
                     after_version_payload = _version_payload(after, required_version, required_package_spec)
                     if after.gpu_offload_supported and after.backend == "cuda":
                         after_version_ok = after_version_payload.get("llama_cpp_python_version_match") == "match"
@@ -1389,7 +1403,17 @@ def _ensure_desktop_llama_runtime_impl(
                     )
                     last_error = _summarize_install_error(source_log)
                     _record_source_repair_failure(last_error)
+                    if qwen_64k_required:
+                        return {
+                            "selected_backend": "cpu",
+                            "fallback_reason": last_error,
+                            "runtime_action": _install_outcome_action(source_log, expected_backend),
+                            **_probe_result_payload(before),
+                            **before_version_payload,
+                            **install_diagnostics,
+                        }
         else:
+            cuda_source_build_suppressed = True
             last_error = repair_skip_reason
 
     try:
@@ -1403,8 +1427,8 @@ def _ensure_desktop_llama_runtime_impl(
     for plan in plans:
         if selected_mode == "gpu" and plan.backend == "cpu":
             continue
-        if attempted_cuda_source_build and plan.backend == "cuda" and plan.no_binary:
-            last_error = last_error or "CUDA source build already attempted for this operator session"
+        if plan.backend == "cuda" and plan.no_binary and (attempted_cuda_source_build or cuda_source_build_suppressed):
+            last_error = last_error or "CUDA source build already attempted or suppressed for this operator session"
             continue
         if dependency_target is None:
             last_error = (
@@ -1425,6 +1449,7 @@ def _ensure_desktop_llama_runtime_impl(
             "install",
             "--disable-pip-version-check",
             "--force-reinstall",
+            "--upgrade",
             "--target",
             dependency_target_text,
             *plan.pip_install_args(),
@@ -1438,15 +1463,27 @@ def _ensure_desktop_llama_runtime_impl(
             pip_kwargs["cancellation_predicate"] = cancellation_predicate
         if heartbeat is not None:
             pip_kwargs["heartbeat"] = heartbeat
-        ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
+        after_probe_hint: Optional[RuntimeProbe] = None
+        with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
+            after_probe_hint = _probe_runtime(target_root)
+            ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
         install_diagnostics = _install_diagnostics_payload(
             log_output, backend=plan.backend, cmake_args=plan.cmake_args or ""
         )
         if not ok:
             last_error = _summarize_install_error(log_output)
+            if qwen_64k_required and plan.backend in {"cuda", "metal"}:
+                return {
+                    "selected_backend": "cpu",
+                    "fallback_reason": last_error,
+                    "runtime_action": _install_outcome_action(log_output, expected_backend),
+                    **_probe_result_payload(before),
+                    **before_version_payload,
+                    **install_diagnostics,
+                }
             continue
 
-        after = _probe_runtime(target_root)
+        after = after_probe_hint or _probe_runtime(target_root)
         after_version_payload = _version_payload(after, required_version, required_package_spec)
         plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend

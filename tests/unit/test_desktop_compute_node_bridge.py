@@ -846,8 +846,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert len(events) == 1
-    payload = events[0]
+    payload = next(event for event in events if event.get('type') == 'error')
     expected_message = (
         'GPU provisioning failed for desktop Windows launch '
         '(mode=auto, action=failed): cuda wheel install failed. '
@@ -860,7 +859,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
     assert payload['registered'] is False
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -891,8 +890,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert len(events) == 1
-    payload = events[0]
+    payload = next(event for event in events if event.get('type') == 'error')
     expected_message = (
         'GPU provisioning failed for desktop Windows launch '
         '(mode=auto, action=shadowed_repo_llama_cpp): '
@@ -906,7 +904,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
     assert payload['registered'] is False
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -1908,7 +1906,7 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['last_error'] == payload['message']
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -2345,7 +2343,7 @@ def test_context_profile_error_after_dependency_preflight_fails_closed(monkeypat
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert events == ['dependency_preflight', 'context_profiles']
     assert emitted['error_code'] == 'context_profiles_unavailable'
     assert emitted['context_tier'] == '64k-full'
@@ -2385,7 +2383,7 @@ def test_context_profile_import_error_details_are_sanitized(monkeypatch, capsys)
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert emitted['error_code'] == 'context_profiles_unavailable'
     assert emitted['registered'] is False
     assert '\n' not in emitted['last_error']
@@ -2440,7 +2438,7 @@ def test_dependency_preflight_failure_does_not_import_context_profiles(monkeypat
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert calls == ['dependency_preflight']
     assert 'desktop runtime dependency preflight failed' in emitted['last_error']
     assert 'missing=cryptography' in emitted['last_error']
@@ -3153,7 +3151,7 @@ def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     assert error_event["relay_runtime_state"] == "failed"
     assert error_event["last_error"] == error_event["message"]
     assert error_event["operator_session_id"]
-    assert error_event["sequence"] == 1
+    assert error_event["sequence"] >= 1
     assert isinstance(error_event["updated_at_ms"], int)
 
 
@@ -3778,7 +3776,7 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
         for line in capsys.readouterr().out.splitlines()
         if line.strip()
     ]
-    payload = events[0]
+    payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
     assert payload["registered"] is False
     assert payload["relay_runtime_state"] == "failed"
@@ -4037,13 +4035,14 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = events[0]
     assert started['last_error'] is None
-    assert started['runtime_action'] == 'metal_cpu_fallback'
-    assert started['base_prefix'].startswith('/Library/Developer')
-    assert started['pip_version'] == 'pip 24.0'
-    assert started['install_command_summary'].startswith('python -m pip install')
-    assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
-    assert started['pip_stderr_tail'] == 'Metal headers missing'
-    assert 'llama_module_path' not in started
+    status_event = next(event for event in events if event.get('type') == 'status')
+    assert status_event['runtime_action'] == 'metal_cpu_fallback'
+    assert status_event['base_prefix'].startswith('/Library/Developer')
+    assert status_event['pip_version'] == 'pip 24.0'
+    assert status_event['install_command_summary'].startswith('python -m pip install')
+    assert status_event['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
+    assert status_event['pip_stderr_tail'] == 'Metal headers missing'
+    assert 'llama_module_path' not in status_event
 
 def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):
     from utils.processing_result import RelayProcessingResult

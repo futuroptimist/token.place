@@ -710,6 +710,9 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
         "backend_selected": "pending",
         "backend_used": "pending",
         "fallback_reason": None,
+        "runtime_action": "provisioning",
+        "offloaded_layers": 0,
+        "kv_cache_device": "cpu",
         "context_tier": _startup_context_tier(args),
         "model_path": str(getattr(args, "model", "")),
         "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
@@ -720,7 +723,12 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
         "runtime_path": _runtime_path_from_env(),
         "relay_runtime_path": "bridge",
         "worker_state": "provisioning",
+        "worker_generation": 0,
+        "worker_restart_count": 0,
         "worker_alive": False,
+        "last_worker_error_code": None,
+        "last_worker_exit_code": None,
+        "last_worker_restart_at_ms": None,
         "readiness_diagnostics": {
             "runtime_provisioning_state": "provisioning",
             "startup_phase": phase,
@@ -829,8 +837,9 @@ def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
     startup_started_at = time.monotonic()
+    inherited_sequence = os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") if os.environ.get("TOKENPLACE_COMPUTE_NODE_SESSION_ID") else "0"
     try:
-        status_sequence = int(os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") or "0")
+        status_sequence = int(inherited_sequence or "0")
     except (TypeError, ValueError):
         status_sequence = 0
     emit_lock = threading.Lock()
@@ -842,8 +851,7 @@ def run(args: argparse.Namespace) -> int:
             payload = dict(payload)
             payload.setdefault("operator_session_id", bridge_session_id)
             payload.setdefault("sequence", status_sequence)
-            if os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE") is not None or os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
-                os.environ["TOKENPLACE_OPERATOR_EVENT_SEQUENCE"] = str(status_sequence)
+            os.environ["TOKENPLACE_OPERATOR_EVENT_SEQUENCE"] = str(status_sequence)
             payload.setdefault("updated_at_ms", int(time.time() * 1000))
             emit(payload)
 
@@ -853,7 +861,7 @@ def run(args: argparse.Namespace) -> int:
     def emit_provisioning(phase: str, extra: Optional[Dict[str, Any]] = None) -> None:
         payload = _structured_provisioning_payload(args, phase=phase, started_at=startup_started_at)
         if extra:
-            safe_extra = {k: v for k, v in extra.items() if k in {"startup_elapsed_ms", "startup_deadline_ms"}}
+            safe_extra = {k: v for k, v in extra.items() if k in {"startup_elapsed_ms", "startup_deadline_ms", "runtime_provisioning_state", "startup_phase"}}
             payload.update(safe_extra)
             payload.setdefault("readiness_diagnostics", {}).update(safe_extra)
         emit_operator_event(payload)
@@ -864,8 +872,7 @@ def run(args: argparse.Namespace) -> int:
         args.model = os.path.abspath(original_model_arg)
     parent_model_path_exists = os.path.exists(args.model)
 
-    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
-        emit_provisioning("dependency_check")
+    emit_provisioning("dependency_check")
     try:
         dependency_setup = ensure_desktop_python_dependencies(cancellation_predicate=stop_requested, heartbeat=lambda extra: emit_provisioning("dependency_install", extra))
     except TypeError as exc:
@@ -884,8 +891,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
-        emit_provisioning("runtime_probe")
+    emit_provisioning("runtime_probe")
     try:
         runtime_setup = _ensure_desktop_llama_runtime_for_context(
             args.mode,
@@ -898,8 +904,7 @@ def run(args: argparse.Namespace) -> int:
             runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
         else:
             raise
-    if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
-        emit_provisioning("runtime_verification")
+    emit_provisioning("runtime_verification")
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "

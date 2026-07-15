@@ -94,6 +94,10 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'api_v1_readiness_qwen_64k_runtime_profile_result',
   'api_v1_readiness_qwen_64k_runtime_profile_failure_category',
   'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',
+  'runtime_provisioning_state',
+  'startup_phase',
+  'startup_elapsed_ms',
+  'startup_deadline_ms',
 ]);
 
 function isSafeReadinessDiagnosticString(value: string): boolean {
@@ -151,6 +155,10 @@ interface ComputeNodeStatus {
   context_tier: string | null;
   context_window_tokens: number | null;
   readiness_diagnostics: ReadinessDiagnostics;
+  runtime_provisioning_state: string | null;
+  startup_phase: string | null;
+  startup_elapsed_ms: number | null;
+  startup_deadline_ms: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -209,6 +217,10 @@ const defaultComputeStatus: ComputeNodeStatus = {
   context_tier: null,
   context_window_tokens: null,
   readiness_diagnostics: {},
+  runtime_provisioning_state: null,
+  startup_phase: null,
+  startup_elapsed_ms: null,
+  startup_deadline_ms: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -437,6 +449,10 @@ function stoppedComputeStatus(
     worker_alive: false,
     last_error: lastError,
     readiness_diagnostics: {},
+    runtime_provisioning_state: null,
+    startup_phase: null,
+    startup_elapsed_ms: null,
+    startup_deadline_ms: null,
   };
 }
 
@@ -661,9 +677,21 @@ function mergeComputeStatusEvent(
             ? payload.message
             : stoppedBase.last_error,
     readiness_diagnostics:
-      payload.type === 'started'
-        ? {}
-        : readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
+      readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
+    runtime_provisioning_state:
+      typeof payload.runtime_provisioning_state === 'string'
+        ? payload.runtime_provisioning_state
+        : stoppedBase.runtime_provisioning_state,
+    startup_phase:
+      typeof payload.startup_phase === 'string' ? payload.startup_phase : stoppedBase.startup_phase,
+    startup_elapsed_ms:
+      typeof payload.startup_elapsed_ms === 'number'
+        ? payload.startup_elapsed_ms
+        : stoppedBase.startup_elapsed_ms,
+    startup_deadline_ms:
+      typeof payload.startup_deadline_ms === 'number'
+        ? payload.startup_deadline_ms
+        : stoppedBase.startup_deadline_ms,
   };
 }
 
@@ -946,6 +974,10 @@ export function App() {
         worker_state: 'starting',
         worker_alive: false,
         log_file_path: null,
+        runtime_provisioning_state: 'provisioning',
+        startup_phase: 'starting',
+        startup_elapsed_ms: 0,
+        startup_deadline_ms: null,
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -1184,6 +1216,9 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{formatRegisteredLabel(computeStatus, normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length)}</strong></p>
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
+        <p style={{ marginBottom: 0 }}>Provisioning state: <code>{computeStatus.runtime_provisioning_state || 'idle'}</code></p>
+        <p style={{ marginBottom: 0 }}>Startup phase: <code>{computeStatus.startup_phase || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{computeStatus.startup_deadline_ms != null ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>
         <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
         <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>

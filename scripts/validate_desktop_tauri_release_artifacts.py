@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import stat
 import time
 from pathlib import Path
 
@@ -306,27 +307,51 @@ def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
 def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     app_for_subprocess = app_path if app_path.is_absolute() else app_path.absolute()
     py_for_subprocess = py if py.is_absolute() else py.absolute()
-    home = tempfile.mkdtemp(prefix="token-place-home-")
-    try:
-        app_data = Path(home) / "token.place"
+    with tempfile.TemporaryDirectory(prefix="token-place-python-probe-") as state_dir:
+        state = Path(state_dir)
+        home = state / "home"
+        pycache = state / "pycache"
+        tmp = state / "tmp"
+        app_data = state / "token.place"
+        for path in (home, pycache, tmp, app_data):
+            path.mkdir(parents=True, exist_ok=True)
         env = {
-            "HOME": home,
-            "PYTHONNOUSERSITE": "1",
+            "HOME": str(home),
             "PATH": "/usr/bin:/bin",
+            "PIP_CACHE_DIR": str(app_data / "pip-cache"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
+            "PYTHONPYCACHEPREFIX": str(pycache),
+            "TMPDIR": str(tmp),
+            "TOKEN_PLACE_CACHE_DIR": str(app_data / "cache"),
+            "TOKEN_PLACE_CONFIG_DIR": str(app_data / "config"),
+            "TOKEN_PLACE_DATA_DIR": str(app_data / "data"),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
-            "XDG_CACHE_HOME": str(app_data / "cache"),
-            "XDG_CONFIG_HOME": str(app_data / "config"),
-            "XDG_DATA_HOME": str(app_data / "data"),
+            "TRANSFORMERS_CACHE": str(app_data / "transformers-cache"),
+            "HF_HOME": str(app_data / "hf-home"),
+            "XDG_CACHE_HOME": str(app_data / "xdg-cache"),
+            "XDG_CONFIG_HOME": str(app_data / "xdg-config"),
+            "XDG_DATA_HOME": str(app_data / "xdg-data"),
         }
-        probe_cwd = app_for_subprocess / "Contents" / "Resources" / "python"
+        for key in (
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "UV_PYTHON",
+            "TOKEN_PLACE_PYTHON",
+            "TOKEN_PLACE_PYTHON_EXECUTABLE",
+        ):
+            env.pop(key, None)
         result = subprocess.run(
-            [str(py_for_subprocess), "-c", code],
+            [str(py_for_subprocess), "-B", "-c", code],
             check=False,
             capture_output=True,
             text=True,
             env=env,
-            cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
+            cwd=str(state),
         )
         output = f"{result.stdout}\n{result.stderr}"
         scan_output = _redact_allowed_app_locations(output, app_for_subprocess)
@@ -335,10 +360,66 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             if marker in scan_output:
                 _fail(f"embedded Python output leaked forbidden marker: {marker}")
         if result.returncode != 0:
-            _fail(_format_command_failure([str(py_for_subprocess), "-c", "<probe>"], result))
+            _fail(_format_command_failure([str(py_for_subprocess), "-B", "-c", "<probe>"], result))
         return output.strip()
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
+
+def _app_tree_fingerprint(app_path: Path) -> dict[str, dict[str, object]]:
+    fingerprint: dict[str, dict[str, object]] = {}
+    for path in sorted(app_path.rglob("*"), key=lambda p: p.relative_to(app_path).as_posix()):
+        rel = path.relative_to(app_path).as_posix()
+        try:
+            st = path.lstat()
+        except OSError as exc:
+            _fail(f"failed to stat app path during fingerprint: {rel}: {exc}")
+        mode = stat.S_IMODE(st.st_mode)
+        if path.is_symlink():
+            fingerprint[rel] = {"type": "symlink", "mode": mode, "target": os.readlink(path)}
+        elif path.is_file():
+            fingerprint[rel] = {"type": "file", "mode": mode, "sha256": _sha256(path), "executable": bool(mode & 0o111)}
+        elif path.is_dir():
+            fingerprint[rel] = {"type": "dir", "mode": mode}
+        else:
+            fingerprint[rel] = {"type": "other", "mode": mode}
+    return fingerprint
+
+
+def _describe_app_tree_mutations(before: dict[str, dict[str, object]], after: dict[str, dict[str, object]]) -> list[str]:
+    messages: list[str] = []
+    before_paths = set(before)
+    after_paths = set(after)
+    for rel in sorted(after_paths - before_paths):
+        suffix = " (unsealed Python bytecode: __pycache__/*.pyc)" if "__pycache__/" in rel and rel.endswith(".pyc") else ""
+        messages.append(f"added: {rel}{suffix}")
+    for rel in sorted(before_paths - after_paths):
+        messages.append(f"removed: {rel}")
+    for rel in sorted(before_paths & after_paths):
+        old = before[rel]
+        new = after[rel]
+        if old.get("type") != new.get("type"):
+            messages.append(f"type changed: {rel}: {old.get('type')} -> {new.get('type')}")
+        elif old.get("type") == "file" and old.get("sha256") != new.get("sha256"):
+            messages.append(f"rewritten: {rel}")
+        elif old.get("type") == "symlink" and old.get("target") != new.get("target"):
+            messages.append(f"retargeted symlink: {rel}: {old.get('target')} -> {new.get('target')}")
+        if old.get("mode") != new.get("mode"):
+            messages.append(f"chmodded: {rel}: {old.get('mode'):04o} -> {new.get('mode'):04o}")
+    return messages
+
+
+def _run_with_app_tree_mutation_guard(app_path: Path, description: str, callback) -> None:
+    before = _app_tree_fingerprint(app_path)
+    callback()
+    after = _app_tree_fingerprint(app_path)
+    mutations = _describe_app_tree_mutations(before, after)
+    if mutations:
+        _fail(f"{description} mutated app bundle; post-sign unsealed resources are not allowed:\n" + "\n".join(mutations[:50]))
+
+
+def _verify_existing_signature(app_path: Path) -> None:
+    if platform.system() != "Darwin":
+        print("::warning::Skipping macOS codesign verification outside macOS.")
+        return
+    _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
 def _parse_otool_rpaths(load_commands: str) -> list[str]:
     rpaths: list[str] = []
@@ -567,6 +648,23 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
     for candidate in runtime.rglob("*"):
         if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
 
+
+def _validate_embedded_python_runtime_non_mutating(app_path: Path) -> None:
+    _run_with_app_tree_mutation_guard(
+        app_path,
+        "embedded Python runtime validation",
+        lambda: _validate_embedded_python_runtime(app_path),
+    )
+
+
+def _validate_runtime_on_disposable_app_copy(app_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="token-place-app-validation-") as temp_dir:
+        copy_path = Path(temp_dir) / app_path.name
+        shutil.copytree(app_path, copy_path, symlinks=True)
+        _verify_existing_signature(copy_path)
+        _validate_embedded_python_runtime_non_mutating(copy_path)
+        _verify_existing_signature(copy_path)
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--app-path", required=True)
@@ -580,7 +678,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
+def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embedded_python_runtime: bool = True) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
@@ -606,6 +704,11 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
                     )
             elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
                 _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
+            mounted_app = apps[0]
+            _verify_existing_signature(mounted_app)
+            if require_embedded_python_runtime:
+                _validate_embedded_python_runtime_non_mutating(mounted_app)
+                _verify_existing_signature(mounted_app)
         finally:
             _cleanup_dmg_attach_state(dmg_path, Path(mount_dir))
     finally:
@@ -632,7 +735,7 @@ def main() -> None:
             _fail(f"dmg artifact missing or invalid: {dmg_path}")
         if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
             _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
+        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -683,17 +786,17 @@ def main() -> None:
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
 
-    if args.require_embedded_python_runtime:
-        _validate_embedded_python_runtime(app_path)
+    _verify_existing_signature(app_path)
 
-    if args.expect_signing:
-        _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])
-        if args.expect_notarization:
-            _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
-        else:
-            print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")
+    if args.require_embedded_python_runtime and args.app_only:
+        _validate_runtime_on_disposable_app_copy(app_path)
+    elif args.require_embedded_python_runtime and dmg_path is None:
+        _validate_runtime_on_disposable_app_copy(app_path)
+
+    if args.expect_notarization:
+        _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
     else:
-        print("::warning::Signing credentials not configured; macOS artifact is preview/dev-only and may fail Gatekeeper.")
+        print("::warning::macOS preview artifacts are ad-hoc/possibly unnotarized; skipping Gatekeeper spctl assessment.")
 
 
 if __name__ == "__main__":

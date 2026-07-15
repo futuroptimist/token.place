@@ -281,6 +281,8 @@ def test_validator_mounts_macos_dmg_with_retry_helper_and_detaches(monkeypatch, 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', fake_attach)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', fake_cleanup_state)
+    monkeypatch.setattr(validator, '_verify_existing_signature', lambda path: None)
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda path: None)
 
     validator._validate_dmg_contents(dmg_path, expect_signing=False)
 
@@ -708,24 +710,17 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
     app = tmp_path / 'token.place desktop.app'
     (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
     py = tmp_path / 'python3'
-    created_home = {}
-
-    def fake_mkdtemp(*, prefix):
-        home = tmp_path / f'{prefix}abc'
-        home.mkdir()
-        created_home['path'] = home
-        return str(home)
+    seen = {}
 
     def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
-        assert env['HOME'] == str(created_home['path'])
-        assert env['TOKEN_PLACE_MODELS_DIR'] == str(created_home['path'] / 'token.place' / 'models')
-        assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
-        assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
-        assert env['XDG_DATA_HOME'] == str(created_home['path'] / 'token.place' / 'data')
-        assert cwd == str((app / 'Contents' / 'Resources' / 'python').absolute())
+        seen['home'] = Path(env['HOME'])
+        assert env['TOKEN_PLACE_MODELS_DIR'].endswith('/token.place/models')
+        assert env['XDG_CACHE_HOME'].endswith('/token.place/xdg-cache')
+        assert env['XDG_CONFIG_HOME'].endswith('/token.place/xdg-config')
+        assert env['XDG_DATA_HOME'].endswith('/token.place/xdg-data')
+        assert not Path(cwd).resolve().is_relative_to(app.resolve())
         return subprocess.CompletedProcess(cmd, 0, '/usr/bin/python3 leaked', '')
 
-    monkeypatch.setattr(validator.tempfile, 'mkdtemp', fake_mkdtemp)
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     try:
@@ -733,7 +728,7 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
         assert False
     except SystemExit as exc:
         assert 'forbidden marker' in str(exc)
-    assert not created_home['path'].exists()
+    assert not seen['home'].exists()
 
 
 def test_run_python_sanitized_allows_paths_inside_runner_app_bundle(monkeypatch, tmp_path) -> None:
@@ -771,7 +766,7 @@ def test_run_python_sanitized_runs_probes_from_packaged_python_resources(monkeyp
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
-    assert seen['cwd'] == str(resources_python.absolute())
+    assert not Path(seen['cwd']).resolve().is_relative_to(app.resolve())
 
 
 def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_cwd(
@@ -795,7 +790,7 @@ def test_run_python_sanitized_absolutizes_relative_interpreter_before_resource_c
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert seen['cmd'][0] == str((tmp_path / py).absolute())
-    assert seen['cwd'] == str((tmp_path / app / 'Contents' / 'Resources' / 'python').absolute())
+    assert not Path(seen['cwd']).resolve().is_relative_to((tmp_path / app).resolve())
 
 def test_redact_allowed_app_locations_still_flags_runner_paths_outside_app(tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -1311,7 +1306,9 @@ def test_validator_app_only_main_validates_app_without_dmg(monkeypatch, tmp_path
 
     validator.main()
 
-    assert embedded_calls == [app]
+    assert len(embedded_calls) == 1
+    assert embedded_calls[0].name == app.name
+    assert embedded_calls[0] != app
     assert dmg_calls == []
 
 
@@ -1339,6 +1336,8 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
     monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: handle)
     monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: cleanup_calls.append((dmg, path)))
+    monkeypatch.setattr(validator, '_verify_existing_signature', lambda path: None)
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda path: None)
 
     dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
     dmg.write_bytes(b'dmg')
@@ -1391,7 +1390,8 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
             expect_notarization=True,
         ),
     )
-    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, *, expect_signing: dmg_calls.append((path, expect_signing)))
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, **kwargs: dmg_calls.append((path, kwargs)))
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
 
     def fake_run(cmd):
         run_calls.append(cmd)
@@ -1401,8 +1401,8 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
 
     validator.main()
 
-    assert dmg_calls == [(dmg, True)]
-    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)] in run_calls
+    assert dmg_calls == [(dmg, {'expect_signing': True, 'require_embedded_python_runtime': False})]
+    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)] in run_calls
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
 
 
@@ -1586,3 +1586,125 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: calls.append(str(path)))
     validator._validate_embedded_python_runtime(app)
     assert any('model_bridge.py' in code for code in calls)
+
+
+def test_run_python_sanitized_disables_bytecode_and_uses_external_state(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
+    py = tmp_path / 'python3'
+    captured = {}
+
+    def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
+        captured.update(cmd=cmd, env=env, cwd=cwd)
+        return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert captured['cmd'][1] == '-B'
+    env = captured['env']
+    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert env['PYTHONPYCACHEPREFIX']
+    writable_keys = [
+        'PYTHONPYCACHEPREFIX', 'TMPDIR', 'PIP_CACHE_DIR', 'HOME', 'XDG_CACHE_HOME',
+        'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'TOKEN_PLACE_MODELS_DIR', 'HF_HOME',
+        'TRANSFORMERS_CACHE', 'TOKEN_PLACE_CACHE_DIR', 'TOKEN_PLACE_CONFIG_DIR',
+        'TOKEN_PLACE_DATA_DIR',
+    ]
+    app_resolved = app.resolve()
+    for key in writable_keys:
+        assert not Path(env[key]).resolve().is_relative_to(app_resolved), key
+    assert not Path(captured['cwd']).resolve().is_relative_to(app_resolved)
+
+
+def test_run_python_sanitized_real_import_and_child_do_not_write_pyc(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    package_dir = app / 'Contents' / 'Resources' / 'python'
+    package_dir.mkdir(parents=True)
+    (package_dir / 'fixture_module.py').write_text('VALUE = 42\n', encoding='utf-8')
+    code = (
+        'import os,subprocess,sys,fixture_module; '
+        'assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"; '
+        'assert sys.dont_write_bytecode; '
+        'raise SystemExit(subprocess.run([sys.executable,"-B","-c","import fixture_module"], env=os.environ.copy()).returncode)'
+    )
+    validator._run_python_sanitized(Path(subprocess.check_output(['which', 'python3'], text=True).strip()), code, app)
+    assert not list(package_dir.rglob('__pycache__'))
+    assert not list(package_dir.rglob('*.pyc'))
+
+
+def test_app_tree_fingerprint_detects_mutations(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    resources = app / 'Contents' / 'Resources'
+    resources.mkdir(parents=True)
+    file_path = resources / 'module.py'
+    file_path.write_text('a', encoding='utf-8')
+    exe = app / 'Contents' / 'MacOS' / 'run'
+    exe.parent.mkdir(parents=True)
+    exe.write_text('x', encoding='utf-8')
+    link = resources / 'link'
+    link.symlink_to('module.py')
+    before = validator._app_tree_fingerprint(app)
+    (resources / '__pycache__').mkdir()
+    (resources / '__pycache__' / 'module.cpython-311.pyc').write_bytes(b'pyc')
+    file_path.write_text('b', encoding='utf-8')
+    exe.chmod(0o755)
+    link.unlink(); link.symlink_to('other.py')
+    (resources / 'removed.txt').write_text('gone', encoding='utf-8')
+    mid = validator._app_tree_fingerprint(app)
+    (resources / 'removed.txt').unlink()
+    after = validator._app_tree_fingerprint(app)
+    messages = validator._describe_app_tree_mutations(before | {'Contents/Resources/removed.txt': mid['Contents/Resources/removed.txt']}, after)
+    joined = '\n'.join(messages)
+    assert 'added: Contents/Resources/__pycache__/module.cpython-311.pyc (unsealed Python bytecode: __pycache__/*.pyc)' in joined
+    assert 'removed: Contents/Resources/removed.txt' in joined
+    assert 'rewritten: Contents/Resources/module.py' in joined
+    assert 'chmodded: Contents/MacOS/run' in joined
+    assert 'retargeted symlink: Contents/Resources/link' in joined
+
+
+def test_mutating_probe_fails_validation_guard(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    (app / 'Contents' / 'Resources').mkdir(parents=True)
+    try:
+        validator._run_with_app_tree_mutation_guard(app, 'probe', lambda: (app / 'Contents' / 'Resources' / '__pycache__').mkdir())
+        assert False
+    except SystemExit as exc:
+        assert 'mutated app bundle' in str(exc)
+
+
+def test_preview_signature_verification_is_not_gated_on_paid_secrets(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'; app.mkdir()
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd) or '')
+    validator._verify_existing_signature(app)
+    assert calls == [['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]]
+
+
+def test_mounted_dmg_validation_targets_mounted_app_and_skips_spctl_notary(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'; mount.mkdir()
+    mounted_app = mount / 'Mounted.app'; mounted_app.mkdir()
+    (mount / 'README BEFORE OPENING.txt').write_text(
+        'This preview build is ad-hoc signed and not notarized. Apple could not verify. '
+        'Privacy & Security Developer ID notarization', encoding='utf-8')
+
+    class Handle:
+        name = str(mount)
+        def cleanup(self): pass
+
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: Handle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+    monkeypatch.setattr(validator, '_verify_existing_signature', lambda path: calls.append(('codesign', path)))
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda path: calls.append(('runtime', path)))
+    validator._validate_dmg_contents(tmp_path / 'token.place-desktop-test-apple-silicon.dmg', expect_signing=False)
+    assert ('runtime', mounted_app) in calls
+    assert all(call[0] != 'spctl' for call in calls)

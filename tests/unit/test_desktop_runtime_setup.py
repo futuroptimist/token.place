@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -1443,6 +1444,83 @@ def test_run_pip_install_success_failure_and_timeout():
     assert 'outcome=timed_out' in output
     assert 'stdout_tail=empty' in output
     assert 'stderr_tail=empty' in output
+
+
+def test_command_summary_redacts_interpreter_targets_requirements_and_paths(tmp_path):
+    target = tmp_path / "managed-site"
+    requirements = tmp_path / "requirements.txt"
+
+    summary = desktop_runtime_setup._command_summary([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--target",
+        str(target),
+        "-r",
+        str(requirements),
+        "llama-cpp-python==0.3.32",
+    ])
+
+    assert summary.startswith("<python> -m pip install")
+    assert "--target <path>" in summary
+    assert "-r <path>" in summary
+    assert str(target) not in summary
+    assert str(requirements) not in summary
+    assert "llama-cpp-python==0.3.32" in summary
+
+
+def test_run_pip_install_cancellation_reports_outcome_and_redacted_command():
+    calls = {"count": 0}
+
+    def cancel_after_start():
+        calls["count"] += 1
+        return calls["count"] >= 2
+
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import time; print('started'); time.sleep(30)"],
+        os.environ.copy(),
+        timeout_seconds=30,
+        cancellation_predicate=cancel_after_start,
+    )
+
+    assert ok is False
+    assert "outcome=cancelled" in output
+    assert "command=<python> -c" in output
+    assert sys.executable not in output
+
+
+def test_run_pip_install_emits_five_second_heartbeat(monkeypatch):
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO("quick\n")
+            self.stderr = io.StringIO("")
+            self.pid = 12345
+            self._polls = 0
+
+        def poll(self):
+            self._polls += 1
+            return None if self._polls == 1 else 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    timeline = iter([100.0, 106.0])
+    heartbeats = []
+    monkeypatch.setattr(desktop_runtime_setup.time, "monotonic", lambda: next(timeline))
+    monkeypatch.setattr(desktop_runtime_setup.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "print('quick')"],
+        os.environ.copy(),
+        heartbeat=heartbeats.append,
+    )
+
+    assert ok is True
+    assert "outcome=completed" in output
+    assert "stdout_tail=quick" in output
+    assert heartbeats == [{"startup_elapsed_ms": 6000, "startup_deadline_ms": 300000}]
 
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):

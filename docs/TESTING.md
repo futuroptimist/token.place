@@ -487,3 +487,8 @@ This wraps `./run_all_tests.sh` and runs every available test.
 
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md) - Detailed ideas for test improvements
 - [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation
+
+
+## macOS desktop embedded runtime checks
+
+Release validation prepares the Apple Silicon embedded Python runtime with `desktop-tauri/scripts/prepare_embedded_python_runtime.py`, verifies the pinned archive checksum, validates Metal `llama-cpp-python`, and then validates the final `.app` with `scripts/validate_desktop_tauri_release_artifacts.py`. Packaged-mode tests should not depend on `/usr/bin/python3`, Homebrew, user-site packages, Xcode, or Command Line Tools.

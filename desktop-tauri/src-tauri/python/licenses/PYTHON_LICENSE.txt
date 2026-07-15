@@ -1,0 +1,1 @@
+CPython is redistributed under the Python Software Foundation License. The release build copies the full upstream LICENSE from the pinned python-build-standalone runtime into python-runtime/licenses.

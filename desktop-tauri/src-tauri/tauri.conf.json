@@ -25,6 +25,10 @@
     "active": true,
     "targets": "all",
     "resources": [
+      {
+        "src": "python-runtime",
+        "target": "python-runtime"
+      },
       "python/desktop_gpu_packaging.py",
       "python/desktop_runtime_setup.py",
       "python/requirements_desktop_runtime.txt",
@@ -35,7 +39,10 @@
       "../../utils",
       "../../config.py",
       "../../encrypt.py",
-      "../../requirements.txt"
+      "../../requirements.txt",
+      "python/embedded_python_runtime_manifest.json",
+      "python/licenses/PYTHON_LICENSE.txt",
+      "python/licenses/PYTHON_BUILD_STANDALONE_NOTICE.txt"
     ],
     "icon": [
       "icons/32x32.png",

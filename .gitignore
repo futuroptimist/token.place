@@ -61,3 +61,7 @@ integration_tests/*
 !integration_tests/setup.js
 !integration_tests/setup.d.ts
 !integration_tests/test_dspace_integration.js
+
+# Generated embedded desktop Python runtime
+desktop-tauri/src-tauri/python-runtime/*
+!desktop-tauri/src-tauri/python-runtime/.gitkeep

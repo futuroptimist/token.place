@@ -318,6 +318,69 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
         mount_temp_dir.cleanup()
 
 
+
+def _run_sanitized_python(python: Path, app_path: Path, code: str) -> str:
+    env = {
+        "HOME": tempfile.mkdtemp(prefix="token-place-empty-home-"),
+        "PYTHONNOUSERSITE": "1",
+        "PATH": "/usr/bin:/bin",
+    }
+    result = subprocess.run([str(python), "-c", code], cwd=app_path, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = f"{result.stdout}\n{result.stderr}"
+    forbidden = ("xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", ".local/lib/python", "hostedtoolcache")
+    for marker in forbidden:
+        if marker in output:
+            _fail(f"bundled Python output leaked forbidden marker: {marker}")
+    if result.returncode != 0:
+        _fail(f"bundled Python command failed with exit {result.returncode}: {output}")
+    return output.strip()
+
+def _validate_embedded_python_runtime(app_path: Path) -> None:
+    runtime = app_path / "Contents" / "Resources" / "python-runtime"
+    python = runtime / "bin" / "python3"
+    if not python.exists():
+        _fail(f"missing embedded Python interpreter: {python}")
+    if not os.access(python, os.X_OK):
+        _fail(f"embedded Python interpreter is not executable: {python}")
+    if not (runtime / "embedded-runtime-provenance.json").exists():
+        _fail("missing embedded runtime provenance")
+    for notice in ("licenses/PYTHON_LICENSE.txt", "licenses/PYTHON_BUILD_STANDALONE_NOTICE.txt"):
+        if not (runtime / notice).exists():
+            _fail(f"missing embedded runtime notice: {notice}")
+    arch = _run(["lipo", "-archs", str(python)]).lower()
+    if "arm64" not in arch:
+        _fail(f"embedded Python is not arm64: {arch}")
+    if "x86_64" in arch and "arm64" not in arch:
+        _fail(f"embedded Python is x86_64-only: {arch}")
+    code = """import json,sys; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix}))"""
+    payload = json.loads(_run_sanitized_python(python, app_path, code).splitlines()[-1])
+    for key in ("executable", "prefix"):
+        if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
+            _fail(f"{key} is not inside app bundle: {payload[key]}")
+    _run_sanitized_python(python, app_path, "import subprocess,sys; raise SystemExit(subprocess.call([sys.executable,'-m','pip','check']))")
+    probe_code = """import importlib.util,json,pathlib; p=pathlib.Path('Contents/Resources/python/desktop_runtime_setup.py'); spec=importlib.util.spec_from_file_location('desktop_runtime_setup', p); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); r=m._probe_llama_runtime(runtime_root=p.parent); print(json.dumps(m._probe_result_payload(r)))"""
+    probe = json.loads(_run_sanitized_python(python, app_path, probe_code).splitlines()[-1])
+    if probe.get('backend') != 'metal' or not probe.get('gpu_offload_supported'):
+        _fail(f"embedded llama_cpp probe is not Metal-capable: {probe}")
+    for key in ('qwen_64k_yarn_support','rope_scaling_type_supported','rope_freq_scale_supported','yarn_orig_ctx_supported'):
+        if not probe.get(key):
+            _fail(f"embedded runtime missing Qwen capability: {key}")
+    for mach in runtime.rglob('*'):
+        if not mach.is_file():
+            continue
+        file_info = subprocess.run(['file', str(mach)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        if 'Mach-O' not in file_info:
+            continue
+        deps = subprocess.run(['otool','-L',str(mach)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if deps.returncode != 0:
+            _fail(f"otool failed for {mach}: {deps.stderr}")
+        for line in deps.stdout.splitlines()[1:]:
+            dep=line.strip().split(' (',1)[0]
+            allowed = dep.startswith(('@loader_path','@rpath','/usr/lib','/System/Library')) or str(app_path) in dep
+            forbidden = any(x in dep for x in ('/opt/homebrew','/usr/local/Cellar','pyenv','/Library/Developer/CommandLineTools','/Applications/Xcode.app','Python.framework','/private/tmp','/var/folders'))
+            if forbidden or not allowed:
+                _fail(f"forbidden embedded runtime linkage in {mach}: {dep}")
+
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
@@ -384,6 +447,8 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

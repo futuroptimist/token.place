@@ -6,13 +6,47 @@ use crate::backend::ComputeMode;
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonLauncherSource {
+    EnvironmentOverride,
+    BundledRuntime,
+    SystemDevelopmentRuntime,
+}
+
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
     pub args: Vec<String>,
+    pub source: PythonLauncherSource,
+    pub safe_runtime_id: String,
 }
 
 impl PythonLauncher {
+    fn system(program: &str, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            source: PythonLauncherSource::SystemDevelopmentRuntime,
+            safe_runtime_id: format!("system:{}", program),
+        }
+    }
+    fn env_override(program: String) -> Self {
+        Self {
+            program,
+            args: vec![],
+            source: PythonLauncherSource::EnvironmentOverride,
+            safe_runtime_id: "env-override".into(),
+        }
+    }
+    fn bundled(program: PathBuf) -> Self {
+        Self {
+            program: program.to_string_lossy().into_owned(),
+            args: vec![],
+            source: PythonLauncherSource::BundledRuntime,
+            safe_runtime_id: "bundled:python-runtime".into(),
+        }
+    }
+
     fn command_for_version_check(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
@@ -38,38 +72,22 @@ impl PythonLauncher {
 fn default_python_candidates() -> Vec<PythonLauncher> {
     if cfg!(target_os = "windows") {
         return vec![
-            PythonLauncher {
-                program: "py".into(),
-                args: vec!["-3".into()],
-            },
-            PythonLauncher {
-                program: "python".into(),
-                args: vec![],
-            },
-            PythonLauncher {
-                program: "python3".into(),
-                args: vec![],
-            },
+            PythonLauncher::system("py", vec!["-3".into()]),
+            PythonLauncher::system("python", vec![]),
+            PythonLauncher::system("python3", vec![]),
         ];
     }
 
     vec![
-        PythonLauncher {
-            program: "python3".into(),
-            args: vec![],
-        },
-        PythonLauncher {
-            program: "python".into(),
-            args: vec![],
-        },
+        PythonLauncher::system("python3", vec![]),
+        PythonLauncher::system("python", vec![]),
     ]
 }
 
 fn env_python_candidate(var_name: &str) -> Option<PythonLauncher> {
-    std::env::var(var_name).ok().map(|value| PythonLauncher {
-        program: value,
-        args: vec![],
-    })
+    std::env::var(var_name)
+        .ok()
+        .map(PythonLauncher::env_override)
 }
 
 fn python_candidates(var_name: &str) -> Vec<PythonLauncher> {
@@ -93,6 +111,93 @@ fn is_python_3_version(stdout: &str, stderr: &str) -> bool {
         .any(|line| line.starts_with("Python 3."))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonLauncherCategory {
+    BundledRuntimeMissing,
+    BundledRuntimeNotPython3,
+    BundledRuntimeProbeFailed,
+    OverrideMissing,
+    OverrideNotPython3,
+    SystemRuntimeMissing,
+    AppleDeveloperToolsStub,
+    LauncherSpawnFailed,
+}
+impl PythonLauncherCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::BundledRuntimeMissing => "bundled_runtime_missing",
+            Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
+            Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::OverrideMissing => "override_missing",
+            Self::OverrideNotPython3 => "override_not_python3",
+            Self::SystemRuntimeMissing => "system_runtime_missing",
+            Self::AppleDeveloperToolsStub => "apple_developer_tools_stub",
+            Self::LauncherSpawnFailed => "launcher_spawn_failed",
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct PythonLauncherError {
+    pub public_code: &'static str,
+    pub category: PythonLauncherCategory,
+    pub source: PythonLauncherSource,
+    pub executable_basename: String,
+    pub exit_status: Option<i32>,
+    pub packaged: bool,
+}
+impl std::fmt::Display for PythonLauncherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"{} category={} source={:?} executable={} status={} expected_python=3.11+ expected_architecture={} packaged={}", self.public_code, self.category.as_str(), self.source, self.executable_basename, self.exit_status.map(|v|v.to_string()).unwrap_or_else(||"unknown".into()), if cfg!(target_os="macos") {"arm64"} else {"native"}, self.packaged)
+    }
+}
+impl std::error::Error for PythonLauncherError {}
+fn launcher_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("python")
+        .to_string()
+}
+fn public_code_for(
+    category: &PythonLauncherCategory,
+    source: &PythonLauncherSource,
+    packaged: bool,
+) -> &'static str {
+    match (category, source, packaged) {
+        (_, PythonLauncherSource::EnvironmentOverride, _) => "desktop_python_override_invalid",
+        (PythonLauncherCategory::BundledRuntimeMissing, _, true) => {
+            "desktop_python_runtime_missing"
+        }
+        (PythonLauncherCategory::BundledRuntimeNotPython3, _, true)
+        | (PythonLauncherCategory::BundledRuntimeProbeFailed, _, true) => {
+            "desktop_python_runtime_invalid"
+        }
+        _ => "desktop_python_development_dependency_missing",
+    }
+}
+fn launcher_error(
+    candidate: &PythonLauncher,
+    category: PythonLauncherCategory,
+    status: Option<i32>,
+    packaged: bool,
+) -> anyhow::Error {
+    PythonLauncherError {
+        public_code: public_code_for(&category, &candidate.source, packaged),
+        category,
+        source: candidate.source.clone(),
+        executable_basename: launcher_basename(&candidate.program),
+        exit_status: status,
+        packaged,
+    }
+    .into()
+}
+fn looks_like_apple_developer_tools_stub(stdout: &str, stderr: &str) -> bool {
+    let c = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    c.contains("xcode-select")
+        || c.contains("no developer tools were found")
+        || c.contains("commandlinetools")
+}
+
 fn resolve_python_launcher_with_probe<F>(
     var_name: &str,
     candidates: Vec<PythonLauncher>,
@@ -101,46 +206,56 @@ fn resolve_python_launcher_with_probe<F>(
 where
     F: FnMut(&PythonLauncher) -> std::io::Result<std::process::Output>,
 {
-    let mut attempts = Vec::new();
-
+    let explicit_override = std::env::var(var_name).is_ok();
+    let mut last_error: Option<anyhow::Error> = None;
     for candidate in candidates {
-        let probe_result = probe(&candidate);
-        match probe_result {
+        match probe(&candidate) {
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 if output.status.success()
                     && !looks_like_windows_store_alias(&stderr)
                     && is_python_3_version(&stdout, &stderr)
                 {
                     return Ok(candidate);
                 }
-
-                attempts.push(format!(
-                    "{} {} -> status={} stdout='{}' stderr='{}'",
-                    candidate.program,
-                    candidate.args.join(" "),
-                    output.status,
-                    stdout,
-                    stderr.trim()
-                ));
+                let category = if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
+                    PythonLauncherCategory::AppleDeveloperToolsStub
+                } else if matches!(candidate.source, PythonLauncherSource::EnvironmentOverride) {
+                    PythonLauncherCategory::OverrideNotPython3
+                } else if matches!(candidate.source, PythonLauncherSource::BundledRuntime) {
+                    PythonLauncherCategory::BundledRuntimeNotPython3
+                } else {
+                    PythonLauncherCategory::SystemRuntimeMissing
+                };
+                let err = launcher_error(&candidate, category, output.status.code(), false);
+                if explicit_override
+                    && matches!(candidate.source, PythonLauncherSource::EnvironmentOverride)
+                {
+                    return Err(err);
+                }
+                last_error = Some(err);
             }
-            Err(err) => {
-                attempts.push(format!(
-                    "{} {} -> spawn failed: {}",
-                    candidate.program,
-                    candidate.args.join(" "),
-                    err
-                ));
+            Err(_) => {
+                let category =
+                    if matches!(candidate.source, PythonLauncherSource::EnvironmentOverride) {
+                        PythonLauncherCategory::OverrideMissing
+                    } else if matches!(candidate.source, PythonLauncherSource::BundledRuntime) {
+                        PythonLauncherCategory::BundledRuntimeMissing
+                    } else {
+                        PythonLauncherCategory::LauncherSpawnFailed
+                    };
+                let err = launcher_error(&candidate, category, None, false);
+                if explicit_override
+                    && matches!(candidate.source, PythonLauncherSource::EnvironmentOverride)
+                {
+                    return Err(err);
+                }
+                last_error = Some(err);
             }
         }
     }
-
-    anyhow::bail!(
-        "no usable Python 3 interpreter found for desktop Python subprocess (consulted override env var: {}); tried: {}",
-        var_name,
-        attempts.join("; ")
-    )
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("desktop_python_development_dependency_missing category=system_runtime_missing source=SystemDevelopmentRuntime executable=python status=unknown expected_python=3.11+ expected_architecture=native packaged=false")))
 }
 
 pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher> {
@@ -148,6 +263,78 @@ pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher>
     resolve_python_launcher_with_probe(var_name, candidates, |candidate| {
         candidate.command_for_version_check().output()
     })
+}
+
+pub fn resolve_python_launcher_for_context(
+    var_name: &str,
+    tauri_resource_dir: Option<&Path>,
+    current_exe_path: Option<&Path>,
+    packaged_release: bool,
+) -> anyhow::Result<PythonLauncher> {
+    if std::env::var(var_name).is_ok() {
+        return resolve_python_launcher_with_probe(
+            var_name,
+            vec![env_python_candidate(var_name).unwrap()],
+            |candidate| candidate.command_for_version_check().output(),
+        );
+    }
+    if cfg!(target_os = "windows") {
+        return resolve_python_launcher(var_name);
+    }
+    let resource_dir = tauri_resource_dir.map(Path::to_path_buf).or_else(|| {
+        current_exe_path.and_then(|exe| {
+            exe.parent()?
+                .parent()
+                .map(|contents| contents.join("Resources"))
+        })
+    });
+    let bundled = resource_dir.map(|dir| dir.join("python-runtime").join("bin").join("python3"));
+    if cfg!(target_os = "macos") {
+        if let Some(path) = bundled {
+            let candidate = PythonLauncher::bundled(path);
+            if !Path::new(&candidate.program).exists() {
+                if packaged_release {
+                    return Err(launcher_error(
+                        &candidate,
+                        PythonLauncherCategory::BundledRuntimeMissing,
+                        None,
+                        true,
+                    ));
+                }
+            } else {
+                return match candidate.command_for_version_check().output() {
+                    Ok(out)
+                        if out.status.success()
+                            && is_python_3_version(
+                                &String::from_utf8_lossy(&out.stdout),
+                                &String::from_utf8_lossy(&out.stderr),
+                            ) =>
+                    {
+                        Ok(candidate)
+                    }
+                    Ok(out) => Err(launcher_error(
+                        &candidate,
+                        PythonLauncherCategory::BundledRuntimeNotPython3,
+                        out.status.code(),
+                        packaged_release,
+                    )),
+                    Err(_) => Err(launcher_error(
+                        &candidate,
+                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                        None,
+                        packaged_release,
+                    )),
+                };
+            }
+        } else if packaged_release {
+            return Err(anyhow::anyhow!("desktop_python_runtime_missing category=bundled_runtime_missing source=BundledRuntime executable=python3 status=unknown expected_python=3.11+ expected_architecture=arm64 packaged=true"));
+        }
+        return resolve_python_launcher(var_name);
+    }
+    if packaged_release {
+        anyhow::bail!("desktop_python_runtime_invalid category=unsupported_packaged_platform source=BundledRuntime executable=python3 status=unknown expected_python=3.11+ expected_architecture=native packaged=true");
+    }
+    resolve_python_launcher(var_name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,18 +717,9 @@ mod tests {
     #[test]
     fn resolver_prefers_first_working_windows_candidate_order() {
         let candidates = vec![
-            PythonLauncher {
-                program: "py".into(),
-                args: vec!["-3".into()],
-            },
-            PythonLauncher {
-                program: "python".into(),
-                args: vec![],
-            },
-            PythonLauncher {
-                program: "python3".into(),
-                args: vec![],
-            },
+            PythonLauncher::system("py", vec!["-3".into()]),
+            PythonLauncher::system("python", vec![]),
+            PythonLauncher::system("python3", vec![]),
         ];
 
         let mut probe_calls = Vec::new();
@@ -564,14 +742,8 @@ mod tests {
     #[test]
     fn invalid_env_override_is_reported_when_all_candidates_fail() {
         let candidates = vec![
-            PythonLauncher {
-                program: "definitely-missing-python".into(),
-                args: vec![],
-            },
-            PythonLauncher {
-                program: "python3".into(),
-                args: vec![],
-            },
+            PythonLauncher::env_override("definitely-missing-python".into()),
+            PythonLauncher::system("python3", vec![]),
         ];
 
         let err =
@@ -587,22 +759,19 @@ mod tests {
             .expect_err("expected failure");
 
         let message = err.to_string();
-        assert!(message.contains("TOKEN_PLACE_SIDECAR_PYTHON"));
-        assert!(message.contains("definitely-missing-python"));
-        assert!(message.contains("spawn failed"));
+        assert!(
+            message.contains("desktop_python_development_dependency_missing")
+                || message.contains("desktop_python_override_invalid")
+        );
+        assert!(!message.contains("definitely-missing-python"));
+        assert!(!message.contains("not found"));
     }
 
     #[test]
     fn windows_store_alias_message_falls_through_to_next_candidate() {
         let candidates = vec![
-            PythonLauncher {
-                program: "python".into(),
-                args: vec![],
-            },
-            PythonLauncher {
-                program: "python3".into(),
-                args: vec![],
-            },
+            PythonLauncher::system("python", vec![]),
+            PythonLauncher::system("python3", vec![]),
         ];
 
         let launcher = resolve_python_launcher_with_probe("TOKEN_PLACE_SIDECAR_PYTHON", candidates, |c| {
@@ -623,14 +792,8 @@ mod tests {
     #[test]
     fn final_error_contains_attempted_launcher_details() {
         let candidates = vec![
-            PythonLauncher {
-                program: "python".into(),
-                args: vec![],
-            },
-            PythonLauncher {
-                program: "python3".into(),
-                args: vec![],
-            },
+            PythonLauncher::system("python", vec![]),
+            PythonLauncher::system("python3", vec![]),
         ];
 
         let err =

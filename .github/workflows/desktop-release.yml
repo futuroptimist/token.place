@@ -101,7 +101,27 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Cache embedded Python runtime downloads
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/embedded-python/*.tar.gz
+            .cache/embedded-python/pip
+          key: embedded-python-${{ runner.os }}-${{ hashFiles('src-tauri/python/embedded_python_runtime_manifest.json', 'src-tauri/python/requirements_desktop_runtime.txt') }}
+
+      - name: Prepare embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          python scripts/prepare_embedded_python_runtime.py --cache-dir .cache/embedded-python
+          test -x src-tauri/python-runtime/bin/python3
+          src-tauri/python-runtime/bin/python3 -m pip check
+
       - name: Install desktop llama-cpp runtime with platform GPU backend
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -251,6 +271,29 @@ jobs:
           else
             npm run tauri build
           fi
+
+
+      - name: Sign and verify embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          app_path="$(find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          runtime_dir="${app_path}/Contents/Resources/python-runtime"
+          test -x "${runtime_dir}/bin/python3"
+          identity="${TAURI_BUNDLE_MACOS_SIGNING_IDENTITY:--}"
+          while IFS= read -r f; do
+            codesign --force --options runtime --sign "${identity}" "${f}"
+          done < <(find "${runtime_dir}" -type f \( -perm -111 -o -name '*.dylib' -o -name '*.so' \) -print)
+          codesign --force --deep --options runtime --sign "${identity}" "${app_path}"
+          codesign --verify --deep --strict "${app_path}"
+          HOME="$(mktemp -d)" PYTHONNOUSERSITE=1 TOKEN_PLACE_PYTHON= TOKEN_PLACE_SIDECAR_PYTHON= "${runtime_dir}/bin/python3" - <<'PY'
+          import platform, sys
+          assert platform.machine() == 'arm64'
+          assert '/Contents/Resources/python-runtime' in sys.executable
+          PY
 
       - name: Stage bundle artifacts
         shell: bash

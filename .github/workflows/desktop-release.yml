@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-26
             artifact_name: macos-arm64-bundles
             tauri_target: aarch64-apple-darwin
             checksum_file: SHA256SUMS-macos-arm64.txt
@@ -102,6 +102,13 @@ jobs:
         run: npm ci
 
       - name: Install desktop llama-cpp runtime with platform GPU backend
+        # The release matrix currently builds macOS and Windows artifacts only.
+        # macOS prepares and validates its bundled interpreter in the dedicated
+        # embedded-runtime step below; Windows intentionally keeps its existing
+        # packaging path. Keep this Linux-only guard so future Linux desktop
+        # packaging can reuse the shared setup without making macOS release
+        # builds compile/install llama-cpp into the runner Python.
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -204,6 +211,25 @@ jobs:
 
           raise RuntimeError("Failed to install llama-cpp-python for all configured plans")
           PY
+
+
+      - name: Cache embedded macOS Python archive and wheels
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/token-place/embedded-python
+          key: embedded-python-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt') }}
+
+      - name: Prepare embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          python scripts/prepare_embedded_python_runtime.py
+          test -x src-tauri/python-runtime/bin/python3
+          src-tauri/python-runtime/bin/python3 -m pip check
 
       - name: Build frontend assets
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
@@ -340,6 +366,12 @@ jobs:
                 "" \
                 "Normal no-warning public macOS distribution requires paid Developer ID signing + notarization." > "${preview_notice}"
             fi
+            signing_flag=""
+            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+              signing_flag="--expect-signing"
+            fi
+            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${app_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+
             rm -rf "${dmg_stage_dir}"
             mkdir -p "${dmg_stage_dir}"
             cp -R "${app_path}" "${dmg_stage_dir}/"
@@ -411,7 +443,7 @@ jobs:
             fi
           fi
 
-          python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
+          python ../scripts/validate_desktop_tauri_release_artifacts.py               --require-embedded-python-runtime               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
 
       - name: Generate SHA256 checksums
         shell: bash

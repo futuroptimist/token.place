@@ -275,13 +275,307 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+
+def _redact_allowed_app_locations(output: str, app_path: Path) -> str:
+    redacted = output
+
+    # CI builds can run probes from an app bundle under host-specific absolute
+    # paths (for example /Users/runner/...). Those app-local paths are expected
+    # in sys.executable/sys.prefix output and should not trip the host-path leak
+    # scan. Redact any absolute prefix ending at the same .app bundle name before
+    # replacing relative app paths; otherwise a relative replacement can leave the
+    # host-specific prefix visible (for example /Users/runner/.../<app-bundle>).
+    app_name = re.escape(app_path.name)
+    redacted = re.sub(rf"/[^\n\r]*?{app_name}", "<app-bundle>", redacted)
+
+    allowed_paths = {str(app_path), str(app_path.absolute())}
+    try:
+        allowed_paths.add(str(app_path.resolve()))
+    except OSError:
+        pass
+    try:
+        allowed_paths.add(os.path.realpath(app_path))
+    except OSError:
+        pass
+    for allowed in sorted(allowed_paths, key=len, reverse=True):
+        if allowed:
+            redacted = redacted.replace(allowed, "<app-bundle>")
+    return redacted
+
+
+def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
+    app_for_subprocess = app_path if app_path.is_absolute() else app_path.absolute()
+    py_for_subprocess = py if py.is_absolute() else py.absolute()
+    home = tempfile.mkdtemp(prefix="token-place-home-")
+    try:
+        app_data = Path(home) / "token.place"
+        env = {
+            "HOME": home,
+            "PYTHONNOUSERSITE": "1",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
+            "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
+            "XDG_CACHE_HOME": str(app_data / "cache"),
+            "XDG_CONFIG_HOME": str(app_data / "config"),
+            "XDG_DATA_HOME": str(app_data / "data"),
+        }
+        probe_cwd = app_for_subprocess / "Contents" / "Resources" / "python"
+        result = subprocess.run(
+            [str(py_for_subprocess), "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(probe_cwd) if probe_cwd.is_dir() else home,
+        )
+        output = f"{result.stdout}\n{result.stderr}"
+        scan_output = _redact_allowed_app_locations(output, app_for_subprocess)
+        forbidden = ("/usr/bin/python3", "xcode-select", "No developer tools were found", "CommandLineTools", "/opt/homebrew", "/usr/local/Cellar", "pyenv", "/Users/runner", "/Library/Developer/CommandLineTools", "site.USER_SITE")
+        for marker in forbidden:
+            if marker in scan_output:
+                _fail(f"embedded Python output leaked forbidden marker: {marker}")
+        if result.returncode != 0:
+            _fail(_format_command_failure([str(py_for_subprocess), "-c", "<probe>"], result))
+        return output.strip()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+def _parse_otool_rpaths(load_commands: str) -> list[str]:
+    rpaths: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for follow in lines[index + 1:index + 6]:
+                stripped = follow.strip()
+                if stripped.startswith("path "):
+                    rpaths.append(stripped.split("path ", 1)[1].split(" (", 1)[0])
+                    break
+    return rpaths
+
+
+def _parse_otool_install_ids(load_commands: str) -> list[str]:
+    ids: list[str] = []
+    lines = load_commands.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "cmd LC_ID_DYLIB":
+            continue
+        name: str | None = None
+        next_command = len(lines)
+        for cursor in range(index + 1, len(lines)):
+            if lines[cursor].lstrip().startswith("Load command "):
+                next_command = cursor
+                break
+        for follow in lines[index + 1:next_command]:
+            stripped = follow.strip()
+            if stripped.startswith("name "):
+                value = stripped.removeprefix("name ")
+                suffix = value.rfind(" (offset ")
+                name = value[:suffix] if suffix != -1 else value
+                break
+        if name is None:
+            _fail("malformed LC_ID_DYLIB load command without name")
+        ids.append(name)
+    if len(ids) > 1:
+        _fail("multiple LC_ID_DYLIB load commands found")
+    return ids
+
+
+def _macho_archs(path: Path) -> list[str]:
+    archs = _run(["lipo", "-archs", str(path)]).split()
+    if not archs:
+        _fail(f"Mach-O file has no architectures: {path}")
+    if "arm64" not in archs:
+        _fail(f"Mach-O file is not arm64: {path}")
+    return archs
+
+
+def _parse_otool_libraries(output: str, owner: Path, architecture: str | None) -> list[str]:
+    owner_text = str(owner)
+    expected_headers = {f"{owner_text}:"}
+    if architecture is not None:
+        expected_headers.add(f"{owner_text} (architecture {architecture}):")
+    deps: list[str] = []
+    saw_header = False
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        stripped = raw_line.strip()
+        is_header = stripped.endswith(":") and not raw_line[:1].isspace()
+        if is_header:
+            if stripped not in expected_headers:
+                _fail(f"unexpected otool -L header for {owner.name}")
+            if saw_header:
+                _fail(f"duplicate otool -L header for {owner.name}")
+            saw_header = True
+            continue
+        if not saw_header:
+            _fail(f"dependency before otool -L header for {owner.name}")
+        if not raw_line[:1].isspace():
+            _fail(f"malformed otool -L record for {owner.name}")
+        metadata = " (compatibility version "
+        if metadata in stripped:
+            stripped = stripped[:stripped.index(metadata)]
+        if not stripped:
+            _fail(f"malformed empty otool -L dependency for {owner.name}")
+        deps.append(stripped)
+    if not saw_header:
+        _fail(f"missing otool -L header for {owner.name}")
+    return deps
+
+
+def _macho_file_kind(file_description: str) -> str:
+    lower = file_description.lower()
+    if "dynamically linked shared library" in lower or "dylib" in lower:
+        return "dylib"
+    if "bundle" in lower:
+        return "bundle"
+    if "executable" in lower:
+        return "executable"
+    return "other"
+
+
+def _validate_macho_ref(ref: str, owner: Path, app_path: Path, *, install_id: bool = False, rpath: bool = False) -> None:
+    if not ref:
+        return
+    if install_id and ref.startswith("/"):
+        _fail(f"absolute Mach-O install ID in {owner}: {ref}")
+    lower = ref.lower()
+    forbidden = (
+        "/opt/homebrew", "/usr/local/cellar", "pyenv", "commandlinetools",
+        "/applications/xcode.app", "python.framework", "/users/runner",
+        "/private/var/folders", "/" + "tmp/", "/var/" + "tmp/", "libssl.3.dylib", "libcrypto.3.dylib",
+    )
+    if any(marker in lower for marker in forbidden):
+        _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
+    if ref.startswith(("@loader_path", "@rpath", "@executable_path")):
+        if rpath and not ref.startswith(("@loader_path", "@executable_path")):
+            _fail(f"forbidden external Mach-O LC_RPATH in {owner}: {ref}")
+        return
+    if ref.startswith(("/usr/lib/", "/System/Library/")):
+        return
+    try:
+        if Path(ref).resolve().is_relative_to(app_path.resolve()):
+            return
+    except OSError:
+        pass
+    if ref.startswith("/"):
+        _fail(f"forbidden external Mach-O linkage in {owner}: {ref}")
+
+
+def _safe_macho_ref(value: str) -> str:
+    return Path(value).name or value[:80]
+
+def _macho_relative(path: Path, app_path: Path) -> Path:
+    try:
+        return path.relative_to(app_path)
+    except ValueError:
+        return Path(path.name)
+
+def _validate_macho_linkage(path: Path, app_path: Path) -> None:
+    if platform.system() != "Darwin":
+        return
+    result = subprocess.run(["file", str(path)], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        _fail(_format_command_failure(["file", str(path)], result))
+    if "Mach-O" not in result.stdout:
+        return
+    file_description = result.stdout
+    archs = _macho_archs(path)
+    for arch in archs:
+        deps = _parse_otool_libraries(_run(["otool", "-arch", arch, "-L", str(path)]), path, arch)
+        for dep in deps:
+            try:
+                _validate_macho_ref(dep, path, app_path)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=dependency ref={_safe_macho_ref(dep)}")
+    load_commands_by_arch = {arch: _run(["otool", "-arch", arch, "-l", str(path)]) for arch in archs}
+    install_ids_by_arch = {arch: _parse_otool_install_ids(output) for arch, output in load_commands_by_arch.items()}
+    kind = _macho_file_kind(file_description)
+    normalized_ids: list[str] = []
+    for arch, install_ids in install_ids_by_arch.items():
+        if kind == "dylib" and len(install_ids) != 1:
+            _fail(f"Mach-O dylib is missing LC_ID_DYLIB: {path} [arch={arch} category=install_id]")
+        for install_id in install_ids:
+            try:
+                _validate_macho_ref(install_id, path, app_path, install_id=True)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=install_id ref={_safe_macho_ref(install_id)}")
+            normalized_ids.append(install_id)
+    if kind == "dylib" and len(set(normalized_ids)) != 1:
+        _fail(f"Mach-O dylib install IDs differ by architecture: {path}")
+    for arch, load_commands in load_commands_by_arch.items():
+        for rpath in _parse_otool_rpaths(load_commands):
+            try:
+                _validate_macho_ref(rpath, path, app_path, rpath=True)
+            except SystemExit as exc:
+                rel = _macho_relative(path, app_path)
+                _fail(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}")
+
+def _validate_embedded_python_runtime(app_path: Path) -> None:
+    runtime = app_path / "Contents" / "Resources" / "python-runtime"
+    py = runtime / "bin" / "python3"
+    if not py.exists() or not os.access(py, os.X_OK):
+        _fail(f"embedded Python interpreter missing or not executable at exact packaged path: {py}")
+    if not (runtime / "embedded_python_runtime_provenance.json").is_file():
+        _fail("embedded runtime provenance missing")
+    for notice in ("LICENSE-PYTHON.txt", "LICENSE-python-build-standalone.txt"):
+        if not (runtime / notice).is_file():
+            _fail(f"embedded runtime notice missing: {notice}")
+    if platform.system() == "Darwin":
+        arch = _run(["lipo", "-archs", str(py)]).lower()
+        if "arm64" not in arch or ("x86_64" in arch and "arm64" not in arch):
+            _fail(f"embedded Python is not arm64: {arch}")
+    code = "import importlib.metadata as im,json,platform,sys; import psutil,requests,dotenv,cryptography,jinja2,numpy,diskcache,llama_cpp; print(json.dumps({'version':sys.version_info[:2],'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix,'llama_cpp_python_version':im.version('llama-cpp-python')}))"
+    payload = json.loads(_run_python_sanitized(py, code, app_path).splitlines()[-1])
+    if payload.get("version") != [3, 11]:
+        _fail(f"embedded Python is not CPython 3.11: {payload.get('version')}")
+    if payload.get("machine") != "arm64":
+        _fail(f"embedded Python is not arm64: {payload.get('machine')}")
+    if payload.get("llama_cpp_python_version") != "0.3.32":
+        _fail("embedded runtime has wrong llama-cpp-python version")
+    for key in ("executable", "prefix"):
+        if not Path(payload[key]).resolve().is_relative_to(app_path.resolve()):
+            _fail(f"embedded Python {key} escaped app bundle: {payload[key]}")
+    _run_python_sanitized(py, "import subprocess,sys; raise SystemExit(subprocess.run([sys.executable,'-m','pip','check']).returncode)", app_path)
+    probe = "import json; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
+    out = _run_python_sanitized(py, probe, app_path)
+    data = json.loads(out.splitlines()[-1])
+    if data.get("backend") != "metal" or not data.get("gpu_offload_supported"):
+        _fail("embedded runtime probe did not report Metal GPU offload")
+    if data.get("qwen_64k_yarn_support") != "supported":
+        _fail("embedded runtime probe missing capability: qwen_64k_yarn_support")
+    top_level_capabilities = {
+        "rope_scaling_type": "rope_scaling_type_supported",
+        "rope_freq_scale": "rope_freq_scale_supported",
+        "yarn_orig_ctx": "yarn_orig_ctx_supported",
+    }
+    for name, field in top_level_capabilities.items():
+        if not data.get(field):
+            _fail(f"embedded runtime probe missing capability: {name}")
+    constructor_support = data.get("constructor_kwarg_support") or {}
+    for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
+        if not constructor_support.get(key):
+            _fail(f"embedded runtime probe missing capability: {key}")
+    model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
+    if model_bridge.is_file():
+        model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()
+        _run_python_sanitized(py, f"import subprocess,sys; raise SystemExit(subprocess.run([sys.executable, {str(model_bridge_for_subprocess)!r}, 'inspect']).returncode)", app_path)
+    else:
+        _fail("packaged model_bridge.py missing from app resources")
+    for candidate in runtime.rglob("*"):
+        if candidate.is_file(): _validate_macho_linkage(candidate, app_path)
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--app-path", required=True)
-    p.add_argument("--dmg-path", required=True)
+    p.add_argument("--dmg-path")
+    p.add_argument("--app-only", action="store_true")
     p.add_argument("--tauri-config", required=True)
     p.add_argument("--expected-icon", required=True)
     p.add_argument("--expect-signing", action="store_true")
+    p.add_argument("--require-embedded-python-runtime", action="store_true")
     p.add_argument("--expect-notarization", action="store_true")
     return p.parse_args()
 
@@ -321,20 +615,24 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
-    dmg_path = Path(args.dmg_path)
+    dmg_path = Path(args.dmg_path) if args.dmg_path else None
     tauri_config = Path(args.tauri_config)
     expected_icon = Path(args.expected_icon)
 
-    for candidate in (app_path.name, dmg_path.name, str(dmg_path)):
+    dmg_candidates = (dmg_path.name, str(dmg_path)) if dmg_path is not None else ()
+    for candidate in (app_path.name, *dmg_candidates):
         for stale in STALE_BRANDS:
             if stale.lower() in candidate.lower():
                 _fail(f"stale Electron branding detected: {stale} in {candidate}")
 
-    if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
-        _fail(f"dmg artifact missing or invalid: {dmg_path}")
-    if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
-        _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-    _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
+    if not args.app_only:
+        if dmg_path is None:
+            _fail("--dmg-path is required unless --app-only is set")
+        if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
+            _fail(f"dmg artifact missing or invalid: {dmg_path}")
+        if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
+            _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
+        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -384,6 +682,9 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    if args.require_embedded_python_runtime:
+        _validate_embedded_python_runtime(app_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

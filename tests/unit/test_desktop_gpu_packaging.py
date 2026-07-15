@@ -60,10 +60,20 @@ def test_macos_install_plan_requests_metal_then_cpu_fallback():
     assert metal_source_plan.only_binary is False
     assert metal_source_plan.force_cmake is True
     assert metal_source_plan.no_binary is True
-    assert metal_source_plan.pip_env() == {
-        "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
-        "FORCE_CMAKE": "1",
-    }
+    cmake_args = metal_source_plan.pip_env()["CMAKE_ARGS"]
+    assert metal_source_plan.pip_env()["FORCE_CMAKE"] == "1"
+    for flag in (
+        "-DGGML_METAL=ON",
+        "-DGGML_METAL_EMBED_LIBRARY=ON",
+        "-DGGML_NATIVE=OFF",
+        "-DGGML_OPENMP=OFF",
+        "-DGGML_ACCELERATE=ON",
+        "-DGGML_BLAS=ON",
+        "-DGGML_BLAS_VENDOR=Apple",
+        "-DLLAMA_CURL=OFF",
+        "-DLLAMA_OPENSSL=OFF",
+    ):
+        assert flag in cmake_args
 
     cpu_fallback = plans[2]
     assert cpu_fallback.backend == "cpu"

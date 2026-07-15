@@ -47,6 +47,10 @@ The project runs on Windows, macOS and Linux. Path handling, configuration locat
 
 The `.gitignore` file keeps OS artifacts like `.DS_Store` and `Thumbs.db` out of commits.
 
+### macOS desktop release runtime
+
+Apple Silicon release DMGs include the pinned Python runtime inside the `.app`, so normal users do not need to install Python, Homebrew, Xcode, or Xcode Command Line Tools. If the packaged runtime is missing or damaged, the supported recovery is to reinstall token.place desktop or use a newer signed release artifact; the app should not ask users to repair it with developer tools. Python override environment variables are development-only guidance and are not part of normal packaged-app operation.
+
 ## Where to Go Next
 
 - **Architecture** – [docs/ARCHITECTURE.md](ARCHITECTURE.md)

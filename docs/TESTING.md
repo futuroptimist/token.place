@@ -473,6 +473,10 @@ operator parity:
 python desktop-tauri/scripts/run_desktop_parity_checks.py
 ```
 
+### macOS desktop release runtime validation
+
+Release DMGs include Python at `Contents/Resources/python-runtime/bin/python3`; normal users do not need Python or Xcode Command Line Tools. Artifact validation should fail publication when the bundled runtime, imports, Metal/Qwen probe, linkage, or signature checks fail. A damaged packaged runtime is repaired by reinstalling token.place desktop or moving to a newer release, while Python overrides remain development-only test controls.
+
 ### Running all tests
 
 To execute the complete test suite that CI runs, use:

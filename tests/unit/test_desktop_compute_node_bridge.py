@@ -5050,6 +5050,17 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
         assert secret not in err
 
 
+def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
+    workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
+    workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['desktop-operator-packaged-e2e-windows']['steps']
+    step_names = [step.get('name') for step in steps]
+    rust_index = step_names.index('Set up Rust')
+    cargo_index = step_names.index('Run Windows CUDA capability handoff regressions (fakes)')
+    assert rust_index < cargo_index
+    assert steps[rust_index]['uses'] == 'dtolnay/rust-toolchain@stable'
+
+
 def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsys, monkeypatch):
     calls = []
 

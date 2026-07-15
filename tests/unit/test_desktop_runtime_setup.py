@@ -2391,3 +2391,44 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
     assert sentinel not in emitted
+
+
+def test_probe_result_payload_carries_private_identity_but_public_result_redacts(monkeypatch, tmp_path):
+    support = {name: True for name in desktop_runtime_setup.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='metal', gpu_offload_supported=True, detected_device='metal',
+        interpreter=sys.executable, prefix=sys.prefix, llama_module_path=str(module_path),
+        llama_cpp_python_version='0.3.32', yarn_rope_supported=True,
+        yarn_resolver_source='top_level_enum', constructor_kwarg_support=support,
+        constructor_signature_inspectable=True, qwen_64k_yarn_support='supported', yarn_enum_value=2,
+    )
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    identity = payload['llama_module_identity']
+    assert identity.startswith('sha256:') and len(identity) == 71
+    assert payload['llama_module_path_present'] is True
+    assert 'llama_module_path' not in payload
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ensure_desktop_llama_runtime_impl', lambda *_, **__: dict(payload, selected_backend='metal', runtime_action='metal_already_supported'))
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert 'llama_module_identity' not in result
+    assert str(module_path) not in json.dumps(result)
+    private_env = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+    assert private_env['llama_module_identity'] == identity
+    assert str(module_path) not in os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
+
+def test_llama_module_identity_canonicalizes_symlink_dotdot(tmp_path):
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_dir = tmp_path / 'link'
+    link_dir.symlink_to(real.parent.parent, target_is_directory=True)
+    via_link = link_dir / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    assert desktop_runtime_setup.llama_module_identity_from_path(real) == desktop_runtime_setup.llama_module_identity_from_path(via_link)
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    assert desktop_runtime_setup.llama_module_identity_from_path(real) != desktop_runtime_setup.llama_module_identity_from_path(other)

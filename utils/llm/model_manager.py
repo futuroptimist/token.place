@@ -5,6 +5,8 @@ import os
 import time
 import logging
 import math
+import hashlib
+import uuid
 from utils.networking.http_requests_compat import requests
 import json
 import re
@@ -48,6 +50,7 @@ QWEN_64K_UBATCH_TOKENS = 128
 QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
+GGUF_MAGIC = b'GGUF'
 
 LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
@@ -66,6 +69,7 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_buffer_limit',
     'runtime_context_create_cuda_memory',
     'runtime_context_create_cuda_buffer_limit',
+    'runtime_context_create_failed',
 }
 
 _INIT_SAFE_CATEGORY_ALIASES = {
@@ -76,6 +80,10 @@ _INIT_SAFE_CATEGORY_ALIASES = {
 }
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
+    'runtime_model_path_unavailable',
+    'runtime_model_load_failed',
+    'runtime_model_vocab_failed',
+    'runtime_batch_create_failed',
     'runtime_context_create_failed',
     'runtime_context_create_unsupported_kwarg',
     'runtime_context_create_rope_yarn_config',
@@ -488,6 +496,12 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
             return marker_category
     if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported (?:parameter|kwarg|argument))', text):
         return 'runtime_context_create_unsupported_kwarg'
+    if 'model path' in text and any(term in text for term in ('not found', 'unavailable', 'does not exist', 'no such file')):
+        return 'runtime_model_path_unavailable'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
+        return 'runtime_batch_create_failed'
     if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'orig', 'context'))):
         return 'runtime_context_create_rope_yarn_config'
     if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'oom', 'failed')):
@@ -515,6 +529,20 @@ def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -
         return 'runtime_context_create_failed'
     return 'runtime_init_unclassified'
 
+
+
+def _classify_runtime_initialization_error(error: Any, child_stderr: str = '') -> str:
+    """Classify constructor/init failures with a bounded, path-free category set."""
+    text = f'{error or ""}\n{child_stderr or ""}'.lower()
+    if 'failed to load model' in text or 'llama_model_load' in text:
+        return 'runtime_model_load_failed'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('abi', 'incompatible gguf', 'unsupported gguf')):
+        return 'runtime_model_load_failed'
+    return _classify_runtime_context_create_error(error, child_stderr)
 
 def _redact_paths_from_text(text: Any, *, limit: int = 2000) -> str:
     redacted = str(text or '')
@@ -1367,10 +1395,10 @@ def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optio
         if isinstance(parsed, dict):
             diagnostics = parsed
     logger.info(
-        "llama_cpp runtime process stage complete stage=%s duration_ms=%s module_path=%s",
+        "llama_cpp runtime process stage complete stage=%s duration_ms=%s module_path_present=%s",
         stage,
         duration_ms,
-        diagnostics.get('module_path') or diagnostics.get('llama_module_path') or 'unknown',
+        bool(diagnostics.get('module_path') or diagnostics.get('llama_module_path')),
     )
     return diagnostics
 
@@ -1585,8 +1613,8 @@ def _import_llama_cpp_subprocess_module(
 
     logger.info(
         "llama_cpp parent import skipped; using subprocess runtime facade "
-        "module_path_hint=%s interpreter=%s thread=%s",
-        module_path_hint or 'unknown',
+        "module_path_hint_present=%s interpreter=%s thread=%s",
+        bool(module_path_hint),
         sys.executable,
         threading.current_thread().name,
     )
@@ -1757,13 +1785,18 @@ def _read_llama_subprocess_message(
             safe_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
             raise LlamaCppInferenceRequestError(error, diagnostics=safe_diagnostics)
         child_category = _validated_init_safe_category(message.get('safe_error_category'))
-        classified = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
-        category = child_category if child_category != 'runtime_init_unclassified' else classified
+        if stage == 'llama_cpp_model_initialization':
+            category = child_category
+            child_stderr_tail = ''
+        else:
+            classified = _classify_runtime_context_create_error(raw_error, str(message.get('stderr') or ''))
+            category = child_category if child_category != 'runtime_init_unclassified' else classified
+            child_stderr_tail = str(message.get('stderr') or '')
         raise LlamaCppRuntimeInitError(
             f'{stage} failed',
             child_exception_type=message.get('exception_type') or 'RuntimeError',
             safe_error_category=category,
-            child_stderr_tail=str(message.get('stderr') or ''),
+            child_stderr_tail=child_stderr_tail,
         )
     return message
 
@@ -1799,6 +1832,11 @@ class _SubprocessLlamaProxy:
         module_path_hint: Any = None,
         **kwargs,
     ) -> None:
+        if 'model_path' in kwargs and isinstance(kwargs.get('model_path'), str):
+            kwargs = dict(kwargs)
+            kwargs['model_path'] = os.path.abspath(kwargs['model_path'])
+        elif args and isinstance(args[0], str):
+            args = (os.path.abspath(args[0]), *args[1:])
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._lock = Lock()
         self._closed = False
@@ -1851,18 +1889,37 @@ class _SubprocessLlamaProxy:
         self._stderr_reader_thread: Optional[threading.Thread] = None
         self._start_stderr_tail_reader()
         try:
-            self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
-        except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
-            self.close()
-            raise RuntimeError(
-                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
-            ) from exc
-        try:
+            self._send({'method': '__import__'}, check_health=False)
             _read_llama_subprocess_message(
                 self._process,
                 timeout_seconds=self._timeout_seconds,
                 stage='llama_cpp_import',
             )
+        except Exception as exc:
+            self._drain_stderr_reader_bounded()
+            safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+            self.close()
+            if isinstance(exc, LlamaCppRuntimeStageTimeout):
+                raise
+            if isinstance(exc, LlamaCppWorkerEOFError):
+                raise LlamaCppWorkerEOFError(safe_exc) from exc
+            if isinstance(exc, (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError)):
+                raise RuntimeError(safe_exc) from exc
+            raise
+        try:
+            self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
+        except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
+            self.close()
+            raise RuntimeError(
+                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
+            ) from exc
+        try:
+            init_message = _read_llama_subprocess_message(
+                self._process,
+                timeout_seconds=self._timeout_seconds,
+                stage='llama_cpp_model_initialization',
+            )
+            self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
         except LlamaCppRuntimeStageTimeout:
             self.close()
             raise
@@ -1872,11 +1929,11 @@ class _SubprocessLlamaProxy:
             if isinstance(exc, LlamaCppRuntimeInitError):
                 category = _refine_init_category(exc.safe_error_category, error=exc, child_stderr=stderr_tail)
                 child_exception_type = exc.child_exception_type
-                safe_exc = 'llama_cpp_import failed'
+                safe_exc = 'llama_cpp_model_initialization failed'
             elif isinstance(exc, LlamaCppWorkerEOFError):
                 category = _classify_runtime_context_create_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
-                safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+                safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
             else:
                 category = _classify_runtime_context_create_error(exc, stderr_tail)
                 child_exception_type = type(exc).__name__
@@ -2168,7 +2225,7 @@ class _SubprocessLlamaCppModule:
 
 
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
-import importlib, inspect, json, os, re, sys, traceback
+import importlib, inspect, json, os, re, sys
 
 def _jsonable(value):
     if hasattr(value, 'model_dump'):
@@ -2184,6 +2241,37 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
+
+
+def _classify_initialization_exception(exc):
+    text = str(exc or '').lower()
+    if 'model path' in text and any(term in text for term in ('not found', 'unavailable', 'does not exist', 'no such file')):
+        return 'runtime_model_path_unavailable'
+    if any(term in text for term in ('failed to load model', 'llama_model_load', 'could not load model')):
+        return 'runtime_model_load_failed'
+    if 'vocab' in text and any(term in text for term in ('fail', 'load', 'invalid')):
+        return 'runtime_model_vocab_failed'
+    if 'llama_batch' in text or 'batch create' in text or 'failed to create batch' in text:
+        return 'runtime_batch_create_failed'
+    if any(term in text for term in ('abi', 'undefined symbol', 'incompatible gguf', 'unsupported gguf')):
+        return 'runtime_model_load_failed'
+    if re.search(r'(?:unexpected keyword argument|got an unexpected keyword argument|unsupported (?:parameter|kwarg|argument))', text):
+        return 'runtime_context_create_unsupported_kwarg'
+    if 'yarn' in text or ('rope' in text and any(term in text for term in ('scal', 'freq', 'orig', 'context'))):
+        return 'runtime_context_create_rope_yarn_config'
+    if 'kv' in text and any(term in text for term in ('alloc', 'cache', 'memory', 'oom', 'failed')):
+        return 'runtime_context_create_kv_cache_allocation'
+    if 'metal' in text and any(term in text for term in ('buffer', 'graph', 'max size', 'too large')):
+        return 'runtime_context_create_metal_buffer_limit'
+    if 'metal' in text and any(term in text for term in ('alloc', 'memory', 'oom', 'out of memory', 'failed to create llama_context')):
+        return 'runtime_context_create_metal_memory'
+    if any(term in text for term in ('cublas_status_alloc_failed', 'cudamalloc', 'cuda malloc', 'cuda oom', 'cuda out of memory', 'cuda allocation failed')):
+        return 'runtime_context_create_cuda_memory'
+    if 'cuda' in text and any(term in text for term in ('buffer', 'resource')):
+        return 'runtime_context_create_cuda_buffer_limit'
+    if 'failed to create llama_context' in text or 'llamacontext' in text:
+        return 'runtime_context_create_failed'
+    return 'runtime_init_unclassified'
 
 def _extract_unsupported_generation_kwarg(message, attempted=None):
     attempted_set = set(str(key) for key in attempted) if attempted is not None else None
@@ -3084,16 +3172,43 @@ try:
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
+    emit_import_handshake = isinstance(init_payload, dict) and init_payload.get('method') == '__import__'
     llama_cpp = importlib.import_module('llama_cpp')
+    if emit_import_handshake:
+        _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+        init_line = sys.stdin.readline()
+        if not init_line:
+            raise RuntimeError('llama_cpp subprocess missing init payload')
+        init_payload = json.loads(init_line)
     init_args = init_payload.get('args', [])
-    llama = llama_cpp.Llama(*init_args, **init_payload.get('kwargs', {}))
     init_kwargs = init_payload.get('kwargs', {})
+except Exception as exc:
+    _emit({
+        'status': 'error',
+        'exception_type': type(exc).__name__,
+        'safe_error_category': _classify_initialization_exception(exc),
+        'child_model_path_exists': False,
+    })
+    raise SystemExit(1)
+
+try:
     _token_place_model_path = init_args[0] if isinstance(init_args, list) and init_args else None
     if _token_place_model_path is None and isinstance(init_kwargs, dict):
         _token_place_model_path = init_kwargs.get('model_path')
-    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+    child_model_path_exists = (
+        os.path.exists(_token_place_model_path)
+        if isinstance(_token_place_model_path, str)
+        else False
+    )
+    llama = llama_cpp.Llama(*init_args, **init_kwargs)
+    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None), 'child_model_path_exists': child_model_path_exists})
 except Exception as exc:
-    _emit({'status': 'error', 'error': str(exc), 'exception_type': type(exc).__name__, 'safe_error_category': _classify_generation_exception(exc), 'traceback': traceback.format_exc()})
+    _emit({
+        'status': 'error',
+        'exception_type': type(exc).__name__,
+        'safe_error_category': _classify_initialization_exception(exc),
+        'child_model_path_exists': bool(locals().get('child_model_path_exists', False)),
+    })
     raise SystemExit(1)
 
 for line in sys.stdin:
@@ -4046,6 +4161,7 @@ class ModelManager:
 
         # LLM instance and lock for thread safety
         self.llm = None
+        self.child_model_path_exists = False
         self.llm_lock = Lock()
         self._llm_generation = 0
         self.worker_restart_count = 0
@@ -4558,6 +4674,18 @@ class ModelManager:
         os.makedirs(self.models_dir, exist_ok=True)
         return self.models_dir
 
+    def _profile_has_pinned_artifact(self) -> bool:
+        return (
+            self.model_profile.get('artifact_size_bytes') is not None
+            or self.model_profile.get('artifact_sha256') is not None
+        )
+
+    def _is_selected_model_path(self, file_path: str) -> bool:
+        try:
+            return os.path.abspath(str(file_path)) == os.path.abspath(str(self.model_path))
+        except (TypeError, ValueError):
+            return False
+
     def download_file_in_chunks(self, file_path: str, url: str, chunk_size_mb: int) -> bool:
         """
         Download a file in chunks with progress reporting.
@@ -4570,8 +4698,16 @@ class ModelManager:
         Returns:
             bool: True if download was successful, False otherwise
         """
+        pinned_artifact = (
+            self._profile_has_pinned_artifact()
+            and self._is_managed_canonical_model_path()
+            and self._is_selected_model_path(file_path)
+        )
+        expected_size = self.model_profile.get('artifact_size_bytes') if pinned_artifact else None
+        expected_sha256 = self.model_profile.get('artifact_sha256') if pinned_artifact else None
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
         response = None
+        tmp_path = f"{file_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
 
         try:
             response = requests.get(url, stream=True, timeout=self.download_timeout)
@@ -4582,31 +4718,31 @@ class ModelManager:
             self.log_error(f"Error: Unable to start download request: {e}")
             return False
 
-        if response.status_code != 200:
-            self.log_error(f"Error: Unable to download file, status code {response.status_code}")
-            return False
-
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        if total_size_in_bytes == 0:
-            self.log_error("Error: Content-Length header is missing or zero.")
-            return False
-
-        total_size_in_mb = total_size_in_bytes / (1024 * 1024)
-        progress = 0
-        start_time = time.time()
-        times = []
-        bytes_downloaded = []
-
         try:
-            with open(file_path, 'wb') as file:
+            if response.status_code != 200:
+                self.log_error(f"Error: Unable to download file, status code {response.status_code}")
+                return False
+
+            total_size_in_bytes = int(response.headers.get('content-length', 0))
+            if total_size_in_bytes == 0:
+                self.log_error("Error: Content-Length header is missing or zero.")
+                return False
+
+            total_size_in_mb = total_size_in_bytes / (1024 * 1024)
+            progress = 0
+            digest = hashlib.sha256()
+            start_time = time.time()
+            times = []
+            bytes_downloaded = []
+
+            with open(tmp_path, 'wb') as file:
                 for data in response.iter_content(chunk_size=chunk_size_bytes):
                     if not data:
                         self.log_warning("Warning: Received empty data chunk.")
                         continue
 
                     file.write(data)
-                    file.flush()
-                    os.fsync(file.fileno())
+                    digest.update(data)
 
                     elapsed_time = time.time() - start_time
                     progress += len(data)
@@ -4630,8 +4766,11 @@ class ModelManager:
                             end='\r',
                             file=sys.stderr,
                         )  # pragma: no cover
+                file.flush()
+                os.fsync(file.fileno())
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
+            self._remove_partial_download(tmp_path)
             return False
         finally:
             if response is not None:
@@ -4639,12 +4778,135 @@ class ModelManager:
                 if callable(close):
                     close()
 
-        if os.path.exists(file_path) and os.path.getsize(file_path) == total_size_in_bytes:
-            self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
-            return True
+        actual_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+        if expected_size is not None and actual_size != int(expected_size):
+            self.log_error("Download failed artifact size validation.")
+            self._remove_partial_download(tmp_path)
+            return False
+        if actual_size != total_size_in_bytes:
+            self.log_error("Download failed or Content-Length does not match.")
+            self._remove_partial_download(tmp_path)
+            return False
+        if expected_size is not None or expected_sha256:
+            try:
+                with open(tmp_path, 'rb') as check_file:
+                    if check_file.read(4) != GGUF_MAGIC:
+                        self.log_error("Download failed GGUF magic validation.")
+                        self._remove_partial_download(tmp_path)
+                        return False
+            except OSError:
+                self._remove_partial_download(tmp_path)
+                return False
+        if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():
+            self.log_error("Download failed SHA-256 validation.")
+            self._remove_partial_download(tmp_path)
+            return False
+
+        if os.path.exists(tmp_path) and actual_size == total_size_in_bytes:
+            try:
+                os.replace(tmp_path, file_path)
+                if expected_sha256:
+                    self._write_artifact_verification_receipt(str(expected_sha256))
+                self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")
+                return True
+            except OSError as e:
+                self.log_error(
+                    f"Download failed while replacing final artifact: exception_type={type(e).__name__}"
+                )
+                self._remove_partial_download(tmp_path)
+                return False
         else:
             self.log_error("Download failed or file size does not match.")
+            self._remove_partial_download(tmp_path)
             return False
+
+    def _remove_partial_download(self, tmp_path: str) -> None:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    def _is_managed_canonical_model_path(self) -> bool:
+        return (
+            self.profile_id == 'qwen3-8b-q4-k-m'
+            and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
+        )
+
+    def _artifact_verification_receipt_path(self) -> str:
+        return f"{self.model_path}.sha256.verified.json"
+
+    def _artifact_stat_fingerprint(self) -> Dict[str, Any]:
+        stat = os.stat(self.model_path)
+        return {
+            'size_bytes': stat.st_size,
+            'mtime_ns': getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000)),
+        }
+
+    def _read_artifact_verification_receipt(self, expected_sha256: str) -> bool:
+        try:
+            with open(self._artifact_verification_receipt_path(), 'r', encoding='utf-8') as receipt_file:
+                receipt = json.load(receipt_file)
+            fingerprint = self._artifact_stat_fingerprint()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return (
+            receipt.get('profile_id') == self.profile_id
+            and receipt.get('artifact_sha256') == str(expected_sha256).lower()
+            and receipt.get('size_bytes') == fingerprint['size_bytes']
+            and receipt.get('mtime_ns') == fingerprint['mtime_ns']
+        )
+
+    def _write_artifact_verification_receipt(self, expected_sha256: str) -> None:
+        try:
+            fingerprint = self._artifact_stat_fingerprint()
+            receipt = {
+                'profile_id': self.profile_id,
+                'artifact_sha256': str(expected_sha256).lower(),
+                **fingerprint,
+            }
+            receipt_path = self._artifact_verification_receipt_path()
+            tmp_receipt = f"{receipt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            with open(tmp_receipt, 'w', encoding='utf-8') as receipt_file:
+                json.dump(receipt, receipt_file, sort_keys=True)
+                receipt_file.flush()
+                os.fsync(receipt_file.fileno())
+            os.replace(tmp_receipt, receipt_path)
+        except OSError:
+            try:
+                if 'tmp_receipt' in locals():
+                    os.unlink(tmp_receipt)
+            except OSError:
+                pass
+
+    def _validate_existing_model_artifact(self, *, hash_if_suspect: bool = False) -> tuple[bool, str]:
+        if not os.path.exists(self.model_path):
+            return False, 'missing'
+        expected_size = self.model_profile.get('artifact_size_bytes')
+        expected_sha256 = self.model_profile.get('artifact_sha256')
+        pinned_artifact = self._profile_has_pinned_artifact() and self._is_managed_canonical_model_path()
+        try:
+            actual_size = os.path.getsize(self.model_path)
+            if pinned_artifact and expected_size is not None and actual_size != int(expected_size):
+                return False, 'size_mismatch'
+            with open(self.model_path, 'rb') as file:
+                if file.read(4) != GGUF_MAGIC:
+                    return False, 'bad_magic'
+                needs_checksum = (
+                    pinned_artifact
+                    and expected_sha256
+                    and (hash_if_suspect or not self._read_artifact_verification_receipt(str(expected_sha256)))
+                )
+                if needs_checksum:
+                    file.seek(0)
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: file.read(1024 * 1024), b''):
+                        digest.update(chunk)
+                    if digest.hexdigest().lower() != str(expected_sha256).lower():
+                        return False, 'checksum_mismatch'
+                    self._write_artifact_verification_receipt(str(expected_sha256))
+        except OSError:
+            return False, 'unavailable'
+        return True, 'valid'
 
     def download_model_if_needed(self) -> bool:
         """
@@ -4656,7 +4918,21 @@ class ModelManager:
         """
         self.create_models_directory()
 
-        if not os.path.exists(self.model_path):
+        # Downloads are always streamed through SHA-256 validation when pinned.
+        # Warm starts validate pinned size + GGUF magic plus a stat-bound
+        # checksum receipt; a missing/stale receipt or exact suspect evidence
+        # triggers a full hash without repeating that 5 GB hash every launch.
+        suspect_existing_artifact = (
+            self._is_managed_canonical_model_path()
+            and str(getattr(self, 'last_runtime_init_error', '') or '').startswith((
+                'model_artifact_invalid:',
+                'runtime_model_load_failed',
+                'runtime_model_vocab_failed',
+            ))
+        )
+        valid, reason = self._validate_existing_model_artifact(hash_if_suspect=suspect_existing_artifact)
+        self.last_model_artifact_validation = {'valid': valid, 'reason': reason}
+        if not valid and reason == 'missing':
             self.log_info(f"Downloading {self.file_name}...")
             if self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb):
                 self.log_info("Download completed!")
@@ -4664,9 +4940,15 @@ class ModelManager:
             else:
                 self.log_error("Download failed or file is empty.")
                 return False
-        else:
+        if valid:
             self.log_info(f"Model file {self.file_name} already exists.")
             return True
+        if self._is_managed_canonical_model_path():
+            self.log_warning(f"Managed model artifact invalid ({reason}); attempting one bounded repair download.")
+            if self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb):
+                return True
+        self.last_runtime_init_error = f"model_artifact_invalid:{reason}"
+        return False
 
     def _publish_qwen_64k_init_failure_readiness_diagnostics(
         self,
@@ -4821,7 +5103,7 @@ class ModelManager:
                 # Double-check after acquiring lock
                 if self.llm is None:
                     if not os.path.exists(self.model_path):
-                        self.log_error(f"Error: Model file {self.model_path} does not exist. LLM not initialized.")
+                        self.log_error("Error: Model file does not exist. LLM not initialized.")
                         return None
                     else:
                         try:
@@ -4835,7 +5117,7 @@ class ModelManager:
                             self._imported_llama_cpp_module_path = getattr(llama_cpp, '__file__', None)
                             self.log_info(
                                 "llama_cpp runtime located "
-                                f"module_path={self._imported_llama_cpp_module_path or 'unknown'}"
+                                f"module_path_present={bool(self._imported_llama_cpp_module_path)}"
                             )
                             Llama = llama_cpp.Llama
 
@@ -4869,8 +5151,8 @@ class ModelManager:
                                             'insufficient GPU memory headroom for safe offload'
                                         )
 
-                            self.log_info(f"About to instantiate Llama model from {self.model_path}...")
-                            self.log_info(f"Llama init started for {self.model_path}.")
+                            self.log_info("About to instantiate Llama model.")
+                            self.log_info("Llama init started.")
                             runtime_profiles = [None]
                             is_qwen_64k = (
                                 self.model_profile.get('provider') == 'qwen'
@@ -4894,7 +5176,7 @@ class ModelManager:
                                 else:
                                     runtime_profiles = [None]
                             profile_failures = []
-                            first_generic_profile_retry_exc = None
+                            first_context_create_init_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
                             for runtime_profile in runtime_profiles:
@@ -4921,7 +5203,7 @@ class ModelManager:
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
                                     break
                                 except Exception as init_exc:
-                                    category = _classify_runtime_context_create_error(init_exc)
+                                    category = _classify_runtime_initialization_error(init_exc)
                                     safe_failure = {
                                         'profile_id': profile_id,
                                         'model_profile_id': self.profile_id,
@@ -4959,15 +5241,9 @@ class ModelManager:
                                             profile_failures=profile_failures,
                                             current_profile_id=profile_id,
                                         )
-                                    generic_profile_retry = (
-                                        is_qwen_64k
-                                        and category == 'runtime_context_create_failed'
-                                        and compute_plan.get('backend_used') in {'cuda', 'metal'}
-                                        and len(profile_failures) < 3
-                                    )
-                                    if generic_profile_retry and first_generic_profile_retry_exc is None:
-                                        first_generic_profile_retry_exc = init_exc
-                                    if not is_qwen_64k or (category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES and not generic_profile_retry):
+                                    if is_qwen_64k and category == 'runtime_context_create_failed' and first_context_create_init_exc is None:
+                                        first_context_create_init_exc = init_exc
+                                    if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
                                         raise
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):
@@ -4980,12 +5256,8 @@ class ModelManager:
                                         compute_plan=compute_plan,
                                         profile_failures=profile_failures,
                                     )
-                                if (
-                                    first_generic_profile_retry_exc is not None
-                                    and profile_failures
-                                    and profile_failures[-1].get('safe_error_category') == 'runtime_context_create_failed'
-                                ):
-                                    raise first_generic_profile_retry_exc
+                                if first_context_create_init_exc is not None:
+                                    raise first_context_create_init_exc
                                 raise RuntimeError(
                                     'Qwen 64K memory/KV/cache profile exhaustion before registration; '
                                     f'failures={profile_failures}'
@@ -5004,6 +5276,7 @@ class ModelManager:
                                             'refusing to run with a Llama fallback template'
                                         )
                             self.llm = llm_instance
+                            self.child_model_path_exists = bool(getattr(llm_instance, 'child_model_path_exists', False))
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['context_tier'] = getattr(self, 'context_tier', '8k-fast')
                             compute_plan['context_window_tokens'] = self.config.get('model.context_size', 8192)
@@ -5092,7 +5365,7 @@ class ModelManager:
                                 f"offloaded_layers={compute_plan['offloaded_layers']} "
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
-                                f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
+                                f"llama_module_path_present={bool(runtime_identity.get('llama_module_path'))} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.worker_state = 'ready'

@@ -2,6 +2,7 @@
 Unit tests for the model manager module.
 """
 import logging
+import hashlib
 import importlib.util
 import os
 import queue
@@ -249,7 +250,7 @@ class TestModelManager:
         assert metadata['api_model_id'] == 'qwen3-8b-instruct'
         assert metadata['profile_id'] == 'qwen3-8b-q4-k-m'
         assert metadata['filename'] == 'Qwen3-8B-Q4_K_M.gguf'
-        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert metadata['url'] == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert metadata['canonical_family_url'] == 'https://huggingface.co/Qwen/Qwen3-8B'
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
@@ -287,7 +288,7 @@ class TestModelManager:
         assert manager.profile_id == 'qwen3-8b-q4-k-m'
         assert manager.api_model_id == 'qwen3-8b-instruct'
         assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
-        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
         metadata = manager.get_model_artifact_metadata()
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
@@ -304,7 +305,7 @@ class TestModelManager:
         assert manager.profile_id == 'qwen3-8b-q4-k-m'
         assert manager.api_model_id == 'qwen3-8b-instruct'
         assert manager.file_name == 'Qwen3-8B-Q4_K_M.gguf'
-        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf'
+        assert manager.url == 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf'
         assert manager.canonical_family_url == 'https://huggingface.co/Qwen/Qwen3-8B'
         assert metadata['source_model'] == 'Qwen/Qwen3-8B'
         assert metadata['quantization'] == 'Q4_K_M'
@@ -338,6 +339,313 @@ class TestModelManager:
         assert manager.file_name == 'custom.gguf'
         assert manager.url == 'https://example.com/custom.gguf'
         assert manager.canonical_family_url == 'https://example.com/family'
+
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_custom_filename_download_still_verifies_checksum(self, mock_get):
+        """A model.filename override must not disable profile pin verification."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'custom-qwen.gguf',
+            'model.url': 'https://mirror.example/custom-qwen.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = '0' * 64
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '8'
+        mock_response.iter_content.return_value = [b'GGUF', b'bad!']
+        mock_get.return_value = mock_response
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not os.path.exists(manager.model_path)
+        assert not list(Path(manager.models_dir).glob('custom-qwen.gguf.tmp.*'))
+        mock_response.close.assert_called_once()
+
+    def test_pinned_qwen_custom_filename_existing_artifact_still_verifies_checksum(self):
+        """Existing custom-named Qwen artifacts remain bound to profile metadata."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'custom-qwen.gguf',
+            'model.url': 'https://mirror.example/custom-qwen.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(b'GGUFbad!')
+
+        valid, reason = manager._validate_existing_model_artifact(hash_if_suspect=True)
+
+        assert valid is False
+        assert reason == 'checksum_mismatch'
+        assert Path(manager.model_path).read_bytes() == b'GGUFbad!'
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_download_size_mismatch_cleans_temp_and_preserves_final(self, mock_get):
+        """Pinned managed downloads reject wrong sizes without replacing an existing final file."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 12
+        manager.model_profile['artifact_sha256'] = None
+        Path(manager.model_path).write_bytes(b'original-final')
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '8'
+        mock_response.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = mock_response
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert Path(manager.model_path).read_bytes() == b'original-final'
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+        mock_response.close.assert_called_once()
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_pinned_qwen_download_bad_magic_and_replace_failure_clean_temp(self, mock_get, monkeypatch):
+        """Pinned managed downloads clean their unique temp file on magic and replace failures."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = None
+
+        bad_magic = MagicMock()
+        bad_magic.status_code = 200
+        bad_magic.headers.get.return_value = '8'
+        bad_magic.iter_content.return_value = [b'NOPE', b'tiny']
+        mock_get.return_value = bad_magic
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+        good_magic = MagicMock()
+        good_magic.status_code = 200
+        good_magic.headers.get.return_value = '8'
+        good_magic.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = good_magic
+        monkeypatch.setattr('utils.llm.model_manager.os.replace', MagicMock(side_effect=OSError('replace failed')))
+
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+    def test_existing_artifact_validation_unavailable_and_unmanaged_invalid_refusal(self, monkeypatch):
+        """Unavailable artifacts fail safely, and unmanaged invalid files are not repaired."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        explicit_path = os.path.join(temp_dir, 'operator-selected.gguf')
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_path = explicit_path
+        Path(manager.model_path).write_bytes(b'BAD!')
+
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+        assert manager.download_model_if_needed() is False
+        assert manager.download_file_in_chunks.call_count == 0
+        assert manager.last_runtime_init_error == 'model_artifact_invalid:bad_magic'
+        assert Path(manager.model_path).read_bytes() == b'BAD!'
+
+        monkeypatch.setattr('utils.llm.model_manager.os.path.exists', lambda _path: True)
+        monkeypatch.setattr('utils.llm.model_manager.os.path.getsize', MagicMock(side_effect=OSError('stat failed')))
+        valid, reason = manager._validate_existing_model_artifact(hash_if_suspect=True)
+        assert (valid, reason) == (False, 'unavailable')
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_validation_covers_temp_read_and_final_disappearance(self, mock_get, monkeypatch):
+        """Transactional download validation cleans temp files on late validation failures."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.url': 'https://mirror.example/Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        manager.model_profile['artifact_size_bytes'] = 8
+        manager.model_profile['artifact_sha256'] = None
+
+        response = MagicMock()
+        response.status_code = 200
+        response.headers.get.return_value = '8'
+        response.iter_content.return_value = [b'GGUF', b'tiny']
+        mock_get.return_value = response
+
+        real_open = open
+
+        def fail_magic_read(path, mode='r', *args, **kwargs):
+            if path != manager.model_path and 'rb' in mode:
+                raise OSError('magic read failed')
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr('builtins.open', fail_magic_read)
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not list(Path(manager.models_dir).glob('Qwen3-8B-Q4_K_M.gguf.tmp.*'))
+
+        monkeypatch.setattr('builtins.open', real_open)
+        exists_calls = {'tmp': 0}
+        real_exists = os.path.exists
+
+        def disappear_before_replace(path):
+            if str(path).startswith(f"{manager.model_path}.tmp."):
+                exists_calls['tmp'] += 1
+                return exists_calls['tmp'] < 2
+            return real_exists(path)
+
+        response.iter_content.return_value = [b'GGUF', b'tiny']
+        monkeypatch.setattr('utils.llm.model_manager.os.path.exists', disappear_before_replace)
+        assert manager.download_file_in_chunks(manager.model_path, manager.url, 1) is False
+        assert not Path(manager.model_path).exists()
+
+    def test_selected_model_path_and_valid_existing_fast_path_edge_cases(self, model_manager):
+        """Cover safe comparison failures and the valid existing-artifact fast path."""
+
+        class UnstringablePath:
+            def __str__(self):
+                raise TypeError('path unavailable')
+
+        assert model_manager._is_selected_model_path(UnstringablePath()) is False
+        model_manager.model_profile['artifact_size_bytes'] = 8
+        model_manager.model_profile['artifact_sha256'] = None
+        Path(model_manager.model_path).write_bytes(b'GGUFtiny')
+
+        assert model_manager.download_model_if_needed() is True
+        assert model_manager.last_model_artifact_validation == {'valid': True, 'reason': 'valid'}
+
+    def test_existing_managed_artifact_fast_path_does_not_hash_every_warm_start(self):
+        """Warm starts validate pinned size and GGUF magic without hashing the full GGUF."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = hashlib.sha256(data).hexdigest()
+        Path(manager.model_path).write_bytes(data)
+        manager._write_artifact_verification_receipt(manager.model_profile['artifact_sha256'])
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': True, 'reason': 'valid'}
+        manager.download_file_in_chunks.assert_not_called()
+
+    def test_suspect_managed_artifact_hashes_and_repairs_checksum_mismatch(self):
+        """Exact model-load evidence makes the managed artifact suspect and enables one hash repair."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(data)
+        manager.last_runtime_init_error = 'runtime_model_load_failed'
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': False, 'reason': 'checksum_mismatch'}
+        manager.download_file_in_chunks.assert_called_once_with(manager.model_path, manager.url, manager.chunk_size_mb)
+
+    def test_unverified_managed_artifact_hashes_before_accepting_fresh_warm_start(self):
+        """Fresh processes verify a pinned artifact once before trusting receipt-backed warm starts."""
+        mock_config = MagicMock(is_production=False)
+        temp_dir = tempfile.mkdtemp()
+        mock_config.get.side_effect = lambda key, default=None: {
+            'model.profile_id': 'qwen3-8b-q4-k-m',
+            'model.filename': 'Qwen3-8B-Q4_K_M.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': temp_dir,
+            'model.use_mock': False,
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }.get(key, default)
+        manager = ModelManager(mock_config)
+        data = b'GGUFtiny'
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = '0' * 64
+        Path(manager.model_path).write_bytes(data)
+        manager.download_file_in_chunks = MagicMock(return_value=True)
+
+        assert manager.download_model_if_needed() is True
+
+        assert manager.last_model_artifact_validation == {'valid': False, 'reason': 'checksum_mismatch'}
+        manager.download_file_in_chunks.assert_called_once_with(manager.model_path, manager.url, manager.chunk_size_mb)
 
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
@@ -413,7 +721,7 @@ class TestModelManager:
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')
     def test_download_model_if_needed_existing(self, mock_download, mock_exists, model_manager):
-        """Test download_model_if_needed when model already exists."""
+        """Pinned existing artifacts with invalid metadata receive a bounded repair."""
         # Setup mocks
         mock_exists.return_value = True  # Model already exists
 
@@ -423,8 +731,12 @@ class TestModelManager:
         # Check the result
         assert result is True
 
-        # Verify mock calls
-        mock_download.assert_not_called()
+        # Verify pinned metadata is not bypassed for an invalid existing artifact.
+        mock_download.assert_called_once_with(
+            model_manager.model_path,
+            'https://example.com/model.gguf',
+            1
+        )
 
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.create_models_directory')
@@ -630,14 +942,14 @@ class TestModelManager:
         assert llm == mock_llama
         messages = [record.getMessage() for record in caplog.records]
         assert 'Locating llama_cpp runtime for model initialization...' in messages
-        assert any(message.startswith('llama_cpp runtime located module_path=') for message in messages)
+        assert any(message.startswith('llama_cpp runtime located module_path_present=') for message in messages)
         assert 'Selecting compute plan for model initialization...' in messages
         assert any(
             message.startswith('Selected compute plan for model initialization ')
             for message in messages
         )
-        assert any(message.startswith('About to instantiate Llama model from ') for message in messages)
-        assert any(message.startswith('Llama init started for ') for message in messages)
+        assert 'About to instantiate Llama model.' in messages
+        assert 'Llama init started.' in messages
         assert 'Llama init completed successfully.' in messages
 
 
@@ -801,8 +1113,7 @@ class TestModelManager:
         file_path = os.path.join(self._temp_dir, 'bad_size.gguf')
         result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
         assert result is False
-        assert os.path.exists(file_path)
-        assert os.path.getsize(file_path) != 1048576
+        assert not os.path.exists(file_path)
 
     @patch('utils.llm.model_manager.requests.get')
     def test_download_file_in_chunks_empty_chunk(self, mock_get, model_manager):
@@ -1317,7 +1628,7 @@ class TestModelManager:
         assert 'offloaded_layers=0' in summary
         assert 'kv_cache=cpu' in summary
         assert 'interpreter=' in summary
-        assert 'llama_module_path=' in summary
+        assert 'llama_module_path_present=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
 
 
@@ -2673,7 +2984,7 @@ def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path,
 
     message = str(exc_info.value)
     assert 'llama_cpp_import subprocess exited before JSON handshake' in message
-    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=7' in message
     assert 'stdout llama_context clue before exit' in message
     assert 'stderr llama_context clue before exit' in message
@@ -2723,7 +3034,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
 
     message = str(exc_info.value)
     assert 'llama_cpp_import subprocess exited before JSON handshake' in message
-    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'llama_cpp_model_initialization subprocess ended' not in message
     assert 'exit_code=9' in message
     assert 'program=' in message
     assert 'command=' in message
@@ -2870,6 +3181,7 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
         def __init__(self):
             self._lines = iter([
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py","child_model_path_exists":true}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"Hi"}}]},"done":false}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"lo"}}]},"done":false}\n',
                 'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","done":true}\n',
@@ -2916,7 +3228,7 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
     chunks = list(proxy.create_chat_completion(messages=[], stream=True))
 
     assert [chunk['choices'][0]['delta']['content'] for chunk in chunks] == ['Hi', 'lo']
-    assert created[0].stdin.writes[1]['kwargs']['stream'] is True
+    assert created[0].stdin.writes[2]['kwargs']['stream'] is True
 
 
 def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(monkeypatch):
@@ -3349,6 +3661,8 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
             self._alive = True
 
         def start(self):
+            if self._target is not None:
+                self._target()
             return None
 
         def is_alive(self):
@@ -3362,6 +3676,7 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
         def __init__(self, *_args, **_kwargs):
             self.stdin = FakeStdin()
             self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n'
                 'TOKEN_PLACE_LLAMA_CPP_JSON:'
                 '{"status":"error","error":"Failed to create llama_context",'
                 '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_failed"}\n'
@@ -6988,6 +7303,47 @@ def test_subprocess_worker_enable_thinking_rejected_no_metadata_fails_closed_wit
     assert 'plaintext must not appear' not in str(diag)
 
 
+def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_spaces(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'fake site-packages child exists'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "import os\n"
+        "class Llama:\n"
+        "    def __init__(self, model_path=None, **_kwargs):\n"
+        "        assert os.path.isabs(model_path)\n"
+        "        assert os.path.exists(model_path)\n"
+        "        assert os.getcwd() != os.path.dirname(model_path)\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}]}\n",
+        encoding='utf-8',
+    )
+    parent_cwd = tmp_path / 'parent cwd with spaces'
+    model_dir = parent_cwd / 'models with spaces'
+    model_dir.mkdir(parents=True)
+    (model_dir / 'mock.gguf').write_bytes(b'GGUFtiny')
+    other_worker_cwd = tmp_path / 'worker cwd with spaces'
+    other_worker_cwd.mkdir()
+
+    monkeypatch.chdir(parent_cwd)
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(fake_site))
+    monkeypatch.setenv('PYTHONPATH', str(fake_site))
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_PYTHON_ROOT', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_PROBE_REPO_ROOT', raising=False)
+    monkeypatch.setattr(model_manager_module, '_llama_cpp_probe_sys_path_entries', lambda: [str(fake_site)])
+    monkeypatch.setattr(model_manager_module, '_llama_cpp_probe_subprocess_cwd', lambda: str(other_worker_cwd))
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=os.path.join('models with spaces', 'mock.gguf'), timeout_seconds=5)
+    try:
+        assert proxy.child_model_path_exists is True
+    finally:
+        proxy.close()
+
+
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -7047,7 +7403,8 @@ def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     assert os.path.exists(tmpfile)
     assert popen_calls[0].command == [sys.executable, '-u', tmpfile]
     assert popen_calls[0]._token_place_command == [sys.executable, '<runtime-worker-script>']
-    assert '"method": "__init__"' in popen_calls[0].stdin.writes[0]
+    assert '"method": "__import__"' in popen_calls[0].stdin.writes[0]
+    assert '"method": "__init__"' in popen_calls[0].stdin.writes[1]
 
     proxy.close()
 
@@ -7843,6 +8200,126 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
         assert secret not in serialized
 
 
+@pytest.mark.parametrize(
+    ('message', 'expected_category'),
+    [
+        ('model path not found: /tmp/SECRET_MODEL.gguf', 'runtime_model_path_unavailable'),
+        ('failed to load model from /tmp/SECRET_MODEL.gguf', 'runtime_model_load_failed'),
+        ('vocab load failed for SECRET_PAYLOAD', 'runtime_model_vocab_failed'),
+        ('failed to create batch for SECRET_KEY', 'runtime_batch_create_failed'),
+        ('undefined symbol: llama_model_load_from_file ABI SECRET_PAYLOAD', 'runtime_model_load_failed'),
+        ('unknown ValueError SECRET_PROMPT SECRET_KEY SECRET_PAYLOAD /tmp/SECRET_MODEL.gguf', 'runtime_init_unclassified'),
+    ],
+)
+def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
+    tmp_path, monkeypatch, message, expected_category, caplog
+):
+    from utils.context_profiles import apply_context_profile
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'fake site with spaces'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "MESSAGE = " + repr(message) + "\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        raise ValueError(MESSAGE)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'testing')
+
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.filename': 'mock.gguf',
+        'model.url': 'https://example.com/mock.gguf',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'model.download_chunk_size_mb': 1,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_bytes(b'GGUFfake')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: model_manager_module._import_llama_cpp_subprocess_module(
+            module_path_hint=str(fake_pkg / '__init__.py'),
+            timeout_seconds=5,
+            desktop_runtime_probe={
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'llama_cpp_python_version': '0.3.32',
+                'constructor_kwarg_support': {
+                    'rope_scaling_type': True,
+                    'rope_freq_scale': True,
+                    'yarn_orig_ctx': True,
+                    'type_k': True,
+                    'type_v': True,
+                    'flash_attn': True,
+                    'offload_kqv': True,
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        '_runtime_capabilities',
+        lambda _runtime=None: {
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_cpp_python_version': '0.3.32',
+            'yarn_resolver_source': 'numeric_fallback',
+            'constructor_kwarg_support': {
+                'rope_scaling_type': True,
+                'rope_freq_scale': True,
+                'yarn_orig_ctx': True,
+                'type_k': True,
+                'type_v': True,
+                'flash_attn': True,
+                'offload_kqv': True,
+            },
+        },
+    )
+
+    with caplog.at_level('INFO'):
+        assert manager.get_llm_instance() is None
+
+    assert manager.llm is None
+    assert manager.last_qwen_64k_init_failures
+    assert [failure['profile_id'] for failure in manager.last_qwen_64k_init_failures] == [
+        'qwen64k_f16_fa_small_batch'
+    ]
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == expected_category
+    assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
+        'qwen64k_f16_fa_small_batch'
+    )
+    serialized = (
+        str(manager.last_runtime_init_error)
+        + json.dumps(manager.last_qwen_64k_init_failures, sort_keys=True)
+        + json.dumps(manager.last_compute_diagnostics, sort_keys=True)
+        + '\n'.join(record.getMessage() for record in caplog.records)
+    )
+    for forbidden in (
+        str(Path(manager.model_path)),
+        'SECRET_PROMPT',
+        'SECRET_KEY',
+        'SECRET_PAYLOAD',
+        'SECRET_MODEL',
+        message,
+    ):
+        assert forbidden not in serialized
+
+
 def test_qwen_64k_kv_constants_resolve_top_level_nested_and_numeric_fallback():
     from utils.llm import model_manager as model_manager_module
 
@@ -8015,7 +8492,7 @@ def test_generic_context_create_failure_is_not_retryable_without_memory_kv_or_bu
     )
 
     assert category == 'runtime_context_create_failed'
-    assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+    assert category in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
 
 
 def test_ggml_cuda_failed_to_load_model_is_not_memory_retryable_and_attempts_once(tmp_path):
@@ -8064,7 +8541,7 @@ def test_ggml_cuda_failed_to_load_model_is_not_memory_retryable_and_attempts_onc
 
     assert len(attempts) == 1
     assert manager.llm is None
-    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_init_unclassified'
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_model_load_failed'
 
 
 def test_child_diagnostic_sanitizer_redacts_secret_values_on_allowlisted_lines():

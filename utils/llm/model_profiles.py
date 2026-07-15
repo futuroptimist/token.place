@@ -37,6 +37,9 @@ class _ModelProfileRequired(TypedDict):
 class ModelProfile(_ModelProfileRequired, total=False):
     license: str
     gguf_repo: str
+    artifact_revision: str
+    artifact_size_bytes: int
+    artifact_sha256: str
     rope_scaling_policy: Optional[Dict[str, Any]]
 
 
@@ -97,7 +100,10 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         "license": "apache-2.0",
         "gguf_repo": "Qwen/Qwen3-8B-GGUF",
         "filename": "Qwen3-8B-Q4_K_M.gguf",
-        "download_url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+        "download_url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf",
+        "artifact_revision": "6a569868d07d3bd59e8b97fb001bf8c0b254bb20",
+        "artifact_size_bytes": 5027783488,
+        "artifact_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
         "canonical_family_url": "https://huggingface.co/Qwen/Qwen3-8B",
         "native_context_tokens": 32768,
         "maximum_validated_context_tokens": 65536,

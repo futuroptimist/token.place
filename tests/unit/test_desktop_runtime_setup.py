@@ -1414,37 +1414,21 @@ def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(mon
     assert 'repo-local shim' in result['fallback_reason']
 
 
-def test_run_pip_install_success_failure_and_timeout(monkeypatch):
-    class _OkResult:
-        returncode = 0
-        stdout = 'ok output'
-        stderr = ''
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+def test_run_pip_install_success_failure_and_timeout():
+    ok, output = desktop_runtime_setup._run_pip_install([desktop_runtime_setup.sys.executable, '-c', 'print("ok output")'], {})
     assert ok is True
     assert 'returncode=0' in output
     assert 'stdout_tail=ok output' in output
 
-    class _FailResult:
-        returncode = 1
-        stdout = 'fallback stdout'
-        stderr = 'real stderr'
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    ok, output = desktop_runtime_setup._run_pip_install([desktop_runtime_setup.sys.executable, '-c', 'import sys; print("fallback stdout"); print("real stderr", file=sys.stderr); sys.exit(1)'], {})
     assert ok is False
     assert 'returncode=1' in output
     assert 'stdout_tail=fallback stdout' in output
     assert 'stderr_tail=real stderr' in output
 
-    def _timeout(*_args, **_kwargs):
-        raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
+    ok, output = desktop_runtime_setup._run_pip_install([desktop_runtime_setup.sys.executable, '-c', 'import time; time.sleep(2)'], {}, timeout_seconds=1)
     assert ok is False
-    assert 'pip install timed out after 12s' in output
+    assert 'outcome=timed_out' in output
     assert 'stdout_tail=empty' in output
     assert 'stderr_tail=empty' in output
 
@@ -1602,8 +1586,31 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv,cryptography,packaging'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography,jinja2'
 
+
+
+def test_ensure_desktop_python_dependencies_uses_existing_target_before_pip(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil==1\nrequests==1\npython-dotenv==1\ncryptography==1\nJinja2==1\n', encoding='utf-8')
+    target = tmp_path / '.token_place_desktop_site'
+    target.mkdir()
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    calls = []
+    def fake_find_spec(_name):
+        assert str(target) in desktop_runtime_setup.sys.path
+        return object()
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', fake_find_spec)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *a, **k: calls.append(a) or (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'true'
+    assert result['action'] == 'already_satisfied'
+    assert calls == []
+    assert desktop_runtime_setup.os.environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == str(target)
 
 def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
     runtime_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
@@ -1645,7 +1652,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, None, None, object(), object(), object(), object(), None])
+    sequence = iter([None, None, None, None, None, None, None, None, None, None, object(), object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -1653,7 +1660,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'packaging'
+    assert result['missing'] == 'jinja2'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
@@ -2125,23 +2132,12 @@ def test_probe_result_payload_preserves_native_capability_types():
     assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
 
 
-def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkeypatch):
-    real_import = __import__
-
-    def import_without_packaging(name, globals=None, locals=None, fromlist=(), level=0):
-        if name.startswith('packaging.'):
-            raise ModuleNotFoundError(name)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr('builtins.__import__', import_without_packaging)
-
-    assert (
-        desktop_runtime_setup._llama_cpp_version_matches(
-            '0.3.32',
-            'llama-cpp-python==0.3.32',
-        )
-        == 'unknown'
-    )
+def test_llama_cpp_version_match_accepts_exact_and_local_only():
+    spec = 'llama-cpp-python==0.3.32'
+    assert desktop_runtime_setup._llama_cpp_version_matches('0.3.32', spec) == 'match'
+    assert desktop_runtime_setup._llama_cpp_version_matches('0.3.32+local', spec) == 'match'
+    for version in ['0.3.16', 'unknown', 'bad', '0.3.32rc1', '0.3.32.post1', '0.3.32.dev1']:
+        assert desktop_runtime_setup._llama_cpp_version_matches(version, spec) != 'match'
 
 
 def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeypatch, tmp_path):

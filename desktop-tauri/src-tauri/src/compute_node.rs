@@ -13,7 +13,7 @@ use crate::python_runtime::{
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -1175,6 +1175,7 @@ pub async fn start_compute_node(
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
+    bridge_command.env("TOKEN_PLACE_DESKTOP_EVENT_SEQUENCE_BASE", "1");
     for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
         bridge_command.env(key, value);
     }
@@ -1285,11 +1286,34 @@ pub async fn start_compute_node(
                 last_worker_exit_code: None,
                 last_worker_restart_at_ms: None,
                 operator_session_id: Some(session_id.clone()),
-                sequence: Some(0),
+                sequence: Some(1),
                 updated_at_ms: Some(current_time_ms()),
                 log_file_path: log_file_path.clone(),
                 readiness_diagnostics: Map::new(),
             };
+            let provisioning_payload = json!({
+                "type": "status",
+                "operator_session_id": session_id,
+                "sequence": 1,
+                "updated_at_ms": current_time_ms(),
+                "running": true,
+                "registered": false,
+                "worker_alive": false,
+                "worker_state": "provisioning",
+                "relay_runtime_state": "provisioning",
+                "runtime_provisioning_state": "provisioning",
+                "startup_phase": "spawned",
+                "startup_elapsed_ms": 0,
+                "startup_deadline_ms": 300000,
+                "active_relay_url": primary_relay_url,
+                "configured_relay_urls": relay_base_urls,
+                "configured_relay_count": relay_base_urls.len(),
+                "requested_mode": format!("{:?}", request.mode).to_lowercase(),
+                "model_path": request.model_path,
+                "context_tier": normalize_context_tier(&request.context_tier),
+                "log_file_path": log_file_path,
+            });
+            app.emit("compute_node_event", provisioning_payload).ok();
             true
         }
     };

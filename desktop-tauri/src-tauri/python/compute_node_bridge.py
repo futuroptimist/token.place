@@ -780,7 +780,7 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
-    status_sequence = 0
+    status_sequence = int(os.environ.get("TOKEN_PLACE_DESKTOP_EVENT_SEQUENCE_BASE", "0") or "0")
     emit_lock = threading.Lock()
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:

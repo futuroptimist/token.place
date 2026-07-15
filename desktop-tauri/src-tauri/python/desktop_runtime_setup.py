@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import platform as platform_module
+import re
 import subprocess
 import sys
 import time
@@ -102,6 +103,11 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "unavailable",
         "metal_install_failed",
         "metal_cpu_fallback",
+        "version_mismatch_failed",
+        "install_failed",
+        "install_timeout",
+        "install_cancelled",
+        "runtime_verification_failed",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -571,7 +577,42 @@ def _tail_text(raw: str, *, limit: int = INSTALL_LOG_TAIL_MAX_CHARS) -> str:
 
 
 def _command_summary(cmd: list[str]) -> str:
-    return " ".join(str(part) for part in cmd)
+    # Keep diagnostics bounded and path/command safe for operator logs.
+    return "pip install <redacted>" if any(str(part) == "pip" for part in cmd) else "subprocess <redacted>"
+
+
+def _emit_provisioning_heartbeat(phase: str, started_at: float, deadline_seconds: int) -> None:
+    payload = {
+        "event": "desktop.runtime_setup.provisioning",
+        "startup_phase": phase,
+        "startup_elapsed_ms": int(max(0.0, time.monotonic() - started_at) * 1000),
+        "startup_deadline_ms": int(deadline_seconds * 1000),
+        "runtime_provisioning_state": "provisioning",
+    }
+    print("desktop.runtime_setup.provisioning " + " ".join(f"{k}={v}" for k, v in payload.items() if k != "event"), file=sys.stderr)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        pass
 
 
 def _run_pip_install(
@@ -579,36 +620,32 @@ def _run_pip_install(
     env: dict[str, str],
     *,
     timeout_seconds: int = PIP_INSTALL_TIMEOUT_SECONDS,
+    phase: str = "dependency_install",
 ) -> tuple[bool, str]:
-    try:
-        install = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = _tail_text(exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-        stderr = _tail_text(exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
-        return (
-            False,
-            f"pip install timed out after {timeout_seconds}s; command={_command_summary(cmd)}; "
-            f"stdout_tail={stdout or 'empty'}; stderr_tail={stderr or 'empty'}",
-        )
-
-    stdout_tail = _tail_text(install.stdout or "")
-    stderr_tail = _tail_text(install.stderr or "")
-    detail = (
-        f"command={_command_summary(cmd)}; returncode={install.returncode}; "
-        f"stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
+    started = time.monotonic()
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
     )
-    if install.returncode == 0:
-        return True, detail
-
-    return False, detail
-
+    next_heartbeat = started
+    while True:
+        now = time.monotonic()
+        if now >= next_heartbeat:
+            _emit_provisioning_heartbeat(phase, started, timeout_seconds)
+            next_heartbeat = now + 5
+        try:
+            out, err = process.communicate(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() - started >= timeout_seconds:
+                _terminate_process_tree(process)
+                try:
+                    out, err = process.communicate(timeout=1)
+                except Exception:
+                    out, err = "", ""
+                return False, f"outcome=timed_out; command={_command_summary(cmd)}; stdout_tail={_tail_text(out or '') or 'empty'}; stderr_tail={_tail_text(err or '') or 'empty'}"
+            continue
+    detail = f"outcome={'verified' if process.returncode == 0 else 'failed'}; command={_command_summary(cmd)}; returncode={process.returncode}; stdout_tail={_tail_text(out or '') or 'empty'}; stderr_tail={_tail_text(err or '') or 'empty'}"
+    return process.returncode == 0, detail
 
 def _source_build_repair(
     requirements_path: Path, backend: str, dependency_target: Optional[Path] = None
@@ -652,13 +689,17 @@ def _source_build_repair(
             [dependency_target_text, existing_pythonpath] if existing_pythonpath else [dependency_target_text]
         )
         cmd.extend(["--target", dependency_target_text])
+    cmd.extend(["--upgrade"])
     cmd.extend([
         "--no-binary",
         "llama-cpp-python",
         "--verbose",
         package_spec,
     ])
-    ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    try:
+        ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, phase=f"{backend}_source_build")
+    except TypeError:
+        ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
     if not metadata_warning:
         return ok, output
 
@@ -811,15 +852,14 @@ def _llama_cpp_version_matches(installed: str, package_spec: str) -> str:
     if not version_text or version_text == "unknown":
         return "unknown"
     try:
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import InvalidVersion, Version
-    except ModuleNotFoundError:
+        required = package_spec.split("==", 1)[1].strip()
+    except (IndexError, ValueError):
         return "unknown"
-    try:
-        spec_text = package_spec.split("llama-cpp-python", 1)[1]
-        return "match" if Version(version_text) in SpecifierSet(spec_text) else "mismatch"
-    except (InvalidVersion, ValueError):
-        return "mismatch"
+    # Exact public version plus local build suffixes only (PEP 440 local form).
+    escaped = re.escape(required)
+    if re.fullmatch(rf"{escaped}(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?", version_text):
+        return "match"
+    return "mismatch"
 
 
 def _version_payload(probe: RuntimeProbe, required_version: str, package_spec: str) -> Dict[str, str]:
@@ -1442,123 +1482,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None,
     )
 
 
-def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
-    candidates = [
-        repo_root / "python" / "requirements_desktop_runtime.txt",
-        repo_root / "resources" / "python" / "requirements_desktop_runtime.txt",
-        Path(__file__).resolve().parent / "requirements_desktop_runtime.txt",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
-
-
-def _desktop_dependency_target(runtime_root: Path) -> Path:
-    return runtime_root / ".token_place_desktop_site"
-
-
-def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
-    probe = candidate / ".token_place_write_probe"
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return True, None
-    except OSError as exc:
-        try:
-            probe.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False, str(exc)
-
-
-def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
-    preferred_targets = [
-        ("runtime_root", _desktop_dependency_target(runtime_root)),
-        ("home_fallback", Path.home() / ".token_place_desktop_site"),
-    ]
-    errors: list[str] = []
-    for label, candidate in preferred_targets:
-        ok, error = _is_writable_directory(candidate)
-        if ok:
-            return candidate, None
-        errors.append(f"{label}={candidate}: {error}")
-    return None, "; ".join(errors) if errors else "no writable install target"
-
-
-def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
-    """Ensure baseline desktop bridge Python dependencies are importable."""
-
-    root = _resolve_runtime_root(repo_root=repo_root)
-    requirements_path = _resolve_desktop_requirements_path(root)
-
-    required_modules = ("psutil", "requests", "dotenv", "cryptography", "packaging")
-    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
-    if not missing:
-        return {"ok": "true", "action": "already_satisfied", "missing": ""}
-
-    if not requirements_path.is_file():
-        return {
-            "ok": "false",
-            "action": "requirements_missing",
-            "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
-        }
-
-    env = os.environ.copy()
-    target_dir, target_error = _resolve_desktop_dependency_target(root)
-    if target_dir is None:
-        return {
-            "ok": "false",
-            "action": "install_target_unavailable",
-            "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
-            "detail": target_error or "unable to create desktop dependency install target",
-        }
-    target_dir_str = str(target_dir)
-    if target_dir_str not in sys.path:
-        sys.path.insert(0, target_dir_str)
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--target",
-        target_dir_str,
-        "-r",
-        str(requirements_path),
-    ]
-    ok, output = _run_pip_install(cmd, env)
-    if not ok:
-        return {
-            "ok": "false",
-            "action": "install_failed",
-            "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
-            "dependency_target": target_dir_str,
-            "detail": _summarize_install_error(output),
-        }
-
-    importlib.invalidate_caches()
-    missing_after = [name for name in required_modules if importlib.util.find_spec(name) is None]
-    return {
-        "ok": "true" if not missing_after else "false",
-        "action": "installed" if not missing_after else "post_install_missing",
-        "missing": ",".join(missing_after),
-        "interpreter": sys.executable,
-        "import_root": str(root),
-        "requirements": str(requirements_path),
-        "dependency_target": target_dir_str,
-    }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()
     if detected_platform.startswith("win"):
@@ -1634,3 +1557,138 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
             no_binary=False,
         )
     ]
+
+class _ManagedSiteLock:
+    def __init__(self, target: Path, *, timeout_seconds: float = 30.0) -> None:
+        self.path = target.with_suffix(target.suffix + ".lock")
+        self.timeout_seconds = timeout_seconds
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_ManagedSiteLock":
+        started = time.monotonic()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(self._fd, str(os.getpid()).encode("ascii", "ignore"))
+                return self
+            except FileExistsError:
+                if time.monotonic() - started > self.timeout_seconds:
+                    raise TimeoutError("managed dependency lock wait timed out")
+                _emit_provisioning_heartbeat("dependency_lock_wait", started, int(self.timeout_seconds))
+                time.sleep(0.1)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def _prepend_dependency_target(target_dir: Path) -> None:
+    target_dir_str = str(target_dir)
+    os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
+    if target_dir.exists() and target_dir_str not in sys.path:
+        # Insert after stdlib path_bootstrap entries but before third-party/repo shims.
+        sys.path.insert(0, target_dir_str)
+    importlib.invalidate_caches()
+
+
+def _missing_desktop_modules(required_modules: tuple[str, ...]) -> list[str]:
+    importlib.invalidate_caches()
+    return [name for name in required_modules if importlib.util.find_spec(name) is None]
+
+def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
+    candidates = [
+        repo_root / "python" / "requirements_desktop_runtime.txt",
+        repo_root / "resources" / "python" / "requirements_desktop_runtime.txt",
+        Path(__file__).resolve().parent / "requirements_desktop_runtime.txt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _desktop_dependency_target(runtime_root: Path) -> Path:
+    return runtime_root / ".token_place_desktop_site"
+
+
+def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
+    probe = candidate / ".token_place_write_probe"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, None
+    except OSError as exc:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, str(exc)
+
+
+def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    preferred_targets = [
+        ("runtime_root", _desktop_dependency_target(runtime_root)),
+        ("home_fallback", Path.home() / ".token_place_desktop_site"),
+    ]
+    errors: list[str] = []
+    for label, candidate in preferred_targets:
+        ok, error = _is_writable_directory(candidate)
+        if ok:
+            return candidate, None
+        errors.append(f"{label}={candidate}: {error}")
+    return None, "; ".join(errors) if errors else "no writable install target"
+
+
+def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, read_only: bool = False) -> Dict[str, str]:
+    """Ensure baseline desktop bridge Python dependencies are importable."""
+
+    root = _resolve_runtime_root(repo_root=repo_root)
+    requirements_path = _resolve_desktop_requirements_path(root)
+    required_modules = ("psutil", "requests", "dotenv", "cryptography", "jinja2")
+    target_dir, target_error = _resolve_desktop_dependency_target(root)
+    if target_dir is not None:
+        _prepend_dependency_target(target_dir)
+    missing = _missing_desktop_modules(required_modules)
+    if not missing:
+        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": str(target_dir) if target_dir else ""}
+    if read_only:
+        return {"ok": "false", "action": "read_only_missing", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "dependency_target": str(target_dir) if target_dir else ""}
+    if not requirements_path.is_file():
+        return {"ok": "false", "action": "requirements_missing", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path)}
+    if target_dir is None:
+        return {"ok": "false", "action": "install_target_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "detail": target_error or "unable to create desktop dependency install target"}
+    target_dir_str = str(target_dir)
+    try:
+        with _ManagedSiteLock(target_dir, timeout_seconds=30):
+            _prepend_dependency_target(target_dir)
+            missing = _missing_desktop_modules(required_modules)
+            if not missing:
+                return {"ok": "true", "action": "already_satisfied_post_lock", "missing": "", "dependency_target": target_dir_str}
+            allowed = set(required_modules)
+            install_specs = [line.strip() for line in requirements_path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.strip().startswith("#") and line.split("==",1)[0].replace("-","_").lower() in allowed and any(line.split("==",1)[0].replace("-","_").lower() == m for m in missing)]
+            if not install_specs:
+                install_specs = [str(requirements_path)]
+                req_args = ["-r", str(requirements_path)]
+            else:
+                req_args = install_specs
+            env = os.environ.copy()
+            env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
+            cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "--target", target_dir_str, *req_args]
+            ok, output = _run_pip_install(cmd, env, phase="dependency_install")
+    except TimeoutError as exc:
+        return {"ok": "false", "action": "lock_timeout", "missing": ",".join(missing), "detail": str(exc), "dependency_target": target_dir_str}
+    if not ok:
+        return {"ok": "false", "action": "install_failed", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": _summarize_install_error(output)}
+    _prepend_dependency_target(target_dir)
+    missing_after = _missing_desktop_modules(required_modules)
+    return {"ok": "true" if not missing_after else "false", "action": "installed" if not missing_after else "post_install_missing", "missing": ",".join(missing_after), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str}

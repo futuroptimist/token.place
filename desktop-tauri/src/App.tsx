@@ -94,6 +94,10 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'api_v1_readiness_qwen_64k_runtime_profile_result',
   'api_v1_readiness_qwen_64k_runtime_profile_failure_category',
   'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',
+  'startup_phase',
+  'startup_elapsed_ms',
+  'startup_deadline_ms',
+  'runtime_provisioning_state',
 ]);
 
 function isSafeReadinessDiagnosticString(value: string): boolean {
@@ -778,7 +782,7 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
+      if (payload.type === 'started' || payload.type === 'status' || payload.type === 'error' || payload.type === 'stopped') {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'stopped') {
@@ -1189,6 +1193,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Worker state: <strong>{displayStatusValue(computeStatus.worker_state, computeStatus.running ? 'starting' : 'stopped')}</strong></p>
+        <p style={{ marginBottom: 0 }}>Provisioning phase: <code>{displayStatusValue((computeStatus.readiness_diagnostics as Record<string, unknown>)?.startup_phase as string | undefined, displayStatusValue(computeStatus.relay_runtime_state, 'idle'))}</code></p>
         <p style={{ marginBottom: 0 }}>Worker alive: <strong>{computeStatus.worker_alive === null ? 'unknown' : computeStatus.worker_alive ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Worker generation: <code>{computeStatus.worker_generation ?? 'unknown'}</code></p>
         <p style={{ marginBottom: 0 }}>Worker restart count: <code>{computeStatus.worker_restart_count ?? 0}</code></p>

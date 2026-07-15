@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -51,6 +52,25 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
+def _canonical_llama_module_identity_path(path_text: str | Path) -> str:
+    return os.path.normcase(
+        os.path.normpath(str(_safe_resolve_path(path_text))).replace(os.sep, "/")
+    )
+
+
+def llama_module_identity_from_path(path_text):
+    if not path_text:
+        return None
+    try:
+        canonical = _canonical_llama_module_identity_path(path_text)
+    except (TypeError, ValueError, OSError):
+        return None
+    digest = hashlib.sha256(
+        ("token.place.llama_module_identity.v1\0" + canonical).encode("utf-8", "surrogatepass")
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 
 @dataclass(frozen=True)
@@ -166,6 +186,21 @@ def _strip_windows_extended_path_prefix(path_text):
 
 def _safe_resolve_path_text(path_text):
     return os.path.realpath(os.path.abspath(_strip_windows_extended_path_prefix(str(path_text))))
+
+
+def llama_module_identity_from_path(path_text):
+    if not path_text:
+        return None
+    try:
+        canonical = os.path.normcase(
+            os.path.normpath(_safe_resolve_path_text(str(path_text))).replace(os.sep, "/")
+        )
+    except (TypeError, ValueError, OSError):
+        return None
+    digest = hashlib.sha256(
+        ("token.place.llama_module_identity.v1\0" + canonical).encode("utf-8", "surrogatepass")
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
@@ -780,6 +815,8 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "dependency_target": probe.dependency_target,
         "pip_version": probe.pip_version,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
+        "llama_module_path_present": bool(probe.llama_module_path and probe.llama_module_path not in {"missing", "unknown"}),
+        "llama_module_identity": llama_module_identity_from_path(probe.llama_module_path),
         "backend": probe.backend,
         "gpu_offload_supported": probe.gpu_offload_supported,
         "constructor_kwarg_support": dict(probe.constructor_kwarg_support),

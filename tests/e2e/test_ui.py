@@ -1716,10 +1716,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 started = bool(payload.get("running"))
                 assert payload.get("use_mock_llm") is False
                 assert payload.get("llama_repo_stub_imported") is False
-                llama_module_path = payload.get("llama_module_path", "")
-                assert isinstance(llama_module_path, str) and llama_module_path
-                assert not llama_module_path.endswith("/llama_cpp.py")
-                assert not llama_module_path.endswith("\\llama_cpp.py")
+                assert "llama_module_path" not in payload
+                assert "module_path_present" not in payload
             if event_type == "status" and payload.get("registered") is True:
                 registered = True
                 break

@@ -286,7 +286,7 @@ def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | Non
                 "import desktop_runtime_setup as mod; "
                 "payload=mod.ensure_desktop_python_dependencies(); "
                 "assert payload.get('ok')=='true', payload; "
-                "import psutil,requests,dotenv,cryptography; "
+                "import psutil,requests,dotenv,cryptography,packaging; "
                 "print('desktop-runtime-imports-ok')"
             ),
         ],
@@ -914,7 +914,9 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
             ),
         },
     )
-    assert str(fake_init) in output, output
+    assert str(fake_init) not in output, output
+    assert "module_path_present=True" in output, output
+    assert "module_path=<path>" in output, output
     assert "cannot import name 'Sequence' from 'collections'" not in output, output
 
 

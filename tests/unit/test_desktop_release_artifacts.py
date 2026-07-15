@@ -1767,3 +1767,89 @@ def test_dmg_validation_runs_against_mounted_app(monkeypatch, tmp_path) -> None:
     validator._validate_dmg_contents(dmg, expect_signing=False, require_embedded_python_runtime=True)
     assert ('runtime', mounted_app) in seen
     assert ('codesign', mounted_app) in seen
+
+
+def test_validator_main_macos_require_runtime_without_dmg_validates_disposable_copy(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    runtime_apps = []
+    codesign_apps = []
+    run_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=False,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=True,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+
+    def fake_run(cmd):
+        run_calls.append(cmd)
+        return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
+
+    def fake_runtime(probe_app):
+        runtime_apps.append(probe_app)
+        assert probe_app != app
+        assert probe_app.name == app.name
+        assert probe_app.exists()
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', fake_runtime)
+    original_codesign = validator._codesign_verify
+    monkeypatch.setattr(validator, '_codesign_verify', lambda probe_app: codesign_apps.append(probe_app) or original_codesign(probe_app))
+
+    validator.main()
+
+    assert len(runtime_apps) == 1
+    assert runtime_apps[0].parent != app.parent
+    assert codesign_apps.count(app) == 2
+    assert runtime_apps[0] in codesign_apps
+
+
+def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg.write_bytes(b'dmg')
+    dmg_calls = []
+    runtime_apps = []
+    run_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=str(dmg),
+            app_only=False,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=True,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator.shutil, 'which', lambda name: '/usr/bin/codesign' if name == 'codesign' else None)
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, **kwargs: dmg_calls.append((path, kwargs)))
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime_non_mutating', lambda probe_app: runtime_apps.append(probe_app))
+
+    def fake_run(cmd):
+        run_calls.append(cmd)
+        return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    validator.main()
+
+    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
+    assert runtime_apps == []
+    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2

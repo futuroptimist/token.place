@@ -730,13 +730,17 @@ def main() -> None:
                 _fail(f"stale Electron branding detected: {stale} in {candidate}")
 
     if not args.app_only:
-        if dmg_path is None:
+        allow_macos_runtime_probe_without_dmg = (
+            args.require_embedded_python_runtime and platform.system() == "Darwin" and dmg_path is None
+        )
+        if dmg_path is None and not allow_macos_runtime_probe_without_dmg:
             _fail("--dmg-path is required unless --app-only is set")
-        if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
-            _fail(f"dmg artifact missing or invalid: {dmg_path}")
-        if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
-            _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-        _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
+        if dmg_path is not None:
+            if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
+                _fail(f"dmg artifact missing or invalid: {dmg_path}")
+            if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
+                _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
+            _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -790,15 +794,13 @@ def main() -> None:
     _codesign_verify(app_path)
 
     if args.require_embedded_python_runtime:
-        if args.app_only:
+        should_probe_source_app_copy = args.app_only or platform.system() != "Darwin" or dmg_path is None
+        if should_probe_source_app_copy:
             with _copy_app_for_runtime_validation(app_path) as probe_dir:
                 probe_app = Path(probe_dir) / app_path.name
                 _validate_embedded_python_runtime_non_mutating(probe_app)
-                _codesign_verify(probe_app)
-        elif platform.system() != "Darwin":
-            with _copy_app_for_runtime_validation(app_path) as probe_dir:
-                probe_app = Path(probe_dir) / app_path.name
-                _validate_embedded_python_runtime_non_mutating(probe_app)
+                if platform.system() == "Darwin":
+                    _codesign_verify(probe_app)
 
     _codesign_verify(app_path)
 

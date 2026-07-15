@@ -664,6 +664,7 @@ def _run_pip_install(
         thread.start()
 
     outcome = "completed"
+    heartbeat_error = ""
     while process.poll() is None:
         elapsed = time.monotonic() - start
         if cancellation_predicate is not None and cancellation_predicate():
@@ -676,7 +677,13 @@ def _run_pip_install(
             break
         if heartbeat is not None and elapsed - last_heartbeat >= 5:
             last_heartbeat = elapsed
-            heartbeat({"startup_elapsed_ms": int(elapsed * 1000), "startup_deadline_ms": int(timeout_seconds * 1000)})
+            try:
+                heartbeat({"startup_elapsed_ms": int(elapsed * 1000), "startup_deadline_ms": int(timeout_seconds * 1000)})
+            except Exception as exc:
+                outcome = "heartbeat_failed"
+                _terminate_process_tree(process)
+                heartbeat_error = type(exc).__name__
+                break
         time.sleep(0.05)
 
     try:
@@ -690,6 +697,7 @@ def _run_pip_install(
     stderr_tail = _tail_text("".join(stderr_chunks))
     detail = (
         f"command={_command_summary(cmd)}; returncode={returncode}; outcome={outcome}; "
+        f"heartbeat_error={heartbeat_error or 'none'}; "
         f"stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
     )
     return outcome == "completed" and returncode == 0, detail
@@ -1674,7 +1682,10 @@ class _ManagedSiteMutationLock:
                         raise TimeoutError("managed-site lock wait timed out")
                     if self.heartbeat is not None and now - last_heartbeat >= 5:
                         last_heartbeat = now
-                        self.heartbeat({"startup_elapsed_ms": int((now - started_at) * 1000), "startup_deadline_ms": int(self.timeout_seconds * 1000)})
+                        try:
+                            self.heartbeat({"startup_elapsed_ms": int((now - started_at) * 1000), "startup_deadline_ms": int(self.timeout_seconds * 1000)})
+                        except Exception as exc:
+                            raise TimeoutError(f"managed-site lock heartbeat failed: {type(exc).__name__}") from exc
                     time.sleep(0.1)
         except BaseException:
             self._close_handle()

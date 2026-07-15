@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2677,4 +2678,69 @@ def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
     lock._handle = Handle()
     FakeMsvcrt.locking = classmethod(lambda cls, _fd, _mode, _size: None)
     lock.__exit__(None, None, None)
+    assert lock._handle is None
+
+
+def test_run_pip_install_heartbeat_failure_terminates_process_tree(monkeypatch):
+    class Stream:
+        def readline(self):
+            return ''
+        def close(self):
+            pass
+
+    class Proc:
+        pid = 12345
+        stdout = Stream()
+        stderr = Stream()
+        def __init__(self):
+            self.polls = 0
+        def poll(self):
+            self.polls += 1
+            return None if self.polls < 3 else -15
+        def wait(self, timeout=None):
+            return -15
+        def kill(self):
+            pass
+
+    proc = Proc()
+    terminated = []
+    times = iter([0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('emit failed')
+
+    ok, detail = desktop_runtime_setup._run_pip_install(
+        [sys.executable, '-m', 'pip', 'install', 'requests==2'],
+        os.environ.copy(),
+        heartbeat=failing_heartbeat,
+    )
+
+    assert ok is False
+    assert terminated == [12345]
+    assert 'outcome=heartbeat_failed' in detail
+    assert 'heartbeat_error=RuntimeError' in detail
+
+
+def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch):
+    times = iter([0.0, 0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+
+    def busy_flock(_fileno, _flags):
+        raise OSError('busy')
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
+    monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=busy_flock))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('emit failed')
+
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(tmp_path / 'site', timeout_seconds=10, heartbeat=failing_heartbeat)
+    with pytest.raises(TimeoutError, match='heartbeat failed'):
+        lock.__enter__()
+
     assert lock._handle is None

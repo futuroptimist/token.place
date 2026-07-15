@@ -1,0 +1,3 @@
+Python is redistributed under the Python Software Foundation License. The full
+license text is included in the generated python-build-standalone runtime under
+its standard license/notice files when the embedded runtime is prepared.

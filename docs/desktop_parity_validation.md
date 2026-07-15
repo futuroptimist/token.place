@@ -55,11 +55,11 @@ Do not make production two-node or round-robin claims until both Windows and mac
 ### macOS Metal prerequisites
 
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
-- Xcode Command Line Tools available for local source builds when a wheel is not sufficient.
+- Packaged Apple Silicon releases include the embedded Python runtime and must not require Xcode Command Line Tools.
 - Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
 - Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. The runtime setup/status payload should show `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `llama_module_path`, `runtime_action`, and any pip/CMake tails from provisioning.
-- If Apple CLT Python lacks pip or build tooling, install/repair pip for that interpreter or install Xcode Command Line Tools, then rerun the packaged app. The app-managed dependency target is `.token_place_desktop_site`; validation should not require writing packages into the CLT Python prefix.
+- If the packaged app reports a missing or invalid bundled runtime, reinstall the app; do not install Python or Xcode Command Line Tools for packaged runtime repair.
 
 ### Backend field meanings
 
@@ -225,38 +225,28 @@ payloads to persisted logs.
 
 ## macOS packaged Metal runtime validation
 
-For packaged `.app` builds, the bridge may launch with Apple Command Line Tools
-Python (for example `/Library/Developer/CommandLineTools/usr/bin/python3`) when
-that is the interpreter discovered by the launcher. The runtime setup must not
-install `llama-cpp-python` into that protected prefix. Instead, it installs into a
-writable desktop dependency target and adds that target to the same import path
-used by the follow-up `llama_cpp` probe and the model runtime.
+Packaged `.app` builds must launch
+`Contents/Resources/python-runtime/bin/python3` from the app bundle. They must not
+probe `/usr/bin/python3`, Homebrew, pyenv, or Apple Command Line Tools Python in
+packaged mode. The release DMG includes its own Python runtime, standard library,
+site-packages, and Metal-capable `llama-cpp-python==0.3.32`.
 
 Manual validation on Apple Silicon:
 
 1. Build and install the macOS desktop release from the commit under test.
-2. Enable debug logging from the desktop debug menu/Prompt 1 logging flow, or
-   launch with `TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS=1` for full bridge stderr.
-3. Start the operator with `mode=auto`, staging relay URL, and a local GGUF model.
-4. In bridge logs, find `desktop.runtime_setup` and confirm it includes:
-   - `interpreter`, `python_version`, `prefix`, and `base_prefix`
-   - `dependency_target` pointing to a writable app/user-specific directory
-   - `pip=` availability details
-   - `llama_module_path` under the dependency target or another real
-     `llama-cpp-python` package path, never the repo-local `llama_cpp.py` shim
-   - `selected_backend=metal` with `action=metal_already_supported` or
-     `installed_metal_reexec`, or `selected_backend=cpu` with
-     `action=metal_cpu_fallback` and an explicit Metal failure reason
-5. Confirm `model_init.ready` appears before `server.registered` / API v1
+2. Remove `TOKEN_PLACE_PYTHON` and `TOKEN_PLACE_SIDECAR_PYTHON` from the launch
+   environment and use a minimal `PATH`.
+3. Confirm the bundled interpreter runs from
+   `token.place desktop.app/Contents/Resources/python-runtime/bin/python3` and
+   `desktop.runtime_setup` reports `runtime_origin=bundled` and
+   `selected_backend=metal`.
+4. Confirm `model_init.ready` appears before `server.registered` / API v1
    registration, then verify the UI shows `Registered: yes`.
-6. Send one encrypted browser chat request, stop the operator, verify relay
+5. Send one encrypted browser chat request, stop the operator, verify relay
    diagnostics drop to zero or TTL-expire, then start again and confirm
    registration succeeds a second time.
 
-If Metal provisioning fails, inspect the `desktop.runtime_setup` line and the
-startup error for the pip/cmake tail. Common prerequisite fixes are installing or
-repairing Command Line Tools (`xcode-select --install`), ensuring `python3 -m pip
---version` works for the selected interpreter, and allowing the app to write its
-desktop dependency target. In `gpu` mode, Metal provisioning failure remains
-fatal. In `auto` and `hybrid`, a successful CPU `llama-cpp-python` install/import
-is an explicit `metal_cpu_fallback`, not a silent GPU success.
+If the bundled runtime is missing or invalid, the user-facing guidance must say
+that the app is missing or damaged and should be reinstalled. It must not show
+raw `xcode-select` output or ask end users to install Python or Xcode Command
+Line Tools. Developer builds may still use an explicit Python override.

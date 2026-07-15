@@ -101,7 +101,33 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Cache embedded Python archive
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: desktop-tauri/.cache/embedded-python
+          key: embedded-python-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json') }}
+
+      - name: Cache embedded Python wheels
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: embedded-python-wheels-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt', 'desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json') }}
+
+      - name: Prepare embedded macOS Python runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch
+          test "$(arch)" = "arm64"
+          python desktop-tauri/scripts/prepare_embedded_python_runtime.py
+          test -x desktop-tauri/src-tauri/python-runtime/bin/python3
+          desktop-tauri/src-tauri/python-runtime/bin/python3 -m pip check
+
       - name: Install desktop llama-cpp runtime with platform GPU backend
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -272,6 +298,12 @@ jobs:
             fi
 
             app_path="${app_files[0]}"
+            runtime_python="${app_path}/Contents/Resources/python-runtime/bin/python3"
+            if [ ! -x "${runtime_python}" ]; then
+              echo "missing embedded runtime interpreter in app: ${runtime_python}" >&2
+              exit 1
+            fi
+            env -u TOKEN_PLACE_PYTHON -u TOKEN_PLACE_SIDECAR_PYTHON HOME="${RUNNER_TEMP}/empty-home" PYTHONNOUSERSITE=1 PATH="/usr/bin:/bin" "${runtime_python}" -c 'import sys, platform; assert platform.machine()=="arm64"; print(sys.executable)'
             app_name="$(basename "${app_path}" .app)"
             if [[ "${app_name}" == *"tokenplace Desktop"* ]]; then
               echo "stale Electron branding detected in app name: ${app_name}" >&2

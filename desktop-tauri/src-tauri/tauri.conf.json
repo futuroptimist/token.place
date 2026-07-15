@@ -25,6 +25,7 @@
     "active": true,
     "targets": "all",
     "resources": [
+      "python-runtime",
       "python/desktop_gpu_packaging.py",
       "python/desktop_runtime_setup.py",
       "python/requirements_desktop_runtime.txt",

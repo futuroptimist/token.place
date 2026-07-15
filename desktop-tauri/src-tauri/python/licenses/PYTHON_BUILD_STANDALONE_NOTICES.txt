@@ -1,0 +1,3 @@
+The embedded runtime is sourced from astral-sh/python-build-standalone. Its
+redistribution notices and bundled component licenses are preserved from the
+verified archive during runtime preparation.

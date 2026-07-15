@@ -31,8 +31,8 @@ except ModuleNotFoundError:
         return {"ok": "false", "action": "desktop_runtime_setup_missing", "missing": "unknown"}
 
 
-def _run_dependency_preflight() -> Dict[str, Any]:
-    result = ensure_desktop_python_dependencies()
+def _run_dependency_preflight(*, readonly: bool = False) -> Dict[str, Any]:
+    result = {"ok": "true", "action": "inspect_readonly"} if readonly else ensure_desktop_python_dependencies()
     if result.get("ok") == "true":
         return {"ok": True}
     missing = result.get("missing") or "unknown"
@@ -148,7 +148,9 @@ def _get_model_manager(*, allow_inspect_fallback: bool = False):
 
 
 def inspect_model() -> int:
-    preflight = _run_dependency_preflight()
+    # Inspect must be read-only: use path bootstrap/import metadata fallbacks and
+    # never launch pip or mutate the app-managed dependency target.
+    preflight = _run_dependency_preflight(readonly=True)
     if not preflight.get("ok", False):
         return _response(**preflight)
     manager, error_status = _get_model_manager(allow_inspect_fallback=True)

@@ -151,6 +151,10 @@ interface ComputeNodeStatus {
   context_tier: string | null;
   context_window_tokens: number | null;
   readiness_diagnostics: ReadinessDiagnostics;
+  startup_phase: string | null;
+  startup_elapsed_ms: number | null;
+  startup_deadline_ms: number | null;
+  runtime_provisioning_state: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -209,6 +213,10 @@ const defaultComputeStatus: ComputeNodeStatus = {
   context_tier: null,
   context_window_tokens: null,
   readiness_diagnostics: {},
+  startup_phase: null,
+  startup_elapsed_ms: null,
+  startup_deadline_ms: null,
+  runtime_provisioning_state: null,
 };
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
@@ -692,6 +700,10 @@ function mergeComputeStatusEvent(
       payload.type === 'started'
         ? {}
         : readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
+    startup_phase: typeof payload.startup_phase === 'string' ? payload.startup_phase : prev.startup_phase,
+    startup_elapsed_ms: typeof payload.startup_elapsed_ms === 'number' ? payload.startup_elapsed_ms : prev.startup_elapsed_ms,
+    startup_deadline_ms: typeof payload.startup_deadline_ms === 'number' ? payload.startup_deadline_ms : prev.startup_deadline_ms,
+    runtime_provisioning_state: typeof payload.runtime_provisioning_state === 'string' ? payload.runtime_provisioning_state : prev.runtime_provisioning_state,
   };
 }
 
@@ -808,7 +820,7 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
+      if (payload.type === 'started' || (payload.type === 'status' && payload.running === true) || payload.type === 'error' || payload.type === 'stopped') {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'stopped') {
@@ -952,6 +964,7 @@ export function App() {
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
+        operator_session_id: computeStatusRef.current.operator_session_id,
         sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
         active_relay_url: primaryRelayUrl(config),
         configured_relay_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
@@ -976,7 +989,8 @@ export function App() {
         last_error: null,
         worker_state: 'starting',
         worker_alive: false,
-        log_file_path: null,
+        runtime_provisioning_state: 'spawn_requested',
+        startup_phase: 'spawn_requested',
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -1220,6 +1234,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Worker state: <strong>{displayStatusValue(computeStatus.worker_state, computeStatus.running ? 'starting' : 'stopped')}</strong></p>
+        <p style={{ marginBottom: 0 }}>Provisioning phase: <code>{displayStatusValue(computeStatus.startup_phase || computeStatus.runtime_provisioning_state, computeStatus.running ? 'starting' : 'stopped')}</code></p>
+        <p style={{ marginBottom: 0 }}>Provisioning elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms</p>
         <p style={{ marginBottom: 0 }}>Worker alive: <strong>{computeStatus.worker_alive === null ? 'unknown' : computeStatus.worker_alive ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Worker generation: <code>{computeStatus.worker_generation ?? 'unknown'}</code></p>
         <p style={{ marginBottom: 0 }}>Worker restart count: <code>{computeStatus.worker_restart_count ?? 0}</code></p>

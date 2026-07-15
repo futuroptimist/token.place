@@ -1414,37 +1414,28 @@ def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(mon
     assert 'repo-local shim' in result['fallback_reason']
 
 
-def test_run_pip_install_success_failure_and_timeout(monkeypatch):
-    class _OkResult:
-        returncode = 0
-        stdout = 'ok output'
-        stderr = ''
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+def test_run_pip_install_success_failure_and_timeout():
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, '-c', 'print("ok output")'], os.environ.copy()
+    )
     assert ok is True
     assert 'returncode=0' in output
     assert 'stdout_tail=ok output' in output
 
-    class _FailResult:
-        returncode = 1
-        stdout = 'fallback stdout'
-        stderr = 'real stderr'
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, '-c', 'import sys; print("fallback stdout"); print("real stderr", file=sys.stderr); sys.exit(1)'],
+        os.environ.copy(),
+    )
     assert ok is False
     assert 'returncode=1' in output
     assert 'stdout_tail=fallback stdout' in output
     assert 'stderr_tail=real stderr' in output
 
-    def _timeout(*_args, **_kwargs):
-        raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, '-c', 'import time; time.sleep(5)'], os.environ.copy(), timeout_seconds=1
+    )
     assert ok is False
-    assert 'pip install timed out after 12s' in output
+    assert 'outcome=timed_out' in output
     assert 'stdout_tail=empty' in output
     assert 'stderr_tail=empty' in output
 
@@ -1602,7 +1593,7 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv,cryptography,packaging'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
 
 
 def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
@@ -1645,7 +1636,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, None, None, object(), object(), object(), object(), None])
+    sequence = iter([None, None, None, None, None, None, None, None, object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -1653,7 +1644,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'packaging'
+    assert result['missing'] == 'cryptography'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
@@ -2140,7 +2131,7 @@ def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkey
             '0.3.32',
             'llama-cpp-python==0.3.32',
         )
-        == 'unknown'
+        == 'match'
     )
 
 

@@ -6,9 +6,11 @@ import importlib.util
 import json
 import os
 import platform as platform_module
+import re
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -102,6 +104,11 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "unavailable",
         "metal_install_failed",
         "metal_cpu_fallback",
+        "version_mismatch_failed",
+        "dependency_install_timeout",
+        "dependency_install_cancelled",
+        "cuda_source_build_timeout",
+        "cuda_source_build_cancelled",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -571,7 +578,24 @@ def _tail_text(raw: str, *, limit: int = INSTALL_LOG_TAIL_MAX_CHARS) -> str:
 
 
 def _command_summary(cmd: list[str]) -> str:
-    return " ".join(str(part) for part in cmd)
+    return " ".join("<python>" if i == 0 else str(part) for i, part in enumerate(cmd))
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], check=False, capture_output=True)
+        else:
+            process.terminate()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
 
 
 def _run_pip_install(
@@ -580,34 +604,43 @@ def _run_pip_install(
     *,
     timeout_seconds: int = PIP_INSTALL_TIMEOUT_SECONDS,
 ) -> tuple[bool, str]:
-    try:
-        install = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = _tail_text(exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-        stderr = _tail_text(exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
-        return (
-            False,
-            f"pip install timed out after {timeout_seconds}s; command={_command_summary(cmd)}; "
-            f"stdout_tail={stdout or 'empty'}; stderr_tail={stderr or 'empty'}",
-        )
+    deadline = time.monotonic() + timeout_seconds
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
 
-    stdout_tail = _tail_text(install.stdout or "")
-    stderr_tail = _tail_text(install.stderr or "")
+    def drain(stream: Any, parts: list[str]) -> None:
+        if stream is None:
+            return
+        for line in iter(stream.readline, ""):
+            parts.append(line)
+            if sum(len(p) for p in parts) > INSTALL_LOG_TAIL_MAX_CHARS * 2:
+                parts[:] = ["".join(parts)[-INSTALL_LOG_TAIL_MAX_CHARS:]]
+
+    threads = [
+        threading.Thread(target=drain, args=(process.stdout, stdout_parts), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr_parts), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            _terminate_process_tree(process)
+            return False, (
+                f"outcome=timed_out; command={_command_summary(cmd)}; returncode=timeout; "
+                f"stdout_tail={_tail_text(''.join(stdout_parts)) or 'empty'}; "
+                f"stderr_tail={_tail_text(''.join(stderr_parts)) or 'empty'}"
+            )
+        time.sleep(0.1)
+    for thread in threads:
+        thread.join(timeout=1)
+    stdout_tail = _tail_text("".join(stdout_parts))
+    stderr_tail = _tail_text("".join(stderr_parts))
     detail = (
-        f"command={_command_summary(cmd)}; returncode={install.returncode}; "
-        f"stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
+        f"outcome={'verified' if process.returncode == 0 else 'failed'}; command={_command_summary(cmd)}; "
+        f"returncode={process.returncode}; stdout_tail={stdout_tail or 'empty'}; stderr_tail={stderr_tail or 'empty'}"
     )
-    if install.returncode == 0:
-        return True, detail
-
-    return False, detail
+    return process.returncode == 0, detail
 
 
 def _source_build_repair(
@@ -643,6 +676,7 @@ def _source_build_repair(
         "install",
         "--disable-pip-version-check",
         "--force-reinstall",
+        "--upgrade",
         "--no-cache-dir",
     ]
     if dependency_target is not None:
@@ -807,19 +841,27 @@ def _required_llama_cpp_spec(requirements_path: Path) -> tuple[str, str]:
 
 
 def _llama_cpp_version_matches(installed: str, package_spec: str) -> str:
+    """Match exact llama-cpp-python == pins without third-party packaging."""
+
     version_text = str(installed or "").strip()
     if not version_text or version_text == "unknown":
         return "unknown"
     try:
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import InvalidVersion, Version
-    except ModuleNotFoundError:
+        required = package_spec.split("==", 1)[1].strip()
+    except (IndexError, AttributeError):
         return "unknown"
-    try:
-        spec_text = package_spec.split("llama-cpp-python", 1)[1]
-        return "match" if Version(version_text) in SpecifierSet(spec_text) else "mismatch"
-    except (InvalidVersion, ValueError):
+    public, plus, local = version_text.partition("+")
+    # Accept only the exact public version or local builds of that exact public
+    # version. Reject pre/post/dev/malformed variants rather than guessing.
+    if public != required:
         return "mismatch"
+    if plus and not local:
+        return "mismatch"
+    if not re.match(r"^\d+\.\d+\.\d+$", public):
+        return "mismatch"
+    if any(token in public.lower() for token in ("a", "b", "rc", "post", "dev", "!")):
+        return "mismatch"
+    return "match"
 
 
 def _version_payload(probe: RuntimeProbe, required_version: str, package_spec: str) -> Dict[str, str]:
@@ -1473,6 +1515,58 @@ def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
         return False, str(exc)
 
 
+class _ProvisioningLock:
+    def __init__(self, target: Path, *, timeout_seconds: float = 30.0) -> None:
+        self.path = target / ".token_place_desktop_site.lock"
+        self.timeout_seconds = timeout_seconds
+        self._file: Any = None
+
+    def __enter__(self) -> "_ProvisioningLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a+")
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("desktop dependency provisioning lock timed out")
+                time.sleep(0.1)
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._file is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._file.seek(0)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+
+
+def _activate_dependency_target(target_dir: Path) -> None:
+    target_dir_str = str(target_dir)
+    os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
+    active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
+    if target_dir.exists() and target_dir_str not in active_sys_path:
+        active_sys_path.insert(0, target_dir_str)
+    importlib.invalidate_caches()
+
+
+def _missing_required_modules(required_modules: tuple[str, ...]) -> list[str]:
+    importlib.invalidate_caches()
+    return [name for name in required_modules if importlib.util.find_spec(name) is None]
+
 def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
     preferred_targets = [
         ("runtime_root", _desktop_dependency_target(runtime_root)),
@@ -1492,11 +1586,25 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
 
     root = _resolve_runtime_root(repo_root=repo_root)
     requirements_path = _resolve_desktop_requirements_path(root)
+    required_modules = ("psutil", "requests", "dotenv", "cryptography")
 
-    required_modules = ("psutil", "requests", "dotenv", "cryptography", "packaging")
-    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    target_dir, target_error = _resolve_desktop_dependency_target(root)
+    if target_dir is None:
+        missing = _missing_required_modules(required_modules)
+        return {
+            "ok": "false" if missing else "true",
+            "action": "install_target_unavailable" if missing else "already_satisfied",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+            "detail": target_error or "unable to create desktop dependency install target",
+        }
+
+    _activate_dependency_target(target_dir)
+    missing = _missing_required_modules(required_modules)
     if not missing:
-        return {"ok": "true", "action": "already_satisfied", "missing": ""}
+        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": str(target_dir)}
 
     if not requirements_path.is_file():
         return {
@@ -1506,59 +1614,51 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
             "interpreter": sys.executable,
             "import_root": str(root),
             "requirements": str(requirements_path),
+            "dependency_target": str(target_dir),
         }
 
-    env = os.environ.copy()
-    target_dir, target_error = _resolve_desktop_dependency_target(root)
-    if target_dir is None:
+    try:
+        with _ProvisioningLock(target_dir):
+            _activate_dependency_target(target_dir)
+            missing = _missing_required_modules(required_modules)
+            if not missing:
+                return {"ok": "true", "action": "already_satisfied_post_lock", "missing": "", "dependency_target": str(target_dir)}
+            env = os.environ.copy()
+            env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = str(target_dir)
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join([str(target_dir), existing_pythonpath] if existing_pythonpath else [str(target_dir)])
+            # Install only the baseline requirement file once. A process that finds
+            # the managed site after activation reaches the fast path above.
+            cmd = [
+                sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                "--upgrade", "--target", str(target_dir), "-r", str(requirements_path),
+            ]
+            ok, output = _run_pip_install(cmd, env)
+    except TimeoutError as exc:
         return {
-            "ok": "false",
-            "action": "install_target_unavailable",
-            "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
-            "detail": target_error or "unable to create desktop dependency install target",
+            "ok": "false", "action": "dependency_install_timeout", "missing": ",".join(missing),
+            "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path),
+            "dependency_target": str(target_dir), "detail": str(exc),
         }
-    target_dir_str = str(target_dir)
-    if target_dir_str not in sys.path:
-        sys.path.insert(0, target_dir_str)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--target",
-        target_dir_str,
-        "-r",
-        str(requirements_path),
-    ]
-    ok, output = _run_pip_install(cmd, env)
     if not ok:
         return {
-            "ok": "false",
-            "action": "install_failed",
-            "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
-            "dependency_target": target_dir_str,
-            "detail": _summarize_install_error(output),
+            "ok": "false", "action": "install_failed", "missing": ",".join(missing),
+            "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path),
+            "dependency_target": str(target_dir), "detail": _summarize_install_error(output),
         }
 
-    importlib.invalidate_caches()
-    missing_after = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    _activate_dependency_target(target_dir)
+    missing_after = _missing_required_modules(required_modules)
     return {
         "ok": "true" if not missing_after else "false",
         "action": "installed" if not missing_after else "post_install_missing",
         "missing": ",".join(missing_after),
-        "interpreter": sys.executable,
-        "import_root": str(root),
-        "requirements": str(requirements_path),
-        "dependency_target": target_dir_str,
+        "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path),
+        "dependency_target": str(target_dir),
     }
+
+
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()
     if detected_platform.startswith("win"):

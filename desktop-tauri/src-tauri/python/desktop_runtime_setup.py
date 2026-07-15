@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import platform as platform_module
@@ -51,6 +52,30 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
+def _canonical_llama_module_path_text(module_path: Any) -> Optional[str]:
+    if not module_path:
+        return None
+    try:
+        path_text = _strip_windows_extended_path_prefix(str(module_path))
+        resolved = os.path.realpath(os.path.abspath(path_text))
+        return os.path.normcase(os.path.normpath(resolved)).replace('\\', '/')
+    except (TypeError, ValueError, OSError):
+        try:
+            normalized = os.path.normpath(_strip_windows_extended_path_prefix(str(module_path)))
+            return os.path.normcase(normalized).replace('\\', '/')
+        except (TypeError, ValueError, OSError):
+            return None
+
+
+def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
+    canonical = _canonical_llama_module_path_text(module_path)
+    if not canonical or canonical.lower() in {"unknown", "missing"}:
+        return None
+    domain = "token.place.llama_module_identity.v1\0"
+    digest = hashlib.sha256((domain + canonical).encode("utf-8", "surrogatepass")).hexdigest()
+    return f"sha256:{digest}"
 
 
 @dataclass(frozen=True)
@@ -770,7 +795,8 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
 
 
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
-    return {
+    module_identity = llama_module_identity_from_path(probe.llama_module_path)
+    payload = {
         "detected_device": probe.detected_device or "cpu",
         "interpreter": probe.interpreter,
         "python_version": probe.python_version,
@@ -797,7 +823,13 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "yarn_ext_factor_supported": probe.yarn_ext_factor_supported,
         "rope_freq_scale_supported": probe.rope_freq_scale_supported,
         "yarn_orig_ctx_supported": probe.yarn_orig_ctx_supported,
+        "llama_module_path_present": bool(
+            probe.llama_module_path and probe.llama_module_path not in {"unknown", "missing"}
+        ),
     }
+    if module_identity:
+        payload["llama_module_identity"] = module_identity
+    return payload
 
 
 def _required_llama_cpp_spec(requirements_path: Path) -> tuple[str, str]:

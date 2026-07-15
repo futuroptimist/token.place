@@ -1147,3 +1147,66 @@ def test_load_manifest_success_and_python_version_failure(tmp_path, monkeypatch)
         assert False
     except prep.RuntimePrepError as exc:
         assert 'major.minor' in str(exc)
+
+
+def test_parse_otool_libraries_rejects_malformed_records(tmp_path):
+    owner = tmp_path / 'runtime with spaces' / 'libexample.dylib'
+    owner.parent.mkdir()
+    owner.write_text('x')
+    try:
+        prep._parse_otool_libraries(f'{owner}:\nmalformed-record\n', owner, None)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'malformed otool -L record' in str(exc)
+    try:
+        prep._parse_otool_libraries('\n    /usr/lib/libSystem.B.dylib\n', owner, None)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'dependency before otool -L header' in str(exc)
+    try:
+        prep._parse_otool_libraries(f'{owner}:\n{owner}:\n', owner, None)
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'duplicate otool -L header' in str(exc)
+
+
+def test_add_rpath_verifies_every_architecture(monkeypatch, tmp_path):
+    binary = tmp_path / 'python3.11'
+    binary.write_text('x')
+    calls = []
+    before = {'arm64': 'Load command 0\ncmd LC_RPATH\npath @loader_path/old (offset 12)'}
+    after_missing = {'arm64': 'Load command 0\ncmd LC_RPATH\npath @loader_path/old (offset 12)'}
+    states = [before, after_missing]
+    monkeypatch.setattr(prep, '_otool_load_commands_by_arch', lambda path: states.pop(0))
+    monkeypatch.setattr(prep, '_install_name_tool', lambda args: calls.append(args))
+
+    try:
+        prep._add_rpath_if_missing(binary, '@executable_path/../lib')
+        assert False
+    except prep.RuntimePrepError as exc:
+        assert 'failed to add required LC_RPATH' in str(exc)
+    assert calls == [['-add_rpath', '@executable_path/../lib', str(binary)]]
+
+
+def test_unique_runtime_macho_files_deduplicates_internal_symlinks(monkeypatch, tmp_path):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    target = runtime / 'libexample.dylib'
+    target.write_bytes(b'macho')
+    duplicate = runtime / 'libduplicate.dylib'
+    duplicate.symlink_to(target)
+    monkeypatch.setattr(prep, '_is_macho_file', lambda path: True)
+
+    files = prep._unique_runtime_macho_files(runtime)
+
+    assert files == [target.resolve()]
+
+
+def test_normalize_python_runtime_is_noop_outside_darwin(monkeypatch, tmp_path):
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Linux')
+    calls = []
+    monkeypatch.setattr(prep, '_otool_install_id', lambda path: calls.append(path))
+
+    prep.normalize_python_build_standalone_macos_runtime(tmp_path / 'missing-runtime', manifest())
+
+    assert calls == []

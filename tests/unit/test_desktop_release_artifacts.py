@@ -1265,3 +1265,169 @@ def test_validate_macho_linkage_rejects_file_and_lipo_failures(monkeypatch, tmp_
         assert False
     except SystemExit as exc:
         assert 'lipo failed' in str(exc)
+
+def test_validator_app_only_main_validates_app_without_dmg(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    contents = app / 'Contents'
+    macos = contents / 'MacOS'
+    resources = contents / 'Resources'
+    macos.mkdir(parents=True)
+    resources.mkdir()
+    executable = macos / 'token-place-desktop-tauri'
+    executable.write_bytes(b'exe')
+    icon = tmp_path / 'icon.icns'
+    icon.write_bytes(b'icon')
+    bundled_icon = resources / 'icon.icns'
+    bundled_icon.write_bytes(b'icon')
+    info = {
+        'CFBundleName': 'token.place desktop',
+        'CFBundleDisplayName': 'token.place desktop',
+        'CFBundleExecutable': executable.name,
+        'CFBundleIconFile': 'icon.icns',
+    }
+    (contents / 'Info.plist').write_bytes(validator.plistlib.dumps(info))
+    tauri_config = tmp_path / 'tauri.conf.json'
+    tauri_config.write_text(json.dumps({'bundle': {'icon': ['icons/icon.icns', 'icons/icon.ico', 'icons/128x128@2x.png']}}))
+    embedded_calls = []
+    dmg_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=True,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64' if cmd[:2] == ['lipo', '-archs'] else '')
+    monkeypatch.setattr(validator, '_validate_embedded_python_runtime', lambda path: embedded_calls.append(path))
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda *args, **kwargs: dmg_calls.append(args))
+
+    validator.main()
+
+    assert embedded_calls == [app]
+    assert dmg_calls == []
+
+
+def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mount.mkdir()
+    (mount / 'token.place desktop.app').mkdir()
+    readme = mount / 'README BEFORE OPENING.txt'
+    readme.write_text(
+        'This preview build is ad-hoc signed and not notarized.\n'
+        'Apple could not verify. Open Privacy & Security. Developer ID notarization.\n',
+        encoding='utf-8',
+    )
+
+    class MountHandle:
+        name = str(mount)
+        cleaned = False
+
+        def cleanup(self):
+            self.cleaned = True
+
+    handle = MountHandle()
+    cleanup_calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: handle)
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: cleanup_calls.append((dmg, path)))
+
+    dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg.write_bytes(b'dmg')
+    validator._validate_dmg_contents(dmg, expect_signing=False)
+
+    assert cleanup_calls == [(dmg, mount)]
+    assert handle.cleaned is True
+
+
+def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'token.place desktop.app'
+    contents = app / 'Contents'
+    macos = contents / 'MacOS'
+    resources = contents / 'Resources'
+    macos.mkdir(parents=True)
+    resources.mkdir()
+    executable = macos / 'token-place-desktop-tauri'
+    executable.write_bytes(b'exe')
+    icon = tmp_path / 'icon.icns'
+    icon.write_bytes(b'icon')
+    (resources / 'token-icon.icns').write_bytes(b'icon')
+    (contents / 'Info.plist').write_bytes(
+        validator.plistlib.dumps(
+            {
+                'CFBundleName': 'token.place desktop',
+                'CFBundleDisplayName': 'token.place desktop',
+                'CFBundleExecutable': executable.name,
+                'CFBundleIconFile': 'token-icon',
+            }
+        )
+    )
+    tauri_config = tmp_path / 'tauri.conf.json'
+    tauri_config.write_text(json.dumps({'bundle': {'icon': ['icons/icon.icns', 'icons/icon.ico', 'icons/128x128@2x.png']}}))
+    dmg = tmp_path / 'token.place-desktop-test-apple-silicon.dmg'
+    dmg.write_bytes(b'dmg')
+    dmg_calls = []
+    run_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=str(dmg),
+            app_only=False,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=True,
+            require_embedded_python_runtime=False,
+            expect_notarization=True,
+        ),
+    )
+    monkeypatch.setattr(validator, '_validate_dmg_contents', lambda path, *, expect_signing: dmg_calls.append((path, expect_signing)))
+
+    def fake_run(cmd):
+        run_calls.append(cmd)
+        return 'arm64' if cmd[:2] == ['lipo', '-archs'] else ''
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    validator.main()
+
+    assert dmg_calls == [(dmg, True)]
+    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)] in run_calls
+    assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
+
+
+def test_validator_dmg_contents_rejects_missing_signed_preview_phrase(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mount.mkdir()
+    (mount / 'token.place desktop.app').mkdir()
+    (mount / 'README BEFORE OPENING.txt').write_text(
+        'This preview build is ad-hoc signed and not notarized.\n'
+        'Apple could not verify. Open Privacy & Security. Developer ID notarization.\n',
+        encoding='utf-8',
+    )
+
+    class MountHandle:
+        name = str(mount)
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+
+    try:
+        validator._validate_dmg_contents(tmp_path / 'token.place-desktop-test-apple-silicon.dmg', expect_signing=True)
+        assert False
+    except SystemExit as exc:
+        assert 'configured Apple signing identity' in str(exc)

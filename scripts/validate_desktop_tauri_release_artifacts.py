@@ -312,12 +312,13 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
     try:
         scratch = Path(home)
         app_data = scratch / "token.place"
+        home_dir = scratch / "home"
         pycache = scratch / "pycache"
         tmpdir = scratch / "tmp"
-        for path in (app_data, pycache, tmpdir):
+        for path in (app_data, home_dir, pycache, tmpdir):
             path.mkdir(parents=True, exist_ok=True)
         env = {
-            "HOME": str(scratch / "home"),
+            "HOME": str(home_dir),
             "TMPDIR": str(tmpdir),
             "PIP_CACHE_DIR": str(app_data / "pip-cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -334,8 +335,6 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "XDG_CONFIG_HOME": str(app_data / "config"),
             "XDG_DATA_HOME": str(app_data / "data"),
         }
-        for key in ("TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
-            env.pop(key, None)
         result = subprocess.run(
             [str(py_for_subprocess), "-B", "-c", code],
             check=False,
@@ -417,7 +416,7 @@ def _run_with_app_mutation_guard(app_path: Path, action_name: str, action) -> No
 def _codesign_verify(app_path: Path) -> None:
     if platform.system() == "Darwin":
         if shutil.which("codesign") is None:
-            print("::warning::codesign unavailable; skipping signature verification outside macOS runner tooling.")
+            print("::warning::codesign not found in PATH; skipping ad-hoc signature verification on this macOS machine.")
             return
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
@@ -792,7 +791,6 @@ def main() -> None:
                 probe_app = Path(probe_dir) / app_path.name
                 _validate_embedded_python_runtime_non_mutating(probe_app)
 
-    _codesign_verify(app_path)
     if args.expect_notarization:
         _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
     elif args.expect_signing:

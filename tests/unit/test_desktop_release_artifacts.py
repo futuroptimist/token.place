@@ -663,7 +663,7 @@ def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
     assert "'inspect'" in text
 
 
-def test_validator_sanitized_python_env_unsets_override_variables(monkeypatch, tmp_path) -> None:
+def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
     (app / 'Contents' / 'Resources' / 'python').mkdir(parents=True)
@@ -703,6 +703,16 @@ def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime(
     assert 'test "$(uname -m)" = "arm64"' in workflow
 
 
+def test_release_workflow_installs_pytest_before_macos_probe() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    install_index = workflow.index('- name: Install macOS validation test dependencies')
+    validate_index = workflow.index('- name: Validate macOS staged artifact guardrails')
+    assert install_index < validate_index
+    install_step = workflow[install_index:validate_index]
+    assert "if: runner.os == 'macOS'" in install_step
+    assert 'python -m pip install --upgrade pip pytest' in install_step
+
+
 def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
@@ -718,6 +728,7 @@ def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypa
 
     def fake_run(cmd, *, check, capture_output, text, env, cwd=None):
         assert env['HOME'] == str(created_home['path'] / 'home')
+        assert Path(env['HOME']).is_dir()
         assert env['TOKEN_PLACE_MODELS_DIR'] == str(created_home['path'] / 'token.place' / 'models')
         assert env['XDG_CACHE_HOME'] == str(created_home['path'] / 'token.place' / 'cache')
         assert env['XDG_CONFIG_HOME'] == str(created_home['path'] / 'token.place' / 'config')
@@ -1406,7 +1417,7 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
     validator.main()
 
     assert dmg_calls == [(dmg, True)]
-    assert ['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)] in run_calls
+    assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 1
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
 
 

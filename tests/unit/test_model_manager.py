@@ -6006,7 +6006,7 @@ def test_qwen_64k_runtime_fails_when_yarn_kwargs_unsupported(tmp_path):
     assert 'Qwen 64K requires YaRN/RoPE support in llama-cpp-python' in manager.last_runtime_init_error
     assert 'active_profile_id=qwen3-8b-q4-k-m' in manager.last_runtime_init_error
     assert 'active_context_tier=64k-full' in manager.last_runtime_init_error
-    assert 'llama_module_path_present=unknown' in manager.last_runtime_init_error
+    assert 'llama_module_path_present=False' in manager.last_runtime_init_error
     assert 'llama_cpp_python_version=' in manager.last_runtime_init_error
     assert 'missing constructor kwargs' in manager.last_runtime_init_error
 
@@ -10180,6 +10180,27 @@ def test_modern_desktop_probe_identity_negative_cases_fail_closed(monkeypatch, t
             assert identity not in formatted
         assert 'child_probe_reprobe_attempted=False' in formatted
         assert 'incomplete_probe_fields=' in formatted
+        if identity == 'sha256:not-valid':
+            assert 'llama_module_identity' in diagnostics['incomplete_probe_fields']
+            assert 'llama_module_identity_match' not in diagnostics['incomplete_probe_fields']
+
+
+def test_coerce_desktop_runtime_probe_preserves_malformed_identity_state():
+    from utils.llm import model_manager as model_manager_module
+
+    probe = model_manager_module._coerce_desktop_runtime_probe({
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'runtime_action': 'metal_already_supported',
+        'llama_module_path': '/private/redacted/llama_cpp/__init__.py',
+        'llama_module_path_present': False,
+        'llama_module_identity': 'sha256:not-valid',
+    })
+
+    assert probe is not None
+    assert probe['llama_module_path_present'] is False
+    assert probe['llama_module_identity_malformed'] is True
+    assert 'llama_module_identity' not in probe
 
 
 def test_qwen_yarn_diagnostics_preserve_false_and_empty_values():

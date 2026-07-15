@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
-import hashlib
 import json
-import re
 import os
 import platform as platform_module
 import subprocess
@@ -14,6 +12,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from utils.llm.llama_module_identity import (
+    llama_module_identity_from_path,
+    strip_windows_extended_path_prefix,
+    valid_llama_module_identity,
+)
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
@@ -43,47 +47,17 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
 )
 
 
+
 def _strip_windows_extended_path_prefix(path_text: str) -> str:
-    if path_text.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + path_text[8:]
-    if path_text.startswith("\\\\?\\"):
-        return path_text[4:]
-    return path_text
+    return strip_windows_extended_path_prefix(path_text)
 
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
 
 
-_LLAMA_MODULE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_LLAMA_MODULE_IDENTITY_DOMAIN = "token.place.llama_cpp.module_path.v1"
-
-
-def _canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
-    if not module_path:
-        return None
-    try:
-        path_text = _strip_windows_extended_path_prefix(str(module_path))
-        canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
-    except (TypeError, ValueError, OSError):
-        try:
-            canonical = os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))
-        except (TypeError, ValueError, OSError):
-            return None
-    return canonical.replace('\\', '/')
-
-
-def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
-    canonical = _canonical_llama_module_identity_input(module_path)
-    if not canonical or canonical in {'missing', 'unknown'}:
-        return None
-    digest = hashlib.sha256(f"{_LLAMA_MODULE_IDENTITY_DOMAIN}\0{canonical}".encode('utf-8')).hexdigest()
-    return f"sha256:{digest}"
-
-
 def _valid_llama_module_identity(value: Any) -> Optional[str]:
-    text = str(value or '').strip()
-    return text if _LLAMA_MODULE_IDENTITY_RE.fullmatch(text) else None
+    return valid_llama_module_identity(value)
 
 
 @dataclass(frozen=True)

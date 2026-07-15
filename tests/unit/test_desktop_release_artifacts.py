@@ -721,6 +721,11 @@ def test_release_workflow_installs_pytest_before_macos_probe() -> None:
     assert "if: runner.os == 'macOS'" in install_step
     assert 'python -m pip install --upgrade pip' in install_step
     assert "python -m pip install 'pytest>=8.1'" in install_step
+    validate_step = workflow[validate_index:]
+    assert (
+        "python -m pytest --confcutdir=tests/integration "
+        "tests/integration/test_macos_release_probe.py -q"
+    ) in validate_step
 
 
 def test_run_python_sanitized_rejects_forbidden_markers_and_cleans_home(monkeypatch, tmp_path) -> None:

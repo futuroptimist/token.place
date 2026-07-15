@@ -457,7 +457,7 @@ jobs:
           python ../scripts/validate_desktop_tauri_release_artifacts.py               --require-embedded-python-runtime               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
 
           cd ..
-          python -m pytest tests/integration/test_macos_release_probe.py -q
+          python -m pytest --confcutdir=tests/integration tests/integration/test_macos_release_probe.py -q
 
       - name: Generate SHA256 checksums
         shell: bash

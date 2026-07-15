@@ -639,18 +639,26 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
-def _ensure_desktop_llama_runtime_for_context(mode: str, context_tier: str) -> Dict[str, str]:
+def _ensure_desktop_llama_runtime_for_context(
+    mode: str,
+    context_tier: str,
+    *,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
+) -> Dict[str, str]:
     try:
         parameters = inspect.signature(ensure_desktop_llama_runtime).parameters
     except (TypeError, ValueError):
         parameters = {}
-    accepts_context_tier = (
-        "context_tier" in parameters
-        or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    )
-    if accepts_context_tier:
-        return ensure_desktop_llama_runtime(mode, context_tier=context_tier)
-    return ensure_desktop_llama_runtime(mode)
+    kwargs: Dict[str, Any] = {}
+    accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if "context_tier" in parameters or accepts_var_kwargs:
+        kwargs["context_tier"] = context_tier
+    if "cancellation_predicate" in parameters or accepts_var_kwargs:
+        kwargs["cancellation_predicate"] = cancellation_predicate
+    if "heartbeat" in parameters or accepts_var_kwargs:
+        kwargs["heartbeat"] = heartbeat
+    return ensure_desktop_llama_runtime(mode, **kwargs)
 
 def _startup_context_tier(args: argparse.Namespace) -> str:
     raw_context_tier = getattr(args, "context_tier", "8k-fast")
@@ -821,7 +829,10 @@ def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
     startup_started_at = time.monotonic()
-    status_sequence = int(os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") or "0")
+    try:
+        status_sequence = int(os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") or "0")
+    except (TypeError, ValueError):
+        status_sequence = 0
     emit_lock = threading.Lock()
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:
@@ -873,7 +884,18 @@ def run(args: argparse.Namespace) -> int:
 
     if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
         emit_provisioning("runtime_probe")
-    runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
+    try:
+        runtime_setup = _ensure_desktop_llama_runtime_for_context(
+            args.mode,
+            _startup_context_tier(args),
+            cancellation_predicate=stop_requested,
+            heartbeat=lambda extra: emit_provisioning("runtime_install", extra),
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
+        else:
+            raise
     if os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE"):
         emit_provisioning("runtime_verification")
     maybe_reexec_for_runtime_refresh(runtime_setup)

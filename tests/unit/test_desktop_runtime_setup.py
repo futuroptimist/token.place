@@ -2370,3 +2370,56 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
     assert sentinel not in emitted
+
+
+def test_managed_site_lock_closes_handle_when_enter_times_out(monkeypatch, tmp_path):
+    closed = {'value': False}
+
+    class FakeHandle:
+        def fileno(self):
+            return 42
+
+        def seek(self, _offset):
+            return None
+
+        def close(self):
+            closed['value'] = True
+
+    class FakeFcntl:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        @staticmethod
+        def flock(_fileno, _flags):
+            raise OSError('busy')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'open', lambda *_args, **_kwargs: FakeHandle(), raising=False)
+    monkeypatch.setitem(sys.modules, 'fcntl', FakeFcntl)
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+
+    with pytest.raises(TimeoutError):
+        with desktop_runtime_setup._ManagedSiteMutationLock(tmp_path, timeout_seconds=0):
+            pass
+
+    assert closed['value'] is True
+
+
+def test_ensure_desktop_python_dependencies_maps_compat_timeout_to_timeout_action(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil==1\nrequests==1\npython-dotenv==1\ncryptography==1\n', encoding='utf-8')
+    target = tmp_path / 'site'
+    target.mkdir()
+
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _modules: ['psutil'])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'pip install timed out after 12s; stderr_tail=empty'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['action'] == 'install_timeout'

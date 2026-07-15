@@ -690,7 +690,12 @@ def _run_pip_install(
 
 
 def _source_build_repair(
-    requirements_path: Path, backend: str, dependency_target: Optional[Path] = None
+    requirements_path: Path,
+    backend: str,
+    dependency_target: Optional[Path] = None,
+    *,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
 ) -> tuple[bool, str]:
     env = os.environ.copy()
     backend_label = backend.upper()
@@ -738,7 +743,12 @@ def _source_build_repair(
         "--verbose",
         package_spec,
     ])
-    ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    pip_kwargs: Dict[str, Any] = {"timeout_seconds": PIP_SOURCE_BUILD_TIMEOUT_SECONDS}
+    if cancellation_predicate is not None:
+        pip_kwargs["cancellation_predicate"] = cancellation_predicate
+    if heartbeat is not None:
+        pip_kwargs["heartbeat"] = heartbeat
+    ok, output = _run_pip_install(cmd, env, **pip_kwargs)
     if not metadata_warning:
         return ok, output
 
@@ -752,16 +762,35 @@ def _source_build_repair(
 
 
 def _windows_cuda_source_repair(
-    requirements_path: Path, dependency_target: Optional[Path] = None
+    requirements_path: Path,
+    dependency_target: Optional[Path] = None,
+    *,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
 ) -> tuple[bool, str]:
-    return _source_build_repair(requirements_path, "cuda", dependency_target)
+    return _source_build_repair(
+        requirements_path,
+        "cuda",
+        dependency_target,
+        cancellation_predicate=cancellation_predicate,
+        heartbeat=heartbeat,
+    )
 
 
 def _run_windows_cuda_source_repair(
-    requirements_path: Path, dependency_target: Optional[Path]
+    requirements_path: Path,
+    dependency_target: Optional[Path],
+    *,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
 ) -> tuple[bool, str]:
     try:
-        return _windows_cuda_source_repair(requirements_path, dependency_target)
+        return _windows_cuda_source_repair(
+            requirements_path,
+            dependency_target,
+            cancellation_predicate=cancellation_predicate,
+            heartbeat=heartbeat,
+        )
     except TypeError as exc:
         message = str(exc)
         if "positional" in message or "argument" in message:
@@ -1140,7 +1169,14 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
-def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] = None, context_tier: Optional[str] = None) -> Dict[str, str]:
+def _ensure_desktop_llama_runtime_impl(
+    mode: str,
+    *,
+    repo_root: Optional[Path] = None,
+    context_tier: Optional[str] = None,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
+) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
@@ -1289,7 +1325,16 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 )
             else:
                 attempted_cuda_source_build = True
-                source_ok, source_log = _run_windows_cuda_source_repair(requirements_path, dependency_target)
+                source_repair_kwargs: Dict[str, Any] = {}
+                if cancellation_predicate is not None:
+                    source_repair_kwargs["cancellation_predicate"] = cancellation_predicate
+                if heartbeat is not None:
+                    source_repair_kwargs["heartbeat"] = heartbeat
+                source_ok, source_log = _run_windows_cuda_source_repair(
+                    requirements_path,
+                    dependency_target,
+                    **source_repair_kwargs,
+                )
                 if source_ok:
                     _clear_source_repair_failure()
                     install_diagnostics = _install_diagnostics_payload(
@@ -1375,7 +1420,12 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         timeout_seconds = (
             PIP_SOURCE_BUILD_TIMEOUT_SECONDS if plan.no_binary else PIP_INSTALL_TIMEOUT_SECONDS
         )
-        ok, log_output = _run_pip_install(cmd, env, timeout_seconds=timeout_seconds)
+        pip_kwargs = {"timeout_seconds": timeout_seconds}
+        if cancellation_predicate is not None:
+            pip_kwargs["cancellation_predicate"] = cancellation_predicate
+        if heartbeat is not None:
+            pip_kwargs["heartbeat"] = heartbeat
+        ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
         install_diagnostics = _install_diagnostics_payload(
             log_output, backend=plan.backend, cmake_args=plan.cmake_args or ""
         )
@@ -1520,11 +1570,24 @@ def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
     return public_result
 
 
-def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None, context_tier: Optional[str] = None) -> Dict[str, Any]:
+def ensure_desktop_llama_runtime(
+    mode: str,
+    *,
+    repo_root: Optional[Path] = None,
+    context_tier: Optional[str] = None,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
+) -> Dict[str, Any]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     return _record_desktop_runtime_probe(
-        _ensure_desktop_llama_runtime_impl(mode, repo_root=repo_root, context_tier=context_tier)
+        _ensure_desktop_llama_runtime_impl(
+            mode,
+            repo_root=repo_root,
+            context_tier=context_tier,
+            cancellation_predicate=cancellation_predicate,
+            heartbeat=heartbeat,
+        )
     )
 
 
@@ -1586,6 +1649,7 @@ class _ManagedSiteMutationLock:
         deadline = time.monotonic() + self.timeout_seconds
         while True:
             if self.cancellation_predicate is not None and self.cancellation_predicate():
+                self._close_handle()
                 raise TimeoutError("managed-site lock wait cancelled")
             try:
                 if os.name == "nt":
@@ -1598,8 +1662,19 @@ class _ManagedSiteMutationLock:
                 return self
             except OSError:
                 if time.monotonic() >= deadline:
+                    self._close_handle()
                     raise TimeoutError("managed-site lock wait timed out")
                 time.sleep(0.1)
+
+    def _close_handle(self) -> None:
+        if self._handle is None:
+            return
+        handle = self._handle
+        self._handle = None
+        try:
+            handle.close()
+        except Exception:
+            pass
 
     def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
         if self._handle is None:
@@ -1613,7 +1688,7 @@ class _ManagedSiteMutationLock:
                 import fcntl
                 fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
         finally:
-            self._handle.close()
+            self._close_handle()
 
 
 def _module_missing(required_modules: tuple[str, ...]) -> list[str]:
@@ -1705,7 +1780,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": str(exc)}
 
     if not ok:
-        action = "install_cancelled" if "outcome=cancelled" in output else ("install_timeout" if "outcome=timed_out" in output else "install_failed")
+        action = "install_cancelled" if "outcome=cancelled" in output else ("install_timeout" if ("outcome=timed_out" in output or "timed out" in output.lower()) else "install_failed")
         return {
             "ok": "false",
             "action": action,

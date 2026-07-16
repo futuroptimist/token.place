@@ -2556,6 +2556,36 @@ def test_shared_llama_module_identity_helper_edge_paths(monkeypatch):
     assert shared_identity.valid_llama_module_identity(f' {good} ') == good
 
 
+def test_shared_llama_module_identity_helper_fail_closed_normalization_paths(monkeypatch, tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock', encoding='utf-8')
+
+    identity = shared_identity.llama_module_identity_from_path(module_path)
+    assert identity is not None
+    assert shared_identity.valid_llama_module_identity(identity) == identity
+    assert shared_identity.llama_module_identity_supplied(identity) is True
+
+    with monkeypatch.context() as path_errors:
+        path_errors.setattr(
+            shared_identity.os.path,
+            'abspath',
+            lambda _path: (_ for _ in ()).throw(OSError('primary blocked')),
+        )
+        path_errors.setattr(
+            shared_identity.os.path,
+            'normpath',
+            lambda _path: (_ for _ in ()).throw(ValueError('fallback blocked')),
+        )
+
+        assert shared_identity.canonical_llama_module_identity_input(module_path) is None
+        assert shared_identity.llama_module_identity_from_path(module_path) is None
+    assert shared_identity.valid_llama_module_identity(object()) is None
+    assert shared_identity.llama_module_identity_supplied(object()) is False
+
+
 def test_llama_module_identity_windows_normalization_is_deterministic():
     base = r'C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py'
     prefixed = r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'

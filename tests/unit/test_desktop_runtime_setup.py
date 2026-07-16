@@ -2600,3 +2600,55 @@ def test_packaged_identity_fallback_matches_shared_helper_in_subprocess(tmp_path
     assert fallback['posix_real'] == fallback['posix_dotdot_symlink']
     assert fallback['windows_extended'] == fallback['windows_mixed_case']
     assert fallback['posix_real'] != fallback['other']
+
+
+def test_packaged_identity_inline_fallback_is_covered_without_utils(
+    monkeypatch, tmp_path
+) -> None:
+    original_is_file = Path.is_file
+
+    def packaged_helper_absent(path: Path) -> bool:
+        if str(path).replace('\\', '/').endswith('/utils/llm/llama_module_identity.py'):
+            return False
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, 'is_file', packaged_helper_absent)
+
+    module_name = 'desktop_runtime_setup_inline_identity_fallback_test'
+    spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock', encoding='utf-8')
+    link_root = tmp_path / 'linked'
+    link_root.symlink_to(real.parent.parent, target_is_directory=True)
+    via_dotdot = link_root / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    windows_prefixed = (
+        r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib'
+        r'\site-packages\llama_cpp\__init__.py'
+    )
+    windows_mixed = (
+        'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/'
+        'LLAMA_CPP/__init__.py'
+    )
+
+    assert module.llama_module_identity_from_path(
+        real
+    ) == module.llama_module_identity_from_path(via_dotdot)
+    assert module.llama_module_identity_from_path(
+        windows_prefixed
+    ) == module.llama_module_identity_from_path(windows_mixed)
+    assert module.llama_module_identity_from_path('unknown') is None
+    assert module.llama_module_identity_from_path('missing') is None
+    assert module.llama_module_identity_from_path('') is None
+    good = 'sha256:' + 'a' * 64
+    assert module._valid_llama_module_identity(good) == good
+    assert module._valid_llama_module_identity('sha256:' + 'A' * 64) is None
+    assert module._valid_llama_module_identity(123) is None

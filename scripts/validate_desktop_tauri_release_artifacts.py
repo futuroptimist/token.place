@@ -702,6 +702,7 @@ def worker():
         desktop_runtime_probe=private_runtime_setup,
     )
     gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    facade_capabilities = model_manager._safe_constructor_capability_payload(facade)
     constructor = gate.get('constructor_kwarg_support') or {}
     result.update({
         'runtime_action': setup.get('runtime_action'),
@@ -711,8 +712,8 @@ def worker():
         'capability_source': gate.get('capability_source'),
         'incomplete_probe_fields': gate.get('incomplete_probe_fields'),
         'facade_type': type(facade).__name__,
-        'backend': gate.get('backend'),
-        'gpu_offload_supported': gate.get('gpu_offload_supported') is True,
+        'backend': facade_capabilities.get('backend'),
+        'gpu_offload_supported': facade_capabilities.get('gpu_offload_supported') is True,
         'version': gate.get('llama_cpp_python_version'),
         'yarn_resolver_source': gate.get('yarn_resolver_source'),
         'constructor_signature_inspectable': gate.get('constructor_signature_inspectable') is True,

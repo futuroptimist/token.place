@@ -864,10 +864,14 @@ def _import_llama_cpp_runtime(*, require_real_runtime, timeout_seconds, desktop_
         raise AssertionError('raw private module path leaked into runtime setup')
     return _SubprocessLlamaCppModule()
 
+def _safe_constructor_capability_payload(facade):
+    return {{
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+    }}
+
 def _runtime_supports_qwen_yarn_rope(facade, llama_cls):
     return {{
-        'backend': getattr(facade, 'backend', None),
-        'gpu_offload_supported': True,
         'llama_cpp_python_version': '0.3.32',
         'yarn_resolver_source': 'top_level_enum',
         'constructor_signature_inspectable': True,
@@ -919,10 +923,12 @@ def worker():
         desktop_runtime_probe=private_runtime_setup,
     )
     gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    facade_capabilities = model_manager._safe_constructor_capability_payload(facade)
     result.update({
         'facade_type': type(facade).__name__,
         'facade_file_discovered': bool(getattr(facade, '__file__', None)),
-        'backend': gate.get('backend'),
+        'backend': facade_capabilities.get('backend'),
+        'gpu_offload_supported': facade_capabilities.get('gpu_offload_supported') is True,
         'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
         'supported': gate.get('supported') is True,
         'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
@@ -957,6 +963,7 @@ print(json.dumps(result, sort_keys=True))
         'desktop_probe_authoritative': True,
         'facade_file_discovered': True,
         'facade_type': '_SubprocessLlamaCppModule',
+        'gpu_offload_supported': True,
         'llama_module_identity_match': True,
         'runtime_call_count': 1,
         'runtime_probe_keys': [
@@ -2232,4 +2239,7 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert any("repo_root=runtime_import_root" in code for code in calls)
     assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
     assert any('_import_llama_cpp_runtime' in code for code in calls)
+    assert any('_safe_constructor_capability_payload' in code for code in calls)
+    assert not any("gate.get('backend')" in code for code in calls)
+    assert not any("gate.get('gpu_offload_supported')" in code for code in calls)
     assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)

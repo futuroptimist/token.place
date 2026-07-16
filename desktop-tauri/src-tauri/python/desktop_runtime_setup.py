@@ -1082,6 +1082,7 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "llama_cpp_python_version": probe.llama_cpp_python_version,
         "backend": probe.backend,
         "gpu_offload_supported": probe.gpu_offload_supported,
+        "llama_module_path": probe.llama_module_path,
         "constructor_kwarg_support": dict(probe.constructor_kwarg_support),
         "constructor_has_var_kwargs": probe.constructor_has_var_kwargs,
         "constructor_signature_inspectable": probe.constructor_signature_inspectable,
@@ -1098,6 +1099,29 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "rope_freq_scale_supported": probe.rope_freq_scale_supported,
         "yarn_orig_ctx_supported": probe.yarn_orig_ctx_supported,
     }
+
+
+_PRIVATE_RUNTIME_PROBE_ACTIONS = frozenset(
+    {
+        "already_supported",
+        "metal_already_supported",
+        "installed_cuda_reexec",
+        "installed_metal_reexec",
+    }
+)
+
+
+def _private_runtime_probe_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(result)
+    action = str(payload.get("runtime_action") or payload.get("action") or "").strip().lower()
+    module_path = str(payload.get("llama_module_path") or "").strip()
+    if (
+        action not in _PRIVATE_RUNTIME_PROBE_ACTIONS
+        or not module_path
+        or module_path in {"missing", "unknown"}
+    ):
+        payload.pop("llama_module_path", None)
+    return payload
 
 
 def _required_llama_cpp_spec(requirements_path: Path) -> tuple[str, str]:
@@ -1831,11 +1855,12 @@ def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
     """Expose the successful setup probe to later diagnostics in this process."""
 
     try:
-        os.environ[RUNTIME_PROBE_ENV] = json.dumps(result)
+        os.environ[RUNTIME_PROBE_ENV] = json.dumps(_private_runtime_probe_payload(result))
     except (TypeError, ValueError):
         os.environ.pop(RUNTIME_PROBE_ENV, None)
         return result
     public_result = dict(result)
+    public_result.pop("llama_module_path", None)
     for key in (
         "yarn_rope_supported",
         "rope_scaling_type_supported",

@@ -3776,18 +3776,57 @@ def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
     return _coerce_desktop_runtime_probe(parsed)
 
 
+_PRIVATE_DESKTOP_RUNTIME_PROBE_ACTIONS = {
+    'already_supported',
+    'metal_already_supported',
+    'installed_cuda_reexec',
+    'installed_metal_reexec',
+}
+
+
+def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
+    if not isinstance(probe, dict):
+        return None
+    interpreter = str(probe.get('interpreter') or '').strip()
+    backend = str(probe.get('backend') or '').strip().lower()
+    action = str(probe.get('runtime_action') or '').strip().lower()
+    if not interpreter or backend not in {'cpu', 'cuda', 'metal'}:
+        return None
+    if action not in _PRIVATE_DESKTOP_RUNTIME_PROBE_ACTIONS:
+        return None
+    return interpreter, backend, action
+
+
+def _probe_module_path_from_probe_dict(probe: Optional[Dict[str, Any]]) -> Optional[str]:
+    if probe is None or probe.get('error'):
+        return None
+    module_path = str(probe.get('llama_module_path') or '').strip()
+    if not module_path or module_path in {'missing', 'unknown'}:
+        return None
+    return module_path
+
+
 def _effective_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
-    return _coerce_desktop_runtime_probe(probe) or _desktop_runtime_probe_from_env()
+    explicit_probe = _coerce_desktop_runtime_probe(probe)
+    if explicit_probe is None:
+        return _desktop_runtime_probe_from_env()
+    explicit_path = _probe_module_path_from_probe_dict(explicit_probe)
+    if explicit_path:
+        return explicit_probe
+    env_probe = _desktop_runtime_probe_from_env()
+    env_path = _probe_module_path_from_probe_dict(env_probe)
+    if not env_path:
+        return explicit_probe
+    if _desktop_runtime_probe_identity(explicit_probe) != _desktop_runtime_probe_identity(env_probe):
+        return explicit_probe
+    merged_probe = dict(explicit_probe)
+    merged_probe['llama_module_path'] = env_path
+    return merged_probe
 
 
 def _probe_module_path_from_desktop_runtime_probe(probe: Any) -> Optional[str]:
     coerced = _effective_desktop_runtime_probe(probe)
-    if coerced is None or coerced.get('error'):
-        return None
-    module_path = str(coerced.get('llama_module_path') or '').strip()
-    if not module_path or module_path in {'missing', 'unknown'}:
-        return None
-    return module_path
+    return _probe_module_path_from_probe_dict(coerced)
 
 
 def _import_llama_cpp_runtime(

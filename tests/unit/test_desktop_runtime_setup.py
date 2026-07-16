@@ -2155,9 +2155,12 @@ def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tm
     )
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+    recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
 
     assert result['runtime_action'] == 'already_supported'
     assert result['selected_backend'] == 'cuda'
+    assert 'llama_module_path' not in result
+    assert recorded['llama_module_path'] == 'C:/Python/Lib/site-packages/llama_cpp/__init__.py'
 
 
 def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monkeypatch, tmp_path):

@@ -2241,6 +2241,94 @@ def test_llama_cpp_runtime_rejects_desktop_probe_import_mismatch(monkeypatch):
         )
 
 
+def test_llama_cpp_runtime_reuses_private_env_probe_for_matching_public_probe(monkeypatch):
+    import types
+    from utils.llm import model_manager as llama_model_manager
+
+    fake_module = types.SimpleNamespace(__file__='/opt/site-packages/llama_cpp/__init__.py', Llama=object)
+    monkeypatch.setenv(
+        llama_model_manager.DESKTOP_RUNTIME_PROBE_ENV,
+        json.dumps(
+            {
+                'runtime_action': 'already_supported',
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': '/python',
+                'prefix': '/prefix',
+                'llama_module_path': '/opt/site-packages/llama_cpp/__init__.py',
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 3},
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: pytest.fail('matching private env probe should avoid child discovery'),
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: pytest.fail('startup-critical child import watchdog must not run'),
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_import_llama_cpp_in_parent_with_timeout',
+        lambda **_kwargs: fake_module,
+    )
+
+    imported = llama_model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+        },
+    )
+
+    assert imported is fake_module
+
+
+def test_effective_desktop_runtime_probe_rejects_private_env_probe_identity_mismatch(monkeypatch):
+    from utils.llm import model_manager as llama_model_manager
+
+    monkeypatch.setenv(
+        llama_model_manager.DESKTOP_RUNTIME_PROBE_ENV,
+        json.dumps(
+            {
+                'runtime_action': 'already_supported',
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': '/python',
+                'prefix': '/prefix',
+                'llama_module_path': '/opt/site-packages/llama_cpp/__init__.py',
+            }
+        ),
+    )
+
+    effective = llama_model_manager._effective_desktop_runtime_probe(
+        {
+            'runtime_action': 'metal_already_supported',
+            'selected_backend': 'metal',
+            'gpu_offload_supported': True,
+            'detected_device': 'metal',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+        }
+    )
+
+    assert effective is not None
+    assert effective['llama_module_path'] == 'unknown'
+
+
 def test_compute_node_runtime_stop_skips_unregister_before_api_v1_registration():
     relay_client = MagicMock()
     relay_client._api_v1_registered_relays = set()

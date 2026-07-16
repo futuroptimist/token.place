@@ -3776,14 +3776,6 @@ def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
     return _coerce_desktop_runtime_probe(parsed)
 
 
-_PRIVATE_DESKTOP_RUNTIME_PROBE_ACTIONS = {
-    'already_supported',
-    'metal_already_supported',
-    'installed_cuda_reexec',
-    'installed_metal_reexec',
-}
-
-
 def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
     if not isinstance(probe, dict):
         return None
@@ -3792,7 +3784,7 @@ def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional
     action = str(probe.get('runtime_action') or '').strip().lower()
     if not interpreter or backend not in {'cpu', 'cuda', 'metal'}:
         return None
-    if action not in _PRIVATE_DESKTOP_RUNTIME_PROBE_ACTIONS:
+    if not action:
         return None
     return interpreter, backend, action
 

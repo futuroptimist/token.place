@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 WORKFLOW = Path('.github/workflows/desktop-release.yml')
 TAURI_CONFIG = Path('desktop-tauri/src-tauri/tauri.conf.json')
 
@@ -693,6 +695,7 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert captured['env']['PIP_NO_INDEX'] == '1'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
     assert captured['env']['PYTHONPATH'] == subprocess.os.pathsep.join([
@@ -909,6 +912,21 @@ def test_validate_embedded_python_runtime_absolutizes_packaged_model_bridge(monk
                     'n_batch': True,
                     'n_ubatch': True,
                 },
+            })
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps({
+                'runtime_action_ok': True,
+                'facade_type': '_SubprocessLlamaCppModule',
+                'backend': 'metal',
+                'gpu_offload_supported': True,
+                'version': '0.3.32',
+                'yarn_resolver_source': 'top_level_enum',
+                'constructor_signature_inspectable': True,
+                'required_kwargs_supported': True,
+                'llama_module_identity_match': True,
+                'supported': True,
+                'desktop_probe_authoritative': True,
+                'secondary_reprobe_skipped': True,
             })
         return 'ok'
 
@@ -1639,7 +1657,24 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(
         validator,
         '_run_python_sanitized',
-        lambda _python, code, app_path: calls.append(code) or json.dumps(payload if 'version_info' in code else probe),
+        lambda _python, code, app_path: calls.append(code) or json.dumps(
+            payload if 'version_info' in code else (
+                {
+                    'runtime_action_ok': True,
+                    'facade_type': '_SubprocessLlamaCppModule',
+                    'backend': 'metal',
+                    'gpu_offload_supported': True,
+                    'version': '0.3.32',
+                    'yarn_resolver_source': 'top_level_enum',
+                    'constructor_signature_inspectable': True,
+                    'required_kwargs_supported': True,
+                    'llama_module_identity_match': True,
+                    'supported': True,
+                    'desktop_probe_authoritative': True,
+                    'secondary_reprobe_skipped': True,
+                } if 'token-place-release-qwen64k-probe' in code else probe
+            )
+        ),
     )
 
     try:
@@ -1863,3 +1898,71 @@ def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(m
     assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
     assert runtime_apps == []
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
+
+
+def test_validate_embedded_python_runtime_requires_background_facade_probe(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+    py.chmod(0o755)
+    (runtime / 'embedded_python_runtime_provenance.json').write_text('{}')
+    (runtime / 'LICENSE-PYTHON.txt').write_text('notice')
+    (runtime / 'LICENSE-python-build-standalone.txt').write_text('notice')
+    resources_python = app / 'Contents' / 'Resources' / 'python'
+    resources_python.mkdir()
+    (resources_python / 'model_bridge.py').write_text('print("inspect")')
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True},
+    }
+    background = {
+        'runtime_action_ok': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'required_kwargs_supported': True,
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'secondary_reprobe_skipped': False,
+    }
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: None)
+
+    def fake_run_python_sanitized(_python, code, _app_path):
+        calls.append(code)
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps(background)
+        if '_probe_llama_runtime' in code:
+            return json.dumps(probe)
+        return 'ok'
+
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python_sanitized)
+    with pytest.raises(SystemExit, match='secondary_reprobe_skipped'):
+        validator._validate_embedded_python_runtime(app)
+    background['secondary_reprobe_skipped'] = True
+    validator._validate_embedded_python_runtime(app)
+    assert any("ensure_desktop_llama_runtime('auto', context_tier='64k-full')" in code for code in calls)
+    assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
+    assert any('_import_llama_cpp_subprocess_module' in code for code in calls)

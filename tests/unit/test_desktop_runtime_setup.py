@@ -2540,3 +2540,63 @@ def test_llama_module_identity_windows_normalization_is_deterministic():
     mixed = r'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/LLAMA_CPP/__init__.py'
     assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(prefixed)
     assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(mixed)
+
+
+def test_packaged_identity_fallback_matches_shared_helper_in_subprocess(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    python_dir.mkdir(parents=True)
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_root = tmp_path / 'link-root'
+    link_root.symlink_to(real.parent.parent, target_is_directory=True)
+    via_dotdot = link_root / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    cases = {
+        'posix_real': str(real),
+        'posix_dotdot_symlink': str(via_dotdot),
+        'windows_extended': r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py',
+        'windows_mixed_case': r'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/LLAMA_CPP/__init__.py',
+        'other': str(other),
+        'unknown': 'unknown',
+        'missing': 'missing',
+        'empty': '',
+    }
+    code = (
+        'import json, desktop_runtime_setup as d; '
+        f'cases = {cases!r}; '
+        'print(json.dumps({k: d.llama_module_identity_from_path(v) for k, v in cases.items()} | {'
+        '"valid_good": d._valid_llama_module_identity("sha256:" + "a" * 64), '
+        '"valid_bad": d._valid_llama_module_identity("sha256:" + "g" * 64), '
+        '"valid_non_string": d._valid_llama_module_identity(123)}))'
+    )
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={'PYTHONPATH': str(python_dir), 'PATH': os.environ.get('PATH', '')},
+        cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    fallback = json.loads(result.stdout)
+
+    from utils.llm import llama_module_identity as shared_identity
+
+    shared = {k: desktop_runtime_setup.llama_module_identity_from_path(v) for k, v in cases.items()}
+    assert fallback == {
+        **shared,
+        'valid_good': 'sha256:' + 'a' * 64,
+        'valid_bad': None,
+        'valid_non_string': None,
+    }
+    assert fallback['posix_real'] == fallback['posix_dotdot_symlink']
+    assert fallback['windows_extended'] == fallback['windows_mixed_case']
+    assert fallback['posix_real'] != fallback['other']

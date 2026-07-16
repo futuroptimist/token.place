@@ -324,6 +324,7 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "HOME": str(home_dir),
             "TMPDIR": str(tmpdir),
             "PIP_CACHE_DIR": str(app_data / "pip-cache"),
+            "PIP_NO_INDEX": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
             "PYTHONPYCACHEPREFIX": str(pycache),
@@ -663,6 +664,65 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
     for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
         if not constructor_support.get(key):
             _fail(f"embedded runtime probe missing capability: {key}")
+
+    background_probe = r"""
+import json, os, threading
+from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
+from utils.llm import model_manager
+
+result = {}
+
+def worker():
+    setup = ensure_desktop_llama_runtime('auto', context_tier='64k-full')
+    private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
+    facade = model_manager._import_llama_cpp_subprocess_module(
+        timeout_seconds=10, desktop_runtime_probe=private_probe
+    )
+    gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    constructor = gate.get('constructor_kwarg_support') or {}
+    result.update({
+        'runtime_action_ok': setup.get('runtime_action') in {'metal_already_supported', 'already_supported'},
+        'facade_type': type(facade).__name__,
+        'backend': gate.get('backend'),
+        'gpu_offload_supported': gate.get('gpu_offload_supported') is True,
+        'version': gate.get('llama_cpp_python_version'),
+        'yarn_resolver_source': gate.get('yarn_resolver_source'),
+        'constructor_signature_inspectable': gate.get('constructor_signature_inspectable') is True,
+        'required_kwargs_supported': all(constructor.get(name) for name in (
+            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')),
+        'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
+        'supported': gate.get('supported') is True,
+        'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
+        'secondary_reprobe_skipped': gate.get('child_probe_reprobe_skipped_reason') == 'desktop_probe_authoritative',
+    })
+
+thread = threading.Thread(target=worker, name='token-place-release-qwen64k-probe')
+thread.start()
+thread.join(timeout=30)
+if thread.is_alive():
+    raise SystemExit('background facade probe timed out')
+print(json.dumps(result, sort_keys=True))
+"""
+    background_data = json.loads(_run_python_sanitized(py, background_probe, app_path).splitlines()[-1])
+    expected_background = {
+        "runtime_action_ok": True,
+        "facade_type": "_SubprocessLlamaCppModule",
+        "backend": "metal",
+        "gpu_offload_supported": True,
+        "version": "0.3.32",
+        "yarn_resolver_source": "top_level_enum",
+        "constructor_signature_inspectable": True,
+        "required_kwargs_supported": True,
+        "llama_module_identity_match": True,
+        "supported": True,
+        "desktop_probe_authoritative": True,
+        "secondary_reprobe_skipped": True,
+    }
+    for key, expected in expected_background.items():
+        if background_data.get(key) != expected:
+            _fail(f"embedded background Qwen 64K facade probe failed {key}: {background_data.get(key)!r}")
     model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
     if model_bridge.is_file():
         model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()

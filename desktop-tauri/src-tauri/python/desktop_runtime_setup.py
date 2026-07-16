@@ -32,6 +32,10 @@ if _HAS_PACKAGED_IDENTITY_HELPER:
         valid_llama_module_identity,
     )
 else:
+    # The signed macOS bundle can execute this module from Contents/Resources/python
+    # without packaging the repository-level utils package. Keep this fallback byte-for-byte
+    # compatible with utils.llm.llama_module_identity; unit tests launch a subprocess in
+    # that packaged shape and compare POSIX, Windows, sentinel, and schema results.
     _LLAMA_MODULE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
     _LLAMA_MODULE_IDENTITY_DOMAIN = "token.place.llama_cpp.module_path.v1"
 

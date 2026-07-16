@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +19,37 @@ desktop_runtime_setup = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 sys.modules['desktop_runtime_setup'] = desktop_runtime_setup
 SPEC.loader.exec_module(desktop_runtime_setup)
+
+
+
+def test_packaged_runtime_setup_imports_utils_from_resources_root(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    utils_llm_dir = resources_root / 'utils' / 'llm'
+    python_dir.mkdir(parents=True)
+    utils_llm_dir.mkdir(parents=True)
+
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+    (resources_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
+    helper = REPO_ROOT / 'utils' / 'llm' / 'llama_module_identity.py'
+    (utils_llm_dir / 'llama_module_identity.py').write_text(helper.read_text(encoding='utf-8'), encoding='utf-8')
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(python_dir)
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', 'import desktop_runtime_setup; print(desktop_runtime_setup.__name__)'],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'desktop_runtime_setup'
 
 
 class _SysStub:

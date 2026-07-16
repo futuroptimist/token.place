@@ -328,7 +328,12 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "PYTHONNOUSERSITE": "1",
             "PYTHONPYCACHEPREFIX": str(pycache),
             "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(app_for_subprocess / "Contents" / "Resources" / "python"),
+                    str(app_for_subprocess / "Contents" / "Resources"),
+                ]
+            ),
             "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(dependency_target),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
             "TOKEN_PLACE_MODEL_DIR": str(app_data / "models"),

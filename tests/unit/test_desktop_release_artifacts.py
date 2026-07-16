@@ -650,7 +650,9 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
 def test_validator_contains_embedded_runtime_guardrails() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'Contents" / "Resources" / "python-runtime' in text
-    assert '"PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert '"PYTHONPATH": os.pathsep.join(' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources")' in text
     assert 'xcode-select' in text
     assert 'otool' in text
     assert 'embedded runtime probe did not report Metal GPU offload' in text
@@ -658,7 +660,9 @@ def test_validator_contains_embedded_runtime_guardrails() -> None:
 
 def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
-    assert 'PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert '"PYTHONPATH": os.pathsep.join(' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources")' in text
     assert "Path.cwd() / 'src-tauri' / 'python'" not in text
     assert "qwen_64k_yarn_support" in text
     assert "model_bridge.py" in text
@@ -691,7 +695,10 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
-    assert captured['env']['PYTHONPATH'] == str((app / 'Contents' / 'Resources' / 'python').absolute())
+    assert captured['env']['PYTHONPATH'] == subprocess.os.pathsep.join([
+        str((app / 'Contents' / 'Resources' / 'python').absolute()),
+        str((app / 'Contents' / 'Resources').absolute()),
+    ])
     for key in forbidden_parent_env:
         assert key not in captured['env']
 
@@ -1670,7 +1677,10 @@ def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locat
     assert env['PYTHONDONTWRITEBYTECODE'] == '1'
     assert env['PYTHONNOUSERSITE'] == '1'
     assert env['PATH'] == '/usr/bin:/bin'
-    assert env['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
+    assert env['PYTHONPATH'] == subprocess.os.pathsep.join([
+        str(app / 'Contents' / 'Resources' / 'python'),
+        str(app / 'Contents' / 'Resources'),
+    ])
     writable_keys = [
         'PYTHONPYCACHEPREFIX',
         'TMPDIR',

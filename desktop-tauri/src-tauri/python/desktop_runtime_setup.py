@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+_PACKAGED_RESOURCES_ROOT = Path(__file__).resolve().parent.parent
+if (_PACKAGED_RESOURCES_ROOT / "utils").is_dir() and str(_PACKAGED_RESOURCES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGED_RESOURCES_ROOT))
+
 from utils.llm.llama_module_identity import (
     canonical_llama_module_identity_input as _shared_canonical_llama_module_identity_input,
     strip_windows_extended_path_prefix,

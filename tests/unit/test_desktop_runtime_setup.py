@@ -2534,6 +2534,28 @@ def test_shared_llama_module_identity_helper_fallback_paths(monkeypatch, tmp_pat
     assert shared_identity.canonical_llama_module_identity_input(None) is None
 
 
+def test_shared_llama_module_identity_helper_edge_paths(monkeypatch):
+    from utils.llm import llama_module_identity as shared_identity
+
+    assert shared_identity.strip_windows_extended_path_prefix(
+        r'\\?\UNC\server\share\llama_cpp\__init__.py'
+    ) == r'\\server\share\llama_cpp\__init__.py'
+    assert shared_identity.strip_windows_extended_path_prefix(
+        r'\\?\C:\runtime\llama_cpp\__init__.py'
+    ) == r'C:\runtime\llama_cpp\__init__.py'
+    assert shared_identity.llama_module_identity_from_path('unknown') is None
+    assert shared_identity.llama_module_identity_from_path('missing') is None
+
+    class UnstringablePath:
+        def __str__(self):
+            raise ValueError('blocked')
+
+    assert shared_identity.canonical_llama_module_identity_input(UnstringablePath()) is None
+
+    good = 'sha256:' + 'b' * 64
+    assert shared_identity.valid_llama_module_identity(f' {good} ') == good
+
+
 def test_llama_module_identity_windows_normalization_is_deterministic():
     base = r'C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py'
     prefixed = r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'

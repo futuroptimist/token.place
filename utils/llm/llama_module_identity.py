@@ -23,11 +23,17 @@ def canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
     if not module_path:
         return None
     try:
-        path_text = strip_windows_extended_path_prefix(str(module_path))
+        raw_path = str(module_path).strip()
+        if raw_path.lower() in {'missing', 'unknown'}:
+            return None
+        path_text = strip_windows_extended_path_prefix(raw_path)
+    except (TypeError, ValueError, OSError):
+        return None
+    try:
         canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
     except (TypeError, ValueError, OSError):
         try:
-            canonical = os.path.normcase(os.path.normpath(strip_windows_extended_path_prefix(str(module_path))))
+            canonical = os.path.normcase(os.path.normpath(path_text))
         except (TypeError, ValueError, OSError):
             return None
     return canonical.replace('\\', '/')

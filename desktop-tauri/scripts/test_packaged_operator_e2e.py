@@ -424,12 +424,17 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
     fake_init.write_text(
         "import os, time\n"
         "__file__ = __file__\n"
+        "__version__ = '0.3.32'\n"
         "GGML_USE_CUDA = True\n"
+        "LLAMA_ROPE_SCALING_TYPE_YARN = 2\n"
+        "GGML_TYPE_Q8_0 = 8\n"
+        "GGML_TYPE_Q4_0 = 4\n"
+        "GGML_TYPE_F16 = 1\n"
         "def llama_supports_gpu_offload():\n"
         "    return True\n"
         "class Llama:\n"
-        "    def __init__(self, *args, **kwargs):\n"
-        "        self.args = args\n"
+        "    def __init__(self, model_path=None, *, n_ctx=512, n_gpu_layers=0, type_k=None, type_v=None, flash_attn=False, offload_kqv=True, n_batch=512, n_ubatch=512, rope_scaling_type=None, yarn_ext_factor=None, yarn_attn_factor=None, yarn_beta_fast=None, yarn_beta_slow=None, yarn_orig_ctx=None, rope_freq_base=None, rope_freq_scale=None, **kwargs):\n"
+        "        self.model_path = model_path\n"
         "        self.kwargs = kwargs\n"
         "    def create_chat_completion(self, *args, **kwargs):\n"
         "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n"
@@ -451,6 +456,9 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
         "        return ([0] if add_bos else []) + tokens\n",
         encoding="utf-8",
     )
+    dist_info = fake_site / "llama_cpp_python-0.3.32.dist-info"
+    dist_info.mkdir(parents=True, exist_ok=True)
+    (dist_info / "METADATA").write_text("Name: llama-cpp-python\nVersion: 0.3.32\n", encoding="utf-8")
     return fake_site, fake_init
 
 def run_llama_cpp_watchdog_regression_probe(

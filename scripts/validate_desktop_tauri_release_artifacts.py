@@ -703,7 +703,7 @@ def worker():
     )
     gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
     facade_capabilities = model_manager._safe_constructor_capability_payload(facade)
-    constructor = gate.get('constructor_kwarg_support') or {}
+    constructor = facade_capabilities.get('constructor_kwarg_support') or {}
     result.update({
         'runtime_action': setup.get('runtime_action'),
         'runtime_action_ok': setup.get('runtime_action') in {'metal_already_supported', 'already_supported'},

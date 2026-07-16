@@ -868,6 +868,10 @@ def _safe_constructor_capability_payload(facade):
     return {{
         'backend': 'metal',
         'gpu_offload_supported': True,
+        'constructor_kwarg_support': {{name: True for name in (
+            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')}},
     }}
 
 def _runtime_supports_qwen_yarn_rope(facade, llama_cls):
@@ -876,7 +880,6 @@ def _runtime_supports_qwen_yarn_rope(facade, llama_cls):
         'yarn_resolver_source': 'top_level_enum',
         'constructor_signature_inspectable': True,
         'constructor_kwarg_support': {{name: True for name in (
-            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
             'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
             'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')}},
         'llama_module_identity_match': True,
@@ -929,6 +932,14 @@ def worker():
         'facade_file_discovered': bool(getattr(facade, '__file__', None)),
         'backend': facade_capabilities.get('backend'),
         'gpu_offload_supported': facade_capabilities.get('gpu_offload_supported') is True,
+        'required_kwargs_supported': all(
+            (facade_capabilities.get('constructor_kwarg_support') or {{}}).get(name)
+            for name in (
+                'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+                'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+                'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale'
+            )
+        ),
         'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
         'supported': gate.get('supported') is True,
         'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
@@ -965,6 +976,7 @@ print(json.dumps(result, sort_keys=True))
         'facade_type': '_SubprocessLlamaCppModule',
         'gpu_offload_supported': True,
         'llama_module_identity_match': True,
+        'required_kwargs_supported': True,
         'runtime_call_count': 1,
         'runtime_probe_keys': [
             'capability_source',
@@ -2240,6 +2252,8 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
     assert any('_import_llama_cpp_runtime' in code for code in calls)
     assert any('_safe_constructor_capability_payload' in code for code in calls)
+    assert any("facade_capabilities.get('constructor_kwarg_support')" in code for code in calls)
     assert not any("gate.get('backend')" in code for code in calls)
     assert not any("gate.get('gpu_offload_supported')" in code for code in calls)
+    assert not any("gate.get('constructor_kwarg_support')" in code for code in calls)
     assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)

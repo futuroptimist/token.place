@@ -1991,13 +1991,17 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
 def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'runtime'
     home_dir = tmp_path / 'home'
+    inherited_target = tmp_path / 'inherited' / '.token_place_desktop_site'
     home_dir.mkdir()
+    inherited_target.mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(inherited_target))
     monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
 
     target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
 
     assert error is None
     assert target == runtime_root / '.token_place_desktop_site'
+    assert target != inherited_target
     assert target.is_dir()
 
 

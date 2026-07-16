@@ -3232,3 +3232,112 @@ def test_actual_probe_snippet_with_fake_llama_cpp_package(monkeypatch, tmp_path)
     assert probe.llama_cpp_python_version == '0.3.32+local'
     assert probe.yarn_rope_supported is True
     assert probe.error is None
+
+
+def test_probe_result_frame_validation_failures_return_safe_errors(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 65432
+        returncode = None
+
+        def __init__(self, stdout: bytes):
+            self.stdout = io.BytesIO(stdout)
+            self.stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    cases = [
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'["not-an-object"]\n',
+            'desktop_runtime_probe_result_not_object',
+        ),
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'{not-json}\n',
+            'desktop_runtime_probe_result_malformed',
+        ),
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'{' + (b'"x"' * desktop_runtime_setup.PROBE_RESULT_MAX_BYTES),
+            'desktop_runtime_probe_result_oversized',
+        ),
+    ]
+
+    for stdout, expected_error in cases:
+        proc = ProbeProcess(stdout)
+        monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+        probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+        assert probe.error == expected_error
+        assert probe.backend == 'missing'
+
+
+def test_probe_reader_failures_are_safe_and_close_streams(monkeypatch, tmp_path):
+    class FailingStream:
+        def __init__(self):
+            self.closed = False
+
+        def read(self, _size=-1):
+            raise OSError('reader exploded with /tmp/secret/path')
+
+        def close(self):
+            self.closed = True
+            raise OSError('close failed')
+
+    class ProbeProcess:
+        pid = 65433
+        returncode = None
+
+        def __init__(self):
+            self.stdout = FailingStream()
+            self.stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    proc = ProbeProcess()
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.error == 'desktop_runtime_probe_reader_failed:OSError'
+    assert proc.stdout.closed is True
+    assert '/tmp/secret/path' not in probe.error
+
+
+def test_probe_heartbeat_failure_terminates_process_tree(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 65434
+        returncode = None
+        stdout = io.BytesIO(b'')
+        stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return -15
+
+    proc = ProbeProcess()
+    terminated = []
+    times = iter([0.0, 0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('heartbeat sink failed')
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, heartbeat=failing_heartbeat)
+
+    assert probe.error == 'desktop_runtime_probe_heartbeat_failed:RuntimeError'
+    assert terminated == [65434]

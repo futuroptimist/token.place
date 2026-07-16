@@ -42,9 +42,11 @@ def llama_module_identity_from_path(module_path: Any) -> Optional[str]:
 
 
 def valid_llama_module_identity(value: Any) -> Optional[str]:
-    text = str(value or '').strip()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
     return text if LLAMA_MODULE_IDENTITY_RE.fullmatch(text) else None
 
 
 def llama_module_identity_supplied(value: Any) -> bool:
-    return str(value or '').strip() != ''
+    return isinstance(value, str) and value.strip() != ''

@@ -2438,6 +2438,37 @@ def test_llama_module_identity_rejects_raw_path_sentinels():
     assert desktop_runtime_setup.llama_module_identity_from_path('unknown') is None
     assert desktop_runtime_setup.llama_module_identity_from_path('missing') is None
     assert desktop_runtime_setup.llama_module_identity_from_path('') is None
+    assert desktop_runtime_setup._canonical_llama_module_identity_input(None) is None
+    assert desktop_runtime_setup._canonical_llama_module_identity_input('  UNKNOWN  ') is None
+
+
+def test_shared_llama_module_identity_helper_requires_string_identity(tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock')
+
+    identity = shared_identity.llama_module_identity_from_path(module_path)
+    assert shared_identity.valid_llama_module_identity(identity) == identity
+    assert shared_identity.valid_llama_module_identity(identity.upper()) is None
+    assert shared_identity.valid_llama_module_identity(123) is None
+    assert shared_identity.llama_module_identity_supplied(identity) is True
+    assert shared_identity.llama_module_identity_supplied('  ') is False
+    assert shared_identity.llama_module_identity_supplied(123) is False
+
+
+def test_shared_llama_module_identity_helper_fallback_paths(monkeypatch, tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock')
+
+    monkeypatch.setattr(shared_identity.os.path, 'abspath', lambda _path: (_ for _ in ()).throw(OSError('blocked')))
+    canonical = shared_identity.canonical_llama_module_identity_input(module_path)
+    assert canonical.endswith('/llama_cpp/__init__.py')
+    assert shared_identity.canonical_llama_module_identity_input(None) is None
 
 
 def test_llama_module_identity_windows_normalization_is_deterministic():

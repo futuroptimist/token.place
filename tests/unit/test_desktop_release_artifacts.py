@@ -2132,6 +2132,92 @@ def test_validate_embedded_background_probe_failure_diagnostics_are_path_free(mo
     assert private_digest not in message
     assert private_path not in message
 
+
+@pytest.mark.parametrize(
+    ('missing_key', 'bad_value'),
+    (
+        ('runtime_action_ok', False),
+        ('backend', None),
+        ('gpu_offload_supported', False),
+        ('required_kwargs_supported', False),
+    ),
+)
+def test_validate_embedded_background_probe_reports_each_safe_failure_key(monkeypatch, tmp_path, missing_key, bad_value) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python', encoding='utf-8')
+    py.chmod(0o755)
+    for notice in (
+        'embedded_python_runtime_provenance.json',
+        'LICENSE-PYTHON.txt',
+        'LICENSE-python-build-standalone.txt',
+    ):
+        (runtime / notice).write_text('notice', encoding='utf-8')
+    resources = app / 'Contents' / 'Resources' / 'python'
+    resources.mkdir(parents=True)
+    (resources / 'model_bridge.py').write_text('print("inspect")', encoding='utf-8')
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True},
+    }
+    background = {
+        'runtime_action_ok': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'required_kwargs_supported': True,
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'secondary_reprobe_skipped': True,
+        'runtime_action': 'metal_already_supported',
+        'selected_backend': 'metal',
+        'llama_cpp_python_version_match': True,
+        'capability_source': 'desktop_runtime_setup_probe',
+        'incomplete_probe_fields': [],
+    }
+    background[missing_key] = bad_value
+
+    def fake_run_python(_python, code, _app_path):
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps(background)
+        if 'model_bridge.py' in code:
+            return 'model bridge ok'
+        return json.dumps(probe)
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python)
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        validator._validate_embedded_python_runtime(app)
+
+    message = str(excinfo.value)
+    assert f'embedded background Qwen 64K facade probe failed {missing_key}: {bad_value!r}' in message
+    assert 'desktop_runtime_setup_probe' in message
+    assert 'diagnostics=' in message
+
 def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locations(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'

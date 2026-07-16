@@ -702,7 +702,7 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
         "runtime_provisioning_state": "provisioning",
         "startup_phase": phase,
         "startup_elapsed_ms": elapsed_ms,
-        "startup_deadline_ms": 0,
+        "startup_deadline_ms": None,
         "active_relay_url": _normalize_relay_urls(getattr(args, "relay_url", "https://token.place"), getattr(args, "relay_urls", None))[0],
         "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
         "effective_mode": "pending",

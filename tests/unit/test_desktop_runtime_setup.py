@@ -1831,6 +1831,39 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
     assert selected_target in sys.path
 
 
+def test_ensure_desktop_python_dependencies_lock_oserror_returns_sanitized_failure(monkeypatch, tmp_path):
+    sentinel = str(tmp_path / "secret" / "managed.lock")
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+
+    class OSErrorLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            raise OSError(f'lock busy at {sentinel}')
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', OSErrorLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('pip must not run without lock')),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'lock_unavailable'
+    assert result['detail'] == 'managed site mutation lock unavailable'
+    assert sentinel not in json.dumps(result)
+
+
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')

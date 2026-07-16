@@ -525,6 +525,21 @@ function mergeComputeStatusEvent(
 
   const isStoppedEvent = payload.type === 'stopped';
   const stoppedBase = isStoppedEvent ? stoppedComputeStatus(prev, null) : prev;
+  const provisioningFieldNames = [
+    'runtime_provisioning_state',
+    'startup_phase',
+    'startup_elapsed_ms',
+    'startup_deadline_ms',
+  ] as const;
+  const eventHasProvisioningFields = provisioningFieldNames.some((field) =>
+    Object.prototype.hasOwnProperty.call(payload, field)
+  );
+  const shouldClearOmittedProvisioningFields =
+    (payload.type === 'started' ||
+      payload.type === 'status' ||
+      payload.type === 'error' ||
+      payload.type === 'stopped') &&
+    !eventHasProvisioningFields;
   const readinessDiagnostics = readinessDiagnosticsFromEventPayload(payload);
   const shouldClearReadinessDiagnostics =
     payload.type === 'started' ||
@@ -707,19 +722,37 @@ function mergeComputeStatusEvent(
     readiness_diagnostics:
       readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
     runtime_provisioning_state:
-      typeof payload.runtime_provisioning_state === 'string'
-        ? payload.runtime_provisioning_state
-        : stoppedBase.runtime_provisioning_state,
+      payload.runtime_provisioning_state === null
+        ? null
+        : typeof payload.runtime_provisioning_state === 'string'
+          ? payload.runtime_provisioning_state
+          : shouldClearOmittedProvisioningFields
+            ? null
+            : stoppedBase.runtime_provisioning_state,
     startup_phase:
-      typeof payload.startup_phase === 'string' ? payload.startup_phase : stoppedBase.startup_phase,
+      payload.startup_phase === null
+        ? null
+        : typeof payload.startup_phase === 'string'
+          ? payload.startup_phase
+          : shouldClearOmittedProvisioningFields
+            ? null
+            : stoppedBase.startup_phase,
     startup_elapsed_ms:
-      typeof payload.startup_elapsed_ms === 'number'
-        ? payload.startup_elapsed_ms
-        : stoppedBase.startup_elapsed_ms,
+      payload.startup_elapsed_ms === null
+        ? null
+        : typeof payload.startup_elapsed_ms === 'number'
+          ? payload.startup_elapsed_ms
+          : shouldClearOmittedProvisioningFields
+            ? null
+            : stoppedBase.startup_elapsed_ms,
     startup_deadline_ms:
-      typeof payload.startup_deadline_ms === 'number'
-        ? payload.startup_deadline_ms
-        : stoppedBase.startup_deadline_ms,
+      payload.startup_deadline_ms === null
+        ? null
+        : typeof payload.startup_deadline_ms === 'number'
+          ? payload.startup_deadline_ms
+          : shouldClearOmittedProvisioningFields
+            ? null
+            : stoppedBase.startup_deadline_ms,
   };
 }
 
@@ -1249,7 +1282,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
         <p style={{ marginBottom: 0 }}>Provisioning state: <code>{computeStatus.runtime_provisioning_state || 'idle'}</code></p>
         <p style={{ marginBottom: 0 }}>Startup phase: <code>{computeStatus.startup_phase || 'none'}</code></p>
-        <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{computeStatus.startup_deadline_ms != null ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>
+        <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{Number.isFinite(computeStatus.startup_deadline_ms) && (computeStatus.startup_deadline_ms ?? 0) > 0 ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>
         <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
         <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>

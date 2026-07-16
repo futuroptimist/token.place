@@ -35,6 +35,20 @@ def _default_desktop_runtime_arch(monkeypatch):
         monkeypatch.setattr(runtime_setup.platform_module, 'machine', lambda: 'AMD64')
 
 
+def test_structured_provisioning_payload_omits_unknown_deadline(monkeypatch):
+    args = SimpleNamespace(relay_url='https://relay.example', relay_urls=None, mode='auto', model='model.gguf')
+    monkeypatch.setattr(compute_node_bridge.time, 'monotonic', lambda: 12.5)
+
+    payload = compute_node_bridge._structured_provisioning_payload(args, phase='dependency_check', started_at=10.0)
+
+    assert payload['runtime_provisioning_state'] == 'provisioning'
+    assert payload['startup_phase'] == 'dependency_check'
+    assert payload['startup_elapsed_ms'] == 2500
+    assert payload['startup_deadline_ms'] is None
+    assert payload['readiness_diagnostics']['startup_elapsed_ms'] == 2500
+    assert 'startup_deadline_ms' not in payload['readiness_diagnostics']
+
+
 def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '-1')
 

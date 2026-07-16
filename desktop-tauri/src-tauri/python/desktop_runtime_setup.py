@@ -1882,8 +1882,11 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
                 *specs,
             ]
             ok, output = _run_pip_install(cmd, env, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat)
-    except TimeoutError as exc:
-        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": str(exc)}
+    except (TimeoutError, OSError) as exc:
+        detail = "managed site mutation lock unavailable"
+        if isinstance(exc, TimeoutError) and "cancelled" in str(exc).lower():
+            detail = "managed site mutation lock cancelled"
+        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": detail}
 
     if not ok:
         action = "install_cancelled" if "outcome=cancelled" in output else ("install_timeout" if ("outcome=timed_out" in output or "timed out" in output.lower()) else "install_failed")

@@ -922,7 +922,11 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         mode="auto",
         model_path=fake_model,
         extra_env={
-            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
+            # Windows CI can spend more than five seconds importing the packaged
+            # fake runtime and completing the background Qwen 64K capability gate.
+            # Keep this lifecycle probe deterministic by giving the warm-load
+            # watchdog enough room while still bounding a genuinely wedged child.
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "15",
             "PYTHONPATH": os.pathsep.join(
                 [str(polluted_site), str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),

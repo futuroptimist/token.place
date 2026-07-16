@@ -1974,6 +1974,77 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     assert any('model_bridge.py' in code for code in calls)
 
 
+@pytest.mark.parametrize(
+    ('mutate_payload', 'mutate_probe', 'expected'),
+    (
+        (lambda payload: payload.update({'version': [3, 12]}), lambda probe: None, 'embedded Python is not CPython 3.11'),
+        (lambda payload: payload.update({'machine': 'x86_64'}), lambda probe: None, 'embedded Python is not arm64'),
+        (lambda payload: payload.update({'llama_cpp_python_version': '0.3.31'}), lambda probe: None, 'embedded runtime has wrong llama-cpp-python version'),
+        (lambda payload: payload.update({'prefix': '/tmp/outside-python-runtime'}), lambda probe: None, 'embedded Python prefix escaped app bundle'),
+        (lambda payload: None, lambda probe: probe.update({'backend': 'cpu'}), 'embedded runtime probe did not report Metal GPU offload'),
+        (lambda payload: None, lambda probe: probe.update({'qwen_64k_yarn_support': 'unsupported'}), 'embedded runtime probe missing capability: qwen_64k_yarn_support'),
+        (lambda payload: None, lambda probe: probe.update({'rope_freq_scale_supported': False}), 'embedded runtime probe missing capability: rope_freq_scale'),
+        (lambda payload: None, lambda probe: probe.update({'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True}}), 'embedded runtime probe missing capability: n_ubatch'),
+    ),
+)
+def test_validate_embedded_python_runtime_safe_capability_failures(
+    monkeypatch, tmp_path, mutate_payload, mutate_probe, expected
+) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python', encoding='utf-8')
+    py.chmod(0o755)
+    for notice in (
+        'embedded_python_runtime_provenance.json',
+        'LICENSE-PYTHON.txt',
+        'LICENSE-python-build-standalone.txt',
+    ):
+        (runtime / notice).write_text('notice', encoding='utf-8')
+
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+    mutate_payload(payload)
+    mutate_probe(probe)
+
+    def fake_run_python(_python, code, _app_path):
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if '_probe_llama_runtime' in code:
+            return json.dumps(probe)
+        return 'ok'
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python)
+
+    with pytest.raises(SystemExit) as excinfo:
+        validator._validate_embedded_python_runtime(app)
+
+    assert expected in str(excinfo.value)
+
+
 def test_validate_embedded_background_probe_failure_diagnostics_are_path_free(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -705,6 +706,48 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
     for key in forbidden_parent_env:
         assert key not in captured['env']
 
+
+def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(tmp_path) -> None:
+    resources = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_resources = resources / 'python'
+    nested_utils = resources / '_up_' / '_up_' / 'utils' / 'llm'
+    python_resources.mkdir(parents=True)
+    nested_utils.mkdir(parents=True)
+    (python_resources / 'desktop_runtime_setup.py').write_text('VALUE = "desktop-runtime"\n', encoding='utf-8')
+    (python_resources / 'path_bootstrap.py').write_text(
+        Path('desktop-tauri/src-tauri/python/path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (nested_utils.parent / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / 'model_manager.py').write_text('BOOTSTRAPPED = True\n', encoding='utf-8')
+
+    code = """
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
+from utils.llm import model_manager
+print(model_manager.BOOTSTRAPPED)
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            'PYTHONPATH': str(python_resources),
+            'PYTHONNOUSERSITE': '1',
+        },
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'True'
 
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
@@ -1963,6 +2006,7 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
         validator._validate_embedded_python_runtime(app)
     background['secondary_reprobe_skipped'] = True
     validator._validate_embedded_python_runtime(app)
+    assert any('ensure_runtime_import_paths(' in code for code in calls)
     assert any("ensure_desktop_llama_runtime('auto', context_tier='64k-full')" in code for code in calls)
     assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
     assert any('_import_llama_cpp_subprocess_module' in code for code in calls)

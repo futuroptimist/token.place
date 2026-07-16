@@ -667,6 +667,14 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
 
     background_probe = r"""
 import json, os, threading
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
 from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
 from utils.llm import model_manager
 

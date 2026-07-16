@@ -624,6 +624,7 @@ def _run_pip_install(
     timeout_seconds: int = PIP_INSTALL_TIMEOUT_SECONDS,
     cancellation_predicate: Optional[Any] = None,
     heartbeat: Optional[Any] = None,
+    startup_phase: str = "runtime_install",
 ) -> tuple[bool, str]:
     start = time.monotonic()
     stdout_chunks: list[str] = []
@@ -683,7 +684,7 @@ def _run_pip_install(
                 heartbeat({
                     "startup_elapsed_ms": int(elapsed * 1000),
                     "startup_deadline_ms": int(timeout_seconds * 1000),
-                    "startup_phase": "runtime_install",
+                    "startup_phase": startup_phase,
                 })
             except Exception as exc:
                 outcome = "heartbeat_failed"
@@ -762,7 +763,7 @@ def _source_build_repair(
         "--verbose",
         package_spec,
     ])
-    pip_kwargs: Dict[str, Any] = {"timeout_seconds": PIP_SOURCE_BUILD_TIMEOUT_SECONDS}
+    pip_kwargs: Dict[str, Any] = {"timeout_seconds": PIP_SOURCE_BUILD_TIMEOUT_SECONDS, "startup_phase": "cuda_build"}
     if cancellation_predicate is not None:
         pip_kwargs["cancellation_predicate"] = cancellation_predicate
     if heartbeat is not None:
@@ -1499,7 +1500,7 @@ def _ensure_desktop_llama_runtime_impl(
         timeout_seconds = (
             PIP_SOURCE_BUILD_TIMEOUT_SECONDS if plan.no_binary else PIP_INSTALL_TIMEOUT_SECONDS
         )
-        pip_kwargs = {"timeout_seconds": timeout_seconds}
+        pip_kwargs = {"timeout_seconds": timeout_seconds, "startup_phase": "cuda_build" if plan.backend == "cuda" and plan.no_binary else "runtime_install"}
         if cancellation_predicate is not None:
             pip_kwargs["cancellation_predicate"] = cancellation_predicate
         if heartbeat is not None:
@@ -1906,7 +1907,13 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
                 target_dir_str,
                 *specs,
             ]
-            ok, output = _run_pip_install(cmd, env, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat)
+            ok, output = _run_pip_install(
+                cmd,
+                env,
+                cancellation_predicate=cancellation_predicate,
+                heartbeat=heartbeat,
+                startup_phase="dependency_install",
+            )
     except (TimeoutError, OSError) as exc:
         detail = "managed site mutation lock unavailable"
         if isinstance(exc, TimeoutError) and "cancelled" in str(exc).lower():

@@ -226,6 +226,65 @@ def run_desktop_dependency_preflight(tmp_root: Path, *, resources_root: Path | N
     assert payload.get("ok") == "true", combined
 
 
+
+def run_managed_dependency_target_reuse_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
+    """Assert two packaged preflight launches reuse one clean managed dependency target."""
+
+    resources_root = resources_root or (tmp_root / "resources")
+    managed_target = tmp_root / "C_drive\\Users\\TokenPlace\\managed-dependencies"
+    counter_path = tmp_root / "pip-call-count.txt"
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={"TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(managed_target)},
+    )
+    probe = f"""
+import json
+import pathlib
+import sys
+sys.path.insert(0, {str(resources_root / 'python')!r})
+counter = pathlib.Path({str(counter_path)!r})
+import desktop_runtime_setup as mod
+
+def fake_run(cmd, env, **kwargs):
+    counter.write_text(str(int(counter.read_text() or '0') + 1) if counter.exists() else '1')
+    target = pathlib.Path(env['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
+    for name in ('psutil', 'requests', 'dotenv', 'cryptography'):
+        package_dir = target / name
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / '__init__.py').write_text('')
+    return True, 'fake install ok'
+
+mod._run_pip_install = fake_run
+
+def fake_missing(required_modules):
+    module_to_package = {{'dotenv': 'dotenv'}}
+    missing = []
+    target = pathlib.Path(__import__('os').environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
+    for module_name in required_modules:
+        package_name = module_to_package.get(module_name, module_name)
+        if not (target / package_name / '__init__.py').is_file():
+            missing.append(module_name)
+    return missing
+
+mod._module_missing = fake_missing
+payload = mod.ensure_desktop_python_dependencies()
+pip_calls = int(counter.read_text() or '0') if counter.exists() else 0
+print(json.dumps({{'payload': payload, 'pip_calls': pip_calls}}, sort_keys=True))
+"""
+
+    first = subprocess.run([sys.executable, "-c", probe], cwd=tmp_root, env=env, capture_output=True, text=True, check=False)  # noqa: S603
+    assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
+    first_payload = json.loads(first.stdout.strip())
+    assert first_payload["payload"].get("ok") == "true", first.stdout
+    assert first_payload["pip_calls"] == 1, first.stdout
+
+    second = subprocess.run([sys.executable, "-c", probe], cwd=tmp_root, env=env, capture_output=True, text=True, check=False)  # noqa: S603
+    assert second.returncode == 0, f"{second.stdout}\n{second.stderr}"
+    second_payload = json.loads(second.stdout.strip())
+    assert second_payload["payload"].get("ok") == "true", second.stdout
+    assert second_payload["pip_calls"] == 1, second.stdout
+
 def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
     resources_root = resources_root or (tmp_root / "resources")
     env = _packaged_env(tmp_root, resources_root)
@@ -1058,6 +1117,7 @@ def main() -> int:
         bridge_script = create_packaged_layout(tmp_path)
         run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
+        run_managed_dependency_target_reuse_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
         run_llama_cpp_watchdog_regression_probe(tmp_path)
         run_llama_cpp_facade_early_exit_diagnostics_probe(tmp_path)

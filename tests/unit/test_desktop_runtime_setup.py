@@ -243,6 +243,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout'] = kwargs.get('timeout_seconds')
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_install)
@@ -251,6 +252,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
     assert result['selected_backend'] == 'metal'
     assert result['runtime_action'] == 'installed_metal_reexec'
+    assert captured['startup_phase'] == 'runtime_install'
     assert '--target' in captured['cmd']
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert captured['env']['FORCE_CMAKE'] == '1'
@@ -435,6 +437,7 @@ def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_
     def _capture_install(cmd, env, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_install)
@@ -442,6 +445,7 @@ def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
 
     assert result['runtime_action'] == 'installed_metal_reexec'
+    assert captured['startup_phase'] == 'runtime_install'
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert str(dependency_target) in captured['env']['PYTHONPATH']
@@ -881,15 +885,22 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     def fake_execve(prog, argv, env):
         called['prog'] = prog
         called['argv'] = argv
+        called['env'] = dict(env)
         called['guard'] = env.get(desktop_runtime_setup.REEXEC_GUARD_ENV)
 
     monkeypatch.setattr(desktop_runtime_setup.os, 'execve', fake_execve)
     monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-123')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', '41')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', '/tmp/token-place-managed-site')
 
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
 
     assert called['prog'] == sys.executable
     assert called['guard'] == '1'
+    assert called['env']['TOKENPLACE_COMPUTE_NODE_SESSION_ID'] == 'session-123'
+    assert called['env']['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == '41'
+    assert called['env']['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == '/tmp/token-place-managed-site'
 
 
 def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
@@ -1140,10 +1151,11 @@ def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     dependency_target = tmp_path / 'desktop deps'
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1151,6 +1163,7 @@ def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     ok, _ = desktop_runtime_setup._windows_cuda_source_repair(requirements_path, dependency_target)
 
     assert ok is True
+    assert captured['startup_phase'] == 'cuda_build'
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert captured['env']['PYTHONPATH'].split(os.pathsep)[0] == str(dependency_target)
@@ -1164,10 +1177,11 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch, tmp_path):
     requirements_path.write_text('llama_cpp_python==0.3.32\n', encoding='utf-8')
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1191,10 +1205,11 @@ def test_windows_source_repair_returns_actionable_message_when_requirements_miss
     missing_requirements = tmp_path / 'AppData' / 'requirements.txt'
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1814,6 +1829,7 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
 
     def _capture_run(cmd, *_args, **_kwargs):
         captured['cmd'] = cmd
+        captured['startup_phase'] = _kwargs.get('startup_phase')
         return False, 'install failed: boom'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
@@ -1823,6 +1839,7 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
     assert result['ok'] == 'false'
     assert result['action'] == 'install_failed'
     assert result['detail'] == 'install failed: boom'
+    assert captured['startup_phase'] == 'dependency_install'
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     selected_target = str(tmp_path / '.token_place_desktop_site')
@@ -1898,6 +1915,7 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
 
     def _capture_run(cmd, *_args, **_kwargs):
         captured['cmd'] = cmd
+        captured['startup_phase'] = _kwargs.get('startup_phase')
         return False, 'install failed: boom'
 
     original_mkdir = desktop_runtime_setup.Path.mkdir
@@ -1913,6 +1931,7 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=runtime_root)
 
     assert result['action'] == 'install_failed'
+    assert captured['startup_phase'] == 'dependency_install'
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')

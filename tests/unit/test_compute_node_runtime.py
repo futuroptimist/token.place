@@ -2326,6 +2326,8 @@ def test_effective_desktop_runtime_probe_rejects_private_env_probe_identity_mism
     )
 
     assert effective is not None
+    assert effective['backend'] == 'metal'
+    assert effective['runtime_action'] == 'metal_already_supported'
     assert effective['llama_module_path'] == 'unknown'
 
 

@@ -1113,6 +1113,8 @@ _INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({"missing", "unknown"})
 
 
 def _private_runtime_probe_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the private env handoff payload, keeping module_path only for valid runtime results."""
+
     payload = dict(result)
     action = str(payload.get("runtime_action") or "").strip().lower()
     module_path = str(payload.get("llama_module_path") or "").strip()

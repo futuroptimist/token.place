@@ -3781,6 +3781,8 @@ _INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({'missing', 'unknown'})
 
 
 def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
+    """Return a validated (interpreter, backend, runtime_action) identity tuple for a probe."""
+
     if not isinstance(probe, dict):
         return None
     interpreter = str(probe.get('interpreter') or '').strip()
@@ -3794,6 +3796,8 @@ def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional
 
 
 def _probe_module_path_from_probe_dict(probe: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return a validated llama_cpp module path from a probe dict, or None for invalid/sentinel values."""
+
     if probe is None or probe.get('error'):
         return None
     module_path = str(probe.get('llama_module_path') or '').strip()

@@ -789,6 +789,188 @@ print(json.dumps({
         'requirements_found': True,
     }
 
+
+def test_background_probe_uses_production_runtime_import_and_private_identity(tmp_path) -> None:
+    resources = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_resources = resources / 'python'
+    runtime_import_root = resources / '_up_' / '_up_'
+    nested_utils = runtime_import_root / 'utils' / 'llm'
+    python_resources.mkdir(parents=True)
+    nested_utils.mkdir(parents=True)
+    sentinel_path = str((tmp_path / 'private' / 'llama_cpp' / '__init__.py').resolve())
+    sentinel_digest = 'sha256:' + ('a' * 64)
+    (runtime_import_root / 'requirements.txt').write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    (python_resources / 'desktop_runtime_setup.py').write_text(
+        f"""
+import json
+import os
+from pathlib import Path
+
+RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
+
+def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
+    root = Path(repo_root)
+    if mode != 'auto' or context_tier != '64k-full':
+        raise RuntimeError('unexpected runtime arguments')
+    if not (root / 'requirements.txt').is_file():
+        raise RuntimeError('missing packaged requirements metadata')
+    os.environ[RUNTIME_PROBE_ENV] = json.dumps({{
+        'llama_module_identity': {sentinel_digest!r},
+        'llama_module_path': {sentinel_path!r},
+    }})
+    return {{
+        'runtime_action': 'metal_already_supported',
+        'selected_backend': 'metal',
+        'llama_cpp_python_version_match': 'match',
+        'llama_module_path_present': True,
+        'capability_source': 'desktop_runtime_setup_probe',
+    }}
+""",
+        encoding='utf-8',
+    )
+    (python_resources / 'path_bootstrap.py').write_text(
+        Path('desktop-tauri/src-tauri/python/path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (nested_utils.parent / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / 'model_manager.py').write_text(
+        f"""
+from pathlib import Path
+import threading
+
+RUNTIME_CALLS = []
+SUBPROCESS_CALLS = []
+
+class _SubprocessLlamaCppModule:
+    __file__ = {sentinel_path!r}
+    backend = 'metal'
+    class Llama:
+        pass
+
+def _import_llama_cpp_subprocess_module(*args, **kwargs):
+    SUBPROCESS_CALLS.append((args, kwargs))
+    raise AssertionError('direct subprocess facade constructor must not be used')
+
+def _import_llama_cpp_runtime(*, require_real_runtime, timeout_seconds, desktop_runtime_probe):
+    if threading.current_thread() is threading.main_thread():
+        raise AssertionError('runtime import did not run in background thread')
+    RUNTIME_CALLS.append(dict(desktop_runtime_probe))
+    if require_real_runtime is not True or timeout_seconds != 10:
+        raise AssertionError('unexpected import arguments')
+    if desktop_runtime_probe.get('llama_module_identity') != {sentinel_digest!r}:
+        raise AssertionError('private identity was not merged')
+    if 'llama_module_path' in desktop_runtime_probe:
+        raise AssertionError('raw private module path leaked into runtime setup')
+    return _SubprocessLlamaCppModule()
+
+def _runtime_supports_qwen_yarn_rope(facade, llama_cls):
+    return {{
+        'backend': getattr(facade, 'backend', None),
+        'gpu_offload_supported': True,
+        'llama_cpp_python_version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'constructor_kwarg_support': {{name: True for name in (
+            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')}},
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'child_probe_reprobe_skipped_reason': 'desktop_probe_authoritative',
+        'capability_source': 'desktop_runtime_setup_probe',
+        'incomplete_probe_fields': [],
+    }}
+""",
+        encoding='utf-8',
+    )
+
+    code = """
+import json, os, threading
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
+from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
+from pathlib import Path
+from utils.llm import model_manager
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('packaged runtime metadata missing: requirements.txt')
+
+result = {}
+
+def worker():
+    setup = ensure_desktop_llama_runtime('auto', repo_root=runtime_import_root, context_tier='64k-full')
+    private_runtime_setup = dict(setup)
+    private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
+    private_identity = private_probe.get('llama_module_identity')
+    if isinstance(private_identity, str):
+        private_runtime_setup['llama_module_identity'] = private_identity
+    facade = model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        timeout_seconds=10,
+        desktop_runtime_probe=private_runtime_setup,
+    )
+    gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    result.update({
+        'facade_type': type(facade).__name__,
+        'facade_file_discovered': bool(getattr(facade, '__file__', None)),
+        'backend': gate.get('backend'),
+        'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
+        'supported': gate.get('supported') is True,
+        'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
+        'runtime_call_count': len(model_manager.RUNTIME_CALLS),
+        'subprocess_call_count': len(model_manager.SUBPROCESS_CALLS),
+        'runtime_probe_keys': sorted(model_manager.RUNTIME_CALLS[0]),
+    })
+
+thread = threading.Thread(target=worker, name='token-place-release-qwen64k-probe')
+thread.start()
+thread.join(timeout=30)
+if thread.is_alive():
+    raise SystemExit('background facade probe timed out')
+print(json.dumps(result, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={'PYTHONPATH': str(python_resources), 'PYTHONNOUSERSITE': '1'},
+        cwd=str(tmp_path),
+    )
+
+    captured = result.stdout + result.stderr
+    assert result.returncode == 0, result.stderr
+    assert sentinel_path not in captured
+    assert sentinel_digest not in captured
+    payload = json.loads(result.stdout.strip())
+    assert payload == {
+        'backend': 'metal',
+        'desktop_probe_authoritative': True,
+        'facade_file_discovered': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'llama_module_identity_match': True,
+        'runtime_call_count': 1,
+        'runtime_probe_keys': [
+            'capability_source',
+            'llama_cpp_python_version_match',
+            'llama_module_identity',
+            'llama_module_path_present',
+            'runtime_action',
+            'selected_backend',
+        ],
+        'subprocess_call_count': 0,
+        'supported': True,
+    }
+
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     install_step = text.split('- name: Install desktop llama-cpp runtime with platform GPU backend', 1)[1]
@@ -2049,4 +2231,5 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert any('ensure_runtime_import_paths(' in code for code in calls)
     assert any("repo_root=runtime_import_root" in code for code in calls)
     assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
-    assert any('_import_llama_cpp_subprocess_module' in code for code in calls)
+    assert any('_import_llama_cpp_runtime' in code for code in calls)
+    assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)

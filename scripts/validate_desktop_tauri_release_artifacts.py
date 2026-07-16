@@ -691,17 +691,25 @@ def worker():
         repo_root=runtime_import_root,
         context_tier='64k-full',
     )
+    private_runtime_setup = dict(setup)
     private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
-    facade = model_manager._import_llama_cpp_subprocess_module(
-        timeout_seconds=10, desktop_runtime_probe=private_probe
+    private_identity = private_probe.get('llama_module_identity')
+    if isinstance(private_identity, str):
+        private_runtime_setup['llama_module_identity'] = private_identity
+    facade = model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        timeout_seconds=10,
+        desktop_runtime_probe=private_runtime_setup,
     )
     gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
     constructor = gate.get('constructor_kwarg_support') or {}
     result.update({
         'runtime_action': setup.get('runtime_action'),
         'runtime_action_ok': setup.get('runtime_action') in {'metal_already_supported', 'already_supported'},
-        'runtime_selected_backend': setup.get('runtime_selected_backend'),
-        'version_match': setup.get('version_match'),
+        'selected_backend': setup.get('selected_backend'),
+        'llama_cpp_python_version_match': setup.get('llama_cpp_python_version_match'),
+        'capability_source': gate.get('capability_source'),
+        'incomplete_probe_fields': gate.get('incomplete_probe_fields'),
         'facade_type': type(facade).__name__,
         'backend': gate.get('backend'),
         'gpu_offload_supported': gate.get('gpu_offload_supported') is True,
@@ -742,7 +750,7 @@ print(json.dumps(result, sort_keys=True))
     }
     safe_background_diagnostics = {
         key: background_data.get(key)
-        for key in ("runtime_action", "runtime_selected_backend", "version_match")
+        for key in ("runtime_action", "selected_backend", "llama_cpp_python_version_match", "capability_source", "llama_module_identity_match", "incomplete_probe_fields")
     }
     for key, expected in expected_background.items():
         if background_data.get(key) != expected:

@@ -676,12 +676,21 @@ ensure_runtime_import_paths(
 )
 
 from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
+from pathlib import Path
 from utils.llm import model_manager
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('packaged runtime metadata missing: requirements.txt')
 
 result = {}
 
 def worker():
-    setup = ensure_desktop_llama_runtime('auto', context_tier='64k-full')
+    setup = ensure_desktop_llama_runtime(
+        'auto',
+        repo_root=runtime_import_root,
+        context_tier='64k-full',
+    )
     private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
     facade = model_manager._import_llama_cpp_subprocess_module(
         timeout_seconds=10, desktop_runtime_probe=private_probe
@@ -689,7 +698,10 @@ def worker():
     gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
     constructor = gate.get('constructor_kwarg_support') or {}
     result.update({
+        'runtime_action': setup.get('runtime_action'),
         'runtime_action_ok': setup.get('runtime_action') in {'metal_already_supported', 'already_supported'},
+        'runtime_selected_backend': setup.get('runtime_selected_backend'),
+        'version_match': setup.get('version_match'),
         'facade_type': type(facade).__name__,
         'backend': gate.get('backend'),
         'gpu_offload_supported': gate.get('gpu_offload_supported') is True,
@@ -728,9 +740,16 @@ print(json.dumps(result, sort_keys=True))
         "desktop_probe_authoritative": True,
         "secondary_reprobe_skipped": True,
     }
+    safe_background_diagnostics = {
+        key: background_data.get(key)
+        for key in ("runtime_action", "runtime_selected_backend", "version_match")
+    }
     for key, expected in expected_background.items():
         if background_data.get(key) != expected:
-            _fail(f"embedded background Qwen 64K facade probe failed {key}: {background_data.get(key)!r}")
+            _fail(
+                f"embedded background Qwen 64K facade probe failed {key}: "
+                f"{background_data.get(key)!r}; diagnostics={safe_background_diagnostics!r}"
+            )
     model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
     if model_bridge.is_file():
         model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()

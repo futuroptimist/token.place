@@ -710,10 +710,30 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
 def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(tmp_path) -> None:
     resources = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
     python_resources = resources / 'python'
-    nested_utils = resources / '_up_' / '_up_' / 'utils' / 'llm'
+    runtime_import_root = resources / '_up_' / '_up_'
+    nested_utils = runtime_import_root / 'utils' / 'llm'
     python_resources.mkdir(parents=True)
     nested_utils.mkdir(parents=True)
-    (python_resources / 'desktop_runtime_setup.py').write_text('VALUE = "desktop-runtime"\n', encoding='utf-8')
+    (runtime_import_root / 'requirements.txt').write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    (python_resources / 'desktop_runtime_setup.py').write_text(
+        """
+import json
+import os
+from pathlib import Path
+
+RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
+
+def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
+    root = Path(repo_root)
+    if mode != 'auto' or context_tier != '64k-full':
+        raise RuntimeError('unexpected runtime arguments')
+    if not (root / 'requirements.txt').is_file():
+        raise RuntimeError('missing packaged requirements metadata')
+    os.environ[RUNTIME_PROBE_ENV] = json.dumps({'private': True})
+    return {'repo_root_name': root.name, 'requirements_found': True}
+""",
+        encoding='utf-8',
+    )
     (python_resources / 'path_bootstrap.py').write_text(
         Path('desktop-tauri/src-tauri/python/path_bootstrap.py').read_text(encoding='utf-8'),
         encoding='utf-8',
@@ -723,6 +743,8 @@ def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(
     (nested_utils / 'model_manager.py').write_text('BOOTSTRAPPED = True\n', encoding='utf-8')
 
     code = """
+import json
+from pathlib import Path
 import desktop_runtime_setup
 from path_bootstrap import ensure_runtime_import_paths
 
@@ -731,8 +753,22 @@ ensure_runtime_import_paths(
     avoid_llama_cpp_shadowing=True,
 )
 
+from desktop_runtime_setup import ensure_desktop_llama_runtime
 from utils.llm import model_manager
-print(model_manager.BOOTSTRAPPED)
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('requirements metadata not found')
+setup = ensure_desktop_llama_runtime(
+    'auto',
+    repo_root=runtime_import_root,
+    context_tier='64k-full',
+)
+print(json.dumps({
+    'bootstrapped': model_manager.BOOTSTRAPPED,
+    'repo_root_name': setup['repo_root_name'],
+    'requirements_found': setup['requirements_found'],
+}, sort_keys=True))
 """
     result = subprocess.run(
         [sys.executable, '-c', code],
@@ -747,7 +783,11 @@ print(model_manager.BOOTSTRAPPED)
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == 'True'
+    assert json.loads(result.stdout.strip()) == {
+        'bootstrapped': True,
+        'repo_root_name': '_up_',
+        'requirements_found': True,
+    }
 
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
@@ -2007,6 +2047,6 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     background['secondary_reprobe_skipped'] = True
     validator._validate_embedded_python_runtime(app)
     assert any('ensure_runtime_import_paths(' in code for code in calls)
-    assert any("ensure_desktop_llama_runtime('auto', context_tier='64k-full')" in code for code in calls)
+    assert any("repo_root=runtime_import_root" in code for code in calls)
     assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
     assert any('_import_llama_cpp_subprocess_module' in code for code in calls)

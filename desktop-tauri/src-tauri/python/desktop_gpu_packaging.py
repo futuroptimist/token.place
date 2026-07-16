@@ -148,7 +148,17 @@ def llama_cpp_install_plan_fallbacks(
                 platform=primary.platform,
                 backend="metal",
                 package_spec=primary.package_spec,
-                cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+                cmake_args=(
+                    "-DGGML_METAL=ON "
+                    "-DGGML_METAL_EMBED_LIBRARY=ON "
+                    "-DGGML_NATIVE=OFF "
+                    "-DGGML_OPENMP=OFF "
+                    "-DGGML_ACCELERATE=ON "
+                    "-DGGML_BLAS=ON "
+                    "-DGGML_BLAS_VENDOR=Apple "
+                    "-DLLAMA_CURL=OFF "
+                    "-DLLAMA_OPENSSL=OFF"
+                ),
                 force_cmake=True,
                 index_url=LLAMA_CPP_PYPI_INDEX_URL,
                 only_binary=False,
@@ -192,7 +202,7 @@ def backend_probe_satisfies_install_plan(plan: LlamaCppInstallPlan, probe: Any) 
         plan.backend == "metal"
         and plan.platform == "darwin"
         and plan.force_cmake
-        and "GGML_METAL=on" in (plan.cmake_args or "")
+        and "GGML_METAL=ON" in (plan.cmake_args or "").upper()
     ):
         return False
 

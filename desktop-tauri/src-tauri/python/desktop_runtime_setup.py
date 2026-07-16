@@ -1699,10 +1699,16 @@ def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
 
 
 def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
-    preferred_targets = [
-        ("runtime_root", _desktop_dependency_target(runtime_root)),
-        ("home_fallback", Path.home() / ".token_place_desktop_site"),
-    ]
+    dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
+    preferred_targets = []
+    if dependency_target:
+        preferred_targets.append(("env_override", Path(dependency_target)))
+    preferred_targets.extend(
+        [
+            ("runtime_root", _desktop_dependency_target(runtime_root)),
+            ("home_fallback", Path.home() / ".token_place_desktop_site"),
+        ]
+    )
     errors: list[str] = []
     for label, candidate in preferred_targets:
         ok, error = _is_writable_directory(candidate)

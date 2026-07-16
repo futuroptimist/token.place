@@ -49,9 +49,16 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
 
 @pytest.fixture(autouse=True)
 def _default_desktop_arch(monkeypatch):
-    """Keep win32 platform simulations independent from the host CPU architecture."""
+    """Keep desktop runtime tests isolated from host architecture and managed-site state."""
 
+    original_sys_path = list(sys.path)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'AMD64')
+    try:
+        yield
+    finally:
+        os.environ.pop('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', None)
+        sys.path[:] = original_sys_path
 
 
 def test_pip_source_build_timeout_env_uses_default_for_malformed_values(monkeypatch):
@@ -1818,7 +1825,10 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
     assert result['detail'] == 'install failed: boom'
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
-    assert captured['cmd'][target_idx] == str(tmp_path / '.token_place_desktop_site')
+    selected_target = str(tmp_path / '.token_place_desktop_site')
+    assert captured['cmd'][target_idx] == selected_target
+    assert os.environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == selected_target
+    assert selected_target in sys.path
 
 
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
@@ -1988,20 +1998,39 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         assert invoked == {"pip": True, "source_repair": False}
 
 
-def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
+def test_resolve_desktop_dependency_target_prefers_env_override(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'runtime'
     home_dir = tmp_path / 'home'
-    inherited_target = tmp_path / 'inherited' / '.token_place_desktop_site'
+    override_target = tmp_path / 'external-desktop-site'
     home_dir.mkdir()
-    inherited_target.mkdir(parents=True)
-    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(inherited_target))
+    probes = []
+
+    def _fake_writable(candidate):
+        probes.append(candidate)
+        return True, None
+
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(override_target))
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == override_target
+    assert probes == [override_target]
+
+
+def test_resolve_desktop_dependency_target_prefers_writable_runtime_target_without_env_override(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir()
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
 
     target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
 
     assert error is None
     assert target == runtime_root / '.token_place_desktop_site'
-    assert target != inherited_target
     assert target.is_dir()
 
 
@@ -2019,6 +2048,7 @@ def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fai
             return False, 'read-only runtime target'
         return True, None
 
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
     monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
 

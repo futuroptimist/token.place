@@ -2218,3 +2218,47 @@ describe('desktop app start failure handling', () => {
   });
 
 });
+
+describe('desktop Python runtime error normalization', () => {
+  afterEach(() => cleanup());
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    eventHandlers.clear();
+    listenMock.mockImplementation((event: string, handler: unknown) => {
+      eventHandlers.set(event, handler as (evt: { payload: Record<string, unknown> }) => void);
+      return Promise.resolve(() => {});
+    });
+  });
+
+  it('hides raw xcode-select launcher diagnostics and disables Python-dependent actions', async () => {
+    const rawFailure = "no usable Python 3 interpreter found for desktop Python subprocess (consulted override env var: TOKEN_PLACE_SIDECAR_PYTHON); tried: python3 -> status=1 stdout='' stderr='xcode-select: note: No developer tools were found, requesting install. If developer tools are located at a non-default location on disk, use sudo xcode-select --switch /Applications/Xcode.app. /Users/daniel/private'; python -> spawn failed: missing";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_inference') return Promise.reject(new Error(rawFailure));
+      if (command === 'detect_backend') return Promise.resolve({ platform_label: 'macos', preferred_mode: 'auto', available_backend: 'metal', availability_label: 'Metal-capable platform (Apple Silicon)' });
+      if (command === 'load_config') return Promise.resolve({ model_path: '/tmp/model.gguf', relay_base_url: 'https://token.place', preferred_mode: 'auto' });
+      if (command === 'get_compute_node_status') return Promise.resolve({ running: false, registered: false, active_relay_url: '', requested_mode: 'auto', effective_mode: 'cpu', backend_available: 'unknown', backend_selected: 'cpu', backend_used: 'cpu', fallback_reason: null, model_path: '', last_error: null });
+      return Promise.resolve({ canonical_family_url: 'https://example.test/models', filename: 'model.gguf', url: 'https://example.test/model.gguf', models_dir: '/tmp', resolved_model_path: '/tmp/model.gguf', exists: true, size_bytes: 1 });
+    });
+
+    render(<App />);
+    const promptArea = (await screen.findByText('Prompt')).parentElement?.querySelector('textarea');
+    fireEvent.change(promptArea as HTMLTextAreaElement, { target: { value: 'hello' } });
+    const startInferenceButton = (await screen.findByText('Start local inference')) as HTMLButtonElement;
+    await waitFor(() => expect(startInferenceButton.disabled).toBe(false));
+    fireEvent.click(startInferenceButton);
+
+    await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
+    const body = document.body.textContent ?? '';
+    expect(body).toContain('Diagnostic code: desktop_python_runtime_invalid');
+    expect(body).not.toContain('xcode-select');
+    expect(body).not.toContain('sudo');
+    expect(body).not.toContain('Xcode.app');
+    expect(body).not.toContain('TOKEN_PLACE_SIDECAR_PYTHON');
+    expect(body).not.toContain('/Users/daniel');
+    expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
+  });
+});

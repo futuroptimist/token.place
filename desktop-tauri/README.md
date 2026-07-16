@@ -257,29 +257,22 @@ keys, and decrypted relay payloads.
 
 ### macOS packaged Metal runtime provisioning
 
-Packaged macOS operator startup may use Apple Command Line Tools Python (for
-example `/Library/Developer/CommandLineTools/usr/bin/python3`). The desktop
-runtime bootstrap treats that interpreter as an execution host only: it installs
-`llama-cpp-python` into a writable desktop dependency target, adds that target to
-`PYTHONPATH`, and verifies `import llama_cpp` from the same path before relay
-registration.
+Apple Silicon release DMGs bundle a self-contained CPython 3.11 runtime at
+`token.place desktop.app/Contents/Resources/python-runtime/bin/python3`. Normal
+packaged-app users do not need Python, Homebrew, Xcode, Xcode Command Line
+Tools, CMake, compiler toolchains, or Python packages. Packaged macOS startup
+uses only the bundled runtime unless the user deliberately sets the documented
+development override variable.
 
-The `desktop.runtime_setup` log line includes the selected interpreter, Python
-version, prefix/base_prefix, dependency target, pip availability, module path,
-install action, fallback reason, and (when provisioning ran) the bounded pip
-command/stdout/stderr tails plus CMake flags. Status events expose the same
-runtime diagnostics, but `last_error` remains reserved for concise actionable
-startup/relay failures instead of verbose pip logs. Metal source builds set
-`CMAKE_ARGS="-DGGML_METAL=on -DGGML_NATIVE=off"` and `FORCE_CMAKE=1`. In `gpu`
-mode, Metal provisioning failure is fatal before relay registration; in
-`auto`/`hybrid`, a successful CPU runtime install/import is reported as
-`metal_cpu_fallback` and can still reach `Registered: yes`.
+If the bundled runtime is missing, damaged, incompatible, or blocked, the app
+fails closed with a concise reinstall message and a stable diagnostic code. Do
+not ask packaged-app users to install Python or developer tools for that case;
+reinstall the desktop app or use a newer release artifact. Developer builds may
+still use `TOKEN_PLACE_PYTHON` / `TOKEN_PLACE_SIDECAR_PYTHON` to point at a
+Python 3.11+ interpreter.
 
-To capture debug logs for a packaged app, launch the sidecar/bridge from a
-terminal or collect the packaged app stderr/stdout log and search for
-`desktop.runtime_setup`, `desktop.compute_node_bridge.model_init.*`, and
-`desktop.compute_node_bridge.registration.*`. If CLT Python lacks `pip` or build
-tooling, install/repair pip for that interpreter or install Xcode Command Line
-Tools, then rerun packaged startup; the app-managed dependency target remains
-under `.token_place_desktop_site` and should not require writing into the CLT
-Python prefix.
+When the bundled runtime is valid, runtime probing reports `runtime_origin=bundled`
+and must not run pip, reinstall `llama-cpp-python`, require network access, or
+silently fall back from Metal to CPU. Repair packages, when explicitly needed,
+remain in the writable app-data dependency target and are installed by invoking
+pip through the bundled interpreter rather than modifying `Contents/Resources`.

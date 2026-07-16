@@ -680,7 +680,11 @@ def _run_pip_install(
         if heartbeat is not None and elapsed - last_heartbeat >= 5:
             last_heartbeat = elapsed
             try:
-                heartbeat({"startup_elapsed_ms": int(elapsed * 1000), "startup_deadline_ms": int(timeout_seconds * 1000)})
+                heartbeat({
+                    "startup_elapsed_ms": int(elapsed * 1000),
+                    "startup_deadline_ms": int(timeout_seconds * 1000),
+                    "startup_phase": "runtime_install",
+                })
             except Exception as exc:
                 outcome = "heartbeat_failed"
                 _terminate_process_tree(process)
@@ -762,7 +766,11 @@ def _source_build_repair(
     if cancellation_predicate is not None:
         pip_kwargs["cancellation_predicate"] = cancellation_predicate
     if heartbeat is not None:
-        pip_kwargs["heartbeat"] = heartbeat
+        def _source_emit(extra: Dict[str, Any]) -> None:
+            safe_extra = dict(extra)
+            safe_extra["startup_phase"] = "cuda_build"
+            heartbeat(safe_extra)
+        pip_kwargs["heartbeat"] = _source_emit
     ok, output = _run_pip_install(cmd, env, **pip_kwargs)
     if not metadata_warning:
         return ok, output
@@ -1355,6 +1363,17 @@ def _ensure_desktop_llama_runtime_impl(
 
     install_diagnostics: Dict[str, str] = {}
 
+    def _phase_heartbeat(phase: str) -> Optional[Any]:
+        if heartbeat is None:
+            return None
+
+        def _emit(extra: Dict[str, Any]) -> None:
+            safe_extra = dict(extra)
+            safe_extra["startup_phase"] = phase
+            heartbeat(safe_extra)
+
+        return _emit
+
     attempted_cuda_source_build = False
     cuda_source_build_suppressed = False
     if expected_backend == "cuda":
@@ -1371,7 +1390,7 @@ def _ensure_desktop_llama_runtime_impl(
                 if cancellation_predicate is not None:
                     source_repair_kwargs["cancellation_predicate"] = cancellation_predicate
                 if heartbeat is not None:
-                    source_repair_kwargs["heartbeat"] = heartbeat
+                    source_repair_kwargs["heartbeat"] = _phase_heartbeat("cuda_build")
                 source_after_probe: Optional[RuntimeProbe] = None
                 try:
                     with _ManagedSiteMutationLock(dependency_target, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
@@ -1484,7 +1503,9 @@ def _ensure_desktop_llama_runtime_impl(
         if cancellation_predicate is not None:
             pip_kwargs["cancellation_predicate"] = cancellation_predicate
         if heartbeat is not None:
-            pip_kwargs["heartbeat"] = heartbeat
+            pip_kwargs["heartbeat"] = _phase_heartbeat(
+                "cuda_build" if plan.backend == "cuda" and plan.no_binary else "runtime_install"
+            )
         after_probe_hint: Optional[RuntimeProbe] = None
         try:
             with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
@@ -1752,7 +1773,11 @@ class _ManagedSiteMutationLock:
                     if self.heartbeat is not None and now - last_heartbeat >= 5:
                         last_heartbeat = now
                         try:
-                            self.heartbeat({"startup_elapsed_ms": int((now - started_at) * 1000), "startup_deadline_ms": int(self.timeout_seconds * 1000)})
+                            self.heartbeat({
+                                "startup_elapsed_ms": int((now - started_at) * 1000),
+                                "startup_deadline_ms": int(self.timeout_seconds * 1000),
+                                "startup_phase": "lock_wait",
+                            })
                         except Exception as exc:
                             raise TimeoutError(f"managed-site lock heartbeat failed: {type(exc).__name__}") from exc
                     time.sleep(0.1)

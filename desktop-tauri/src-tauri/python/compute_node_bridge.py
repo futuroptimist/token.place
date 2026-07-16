@@ -861,9 +861,12 @@ def run(args: argparse.Namespace) -> int:
         emit_operator_event(_structured_startup_error_payload(args, message))
 
     def emit_provisioning(phase: str, extra: Optional[Dict[str, Any]] = None) -> None:
-        payload = _structured_provisioning_payload(args, phase=phase, started_at=startup_started_at)
+        safe_extra: Dict[str, Any] = {}
         if extra:
             safe_extra = {k: v for k, v in extra.items() if k in {"startup_elapsed_ms", "startup_deadline_ms", "runtime_provisioning_state", "startup_phase"}}
+            phase = str(safe_extra.get("startup_phase") or phase)
+        payload = _structured_provisioning_payload(args, phase=phase, started_at=startup_started_at)
+        if safe_extra:
             payload.update(safe_extra)
             payload.setdefault("readiness_diagnostics", {}).update(safe_extra)
         emit_operator_event(payload)
@@ -907,6 +910,12 @@ def run(args: argparse.Namespace) -> int:
         else:
             raise
     emit_provisioning("runtime_verification")
+    if runtime_setup.get("runtime_action") in {
+        "installed_cuda_reexec",
+        "installed_metal_reexec",
+        "installed_gpu_reexec",
+    }:
+        emit_provisioning("reexec")
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
@@ -1022,6 +1031,7 @@ def run(args: argparse.Namespace) -> int:
                 relay_runtime.crypto_manager = shared_runtime.crypto_manager
             return relay_runtime
 
+    emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
     for relay_runtime in runtimes:
@@ -1473,10 +1483,20 @@ def run(args: argparse.Namespace) -> int:
                     f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
-                emit_status_event(
-                    registered=False,
-                    active_relay_url=runtime.relay_client.relay_url,
-                    current_last_error=last_error,
+                emit_operator_event(
+                    build_status_payload(
+                        event_type="status",
+                        running=True,
+                        registered=False,
+                        active_relay_url=runtime.relay_client.relay_url,
+                        current_last_error=last_error,
+                        extra={
+                            "runtime_provisioning_state": "provisioning",
+                            "startup_phase": "warm_load",
+                            "startup_elapsed_ms": warm_load_duration_ms,
+                            "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
+                        },
+                    )
                 )
                 fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
                 return False
@@ -1500,10 +1520,20 @@ def run(args: argparse.Namespace) -> int:
                 )
             if now - last_status_emit_at >= progress_emit_interval_seconds:
                 last_status_emit_at = now
-                emit_status_event(
-                    registered=False,
-                    active_relay_url=runtime.relay_client.relay_url,
-                    current_last_error=last_error,
+                emit_operator_event(
+                    build_status_payload(
+                        event_type="status",
+                        running=True,
+                        registered=False,
+                        active_relay_url=runtime.relay_client.relay_url,
+                        current_last_error=last_error,
+                        extra={
+                            "runtime_provisioning_state": "provisioning",
+                            "startup_phase": "warm_load",
+                            "startup_elapsed_ms": duration_ms,
+                            "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
+                        },
+                    )
                 )
             if stop_requested():
                 return False

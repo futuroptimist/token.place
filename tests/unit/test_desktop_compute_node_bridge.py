@@ -5120,6 +5120,7 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
 
 def test_run_defaults_bad_operator_event_sequence_to_zero(monkeypatch, capsys):
     _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-1')
     monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', 'boot')
     monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
@@ -5142,6 +5143,26 @@ def test_run_defaults_bad_operator_event_sequence_to_zero(monkeypatch, capsys):
 
     assert events[0]['sequence'] == 1
     assert events[0]['worker_state'] == 'provisioning'
+
+
+def test_run_inherits_valid_operator_event_sequence(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-1')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', '41')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'false', 'missing': 'psutil', 'action': 'install_cancelled'},
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+
+    assert events[0]['sequence'] == 42
+    assert os.environ['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == str(events[-1]['sequence'])
 
 
 def test_provisioning_extra_updates_readiness_diagnostics(monkeypatch, capsys):

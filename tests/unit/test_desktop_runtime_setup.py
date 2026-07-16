@@ -1640,7 +1640,7 @@ def test_run_pip_install_emits_five_second_heartbeat(monkeypatch):
     assert ok is True
     assert "outcome=completed" in output
     assert "stdout_tail=quick" in output
-    assert heartbeats == [{"startup_elapsed_ms": 6000, "startup_deadline_ms": 300000}]
+    assert heartbeats == [{"startup_elapsed_ms": 6000, "startup_deadline_ms": 300000, "startup_phase": "runtime_install"}]
 
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):
@@ -2831,7 +2831,7 @@ def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
     lock = desktop_runtime_setup._ManagedSiteMutationLock(tmp_path / '.lock', timeout_seconds=6, heartbeat=events.append)
     with pytest.raises(TimeoutError):
         lock.__enter__()
-    assert events == [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 6000}]
+    assert events == [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 6000, 'startup_phase': 'lock_wait'}]
     assert lock._handle is None
 
     # Cover the Windows unlock path on __exit__ with an already-held fake handle.

@@ -8,6 +8,7 @@ import os
 import ntpath
 import hashlib
 import platform as platform_module
+import re
 import subprocess
 import sys
 import time
@@ -19,11 +20,46 @@ _PACKAGED_RESOURCES_ROOT = Path(__file__).resolve().parent.parent
 if (_PACKAGED_RESOURCES_ROOT / "utils").is_dir() and str(_PACKAGED_RESOURCES_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGED_RESOURCES_ROOT))
 
-from utils.llm.llama_module_identity import (
-    canonical_llama_module_identity_input as _shared_canonical_llama_module_identity_input,
-    strip_windows_extended_path_prefix,
-    valid_llama_module_identity,
+_PACKAGED_IDENTITY_HELPER = _PACKAGED_RESOURCES_ROOT / "utils" / "llm" / "llama_module_identity.py"
+_HAS_PACKAGED_IDENTITY_HELPER = _PACKAGED_IDENTITY_HELPER.is_file() or any(
+    (Path(entry or ".") / "utils" / "llm" / "llama_module_identity.py").is_file() for entry in sys.path
 )
+
+if _HAS_PACKAGED_IDENTITY_HELPER:
+    from utils.llm.llama_module_identity import (
+        canonical_llama_module_identity_input as _shared_canonical_llama_module_identity_input,
+        strip_windows_extended_path_prefix,
+        valid_llama_module_identity,
+    )
+else:
+    _LLAMA_MODULE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+    _LLAMA_MODULE_IDENTITY_DOMAIN = "token.place.llama_cpp.module_path.v1"
+
+    def strip_windows_extended_path_prefix(path_text: str) -> str:
+        if path_text.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + path_text[8:]
+        if path_text.startswith("\\\\?\\"):
+            return path_text[4:]
+        return path_text
+
+    def _shared_canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
+        if not module_path:
+            return None
+        try:
+            path_text = strip_windows_extended_path_prefix(str(module_path))
+            canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
+        except (TypeError, ValueError, OSError):
+            try:
+                canonical = os.path.normcase(os.path.normpath(strip_windows_extended_path_prefix(str(module_path))))
+            except (TypeError, ValueError, OSError):
+                return None
+        return canonical.replace("\\", "/")
+
+    def valid_llama_module_identity(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text if _LLAMA_MODULE_IDENTITY_RE.fullmatch(text) else None
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,

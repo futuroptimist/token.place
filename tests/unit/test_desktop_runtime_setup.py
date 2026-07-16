@@ -52,6 +52,37 @@ def test_packaged_runtime_setup_imports_utils_from_resources_root(tmp_path) -> N
     assert result.stdout.strip() == 'desktop_runtime_setup'
 
 
+def test_packaged_runtime_setup_imports_without_bundled_utils(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    python_dir.mkdir(parents=True)
+
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    env = {'PYTHONPATH': str(python_dir), 'PATH': os.environ.get('PATH', '')}
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-B',
+            '-c',
+            (
+                'import desktop_runtime_setup as d; '
+                'print(d.llama_module_identity_from_path("/tmp/llama_cpp/__init__.py").startswith("sha256:"))'
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'True'
+
+
 class _SysStub:
     platform = 'win32'
     executable = sys.executable

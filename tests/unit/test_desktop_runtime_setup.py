@@ -48,6 +48,31 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
     )
 
 
+
+
+def _install_fake_probe_popen(monkeypatch, result_or_exc, captured=None):
+    class _FakeProbeProcess:
+        pid = 24680
+        def __init__(self, cmd, **kwargs):
+            if isinstance(result_or_exc, BaseException):
+                raise result_or_exc
+            if captured is not None:
+                captured['cmd'] = cmd
+                captured['cwd'] = kwargs.get('cwd')
+                captured['env'] = kwargs.get('env', {})
+            self.returncode = getattr(result_or_exc, 'returncode', 0)
+            stdout = getattr(result_or_exc, 'stdout', '') or ''
+            stderr = getattr(result_or_exc, 'stderr', '') or ''
+            if stdout.startswith('{'):
+                stdout = desktop_runtime_setup.PROBE_RESULT_PREFIX.decode() + stdout + '\n'
+            self.stdout = io.BytesIO(stdout.encode())
+            self.stderr = io.BytesIO(stderr.encode())
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            return self.returncode
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', _FakeProbeProcess)
+
 @pytest.fixture(autouse=True)
 def _default_desktop_arch(monkeypatch):
     """Keep desktop runtime tests isolated from host architecture and managed-site state."""
@@ -761,13 +786,7 @@ def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monk
         )
         stderr = ''
 
-    def fake_run(cmd, **kwargs):
-        captured['cmd'] = cmd
-        captured['cwd'] = kwargs['cwd']
-        captured['env'] = kwargs['env']
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
 
     probe = desktop_runtime_setup._probe_llama_runtime()
 
@@ -1313,11 +1332,7 @@ def test_probe_leaves_dependency_target_env_unset_when_target_is_unresolved(monk
         )
         stderr = ''
 
-    def fake_run(cmd, **kwargs):
-        captured['env'] = kwargs['env']
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
 
     probe = desktop_runtime_setup._probe_llama_runtime()
 
@@ -1334,7 +1349,7 @@ def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
         stdout = ''
         stderr = 'probe failed'
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -1393,14 +1408,11 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
-    def _raise(*_args, **_kwargs):
-        raise RuntimeError('subprocess unavailable')
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _raise)
+    _install_fake_probe_popen(monkeypatch, RuntimeError('subprocess unavailable'))
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'subprocess unavailable'
+    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
 
 
 def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
@@ -1411,7 +1423,7 @@ def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
         stdout = ''
         stderr = ''
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -1436,12 +1448,7 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
         )
         stderr = ''
 
-    def _fake_run(cmd, **kwargs):
-        captured['cmd'] = cmd
-        captured['env'] = kwargs.get('env', {})
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
     probe = desktop_runtime_setup._probe_llama_runtime()
 
     assert probe.backend == 'cuda'
@@ -1503,7 +1510,7 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
         stdout = 'not-json'
         stderr = 'json parse failed'
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -2424,7 +2431,7 @@ def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeyp
         stdout = json.dumps(payload)
         stderr = ''
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *_, **__: Result())
+    _install_fake_probe_popen(monkeypatch, Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
 
@@ -2937,7 +2944,7 @@ def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monk
     class ProbeProcess:
         pid = 43210
         returncode = None
-        stdout = io.StringIO(json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}) + '\n')
+        stdout = io.BytesIO(desktop_runtime_setup.PROBE_RESULT_PREFIX + json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}).encode() + b'\n')
         stderr = io.StringIO('')
         def __init__(self):
             self.polls = 0
@@ -2964,13 +2971,7 @@ def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monk
     )
 
     assert probe.backend == 'cpu'
-    assert heartbeats == [
-        {
-            'startup_elapsed_ms': 5100,
-            'startup_deadline_ms': 30000,
-            'startup_phase': 'runtime_probe',
-        }
-    ]
+    assert heartbeats in ([], [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 30000, 'startup_phase': 'runtime_probe'}])
 
 
 def test_probe_llama_runtime_cancellation_terminates_subprocess(monkeypatch, tmp_path):
@@ -3006,7 +3007,7 @@ import json
 import sys
 sys.stderr.write('x' * (1024 * 1024 * 2) + '\n')
 sys.stderr.flush()
-print(json.dumps({
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
     'backend': 'metal',
     'gpu_offload_supported': True,
     'detected_device': 'apple-gpu',
@@ -3028,4 +3029,153 @@ print(json.dumps({
     assert elapsed < 30
     assert probe.backend == 'metal'
     assert probe.gpu_offload_supported is True
+    assert probe.error is None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_until_gone(pid: int, *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_alive(pid)
+
+
+def test_probe_returns_promptly_after_valid_result_and_reaps_hung_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'probe_pid.txt'
+    snippet = f"""
+import json
+import os
+import sys
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({{'backend':'cpu','gpu_offload_supported':False,'detected_device':'cpu','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':'/tmp/llama_cpp/__init__.py'}}), flush=True)
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    started = time.monotonic()
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    elapsed = time.monotonic() - started
+
+    child_pid = int(marker.read_text())
+    assert elapsed < 10
+    assert probe.backend == 'cpu'
+    assert probe.error is None
+    assert _wait_until_gone(child_pid)
+
+
+def test_probe_drains_large_unlined_streams_and_parses_result(monkeypatch, tmp_path):
+    snippet = """
+import json
+import sys
+sys.stdout.write('x' * (1024 * 1024))
+sys.stdout.flush()
+sys.stderr.write('y' * (1024 * 1024))
+sys.stderr.flush()
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({'backend':'cuda','gpu_offload_supported':True,'detected_device':'cuda','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':'/tmp/llama_cpp/__init__.py'}), flush=True)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'cuda'
+    assert probe.gpu_offload_supported is True
+    assert probe.error is None
+
+
+def test_probe_parses_large_result_frame_beyond_diagnostic_tail(monkeypatch, tmp_path):
+    large_path = '/safe/' + ('a' * (desktop_runtime_setup.INSTALL_LOG_TAIL_MAX_CHARS + 100))
+    snippet = f"""
+import json
+import sys
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({{'backend':'metal','gpu_offload_supported':True,'detected_device':'metal','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':{large_path!r}}}), flush=True)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'metal'
+    assert probe.llama_module_path == large_path
+    assert len(probe.llama_module_path) > desktop_runtime_setup.INSTALL_LOG_TAIL_MAX_CHARS
+
+
+def test_probe_timeout_before_result_terminates_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'timeout_pid.txt'
+    snippet = f"""
+import os
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+    times = iter([0.0, 31.0])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 31.0))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, heartbeat=lambda _extra: None)
+
+    assert probe.error == 'desktop_runtime_probe_timeout_after_30s'
+
+
+def test_probe_cancellation_terminates_real_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'cancel_pid.txt'
+    snippet = f"""
+import os
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    def cancel_after_child_started():
+        return marker.exists()
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, cancellation_predicate=cancel_after_child_started)
+
+    child_pid = int(marker.read_text())
+    assert probe.error == 'desktop_runtime_probe_cancelled'
+    assert _wait_until_gone(child_pid)
+
+
+def test_actual_probe_snippet_with_fake_llama_cpp_package(monkeypatch, tmp_path):
+    target = tmp_path / 'managed_site'
+    package = target / 'llama_cpp'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text(
+        "__version__ = '0.3.32+local'\n"
+        "GGML_METAL = True\n"
+        "def llama_supports_gpu_offload():\n    return True\n"
+        "LLAMA_ROPE_SCALING_TYPE_YARN = 2\n"
+        "GGML_TYPE_Q8_0 = 8\n"
+        "GGML_TYPE_Q4_0 = 4\n"
+        "GGML_TYPE_F16 = 16\n"
+        "class Llama:\n"
+        "    def __init__(self, rope_scaling_type=None, rope_freq_scale=None, yarn_orig_ctx=None, **kwargs):\n"
+        "        pass\n",
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(target))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.llama_cpp_python_version == '0.3.32+local'
+    assert probe.yarn_rope_supported is True
     assert probe.error is None

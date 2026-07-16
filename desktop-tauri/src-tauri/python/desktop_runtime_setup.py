@@ -138,6 +138,9 @@ REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
 RUNTIME_PROBE_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON"
+PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
+PROBE_RESULT_MAX_BYTES = 1024 * 1024
+PROBE_EXIT_GRACE_SECONDS = 1.0
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 _PROCESS_SYS_PATH = sys.path
 _PROCESS_PYTHON_VERSION = sys.version.split()[0]
@@ -373,7 +376,7 @@ except Exception as exc:
         "error": str(exc),
     }
 
-print(json.dumps(payload))
+print("TOKEN_PLACE_RUNTIME_PROBE_RESULT " + json.dumps(payload, separators=(",", ":")), flush=True)
 """.strip()
 
 
@@ -430,6 +433,27 @@ def _pip_version_summary() -> str:
     return output or "available"
 
 
+def _probe_failure(
+    *,
+    error: str,
+    dependency_target_text: str,
+    pip_version: str,
+) -> RuntimeProbe:
+    return RuntimeProbe(
+        backend="missing",
+        gpu_offload_supported=False,
+        detected_device="none",
+        interpreter=sys.executable,
+        prefix=sys.prefix,
+        llama_module_path="missing",
+        error=error,
+        python_version=_python_version_text(),
+        base_prefix=getattr(sys, "base_prefix", sys.prefix),
+        dependency_target=dependency_target_text,
+        pip_version=pip_version,
+    )
+
+
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
@@ -455,168 +479,210 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     env["TOKEN_PLACE_DESKTOP_PIP_VERSION"] = pip_version
     env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
-    if cancellation_predicate is None and heartbeat is None:
-        try:
-            result = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=str(repo_root),
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return RuntimeProbe(
-                backend="missing", gpu_offload_supported=False, detected_device="none",
-                interpreter=sys.executable, prefix=sys.prefix, llama_module_path="missing",
-                error="desktop_runtime_probe_timeout_after_30s", python_version=_python_version_text(),
-                base_prefix=getattr(sys, "base_prefix", sys.prefix), dependency_target=dependency_target_text,
-                pip_version=pip_version,
-            )
-        except Exception as exc:
-            return RuntimeProbe(
-                backend="missing", gpu_offload_supported=False, detected_device="none",
-                interpreter=sys.executable, prefix=sys.prefix, llama_module_path="missing",
-                error=str(exc), python_version=_python_version_text(),
-                base_prefix=getattr(sys, "base_prefix", sys.prefix), dependency_target=dependency_target_text,
-                pip_version=pip_version,
-            )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-        returncode = result.returncode
-    else:
-        popen_kwargs: dict[str, Any] = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "cwd": str(repo_root),
-            "env": env,
-        }
-        if os.name != "nt":
-            popen_kwargs["start_new_session"] = True
-        else:
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        try:
-            process = subprocess.Popen(cmd, **popen_kwargs)
-        except Exception as exc:
-            return RuntimeProbe(
-                backend="missing",
-                gpu_offload_supported=False,
-                detected_device="none",
-                interpreter=sys.executable,
-                prefix=sys.prefix,
-                llama_module_path="missing",
-                error=f"desktop_runtime_probe_start_failed:{type(exc).__name__}",
-                python_version=_python_version_text(),
-                base_prefix=getattr(sys, "base_prefix", sys.prefix),
-                dependency_target=dependency_target_text,
-                pip_version=pip_version,
-            )
 
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-
-        def reader(stream: Any, chunks: list[str]) -> None:
-            try:
-                for line in iter(stream.readline, ""):
-                    chunks.append(line)
-                    joined = "".join(chunks)
-                    if len(joined) > INSTALL_LOG_TAIL_MAX_CHARS:
-                        chunks[:] = [joined[-INSTALL_LOG_TAIL_MAX_CHARS:]]
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-        threads = [
-            threading.Thread(target=reader, args=(process.stdout, stdout_chunks), daemon=True),
-            threading.Thread(target=reader, args=(process.stderr, stderr_chunks), daemon=True),
-        ]
-        for thread in threads:
-            thread.start()
-
-        deadline_seconds = 30.0
-        start = time.monotonic()
-        last_heartbeat = 0.0
-        probe_error = ""
-        while process.poll() is None:
-            elapsed = time.monotonic() - start
-            if cancellation_predicate is not None and cancellation_predicate():
-                probe_error = "desktop_runtime_probe_cancelled"
-                _terminate_process_tree(process)
-                break
-            if elapsed >= deadline_seconds:
-                probe_error = "desktop_runtime_probe_timeout_after_30s"
-                _terminate_process_tree(process)
-                break
-            if heartbeat is not None and elapsed - last_heartbeat >= 5:
-                last_heartbeat = elapsed
-                try:
-                    heartbeat({
-                        "startup_elapsed_ms": int(elapsed * 1000),
-                        "startup_deadline_ms": int(deadline_seconds * 1000),
-                        "startup_phase": startup_phase,
-                    })
-                except Exception as exc:
-                    probe_error = f"desktop_runtime_probe_heartbeat_failed:{type(exc).__name__}"
-                    _terminate_process_tree(process)
-                    break
-            time.sleep(0.05)
-
-        try:
-            returncode = process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            _terminate_process_tree(process)
-            returncode = process.poll()
-            if not probe_error:
-                probe_error = "desktop_runtime_probe_timeout_after_30s"
-        for thread in threads:
-            thread.join(timeout=1)
-        stdout = _tail_text("".join(stdout_chunks)).strip()
-        stderr = _tail_text("".join(stderr_chunks)).strip()
-        if probe_error:
-            return RuntimeProbe(
-                backend="missing",
-                gpu_offload_supported=False,
-                detected_device="none",
-                interpreter=sys.executable,
-                prefix=sys.prefix,
-                llama_module_path="missing",
-                error=probe_error,
-                python_version=_python_version_text(),
-                base_prefix=getattr(sys, "base_prefix", sys.prefix),
-                dependency_target=dependency_target_text,
-                pip_version=pip_version,
-            )
-    if returncode != 0 or not stdout:
-        return RuntimeProbe(
-            backend="missing",
-            gpu_offload_supported=False,
-            detected_device="none",
-            interpreter=sys.executable,
-            prefix=sys.prefix,
-            llama_module_path="missing",
-            error=stderr or f"probe subprocess failed with return code {returncode}",
-            python_version=_python_version_text(),
-            base_prefix=getattr(sys, "base_prefix", sys.prefix),
-            dependency_target=dependency_target_text,
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "cwd": str(repo_root),
+        "env": env,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as exc:
+        return _probe_failure(
+            error=f"desktop_runtime_probe_start_failed:{type(exc).__name__}",
+            dependency_target_text=dependency_target_text,
             pip_version=pip_version,
         )
 
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        payload = {
-            "backend": "missing",
-            "gpu_offload_supported": False,
-            "detected_device": "none",
-            "interpreter": sys.executable,
-            "prefix": sys.prefix,
-            "llama_module_path": "missing",
-            "error": stderr or "probe parse failure",
-        }
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+    result_frame: dict[str, Any] = {}
+    result_event = threading.Event()
+    reader_error: list[str] = []
+    lock = threading.Lock()
+
+    def append_tail(tail: bytearray, data: bytes) -> None:
+        tail.extend(data)
+        if len(tail) > INSTALL_LOG_TAIL_MAX_CHARS:
+            del tail[: len(tail) - INSTALL_LOG_TAIL_MAX_CHARS]
+
+    def decode_tail(tail: bytearray) -> str:
+        return bytes(tail).decode("utf-8", errors="replace")[-INSTALL_LOG_TAIL_MAX_CHARS:].strip()
+
+    def read_chunk(stream: Any) -> bytes:
+        try:
+            fileno = stream.fileno()
+        except Exception:
+            chunk = stream.read(32768)
+        else:
+            chunk = os.read(fileno, 32768)
+        if isinstance(chunk, str):
+            return chunk.encode("utf-8", errors="replace")
+        return chunk or b""
+
+    def consume_result_lines(pending: bytearray) -> bool:
+        while True:
+            prefix_at = pending.find(PROBE_RESULT_PREFIX)
+            if prefix_at < 0:
+                if len(pending) > len(PROBE_RESULT_PREFIX):
+                    del pending[: -len(PROBE_RESULT_PREFIX)]
+                return False
+            if prefix_at > 0:
+                del pending[:prefix_at]
+            newline_at = pending.find(b"\n", len(PROBE_RESULT_PREFIX))
+            if newline_at < 0:
+                if len(pending) > PROBE_RESULT_MAX_BYTES + len(PROBE_RESULT_PREFIX):
+                    reader_error.append("desktop_runtime_probe_result_oversized")
+                    result_event.set()
+                    return True
+                return False
+            frame = bytes(pending[len(PROBE_RESULT_PREFIX):newline_at])
+            del pending[: newline_at + 1]
+            if len(frame) > PROBE_RESULT_MAX_BYTES:
+                reader_error.append("desktop_runtime_probe_result_oversized")
+                result_event.set()
+                return True
+            try:
+                parsed = json.loads(frame.decode("utf-8"))
+            except Exception:
+                reader_error.append("desktop_runtime_probe_result_malformed")
+                result_event.set()
+                return True
+            if not isinstance(parsed, dict):
+                reader_error.append("desktop_runtime_probe_result_not_object")
+                result_event.set()
+                return True
+            result_frame.update(parsed)
+            result_event.set()
+            return True
+
+    def stdout_reader(stream: Any) -> None:
+        pending = bytearray()
+        try:
+            while True:
+                chunk = read_chunk(stream)
+                if not chunk:
+                    break
+                with lock:
+                    append_tail(stdout_tail, chunk)
+                pending.extend(chunk)
+                if consume_result_lines(pending):
+                    return
+        except Exception as exc:
+            reader_error.append(f"desktop_runtime_probe_reader_failed:{type(exc).__name__}")
+            result_event.set()
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def stderr_reader(stream: Any) -> None:
+        try:
+            while True:
+                chunk = read_chunk(stream)
+                if not chunk:
+                    break
+                with lock:
+                    append_tail(stderr_tail, chunk)
+        except Exception as exc:
+            reader_error.append(f"desktop_runtime_probe_reader_failed:{type(exc).__name__}")
+            result_event.set()
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=stdout_reader, args=(process.stdout,), daemon=True),
+        threading.Thread(target=stderr_reader, args=(process.stderr,), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    deadline_seconds = 30.0
+    start = time.monotonic()
+    last_heartbeat = 0.0
+    probe_error = ""
+    returncode: Optional[int] = None
+    while True:
+        returncode = process.poll()
+        if result_event.is_set() or returncode is not None:
+            break
+        elapsed = time.monotonic() - start
+        if cancellation_predicate is not None and cancellation_predicate():
+            probe_error = "desktop_runtime_probe_cancelled"
+            _terminate_process_tree(process)
+            break
+        if elapsed >= deadline_seconds:
+            probe_error = "desktop_runtime_probe_timeout_after_30s"
+            _terminate_process_tree(process)
+            break
+        if heartbeat is not None and elapsed - last_heartbeat >= 5:
+            last_heartbeat = elapsed
+            try:
+                heartbeat({
+                    "startup_elapsed_ms": int(elapsed * 1000),
+                    "startup_deadline_ms": int(deadline_seconds * 1000),
+                    "startup_phase": startup_phase,
+                })
+            except Exception as exc:
+                probe_error = f"desktop_runtime_probe_heartbeat_failed:{type(exc).__name__}"
+                _terminate_process_tree(process)
+                break
+        time.sleep(0.05)
+
+    if reader_error and not result_frame:
+        probe_error = probe_error or reader_error[0]
+        _terminate_process_tree(process)
+
+    if result_frame and process.poll() is None:
+        try:
+            returncode = process.wait(timeout=PROBE_EXIT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                returncode = process.poll()
+    else:
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                returncode = process.poll()
+            if not probe_error:
+                probe_error = "desktop_runtime_probe_timeout_after_30s"
+
+    for thread in threads:
+        thread.join(timeout=1)
+
+    stderr = decode_tail(stderr_tail)
+    if probe_error:
+        return _probe_failure(error=probe_error, dependency_target_text=dependency_target_text, pip_version=pip_version)
+    if result_frame:
+        payload = result_frame
+    else:
+        stdout = decode_tail(stdout_tail)
+        if returncode != 0 or not stdout:
+            return _probe_failure(
+                error=stderr or f"probe subprocess failed with return code {returncode}",
+                dependency_target_text=dependency_target_text,
+                pip_version=pip_version,
+            )
+        return _probe_failure(
+            error=stderr or "probe parse failure",
+            dependency_target_text=dependency_target_text,
+            pip_version=pip_version,
+        )
 
     return RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),

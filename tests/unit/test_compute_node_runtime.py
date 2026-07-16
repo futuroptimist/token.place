@@ -2331,6 +2331,99 @@ def test_effective_desktop_runtime_probe_rejects_private_env_probe_identity_mism
     assert effective['llama_module_path'] == 'unknown'
 
 
+def test_effective_desktop_runtime_probe_ignores_invalid_private_env_payload(monkeypatch):
+    from utils.llm import model_manager as llama_model_manager
+
+    monkeypatch.setenv(llama_model_manager.DESKTOP_RUNTIME_PROBE_ENV, '{not-json')
+
+    effective = llama_model_manager._effective_desktop_runtime_probe(
+        {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+        }
+    )
+
+    assert effective is not None
+    assert effective['runtime_action'] == 'already_supported'
+    assert effective['llama_module_path'] == 'unknown'
+
+
+@pytest.mark.parametrize('private_path', ['', 'missing', 'unknown'])
+def test_effective_desktop_runtime_probe_rejects_private_env_without_valid_path(
+    monkeypatch,
+    private_path,
+):
+    from utils.llm import model_manager as llama_model_manager
+
+    monkeypatch.setenv(
+        llama_model_manager.DESKTOP_RUNTIME_PROBE_ENV,
+        json.dumps(
+            {
+                'runtime_action': 'already_supported',
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': '/python',
+                'prefix': '/prefix',
+                'llama_module_path': private_path,
+            }
+        ),
+    )
+
+    effective = llama_model_manager._effective_desktop_runtime_probe(
+        {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+        }
+    )
+
+    assert effective is not None
+    assert effective['runtime_action'] == 'already_supported'
+    assert effective['llama_module_path'] == 'unknown'
+
+
+def test_effective_desktop_runtime_probe_preserves_explicit_module_path(monkeypatch):
+    from utils.llm import model_manager as llama_model_manager
+
+    monkeypatch.setenv(
+        llama_model_manager.DESKTOP_RUNTIME_PROBE_ENV,
+        json.dumps(
+            {
+                'runtime_action': 'already_supported',
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': '/python',
+                'prefix': '/prefix',
+                'llama_module_path': '/private/site-packages/llama_cpp/__init__.py',
+            }
+        ),
+    )
+
+    effective = llama_model_manager._effective_desktop_runtime_probe(
+        {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+            'llama_module_path': '/explicit/site-packages/llama_cpp/__init__.py',
+        }
+    )
+
+    assert effective is not None
+    assert effective['llama_module_path'] == '/explicit/site-packages/llama_cpp/__init__.py'
+
+
 def test_compute_node_runtime_stop_skips_unregister_before_api_v1_registration():
     relay_client = MagicMock()
     relay_client._api_v1_registered_relays = set()

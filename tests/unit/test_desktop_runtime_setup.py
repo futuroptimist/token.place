@@ -2141,6 +2141,56 @@ def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializabl
     assert desktop_runtime_setup.RUNTIME_PROBE_ENV not in os.environ
 
 
+@pytest.mark.parametrize(
+    'runtime_action,module_path',
+    [
+        ('install_failed', 'C:/Python/Lib/site-packages/llama_cpp/__init__.py'),
+        ('already_supported', ''),
+        ('already_supported', 'missing'),
+        ('already_supported', 'unknown'),
+    ],
+)
+def test_record_desktop_runtime_probe_keeps_module_path_private_only_for_valid_success(
+    monkeypatch,
+    runtime_action,
+    module_path,
+):
+    monkeypatch.delenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, raising=False)
+    result = {
+        'runtime_action': runtime_action,
+        'selected_backend': 'cuda',
+        'backend': 'cuda',
+        'interpreter': sys.executable,
+        'llama_module_path': module_path,
+    }
+
+    public = desktop_runtime_setup._record_desktop_runtime_probe(result)
+    private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    assert 'llama_module_path' not in public
+    assert 'llama_module_path' not in private
+
+
+def test_record_desktop_runtime_probe_private_payload_accepts_reexec_success(monkeypatch):
+    monkeypatch.delenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, raising=False)
+    result = {
+        'runtime_action': 'installed_cuda_reexec',
+        'selected_backend': 'cuda',
+        'backend': 'cuda',
+        'interpreter': sys.executable,
+        'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        'yarn_rope_supported': True,
+    }
+
+    public = desktop_runtime_setup._record_desktop_runtime_probe(result)
+    private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    assert 'llama_module_path' not in public
+    assert public['yarn_rope_supported'] == 'true'
+    assert private['llama_module_path'] == result['llama_module_path']
+    assert private['yarn_rope_supported'] is True
+
+
 def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setattr(

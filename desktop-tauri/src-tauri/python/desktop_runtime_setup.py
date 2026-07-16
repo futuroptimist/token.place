@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import platform as platform_module
@@ -429,7 +430,7 @@ def _pip_version_summary() -> str:
     return output or "available"
 
 
-def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe:
+def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
     dependency_target, _dependency_target_error = _resolve_desktop_dependency_target(repo_root)
@@ -454,48 +455,116 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     env["TOKEN_PLACE_DESKTOP_PIP_VERSION"] = pip_version
     env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
-    try:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=str(repo_root),
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return RuntimeProbe(
-            backend="missing",
-            gpu_offload_supported=False,
-            detected_device="none",
-            interpreter=sys.executable,
-            prefix=sys.prefix,
-            llama_module_path="missing",
-            error="desktop_runtime_probe_timeout_after_30s",
-            python_version=_python_version_text(),
-            base_prefix=getattr(sys, "base_prefix", sys.prefix),
-            dependency_target=dependency_target_text,
-            pip_version=pip_version,
-        )
-    except Exception as exc:
-        return RuntimeProbe(
-            backend="missing",
-            gpu_offload_supported=False,
-            detected_device="none",
-            interpreter=sys.executable,
-            prefix=sys.prefix,
-            llama_module_path="missing",
-            error=str(exc),
-            python_version=_python_version_text(),
-            base_prefix=getattr(sys, "base_prefix", sys.prefix),
-            dependency_target=dependency_target_text,
-            pip_version=pip_version,
-        )
+    if cancellation_predicate is None and heartbeat is None:
+        try:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(repo_root),
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return RuntimeProbe(
+                backend="missing", gpu_offload_supported=False, detected_device="none",
+                interpreter=sys.executable, prefix=sys.prefix, llama_module_path="missing",
+                error="desktop_runtime_probe_timeout_after_30s", python_version=_python_version_text(),
+                base_prefix=getattr(sys, "base_prefix", sys.prefix), dependency_target=dependency_target_text,
+                pip_version=pip_version,
+            )
+        except Exception as exc:
+            return RuntimeProbe(
+                backend="missing", gpu_offload_supported=False, detected_device="none",
+                interpreter=sys.executable, prefix=sys.prefix, llama_module_path="missing",
+                error=str(exc), python_version=_python_version_text(),
+                base_prefix=getattr(sys, "base_prefix", sys.prefix), dependency_target=dependency_target_text,
+                pip_version=pip_version,
+            )
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        returncode = result.returncode
+    else:
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "cwd": str(repo_root),
+            "env": env,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            process = subprocess.Popen(cmd, **popen_kwargs)
+        except Exception as exc:
+            return RuntimeProbe(
+                backend="missing",
+                gpu_offload_supported=False,
+                detected_device="none",
+                interpreter=sys.executable,
+                prefix=sys.prefix,
+                llama_module_path="missing",
+                error=f"desktop_runtime_probe_start_failed:{type(exc).__name__}",
+                python_version=_python_version_text(),
+                base_prefix=getattr(sys, "base_prefix", sys.prefix),
+                dependency_target=dependency_target_text,
+                pip_version=pip_version,
+            )
 
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if result.returncode != 0 or not stdout:
+        deadline_seconds = 30.0
+        start = time.monotonic()
+        last_heartbeat = 0.0
+        probe_error = ""
+        while process.poll() is None:
+            elapsed = time.monotonic() - start
+            if cancellation_predicate is not None and cancellation_predicate():
+                probe_error = "desktop_runtime_probe_cancelled"
+                _terminate_process_tree(process)
+                break
+            if elapsed >= deadline_seconds:
+                probe_error = "desktop_runtime_probe_timeout_after_30s"
+                _terminate_process_tree(process)
+                break
+            if heartbeat is not None and elapsed - last_heartbeat >= 5:
+                last_heartbeat = elapsed
+                try:
+                    heartbeat({
+                        "startup_elapsed_ms": int(elapsed * 1000),
+                        "startup_deadline_ms": int(deadline_seconds * 1000),
+                        "startup_phase": startup_phase,
+                    })
+                except Exception as exc:
+                    probe_error = f"desktop_runtime_probe_heartbeat_failed:{type(exc).__name__}"
+                    _terminate_process_tree(process)
+                    break
+            time.sleep(0.05)
+
+        try:
+            stdout_raw, stderr_raw = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            stdout_raw, stderr_raw = process.communicate(timeout=1)
+        stdout = (stdout_raw or "").strip()
+        stderr = (stderr_raw or "").strip()
+        returncode = process.returncode
+        if probe_error:
+            return RuntimeProbe(
+                backend="missing",
+                gpu_offload_supported=False,
+                detected_device="none",
+                interpreter=sys.executable,
+                prefix=sys.prefix,
+                llama_module_path="missing",
+                error=probe_error,
+                python_version=_python_version_text(),
+                base_prefix=getattr(sys, "base_prefix", sys.prefix),
+                dependency_target=dependency_target_text,
+                pip_version=pip_version,
+            )
+    if returncode != 0 or not stdout:
         return RuntimeProbe(
             backend="missing",
             gpu_offload_supported=False,
@@ -503,7 +572,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
             interpreter=sys.executable,
             prefix=sys.prefix,
             llama_module_path="missing",
-            error=stderr or f"probe subprocess failed with return code {result.returncode}",
+            error=stderr or f"probe subprocess failed with return code {returncode}",
             python_version=_python_version_text(),
             base_prefix=getattr(sys, "base_prefix", sys.prefix),
             dependency_target=dependency_target_text,
@@ -560,16 +629,22 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     )
 
 
-def _probe_runtime(runtime_root: Path) -> RuntimeProbe:
+def _probe_runtime(runtime_root: Path, *, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     try:
-        return _probe_llama_runtime(runtime_root=runtime_root)
-    except TypeError as exc:
-        message = str(exc)
-        if "unexpected keyword argument" in message and "runtime_root" in message:
-            # Backward-compatible path for tests that monkeypatch _probe_llama_runtime
-            # with callables that do not accept keyword arguments.
-            return _probe_llama_runtime()
-        raise
+        parameters = inspect.signature(_probe_llama_runtime).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    kwargs: Dict[str, Any] = {}
+    if "runtime_root" in parameters or accepts_kwargs:
+        kwargs["runtime_root"] = runtime_root
+    if "cancellation_predicate" in parameters or accepts_kwargs:
+        kwargs["cancellation_predicate"] = cancellation_predicate
+    if "heartbeat" in parameters or accepts_kwargs:
+        kwargs["heartbeat"] = heartbeat
+    if "startup_phase" in parameters or accepts_kwargs:
+        kwargs["startup_phase"] = startup_phase
+    return _probe_llama_runtime(**kwargs)
 
 
 def _tail_text(raw: str, *, limit: int = INSTALL_LOG_TAIL_MAX_CHARS) -> str:
@@ -898,7 +973,7 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
         dependency_target_text = str(dependency_target)
         active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
         if dependency_target_text not in active_sys_path:
-            active_sys_path.insert(0, dependency_target_text)
+            active_sys_path.insert(1 if active_sys_path else 0, dependency_target_text)
     return dependency_target, dependency_target_error
 
 
@@ -1232,7 +1307,28 @@ def _ensure_desktop_llama_runtime_impl(
     selected_mode = (mode or "auto").strip().lower()
     target_root = _resolve_runtime_root(repo_root=repo_root)
     qwen_64k_required = (context_tier or os.getenv("TOKEN_PLACE_CONTEXT_TIER", "")).strip() == "64k-full"
-    before = _probe_runtime(target_root)
+    def _phase_heartbeat(phase: str) -> Optional[Any]:
+        if heartbeat is None:
+            return None
+
+        def _emit(extra: Dict[str, Any]) -> None:
+            safe_extra = dict(extra)
+            safe_extra["startup_phase"] = phase
+            heartbeat(safe_extra)
+
+        return _emit
+
+    try:
+        before = _probe_runtime(
+            target_root,
+            cancellation_predicate=cancellation_predicate,
+            heartbeat=_phase_heartbeat("runtime_probe"),
+            startup_phase="runtime_probe",
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        before = _probe_runtime(target_root)
     dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
     dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
     requirements_path = _resolve_requirements_path(target_root)
@@ -1363,17 +1459,6 @@ def _ensure_desktop_llama_runtime_impl(
         }
 
     install_diagnostics: Dict[str, str] = {}
-
-    def _phase_heartbeat(phase: str) -> Optional[Any]:
-        if heartbeat is None:
-            return None
-
-        def _emit(extra: Dict[str, Any]) -> None:
-            safe_extra = dict(extra)
-            safe_extra["startup_phase"] = phase
-            heartbeat(safe_extra)
-
-        return _emit
 
     attempted_cuda_source_build = False
     cuda_source_build_suppressed = False

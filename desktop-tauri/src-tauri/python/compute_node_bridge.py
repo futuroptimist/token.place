@@ -80,6 +80,7 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
+PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 
@@ -1457,6 +1458,7 @@ def run(args: argparse.Namespace) -> int:
         last_progress_log_at = wait_started_at
         last_status_emit_at = wait_started_at
         progress_emit_interval_seconds = PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS
+        status_emit_interval_seconds = PRE_REGISTRATION_STATUS_INTERVAL_SECONDS
         while warm_load_state == "warming":
             elapsed_seconds = time.monotonic() - wait_started_at
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds

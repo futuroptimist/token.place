@@ -2930,3 +2930,65 @@ def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch
         lock.__enter__()
 
     assert lock._handle is None
+
+
+def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 43210
+        returncode = None
+        def __init__(self):
+            self.polls = 0
+        def poll(self):
+            self.polls += 1
+            if self.polls > 2:
+                self.returncode = 0
+            return self.returncode
+        def communicate(self, timeout=None):
+            return (json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}), '')
+
+    proc = ProbeProcess()
+    heartbeats = []
+    times = iter([0.0, 0.0, 5.1, 5.2])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=heartbeats.append,
+    )
+
+    assert probe.backend == 'cpu'
+    assert heartbeats == [
+        {
+            'startup_elapsed_ms': 5100,
+            'startup_deadline_ms': 30000,
+            'startup_phase': 'runtime_probe',
+        }
+    ]
+
+
+def test_probe_llama_runtime_cancellation_terminates_subprocess(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 54321
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def communicate(self, timeout=None):
+            self.returncode = -15
+            return ('', '')
+
+    proc = ProbeProcess()
+    terminated = []
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: True,
+        heartbeat=lambda _extra: None,
+    )
+
+    assert probe.error == 'desktop_runtime_probe_cancelled'
+    assert terminated == [54321]

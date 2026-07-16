@@ -5207,3 +5207,11 @@ def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
     phases = [json.loads(line).get('startup_phase') for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert 'runtime_probe' in phases
     assert 'runtime_verification' in phases
+
+
+def test_warm_load_status_interval_is_bounded_below_log_interval():
+    assert compute_node_bridge.PRE_REGISTRATION_STATUS_INTERVAL_SECONDS <= 5.0
+    assert (
+        compute_node_bridge.PRE_REGISTRATION_STATUS_INTERVAL_SECONDS
+        <= compute_node_bridge.PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS
+    )

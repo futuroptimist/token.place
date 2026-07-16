@@ -1161,6 +1161,7 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
 
     stop_counter = {'count': 0}
 
@@ -5209,9 +5210,35 @@ def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
     assert 'runtime_verification' in phases
 
 
-def test_warm_load_status_interval_is_bounded_below_log_interval():
-    assert compute_node_bridge.PRE_REGISTRATION_STATUS_INTERVAL_SECONDS <= 5.0
-    assert (
-        compute_node_bridge.PRE_REGISTRATION_STATUS_INTERVAL_SECONDS
-        <= compute_node_bridge.PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS
+def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
     )
+    assert compute_node_bridge.run(args) == 1
+
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    warming_status_events = [
+        event
+        for event in events
+        if event.get('type') == 'status' and event.get('startup_phase') == 'warm_load'
+    ]
+    assert warming_status_events
+    assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err

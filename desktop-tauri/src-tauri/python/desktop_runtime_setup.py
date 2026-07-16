@@ -514,6 +514,29 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
                 pip_version=pip_version,
             )
 
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def reader(stream: Any, chunks: list[str]) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    chunks.append(line)
+                    joined = "".join(chunks)
+                    if len(joined) > INSTALL_LOG_TAIL_MAX_CHARS:
+                        chunks[:] = [joined[-INSTALL_LOG_TAIL_MAX_CHARS:]]
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        threads = [
+            threading.Thread(target=reader, args=(process.stdout, stdout_chunks), daemon=True),
+            threading.Thread(target=reader, args=(process.stderr, stderr_chunks), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+
         deadline_seconds = 30.0
         start = time.monotonic()
         last_heartbeat = 0.0
@@ -543,13 +566,16 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
             time.sleep(0.05)
 
         try:
-            stdout_raw, stderr_raw = process.communicate(timeout=15)
+            returncode = process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             _terminate_process_tree(process)
-            stdout_raw, stderr_raw = process.communicate(timeout=1)
-        stdout = (stdout_raw or "").strip()
-        stderr = (stderr_raw or "").strip()
-        returncode = process.returncode
+            returncode = process.poll()
+            if not probe_error:
+                probe_error = "desktop_runtime_probe_timeout_after_30s"
+        for thread in threads:
+            thread.join(timeout=1)
+        stdout = _tail_text("".join(stdout_chunks)).strip()
+        stderr = _tail_text("".join(stderr_chunks)).strip()
         if probe_error:
             return RuntimeProbe(
                 backend="missing",
@@ -1318,17 +1344,20 @@ def _ensure_desktop_llama_runtime_impl(
 
         return _emit
 
-    try:
-        before = _probe_runtime(
-            target_root,
-            cancellation_predicate=cancellation_predicate,
-            heartbeat=_phase_heartbeat("runtime_probe"),
-            startup_phase="runtime_probe",
-        )
-    except TypeError as exc:
-        if "unexpected keyword argument" not in str(exc):
-            raise
-        before = _probe_runtime(target_root)
+    def _probe_with_context(phase: str) -> RuntimeProbe:
+        try:
+            return _probe_runtime(
+                target_root,
+                cancellation_predicate=cancellation_predicate,
+                heartbeat=_phase_heartbeat(phase),
+                startup_phase=phase,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return _probe_runtime(target_root)
+
+    before = _probe_with_context("runtime_probe")
     dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
     dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
     requirements_path = _resolve_requirements_path(target_root)
@@ -1485,7 +1514,7 @@ def _ensure_desktop_llama_runtime_impl(
                             dependency_target,
                             **source_repair_kwargs,
                         )
-                        source_after_probe = _probe_runtime(target_root)
+                        source_after_probe = _probe_with_context("runtime_verification")
                 except (TimeoutError, OSError) as exc:
                     source_ok = False
                     source_log = _lock_failure_install_log(exc)
@@ -1494,7 +1523,7 @@ def _ensure_desktop_llama_runtime_impl(
                     install_diagnostics = _install_diagnostics_payload(
                         source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
                     )
-                    after = source_after_probe or _probe_runtime(target_root)
+                    after = source_after_probe or _probe_with_context("runtime_verification")
                     after_version_payload = _version_payload(after, required_version, required_package_spec)
                     if after.gpu_offload_supported and after.backend == "cuda":
                         after_version_ok = after_version_payload.get("llama_cpp_python_version_match") == "match"
@@ -1596,7 +1625,7 @@ def _ensure_desktop_llama_runtime_impl(
         try:
             with _ManagedSiteMutationLock(dependency_target, timeout_seconds=timeout_seconds, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):
                 ok, log_output = _run_pip_install(cmd, env, **pip_kwargs)
-                after_probe_hint = _probe_runtime(target_root)
+                after_probe_hint = _probe_with_context("runtime_verification")
         except (TimeoutError, OSError) as exc:
             ok = False
             log_output = _lock_failure_install_log(exc)
@@ -1616,7 +1645,7 @@ def _ensure_desktop_llama_runtime_impl(
                 }
             continue
 
-        after = after_probe_hint or _probe_runtime(target_root)
+        after = after_probe_hint or _probe_with_context("runtime_verification")
         after_version_payload = _version_payload(after, required_version, required_package_spec)
         plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend

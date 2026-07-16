@@ -1510,9 +1510,9 @@ def run(args: argparse.Namespace) -> int:
             ):
                 break
             now = time.monotonic()
+            duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
             if now - last_progress_log_at >= progress_emit_interval_seconds:
                 last_progress_log_at = now
-                duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
                     "desktop.compute_node_bridge.model_init.still_warming "
                     f"reason=pre_registration relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
@@ -1520,7 +1520,7 @@ def run(args: argparse.Namespace) -> int:
                     f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
-            if now - last_status_emit_at >= progress_emit_interval_seconds:
+            if now - last_status_emit_at >= status_emit_interval_seconds:
                 last_status_emit_at = now
                 emit_operator_event(
                     build_status_payload(

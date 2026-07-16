@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2936,6 +2937,8 @@ def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monk
     class ProbeProcess:
         pid = 43210
         returncode = None
+        stdout = io.StringIO(json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}) + '\n')
+        stderr = io.StringIO('')
         def __init__(self):
             self.polls = 0
         def poll(self):
@@ -2943,8 +2946,9 @@ def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monk
             if self.polls > 2:
                 self.returncode = 0
             return self.returncode
-        def communicate(self, timeout=None):
-            return (json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}), '')
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
 
     proc = ProbeProcess()
     heartbeats = []
@@ -2973,11 +2977,13 @@ def test_probe_llama_runtime_cancellation_terminates_subprocess(monkeypatch, tmp
     class ProbeProcess:
         pid = 54321
         returncode = None
+        stdout = io.StringIO('')
+        stderr = io.StringIO('')
         def poll(self):
             return self.returncode
-        def communicate(self, timeout=None):
+        def wait(self, timeout=None):
             self.returncode = -15
-            return ('', '')
+            return -15
 
     proc = ProbeProcess()
     terminated = []
@@ -2992,3 +2998,34 @@ def test_probe_llama_runtime_cancellation_terminates_subprocess(monkeypatch, tmp
 
     assert probe.error == 'desktop_runtime_probe_cancelled'
     assert terminated == [54321]
+
+
+def test_probe_llama_runtime_drains_large_stderr_before_json_payload(monkeypatch, tmp_path):
+    snippet = r"""
+import json
+import sys
+sys.stderr.write('x' * (1024 * 1024 * 2) + '\n')
+sys.stderr.flush()
+print(json.dumps({
+    'backend': 'metal',
+    'gpu_offload_supported': True,
+    'detected_device': 'apple-gpu',
+    'interpreter': sys.executable,
+    'prefix': sys.prefix,
+    'llama_module_path': '/safe/site/llama_cpp/__init__.py',
+}))
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    started = time.monotonic()
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=lambda _extra: None,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.error is None

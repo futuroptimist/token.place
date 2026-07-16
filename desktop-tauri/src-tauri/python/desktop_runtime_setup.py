@@ -1109,16 +1109,17 @@ _PRIVATE_RUNTIME_PROBE_ACTIONS = frozenset(
         "installed_metal_reexec",
     }
 )
+_INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({"missing", "unknown"})
 
 
 def _private_runtime_probe_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(result)
-    action = str(payload.get("runtime_action") or payload.get("action") or "").strip().lower()
+    action = str(payload.get("runtime_action") or "").strip().lower()
     module_path = str(payload.get("llama_module_path") or "").strip()
     if (
         action not in _PRIVATE_RUNTIME_PROBE_ACTIONS
         or not module_path
-        or module_path in {"missing", "unknown"}
+        or module_path in _INVALID_RUNTIME_MODULE_PATH_VALUES
     ):
         payload.pop("llama_module_path", None)
     return payload

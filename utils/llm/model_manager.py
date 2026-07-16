@@ -3776,13 +3776,17 @@ def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
     return _coerce_desktop_runtime_probe(parsed)
 
 
+_VALID_DESKTOP_RUNTIME_BACKENDS = frozenset({'cpu', 'cuda', 'metal'})
+_INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({'missing', 'unknown'})
+
+
 def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
     if not isinstance(probe, dict):
         return None
     interpreter = str(probe.get('interpreter') or '').strip()
     backend = str(probe.get('backend') or '').strip().lower()
     action = str(probe.get('runtime_action') or '').strip().lower()
-    if not interpreter or backend not in {'cpu', 'cuda', 'metal'}:
+    if not interpreter or backend not in _VALID_DESKTOP_RUNTIME_BACKENDS:
         return None
     if not action:
         return None
@@ -3793,7 +3797,7 @@ def _probe_module_path_from_probe_dict(probe: Optional[Dict[str, Any]]) -> Optio
     if probe is None or probe.get('error'):
         return None
     module_path = str(probe.get('llama_module_path') or '').strip()
-    if not module_path or module_path in {'missing', 'unknown'}:
+    if not module_path or module_path in _INVALID_RUNTIME_MODULE_PATH_VALUES:
         return None
     return module_path
 

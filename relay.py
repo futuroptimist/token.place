@@ -1177,6 +1177,40 @@ def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: fl
     return active
 
 
+def _api_v1_in_flight_entry_can_be_pruned(entry: Any, *, now_monotonic: float) -> bool:
+    """Return whether an expired accounting entry has no live owner state left.
+
+    Lease expiry alone is not terminal: a compute node can renew an expired
+    accounting lease until the absolute request deadline.  Housekeeping may only
+    prune legacy entries without deadline metadata, or deadline-backed entries
+    after that authoritative deadline has elapsed.
+    """
+    expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+    if not isinstance(expires_at, (int, float)) or expires_at > now_monotonic:
+        return False
+    deadline_monotonic = (
+        _valid_request_deadline_monotonic(entry.get("request_deadline_monotonic"))
+        if isinstance(entry, dict)
+        else None
+    )
+    return deadline_monotonic is None or deadline_monotonic <= now_monotonic
+
+
+def _prune_api_v1_stale_in_flight_entries(payload: dict[str, Any], *, now_monotonic: float) -> int:
+    """Drop expired in-flight accounting entries whose owner window is over."""
+    in_flight_requests = payload.get("api_v1_in_flight_requests")
+    if not isinstance(in_flight_requests, dict):
+        return 0
+    removed = 0
+    with api_v1_in_flight_requests_lock:
+        for request_id, entry in list(in_flight_requests.items()):
+            if _api_v1_in_flight_entry_can_be_pruned(entry, now_monotonic=now_monotonic):
+                in_flight_requests.pop(request_id, None)
+                removed += 1
+        if not in_flight_requests:
+            payload.pop("api_v1_in_flight_requests", None)
+    return removed
+
 def _api_v1_node_load_snapshot(server_public_key: str, payload: dict[str, Any], *, now_monotonic: float | None = None) -> dict[str, int | float]:
     capabilities = payload.get("capabilities") if isinstance(payload, dict) else {}
     max_concurrency = capabilities.get("max_concurrency") if isinstance(capabilities, dict) else 1
@@ -1330,16 +1364,9 @@ def _evict_stale_servers() -> list[str]:
             polling_until = payload.get("polling_until_monotonic")
             if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
                 continue
-            with api_v1_in_flight_requests_lock:
-                in_flight_requests = payload.get("api_v1_in_flight_requests")
-                if isinstance(in_flight_requests, dict):
-                    has_active_in_flight_requests = any(
-                        isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                        and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
-                        for entry in in_flight_requests.values()
-                    )
-                    if has_active_in_flight_requests:
-                        continue
+            _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
+            if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
+                continue
 
             in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
             if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
@@ -1372,16 +1399,9 @@ def _evict_stale_servers() -> list[str]:
                 stale_after = max(float(stale_after), 1.0)
                 if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                     continue
-                with api_v1_in_flight_requests_lock:
-                    in_flight_requests = payload.get("api_v1_in_flight_requests")
-                    if isinstance(in_flight_requests, dict):
-                        has_active_in_flight_requests = any(
-                            isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                            and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
-                            for entry in in_flight_requests.values()
-                        )
-                        if has_active_in_flight_requests:
-                            continue
+                _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
+                if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
+                    continue
                 if _unregister_server(server_public_key, eviction_reason="stale_lease"):
                     evicted.append(server_public_key)
     return evicted

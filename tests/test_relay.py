@@ -610,6 +610,38 @@ def test_api_v1_in_flight_count_snapshots_under_lock_without_mutating_payload(cl
     assert set(payload["api_v1_in_flight_requests"]) == {"req-active", "req-expired"}
 
 
+def test_evict_stale_servers_prunes_expired_in_flight_entries_after_deadline(client):
+    server = _server_key("prune-expired-inflight")
+    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
+    now = time.monotonic()
+    known_servers[server]["api_v1_in_flight_requests"] = {
+        "legacy-expired": {
+            "expires_at": now - 30,
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        },
+        "deadline-expired": {
+            "expires_at": now - 20,
+            "request_deadline_monotonic": now - 1,
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        },
+        "renewable-owner-state": {
+            "expires_at": now - 10,
+            "request_deadline_monotonic": now + 60,
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        },
+        "active": {
+            "expires_at": now + 60,
+            "request_deadline_monotonic": now + 120,
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        },
+    }
+
+    relay_module._evict_stale_servers()
+
+    remaining = known_servers[server]["api_v1_in_flight_requests"]
+    assert set(remaining) == {"renewable-owner-state", "active"}
+
+
 def test_api_v1_malformed_capabilities_are_rejected_without_registration(client):
     server = _server_key("malformed-cap")
     response = client.post(

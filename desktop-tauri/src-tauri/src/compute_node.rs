@@ -1638,7 +1638,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
             Some(warning)
         } else if !session_matches {
             Some(warning)
-        } else if status.stop_cleanup_outcome.is_none() {
+        } else if had_child && status.stop_cleanup_outcome.is_none() {
             Some(warning)
         } else if matches!(
             status.stop_cleanup_outcome.as_deref(),
@@ -2367,6 +2367,31 @@ mod tests {
         assert!(log.contains("desktop.compute_node.stop_requested"));
         assert!(log.contains("operator_session_id=session-1"));
         assert!(state.status.lock().await.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_after_startup_failure_without_child_does_not_require_cleanup_ack() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            status.running = false;
+            status.registered = false;
+            status.operator_session_id = Some("startup-failed-session".into());
+            status.stop_cleanup_outcome = None;
+            status.last_error = Some("startup failed before bridge spawn".into());
+        }
+
+        stop_compute_node(state.clone())
+            .await
+            .expect("stop after startup failure without child should not require cleanup ack");
+
+        let status = state.status.lock().await.clone();
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("startup failed before bridge spawn")
+        );
     }
 
     #[tokio::test]

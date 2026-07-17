@@ -451,9 +451,12 @@ REQUEST_COUNTER = None
 
 PROVIDER_MODE_ENUM = ("relay", "direct", "unknown")
 OUTCOME_ENUM = (
+    "active",
     "completed",
     "cancelled",
     "expired",
+    "acknowledged",
+    "lease_renewed",
     "timed_out",
     "rate_limited",
     "dependency_failure",
@@ -611,6 +614,7 @@ def _normalise_http_route() -> str:
     route_map = {
         "api_v1_relay_requests": "/api/v1/relay/requests",
         "api_v1_relay_requests_cancel": "/api/v1/relay/requests/cancel",
+        "api_v1_relay_requests_control": "/api/v1/relay/requests/control",
         "api_v1_relay_responses": "/api/v1/relay/responses",
         "api_v1_relay_responses_retrieve": "/api/v1/relay/responses/retrieve",
         "api_v1_relay_servers_register": "/api/v1/relay/servers/register",
@@ -859,6 +863,11 @@ DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
 API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
+API_V1_REQUEST_DEADLINE_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_SECONDS"
+API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MIN_SECONDS"
+API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MAX_SECONDS"
+API_V1_CONTROL_TOMBSTONE_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS"
+API_V1_CONTROL_NEXT_POLL_MAX_SECONDS = 30.0
 API_V1_MAX_QUEUE_DEPTH_ENV = "TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_NODE"
 DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
@@ -918,6 +927,34 @@ def _api_v1_max_queue_depth_per_node() -> int:
     except ValueError:
         return 1024
     return max(value, 1)
+
+
+def _api_v1_request_deadline_seconds() -> float:
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    minimum = max(_env_float(API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV, 1.0), 1.0)
+    maximum = max(_env_float(API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV, 3600.0), minimum)
+    configured = _env_float(API_V1_REQUEST_DEADLINE_SECONDS_ENV, 300.0)
+    return min(max(configured, minimum), maximum)
+
+
+def _api_v1_control_tombstone_ttl_seconds() -> float:
+    try:
+        value = float(os.environ.get(API_V1_CONTROL_TOMBSTONE_TTL_SECONDS_ENV, "60"))
+    except ValueError:
+        value = 60.0
+    return min(max(value, 1.0), 300.0)
+
+
+def _api_v1_control_next_poll_seconds(remaining_ttl: float | None) -> float:
+    hint = min(float(_api_v1_lease_seconds()), API_V1_CONTROL_NEXT_POLL_MAX_SECONDS)
+    if isinstance(remaining_ttl, (int, float)):
+        hint = min(hint, max(float(remaining_ttl), 0.0))
+    return max(round(hint, 3), 0.0)
 
 
 def _api_v1_in_flight_ttl_seconds() -> float:
@@ -2052,6 +2089,8 @@ _ALLOWED_API_V1_TERMINAL_STATUSES = {"cancelled", "expired"}
 _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS = 300.0
 api_v1_recently_unregistered_servers: dict[str, float] = {}
 api_v1_recently_unregistered_servers_lock = threading.Lock()
+api_v1_control_tombstones: dict[str, dict[str, Any]] = {}
+api_v1_control_tombstones_lock = threading.Lock()
 
 
 def _record_api_v1_server_unregistered(server_public_key: str) -> None:
@@ -2075,11 +2114,64 @@ def _api_v1_server_was_recently_unregistered(server_public_key: str) -> bool:
         return server_public_key in api_v1_recently_unregistered_servers
 
 
+def _control_key(server_public_key: str, client_public_key: str, request_id: str) -> str:
+    return f"{server_public_key}\0{client_public_key}\0{request_id}"
+
+
+def _prune_api_v1_control_tombstones(*, now_monotonic: float | None = None) -> None:
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    with api_v1_control_tombstones_lock:
+        for key, tombstone in list(api_v1_control_tombstones.items()):
+            expires_at = tombstone.get("control_expires_at_monotonic") if isinstance(tombstone, dict) else None
+            if not isinstance(expires_at, (int, float)) or expires_at <= now:
+                api_v1_control_tombstones.pop(key, None)
+
+
+def _record_api_v1_control_tombstone(
+    server_public_key: str | None,
+    client_public_key: str | None,
+    request_id: str | None,
+    *,
+    status: str,
+    reason: str | None,
+    deadline_monotonic: float | None,
+    deadline_unix: float | None,
+) -> None:
+    if not (server_public_key and client_public_key and request_id):
+        return
+    _prune_api_v1_control_tombstones()
+    now = time.monotonic()
+    with api_v1_control_tombstones_lock:
+        api_v1_control_tombstones[_control_key(server_public_key, client_public_key, request_id)] = {
+            "server_public_key": server_public_key,
+            "client_public_key": client_public_key,
+            "request_id": request_id,
+            "status": _sanitize_terminal_status(status),
+            "reason": _sanitize_terminal_reason(reason, status),
+            "deadline_monotonic": deadline_monotonic,
+            "deadline_unix": deadline_unix,
+            "control_expires_at_monotonic": now + _api_v1_control_tombstone_ttl_seconds(),
+        }
+
+
+def _get_api_v1_control_tombstone(server_public_key: str, client_public_key: str, request_id: str) -> dict[str, Any] | None:
+    _prune_api_v1_control_tombstones()
+    with api_v1_control_tombstones_lock:
+        tombstone = api_v1_control_tombstones.get(_control_key(server_public_key, client_public_key, request_id))
+        return dict(tombstone) if isinstance(tombstone, dict) else None
+
+
+def _ack_api_v1_control_tombstone(server_public_key: str, client_public_key: str, request_id: str) -> bool:
+    with api_v1_control_tombstones_lock:
+        return api_v1_control_tombstones.pop(_control_key(server_public_key, client_public_key, request_id), None) is not None
+
+
 _ALLOWED_API_V1_TERMINAL_REASONS = {
     "cancelled",
     "expired",
     "requester_cancelled",
     "requester_gave_up",
+    "client_timeout",
     "provider_timeout",
     "pending_request_ttl_exceeded",
     "server_unregistered",
@@ -2251,10 +2343,22 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
         with server_round_robin_lock:
             with api_v1_in_flight_requests_lock:
                 for server_payload in known_servers.values():
+                    server_public_key = server_payload.get("public_key") if isinstance(server_payload, dict) else None
                     in_flight_requests = server_payload.get("api_v1_in_flight_requests")
                     if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
                         continue
-                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                    entry = in_flight_requests.get(request_id)
+                    if _in_flight_entry_matches_client(entry, client_public_key):
+                        if isinstance(entry, dict):
+                            _record_api_v1_control_tombstone(
+                                server_public_key,
+                                client_public_key,
+                                request_id,
+                                status=status,
+                                reason=reason,
+                                deadline_monotonic=entry.get("deadline_monotonic"),
+                                deadline_unix=entry.get("deadline_unix"),
+                            )
                         in_flight_requests.pop(request_id, None)
                         in_flight_removed += 1
                         if not in_flight_requests:
@@ -2279,7 +2383,7 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     return removed
 
 
-def _mark_request_pending(client_public_key, request_id, *, cancel_token=None):
+def _mark_request_pending(client_public_key, request_id, *, cancel_token=None, deadline_monotonic=None, deadline_unix=None):
     if not client_public_key or not request_id:
         return
     with client_pending_request_ids_lock:
@@ -2288,6 +2392,8 @@ def _mark_request_pending(client_public_key, request_id, *, cancel_token=None):
             pending_ids[request_id] = {
                 "queued_at": time.time(),
                 "cancel_token": cancel_token,
+                "deadline_monotonic": deadline_monotonic,
+                "deadline_unix": deadline_unix,
             }
         else:
             pending_ids[request_id] = time.time()
@@ -2600,6 +2706,16 @@ def api_v1_relay_servers_poll():
         with client_inference_requests_changed:
             first_request = _pop_next_api_v1_request(public_key)
             if first_request is not None:
+                deadline = first_request.get('_deadline_monotonic')
+                if isinstance(deadline, (int, float)) and deadline <= time.monotonic():
+                    _cancel_api_v1_request(
+                        first_request.get('client_public_key'),
+                        first_request.get('request_id'),
+                        status='expired',
+                        reason='expired',
+                    )
+                    first_request = None
+                    continue
                 break
             remaining = deadline - time.monotonic()
             if poll_wait_seconds <= 0 or remaining <= 0:
@@ -2644,9 +2760,14 @@ def api_v1_relay_servers_poll():
                             'started_at_monotonic': time.monotonic(),
                             'client_public_key': first_request.get('client_public_key'),
                             'cancel_token': first_request.get('cancel_token'),
+                            'deadline_monotonic': first_request.get('_deadline_monotonic'),
+                            'deadline_unix': first_request.get('_deadline_unix'),
                         }
         if server_missing:
             return _server_not_found_response(first_request)
+
+    for internal_key in ('_deadline_monotonic', '_deadline_unix'):
+        first_request.pop(internal_key, None)
 
     LOGGER.info(
         "relay.api_v1.request_dispatched",
@@ -2678,7 +2799,14 @@ def api_v1_relay_requests():
 
     envelope['e2ee_v1'] = True
     queued_at = time.time()
+    deadline_seconds = _api_v1_request_deadline_seconds()
+    deadline_monotonic = time.monotonic() + deadline_seconds
+    deadline_unix = queued_at + deadline_seconds
     envelope['_queued_at'] = queued_at
+    envelope['_deadline_monotonic'] = deadline_monotonic
+    envelope['_deadline_unix'] = deadline_unix
+    envelope['request_deadline_unix'] = deadline_unix
+    envelope['request_ttl_seconds'] = round(max(deadline_seconds, 0.0), 3)
     with server_round_robin_lock:
         server_payload = known_servers.get(server_public_key)
         if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
@@ -2687,6 +2815,8 @@ def api_v1_relay_requests():
             envelope.get('client_public_key'),
             envelope.get('request_id'),
             cancel_token=envelope.get('cancel_token'),
+            deadline_monotonic=deadline_monotonic,
+            deadline_unix=deadline_unix,
         )
         with client_inference_requests_changed:
             client_inference_requests.setdefault(server_public_key, []).append(envelope)
@@ -2699,8 +2829,94 @@ def api_v1_relay_requests():
             "queue_depth": queue_depth,
         },
     )
-    return jsonify({'message': 'Request received'}), 200
+    return jsonify({'message': 'Request received', 'request_deadline_unix': deadline_unix, 'request_ttl_seconds': round(max(deadline_monotonic - time.monotonic(), 0.0), 3)}), 200
 
+
+
+@app.route('/api/v1/relay/requests/control', methods=['POST'])
+def api_v1_relay_requests_control():
+    """Authenticated compute-owned status poll for one in-flight API v1 request."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+    server_public_key = data.get('server_public_key')
+    client_public_key = data.get('client_public_key')
+    request_id = data.get('request_id')
+    if not (isinstance(server_public_key, str) and isinstance(client_public_key, str) and isinstance(request_id, str)):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    ack = bool(data.get('acknowledge'))
+    now = time.monotonic()
+    with server_round_robin_lock:
+        server_payload = known_servers.get(server_public_key)
+        if not isinstance(server_payload, dict) or not bool(server_payload.get(API_V1_SERVER_MARKER)):
+            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        entry = None
+        with api_v1_in_flight_requests_lock:
+            in_flight = server_payload.get('api_v1_in_flight_requests')
+            if isinstance(in_flight, dict):
+                candidate = in_flight.get(request_id)
+                if isinstance(candidate, dict) and candidate.get('client_public_key') == client_public_key:
+                    entry = candidate
+                    deadline = candidate.get('deadline_monotonic')
+                    if isinstance(deadline, (int, float)) and deadline <= now:
+                        _record_api_v1_control_tombstone(
+                            server_public_key,
+                            client_public_key,
+                            request_id,
+                            status='expired',
+                            reason='expired',
+                            deadline_monotonic=deadline,
+                            deadline_unix=candidate.get('deadline_unix'),
+                        )
+                        in_flight.pop(request_id, None)
+                        _clear_pending_request(client_public_key, request_id)
+                        _mark_request_terminal(client_public_key, request_id, status='expired', reason='expired')
+                        entry = None
+                        if not in_flight:
+                            server_payload.pop('api_v1_in_flight_requests', None)
+
+    if entry is not None:
+        deadline = entry.get('deadline_monotonic')
+        remaining = max(float(deadline) - now, 0.0) if isinstance(deadline, (int, float)) else None
+        with api_v1_in_flight_requests_lock:
+            entry['expires_at'] = time.monotonic() + _api_v1_in_flight_ttl_seconds()
+        _record_terminal_outcome('active')
+        _record_terminal_outcome('lease_renewed')
+        return jsonify({
+            'status': 'active',
+            'request_deadline_unix': entry.get('deadline_unix'),
+            'request_ttl_seconds': round(remaining, 3) if remaining is not None else None,
+            'next_poll_seconds': _api_v1_control_next_poll_seconds(remaining),
+        }), 200
+
+    tombstone = _get_api_v1_control_tombstone(server_public_key, client_public_key, request_id)
+    if tombstone is not None:
+        status = tombstone.get('status', 'cancelled')
+        if ack:
+            _ack_api_v1_control_tombstone(server_public_key, client_public_key, request_id)
+            _record_terminal_outcome('acknowledged')
+        remaining = None
+        deadline = tombstone.get('deadline_monotonic')
+        if isinstance(deadline, (int, float)):
+            remaining = max(float(deadline) - time.monotonic(), 0.0)
+        return jsonify({
+            'status': status,
+            'reason': tombstone.get('reason', status),
+            'request_deadline_unix': tombstone.get('deadline_unix'),
+            'request_ttl_seconds': round(remaining, 3) if remaining is not None else None,
+            'next_poll_seconds': _api_v1_control_next_poll_seconds(remaining),
+        }), 200
+
+    return jsonify({
+        'status': 'completed/unavailable',
+        'request_deadline_unix': None,
+        'request_ttl_seconds': None,
+        'next_poll_seconds': _api_v1_control_next_poll_seconds(None),
+    }), 200
 
 
 @app.route('/api/v1/relay/requests/cancel', methods=['POST'])
@@ -2783,7 +2999,25 @@ def api_v1_relay_responses():
                         in_flight_requests = server_payload.get('api_v1_in_flight_requests')
                         if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
                             continue
-                        if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                        entry = in_flight_requests.get(request_id)
+                        if _in_flight_entry_matches_client(entry, client_public_key):
+                            if isinstance(entry, dict):
+                                deadline = entry.get('deadline_monotonic')
+                                if isinstance(deadline, (int, float)) and deadline <= time.monotonic():
+                                    _record_api_v1_control_tombstone(
+                                        server_payload.get('public_key'),
+                                        client_public_key,
+                                        request_id,
+                                        status='expired',
+                                        reason='expired',
+                                        deadline_monotonic=deadline,
+                                        deadline_unix=entry.get('deadline_unix'),
+                                    )
+                                    in_flight_requests.pop(request_id, None)
+                                    if not in_flight_requests:
+                                        server_payload.pop('api_v1_in_flight_requests', None)
+                                    _mark_request_terminal(client_public_key, request_id, status='expired', reason='expired')
+                                    break
                             in_flight_requests.pop(request_id, None)
                             lifecycle_owned = True
                             if not in_flight_requests:

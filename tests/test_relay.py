@@ -54,6 +54,7 @@ def client():
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
+    relay_module.api_v1_control_tombstones.clear()
 
     with app.test_client() as client:
         yield client
@@ -73,6 +74,7 @@ def client():
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
+    relay_module.api_v1_control_tombstones.clear()
 
 
 def test_operational_endpoints_are_not_rate_limited_by_public_quota(client):
@@ -3834,3 +3836,114 @@ def test_api_v1_terminal_records_are_pruned_without_retrieve(client, monkeypatch
 
     assert diagnostics.status_code == 200
     assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def test_api_v1_control_tombstone_visible_only_to_owner_and_ack_cleans_up(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
+    other_server = _server_key('control-other')
+    _register_api_v1_server(client, other_server)
+    request_id = 'req-control-owner-cancel'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    original_deadline = poll.get_json()['request_deadline_unix']
+
+    active = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    assert known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]['deadline_unix'] == original_deadline
+    wrong = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': other_server,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    unsigned = client.post('/api/v1/relay/requests/control', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'client_timeout',
+        'cancel_token': 'cancel-proof',
+    })
+    owner = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    ack = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'acknowledge': True,
+    })
+    after_ack = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+
+    assert active.status_code == 200
+    active_json = active.get_json()
+    assert active_json['status'] == 'active'
+    assert active_json['request_deadline_unix'] == original_deadline
+    assert wrong.status_code == 200
+    assert wrong.get_json()['status'] == 'completed/unavailable'
+    assert unsigned.status_code == 400
+    assert cancelled.status_code == 200
+    assert owner.status_code == 200
+    assert owner.get_json()['status'] == 'cancelled'
+    assert owner.get_json()['reason'] == 'client_timeout'
+    assert ack.get_json()['status'] == 'cancelled'
+    assert after_ack.get_json()['status'] == 'completed/unavailable'
+
+
+def test_api_v1_absolute_deadline_expires_without_lease_extension(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_REQUEST_DEADLINE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '30')
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
+    request_id = 'req-absolute-deadline'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    deadline = poll.get_json()['request_deadline_unix']
+    entry = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
+    entry['deadline_monotonic'] = time.monotonic() - 0.1
+    entry['deadline_unix'] = deadline
+
+    control = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    late = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'expired'
+    assert control.get_json()['request_deadline_unix'] == deadline
+    assert late.status_code == 410
+    assert late.get_json()['error']['code'] == 'expired'
+
+
+def test_api_v1_control_endpoint_requires_server_token_when_configured(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TOKEN', 'relay-token')
+    monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['relay-token'])
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+
+    denied = client.post('/api/v1/relay/requests/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'missing',
+    })
+
+    assert denied.status_code == 401

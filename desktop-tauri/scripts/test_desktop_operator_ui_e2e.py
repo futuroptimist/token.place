@@ -466,6 +466,50 @@ def start_driver(app_binary: Path) -> webdriver.Remote:
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
 
 
+def start_landing_driver() -> webdriver.Chrome:
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    return webdriver.Chrome(options=options)
+
+
+def wait_for_operator_log_stop_markers(
+    relay_log: Path, driver_log: Path, timeout_seconds: float = 5.0
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    markers = (
+        "desktop.compute_node_bridge.unregister.attempted",
+        "desktop.compute_node_bridge.unregister.succeeded",
+        "desktop.compute_node.bridge_process_exited",
+    )
+    last_log = ""
+    while time.monotonic() < deadline:
+        last_log = read_tail(relay_log) + read_tail(driver_log)
+        attempted_index = last_log.find(markers[0])
+        succeeded_index = last_log.find(markers[1])
+        exited_index = last_log.find(markers[2])
+        if (
+            attempted_index >= 0
+            and succeeded_index > attempted_index
+            and exited_index > succeeded_index
+        ):
+            exited_line = next(
+                (line for line in last_log[exited_index:].splitlines() if markers[2] in line),
+                "",
+            )
+            if "killed=false" in exited_line:
+                if "desktop.compute_node.bridge_kill_requested" in last_log:
+                    raise AssertionError("unexpected bridge kill request in operator log")
+                return last_log
+        time.sleep(0.1)
+    raise AssertionError(
+        "timed out waiting for ordered unregister/exit markers; "
+        f"operator_log_tail={last_log}"
+    )
+
+
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
     webkit_driver_bin = shutil.which("WebKitWebDriver") or shutil.which("webkit2gtk-driver")
@@ -542,6 +586,7 @@ def main() -> int:
     )
 
     driver: webdriver.Remote | None = None
+    landing_driver: webdriver.Chrome | None = None
     model_path: str | None = None
     try:
         wait_for_http_200(f"{relay_url}/livez")
@@ -603,16 +648,13 @@ def main() -> int:
         wait_for_relay_diagnostics_count(relay_url, 1, timeout_seconds=5.0)
         operator_log = read_tail(relay_log) + read_tail(driver_log)
         assert "lease_seconds=120" in operator_log
-        app_window = driver.current_window_handle
-        driver.execute_script("window.open(arguments[0], '_blank');", relay_url)
-        landing_window = next(
-            handle for handle in driver.window_handles if handle != app_window
+        landing_driver = start_landing_driver()
+        landing_driver.get(relay_url)
+        WebDriverWait(landing_driver, 4).until(
+            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
+            .text.strip()
+            == "Live compute nodes: 1"
         )
-        driver.switch_to.window(landing_window)
-        WebDriverWait(driver, 4).until(
-            lambda d: "Live compute nodes: 1" in d.page_source
-        )
-        driver.switch_to.window(app_window)
 
         prompt = driver.find_element(
             By.XPATH,
@@ -647,22 +689,14 @@ def main() -> int:
         stop_to_diagnostics_seconds = wait_for_relay_diagnostics_count(
             relay_url, 0, timeout_seconds=2.0
         )
-        operator_log = read_tail(relay_log) + read_tail(driver_log)
-        assert "desktop.compute_node_bridge.unregister.attempted" in operator_log
-        assert "desktop.compute_node_bridge.unregister.succeeded" in operator_log
-        attempted_index = operator_log.find("desktop.compute_node_bridge.unregister.attempted")
-        succeeded_index = operator_log.find("desktop.compute_node_bridge.unregister.succeeded")
-        exited_index = operator_log.find("desktop.compute_node.bridge_process_exited")
-        assert attempted_index >= 0 and succeeded_index > attempted_index
-        assert exited_index > succeeded_index
+        operator_log = wait_for_operator_log_stop_markers(relay_log, driver_log)
         assert "desktop.compute_node.bridge_process_exited operator_session_id=" in operator_log
-        assert "killed=false" in operator_log
-        assert "desktop.compute_node.bridge_kill_requested" not in operator_log
 
-        driver.switch_to.window(landing_window)
         diagnostics_zero_at = stop_clicked_at + stop_to_diagnostics_seconds
-        WebDriverWait(driver, 4).until(
-            lambda d: "Live compute nodes: 0" in d.page_source
+        WebDriverWait(landing_driver, 4).until(
+            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
+            .text.strip()
+            == "Live compute nodes: 0"
         )
         widget_zero_at = time.monotonic()
         print(
@@ -681,6 +715,9 @@ def main() -> int:
             diagnostics_message(f"desktop UI e2e webdriver failure: {exc}", relay_log, driver_log, driver)
         ) from exc
     finally:
+        if landing_driver is not None:
+            with contextlib.suppress(Exception):
+                landing_driver.quit()
         if driver is not None:
             driver.quit()
         if model_path:

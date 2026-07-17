@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parents[1]
 SRC_TAURI = ROOT / "src-tauri"
 MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest.json"
+WINDOWS_MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest_windows_x86_64.json"
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 BUILD_PROFILE = "metal-relocatable-no-openssl-libpython-rpath-v2"
@@ -36,6 +37,18 @@ def load_manifest(path: Path = MANIFEST) -> dict:
     if not str(m.get("archive_url", "")).startswith("https://"): raise RuntimePrepError("archive_url must be HTTPS")
     sha = str(m.get("sha256", ""))
     if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha): raise RuntimePrepError("sha256 must be a lowercase 64-character hex digest")
+    if m.get("target_triple") == "x86_64-pc-windows-msvc":
+        if m.get("expected_packaged_runtime_path") != "resources/python-runtime/python.exe": raise RuntimePrepError("unexpected Windows packaged runtime path")
+        wheel = m.get("llama_cpp_python_wheel") or {}
+        expected_wheel = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
+        if wheel.get("filename") != expected_wheel: raise RuntimePrepError("Windows CUDA wheel filename must be exact 0.3.32 py3 none win_amd64")
+        if wheel.get("version") != "0.3.32" or wheel.get("cuda") != "cu124": raise RuntimePrepError("Windows CUDA wheel must be llama-cpp-python 0.3.32 cu124")
+        if wheel.get("python_tag") != "py3" or wheel.get("abi_tag") != "none" or wheel.get("platform_tag") != "win_amd64": raise RuntimePrepError("Windows CUDA wheel has unexpected tag/flavor")
+        wheel_sha = str(wheel.get("sha256", ""))
+        if len(wheel_sha) != 64 or any(c not in "0123456789abcdef" for c in wheel_sha): raise RuntimePrepError("Windows CUDA wheel sha256 must be pinned")
+        if "cu124" not in str(wheel.get("url", "")) or "cpu" in str(wheel.get("url", "")).lower(): raise RuntimePrepError("Windows wheel URL must be official cu124, not CPU")
+        if m.get("expected_interpreter_path") != "python.exe" or m.get("expected_architecture") != "AMD64": raise RuntimePrepError("unexpected Windows interpreter metadata")
+        return m
     if m.get("target_triple") != "aarch64-apple-darwin": raise RuntimePrepError("manifest target_triple must be aarch64-apple-darwin")
     if m.get("expected_packaged_runtime_path") != "Contents/Resources/python-runtime/bin/python3": raise RuntimePrepError("unexpected packaged runtime path")
     for key in ["cpython_version","python_build_standalone_release","python_build_standalone_build","expected_archive_root","expected_interpreter_path","expected_architecture","minimum_macos_version","required_packages","runtime_notices"]:
@@ -507,8 +520,8 @@ def existing_valid(m: dict) -> bool:
         prove_interpreter(py, OUTPUT, m); probe_runtime(py, m); audit_macho_runtime(OUTPUT); return True
     except Exception: return False
 
-def prepare(cache_dir: Path) -> None:
-    m=load_manifest()
+def prepare(cache_dir: Path, manifest_path: Path = MANIFEST) -> None:
+    m=load_manifest(manifest_path)
     if existing_valid(m): print("embedded runtime already valid"); return
     archive=download_verified(m, cache_dir)
     with tempfile.TemporaryDirectory(prefix="token-place-python-runtime-", dir=str(OUTPUT.parent)) as td:
@@ -523,9 +536,10 @@ def prepare(cache_dir: Path) -> None:
         staging.rename(OUTPUT); shutil.rmtree(backup, ignore_errors=True)
 
 def main() -> int:
-    ap=argparse.ArgumentParser(); ap.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("TOKEN_PLACE_EMBEDDED_PYTHON_CACHE", Path.home()/".cache/token-place/embedded-python")))
+    ap=argparse.ArgumentParser(); ap.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("TOKEN_PLACE_EMBEDDED_PYTHON_CACHE", Path.home()/".cache/token-place/embedded-python"))); ap.add_argument("--target", choices=["macos-aarch64", "windows-x86_64"], default="macos-aarch64")
     args=ap.parse_args()
-    try: prepare(args.cache_dir); return 0
+    manifest = WINDOWS_MANIFEST if args.target == "windows-x86_64" else MANIFEST
+    try: prepare(args.cache_dir, manifest); return 0
     except subprocess.CalledProcessError as e:
         print(f"embedded runtime preparation failed: {e}", file=sys.stderr)
         if e.stdout: print(e.stdout, file=sys.stderr)

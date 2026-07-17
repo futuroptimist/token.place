@@ -1504,6 +1504,33 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
+
+
+def _is_bundled_windows_runtime() -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        executable = Path(sys.executable).resolve()
+    except (OSError, RuntimeError):
+        executable = Path(sys.executable)
+    parts = {part.lower() for part in executable.parts}
+    return "python-runtime" in parts and executable.name.lower() == "python.exe"
+
+def _allow_development_source_build() -> bool:
+    if _is_bundled_windows_runtime():
+        return False
+    return os.getenv("TOKEN_PLACE_DESKTOP_ALLOW_DEV_SOURCE_BUILD", "").strip().lower() in {"1", "true", "yes"}
+
+def _packaged_windows_runtime_fail_closed_payload(before: RuntimeProbe, before_version_payload: Dict[str, str], reason: str) -> Dict[str, str]:
+    return {
+        "selected_backend": "cpu",
+        "fallback_reason": reason,
+        "runtime_action": "bundled_runtime_invalid",
+        "bundled_runtime_probe": "failed",
+        **_probe_result_payload(before),
+        **before_version_payload,
+    }
+
 def _ensure_desktop_llama_runtime_impl(
     mode: str,
     *,
@@ -1556,6 +1583,21 @@ def _ensure_desktop_llama_runtime_impl(
             f"{type(exc).__name__}"
         )
     before_version_payload = _version_payload(before, required_version, required_package_spec)
+    bundled_windows_runtime = _is_bundled_windows_runtime()
+    if bundled_windows_runtime:
+        if before.backend == "missing":
+            return _packaged_windows_runtime_fail_closed_payload(
+                before,
+                before_version_payload,
+                "bundled Windows CUDA runtime is missing llama-cpp-python; reinstall desktop-v0.1.2 or use the NVIDIA Windows build",
+            )
+        if before.backend != "cuda" or not before.gpu_offload_supported:
+            return _packaged_windows_runtime_fail_closed_payload(
+                before,
+                before_version_payload,
+                "bundled Windows CUDA runtime did not report CUDA GPU offload; update the NVIDIA driver and reinstall desktop-v0.1.2",
+            )
+
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {
             "selected_backend": "cpu",
@@ -1677,6 +1719,9 @@ def _ensure_desktop_llama_runtime_impl(
     cuda_source_build_suppressed = False
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
+        if should_repair and not _allow_development_source_build():
+            should_repair = False
+            repair_skip_reason = "CUDA source repair requires unbundled development layout and TOKEN_PLACE_DESKTOP_ALLOW_DEV_SOURCE_BUILD=1"
         if should_repair:
             if dependency_target is None:
                 last_error = (
@@ -1755,6 +1800,13 @@ def _ensure_desktop_llama_runtime_impl(
         else:
             cuda_source_build_suppressed = True
             last_error = repair_skip_reason
+
+    if bundled_windows_runtime:
+        return _packaged_windows_runtime_fail_closed_payload(
+            before,
+            before_version_payload,
+            (last_error or "bundled Windows CUDA runtime failed immutable probe; startup will not run pip, source builds, CPU fallback, or model fallback"),
+        )
 
     try:
         plans = llama_cpp_install_plan_fallbacks(

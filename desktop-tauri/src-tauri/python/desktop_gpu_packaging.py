@@ -11,6 +11,7 @@ LLAMA_CPP_PYPI_INDEX_URL = "https://pypi.org/simple"
 LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE = "https://abetlen.github.io/llama-cpp-python/whl"
 LLAMA_CPP_CPU_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/cpu"
 LLAMA_CPP_METAL_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/metal"
+LLAMA_CPP_CUDA_124_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/cu124"
 
 
 @dataclass(frozen=True)
@@ -79,11 +80,12 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="cuda",
             package_spec=package_spec,
-            cmake_args="-DGGML_CUDA=on",
-            force_cmake=True,
+            cmake_args=None,
+            force_cmake=False,
             index_url=LLAMA_CPP_PYPI_INDEX_URL,
-            only_binary=False,
-            no_binary=True,
+            extra_index_url=LLAMA_CPP_CUDA_124_WHEEL_INDEX_URL,
+            only_binary=True,
+            no_binary=False,
         )
 
     if detected_platform == "darwin":
@@ -118,22 +120,9 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
-        # If CUDA builds are unavailable for this ABI, fall back to
-        # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
-        # without entering another native compilation path.
-        plans.append(
-            LlamaCppInstallPlan(
-                platform=primary.platform,
-                backend="cpu",
-                package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url=LLAMA_CPP_PYPI_INDEX_URL,
-                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
-                only_binary=True,
-                no_binary=False,
-            )
-        )
+        # Packaged Windows releases must use the bundled cu124 wheel only.
+        # Development repair paths may run this plan but never a source build or CPU fallback.
+        return plans
 
     if primary.platform == "darwin":
         # Prefer a prebuilt macOS wheel first so packaged apps do not require

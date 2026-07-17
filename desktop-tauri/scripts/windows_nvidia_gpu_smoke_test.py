@@ -6,10 +6,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
+
+BRIDGE_TIMEOUT_SECONDS = 180.0
+DIAGNOSTIC_TAIL_LINES = 80
 
 
 def _fail(message: str) -> int:
@@ -34,30 +42,102 @@ def _offloaded_layer_count(value: Any) -> int:
     return int(value or 0)
 
 
-def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
+def _is_truthy_cuda_ready(event: dict[str, Any], context_tier: str) -> bool:
+    """Return True for the bridge's authoritative operational CUDA-ready event."""
+
+    if event.get('type') != 'started':
+        return False
+    if event.get('worker_state') == 'provisioning':
+        return False
+    if event.get('backend_available') == 'pending' or event.get('backend_used') == 'pending':
+        return False
+    if event.get('registered') is not True:
+        return False
+    if event.get('context_tier') != context_tier:
+        return False
+    if event.get('warm_load_state') != 'ready':
+        return False
+    if event.get('backend_available') != 'cuda' or event.get('backend_used') != 'cuda':
+        return False
+    if event.get('llama_repo_stub_imported') is not False:
+        return False
+    if _offloaded_layer_count(event.get('offloaded_layers')) <= 0:
+        return False
+    kv_cache = str(event.get('kv_cache_device') or '').lower()
+    return kv_cache not in {'', 'cpu'}
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(
+                ['taskkill', '/T', '/F', '/PID', str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+    except Exception:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == 'nt':
+                subprocess.run(
+                    ['taskkill', '/T', '/F', '/PID', str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def _drain_lines(stream: Any, output: 'queue.Queue[str] | None', tail: deque[str]) -> None:
+    try:
+        for line in iter(stream.readline, ''):
+            if not line:
+                break
+            tail.append(line.rstrip('\n'))
+            if output is not None:
+                output.put(line)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _load_compute_runtime_diagnostics(model_path: str, mode: str, context_tier: str) -> dict[str, Any]:
     from desktop_runtime_setup import ENABLE_BOOTSTRAP_ENV, ensure_desktop_llama_runtime
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
+    from utils.context_profiles import apply_context_profile
     from utils.llm.model_manager import get_model_manager
 
     os.environ.setdefault(ENABLE_BOOTSTRAP_ENV, '1')
-    runtime_setup = ensure_desktop_llama_runtime(mode)
+    runtime_setup = ensure_desktop_llama_runtime(mode, context_tier=context_tier)
 
     manager = get_model_manager()
     manager.model_path = model_path
     apply_compute_mode(manager, mode)
+    apply_context_profile(manager, context_tier)
     manager.get_llm_instance()
     diagnostics = compute_mode_diagnostics(manager)
-    diagnostics["runtime_setup"] = runtime_setup
+    diagnostics['runtime_setup'] = runtime_setup
     return diagnostics
 
 
-def _is_repo_llama_shim(module_path: str, repo_root: Path) -> bool:
-    if not module_path:
-        return False
-    return str(Path(module_path).resolve()).lower() == str((repo_root / 'llama_cpp.py').resolve()).lower()
-
-
-def _run_bridge_oneshot(model_path: str, mode: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     repo_root = _repo_root()
     python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
     bridge_path = python_root / 'compute_node_bridge.py'
@@ -68,7 +148,18 @@ def _run_bridge_oneshot(model_path: str, mode: str) -> tuple[dict[str, Any], lis
         entries.append(existing_pythonpath)
     env['PYTHONPATH'] = os.pathsep.join(entries)
 
-    completed = subprocess.run(
+    popen_kwargs: dict[str, Any] = {
+        'stdin': subprocess.PIPE,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+        'text': True,
+        'cwd': str(repo_root),
+        'env': env,
+    }
+    if os.name != 'nt':
+        popen_kwargs['start_new_session'] = True
+
+    process = subprocess.Popen(
         [
             sys.executable,
             str(bridge_path),
@@ -76,24 +167,73 @@ def _run_bridge_oneshot(model_path: str, mode: str) -> tuple[dict[str, Any], lis
             model_path,
             '--mode',
             mode,
+            '--context-tier',
+            context_tier,
             '--relay-url',
             'https://token.place',
         ],
-        input='{"type":"cancel"}\n',
-        capture_output=True,
-        text=True,
-        timeout=180,
-        cwd=str(repo_root),
-        env=env,
-        check=False,
+        **popen_kwargs,
     )
-    events = [
-        json.loads(line)
-        for line in (completed.stdout or '').splitlines()
-        if line.strip().startswith('{')
-    ]
-    started = next((event for event in events if event.get('type') == 'started'), {})
-    return started, events, (completed.stderr or '').strip()
+
+    stdout_queue: 'queue.Queue[str]' = queue.Queue()
+    stdout_tail: deque[str] = deque(maxlen=DIAGNOSTIC_TAIL_LINES)
+    stderr_tail: deque[str] = deque(maxlen=DIAGNOSTIC_TAIL_LINES)
+    stdout_thread = threading.Thread(target=_drain_lines, args=(process.stdout, stdout_queue, stdout_tail), daemon=True)
+    stderr_thread = threading.Thread(target=_drain_lines, args=(process.stderr, None, stderr_tail), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    events: list[dict[str, Any]] = []
+    ready_event: dict[str, Any] = {}
+    deadline = time.monotonic() + BRIDGE_TIMEOUT_SECONDS
+    try:
+        while time.monotonic() < deadline:
+            try:
+                line = stdout_queue.get(timeout=0.25)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            events.append(event)
+            if event.get('type') == 'error':
+                raise RuntimeError(f"compute_node_bridge.py emitted error before CUDA readiness: {event.get('message') or event.get('last_error') or event.get('error_code')}")
+            if _is_truthy_cuda_ready(event, context_tier):
+                ready_event = event
+                if process.stdin is not None:
+                    process.stdin.write('{"type":"cancel"}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                break
+        else:
+            raise TimeoutError('compute_node_bridge.py did not emit authoritative CUDA-ready started event before timeout')
+
+        if not ready_event:
+            raise RuntimeError('compute_node_bridge.py exited before emitting authoritative CUDA-ready started event')
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+        return ready_event, events, '\n'.join(stderr_tail)
+    except Exception:
+        _terminate_process_tree(process)
+        raise RuntimeError(
+            'bridge validation failed; '
+            f'events_tail={events[-5:]} stderr_tail={list(stderr_tail)[-20:]} stdout_tail={list(stdout_tail)[-20:]}'
+        )
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
 
 
 def main() -> int:
@@ -102,6 +242,7 @@ def main() -> int:
     )
     parser.add_argument('--model', required=True, help='Path to GGUF model used by desktop sidecars')
     parser.add_argument('--mode', default='auto', choices=['auto', 'gpu', 'hybrid'])
+    parser.add_argument('--context-tier', default='64k-full', choices=['8k-fast', '64k-full'])
     args = parser.parse_args()
 
     if not sys.platform.startswith('win'):
@@ -118,35 +259,30 @@ def main() -> int:
     ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
     try:
-        diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode)
+        diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode, args.context_tier)
         runtime_setup = diagnostics.get('runtime_setup', {})
+        repo_shim_imported = runtime_setup.get('runtime_action') == 'shadowed_repo_llama_cpp'
         payload = {
             'interpreter': runtime_setup.get('interpreter', sys.executable),
-            'llama_module_path': runtime_setup.get('llama_module_path', 'missing'),
+            'repo_shim_imported': repo_shim_imported,
             'backend_available': diagnostics.get('backend_available'),
             'backend_used': diagnostics.get('backend_used'),
             'offloaded_layers': diagnostics.get('offloaded_layers'),
             'kv_cache_device': diagnostics.get('kv_cache_device'),
             'fallback_reason': diagnostics.get('fallback_reason'),
+            'context_tier': getattr(diagnostics, 'context_tier', args.context_tier) if not isinstance(diagnostics, dict) else diagnostics.get('context_tier', args.context_tier),
         }
         print(json.dumps(payload, indent=2))
 
-        _require(
-            not _is_repo_llama_shim(str(payload.get('llama_module_path') or ''), repo_root),
-            'llama_module_path resolved to repo-local llama_cpp.py shim; expected site-packages package',
-        )
+        _require(payload['repo_shim_imported'] is False, 'runtime origin check reported repo-local llama_cpp.py shim')
         _require(str(payload.get('interpreter') or '').strip() != '', 'interpreter is missing')
-        _require(
-            runtime_setup.get('runtime_action') != 'shadowed_repo_llama_cpp',
-            'runtime_action reported shadowed_repo_llama_cpp',
-        )
         _require(payload['backend_available'] == 'cuda', 'backend_available is not cuda')
         _require(payload['backend_used'] == 'cuda', 'backend_used is not cuda')
         _require(_offloaded_layer_count(payload.get('offloaded_layers')) > 0, 'offloaded_layers must be > 0')
         kv_cache = str(payload.get('kv_cache_device') or '').lower()
         _require(kv_cache not in {'', 'cpu'}, 'kv_cache_device indicates CPU-only execution')
 
-        started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode)
+        started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier)
         print(
             json.dumps(
                 {
@@ -157,12 +293,10 @@ def main() -> int:
                 indent=2,
             )
         )
-        _require(bool(started), 'compute_node_bridge.py did not emit a started event')
-        _require(
-            not _is_repo_llama_shim(str(started.get('llama_module_path') or ''), repo_root),
-            'bridge started.llama_module_path resolved to repo-local llama_cpp.py shim',
-        )
+        _require(bool(started), 'compute_node_bridge.py did not emit an authoritative CUDA-ready started event')
+        _require(started.get('llama_repo_stub_imported') is False, 'bridge runtime origin check reported repo-local llama_cpp.py shim')
         _require(str(started.get('interpreter') or '').strip() != '', 'bridge started.interpreter is missing')
+        _require(started.get('context_tier') == args.context_tier, f"bridge started.context_tier is not {args.context_tier}")
         _require(started.get('backend_available') == 'cuda', 'bridge started.backend_available is not cuda')
         _require(started.get('backend_used') == 'cuda', 'bridge started.backend_used is not cuda')
         _require(

@@ -27,12 +27,12 @@ from utils.llm.model_profiles import get_default_model_profile
 try:
     from desktop_runtime_setup import ensure_desktop_python_dependencies
 except ModuleNotFoundError:
-    def ensure_desktop_python_dependencies() -> Dict[str, str]:
+    def ensure_desktop_python_dependencies(**_kwargs: Any) -> Dict[str, str]:
         return {"ok": "false", "action": "desktop_runtime_setup_missing", "missing": "unknown"}
 
 
-def _run_dependency_preflight() -> Dict[str, Any]:
-    result = ensure_desktop_python_dependencies()
+def _run_dependency_preflight(*, mutate: bool = True) -> Dict[str, Any]:
+    result = ensure_desktop_python_dependencies(mutate=mutate)
     if result.get("ok") == "true":
         return {"ok": True}
     missing = result.get("missing") or "unknown"
@@ -148,12 +148,19 @@ def _get_model_manager(*, allow_inspect_fallback: bool = False):
 
 
 def inspect_model() -> int:
-    preflight = _run_dependency_preflight()
+    preflight = _run_dependency_preflight(mutate=False)
     if not preflight.get("ok", False):
-        return _response(**preflight)
+        manager, error_status = _get_model_manager(allow_inspect_fallback=True)
+        if error_status is not None:
+            return _response(**error_status)
+        if manager is None:
+            return _response(True, payload=_fallback_model_metadata())
+        return _response(True, payload=manager.get_model_artifact_metadata())
     manager, error_status = _get_model_manager(allow_inspect_fallback=True)
     if error_status is not None:
         return _response(**error_status)
+    if manager is None:
+        return _response(True, payload=_fallback_model_metadata())
     return _response(True, payload=manager.get_model_artifact_metadata())
 
 

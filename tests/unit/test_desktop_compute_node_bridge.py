@@ -35,6 +35,20 @@ def _default_desktop_runtime_arch(monkeypatch):
         monkeypatch.setattr(runtime_setup.platform_module, 'machine', lambda: 'AMD64')
 
 
+def test_structured_provisioning_payload_omits_unknown_deadline(monkeypatch):
+    args = SimpleNamespace(relay_url='https://relay.example', relay_urls=None, mode='auto', model='model.gguf')
+    monkeypatch.setattr(compute_node_bridge.time, 'monotonic', lambda: 12.5)
+
+    payload = compute_node_bridge._structured_provisioning_payload(args, phase='dependency_check', started_at=10.0)
+
+    assert payload['runtime_provisioning_state'] == 'provisioning'
+    assert payload['startup_phase'] == 'dependency_check'
+    assert payload['startup_elapsed_ms'] == 2500
+    assert payload['startup_deadline_ms'] is None
+    assert payload['readiness_diagnostics']['startup_elapsed_ms'] == 2500
+    assert 'startup_deadline_ms' not in payload['readiness_diagnostics']
+
+
 def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '-1')
 
@@ -646,6 +660,8 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     started = events[0]
     assert started['offloaded_layers'] == 0
     assert started['kv_cache_device'] == 'cpu'
+    assert started['use_mock_llm'] is False
+    assert started['llama_repo_stub_imported'] is False
     required_status_fields = {
         'running',
         'registered',
@@ -846,8 +862,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert len(events) == 1
-    payload = events[0]
+    payload = next(event for event in events if event.get('type') == 'error')
     expected_message = (
         'GPU provisioning failed for desktop Windows launch '
         '(mode=auto, action=failed): cuda wheel install failed. '
@@ -860,7 +875,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
     assert payload['registered'] is False
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -891,8 +906,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert len(events) == 1
-    payload = events[0]
+    payload = next(event for event in events if event.get('type') == 'error')
     expected_message = (
         'GPU provisioning failed for desktop Windows launch '
         '(mode=auto, action=shadowed_repo_llama_cpp): '
@@ -906,7 +920,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
     assert payload['registered'] is False
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -1147,6 +1161,7 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
 
     stop_counter = {'count': 0}
 
@@ -1908,7 +1923,7 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['last_error'] == payload['message']
     assert payload['operator_session_id']
-    assert payload['sequence'] == 1
+    assert payload['sequence'] >= 1
     assert isinstance(payload['updated_at_ms'], int)
 
 
@@ -2345,7 +2360,7 @@ def test_context_profile_error_after_dependency_preflight_fails_closed(monkeypat
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert events == ['dependency_preflight', 'context_profiles']
     assert emitted['error_code'] == 'context_profiles_unavailable'
     assert emitted['context_tier'] == '64k-full'
@@ -2385,7 +2400,7 @@ def test_context_profile_import_error_details_are_sanitized(monkeypatch, capsys)
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert emitted['error_code'] == 'context_profiles_unavailable'
     assert emitted['registered'] is False
     assert '\n' not in emitted['last_error']
@@ -2440,7 +2455,7 @@ def test_dependency_preflight_failure_does_not_import_context_profiles(monkeypat
     )
 
     assert compute_node_bridge.run(args) == 1
-    emitted = json.loads(capsys.readouterr().out.strip())
+    emitted = next(event for event in (json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()) if event.get('type') == 'error')
     assert calls == ['dependency_preflight']
     assert 'desktop runtime dependency preflight failed' in emitted['last_error']
     assert 'missing=cryptography' in emitted['last_error']
@@ -3153,7 +3168,7 @@ def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     assert error_event["relay_runtime_state"] == "failed"
     assert error_event["last_error"] == error_event["message"]
     assert error_event["operator_session_id"]
-    assert error_event["sequence"] == 1
+    assert error_event["sequence"] >= 1
     assert isinstance(error_event["updated_at_ms"], int)
 
 
@@ -3778,7 +3793,7 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
         for line in capsys.readouterr().out.splitlines()
         if line.strip()
     ]
-    payload = events[0]
+    payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
     assert payload["registered"] is False
     assert payload["relay_runtime_state"] == "failed"
@@ -4037,13 +4052,14 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = events[0]
     assert started['last_error'] is None
-    assert started['runtime_action'] == 'metal_cpu_fallback'
-    assert started['base_prefix'].startswith('/Library/Developer')
-    assert started['pip_version'] == 'pip 24.0'
-    assert started['install_command_summary'].startswith('python -m pip install')
-    assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
-    assert started['pip_stderr_tail'] == 'Metal headers missing'
-    assert 'llama_module_path' not in started
+    status_event = next(event for event in events if event.get('type') == 'status')
+    assert status_event['runtime_action'] == 'metal_cpu_fallback'
+    assert status_event['base_prefix'].startswith('/Library/Developer')
+    assert status_event['pip_version'] == 'pip 24.0'
+    assert status_event['install_command_summary'].startswith('python -m pip install')
+    assert status_event['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
+    assert status_event['pip_stderr_tail'] == 'Metal headers missing'
+    assert 'llama_module_path' not in status_event
 
 def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):
     from utils.processing_result import RelayProcessingResult
@@ -5124,3 +5140,128 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert any(event.get('child_model_path_exists') is True for event in events if event.get('type') == 'status')
+
+
+def test_run_defaults_bad_operator_event_sequence_to_zero(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-1')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', 'boot')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'false', 'missing': 'psutil', 'action': 'install_cancelled'},
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_urls=[],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+
+    assert events[0]['sequence'] == 1
+    assert events[0]['worker_state'] == 'provisioning'
+
+
+def test_run_inherits_valid_operator_event_sequence(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-1')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', '41')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'false', 'missing': 'psutil', 'action': 'install_cancelled'},
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+
+    assert events[0]['sequence'] == 42
+    assert os.environ['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == str(events[-1]['sequence'])
+
+
+def test_provisioning_extra_updates_readiness_diagnostics(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    def deps(**kwargs):
+        kwargs['heartbeat']({'startup_elapsed_ms': 5000, 'startup_deadline_ms': 10000, 'unsafe': 'drop'})
+        return {'ok': 'false', 'missing': 'psutil', 'action': 'install_cancelled'}
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', deps)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    install = next(event for event in events if event.get('startup_phase') == 'dependency_install')
+    assert install['startup_elapsed_ms'] == 5000
+    assert install['startup_deadline_ms'] == 10000
+    assert install['readiness_diagnostics']['startup_elapsed_ms'] == 5000
+    assert 'unsafe' not in install
+    assert os.environ['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == str(events[-1]['sequence'])
+
+
+def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_LOG_FILE', '/tmp/operator.log')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda **_kwargs: {'ok': 'true'})
+
+    def runtime(*args, **kwargs):
+        if kwargs:
+            raise TypeError('unexpected keyword argument cancellation_predicate')
+        return {'runtime_action': 'already_supported', 'selected_backend': 'cpu'}
+
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', runtime)
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
+    _install_fake_runtime_module(monkeypatch)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_urls=[], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+    phases = [json.loads(line).get('startup_phase') for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert 'runtime_probe' in phases
+    assert 'runtime_verification' in phases
+
+
+def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    assert compute_node_bridge.run(args) == 1
+
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    warming_status_events = [
+        event
+        for event in events
+        if event.get('type') == 'status' and event.get('startup_phase') == 'warm_load'
+    ]
+    assert warming_status_events
+    assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err

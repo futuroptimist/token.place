@@ -91,12 +91,14 @@ def test_download_returns_metadata_when_download_succeeds(capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': metadata}
 
 
-def test_inspect_fails_when_dependency_preflight_fails(capsys):
+def test_inspect_uses_read_only_fallback_when_dependency_preflight_fails(capsys):
     with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': False, 'error': 'deps bad'}):
         status = model_bridge.inspect_model()
 
-    assert status == 1
-    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['ok'] is True
+    assert payload['payload']['api_model_id'] == 'qwen3-8b-instruct'
 
 
 def test_get_model_manager_reports_missing_dependency(capsys):
@@ -396,3 +398,59 @@ def test_fallback_model_metadata_preserves_model_env_overrides(monkeypatch):
     assert payload['filename'] == 'override.gguf'
     assert payload['url'] == 'https://example.com/override.gguf'
     assert payload['canonical_family_url'] == 'https://example.com/family'
+
+
+def test_fallback_dependency_preflight_accepts_mutate_keyword(monkeypatch):
+    def fallback(**_kwargs):
+        return {'ok': 'false', 'action': 'desktop_runtime_setup_missing', 'missing': 'unknown'}
+
+    monkeypatch.setattr(model_bridge, 'ensure_desktop_python_dependencies', fallback)
+
+    result = model_bridge._run_dependency_preflight(mutate=False)
+
+    assert result['ok'] is False
+    assert 'desktop_runtime_setup_missing' in result['error']
+
+
+def test_inspect_uses_preflight_failure_manager_without_second_lookup(capsys, monkeypatch):
+    class Manager:
+        def get_model_artifact_metadata(self):
+            return {'filename': 'model.gguf'}
+
+    calls = {'count': 0}
+
+    def get_manager(*, allow_inspect_fallback=False):
+        calls['count'] += 1
+        assert allow_inspect_fallback is True
+        return Manager(), None
+
+    monkeypatch.setattr(model_bridge, '_run_dependency_preflight', lambda mutate=False: {'ok': False, 'error': 'deps missing'})
+    monkeypatch.setattr(model_bridge, '_get_model_manager', get_manager)
+
+    status = model_bridge.inspect_model()
+
+    assert status == 0
+    assert calls['count'] == 1
+    assert json.loads(capsys.readouterr().out)['payload'] == {'filename': 'model.gguf'}
+
+
+def test_inspect_preflight_error_status_and_none_manager_fallback(capsys, monkeypatch):
+    monkeypatch.setattr(model_bridge, '_run_dependency_preflight', lambda mutate=False: {'ok': False, 'error': 'deps missing'})
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, {'ok': False, 'error': 'manager failed'}))
+    assert model_bridge.inspect_model() == 1
+    assert json.loads(capsys.readouterr().out)['error'] == 'manager failed'
+
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, None))
+    assert model_bridge.inspect_model() == 0
+    assert json.loads(capsys.readouterr().out)['payload']['filename'].endswith('.gguf')
+
+
+def test_inspect_successful_preflight_none_manager_uses_safe_fallback(capsys, monkeypatch):
+    monkeypatch.setattr(model_bridge, '_run_dependency_preflight', lambda mutate=False: {'ok': True})
+    monkeypatch.setattr(model_bridge, '_get_model_manager', lambda allow_inspect_fallback=False: (None, None))
+
+    assert model_bridge.inspect_model() == 0
+
+    payload = json.loads(capsys.readouterr().out)['payload']
+    assert payload['filename'].endswith('.gguf')
+    assert payload['active_profile_id'] == payload['profile_id']

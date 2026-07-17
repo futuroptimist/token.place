@@ -1890,6 +1890,145 @@ describe('desktop app start failure handling', () => {
   });
 
 
+  it('renders provisioning started event fields and locks controls', async () => {
+    render(<App />);
+
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const stopButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    const inspectButton = (await screen.findByText('Open debug log')) as HTMLButtonElement;
+    const handler = eventHandlers.get('compute_node_event');
+    expect(handler).toBeTruthy();
+
+    handler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'provisioning',
+        runtime_provisioning_state: 'provisioning',
+        startup_phase: 'cuda_build',
+        startup_elapsed_ms: 5100,
+        startup_deadline_ms: 300000,
+        worker_state: 'provisioning',
+        worker_alive: false,
+        log_file_path: 'C:/Users/alice/AppData/Local/token.place/operator.log',
+        readiness_diagnostics: { startup_phase: 'cuda_build' },
+        operator_session_id: 'provisioning-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
+    expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning');
+    expect(screen.getByText(/Startup phase:/).textContent).toContain('cuda_build');
+    expect(screen.getByText(/Startup elapsed:/).textContent).toContain('5100');
+    expect(screen.getByText(/Startup elapsed:/).textContent).toContain('/ 300000 ms');
+    expect(screen.getByText(/Operator debug log:/).textContent).toContain('C:/Users/alice/AppData/Local/token.place/operator.log');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('startup_phase=cuda_build');
+    expect(stopButton.disabled).toBe(false);
+    expect(startButton.disabled).toBe(true);
+    expect(inspectButton.disabled).toBe(false);
+  });
+
+  it('hides unknown startup deadline and clears stale provisioning fields after live, error, and stopped events', async () => {
+    render(<App />);
+
+    const handler = eventHandlers.get('compute_node_event');
+    expect(handler).toBeTruthy();
+
+    handler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'provisioning',
+        runtime_provisioning_state: 'provisioning',
+        startup_phase: 'dependency_check',
+        startup_elapsed_ms: 0,
+        startup_deadline_ms: null,
+        worker_state: 'provisioning',
+        worker_alive: false,
+        operator_session_id: 'cleanup-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning'));
+    expect(screen.getByText(/Startup elapsed:/).textContent).toContain('0 ms');
+    expect(screen.getByText(/Startup elapsed:/).textContent).not.toContain('/ 0 ms');
+
+    handler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        worker_state: 'ready',
+        worker_alive: true,
+        operator_session_id: 'cleanup-session',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('idle'));
+    expect(screen.getByText(/Startup phase:/).textContent).toContain('none');
+    expect(screen.getByText(/Startup elapsed:/).textContent).not.toContain('/ 0 ms');
+
+    handler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        relay_runtime_state: 'provisioning',
+        runtime_provisioning_state: 'provisioning',
+        startup_phase: 'runtime_install',
+        startup_elapsed_ms: 2500,
+        startup_deadline_ms: 300000,
+        worker_state: 'provisioning',
+        worker_alive: false,
+        operator_session_id: 'cleanup-session',
+        sequence: 3,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning'));
+
+    handler?.({
+      payload: {
+        type: 'error',
+        message: 'failed',
+        operator_session_id: 'cleanup-session',
+        sequence: 4,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('idle'));
+
+    handler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        relay_runtime_state: 'provisioning',
+        runtime_provisioning_state: 'provisioning',
+        startup_phase: 'runtime_install',
+        startup_elapsed_ms: 2500,
+        startup_deadline_ms: 300000,
+        worker_state: 'provisioning',
+        worker_alive: false,
+        operator_session_id: 'cleanup-session',
+        sequence: 5,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning'));
+
+    handler?.({
+      payload: {
+        type: 'stopped',
+        operator_session_id: 'cleanup-session',
+        sequence: 6,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Provisioning state:/).textContent).toContain('idle'));
+  });
+
   it('re-enables context tier and relay controls immediately after successful Stop Operator', async () => {
     mockInitialComputeStatus(
       {

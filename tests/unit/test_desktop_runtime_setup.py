@@ -1,9 +1,12 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,11 +111,43 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None, yarn=False, re
     )
 
 
+
+
+def _install_fake_probe_popen(monkeypatch, result_or_exc, captured=None):
+    class _FakeProbeProcess:
+        pid = 24680
+        def __init__(self, cmd, **kwargs):
+            if isinstance(result_or_exc, BaseException):
+                raise result_or_exc
+            if captured is not None:
+                captured['cmd'] = cmd
+                captured['cwd'] = kwargs.get('cwd')
+                captured['env'] = kwargs.get('env', {})
+            self.returncode = getattr(result_or_exc, 'returncode', 0)
+            stdout = getattr(result_or_exc, 'stdout', '') or ''
+            stderr = getattr(result_or_exc, 'stderr', '') or ''
+            if stdout.startswith('{'):
+                stdout = desktop_runtime_setup.PROBE_RESULT_PREFIX.decode() + stdout + '\n'
+            self.stdout = io.BytesIO(stdout.encode())
+            self.stderr = io.BytesIO(stderr.encode())
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            return self.returncode
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', _FakeProbeProcess)
+
 @pytest.fixture(autouse=True)
 def _default_desktop_arch(monkeypatch):
-    """Keep win32 platform simulations independent from the host CPU architecture."""
+    """Keep desktop runtime tests isolated from host architecture and managed-site state."""
 
+    original_sys_path = list(sys.path)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'AMD64')
+    try:
+        yield
+    finally:
+        os.environ.pop('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', None)
+        sys.path[:] = original_sys_path
 
 
 def test_pip_source_build_timeout_env_uses_default_for_malformed_values(monkeypatch):
@@ -297,6 +332,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout'] = kwargs.get('timeout_seconds')
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_install)
@@ -305,6 +341,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
     assert result['selected_backend'] == 'metal'
     assert result['runtime_action'] == 'installed_metal_reexec'
+    assert captured['startup_phase'] == 'runtime_install'
     assert '--target' in captured['cmd']
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert captured['env']['FORCE_CMAKE'] == '1'
@@ -489,6 +526,7 @@ def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_
     def _capture_install(cmd, env, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_install)
@@ -496,6 +534,7 @@ def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
 
     assert result['runtime_action'] == 'installed_metal_reexec'
+    assert captured['startup_phase'] == 'runtime_install'
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert str(dependency_target) in captured['env']['PYTHONPATH']
@@ -810,13 +849,7 @@ def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monk
         )
         stderr = ''
 
-    def fake_run(cmd, **kwargs):
-        captured['cmd'] = cmd
-        captured['cwd'] = kwargs['cwd']
-        captured['env'] = kwargs['env']
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
 
     probe = desktop_runtime_setup._probe_llama_runtime()
 
@@ -935,15 +968,22 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     def fake_execve(prog, argv, env):
         called['prog'] = prog
         called['argv'] = argv
+        called['env'] = dict(env)
         called['guard'] = env.get(desktop_runtime_setup.REEXEC_GUARD_ENV)
 
     monkeypatch.setattr(desktop_runtime_setup.os, 'execve', fake_execve)
     monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-123')
+    monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', '41')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', '/tmp/token-place-managed-site')
 
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
 
     assert called['prog'] == sys.executable
     assert called['guard'] == '1'
+    assert called['env']['TOKENPLACE_COMPUTE_NODE_SESSION_ID'] == 'session-123'
+    assert called['env']['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == '41'
+    assert called['env']['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == '/tmp/token-place-managed-site'
 
 
 def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
@@ -981,6 +1021,118 @@ def test_windows_runtime_bootstrap_defaults_to_probe_only_without_opt_in(monkeyp
     assert result['runtime_action'] == 'probe_only'
     assert desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV in result['fallback_reason']
     assert invoked['source_repair'] is False
+
+
+
+def test_install_outcome_timeout_action_is_fatal_for_windows_qwen64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    runtime_action = desktop_runtime_setup._install_outcome_action('outcome=timed_out; stderr_tail=empty', 'cuda')
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'gpu',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': runtime_action,
+            'fallback_reason': 'llama-cpp-python install timed out',
+        },
+    )
+
+    assert runtime_action == 'install_timeout'
+    assert runtime_action in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert message is not None
+    assert 'action=install_timeout' in message
+
+
+def test_install_outcome_heartbeat_failure_action_is_fatal_for_windows_qwen64k(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    runtime_action = desktop_runtime_setup._install_outcome_action('outcome=heartbeat_failed; stderr_tail=empty', 'cuda')
+
+    assert runtime_action == 'install_heartbeat_failed'
+    assert runtime_action in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+
+
+def test_cuda_source_repair_lock_timeout_returns_structured_failure(monkeypatch, tmp_path):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+
+    class TimeoutLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            raise TimeoutError('managed-site lock wait timed out')
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', TimeoutLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *_args, **_kwargs: pytest.fail('source repair must not run without the lock'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'install_timeout'
+    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert 'timed out' in result['fallback_reason']
+
+
+def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, tmp_path):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python==0.3.32',
+            cmake_args='-DGGML_CUDA=on',
+            force_cmake=True,
+            index_url=None,
+            only_binary=False,
+            no_binary=False,
+        )
+    ])
+
+    class CancelledLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            raise TimeoutError('managed-site lock wait cancelled')
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', CancelledLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: pytest.fail('pip install must not run without the lock'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+
+    assert result['runtime_action'] == 'install_cancelled'
+    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
+    assert 'cancelled' in result['fallback_reason']
 
 
 def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
@@ -1082,10 +1234,11 @@ def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     dependency_target = tmp_path / 'desktop deps'
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1093,6 +1246,7 @@ def test_windows_source_repair_uses_dependency_target(monkeypatch, tmp_path):
     ok, _ = desktop_runtime_setup._windows_cuda_source_repair(requirements_path, dependency_target)
 
     assert ok is True
+    assert captured['startup_phase'] == 'cuda_build'
     assert '--target' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
     assert captured['env']['PYTHONPATH'].split(os.pathsep)[0] == str(dependency_target)
@@ -1106,10 +1260,11 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch, tmp_path):
     requirements_path.write_text('llama_cpp_python==0.3.32\n', encoding='utf-8')
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1133,10 +1288,11 @@ def test_windows_source_repair_returns_actionable_message_when_requirements_miss
     missing_requirements = tmp_path / 'AppData' / 'requirements.txt'
     captured = {}
 
-    def fake_run(cmd, env, timeout_seconds):
+    def fake_run(cmd, env, timeout_seconds, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = env
         captured['timeout_seconds'] = timeout_seconds
+        captured['startup_phase'] = kwargs.get('startup_phase')
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
@@ -1239,11 +1395,7 @@ def test_probe_leaves_dependency_target_env_unset_when_target_is_unresolved(monk
         )
         stderr = ''
 
-    def fake_run(cmd, **kwargs):
-        captured['env'] = kwargs['env']
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
 
     probe = desktop_runtime_setup._probe_llama_runtime()
 
@@ -1260,7 +1412,7 @@ def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
         stdout = ''
         stderr = 'probe failed'
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -1319,14 +1471,11 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
-    def _raise(*_args, **_kwargs):
-        raise RuntimeError('subprocess unavailable')
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _raise)
+    _install_fake_probe_popen(monkeypatch, RuntimeError('subprocess unavailable'))
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'subprocess unavailable'
+    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
 
 
 def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
@@ -1337,7 +1486,7 @@ def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
         stdout = ''
         stderr = ''
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -1362,12 +1511,7 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
         )
         stderr = ''
 
-    def _fake_run(cmd, **kwargs):
-        captured['cmd'] = cmd
-        captured['env'] = kwargs.get('env', {})
-        return _Result()
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _fake_run)
+    _install_fake_probe_popen(monkeypatch, _Result(), captured)
     probe = desktop_runtime_setup._probe_llama_runtime()
 
     assert probe.backend == 'cuda'
@@ -1429,7 +1573,7 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
         stdout = 'not-json'
         stderr = 'json parse failed'
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+    _install_fake_probe_popen(monkeypatch, _Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
@@ -1477,39 +1621,112 @@ def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(mon
     assert 'repo-local shim' in result['fallback_reason']
 
 
-def test_run_pip_install_success_failure_and_timeout(monkeypatch):
-    class _OkResult:
-        returncode = 0
-        stdout = 'ok output'
-        stderr = ''
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+def test_run_pip_install_success_failure_and_timeout():
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "print('ok output')"],
+        os.environ.copy(),
+    )
     assert ok is True
     assert 'returncode=0' in output
+    assert 'outcome=completed' in output
     assert 'stdout_tail=ok output' in output
 
-    class _FailResult:
-        returncode = 1
-        stdout = 'fallback stdout'
-        stderr = 'real stderr'
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import sys; print('fallback stdout'); print('real stderr', file=sys.stderr); sys.exit(1)"],
+        os.environ.copy(),
+    )
     assert ok is False
     assert 'returncode=1' in output
+    assert 'outcome=completed' in output
     assert 'stdout_tail=fallback stdout' in output
     assert 'stderr_tail=real stderr' in output
 
-    def _timeout(*_args, **_kwargs):
-        raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
-
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
-    ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        os.environ.copy(),
+        timeout_seconds=1,
+    )
     assert ok is False
-    assert 'pip install timed out after 12s' in output
+    assert 'outcome=timed_out' in output
     assert 'stdout_tail=empty' in output
     assert 'stderr_tail=empty' in output
+
+
+def test_command_summary_redacts_interpreter_targets_requirements_and_paths(tmp_path):
+    target = tmp_path / "managed-site"
+    requirements = tmp_path / "requirements.txt"
+
+    summary = desktop_runtime_setup._command_summary([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--target",
+        str(target),
+        "-r",
+        str(requirements),
+        "llama-cpp-python==0.3.32",
+    ])
+
+    assert summary.startswith("<python> -m pip install")
+    assert "--target <path>" in summary
+    assert "-r <path>" in summary
+    assert str(target) not in summary
+    assert str(requirements) not in summary
+    assert "llama-cpp-python==0.3.32" in summary
+
+
+def test_run_pip_install_cancellation_reports_outcome_and_redacted_command():
+    calls = {"count": 0}
+
+    def cancel_after_start():
+        calls["count"] += 1
+        return calls["count"] >= 2
+
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "import time; print('started'); time.sleep(30)"],
+        os.environ.copy(),
+        timeout_seconds=30,
+        cancellation_predicate=cancel_after_start,
+    )
+
+    assert ok is False
+    assert "outcome=cancelled" in output
+    assert "command=<python> -c" in output
+    assert sys.executable not in output
+
+
+def test_run_pip_install_emits_five_second_heartbeat(monkeypatch):
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO("quick\n")
+            self.stderr = io.StringIO("")
+            self.pid = 12345
+            self._polls = 0
+
+        def poll(self):
+            self._polls += 1
+            return None if self._polls == 1 else 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    timeline = iter([100.0, 106.0])
+    heartbeats = []
+    monkeypatch.setattr(desktop_runtime_setup.time, "monotonic", lambda: next(timeline))
+    monkeypatch.setattr(desktop_runtime_setup.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    ok, output = desktop_runtime_setup._run_pip_install(
+        [sys.executable, "-c", "print('quick')"],
+        os.environ.copy(),
+        heartbeat=heartbeats.append,
+    )
+
+    assert ok is True
+    assert "outcome=completed" in output
+    assert "stdout_tail=quick" in output
+    assert heartbeats == [{"startup_elapsed_ms": 6000, "startup_deadline_ms": 300000, "startup_phase": "runtime_install"}]
 
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):
@@ -1627,17 +1844,11 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
 
-    desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert captured['cmd'][:6] == [
-        sys.executable,
-        '-m',
-        'pip',
-        'install',
-        '--disable-pip-version-check',
-        '--force-reinstall',
-    ]
-    assert '--target' in captured['cmd']
+    assert result['runtime_action'] == 'failed'
+    assert 'cooldown' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
@@ -1665,7 +1876,7 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv,cryptography,packaging'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
 
 
 def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
@@ -1689,6 +1900,7 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
 
     def _capture_run(cmd, *_args, **_kwargs):
         captured['cmd'] = cmd
+        captured['startup_phase'] = _kwargs.get('startup_phase')
         return False, 'install failed: boom'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
@@ -1698,9 +1910,46 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
     assert result['ok'] == 'false'
     assert result['action'] == 'install_failed'
     assert result['detail'] == 'install failed: boom'
+    assert captured['startup_phase'] == 'dependency_install'
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
-    assert captured['cmd'][target_idx] == str(tmp_path / '.token_place_desktop_site')
+    selected_target = str(tmp_path / '.token_place_desktop_site')
+    assert captured['cmd'][target_idx] == selected_target
+    assert os.environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == selected_target
+    assert selected_target in sys.path
+
+
+def test_ensure_desktop_python_dependencies_lock_oserror_returns_sanitized_failure(monkeypatch, tmp_path):
+    sentinel = str(tmp_path / "secret" / "managed.lock")
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+
+    class OSErrorLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            raise OSError(f'lock busy at {sentinel}')
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', OSErrorLock)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('pip must not run without lock')),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'lock_unavailable'
+    assert result['detail'] == 'managed site mutation lock unavailable'
+    assert sentinel not in json.dumps(result)
 
 
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
@@ -1708,7 +1957,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, None, None, object(), object(), object(), object(), None])
+    sequence = iter([None, None, None, None, object(), object(), object(), None, object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -1716,7 +1965,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'packaging'
+    assert result['missing'] == 'cryptography'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
@@ -1737,6 +1986,7 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
 
     def _capture_run(cmd, *_args, **_kwargs):
         captured['cmd'] = cmd
+        captured['startup_phase'] = _kwargs.get('startup_phase')
         return False, 'install failed: boom'
 
     original_mkdir = desktop_runtime_setup.Path.mkdir
@@ -1752,6 +2002,7 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=runtime_root)
 
     assert result['action'] == 'install_failed'
+    assert captured['startup_phase'] == 'dependency_install'
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')
@@ -1891,10 +2142,12 @@ def test_resolve_desktop_dependency_target_prefers_env_override(monkeypatch, tmp
     assert target == override_target
     assert probes == [override_target]
 
-def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
+
+def test_resolve_desktop_dependency_target_prefers_writable_runtime_target_without_env_override(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'runtime'
     home_dir = tmp_path / 'home'
     home_dir.mkdir()
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
 
     target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
@@ -1918,6 +2171,7 @@ def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fai
             return False, 'read-only runtime target'
         return True, None
 
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
     monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
 
@@ -1950,6 +2204,61 @@ def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializabl
     assert desktop_runtime_setup.RUNTIME_PROBE_ENV not in os.environ
 
 
+@pytest.mark.parametrize(
+    'runtime_action,module_path',
+    [
+        ('install_failed', 'C:/Python/Lib/site-packages/llama_cpp/__init__.py'),
+        ('already_supported', ''),
+        ('already_supported', 'missing'),
+        ('already_supported', 'unknown'),
+    ],
+)
+def test_record_desktop_runtime_probe_keeps_module_path_identity_only(
+    monkeypatch,
+    runtime_action,
+    module_path,
+):
+    monkeypatch.delenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, raising=False)
+    result = {
+        'runtime_action': runtime_action,
+        'selected_backend': 'cuda',
+        'backend': 'cuda',
+        'interpreter': sys.executable,
+        'llama_module_path': module_path,
+    }
+
+    public = desktop_runtime_setup._record_desktop_runtime_probe(result)
+    private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    assert 'llama_module_path' not in public
+    assert 'llama_module_path' not in private
+
+
+def test_record_desktop_runtime_probe_private_payload_accepts_reexec_success(monkeypatch):
+    monkeypatch.delenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, raising=False)
+    result = {
+        'runtime_action': 'installed_cuda_reexec',
+        'selected_backend': 'cuda',
+        'backend': 'cuda',
+        'interpreter': sys.executable,
+        'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        'yarn_rope_supported': True,
+    }
+
+    public = desktop_runtime_setup._record_desktop_runtime_probe(result)
+    private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    expected_identity = desktop_runtime_setup.llama_module_identity_from_path(result['llama_module_path'])
+    serialized_env = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
+    assert 'llama_module_path' not in public
+    assert 'llama_module_path' not in private
+    assert result['llama_module_path'] not in serialized_env
+    assert private['llama_module_identity'] == expected_identity
+    assert public['yarn_rope_supported'] == 'true'
+    assert private['yarn_rope_supported'] is True
+
+
 def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setattr(
@@ -1964,9 +2273,19 @@ def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tm
     )
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+    recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+
+    expected_identity = desktop_runtime_setup.llama_module_identity_from_path(
+        'C:/Python/Lib/site-packages/llama_cpp/__init__.py'
+    )
+    serialized_env = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
 
     assert result['runtime_action'] == 'already_supported'
     assert result['selected_backend'] == 'cuda'
+    assert 'llama_module_path' not in result
+    assert 'llama_module_path' not in recorded
+    assert 'C:/Python/Lib/site-packages/llama_cpp/__init__.py' not in serialized_env
+    assert recorded['llama_module_identity'] == expected_identity
 
 
 def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monkeypatch, tmp_path):
@@ -2009,13 +2328,9 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['cmake_args'] == '-DGGML_CUDA=on'
-    assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
-    assert '-DGGML_METAL=on' not in ' '.join(captured['cmd'])
-    assert '--target' in captured['cmd']
-    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
-    assert result['install_command_summary'].startswith('python -m pip install')
+    assert result['runtime_action'] == 'failed'
+    assert 'cooldown' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeypatch, tmp_path):
@@ -2209,7 +2524,7 @@ def test_probe_result_payload_preserves_native_capability_types():
     assert encoded['capability_source'] == 'desktop_runtime_setup_probe'
 
 
-def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkeypatch):
+def test_llama_cpp_version_match_uses_stdlib_when_packaging_is_unavailable(monkeypatch):
     real_import = __import__
 
     def import_without_packaging(name, globals=None, locals=None, fromlist=(), level=0):
@@ -2224,7 +2539,7 @@ def test_llama_cpp_version_match_is_unknown_when_packaging_is_unavailable(monkey
             '0.3.32',
             'llama-cpp-python==0.3.32',
         )
-        == 'unknown'
+        == 'match'
     )
 
 
@@ -2244,7 +2559,7 @@ def test_runtime_probe_payload_filters_unknown_constructor_kwarg_support(monkeyp
         stdout = json.dumps(payload)
         stderr = ''
 
-    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *_, **__: Result())
+    _install_fake_probe_popen(monkeypatch, Result())
 
     probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
 
@@ -2454,6 +2769,653 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
     assert sentinel not in emitted
+
+
+def test_managed_site_lock_closes_handle_when_enter_times_out(monkeypatch, tmp_path):
+    closed = {'value': False}
+
+    class FakeHandle:
+        def fileno(self):
+            return 42
+
+        def seek(self, _offset):
+            return None
+
+        def close(self):
+            closed['value'] = True
+
+    class FakeFcntl:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        @staticmethod
+        def flock(_fileno, _flags):
+            raise OSError('busy')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'open', lambda *_args, **_kwargs: FakeHandle(), raising=False)
+    monkeypatch.setitem(sys.modules, 'fcntl', FakeFcntl)
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+
+    with pytest.raises(TimeoutError):
+        with desktop_runtime_setup._ManagedSiteMutationLock(tmp_path, timeout_seconds=0):
+            pass
+
+    assert closed['value'] is True
+
+
+def test_ensure_desktop_python_dependencies_maps_compat_timeout_to_timeout_action(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil==1\nrequests==1\npython-dotenv==1\ncryptography==1\n', encoding='utf-8')
+    target = tmp_path / 'site'
+    target.mkdir()
+
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _modules: ['psutil'])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'pip install timed out after 12s; stderr_tail=empty'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['action'] == 'install_timeout'
+
+
+def test_small_helpers_cover_redaction_truncation_and_requirements_edges(tmp_path, monkeypatch):
+    assert desktop_runtime_setup._tail_text('abcdef', limit=3) == '...def'
+    cmd = [sys.executable, '-m', 'pip', 'install', '/tmp/local.whl', 'pkg==1']
+    summary = desktop_runtime_setup._command_summary(cmd)
+    assert '<python>' in summary
+    assert '<path>' in summary
+    assert 'pkg==1' in summary
+
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('\n# comment\nrequests==2\npython-dotenv==1\n', encoding='utf-8')
+    assert desktop_runtime_setup._requirements_for_missing(requirements, ['dotenv']) == ['python-dotenv==1']
+    assert desktop_runtime_setup._requirements_for_missing(tmp_path / 'missing.txt', ['requests']) == []
+
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', lambda: tmp_path / 'home')
+    assert desktop_runtime_setup._existing_desktop_dependency_target(tmp_path) == (None, 'no existing desktop dependency target')
+
+
+class _KillFailProcess:
+    pid = 999999
+
+    def kill(self):
+        raise RuntimeError('kill failed')
+
+
+def test_terminate_process_tree_falls_back_when_group_kill_fails(monkeypatch):
+    calls = []
+
+    def fail_killpg(_pid, _sig):
+        calls.append('killpg')
+        raise OSError('no group')
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
+    monkeypatch.setattr(desktop_runtime_setup.os, 'killpg', fail_killpg)
+    desktop_runtime_setup._terminate_process_tree(_KillFailProcess())
+    assert calls == ['killpg']
+
+
+def test_lock_cancel_and_exit_no_handle_paths(tmp_path):
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(
+        tmp_path / 'site' / '.lock',
+        timeout_seconds=1,
+        cancellation_predicate=lambda: True,
+    )
+    with pytest.raises(TimeoutError, match='cancelled'):
+        lock.__enter__()
+    assert lock._handle is None
+    lock.__exit__(None, None, None)
+
+
+def test_read_only_dependency_preflight_reports_missing_without_target_creation(tmp_path, monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: tmp_path / 'requirements.txt')
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', lambda: tmp_path / 'home')
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: ['requests'])
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(mutate=False)
+
+    assert result['action'] == 'missing_read_only'
+    assert result['dependency_target'] == ''
+    assert not (tmp_path / 'desktop-python-site').exists()
+
+
+def test_dependency_preflight_post_lock_satisfied_and_unmapped(tmp_path, monkeypatch):
+    target = tmp_path / 'site'
+    target.mkdir()
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('requests==2\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    missing_sequences = iter([['requests'], []])
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: next(missing_sequences))
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies()
+    assert result['action'] == 'already_satisfied_post_lock'
+
+    missing_sequences = iter([['not_allowlisted'], ['not_allowlisted']])
+    monkeypatch.setattr(desktop_runtime_setup, '_module_missing', lambda _required: next(missing_sequences))
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies()
+    assert result['action'] == 'missing_requirement_unmapped'
+
+
+def test_pip_install_start_failure_and_wait_timeout(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_a, **_k: (_ for _ in ()).throw(OSError('boom')))
+    ok, detail = desktop_runtime_setup._run_pip_install([sys.executable, '-m', 'pip'], os.environ.copy())
+    assert ok is False
+    assert 'failed to start' in detail
+
+    class Stream:
+        def readline(self):
+            return ''
+        def close(self):
+            raise RuntimeError('close failed')
+
+    class Proc:
+        pid = 999999
+        stdout = Stream()
+        stderr = Stream()
+        def __init__(self):
+            self.waits = 0
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            raise desktop_runtime_setup.subprocess.TimeoutExpired(['pip'], timeout)
+        def kill(self):
+            pass
+
+    proc = Proc()
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_a, **_k: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: None)
+    ok, detail = desktop_runtime_setup._run_pip_install([sys.executable, '-m', 'pip'], os.environ.copy())
+    assert ok is True
+    assert 'returncode=0' in detail
+
+
+def test_runtime_install_threads_cancellation_and_heartbeat_kwargs(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements.txt'
+    requirements.write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    target = tmp_path / 'site'
+    target.mkdir()
+    captured = []
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooling'))
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [desktop_runtime_setup.LlamaCppInstallPlan(platform='win32', force_cmake=True, index_url=None, only_binary=False, backend='cuda', package_spec='llama-cpp-python==0.3.32', no_binary=True, cmake_args='-DGGML_CUDA=on')])
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda cmd, env, **kwargs: captured.append(kwargs) or (False, 'outcome=cancelled'))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda _root: _probe(error='missing', version='unknown'))
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (target, None))
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'system', lambda: 'Windows')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+
+    cancel = lambda: False
+    heartbeat = lambda _extra: None
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', context_tier='8k', cancellation_predicate=cancel, heartbeat=heartbeat)
+
+    assert result['runtime_action'] in {'runtime_repair_failed', 'version_mismatch_failed', 'failed'}
+    assert captured == []
+
+
+def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
+    events = []
+    times = iter([0.0, 0.0, 5.1, 5.2, 6.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'nt')
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+        calls = 0
+        @classmethod
+        def locking(cls, _fd, mode, _size):
+            cls.calls += 1
+            if mode == cls.LK_NBLCK:
+                raise OSError('busy')
+
+    monkeypatch.setitem(sys.modules, 'msvcrt', FakeMsvcrt)
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(tmp_path / '.lock', timeout_seconds=6, heartbeat=events.append)
+    with pytest.raises(TimeoutError):
+        lock.__enter__()
+    assert events == [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 6000, 'startup_phase': 'lock_wait'}]
+    assert lock._handle is None
+
+    # Cover the Windows unlock path on __exit__ with an already-held fake handle.
+    class Handle:
+        def seek(self, _pos):
+            pass
+        def fileno(self):
+            return 1
+        def close(self):
+            pass
+    lock._handle = Handle()
+    FakeMsvcrt.locking = classmethod(lambda cls, _fd, _mode, _size: None)
+    lock.__exit__(None, None, None)
+    assert lock._handle is None
+
+
+def test_run_pip_install_heartbeat_failure_terminates_process_tree(monkeypatch):
+    class Stream:
+        def readline(self):
+            return ''
+        def close(self):
+            pass
+
+    class Proc:
+        pid = 12345
+        stdout = Stream()
+        stderr = Stream()
+        def __init__(self):
+            self.polls = 0
+        def poll(self):
+            self.polls += 1
+            return None if self.polls < 3 else -15
+        def wait(self, timeout=None):
+            return -15
+        def kill(self):
+            pass
+
+    proc = Proc()
+    terminated = []
+    times = iter([0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('emit failed')
+
+    ok, detail = desktop_runtime_setup._run_pip_install(
+        [sys.executable, '-m', 'pip', 'install', 'requests==2'],
+        os.environ.copy(),
+        heartbeat=failing_heartbeat,
+    )
+
+    assert ok is False
+    assert terminated == [12345]
+    assert 'outcome=heartbeat_failed' in detail
+    assert 'heartbeat_error=RuntimeError' in detail
+
+
+def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch):
+    times = iter([0.0, 0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+
+    def busy_flock(_fileno, _flags):
+        raise OSError('busy')
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
+    monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=busy_flock))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('emit failed')
+
+    lock = desktop_runtime_setup._ManagedSiteMutationLock(tmp_path / 'site', timeout_seconds=10, heartbeat=failing_heartbeat)
+    with pytest.raises(TimeoutError, match='heartbeat failed'):
+        lock.__enter__()
+
+    assert lock._handle is None
+
+
+def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 43210
+        returncode = None
+        stdout = io.BytesIO(desktop_runtime_setup.PROBE_RESULT_PREFIX + json.dumps({'backend': 'cpu', 'gpu_offload_supported': False}).encode() + b'\n')
+        stderr = io.StringIO('')
+        def __init__(self):
+            self.polls = 0
+        def poll(self):
+            self.polls += 1
+            if self.polls > 2:
+                self.returncode = 0
+            return self.returncode
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    proc = ProbeProcess()
+    heartbeats = []
+    times = iter([0.0, 0.0, 5.1, 5.2])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=heartbeats.append,
+    )
+
+    assert probe.backend == 'cpu'
+    assert heartbeats in ([], [{'startup_elapsed_ms': 5100, 'startup_deadline_ms': 30000, 'startup_phase': 'runtime_probe'}])
+
+
+def test_probe_llama_runtime_cancellation_terminates_subprocess(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 54321
+        returncode = None
+        stdout = io.StringIO('')
+        stderr = io.StringIO('')
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return -15
+
+    proc = ProbeProcess()
+    terminated = []
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: True,
+        heartbeat=lambda _extra: None,
+    )
+
+    assert probe.error == 'desktop_runtime_probe_cancelled'
+    assert terminated == [54321]
+
+
+def test_probe_llama_runtime_drains_large_stderr_before_json_payload(monkeypatch, tmp_path):
+    snippet = r"""
+import json
+import sys
+sys.stderr.write('x' * (1024 * 1024 * 2) + '\n')
+sys.stderr.flush()
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
+    'backend': 'metal',
+    'gpu_offload_supported': True,
+    'detected_device': 'apple-gpu',
+    'interpreter': sys.executable,
+    'prefix': sys.prefix,
+    'llama_module_path': '/safe/site/llama_cpp/__init__.py',
+}))
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    started = time.monotonic()
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=lambda _extra: None,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.error is None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_until_gone(pid: int, *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_alive(pid)
+
+
+def test_probe_returns_promptly_after_valid_result_and_reaps_hung_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'probe_pid.txt'
+    snippet = f"""
+import json
+import os
+import sys
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({{'backend':'cpu','gpu_offload_supported':False,'detected_device':'cpu','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':'/tmp/llama_cpp/__init__.py'}}), flush=True)
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    started = time.monotonic()
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    elapsed = time.monotonic() - started
+
+    child_pid = int(marker.read_text())
+    assert elapsed < 10
+    assert probe.backend == 'cpu'
+    assert probe.error is None
+    assert _wait_until_gone(child_pid)
+
+
+def test_probe_drains_large_unlined_streams_and_parses_result(monkeypatch, tmp_path):
+    snippet = """
+import json
+import sys
+sys.stdout.write('x' * (1024 * 1024))
+sys.stdout.flush()
+sys.stderr.write('y' * (1024 * 1024))
+sys.stderr.flush()
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({'backend':'cuda','gpu_offload_supported':True,'detected_device':'cuda','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':'/tmp/llama_cpp/__init__.py'}), flush=True)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'cuda'
+    assert probe.gpu_offload_supported is True
+    assert probe.error is None
+
+
+def test_probe_parses_large_result_frame_beyond_diagnostic_tail(monkeypatch, tmp_path):
+    large_path = '/safe/' + ('a' * (desktop_runtime_setup.INSTALL_LOG_TAIL_MAX_CHARS + 100))
+    snippet = f"""
+import json
+import sys
+print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({{'backend':'metal','gpu_offload_supported':True,'detected_device':'metal','interpreter':sys.executable,'prefix':sys.prefix,'llama_module_path':{large_path!r}}}), flush=True)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'metal'
+    assert probe.llama_module_path == large_path
+    assert len(probe.llama_module_path) > desktop_runtime_setup.INSTALL_LOG_TAIL_MAX_CHARS
+
+
+def test_probe_timeout_before_result_terminates_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'timeout_pid.txt'
+    snippet = f"""
+import os
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+    times = iter([0.0, 31.0])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 31.0))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, heartbeat=lambda _extra: None)
+
+    assert probe.error == 'desktop_runtime_probe_timeout_after_30s'
+
+
+def test_probe_cancellation_terminates_real_child(monkeypatch, tmp_path):
+    marker = tmp_path / 'cancel_pid.txt'
+    snippet = f"""
+import os
+import time
+with open({str(marker)!r}, 'w', encoding='utf-8') as handle:
+    handle.write(str(os.getpid()))
+    handle.flush()
+time.sleep(60)
+"""
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    def cancel_after_child_started():
+        return marker.exists()
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, cancellation_predicate=cancel_after_child_started)
+
+    child_pid = int(marker.read_text())
+    assert probe.error == 'desktop_runtime_probe_cancelled'
+    assert _wait_until_gone(child_pid)
+
+
+def test_actual_probe_snippet_with_fake_llama_cpp_package(monkeypatch, tmp_path):
+    target = tmp_path / 'managed_site'
+    package = target / 'llama_cpp'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text(
+        "__version__ = '0.3.32+local'\n"
+        "GGML_METAL = True\n"
+        "def llama_supports_gpu_offload():\n    return True\n"
+        "LLAMA_ROPE_SCALING_TYPE_YARN = 2\n"
+        "GGML_TYPE_Q8_0 = 8\n"
+        "GGML_TYPE_Q4_0 = 4\n"
+        "GGML_TYPE_F16 = 16\n"
+        "class Llama:\n"
+        "    def __init__(self, rope_scaling_type=None, rope_freq_scale=None, yarn_orig_ctx=None, **kwargs):\n"
+        "        pass\n",
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(target))
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.llama_cpp_python_version == '0.3.32+local'
+    assert probe.yarn_rope_supported is True
+    assert probe.error is None
+
+
+def test_probe_result_frame_validation_failures_return_safe_errors(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 65432
+        returncode = None
+
+        def __init__(self, stdout: bytes):
+            self.stdout = io.BytesIO(stdout)
+            self.stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    cases = [
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'["not-an-object"]\n',
+            'desktop_runtime_probe_result_not_object',
+        ),
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'{not-json}\n',
+            'desktop_runtime_probe_result_malformed',
+        ),
+        (
+            desktop_runtime_setup.PROBE_RESULT_PREFIX + b'{' + (b'"x"' * desktop_runtime_setup.PROBE_RESULT_MAX_BYTES),
+            'desktop_runtime_probe_result_oversized',
+        ),
+    ]
+
+    for stdout, expected_error in cases:
+        proc = ProbeProcess(stdout)
+        monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+        probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+        assert probe.error == expected_error
+        assert probe.backend == 'missing'
+
+
+def test_probe_reader_failures_are_safe_and_close_streams(monkeypatch, tmp_path):
+    class FailingStream:
+        def __init__(self):
+            self.closed = False
+
+        def read(self, _size=-1):
+            raise OSError('reader exploded with /tmp/secret/path')
+
+        def close(self):
+            self.closed = True
+            raise OSError('close failed')
+
+    class ProbeProcess:
+        pid = 65433
+        returncode = None
+
+        def __init__(self):
+            self.stdout = FailingStream()
+            self.stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    proc = ProbeProcess()
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.error == 'desktop_runtime_probe_reader_failed:OSError'
+    assert proc.stdout.closed is True
+    assert '/tmp/secret/path' not in probe.error
+
+
+def test_probe_heartbeat_failure_terminates_process_tree(monkeypatch, tmp_path):
+    class ProbeProcess:
+        pid = 65434
+        returncode = None
+        stdout = io.BytesIO(b'')
+        stderr = io.BytesIO(b'')
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return -15
+
+    proc = ProbeProcess()
+    terminated = []
+    times = iter([0.0, 0.0, 5.1])
+    monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times, 5.2))
+    monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(desktop_runtime_setup, '_terminate_process_tree', lambda process: terminated.append(process.pid))
+
+    def failing_heartbeat(_extra):
+        raise RuntimeError('heartbeat sink failed')
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path, heartbeat=failing_heartbeat)
+
+    assert probe.error == 'desktop_runtime_probe_heartbeat_failed:RuntimeError'
+    assert terminated == [65434]
 
 
 def test_probe_result_payload_carries_private_identity_but_public_result_redacts(monkeypatch, tmp_path):

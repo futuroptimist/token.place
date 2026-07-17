@@ -245,6 +245,7 @@ def _safe_constructor_capability_payload(llama_cpp_module: Any) -> Dict[str, Any
         'llama_module_path',
         'llama_module_path_present',
         'llama_module_identity_match',
+        'llama_module_identity_verified',
         'child_probe_reprobe_attempted',
         'child_probe_reprobe_skipped_reason',
     ):
@@ -930,6 +931,8 @@ def _runtime_supports_qwen_yarn_rope(llama_cpp_module: Any, llama_cls: Any) -> D
             == _canonical_path_for_compare(facade_module_path)
         )
         identities_match = bool(capability_identity and facade_identity and capability_identity == facade_identity)
+        if capability_identity and capabilities.get('llama_module_identity_verified') is True:
+            identities_match = True
         if capability_identity and capability_module_path and str(capability_module_path).strip() not in {'missing', 'unknown'}:
             identities_match = identities_match and capability_identity == llama_module_identity_from_path(capability_module_path)
         legacy_path_fallback_allowed = (
@@ -1698,6 +1701,7 @@ def _import_llama_cpp_subprocess_module(
     module_path_hint: Any = None,
     timeout_seconds: Optional[float] = None,
     desktop_runtime_probe: Any = None,
+    expected_llama_module_identity: Any = None,
 ):
     """Return a killable subprocess-backed llama_cpp module facade.
 
@@ -1720,6 +1724,7 @@ def _import_llama_cpp_subprocess_module(
         module_path_hint,
         timeout_seconds=timeout_seconds,
         desktop_runtime_probe=desktop_runtime_probe,
+        expected_llama_module_identity=expected_llama_module_identity,
     )
 
 
@@ -1728,6 +1733,7 @@ def _import_llama_cpp_in_parent_with_timeout(
     timeout_seconds: Optional[float] = None,
     module_path_hint: Any = None,
     desktop_runtime_probe: Any = None,
+    expected_llama_module_identity: Any = None,
 ):
     """Import llama_cpp in-process only when the active thread can be bounded.
 
@@ -1748,6 +1754,7 @@ def _import_llama_cpp_in_parent_with_timeout(
             module_path_hint=module_path_hint,
             timeout_seconds=timeout,
             desktop_runtime_probe=desktop_runtime_probe,
+            expected_llama_module_identity=expected_llama_module_identity,
         )
 
     if threading.current_thread() is threading.main_thread():
@@ -1775,6 +1782,7 @@ def _import_llama_cpp_in_parent_with_timeout(
         module_path_hint=module_path_hint,
         timeout_seconds=timeout,
         desktop_runtime_probe=desktop_runtime_probe,
+        expected_llama_module_identity=expected_llama_module_identity,
     )
 
 def _llama_subprocess_tail(process: subprocess.Popen, name: str) -> str:
@@ -1928,6 +1936,8 @@ class _SubprocessLlamaProxy:
         *args,
         timeout_seconds: Optional[float] = None,
         module_path_hint: Any = None,
+        expected_llama_module_identity: Any = None,
+        worker_capabilities: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
         if 'model_path' in kwargs and isinstance(kwargs.get('model_path'), str):
@@ -1936,6 +1946,8 @@ class _SubprocessLlamaProxy:
         elif args and isinstance(args[0], str):
             args = (os.path.abspath(args[0]), *args[1:])
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+        self._expected_llama_module_identity = _valid_llama_module_identity(expected_llama_module_identity)
+        self._worker_capabilities_ref = worker_capabilities if isinstance(worker_capabilities, dict) else None
         self._lock = Lock()
         self._closed = False
         self._worker_tmpfile: Optional[str] = None
@@ -1988,11 +2000,21 @@ class _SubprocessLlamaProxy:
         self._start_stderr_tail_reader()
         try:
             self._send({'method': '__import__'}, check_health=False)
-            _read_llama_subprocess_message(
+            import_message = _read_llama_subprocess_message(
                 self._process,
                 timeout_seconds=self._timeout_seconds,
                 stage='llama_cpp_import',
             )
+            imported_worker_module_path = import_message.get('module_path')
+            imported_worker_identity = llama_module_identity_from_path(imported_worker_module_path)
+            expected_identity = self._expected_llama_module_identity
+            if _is_repo_llama_cpp_shim(imported_worker_module_path):
+                raise ImportError('llama_cpp worker imported repository-local shim')
+            if expected_identity is not None and imported_worker_identity != expected_identity:
+                raise ImportError('llama_cpp worker identity mismatch')
+            if self._worker_capabilities_ref is not None and expected_identity is not None:
+                self._worker_capabilities_ref['llama_module_identity_match'] = True
+                self._worker_capabilities_ref['llama_module_identity_verified'] = True
         except Exception as exc:
             self._drain_stderr_reader_bounded()
             safe_exc = _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
@@ -2266,14 +2288,25 @@ class _SubprocessLlamaCppModule:
         *,
         timeout_seconds: Optional[float] = None,
         desktop_runtime_probe: Any = None,
+        expected_llama_module_identity: Any = None,
     ) -> None:
         self.__file__ = module_path
         self._timeout_seconds = timeout_seconds
+        probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
+        self._expected_llama_module_identity = (
+            _valid_llama_module_identity(expected_llama_module_identity)
+            or _modern_desktop_runtime_probe_identity(probe)
+        )
         self.__token_place_subprocess_facade__ = True
         self.LLAMA_TYPE_Q8_0 = 8
         self.GGML_TYPE_Q8_0 = 8
-        probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
         self.__token_place_worker_capabilities__ = dict(probe or {})
+        if self._expected_llama_module_identity is not None:
+            self.__token_place_worker_capabilities__['llama_module_identity'] = self._expected_llama_module_identity
+            module_identity = llama_module_identity_from_path(module_path)
+            if module_identity is None or module_identity == self._expected_llama_module_identity:
+                self.__token_place_worker_capabilities__['llama_module_identity_match'] = True
+                self.__token_place_worker_capabilities__['llama_module_identity_verified'] = True
         backend = str((probe or {}).get('backend') or '').lower()
         self.GGML_USE_CUDA = backend == 'cuda'
         self.GGML_USE_METAL = backend == 'metal'
@@ -2299,8 +2332,10 @@ class _SubprocessLlamaCppModule:
     def Llama(self):
         timeout_seconds = self._timeout_seconds
         module_path_hint = self.__file__
+        expected_llama_module_identity = self._expected_llama_module_identity
 
         worker_capabilities = _safe_constructor_capability_payload(self)
+        worker_capabilities_ref = self.__token_place_worker_capabilities__
         supported_kwargs = tuple(
             sorted(
                 name for name, supported in (worker_capabilities.get('constructor_kwarg_support') or {}).items()
@@ -2316,6 +2351,8 @@ class _SubprocessLlamaCppModule:
                     *args,
                     timeout_seconds=timeout_seconds,
                     module_path_hint=module_path_hint,
+                    expected_llama_module_identity=expected_llama_module_identity,
+                    worker_capabilities=worker_capabilities_ref,
                     **kwargs,
                 )
 
@@ -3874,18 +3911,91 @@ def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
     return _coerce_desktop_runtime_probe(parsed)
 
 
+_VALID_DESKTOP_RUNTIME_BACKENDS = frozenset({'cpu', 'cuda', 'metal'})
+_INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({'missing', 'unknown'})
+
+
+def _desktop_runtime_probe_identity(probe: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
+    """Return a validated (interpreter, backend, runtime_action) identity tuple for a probe."""
+
+    if not isinstance(probe, dict):
+        return None
+    interpreter = str(probe.get('interpreter') or '').strip()
+    backend = str(probe.get('backend') or '').strip().lower()
+    action = str(probe.get('runtime_action') or '').strip().lower()
+    if not interpreter or backend not in _VALID_DESKTOP_RUNTIME_BACKENDS:
+        return None
+    if not action:
+        return None
+    return interpreter, backend, action
+
+
+def _probe_module_path_from_probe_dict(probe: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return a validated llama_cpp module path from a probe dict, or None for invalid/sentinel values."""
+
+    if probe is None or probe.get('error'):
+        return None
+    module_path = str(probe.get('llama_module_path') or '').strip()
+    if not module_path or module_path in _INVALID_RUNTIME_MODULE_PATH_VALUES:
+        return None
+    return module_path
+
+
 def _effective_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
-    return _coerce_desktop_runtime_probe(probe) or _desktop_runtime_probe_from_env()
+    explicit_probe = _coerce_desktop_runtime_probe(probe)
+    if explicit_probe is None:
+        return _desktop_runtime_probe_from_env()
+    explicit_path = _probe_module_path_from_probe_dict(explicit_probe)
+    if explicit_path:
+        return explicit_probe
+    env_probe = _desktop_runtime_probe_from_env()
+    env_path = _probe_module_path_from_probe_dict(env_probe)
+    if not env_path:
+        return explicit_probe
+    if _desktop_runtime_probe_identity(explicit_probe) != _desktop_runtime_probe_identity(env_probe):
+        return explicit_probe
+    merged_probe = dict(explicit_probe)
+    merged_probe['llama_module_path'] = env_path
+    return merged_probe
 
 
 def _probe_module_path_from_desktop_runtime_probe(probe: Any) -> Optional[str]:
     coerced = _effective_desktop_runtime_probe(probe)
-    if coerced is None or coerced.get('error'):
+    return _probe_module_path_from_probe_dict(coerced)
+
+
+def _modern_desktop_runtime_probe_identity(probe: Any) -> Optional[str]:
+    coerced = _coerce_desktop_runtime_probe(probe)
+    if not coerced:
         return None
-    module_path = str(coerced.get('llama_module_path') or '').strip()
-    if not module_path or module_path in {'missing', 'unknown'}:
+    if coerced.get('capability_source') != 'desktop_runtime_setup_probe':
         return None
-    return module_path
+    if coerced.get('llama_module_identity_malformed') is True:
+        return None
+    identity = _valid_llama_module_identity(coerced.get('llama_module_identity'))
+    if identity is None:
+        return None
+    action = str(coerced.get('runtime_action') or '').lower()
+    if action not in {'already_supported', 'metal_already_supported', 'installed_cuda_reexec', 'installed_metal_reexec'}:
+        return None
+    if str(coerced.get('backend') or '').lower() not in {'cuda', 'metal'}:
+        return None
+    if coerced.get('gpu_offload_supported') is not True:
+        return None
+    return identity
+
+
+def _will_use_llama_cpp_subprocess_facade() -> bool:
+    return (not _signal_guard_available()) or (threading.current_thread() is not threading.main_thread())
+
+
+def _is_pathless_modern_desktop_probe_with_invalid_identity(probe: Any) -> bool:
+    coerced = _coerce_desktop_runtime_probe(probe)
+    if not coerced or coerced.get('capability_source') != 'desktop_runtime_setup_probe':
+        return False
+    if _probe_module_path_from_probe_dict(coerced):
+        return False
+    return _valid_llama_module_identity(coerced.get('llama_module_identity')) is None
 
 
 def _import_llama_cpp_runtime(
@@ -3896,10 +4006,10 @@ def _import_llama_cpp_runtime(
 ):
     """Import llama_cpp while guarding against the repo-local test shim.
 
-    Packaged desktop runtime setup already imports/probes llama_cpp in the
-    selected interpreter to verify CUDA/Metal support.  Reuse that module-path
-    diagnostic when present and avoid a second pre-import child watchdog whose
-    environment can diverge from the real bridge process.
+    Packaged desktop runtime setup verifies CUDA/Metal support and now hands off
+    an identity-only llama_cpp module contract.  When the active platform/thread
+    requires the subprocess facade, enforce that identity in the worker import
+    handshake instead of launching redundant native discovery.
     """
     path_diagnostics = _sanitize_llama_cpp_import_paths()
     logger.info(
@@ -3911,6 +4021,12 @@ def _import_llama_cpp_runtime(
 
     desktop_runtime_probe = _effective_desktop_runtime_probe(desktop_runtime_probe)
     expected_module_path = _probe_module_path_from_desktop_runtime_probe(desktop_runtime_probe)
+    expected_module_identity = _modern_desktop_runtime_probe_identity(desktop_runtime_probe)
+    identity_only_subprocess_probe = (
+        expected_module_path is None
+        and expected_module_identity is not None
+        and _will_use_llama_cpp_subprocess_facade()
+    )
     if expected_module_path:
         llama_module_path = expected_module_path
         logger.info(
@@ -3918,6 +4034,14 @@ def _import_llama_cpp_runtime(
             _redact_paths_from_text(llama_module_path),
             _redact_paths_from_text(sys.executable),
         )
+    elif identity_only_subprocess_probe:
+        llama_module_path = None
+        logger.info(
+            "llama_cpp runtime discovery reused desktop probe identity interpreter=%s",
+            _redact_paths_from_text(sys.executable),
+        )
+    elif _is_pathless_modern_desktop_probe_with_invalid_identity(desktop_runtime_probe):
+        raise ImportError('Desktop runtime probe identity is missing or malformed; refusing runtime discovery fallback')
     else:
         spec_diagnostics = _find_llama_cpp_spec_in_subprocess(timeout_seconds=timeout_seconds)
         llama_module_path = spec_diagnostics.get('module_path')
@@ -3946,6 +4070,9 @@ def _import_llama_cpp_runtime(
         timeout_seconds=timeout_seconds,
         module_path_hint=llama_module_path,
         desktop_runtime_probe=desktop_runtime_probe,
+        expected_llama_module_identity=(
+            expected_module_identity if expected_module_identity is not None and _will_use_llama_cpp_subprocess_facade() else None
+        ),
     )
     imported_module_path = getattr(llama_cpp, '__file__', None)
     if (

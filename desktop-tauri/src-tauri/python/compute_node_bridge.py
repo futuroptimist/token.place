@@ -80,6 +80,7 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
+PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 
@@ -639,18 +640,26 @@ def _bridge_session_id_from_env() -> str:
     return value or uuid.uuid4().hex
 
 
-def _ensure_desktop_llama_runtime_for_context(mode: str, context_tier: str) -> Dict[str, str]:
+def _ensure_desktop_llama_runtime_for_context(
+    mode: str,
+    context_tier: str,
+    *,
+    cancellation_predicate: Optional[Any] = None,
+    heartbeat: Optional[Any] = None,
+) -> Dict[str, str]:
     try:
         parameters = inspect.signature(ensure_desktop_llama_runtime).parameters
     except (TypeError, ValueError):
         parameters = {}
-    accepts_context_tier = (
-        "context_tier" in parameters
-        or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    )
-    if accepts_context_tier:
-        return ensure_desktop_llama_runtime(mode, context_tier=context_tier)
-    return ensure_desktop_llama_runtime(mode)
+    kwargs: Dict[str, Any] = {}
+    accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if "context_tier" in parameters or accepts_var_kwargs:
+        kwargs["context_tier"] = context_tier
+    if "cancellation_predicate" in parameters or accepts_var_kwargs:
+        kwargs["cancellation_predicate"] = cancellation_predicate
+    if "heartbeat" in parameters or accepts_var_kwargs:
+        kwargs["heartbeat"] = heartbeat
+    return ensure_desktop_llama_runtime(mode, **kwargs)
 
 def _startup_context_tier(args: argparse.Namespace) -> str:
     raw_context_tier = getattr(args, "context_tier", "8k-fast")
@@ -679,6 +688,56 @@ def _sanitize_context_profile_import_error(exc: BaseException) -> str:
     if len(detail) > 240:
         detail = f"{detail[:237]}..."
     return detail
+
+
+def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, started_at: float) -> Dict[str, Any]:
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    return {
+        "type": "started",
+        "running": True,
+        "registered": False,
+        "registered_relay_count": 0,
+        "registered_relay_urls": [],
+        "active_relay_urls": [],
+        "relay_runtime_state": "provisioning",
+        "runtime_provisioning_state": "provisioning",
+        "startup_phase": phase,
+        "startup_elapsed_ms": elapsed_ms,
+        "startup_deadline_ms": None,
+        "active_relay_url": _normalize_relay_urls(getattr(args, "relay_url", "https://token.place"), getattr(args, "relay_urls", None))[0],
+        "requested_mode": _normalize_compute_mode_local(getattr(args, "mode", "auto")),
+        "effective_mode": "pending",
+        "backend_available": "pending",
+        "backend_selected": "pending",
+        "backend_used": "pending",
+        "fallback_reason": None,
+        "runtime_action": "provisioning",
+        "offloaded_layers": 0,
+        "kv_cache_device": "cpu",
+        "context_tier": _startup_context_tier(args),
+        "model_path": str(getattr(args, "model", "")),
+        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+        "last_error": None,
+        "warm_load_state": "provisioning",
+        "warm_load_enabled": _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT),
+        "warm_load_duration_ms": None,
+        "runtime_path": _runtime_path_from_env(),
+        "relay_runtime_path": "bridge",
+        "worker_state": "provisioning",
+        "worker_generation": 0,
+        "worker_restart_count": 0,
+        "worker_alive": False,
+        "use_mock_llm": False,
+        "llama_repo_stub_imported": False,
+        "last_worker_error_code": None,
+        "last_worker_exit_code": None,
+        "last_worker_restart_at_ms": None,
+        "readiness_diagnostics": {
+            "runtime_provisioning_state": "provisioning",
+            "startup_phase": phase,
+            "startup_elapsed_ms": elapsed_ms,
+        },
+    }
 
 def _structured_startup_error_payload(
     args: argparse.Namespace,
@@ -780,7 +839,12 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
-    status_sequence = 0
+    startup_started_at = time.monotonic()
+    inherited_sequence = os.environ.get("TOKENPLACE_OPERATOR_EVENT_SEQUENCE", "0") if os.environ.get("TOKENPLACE_COMPUTE_NODE_SESSION_ID") else "0"
+    try:
+        status_sequence = int(inherited_sequence or "0")
+    except (TypeError, ValueError):
+        status_sequence = 0
     emit_lock = threading.Lock()
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:
@@ -790,11 +854,23 @@ def run(args: argparse.Namespace) -> int:
             payload = dict(payload)
             payload.setdefault("operator_session_id", bridge_session_id)
             payload.setdefault("sequence", status_sequence)
+            os.environ["TOKENPLACE_OPERATOR_EVENT_SEQUENCE"] = str(status_sequence)
             payload.setdefault("updated_at_ms", int(time.time() * 1000))
             emit(payload)
 
     def emit_startup_error(message: str) -> None:
         emit_operator_event(_structured_startup_error_payload(args, message))
+
+    def emit_provisioning(phase: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        safe_extra: Dict[str, Any] = {}
+        if extra:
+            safe_extra = {k: v for k, v in extra.items() if k in {"startup_elapsed_ms", "startup_deadline_ms", "runtime_provisioning_state", "startup_phase"}}
+            phase = str(safe_extra.get("startup_phase") or phase)
+        payload = _structured_provisioning_payload(args, phase=phase, started_at=startup_started_at)
+        if safe_extra:
+            payload.update(safe_extra)
+            payload.setdefault("readiness_diagnostics", {}).update(safe_extra)
+        emit_operator_event(payload)
 
     original_model_arg = str(args.model)
     model_path_was_relative = not os.path.isabs(original_model_arg)
@@ -802,7 +878,14 @@ def run(args: argparse.Namespace) -> int:
         args.model = os.path.abspath(original_model_arg)
     parent_model_path_exists = os.path.exists(args.model)
 
-    dependency_setup = ensure_desktop_python_dependencies()
+    emit_provisioning("dependency_check")
+    try:
+        dependency_setup = ensure_desktop_python_dependencies(cancellation_predicate=stop_requested, heartbeat=lambda extra: emit_provisioning("dependency_install", extra))
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            dependency_setup = ensure_desktop_python_dependencies()
+        else:
+            raise
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
         detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
@@ -814,7 +897,26 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
+    emit_provisioning("runtime_probe")
+    try:
+        runtime_setup = _ensure_desktop_llama_runtime_for_context(
+            args.mode,
+            _startup_context_tier(args),
+            cancellation_predicate=stop_requested,
+            heartbeat=lambda extra: emit_provisioning("runtime_install", extra),
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            runtime_setup = _ensure_desktop_llama_runtime_for_context(args.mode, _startup_context_tier(args))
+        else:
+            raise
+    emit_provisioning("runtime_verification")
+    if runtime_setup.get("runtime_action") in {
+        "installed_cuda_reexec",
+        "installed_metal_reexec",
+        "installed_gpu_reexec",
+    }:
+        emit_provisioning("reexec")
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
@@ -930,6 +1032,7 @@ def run(args: argparse.Namespace) -> int:
                 relay_runtime.crypto_manager = shared_runtime.crypto_manager
             return relay_runtime
 
+    emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
     for relay_runtime in runtimes:
@@ -1366,6 +1469,7 @@ def run(args: argparse.Namespace) -> int:
         last_progress_log_at = wait_started_at
         last_status_emit_at = wait_started_at
         progress_emit_interval_seconds = PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS
+        status_emit_interval_seconds = PRE_REGISTRATION_STATUS_INTERVAL_SECONDS
         while warm_load_state == "warming":
             elapsed_seconds = time.monotonic() - wait_started_at
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
@@ -1392,10 +1496,20 @@ def run(args: argparse.Namespace) -> int:
                     f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
-                emit_status_event(
-                    registered=False,
-                    active_relay_url=runtime.relay_client.relay_url,
-                    current_last_error=last_error,
+                emit_operator_event(
+                    build_status_payload(
+                        event_type="status",
+                        running=True,
+                        registered=False,
+                        active_relay_url=runtime.relay_client.relay_url,
+                        current_last_error=last_error,
+                        extra={
+                            "runtime_provisioning_state": "provisioning",
+                            "startup_phase": "warm_load",
+                            "startup_elapsed_ms": warm_load_duration_ms,
+                            "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
+                        },
+                    )
                 )
                 fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
                 return False
@@ -1407,9 +1521,9 @@ def run(args: argparse.Namespace) -> int:
             ):
                 break
             now = time.monotonic()
+            duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
             if now - last_progress_log_at >= progress_emit_interval_seconds:
                 last_progress_log_at = now
-                duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
                     "desktop.compute_node_bridge.model_init.still_warming "
                     f"reason=pre_registration relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
@@ -1417,12 +1531,22 @@ def run(args: argparse.Namespace) -> int:
                     f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
-            if now - last_status_emit_at >= progress_emit_interval_seconds:
+            if now - last_status_emit_at >= status_emit_interval_seconds:
                 last_status_emit_at = now
-                emit_status_event(
-                    registered=False,
-                    active_relay_url=runtime.relay_client.relay_url,
-                    current_last_error=last_error,
+                emit_operator_event(
+                    build_status_payload(
+                        event_type="status",
+                        running=True,
+                        registered=False,
+                        active_relay_url=runtime.relay_client.relay_url,
+                        current_last_error=last_error,
+                        extra={
+                            "runtime_provisioning_state": "provisioning",
+                            "startup_phase": "warm_load",
+                            "startup_elapsed_ms": duration_ms,
+                            "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
+                        },
+                    )
                 )
             if stop_requested():
                 return False

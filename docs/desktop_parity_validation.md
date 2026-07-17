@@ -17,7 +17,7 @@ The architectural source of truth is [Desktop operator parity contract](architec
 | Area | Windows CUDA expectation | macOS Metal expectation | CPU fallback expectation | Evidence to capture |
 | --- | --- | --- | --- | --- |
 | GPU runtime availability | CUDA-capable `llama-cpp-python` is installed or repaired for `auto`/`cuda`/GPU modes. | Metal-capable `llama-cpp-python` is installed or repaired for `auto`/`metal`/GPU modes. | Explicit `cpu` mode skips GPU bootstrap and reports CPU cleanly. | `verify_desktop_runtime.py` output and bridge `started` event fields. |
-| Dependency isolation | Desktop imports resolve from the desktop target/import root and never from user site packages or repo-local shims. | Same isolation inside `.app/Contents/Resources`. | Same isolation for CPU-only installs. | Packaged bridge e2e, `llama_module_path`, `interpreter`, `prefix`, and import-root diagnostics. |
+| Dependency isolation | Desktop imports resolve from the desktop target/import root and never from user site packages or repo-local shims. | Same isolation inside `.app/Contents/Resources`. | Same isolation for CPU-only installs. | Packaged bridge e2e, private runtime-origin checks, `interpreter`, `prefix`, and import-root diagnostics. |
 | Packaged resource resolution | Packaged app resolves the shared bridge, model bridge, runtime setup, requirements, and config files. | `.app/Contents/Resources` resolves the same shared files and launcher paths. | Same paths remain valid without GPU libraries. | `test_packaged_operator_e2e.py` logs. |
 | Warm-load before register | Bridge warms the relay-processing runtime before API v1 registration. | Same sequence. | Same sequence. | Bridge logs contain `model_init.ready` with `reason=pre_registration` before `api_v1_e2ee.register`. |
 | Relay registration | Registered only after warm-load and runtime readiness. | Same behavior. | Same behavior when CPU runtime is explicitly ready. | `/relay/diagnostics` and bridge status show `registered: true`. |
@@ -58,7 +58,7 @@ Do not make production two-node or round-robin claims until both Windows and mac
 - Packaged Apple Silicon releases use the bundled Python runtime; Command Line Tools are development-only and not an end-user prerequisite.
 - Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
-- Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. The runtime setup/status payload should show `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `llama_module_path`, `runtime_action`, and any pip/CMake tails from provisioning.
+- Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. Public runtime setup/status payloads should show safe fields such as `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `runtime_action`, safe origin booleans/categories, and any bounded pip/CMake tails from provisioning. The internal runtime handoff serializes the versioned SHA-256 `llama_module_identity`, never the raw absolute `llama_module_path`; raw paths must not be copied into bridge events or public diagnostics.
 - If the bundled runtime is missing or invalid in a packaged app, reinstall token.place desktop or use a newer release; do not ask end users to install Python or Xcode Command Line Tools.
 
 ### Backend field meanings
@@ -100,10 +100,20 @@ gh workflow run desktop-operator-e2e.yml
 ### Local hardware runtime checks
 
 ```powershell
-# Windows PowerShell on NVIDIA hardware.
+# Windows PowerShell on real Windows 11 NVIDIA hardware.
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model C:\path\to\model.gguf
-python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\path\to\model.gguf
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
 ```
+
+The smoke helper must observe the safe local phase sequence: `dependency_check`,
+optional `dependency_install`/`lock_wait`, `runtime_probe`, optional
+`runtime_install` or `cuda_build`, `runtime_verification`, optional `reexec`,
+`model_preflight`, `warm_load`, then ready/registered. Long phases should produce
+5-second heartbeats. A fast path may skip build/reexec phases; a repair path should
+include them. Public bridge/status payloads keep absolute module paths private and
+use safe origin indicators such as `llama_repo_stub_imported=false`; the helper
+performs runtime-origin validation internally. Fake-CUDA CI validates contracts only
+and is not evidence of a successful real Windows 11 NVIDIA packaged run.
 
 ```bash
 # macOS shell on Metal-capable hardware.
@@ -215,7 +225,7 @@ When Start operator fails on macOS, capture:
 2. The **Operator debug log** path shown in the UI.
 3. The first `desktop.compute_node.session.start` and
    `desktop.compute_node.session.layout` lines.
-4. Any `desktop_runtime_setup`, `llama_module_path`, `interpreter`, `prefix`,
+4. Any public `desktop_runtime_setup`, runtime-origin, `interpreter`, `prefix`,
    `metal`, `llama_cpp`, `model_init`, registration, unregister, cancel, or
    bridge stderr lines from the log.
 

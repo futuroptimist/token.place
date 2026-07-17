@@ -231,6 +231,15 @@ jobs:
           test -x src-tauri/python-runtime/bin/python3
           src-tauri/python-runtime/bin/python3 -m pip check
 
+      - name: Prepare embedded Windows CUDA Python runtime
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare_windows_embedded_python_runtime.py
+          test -f src-tauri/python-runtime/python.exe
+          src-tauri/python-runtime/python.exe -m pip check
+
       - name: Build frontend assets
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
         # before Tauri's internal beforeBuildCommand hook on clean runners.

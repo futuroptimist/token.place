@@ -12,6 +12,8 @@ if str(DESKTOP_PYTHON) not in sys.path:
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
     LLAMA_CPP_CPU_WHEEL_INDEX_URL,
+    LLAMA_CPP_CUDA_124_WHEEL_SHA256,
+    LLAMA_CPP_CUDA_124_WHEEL_URL,
     LLAMA_CPP_METAL_WHEEL_INDEX_URL,
     backend_probe_satisfies_install_plan,
     llama_cpp_install_plan,
@@ -20,25 +22,20 @@ from desktop_gpu_packaging import (
 )
 
 
-def test_windows_install_plan_requests_cuda_then_cpu_fallback():
+def test_windows_install_plan_is_bundled_cuda_wheel_only():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 2
+    assert len(plans) == 1
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
-    assert gpu_plan.package_spec.startswith("llama-cpp-python==")
-    assert gpu_plan.index_url == "https://pypi.org/simple"
-    assert gpu_plan.only_binary is False
-    assert gpu_plan.no_binary is True
-    assert gpu_plan.pip_env() == {"CMAKE_ARGS": "-DGGML_CUDA=on", "FORCE_CMAKE": "1"}
-
-    cpu_fallback = plans[1]
-    assert cpu_fallback.backend == "cpu"
-    assert cpu_fallback.package_spec == "llama-cpp-python"
-    assert cpu_fallback.index_url == "https://pypi.org/simple"
-    assert cpu_fallback.extra_index_url == LLAMA_CPP_CPU_WHEEL_INDEX_URL
-    assert cpu_fallback.only_binary is True
-    assert cpu_fallback.no_binary is False
+    assert gpu_plan.package_spec == "llama-cpp-python==0.3.32"
+    assert gpu_plan.index_url is None
+    assert gpu_plan.only_binary is True
+    assert gpu_plan.no_binary is False
+    assert gpu_plan.pip_env() == {}
+    assert "v0.3.32-cu124" in LLAMA_CPP_CUDA_124_WHEEL_URL
+    assert LLAMA_CPP_CUDA_124_WHEEL_URL.endswith("llama_cpp_python-0.3.32-py3-none-win_amd64.whl")
+    assert len(LLAMA_CPP_CUDA_124_WHEEL_SHA256) == 64
 
 
 def test_macos_install_plan_requests_metal_then_cpu_fallback():
@@ -166,21 +163,10 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
     assert plan.backend == "cpu"
 
 
-def test_windows_cpu_fallback_install_args_only_accept_wheels():
+def test_windows_install_args_never_request_source_or_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    cpu_fallback = plans[1]
-
-    assert cpu_fallback.pip_install_args() == [
-        "--upgrade",
-        "--no-cache-dir",
-        "--index-url",
-        "https://pypi.org/simple",
-        "--extra-index-url",
-        LLAMA_CPP_CPU_WHEEL_INDEX_URL,
-        "--only-binary",
-        "llama-cpp-python",
-        "--prefer-binary",
-    ]
+    assert [p.backend for p in plans] == ["cuda"]
+    assert plans[0].pip_install_args() == ["--upgrade", "--no-cache-dir", "--only-binary", "llama-cpp-python"]
 
 
 def test_macos_metal_install_args_try_wheel_before_source_build():
@@ -234,8 +220,8 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
 
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
-    assert plan.only_binary is False
-    assert plan.no_binary is True
+    assert plan.only_binary is True
+    assert plan.no_binary is False
 
 
 def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
@@ -328,3 +314,25 @@ def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
     probe = SimpleNamespace(backend="missing", llama_module_path="missing", error="import failed")
 
     assert backend_probe_satisfies_install_plan(plan, probe) is False
+
+
+def test_windows_embedded_runtime_manifest_pins_cuda_wheel_and_dlls():
+    import json
+
+    manifest = json.loads(
+        (ROOT / "desktop-tauri" / "src-tauri" / "python" / "embedded_python_runtime_windows_x86_64_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["expected_interpreter_path"] == "python.exe"
+    assert manifest["expected_architecture"] == "AMD64"
+    wheel = manifest["llama_cpp_cuda_wheel"]
+    assert wheel == {
+        "name": "llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+        "version": "0.3.32",
+        "flavor": "cu124",
+        "url": LLAMA_CPP_CUDA_124_WHEEL_URL,
+        "sha256": LLAMA_CPP_CUDA_124_WHEEL_SHA256,
+    }
+    for dll in ("python311.dll", "vcruntime140.dll", "llama.dll"):
+        assert dll in manifest["required_native_dlls"]

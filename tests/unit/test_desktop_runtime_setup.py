@@ -1742,6 +1742,8 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
     assert reason == 'build failed badly'
 
     desktop_runtime_setup._clear_source_repair_failure()
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_development_source_build_allowed', lambda: True)
     state = json.loads(state_path.read_text(encoding='utf-8'))
     assert sys.executable not in state.get('source_repair_failures', {})
     monkeypatch.setattr(

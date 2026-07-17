@@ -791,3 +791,31 @@ def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(
     assert events[0]['type'] == 'started'
     assert events[-1]['type'] == 'done'
     assert all(event['type'] != 'error' for event in events)
+
+
+def test_packaged_windows_bundled_runtime_probe_failure_never_invokes_installer(tmp_path, monkeypatch):
+    runtime_setup_module = sys.modules['desktop_runtime_setup']
+    probe = SimpleNamespace(
+        backend='missing', detected_device='none', gpu_offload_supported=False,
+        error='llama_cpp missing', interpreter=str(tmp_path / 'python-runtime' / 'python.exe'),
+        llama_module_path='missing', prefix='', python_version='3.11.13', base_prefix='',
+        dependency_target='unknown', pip_version='unknown', llama_cpp_python_version='unknown',
+        yarn_rope_supported=False, yarn_resolver_source='unsupported', rope_scaling_type_supported=False,
+        yarn_ext_factor_supported=False, rope_freq_scale_supported=False, yarn_orig_ctx_supported=False,
+        constructor_kwarg_support={}, constructor_has_var_kwargs=False, constructor_signature_inspectable=False,
+        qwen_64k_yarn_support='unsupported', yarn_enum_value=None, q8_kv_cache_type_value=None,
+        q4_kv_cache_type_value=None, f16_kv_cache_type_value=None, capability_source='test',
+    )
+    calls = {'pip': 0, 'source': 0}
+
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': probe.interpreter})
+    monkeypatch.setattr(runtime_setup_module, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(runtime_setup_module, '_probe_runtime', lambda *a, **k: probe)
+    monkeypatch.setattr(runtime_setup_module, '_run_pip_install', lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'))
+    monkeypatch.setattr(runtime_setup_module, '_run_windows_cuda_source_repair', lambda *a, **k: calls.__setitem__('source', calls['source'] + 1) or (False, 'no'))
+    result = runtime_setup_module.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed'
+    assert result['runtime_origin'] == 'bundled'
+    assert calls == {'pip': 0, 'source': 0}
+    assert 'cuda_build' not in str(result)

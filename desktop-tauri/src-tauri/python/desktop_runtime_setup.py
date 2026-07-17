@@ -213,6 +213,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "install_heartbeat_failed",
         "provisioning_cancelled",
         "cuda_install_failed",
+        "bundled_runtime_probe_failed",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -244,6 +245,7 @@ PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
 PROBE_RESULT_MAX_BYTES = 1024 * 1024
 PROBE_EXIT_GRACE_SECONDS = 1.0
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
+DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV = "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"
 _PROCESS_SYS_PATH = sys.path
 _PROCESS_PYTHON_VERSION = sys.version.split()[0]
 
@@ -1299,16 +1301,38 @@ def _save_runtime_state(state: dict) -> None:
         return
 
 
+
+def _is_bundled_packaged_runtime() -> bool:
+    exe = _safe_resolve_path(sys.executable)
+    parts = {part.lower() for part in exe.parts}
+    if _desktop_platform().startswith("win"):
+        return exe.name.lower() == "python.exe" and "python-runtime" in parts
+    return "python-runtime" in parts and "contents" in parts and "resources" in parts
+
+
+def _development_source_build_allowed() -> bool:
+    if _is_bundled_packaged_runtime():
+        return False
+    if os.getenv(DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, "").strip() != "1":
+        return False
+    target_root = _resolve_runtime_root()
+    return (target_root / "python").is_dir() and (target_root / "src-tauri").is_dir()
+
 def _should_attempt_source_repair() -> tuple[bool, str]:
     state = _load_runtime_state()
     failures = state.get("source_repair_failures", {})
     entry = failures.get(sys.executable, {})
     last_failed_at = float(entry.get("last_failed_at", 0))
     now = time.time()
-    if now - last_failed_at >= SOURCE_REPAIR_COOLDOWN_SECONDS:
-        return True, ""
-    retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
-    return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+    if now - last_failed_at < SOURCE_REPAIR_COOLDOWN_SECONDS:
+        retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
+        return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+    if not _development_source_build_allowed():
+        return False, (
+            "CUDA source repair is disabled for packaged startup; "
+            f"set {DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV}=1 only in an unbundled development layout"
+        )
+    return True, ""
 
 
 def _record_source_repair_failure(reason: str) -> None:
@@ -1607,6 +1631,19 @@ def _ensure_desktop_llama_runtime_impl(
 
     policy = _runtime_bootstrap_policy()
     expected_backend = policy.expected_backend
+
+    if _is_bundled_packaged_runtime():
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                (f"{last_error}; " if last_error else "")
+                + "immutable bundled Windows CUDA runtime probe failed; packaged startup will not run pip, compilers, or CPU/model/context fallback"
+            ),
+            "runtime_action": "bundled_runtime_probe_failed",
+            "runtime_origin": "bundled",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
 
     if before.backend == "missing" and not policy.bootstrap_supported:
         return {

@@ -5,7 +5,11 @@ use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = "python-runtime/bin/python3";
+pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = if cfg!(target_os = "windows") {
+    "python-runtime/python.exe"
+} else {
+    "python-runtime/bin/python3"
+};
 pub const DESKTOP_PYTHON_RUNTIME_MISSING: &str = "desktop_python_runtime_missing";
 pub const DESKTOP_PYTHON_RUNTIME_INVALID: &str = "desktop_python_runtime_invalid";
 pub const DESKTOP_PYTHON_OVERRIDE_INVALID: &str = "desktop_python_override_invalid";
@@ -116,12 +120,28 @@ pub struct PythonLauncherError {
 
 impl std::fmt::Display for PythonLauncherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=arm64 packaged={}{}",
-            self.public_code, self.category.as_str(), self.source, self.executable_basename, self.packaged,
+        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch={} packaged={}{}",
+            self.public_code, self.category.as_str(), self.source, self.executable_basename, expected_runtime_arch(), self.packaged,
             self.exit_status.map(|s| format!(" exit_status={s}")).unwrap_or_default())
     }
 }
 impl std::error::Error for PythonLauncherError {}
+
+fn expected_runtime_arch() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "AMD64"
+    } else {
+        "arm64"
+    }
+}
+
+fn bundled_runtime_id() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "bundled-cpython-3.11-win_amd64"
+    } else {
+        "bundled-cpython-3.11-arm64"
+    }
+}
 
 fn basename(path: &str) -> String {
     Path::new(path)
@@ -393,6 +413,8 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .into_iter()
             .find(|c| {
                 c.layout == ResourceLayoutKind::MacOsAppResources
+                    || c.layout == ResourceLayoutKind::WindowsResources
+                    || c.layout == ResourceLayoutKind::TauriResourceDir
                     || c.layout == ResourceLayoutKind::DevSourceTree
             })
             .map(|c| c.root)
@@ -403,14 +425,20 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .to_string(),
         vec![],
         PythonLauncherSource::BundledRuntime,
-        "bundled-cpython-3.11-arm64",
+        bundled_runtime_id(),
     ))
 }
 
 fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
     Path::new(&candidate.program)
         .parent()
-        .and_then(Path::parent)
+        .and_then(|parent| {
+            if parent.file_name().and_then(|s| s.to_str()) == Some("bin") {
+                parent.parent()
+            } else {
+                Some(parent)
+            }
+        })
         .map(Path::to_path_buf)
 }
 
@@ -432,12 +460,13 @@ pub fn resolve_python_launcher_resource_aware(
             )),
         };
     }
+    let is_bundled_required_platform = cfg!(target_os = "macos") || cfg!(target_os = "windows");
     let is_macos = cfg!(target_os = "macos")
         || opts
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_macos {
+    if is_bundled_required_platform || is_macos {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -489,7 +518,7 @@ pub fn resolve_python_launcher_resource_aware(
                                     output_status_code(&output),
                                 )
                             })?;
-                        metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
+                        metadata_probe_is_valid(&stdout, &runtime_root, expected_runtime_arch())
                             .map(|_| candidate.clone())
                             .map_err(|category| {
                                 launcher_error(

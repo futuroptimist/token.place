@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Prepare the deterministic Windows x86-64 CPython/CUDA runtime for Tauri."""
+from __future__ import annotations
+
+import argparse, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
+from pathlib import Path
+from datetime import datetime, timezone
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC_TAURI = ROOT / "src-tauri"
+MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_windows_x86_64_manifest.json"
+OUTPUT = SRC_TAURI / "python-runtime"
+PROVENANCE = "embedded_python_runtime_provenance.json"
+
+class RuntimePrepError(RuntimeError): pass
+
+def sha256_file(path: Path) -> str:
+    h=hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024), b''): h.update(chunk)
+    return h.hexdigest()
+
+def load_manifest(path: Path=MANIFEST) -> dict:
+    m=json.loads(path.read_text(encoding='utf-8'))
+    required={"schema_version","cpython_version","archive_url","sha256","expected_archive_root","expected_interpreter_path","expected_architecture","llama_cpp_cuda_wheel","required_packages","required_native_dlls"}
+    missing=required-set(m)
+    if missing: raise RuntimePrepError(f"windows runtime manifest missing keys: {sorted(missing)}")
+    if m["schema_version"] != 1: raise RuntimePrepError("unsupported windows runtime manifest schema_version")
+    wheel=m["llama_cpp_cuda_wheel"]
+    if wheel.get("name") != "llama_cpp_python-0.3.32-py3-none-win_amd64.whl": raise RuntimePrepError("unexpected llama-cpp-python wheel name")
+    if wheel.get("version") != "0.3.32" or wheel.get("flavor") != "cu124": raise RuntimePrepError("unexpected llama-cpp-python CUDA wheel version/flavor")
+    if "win_amd64" not in wheel.get("name","") or "cu124" not in wheel.get("url",""): raise RuntimePrepError("CUDA wheel must be cu124 win_amd64")
+    if m.get("expected_architecture") != "AMD64": raise RuntimePrepError("windows runtime architecture must be AMD64")
+    return m
+
+def fetch(url: str, sha: str, dest: Path) -> Path:
+    if not url.startswith("https://github.com/"):
+        raise RuntimePrepError("runtime artifacts must be fetched from pinned GitHub HTTPS URLs")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        with urllib.request.urlopen(url, timeout=120) as r, dest.open('wb') as f:  # nosec B310 - URL scheme/host is validated and SHA-256 pinned
+            shutil.copyfileobj(r, f)
+    got=sha256_file(dest)
+    if got != sha: raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
+    return dest
+
+def safe_extract_tar(archive: Path, dest: Path) -> None:
+    with tarfile.open(archive, 'r:*') as tf:
+        base=dest.resolve()
+        for member in tf.getmembers():
+            target=(dest/member.name).resolve()
+            if not str(target).startswith(str(base)): raise RuntimePrepError("archive member escapes destination")
+        tf.extractall(dest)  # nosec B202 - all members are resolved under dest before extraction
+
+def validate_wheel(whl: Path, m: dict) -> None:
+    wheel=m['llama_cpp_cuda_wheel']
+    if whl.name != wheel['name']: raise RuntimePrepError("wrong wheel filename")
+    with zipfile.ZipFile(whl) as zf:
+        names=set(zf.namelist())
+        if not any(n.endswith('.dist-info/METADATA') for n in names): raise RuntimePrepError("wheel missing METADATA")
+        meta_name=next(n for n in names if n.endswith('.dist-info/METADATA'))
+        meta=zf.read(meta_name).decode('utf-8','replace')
+        if 'Name: llama_cpp_python' not in meta and 'Name: llama-cpp-python' not in meta: raise RuntimePrepError("wheel package name mismatch")
+        if 'Version: 0.3.32' not in meta: raise RuntimePrepError("wheel version mismatch")
+        wheel_name=next((n for n in names if n.endswith('.dist-info/WHEEL')), '')
+        wheel_text=zf.read(wheel_name).decode('utf-8','replace') if wheel_name else ''
+        if 'Tag: py3-none-win_amd64' not in wheel_text: raise RuntimePrepError("wheel tag must be py3-none-win_amd64")
+        if not any(n.lower().endswith('llama.dll') for n in names): raise RuntimePrepError("wheel missing llama.dll native runtime")
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
+
+def write_provenance(runtime: Path, m: dict) -> None:
+    payload={
+        'cpython_version': m['cpython_version'], 'target_triple': m['target_triple'],
+        'source_archive_sha256': m['sha256'], 'llama_cpp_cuda_wheel': m['llama_cpp_cuda_wheel'],
+        'required_packages': m['required_packages'], 'required_native_dlls': m['required_native_dlls'],
+        'expected_backend': 'cuda', 'build_timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+    (runtime/PROVENANCE).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
+
+def prepare(m: dict) -> None:
+    cache=ROOT/'.cache'/'windows-python-runtime'
+    archive=fetch(m['archive_url'], m['sha256'], cache/Path(m['archive_url'].split('/')[-1].replace('%2B','+')).name)
+    wheel_meta=m['llama_cpp_cuda_wheel']
+    wheel=fetch(wheel_meta['url'], wheel_meta['sha256'], cache/wheel_meta['name'])
+    validate_wheel(wheel, m)
+    with tempfile.TemporaryDirectory(prefix='token-place-win-python-', dir=str(OUTPUT.parent)) as td:
+        tmp=Path(td); safe_extract_tar(archive, tmp)
+        staged=tmp/'python-runtime'; shutil.move(str(tmp/m['expected_archive_root']), staged)
+        py=staged/m['expected_interpreter_path']
+        if not py.is_file(): raise RuntimePrepError('archive missing python.exe')
+        req=SRC_TAURI/'python'/'requirements_desktop_runtime.txt'
+        baseline=[f"{k}=={v}" for k,v in sorted(m['required_packages'].items()) if k != 'llama-cpp-python']
+        run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', *baseline])
+        run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', str(wheel)])
+        data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:2]),'machine':platform.machine()}))"]).stdout)
+        if data != {'version':[3,11], 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
+        for dll in m['required_native_dlls']:
+            if not any(p.name.lower()==dll.lower() for p in staged.rglob('*')): raise RuntimePrepError(f'missing required DLL: {dll}')
+        for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
+        write_provenance(staged, m)
+        backup=tmp/'old-runtime'
+        if OUTPUT.exists(): OUTPUT.rename(backup)
+        staged.rename(OUTPUT)
+
+def main() -> int:
+    ap=argparse.ArgumentParser(); ap.add_argument('--manifest', type=Path, default=MANIFEST); ap.add_argument('--check-manifest-only', action='store_true')
+    args=ap.parse_args()
+    try:
+        m=load_manifest(args.manifest)
+        if not args.check_manifest_only: prepare(m)
+        return 0
+    except Exception as e:
+        print(f"windows embedded runtime preparation failed: {e}", file=sys.stderr); return 1
+if __name__ == '__main__': raise SystemExit(main())

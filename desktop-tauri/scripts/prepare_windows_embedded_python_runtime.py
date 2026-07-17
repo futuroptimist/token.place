@@ -160,8 +160,9 @@ def prepare(m: dict) -> None:
         if baseline:
             run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-index', '--only-binary', ':all:', '--require-hashes', '--find-links', str(cache), '-r', str(requirements)])
         run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-index', '--only-binary', ':all:', '--no-deps', str(wheel)])
-        data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:2]),'machine':platform.machine()}))"]).stdout)
-        if data != {'version':[3,11], 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
+        expected_version=[int(part) for part in m['cpython_version'].split('.')[:3]]
+        data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
+        if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
         for dll in m['required_native_dlls']:
             if not any(p.name.lower()==dll.lower() for p in staged.rglob('*')): raise RuntimePrepError(f'missing required DLL: {dll}')
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')

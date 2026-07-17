@@ -137,7 +137,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
         if '-r' in cmd:
             requirement_texts.append(Path(cmd[-1]).read_text(encoding='utf-8'))
         class Result:
-            stdout = json.dumps({'version': [3, 11], 'machine': 'AMD64'})
+            stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
         return Result()
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
@@ -370,7 +370,7 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
         prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}))
 
     class GoodProbe:
-        stdout = json.dumps({'version': [3, 11], 'machine': 'AMD64'})
+        stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
 
     monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: GoodProbe())
     with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):

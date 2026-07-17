@@ -455,20 +455,25 @@ def test_control_plane_routes_keep_aggregate_ip_abuse_budget():
         "API_RATE_LIMIT": "2/hour",
         "API_DAILY_QUOTA": "1000/day",
         "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT": "65/hour",
+        "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT": "65/hour",
         "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT": "65/hour",
         "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "1000/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
     },
     clear=True,
 )
-def test_poll_and_response_control_plane_routes_do_not_use_public_quota():
-    """Poll and encrypted response submissions allow healthy cadence above user quota."""
+def test_poll_control_and_response_control_plane_routes_do_not_use_public_quota():
+    """Compute control-plane routes allow healthy cadence above user quota."""
     app = Flask(__name__)
     init_app(app)
 
     @app.post("/api/v1/relay/servers/poll")
     def relay_servers_poll():
         return {"status": "polling"}
+
+    @app.post("/api/v1/relay/servers/control")
+    def relay_servers_control():
+        return {"status": "active"}
 
     @app.post("/api/v1/relay/responses")
     def relay_responses():
@@ -480,19 +485,31 @@ def test_poll_and_response_control_plane_routes_do_not_use_public_quota():
                 "/api/v1/relay/servers/poll",
                 json={"server_public_key": "server-a"},
                 headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "198.51.100.10"},
             )
             for _ in range(65)
+        ]
+        control_responses = [
+            client.post(
+                "/api/v1/relay/servers/control",
+                json={"server_public_key": "server-a", "request_id": f"req-{index}"},
+                headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "198.51.100.11"},
+            )
+            for index in range(65)
         ]
         response_submissions = [
             client.post(
                 "/api/v1/relay/responses",
                 json={"client_public_key": "client-a", "request_id": f"req-{index}"},
                 headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "198.51.100.12"},
             )
             for index in range(65)
         ]
 
     assert {response.status_code for response in poll_responses} == {200}
+    assert {response.status_code for response in control_responses} == {200}
     assert {response.status_code for response in response_submissions} == {200}
 
 

@@ -2454,8 +2454,9 @@ def _clear_pending_requests_for_queued_items(queued_items):
         _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
 
 
-def _pending_request_entry_is_expired(pending_entry, *, now=None):
-    deadline_monotonic = pending_entry.get("request_deadline_monotonic") if isinstance(pending_entry, dict) else None
+def _pending_request_entry_is_expired(pending_entry, *, now=None, deadline_monotonic=None):
+    entry_deadline = pending_entry.get("request_deadline_monotonic") if isinstance(pending_entry, dict) else None
+    deadline_monotonic = entry_deadline if isinstance(entry_deadline, (int, float)) else deadline_monotonic
     if isinstance(deadline_monotonic, (int, float)) and deadline_monotonic <= time.monotonic():
         return True
     if PENDING_REQUEST_TTL_SECONDS <= 0:
@@ -2560,8 +2561,10 @@ def _expire_stale_pending_requests():
             if not isinstance(pending_ids, dict):
                 client_pending_request_ids.pop(client_public_key, None)
                 continue
+            deadline_ids = client_pending_request_deadlines.get(client_public_key)
             for request_id, pending_entry in list(pending_ids.items()):
-                if _pending_request_entry_is_expired(pending_entry, now=now):
+                deadline = deadline_ids.get(request_id) if isinstance(deadline_ids, dict) else None
+                if _pending_request_entry_is_expired(pending_entry, now=now, deadline_monotonic=deadline):
                     expired.append((client_public_key, request_id))
     for client_public_key, request_id in expired:
         if _has_client_response_for_request(client_public_key, request_id):
@@ -2847,43 +2850,44 @@ def api_v1_relay_servers_control():
 
     lease_seconds = _api_v1_in_flight_ttl_seconds()
     now = time.monotonic()
-    with server_round_robin_lock:
-        server_payload = known_servers.get(public_key)
-        if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        with api_v1_in_flight_requests_lock:
-            in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-            entry = in_flight_requests.get(request_id) if isinstance(in_flight_requests, dict) else None
-            if isinstance(entry, dict):
-                deadline_monotonic = entry.get('request_deadline_monotonic')
-                if isinstance(deadline_monotonic, (int, float)) and deadline_monotonic <= now:
-                    client_public_key = entry.get('client_public_key')
-                    in_flight_requests.pop(request_id, None)
-                    if not in_flight_requests:
-                        server_payload.pop('api_v1_in_flight_requests', None)
-                    _add_api_v1_control_tombstone(
-                        public_key,
-                        request_id,
-                        client_public_key,
-                        status='expired',
-                        reason='provider_timeout',
-                        deadline_monotonic=deadline_monotonic,
-                    )
-                    _mark_request_terminal(client_public_key, request_id, status='expired', reason='provider_timeout')
-                else:
-                    lease_deadline = min(
-                        now + lease_seconds,
-                        float(deadline_monotonic) if isinstance(deadline_monotonic, (int, float)) else now + lease_seconds,
-                    )
-                    entry['expires_at'] = lease_deadline
-                    _record_compute_control_state("active")
-                    _record_compute_control_state("lease_renewed")
-                    payload = {
-                        'status': 'active',
-                        'next_poll_seconds': min(_api_v1_poll_wait_seconds(), API_V1_CONTROL_NEXT_POLL_MAX_SECONDS, max(lease_seconds / 2.0, 1.0)),
-                        **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
-                    }
-                    return jsonify(payload), 200
+    with api_v1_terminal_transition_lock:
+        with server_round_robin_lock:
+            server_payload = known_servers.get(public_key)
+            if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
+                return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+            with api_v1_in_flight_requests_lock:
+                in_flight_requests = server_payload.get('api_v1_in_flight_requests')
+                entry = in_flight_requests.get(request_id) if isinstance(in_flight_requests, dict) else None
+                if isinstance(entry, dict):
+                    deadline_monotonic = entry.get('request_deadline_monotonic')
+                    if isinstance(deadline_monotonic, (int, float)) and deadline_monotonic <= now:
+                        client_public_key = entry.get('client_public_key')
+                        in_flight_requests.pop(request_id, None)
+                        if not in_flight_requests:
+                            server_payload.pop('api_v1_in_flight_requests', None)
+                        _add_api_v1_control_tombstone(
+                            public_key,
+                            request_id,
+                            client_public_key,
+                            status='expired',
+                            reason='provider_timeout',
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                        _mark_request_terminal(client_public_key, request_id, status='expired', reason='provider_timeout')
+                    else:
+                        lease_deadline = min(
+                            now + lease_seconds,
+                            float(deadline_monotonic) if isinstance(deadline_monotonic, (int, float)) else now + lease_seconds,
+                        )
+                        entry['expires_at'] = lease_deadline
+                        _record_compute_control_state("active")
+                        _record_compute_control_state("lease_renewed")
+                        payload = {
+                            'status': 'active',
+                            'next_poll_seconds': min(_api_v1_poll_wait_seconds(), API_V1_CONTROL_NEXT_POLL_MAX_SECONDS, max(lease_seconds / 2.0, 1.0)),
+                            **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
+                        }
+                        return jsonify(payload), 200
 
     key = _control_tombstone_key(public_key, request_id)
     with api_v1_control_tombstones_lock:
@@ -2928,10 +2932,11 @@ def api_v1_relay_requests():
 
     envelope['e2ee_v1'] = True
     queued_at = time.time()
-    deadline_monotonic = time.monotonic() + _api_v1_request_deadline_seconds()
+    deadline_seconds = _api_v1_request_deadline_seconds()
+    deadline_monotonic = time.monotonic() + deadline_seconds
     envelope['_queued_at'] = queued_at
-    envelope['request_deadline_remaining_seconds'] = _api_v1_request_deadline_seconds()
-    envelope['request_ttl_seconds'] = envelope['request_deadline_remaining_seconds']
+    envelope['request_deadline_remaining_seconds'] = deadline_seconds
+    envelope['request_ttl_seconds'] = deadline_seconds
     envelope['_request_deadline_monotonic'] = deadline_monotonic
     with server_round_robin_lock:
         server_payload = known_servers.get(server_public_key)

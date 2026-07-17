@@ -3925,6 +3925,21 @@ def test_api_v1_control_renews_lease_without_extending_absolute_deadline(client,
     assert control.get_json()['request_ttl_seconds'] <= queued_ttl
 
 
+def test_expire_stale_pending_requests_uses_deadline_index_for_legacy_float_entries(client):
+    request_id = 'req-deadline-index-only'
+    relay_module._mark_request_pending(
+        DUMMY_CLIENT_PUB_KEY,
+        request_id,
+        deadline_monotonic=time.monotonic() - 1.0,
+    )
+
+    relay_module._expire_stale_pending_requests()
+
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    terminal = relay_module._get_terminal_request(DUMMY_CLIENT_PUB_KEY, request_id)
+    assert terminal['status'] == 'expired'
+
+
 def test_api_v1_absolute_deadline_expiry_rejects_late_response(client, monkeypatch):
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}

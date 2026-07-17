@@ -33,12 +33,14 @@ CONTROL_PLANE_ROUTE_LIMIT_ENVS = {
     "/api/v1/relay/servers/register": "API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT",
     "/api/v1/relay/servers/unregister": "API_RELAY_CONTROL_PLANE_UNREGISTER_RATE_LIMIT",
     "/api/v1/relay/servers/poll": "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT",
+    "/api/v1/relay/servers/control": "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT",
     "/api/v1/relay/responses": "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT",
 }
 CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/register": "240/hour",
     "/api/v1/relay/servers/unregister": "240/hour",
     "/api/v1/relay/servers/poll": "1200/hour",
+    "/api/v1/relay/servers/control": "1200/hour",
     "/api/v1/relay/responses": "1200/hour",
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"

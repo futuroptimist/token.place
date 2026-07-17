@@ -4627,7 +4627,7 @@ def test_api_v1_abuse_ceiling_uses_utf8_bytes_for_blocks_and_unicode():
 
 
 def test_api_v1_text_blocks_use_aggregate_limit_without_lower_message_cap():
-    limit = RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    limit = RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     valid_blocks = [
         {"type": "text", "text": "a" * 20000},
         {"type": "input_text", "text": "b" * 20000},
@@ -4664,6 +4664,27 @@ def test_api_v1_text_blocks_use_aggregate_limit_without_lower_message_cap():
     assert too_large.code == "compute_node_request_too_large"
 
 
+def test_api_v1_rejects_unpaired_surrogates_before_utf8_byte_counting():
+    result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": "bad surrogate: \ud800"}]
+    )
+    assert result.valid is False
+    assert result.code == "compute_node_invalid_request"
+    assert result.reason == "invalid_content"
+
+    block_result = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "bad surrogate: \ud800"}],
+            }
+        ]
+    )
+    assert block_result.valid is False
+    assert block_result.code == "compute_node_invalid_request"
+    assert block_result.reason == "invalid_content"
+
+
 def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(caplog):
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
@@ -4677,7 +4698,7 @@ def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(cap
                 {
                     "role": "user",
                     "content": distinctive_text
-                    + ("x" * RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS),
+                    + ("x" * RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES),
                 }
             ],
             options={},
@@ -4687,7 +4708,7 @@ def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(cap
     assert error["code"] == "compute_node_request_too_large"
     assert error["type"] == "validation_error"
     assert error["message_count"] == 1
-    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["maximum_total_content_chars"] is None
     assert error["total_content_utf8_bytes"] > RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     assert error["maximum_total_content_utf8_bytes"] == RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     assert error["retryable"] is False
@@ -4816,13 +4837,13 @@ def _admission_envelope(client, manager, content, *, options=None, requested_tie
     )
 
 
-def _large_natural_language_payload(target_bytes=248 * 1024):
+def _large_natural_language_payload(target_chars=248 * 1024):
     sentence = (
         "A calm deterministic paragraph describes relay-safe token admission, "
         "context windows, and neutral validation behavior for repeatable tests. "
     )
-    repeats = (target_bytes // len(sentence.encode("utf-8"))) + 1
-    payload = (sentence * repeats)[:target_bytes]
+    repeats = (target_chars // len(sentence)) + 1
+    payload = (sentence * repeats)[:target_chars]
     assert 240 * 1024 <= len(payload.encode("utf-8")) <= 260 * 1024
     assert len(payload) > 131072
     return payload

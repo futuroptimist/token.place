@@ -869,8 +869,10 @@ class RelayClient:
     # Enforced in UTF-8 bytes so multi-byte payloads are bounded by transport size
     # while exact runtime token admission remains the only context-fit authority.
     _API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES = 512 * 1024
-    # Backward-compatible diagnostic alias for privacy-safe character counters.
-    _API_V1_MAX_TOTAL_REQUEST_CHARS = _API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+    # API v1 no longer enforces an aggregate character ceiling; keep the
+    # legacy diagnostic field explicit as null instead of reporting a byte
+    # limit under a character-oriented name.
+    _API_V1_MAX_TOTAL_REQUEST_CHARS = None
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
@@ -2883,7 +2885,10 @@ class RelayClient:
     @classmethod
     def _api_v1_content_validation_size(cls, content: Any) -> Optional[Tuple[int, int]]:
         if isinstance(content, str):
-            return len(content), len(content.encode("utf-8"))
+            try:
+                return len(content), len(content.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
         if (
             not isinstance(content, list)
             or not content
@@ -2901,8 +2906,12 @@ class RelayClient:
             text = item.get("text")
             if not isinstance(text, str) or not text:
                 return None
+            try:
+                text_utf8_bytes = len(text.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
             total_chars += len(text)
-            total_utf8_bytes += len(text.encode("utf-8"))
+            total_utf8_bytes += text_utf8_bytes
         return total_chars, total_utf8_bytes
 
 

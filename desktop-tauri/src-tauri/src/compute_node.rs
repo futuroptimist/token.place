@@ -2315,13 +2315,21 @@ mod tests {
             let mut status = state.status.lock().await;
             status.operator_session_id = Some("session-1".into());
             status.log_file_path = Some(log_path.to_string_lossy().into_owned());
+            status.stop_cleanup_required = Some(false);
+            status.stop_cleanup_attempted = Some(false);
+            status.stop_cleanup_outcome = Some("not_required".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(0);
         }
 
-        stop_compute_node(state).await.expect("stop compute node");
+        stop_compute_node(state.clone())
+            .await
+            .expect("stop compute node");
 
         let log = std::fs::read_to_string(log_path).expect("operator log");
         assert!(log.contains("desktop.compute_node.stop_requested"));
         assert!(log.contains("operator_session_id=session-1"));
+        assert!(state.status.lock().await.last_error.is_none());
     }
 
     #[tokio::test]

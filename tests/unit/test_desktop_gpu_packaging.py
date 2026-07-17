@@ -28,7 +28,7 @@ def test_windows_install_plan_is_bundled_cuda_wheel_only():
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
-    assert gpu_plan.package_spec == "llama-cpp-python==0.3.32"
+    assert gpu_plan.package_spec == LLAMA_CPP_CUDA_124_WHEEL_URL
     assert gpu_plan.index_url is None
     assert gpu_plan.only_binary is True
     assert gpu_plan.no_binary is False
@@ -220,6 +220,7 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
 
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
+    assert plan.package_spec == LLAMA_CPP_CUDA_124_WHEEL_URL
     assert plan.only_binary is True
     assert plan.no_binary is False
 

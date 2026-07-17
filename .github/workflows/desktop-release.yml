@@ -221,6 +221,14 @@ jobs:
             ~/.cache/token-place/embedded-python
           key: embedded-python-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt') }}
 
+      - name: Cache embedded Windows CUDA Python runtime artifacts
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            desktop-tauri/.cache/windows-python-runtime
+          key: windows-cuda-python-runtime-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json') }}
+
       - name: Prepare embedded macOS Python runtime
         if: runner.os == 'macOS'
         shell: bash

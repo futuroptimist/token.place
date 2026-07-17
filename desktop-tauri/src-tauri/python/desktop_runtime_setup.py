@@ -1306,7 +1306,11 @@ def _is_bundled_packaged_runtime() -> bool:
     exe = _safe_resolve_path(sys.executable)
     parts = {part.lower() for part in exe.parts}
     if _desktop_platform().startswith("win"):
-        return exe.name.lower() == "python.exe" and "python-runtime" in parts
+        return (
+            exe.name.lower() == "python.exe"
+            and exe.parent.name.lower() == "python-runtime"
+            and (exe.parent / "embedded_python_runtime_provenance.json").is_file()
+        )
     return "python-runtime" in parts and "contents" in parts and "resources" in parts
 
 
@@ -1390,7 +1394,7 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
     if (
         current_platform == "darwin"
         and selected_mode != "gpu"
-        and runtime_action not in {"failed", "metal_install_failed"}
+        and runtime_action not in {"failed", "metal_install_failed", "bundled_runtime_probe_failed"}
     ):
         return None
 
@@ -1637,7 +1641,7 @@ def _ensure_desktop_llama_runtime_impl(
             "selected_backend": "cpu",
             "fallback_reason": (
                 (f"{last_error}; " if last_error else "")
-                + "immutable bundled Windows CUDA runtime probe failed; packaged startup will not run pip, compilers, or CPU/model/context fallback"
+                + "immutable bundled GPU runtime probe failed; packaged startup will not run pip, compilers, or CPU/model/context fallback"
             ),
             "runtime_action": "bundled_runtime_probe_failed",
             "runtime_origin": "bundled",

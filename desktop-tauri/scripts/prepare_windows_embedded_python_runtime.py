@@ -22,7 +22,7 @@ def sha256_file(path: Path) -> str:
 
 def load_manifest(path: Path=MANIFEST) -> dict:
     m=json.loads(path.read_text(encoding='utf-8'))
-    required={"schema_version","cpython_version","archive_url","sha256","expected_archive_root","expected_interpreter_path","expected_architecture","llama_cpp_cuda_wheel","required_packages","required_native_dlls"}
+    required={"schema_version","cpython_version","archive_url","sha256","expected_archive_root","expected_interpreter_path","expected_architecture","llama_cpp_cuda_wheel","required_packages","required_native_dlls","target_triple"}
     missing=required-set(m)
     if missing: raise RuntimePrepError(f"windows runtime manifest missing keys: {sorted(missing)}")
     if m["schema_version"] != 1: raise RuntimePrepError("unsupported windows runtime manifest schema_version")
@@ -48,8 +48,11 @@ def safe_extract_tar(archive: Path, dest: Path) -> None:
     with tarfile.open(archive, 'r:*') as tf:
         base=dest.resolve()
         for member in tf.getmembers():
+            if member.issym() or member.islnk():
+                raise RuntimePrepError("archive member links are not allowed")
             target=(dest/member.name).resolve()
-            if not str(target).startswith(str(base)): raise RuntimePrepError("archive member escapes destination")
+            if not target.is_relative_to(base):
+                raise RuntimePrepError("archive member escapes destination")
         tf.extractall(dest)  # nosec B202 - all members are resolved under dest before extraction
 
 def validate_wheel(whl: Path, m: dict) -> None:
@@ -90,9 +93,8 @@ def prepare(m: dict) -> None:
         staged=tmp/'python-runtime'; shutil.move(str(tmp/m['expected_archive_root']), staged)
         py=staged/m['expected_interpreter_path']
         if not py.is_file(): raise RuntimePrepError('archive missing python.exe')
-        req=SRC_TAURI/'python'/'requirements_desktop_runtime.txt'
         baseline=[f"{k}=={v}" for k,v in sorted(m['required_packages'].items()) if k != 'llama-cpp-python']
-        run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', *baseline])
+        run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--only-binary', ':all:', '--prefer-binary', *baseline])
         run([str(py), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', str(wheel)])
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:2]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':[3,11], 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')

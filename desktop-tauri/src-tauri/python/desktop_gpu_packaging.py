@@ -83,7 +83,7 @@ def llama_cpp_install_plan(
         return LlamaCppInstallPlan(
             platform=detected_platform,
             backend="cuda",
-            package_spec=package_spec,
+            package_spec=LLAMA_CPP_CUDA_124_WHEEL_URL,
             cmake_args=None,
             force_cmake=False,
             index_url=None,

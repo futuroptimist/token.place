@@ -130,16 +130,24 @@ impl std::error::Error for PythonLauncherError {}
 fn expected_runtime_arch() -> &'static str {
     if cfg!(target_os = "windows") {
         "AMD64"
-    } else {
+    } else if cfg!(target_os = "macos") {
         "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "unknown"
     }
 }
 
 fn bundled_runtime_id() -> &'static str {
     if cfg!(target_os = "windows") {
         "bundled-cpython-3.11-win_amd64"
+    } else if cfg!(target_os = "macos") {
+        "bundled-cpython-3.11-macos-arm64"
     } else {
-        "bundled-cpython-3.11-arm64"
+        "bundled-cpython-3.11-unknown"
     }
 }
 

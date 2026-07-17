@@ -808,6 +808,10 @@ def test_packaged_windows_bundled_runtime_probe_failure_never_invokes_installer(
     )
     calls = {'pip': 0, 'source': 0}
 
+    runtime_dir = Path(probe.interpreter).parent
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text('{}', encoding='utf-8')
+
     sys_attrs = vars(sys).copy()
     sys_attrs.update({'platform': 'win32', 'executable': probe.interpreter})
     monkeypatch.setattr(runtime_setup_module, 'sys', SimpleNamespace(**sys_attrs))

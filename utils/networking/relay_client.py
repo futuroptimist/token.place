@@ -1330,6 +1330,8 @@ class RelayClient:
     def unregister_from_relay(self) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
+        self.stop_polling = True
+        self._polling_stopped_by_request = True
         self._api_v1_stop_heartbeat_worker()
 
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
@@ -1395,7 +1397,7 @@ class RelayClient:
                 if response.status_code == 200:
                     if candidate_url in relay_index_by_url:
                         self._active_relay_index = relay_index_by_url[candidate_url]
-                    log_info("Unregistered compute node from relay {}", candidate_url)
+                    log_info("Unregistered compute node from relay {}", _sanitize_relay_target(candidate_url))
                     unregistered_relays.add(candidate_url)
                     self._api_v1_registered_relays.discard(candidate_url)
                     self._api_v1_last_heartbeat_at.pop(candidate_url, None)
@@ -1412,7 +1414,7 @@ class RelayClient:
                 last_error = f"HTTP {diagnostic['status_code']}"
                 log_error(
                     "Failed to unregister compute node from {}: {}",
-                    candidate_url,
+                    _sanitize_relay_target(candidate_url),
                     last_error,
                 )
             except requests.RequestException as exc:
@@ -1420,7 +1422,7 @@ class RelayClient:
                 last_error = str(exc)
                 log_error(
                     "Error unregistering compute node from {}: {}",
-                    candidate_url,
+                    _sanitize_relay_target(candidate_url),
                     last_error,
                     exc_info=True,
                 )
@@ -1429,7 +1431,7 @@ class RelayClient:
                 last_error = str(exc)
                 log_error(
                     "Unexpected error unregistering compute node from {}: {}",
-                    candidate_url,
+                    _sanitize_relay_target(candidate_url),
                     last_error,
                     exc_info=True,
                 )

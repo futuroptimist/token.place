@@ -1,6 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1500;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -40,7 +40,9 @@ new Vue({
         computeNodeCountStatus: 'loading',
         computeNodeCountLastUpdated: '',
         computeNodeCountPoller: null,
-        computeNodeCountRequestId: 0
+        computeNodeCountRequestId: 0,
+        computeNodeCountRefreshInFlight: false,
+        computeNodeCountVisibilityHandler: null
     },
     mounted() {
         this.detectTouchInput();
@@ -49,8 +51,19 @@ new Vue({
         this.generateClientKeys();
         this.refreshComputeNodeCount();
         this.computeNodeCountPoller = setInterval(() => {
-            this.refreshComputeNodeCount();
+            if (typeof document !== 'undefined' && document.hidden) {
+                return;
+            }
+            this.refreshComputeNodeCount({ background: true });
         }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            this.computeNodeCountVisibilityHandler = () => {
+                if (!document.hidden) {
+                    this.refreshComputeNodeCount();
+                }
+            };
+            document.addEventListener('visibilitychange', this.computeNodeCountVisibilityHandler);
+        }
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
@@ -102,6 +115,10 @@ new Vue({
     },
     methods: {
         async refreshComputeNodeCount(options = {}) {
+            if (this.computeNodeCountRefreshInFlight && options && options.background === true) {
+                return false;
+            }
+            this.computeNodeCountRefreshInFlight = true;
             // Failover capacity refreshes must be allowed to apply their own
             // successful diagnostics result even if the background poller starts
             // another request before they finish; otherwise a stale count of one
@@ -148,6 +165,10 @@ new Vue({
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';
                 return false;
+            } finally {
+                if (requestId === this.computeNodeCountRequestId || !applySupersededSuccess) {
+                    this.computeNodeCountRefreshInFlight = false;
+                }
             }
         },
 
@@ -1335,6 +1356,14 @@ new Vue({
         if (this.computeNodeCountPoller) {
             clearInterval(this.computeNodeCountPoller);
             this.computeNodeCountPoller = null;
+        }
+        if (
+            this.computeNodeCountVisibilityHandler &&
+            typeof document !== 'undefined' &&
+            typeof document.removeEventListener === 'function'
+        ) {
+            document.removeEventListener('visibilitychange', this.computeNodeCountVisibilityHandler);
+            this.computeNodeCountVisibilityHandler = null;
         }
         if (!Array.isArray(this.chatHistory)) {
             return;

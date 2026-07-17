@@ -33,6 +33,7 @@ def manifest(**overrides):
         },
         'required_packages': {'pip': '25.2', 'llama-cpp-python': '0.3.32'},
         'required_native_dlls': ['llama.dll'],
+        'python_package_wheels': [],
     }
     data.update(overrides)
     return data
@@ -104,12 +105,19 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     m = manifest(
         expected_archive_root=archive_root,
         required_packages={'alpha': '1.0', 'llama-cpp-python': '0.3.32'},
+        python_package_wheels=[{
+            'package': 'alpha', 'version': '1.0',
+            'filename': 'alpha-1.0-py3-none-any.whl',
+            'url': 'https://files.pythonhosted.org/packages/alpha-1.0-py3-none-any.whl',
+            'sha256': '2' * 64,
+        }],
     )
     wheel = tmp_path / m['llama_cpp_cuda_wheel']['name']
     wheel.write_bytes(b'wheel')
     archive = tmp_path / 'runtime.tar.gz'
     archive.write_bytes(b'archive')
     commands = []
+    requirement_texts = []
     runtime_root.parent.mkdir(parents=True)
 
     monkeypatch.setattr(prep, 'ROOT', tmp_path / 'desktop-tauri')
@@ -126,6 +134,8 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         commands.append(cmd)
+        if '-r' in cmd:
+            requirement_texts.append(Path(cmd[-1]).read_text(encoding='utf-8'))
         class Result:
             stdout = json.dumps({'version': [3, 11], 'machine': 'AMD64'})
         return Result()
@@ -141,8 +151,10 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     assert baseline_cmd[1:5] == ['-m', 'pip', 'install', '--disable-pip-version-check']
     assert '--only-binary' in baseline_cmd
     assert ':all:' in baseline_cmd
-    assert '--prefer-binary' in baseline_cmd
-    assert 'alpha==1.0' in baseline_cmd
+    assert '--no-index' in baseline_cmd
+    assert '--require-hashes' in baseline_cmd
+    assert '--find-links' in baseline_cmd
+    assert requirement_texts == ['alpha==1.0 --hash=sha256:' + '2' * 64 + '\n']
 
 
 def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path):
@@ -151,7 +163,7 @@ def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path
     digest = prep.sha256_file(artifact)
     assert digest == '68e80e55363cd61ec4d038a99d2705886d56de5a93793e48ad4824f2c45104f0'
 
-    with pytest.raises(prep.RuntimePrepError, match='GitHub HTTPS'):
+    with pytest.raises(prep.RuntimePrepError, match='immutable HTTPS'):
         prep.fetch('https://example.com/runtime.tar.gz', digest, artifact)
 
     with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
@@ -179,6 +191,40 @@ def test_load_manifest_rejects_wrong_schema_wheel_flavor_and_architecture(tmp_pa
 
     write_manifest(path, manifest(expected_architecture='ARM64'))
     with pytest.raises(prep.RuntimePrepError, match='architecture must be AMD64'):
+        prep.load_manifest(path)
+
+    bad_hash = dict(manifest()['llama_cpp_cuda_wheel'])
+    bad_hash['sha256'] = 'not-a-hash'
+    write_manifest(path, manifest(llama_cpp_cuda_wheel=bad_hash))
+    with pytest.raises(prep.RuntimePrepError, match='wheel sha256'):
+        prep.load_manifest(path)
+
+
+def test_manifest_validates_local_wheelhouse_contract(tmp_path):
+    path = tmp_path / 'manifest.json'
+    wheel_artifact = {
+        'package': 'requests',
+        'version': '2.32.5',
+        'filename': 'requests-2.32.5-py3-none-any.whl',
+        'url': 'https://files.pythonhosted.org/packages/requests-2.32.5-py3-none-any.whl',
+        'sha256': 'a' * 64,
+    }
+    write_manifest(path, manifest(python_package_wheels=[wheel_artifact]))
+    assert prep.load_manifest(path)['python_package_wheels'] == [wheel_artifact]
+
+    bad = dict(wheel_artifact, filename='requests-2.32.5.tar.gz')
+    write_manifest(path, manifest(python_package_wheels=[bad]))
+    with pytest.raises(prep.RuntimePrepError, match='must be wheels'):
+        prep.load_manifest(path)
+
+    bad = dict(wheel_artifact, url='https://example.com/requests.whl')
+    write_manifest(path, manifest(python_package_wheels=[bad]))
+    with pytest.raises(prep.RuntimePrepError, match='immutable HTTPS'):
+        prep.load_manifest(path)
+
+    bad = dict(wheel_artifact, filename='requests-2.32.5-py3-none-win_arm64.whl')
+    write_manifest(path, manifest(python_package_wheels=[bad]))
+    with pytest.raises(prep.RuntimePrepError, match='win_amd64 or none-any'):
         prep.load_manifest(path)
 
 
@@ -308,7 +354,7 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_without_python)
     with pytest.raises(prep.RuntimePrepError, match='archive missing python.exe'):
-        prep.prepare(manifest(expected_archive_root='cpython'))
+        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}))
 
     def fake_extract_with_python(_archive, dest):
         staged = dest / 'cpython'
@@ -321,14 +367,14 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_with_python)
     monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: Result())
     with pytest.raises(prep.RuntimePrepError, match='interpreter probe mismatch'):
-        prep.prepare(manifest(expected_archive_root='cpython'))
+        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}))
 
     class GoodProbe:
         stdout = json.dumps({'version': [3, 11], 'machine': 'AMD64'})
 
     monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: GoodProbe())
     with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
-        prep.prepare(manifest(expected_archive_root='cpython', required_native_dlls=['llama.dll']))
+        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}, required_native_dlls=['llama.dll']))
 
 
 def test_main_check_manifest_only_success_and_error(tmp_path, monkeypatch, capsys):

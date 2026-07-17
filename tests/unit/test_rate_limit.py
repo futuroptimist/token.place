@@ -9,6 +9,8 @@ from flask import Flask, request as flask_request
 
 from api import (
     _check_control_plane_limits,
+    _control_plane_identity_for_request,
+    _control_server_owner_identity,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -447,6 +449,72 @@ def test_control_plane_routes_keep_aggregate_ip_abuse_budget():
         ]
 
     assert [response.status_code for response in responses] == [200, 200, 429]
+
+
+def test_control_server_owner_identity_requires_matching_bound_credential(monkeypatch):
+    """Control buckets use the exact owner only after proof verification."""
+
+    def digest(value: str) -> str:
+        return f"digest:{value}"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(
+            known_servers={
+                "server-a": {"api_v1_control_credential_digest": digest("secret-a")},
+            },
+            _api_v1_control_credential_digest=digest,
+        ),
+    )
+
+    assert _control_server_owner_identity(None) is None
+    assert _control_server_owner_identity({"server_public_key": "server-a"}) is None
+    assert (
+        _control_server_owner_identity(
+            {"server_public_key": "server-a", "control_credential": "wrong"}
+        )
+        is None
+    )
+    valid_control_payload = {
+        "server_public_key": " server-a ",
+        "control_credential": "secret-a",
+    }
+    assert _control_server_owner_identity(valid_control_payload) == (
+        "server_public_key",
+        "server-a",
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context("/api/v1/relay/servers/control", method="POST"):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/control", valid_control_payload
+        ) == ("server_public_key", "server-a")
+
+
+def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
+    monkeypatch,
+):
+    """Invalid control credentials cannot burn another server's identity bucket."""
+
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(
+            known_servers={}, _api_v1_control_credential_digest=lambda value: value
+        ),
+    )
+    app = Flask(__name__)
+
+    with app.test_request_context(
+        "/api/v1/relay/servers/control",
+        method="POST",
+        environ_base={"REMOTE_ADDR": "203.0.113.9"},
+    ):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/control",
+            {"server_public_key": "victim", "control_credential": "wrong"},
+        ) == ("client_ip", "203.0.113.9")
 
 
 @patch.dict(

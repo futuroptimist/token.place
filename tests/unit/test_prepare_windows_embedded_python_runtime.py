@@ -132,6 +132,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
     monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
 
     prep.prepare(m)
 

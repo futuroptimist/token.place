@@ -4016,6 +4016,145 @@ def test_run_logs_unregister_skip_when_cancelled_before_registration(capsys, mon
     assert stopped_payload["unregister_outcome"] == "not_required"
 
 
+class MultiRelayShutdownRelayClient(FakeRelayClient):
+    def __init__(self, relay_url, *, unregister_result=True, unregister_delay=0.0):
+        self.relay_url = relay_url
+        self.stop_calls = 0
+        self.unregister_calls = 0
+        self.unregister_result = unregister_result
+        self.unregister_delay = unregister_delay
+        self.shutdown_deadlines = []
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self, *, shutdown_deadline=None):
+        self.unregister_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.unregister_delay:
+            time.sleep(self.unregister_delay)
+        return self.unregister_result
+
+
+class MultiRelayShutdownRuntime(FakeRuntime):
+    instances = []
+    outcomes_by_relay = {}
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        self.model_manager = model_manager or FakeModelManager()
+        self.crypto_manager = crypto_manager or object()
+        result, delay = self.outcomes_by_relay.get(config.relay_url, (True, 0.0))
+        self.relay_client = MultiRelayShutdownRelayClient(
+            config.relay_url,
+            unregister_result=result,
+            unregister_delay=delay,
+        )
+        self.poll_calls = 0
+        self.stop_calls = 0
+        self._processed = []
+        MultiRelayShutdownRuntime.instances.append(self)
+
+    def register_and_poll_once(self):
+        self.poll_calls += 1
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+def test_run_reports_partial_cleanup_when_one_registered_relay_unregister_fails(
+    capsys,
+    monkeypatch,
+):
+    _reset_cancel_queue()
+    MultiRelayShutdownRuntime.instances = []
+    MultiRelayShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.0),
+        'https://relay-b.example': (False, 0.0),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MultiRelayShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_urls=['https://relay-b.example'],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 1
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert all(
+        instance.relay_client.unregister_calls == 1
+        for instance in MultiRelayShutdownRuntime.instances
+    )
+    assert all(
+        instance.relay_client.shutdown_deadlines
+        for instance in MultiRelayShutdownRuntime.instances
+    )
+    assert output.err.count('desktop.compute_node_bridge.unregister.attempted') == 2
+    assert output.err.count('desktop.compute_node_bridge.unregister.succeeded') == 1
+    assert output.err.count('desktop.compute_node_bridge.unregister.failed') == 1
+
+
+def test_run_reports_timed_out_cleanup_when_registered_relay_exceeds_budget(
+    capsys,
+    monkeypatch,
+):
+    _reset_cancel_queue()
+    MultiRelayShutdownRuntime.instances = []
+    MultiRelayShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.03),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MultiRelayShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_stop_cleanup_budget_seconds',
+        lambda default=0.0: 0.001,
+    )
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'timed_out'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert MultiRelayShutdownRuntime.instances[0].relay_client.unregister_calls == 1
+    assert 'desktop.compute_node_bridge.unregister.attempted' in output.err
+
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

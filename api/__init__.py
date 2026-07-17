@@ -359,18 +359,39 @@ def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
     credential = data.get("control_credential")
     if not (isinstance(server_public_key, str) and server_public_key.strip() and isinstance(credential, str) and credential):
         return None
+    request_id = data.get("request_id")
     for module_name in ("relay", "__main__"):
         module = sys.modules.get(module_name)
         known_servers = getattr(module, "known_servers", None) if module is not None else None
+        tombstones = (
+            getattr(module, "api_v1_control_tombstones", None)
+            if module is not None
+            else None
+        )
+        tombstone_key_func = (
+            getattr(module, "_control_tombstone_key", None) if module is not None else None
+        )
         digest_func = getattr(module, "_api_v1_control_credential_digest", None) if module is not None else None
-        if not isinstance(known_servers, dict) or digest_func is None:
+        if digest_func is None:
             continue
-        payload = known_servers.get(server_public_key.strip())
-        if not isinstance(payload, dict):
-            continue
-        expected_digest = payload.get("api_v1_control_credential_digest")
+        server_key = server_public_key.strip()
+        expected_digest = None
+        if isinstance(known_servers, dict):
+            payload = known_servers.get(server_key)
+            if isinstance(payload, dict):
+                expected_digest = payload.get("api_v1_control_credential_digest")
+        if (
+            expected_digest is None
+            and isinstance(tombstones, dict)
+            and callable(tombstone_key_func)
+            and isinstance(request_id, str)
+            and request_id
+        ):
+            tombstone = tombstones.get(tombstone_key_func(server_key, request_id))
+            if isinstance(tombstone, dict):
+                expected_digest = tombstone.get("control_credential_digest")
         if isinstance(expected_digest, str) and secrets.compare_digest(digest_func(credential), expected_digest):
-            return "server_public_key", server_public_key.strip()
+            return "server_public_key", server_key
     return None
 
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
@@ -535,13 +556,19 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         # configured-token boundary as relay.py. Invalid-token and tokenless
         # anonymous requests stay keyed to client IP so callers cannot spoof a
         # victim server/client bucket before relay.py validates the request.
-        if _relay_server_token_boundary_has_configured_token():
-            data = request.get_json(silent=True)
-            identity_kind, identity_value = _control_plane_identity_for_request(
-                route, data
-            )
-            if identity_kind != "client_ip" or identity_value != remote_address:
-                checks.append((identity_kind, identity_value, route_limit["identity"]))
+        data = request.get_json(silent=True)
+        identity_kind, identity_value = _control_plane_identity_for_request(route, data)
+        allow_identity_bucket = _relay_server_token_boundary_has_configured_token()
+        if (
+            route == "/api/v1/relay/servers/control"
+            and identity_kind != "client_ip"
+            and identity_value != remote_address
+        ):
+            allow_identity_bucket = True
+        if allow_identity_bucket and (
+            identity_kind != "client_ip" or identity_value != remote_address
+        ):
+            checks.append((identity_kind, identity_value, route_limit["identity"]))
 
         allowed, retry_after, bucket_kind, bucket_key, limit_item = (
             _check_control_plane_limits(

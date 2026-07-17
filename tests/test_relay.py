@@ -56,6 +56,21 @@ def client():
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
     relay_module.api_v1_control_tombstones.clear()
+    for limiter in app.extensions.get("limiter", set()):
+        storage = getattr(getattr(limiter, "limiter", None), "storage", None)
+        if storage is None:
+            continue
+        if hasattr(storage, "reset"):
+            storage.reset()
+        elif hasattr(storage, "clear"):
+            storage.clear()
+    control_plane_limiter = app.config.get("relay_control_plane_rate_limiter")
+    control_plane_storage = getattr(control_plane_limiter, "storage", None)
+    if control_plane_storage is not None:
+        if hasattr(control_plane_storage, "reset"):
+            control_plane_storage.reset()
+        elif hasattr(control_plane_storage, "clear"):
+            control_plane_storage.clear()
 
     with app.test_client() as client:
         yield client
@@ -77,6 +92,21 @@ def client():
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
     relay_module.api_v1_control_tombstones.clear()
+    for limiter in app.extensions.get("limiter", set()):
+        storage = getattr(getattr(limiter, "limiter", None), "storage", None)
+        if storage is None:
+            continue
+        if hasattr(storage, "reset"):
+            storage.reset()
+        elif hasattr(storage, "clear"):
+            storage.clear()
+    control_plane_limiter = app.config.get("relay_control_plane_rate_limiter")
+    control_plane_storage = getattr(control_plane_limiter, "storage", None)
+    if control_plane_storage is not None:
+        if hasattr(control_plane_storage, "reset"):
+            control_plane_storage.reset()
+        elif hasattr(control_plane_storage, "clear"):
+            control_plane_storage.clear()
 
 
 def test_operational_endpoints_are_not_rate_limited_by_public_quota(client):
@@ -2396,7 +2426,8 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
     )
     assert queued.status_code == 200
 
-    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-long-running']
+    pending_entry = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-long-running']
+    queued_at = pending_entry['queued_at'] if isinstance(pending_entry, dict) else pending_entry
     monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 300.0)
     monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 299.0)
 
@@ -3559,6 +3590,7 @@ def _api_v1_response_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_K
 
 def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):
     monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
@@ -3568,7 +3600,9 @@ def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeyp
     queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-expired-late-response'))
     assert queued.status_code == 200
     original_time = time.time
+    original_monotonic = time.monotonic
     monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 2.0)
 
     response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload('req-expired-late-response'))
 
@@ -3809,14 +3843,8 @@ def test_api_v1_cancel_only_clears_matching_client_in_flight_entry(client):
 
 def test_api_v1_pending_ttl_cleanup_runs_without_retrieve(client, monkeypatch):
     monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
-    known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY,
-        'last_ping': datetime.now(),
-        'last_ping_duration': 60,
-        relay_module.API_V1_SERVER_MARKER: True,
-    }
     request_id = 'req-cleanup-without-retrieve'
-    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    client_pending_request_ids.setdefault(DUMMY_CLIENT_PUB_KEY, {})[request_id] = time.time()
     original_time = time.time
     monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
 
@@ -3965,6 +3993,51 @@ def test_expire_stale_pending_requests_uses_deadline_index_for_legacy_float_entr
     assert terminal['status'] == 'expired'
 
 
+def test_pending_entry_deadline_is_authoritative_over_legacy_ttl(monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    future_deadline = time.monotonic() + 30.0
+    assert relay_module._pending_request_entry_is_expired(
+        {'queued_at': time.time() - 3600, 'request_deadline_monotonic': future_deadline},
+        now=time.time(),
+    ) is False
+
+
+def test_pending_entry_uses_deadline_even_when_legacy_ttl_disabled(monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 0.0)
+    assert relay_module._pending_request_entry_is_expired(
+        {'queued_at': time.time(), 'request_deadline_monotonic': time.monotonic() - 0.1},
+    ) is True
+
+
+def test_api_v1_request_deadline_seconds_rejects_non_finite_and_hard_clamps(monkeypatch):
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV, 'nan')
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV, 'inf')
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '999999')
+    assert relay_module._api_v1_request_deadline_seconds() == relay_module.HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS
+
+
+def test_api_v1_poll_drops_expired_queue_head_and_dispatches_next(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-expired-head')).status_code == 200
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-valid-next')).status_code == 200
+    queued = client_inference_requests[DUMMY_SERVER_PUB_KEY]
+    queued[0]['_request_deadline_monotonic'] = time.monotonic() - 1.0
+    queued[1]['_request_deadline_monotonic'] = time.monotonic() + 30.0
+
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == 'req-valid-next'
+    expired_terminal = relay_module._get_terminal_request(DUMMY_CLIENT_PUB_KEY, 'req-expired-head')
+    assert expired_terminal is not None
+    assert expired_terminal['status'] == 'expired'
+
+
 def test_api_v1_absolute_deadline_expiry_rejects_late_response(client, monkeypatch):
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
@@ -4015,6 +4088,17 @@ def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, 
 
     assert control.status_code == 200
     assert control.get_json()['status'] == 'expired'
+
+
+def test_api_v1_control_next_poll_seconds_has_positive_floor(client, monkeypatch):
+    monkeypatch.setenv(relay_module.API_V1_POLL_WAIT_SECONDS_ENV, '0')
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    control_payload = server_payload | {'control_credential': register.get_json()['control_credential']}
+    assert register.status_code == 200
+    response = client.post('/api/v1/relay/servers/control', json=control_payload | {'request_id': 'missing'})
+    assert response.status_code == 200
+    assert response.get_json()['next_poll_seconds'] >= 1.0
 
 
 def test_api_v1_queued_cancellation_and_old_client_compatibility(client):

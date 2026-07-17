@@ -12,6 +12,7 @@ Request body:
 {
   "server_public_key": "registered compute node public key",
   "request_id": "opaque relay request id",
+  "control_credential": "owner-bound opaque credential from initial register response",
   "acknowledge": false
 }
 ```
@@ -20,7 +21,9 @@ Request body:
 
 ## Authentication and ownership
 
-The route reuses the compute-node registration control-plane authentication (`X-Relay-Server-Token` when the relay is configured with registration tokens) and requires the `server_public_key` to be currently registered as an API v1 compute node. A successful active or terminal state is visible only to the exact registered compute server that owns the in-flight request. Polls for another server's request fail closed as `completed/unavailable`; they do not reveal cancellation state, ciphertext, client keys, cancel proofs, prompts, payloads, or model output.
+The route reuses the compute-node registration control-plane authentication (`X-Relay-Server-Token` when the relay is configured with registration tokens) and also requires an exact-owner `control_credential` proof. Registration returns this opaque credential only when first created; the relay stores only its digest bound to the exact `server_public_key`, and re-registration does not disclose or rotate an existing credential. This owner proof is required even when shared registration tokens are disabled.
+
+A successful active or terminal state is visible only to the exact owner credential bound to the request. Polls for another server's request fail closed as `completed/unavailable`; they do not reveal cancellation state, ciphertext, client keys, cancel proofs, prompts, payloads, or model output.
 
 ## Response states
 
@@ -31,7 +34,7 @@ Responses are JSON and intentionally bounded to control state:
 - `expired`: the authoritative relay deadline elapsed.
 - `completed/unavailable`: the relay has no owner-visible active or terminal tombstone for this server/request pair.
 
-The response may include `request_ttl_seconds` and `request_deadline_remaining_seconds`. These are relative values for backward compatibility and privacy; compute nodes must not treat a lease renewal as an extension of the absolute request deadline. `next_poll_seconds` is a bounded hint only.
+The response may include `request_ttl_seconds` and `request_deadline_remaining_seconds`. These are relative values for backward compatibility and privacy; compute nodes must not treat a lease renewal as an extension of the absolute request deadline. `next_poll_seconds` is a bounded positive hint only.
 
 ## Deadline and lease behavior
 
@@ -41,4 +44,4 @@ A valid active control poll may renew only the in-flight accounting lease for th
 
 ## Privacy-safe observability
 
-Metrics count bounded control states (`active`, `cancelled`, `expired`, `acknowledged`, `completed_unavailable`, and `lease_renewed`) without request ids, ciphertext, client keys, cancel proofs, prompts, responses, or payload contents.
+Metrics count bounded control request states (`active`, `cancelled`, `expired`, `acknowledged`, `completed_unavailable`) plus a separate lease-renewal counter, without request ids, ciphertext, client keys, cancel proofs, prompts, responses, or payload contents.

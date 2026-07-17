@@ -388,3 +388,27 @@ def test_main_check_manifest_only_success_and_error(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(prep.sys, 'argv', ['prepare', '--manifest', str(bad), '--check-manifest-only'])
     assert prep.main() == 1
     assert 'windows embedded runtime preparation failed' in capsys.readouterr().err
+
+
+def test_production_manifest_includes_llama_direct_dependency_closure(tmp_path):
+    m = prep.load_manifest(prep.MANIFEST)
+    required = m['required_packages']
+    wheels = {artifact['package']: artifact for artifact in m['python_package_wheels']}
+
+    typing_wheel = wheels['typing-extensions']
+    assert required['typing-extensions'] == '4.15.0'
+    assert typing_wheel == {
+        'package': 'typing-extensions',
+        'version': '4.15.0',
+        'filename': 'typing_extensions-4.15.0-py3-none-any.whl',
+        'url': 'https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl',
+        'sha256': 'f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548',
+    }
+
+    requirements = tmp_path / 'requirements.txt'
+    lines = prep.write_hash_requirements(requirements, m)
+    assert 'typing-extensions==4.15.0 --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548' in lines
+
+    llama_direct_dependencies = {'diskcache', 'Jinja2', 'numpy', 'typing-extensions'}
+    assert llama_direct_dependencies <= set(required)
+    assert llama_direct_dependencies <= set(wheels)

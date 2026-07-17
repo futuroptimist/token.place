@@ -1185,7 +1185,6 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "llama_module_path_present": bool(llama_module_identity_from_path(probe.llama_module_path)),
         "backend": probe.backend,
         "gpu_offload_supported": probe.gpu_offload_supported,
-        "llama_module_path": probe.llama_module_path,
         "constructor_kwarg_support": dict(probe.constructor_kwarg_support),
         "constructor_has_var_kwargs": probe.constructor_has_var_kwargs,
         "constructor_signature_inspectable": probe.constructor_signature_inspectable,
@@ -1205,29 +1204,17 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     }
 
 
-_PRIVATE_RUNTIME_PROBE_ACTIONS = frozenset(
-    {
-        "already_supported",
-        "metal_already_supported",
-        "installed_cuda_reexec",
-        "installed_metal_reexec",
-    }
-)
-_INVALID_RUNTIME_MODULE_PATH_VALUES = frozenset({"missing", "unknown"})
-
-
 def _private_runtime_probe_payload(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the private env handoff payload, keeping module_path only for valid runtime results."""
+    """Return the private env handoff payload without raw module paths."""
 
     payload = dict(result)
-    action = str(payload.get("runtime_action") or "").strip().lower()
-    module_path = str(payload.get("llama_module_path") or "").strip()
-    if (
-        action not in _PRIVATE_RUNTIME_PROBE_ACTIONS
-        or not module_path
-        or module_path in _INVALID_RUNTIME_MODULE_PATH_VALUES
-    ):
-        payload.pop("llama_module_path", None)
+    identity_supplied = "llama_module_identity" in payload
+    if not identity_supplied:
+        module_path = str(payload.get("llama_module_path") or "").strip()
+        identity = llama_module_identity_from_path(module_path)
+        if identity:
+            payload["llama_module_identity"] = identity
+    payload.pop("llama_module_path", None)
     return payload
 
 

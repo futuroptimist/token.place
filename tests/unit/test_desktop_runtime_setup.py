@@ -2213,7 +2213,7 @@ def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializabl
         ('already_supported', 'unknown'),
     ],
 )
-def test_record_desktop_runtime_probe_keeps_module_path_private_only_for_valid_success(
+def test_record_desktop_runtime_probe_keeps_module_path_identity_only(
     monkeypatch,
     runtime_action,
     module_path,
@@ -2248,9 +2248,14 @@ def test_record_desktop_runtime_probe_private_payload_accepts_reexec_success(mon
     public = desktop_runtime_setup._record_desktop_runtime_probe(result)
     private = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
 
+    expected_identity = desktop_runtime_setup.llama_module_identity_from_path(result['llama_module_path'])
+    serialized_env = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
     assert 'llama_module_path' not in public
+    assert 'llama_module_path' not in private
+    assert result['llama_module_path'] not in serialized_env
+    assert private['llama_module_identity'] == expected_identity
     assert public['yarn_rope_supported'] == 'true'
-    assert private['llama_module_path'] == result['llama_module_path']
     assert private['yarn_rope_supported'] is True
 
 
@@ -2270,10 +2275,17 @@ def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tm
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
     recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
 
+    expected_identity = desktop_runtime_setup.llama_module_identity_from_path(
+        'C:/Python/Lib/site-packages/llama_cpp/__init__.py'
+    )
+    serialized_env = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
     assert result['runtime_action'] == 'already_supported'
     assert result['selected_backend'] == 'cuda'
     assert 'llama_module_path' not in result
-    assert recorded['llama_module_path'] == 'C:/Python/Lib/site-packages/llama_cpp/__init__.py'
+    assert 'llama_module_path' not in recorded
+    assert 'C:/Python/Lib/site-packages/llama_cpp/__init__.py' not in serialized_env
+    assert recorded['llama_module_identity'] == expected_identity
 
 
 def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monkeypatch, tmp_path):

@@ -1,6 +1,8 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1500;
+const COMPUTE_NODE_COUNT_FAST_POLL_INTERVAL_MS = 1500;
+const COMPUTE_NODE_COUNT_STEADY_POLL_INTERVAL_MS = 15000;
+const COMPUTE_NODE_COUNT_FAST_POLL_WINDOW_MS = 10000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -39,16 +41,17 @@ new Vue({
         computeNodeCount: null,
         computeNodeCountStatus: 'loading',
         computeNodeCountLastUpdated: '',
-        computeNodeCountPoller: null,
         computeNodeCountRequestId: 0,
         computeNodeCountRefreshInFlight: false,
-        computeNodeCountPollTimeout: null
+        computeNodeCountPollTimeout: null,
+        computeNodeCountFastPollUntil: 0
     },
     mounted() {
         this.detectTouchInput();
         this.selectedContextTier = this.loadStoredContextTier();
         this.fetchModels();
         this.generateClientKeys();
+        this.startComputeNodeCountFastPolling();
         this.refreshComputeNodeCount();
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
@@ -56,12 +59,6 @@ new Vue({
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
-    },
-    beforeDestroy() {
-        this.clearComputeNodeCountPoller();
-        if (typeof document !== 'undefined') {
-            document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
-        }
     },
     computed: {
         computeNodeCountLabel() {
@@ -116,7 +113,22 @@ new Vue({
             }
         },
 
-        scheduleComputeNodeCountRefresh(delayMs = COMPUTE_NODE_COUNT_POLL_INTERVAL_MS) {
+        startComputeNodeCountFastPolling() {
+            this.computeNodeCountFastPollUntil = Date.now() + COMPUTE_NODE_COUNT_FAST_POLL_WINDOW_MS;
+        },
+
+        getComputeNodeCountPollDelay() {
+            if (Date.now() < this.computeNodeCountFastPollUntil) {
+                return COMPUTE_NODE_COUNT_FAST_POLL_INTERVAL_MS;
+            }
+            return COMPUTE_NODE_COUNT_STEADY_POLL_INTERVAL_MS;
+        },
+
+        scheduleComputeNodeCountRefresh(delayMs = null) {
+            const nextDelayMs = delayMs === null ? this.getComputeNodeCountPollDelay() : delayMs;
+            if (this.computeNodeCountRefreshInFlight) {
+                return;
+            }
             this.clearComputeNodeCountPoller();
             if (typeof document !== 'undefined' && document.hidden) {
                 return;
@@ -124,7 +136,7 @@ new Vue({
             this.computeNodeCountPollTimeout = setTimeout(() => {
                 this.computeNodeCountPollTimeout = null;
                 this.refreshComputeNodeCount();
-            }, Math.max(0, delayMs));
+            }, Math.max(0, nextDelayMs));
         },
 
         handleComputeNodeCountVisibilityChange() {
@@ -132,6 +144,7 @@ new Vue({
                 this.clearComputeNodeCountPoller();
                 return;
             }
+            this.startComputeNodeCountFastPolling();
             this.scheduleComputeNodeCountRefresh(0);
         },
 
@@ -1372,9 +1385,9 @@ new Vue({
         }
     },
     beforeDestroy() {
-        if (this.computeNodeCountPoller) {
-            clearInterval(this.computeNodeCountPoller);
-            this.computeNodeCountPoller = null;
+        this.clearComputeNodeCountPoller();
+        if (typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }
         if (!Array.isArray(this.chatHistory)) {
             return;

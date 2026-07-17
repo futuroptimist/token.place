@@ -83,14 +83,23 @@ def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeou
     started = time.monotonic()
     deadline = started + timeout_seconds
     last_count: int | None = None
+    last_error: Exception | None = None
     while time.monotonic() < deadline:
-        last_count = fetch_relay_diagnostics_count(relay_url)
+        try:
+            last_count = fetch_relay_diagnostics_count(relay_url)
+            last_error = None
+        except Exception as exc:  # pragma: no cover - depends on transient relay timing
+            last_error = exc
+            time.sleep(0.1)
+            continue
         if last_count == expected_count:
             return time.monotonic() - started
         time.sleep(0.1)
     raise AssertionError(
-        f"expected relay diagnostics compute-node count {expected_count}, got {last_count}"
+        f"expected relay diagnostics compute-node count {expected_count}, "
+        f"got {last_count}; last_error={last_error}"
     )
+
 
 def wait_for_port(
     host: str,

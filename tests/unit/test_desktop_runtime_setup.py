@@ -3668,3 +3668,21 @@ def test_packaged_identity_inline_fallback_is_covered_without_utils(
     assert module._valid_llama_module_identity(good) == good
     assert module._valid_llama_module_identity('sha256:' + 'A' * 64) is None
     assert module._valid_llama_module_identity(123) is None
+
+
+def test_macos_bundled_runtime_probe_failure_is_fatal_for_auto(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'arm64')
+
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'auto',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'fallback_reason': 'immutable bundled GPU runtime probe failed',
+        },
+    )
+
+    assert message is not None
+    assert 'desktop macOS launch' in message
+    assert 'action=bundled_runtime_probe_failed' in message

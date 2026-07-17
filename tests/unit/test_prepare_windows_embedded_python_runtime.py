@@ -143,3 +143,85 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     assert ':all:' in baseline_cmd
     assert '--prefer-binary' in baseline_cmd
     assert 'alpha==1.0' in baseline_cmd
+
+
+def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path):
+    artifact = tmp_path / 'artifact.bin'
+    artifact.write_bytes(b'token-place')
+    digest = prep.sha256_file(artifact)
+    assert digest == '68e80e55363cd61ec4d038a99d2705886d56de5a93793e48ad4824f2c45104f0'
+
+    with pytest.raises(prep.RuntimePrepError, match='GitHub HTTPS'):
+        prep.fetch('https://example.com/runtime.tar.gz', digest, artifact)
+
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/example/runtime.tar.gz', 'f' * 64, artifact)
+
+
+def test_load_manifest_rejects_wrong_schema_wheel_flavor_and_architecture(tmp_path):
+    path = tmp_path / 'manifest.json'
+
+    write_manifest(path, manifest(schema_version=2))
+    with pytest.raises(prep.RuntimePrepError, match='schema_version'):
+        prep.load_manifest(path)
+
+    bad_wheel = dict(manifest()['llama_cpp_cuda_wheel'])
+    bad_wheel['name'] = 'llama_cpp_python-0.3.32-py3-none-win_arm64.whl'
+    write_manifest(path, manifest(llama_cpp_cuda_wheel=bad_wheel))
+    with pytest.raises(prep.RuntimePrepError, match='wheel name'):
+        prep.load_manifest(path)
+
+    bad_flavor = dict(manifest()['llama_cpp_cuda_wheel'])
+    bad_flavor['flavor'] = 'cpu'
+    write_manifest(path, manifest(llama_cpp_cuda_wheel=bad_flavor))
+    with pytest.raises(prep.RuntimePrepError, match='version/flavor'):
+        prep.load_manifest(path)
+
+    write_manifest(path, manifest(expected_architecture='ARM64'))
+    with pytest.raises(prep.RuntimePrepError, match='architecture must be AMD64'):
+        prep.load_manifest(path)
+
+
+def _write_wheel(path: Path, *, metadata: str, wheel_text: str, include_dll: bool = True) -> None:
+    import zipfile
+
+    with zipfile.ZipFile(path, 'w') as zf:
+        zf.writestr('llama_cpp_python-0.3.32.dist-info/METADATA', metadata)
+        zf.writestr('llama_cpp_python-0.3.32.dist-info/WHEEL', wheel_text)
+        if include_dll:
+            zf.writestr('llama_cpp/lib/llama.dll', b'dll')
+
+
+def test_validate_wheel_rejects_metadata_tag_and_native_runtime_mismatches(tmp_path):
+    m = manifest()
+    wheel = tmp_path / m['llama_cpp_cuda_wheel']['name']
+
+    _write_wheel(wheel, metadata='Name: other\nVersion: 0.3.32\n', wheel_text='Tag: py3-none-win_amd64\n')
+    with pytest.raises(prep.RuntimePrepError, match='package name mismatch'):
+        prep.validate_wheel(wheel, m)
+
+    _write_wheel(wheel, metadata='Name: llama-cpp-python\nVersion: 0.3.31\n', wheel_text='Tag: py3-none-win_amd64\n')
+    with pytest.raises(prep.RuntimePrepError, match='version mismatch'):
+        prep.validate_wheel(wheel, m)
+
+    _write_wheel(wheel, metadata='Name: llama-cpp-python\nVersion: 0.3.32\n', wheel_text='Tag: py3-none-win_arm64\n')
+    with pytest.raises(prep.RuntimePrepError, match='wheel tag'):
+        prep.validate_wheel(wheel, m)
+
+    _write_wheel(wheel, metadata='Name: llama-cpp-python\nVersion: 0.3.32\n', wheel_text='Tag: py3-none-win_amd64\n', include_dll=False)
+    with pytest.raises(prep.RuntimePrepError, match='llama.dll'):
+        prep.validate_wheel(wheel, m)
+
+
+def test_write_provenance_records_windows_x86_64_runtime_contract(tmp_path):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    m = manifest(required_native_dlls=['llama.dll', 'python311.dll'])
+
+    prep.write_provenance(runtime, m)
+
+    payload = json.loads((runtime / prep.PROVENANCE).read_text(encoding='utf-8'))
+    assert payload['target_triple'] == 'x86_64-pc-windows-msvc'
+    assert payload['llama_cpp_cuda_wheel']['name'].endswith('win_amd64.whl')
+    assert payload['expected_backend'] == 'cuda'
+    assert payload['required_native_dlls'] == ['llama.dll', 'python311.dll']

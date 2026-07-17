@@ -615,9 +615,8 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
         status.stop_cleanup_required = payload.get("unregister_required").and_then(Value::as_bool);
     }
     if payload.get("unregister_attempted").is_some() {
-        status.stop_cleanup_attempted = payload
-            .get("unregister_attempted")
-            .and_then(Value::as_bool);
+        status.stop_cleanup_attempted =
+            payload.get("unregister_attempted").and_then(Value::as_bool);
     }
     if payload.get("unregister_outcome").is_some() {
         status.stop_cleanup_outcome = payload
@@ -1484,6 +1483,33 @@ pub async fn start_compute_node(
     Ok(())
 }
 
+async fn wait_for_stop_cleanup_ack(
+    state: &ComputeNodeState,
+    expected_session_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let status = state.status.lock().await;
+            if status.operator_session_id.as_deref() == Some(expected_session_id)
+                && status.stop_cleanup_outcome.is_some()
+            {
+                return;
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::cmp::min(
+            Duration::from_millis(25),
+            deadline.saturating_duration_since(now),
+        ))
+        .await;
+    }
+}
+
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     let (stop_session_id, stop_log_file_path) = {
         let status = state.status.lock().await;
@@ -1535,6 +1561,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     }
 
     let mut bridge_killed = false;
+    let had_child = owned_child.is_some();
     if let Some(mut child) = owned_child {
         let shutdown_deadline = Duration::from_secs(12);
         let shutdown_started = Instant::now();
@@ -1588,9 +1615,19 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
+    if had_child && !bridge_killed {
+        if let Some(expected_session_id) = stop_session_id.as_deref() {
+            wait_for_stop_cleanup_ack(&state, expected_session_id, Duration::from_millis(750))
+                .await;
+        }
+    }
+
     let stop_outcome_error = {
         let status = state.status.lock().await.clone();
-        let session_matches = match (stop_session_id.as_deref(), status.operator_session_id.as_deref()) {
+        let session_matches = match (
+            stop_session_id.as_deref(),
+            status.operator_session_id.as_deref(),
+        ) {
             (Some(expected), Some(actual)) => expected == actual,
             _ => true,
         };
@@ -2400,7 +2437,6 @@ mod tests {
         assert!(!final_status.registered);
     }
 
-
     #[cfg(not(windows))]
     #[tokio::test]
     async fn stop_compute_node_waits_for_bounded_bridge_cleanup() {
@@ -2429,7 +2465,10 @@ mod tests {
         let started = Instant::now();
         let stop_result =
             tokio::time::timeout(Duration::from_secs(5), stop_compute_node(state.clone())).await;
-        assert!(stop_result.is_ok(), "stop should allow slow cleanup without timing out");
+        assert!(
+            stop_result.is_ok(),
+            "stop should allow slow cleanup without timing out"
+        );
         stop_result
             .expect("timeout result")
             .expect("stop should succeed");
@@ -2513,11 +2552,49 @@ mod tests {
         let error = stop_compute_node(state.clone())
             .await
             .expect_err("partial cleanup should return an error");
-        assert!(
-            error
-                .to_string()
-                .contains("Operator stopped locally, but unregister did not complete")
-        );
+        assert!(error
+            .to_string()
+            .contains("Operator stopped locally, but unregister did not complete"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_waits_for_event_reader_cleanup_ack_after_exit() {
+        let state = ComputeNodeState::default();
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.operator_session_id = Some("session-current".into());
+            status.stop_cleanup_outcome = None;
+        }
+
+        let event_reader_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            let mut status = event_reader_state.status.lock().await;
+            status.operator_session_id = Some("session-current".into());
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
+        });
+
+        stop_compute_node(state.clone())
+            .await
+            .expect("delayed cleanup ack should be accepted");
+        assert!(state.status.lock().await.last_error.is_none());
     }
 
     #[cfg(not(windows))]
@@ -2545,11 +2622,9 @@ mod tests {
         let error = stop_compute_node(state.clone())
             .await
             .expect_err("missing cleanup ack should return an error");
-        assert!(
-            error
-                .to_string()
-                .contains("Operator stopped locally, but unregister did not complete")
-        );
+        assert!(error
+            .to_string()
+            .contains("Operator stopped locally, but unregister did not complete"));
     }
 
     #[test]

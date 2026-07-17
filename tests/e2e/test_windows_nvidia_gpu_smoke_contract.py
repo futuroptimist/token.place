@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import importlib.util
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 MODULE_PATH = (
@@ -166,6 +168,64 @@ class _FakeProcess:
         self.terminated = True
         self.returncode = -9
 
+
+
+def test_load_compute_runtime_diagnostics_forwards_context_tier(monkeypatch, tmp_path):
+    model_path = tmp_path / 'model.gguf'
+    calls: dict[str, object] = {}
+
+    fake_manager = SimpleNamespace(model_path=None)
+
+    def fake_ensure(mode, *, context_tier):
+        calls['runtime_setup'] = (mode, context_tier)
+        return {'runtime_action': 'already_supported'}
+
+    def fake_apply_mode(manager, mode):
+        calls['mode'] = (manager, mode)
+
+    def fake_apply_context(manager, context_tier):
+        calls['context'] = (manager, context_tier)
+        manager.context_tier = context_tier
+
+    def fake_get_manager():
+        calls['manager_requested'] = True
+        return fake_manager
+
+    def fake_compute_diagnostics(manager):
+        calls['diagnostics_manager'] = manager
+        return {'context_tier': getattr(manager, 'context_tier', None)}
+
+    fake_manager.get_llm_instance = lambda: calls.setdefault('loaded_after_context', fake_manager.context_tier)
+
+    monkeypatch.setitem(
+        sys.modules,
+        'desktop_runtime_setup',
+        SimpleNamespace(ENABLE_BOOTSTRAP_ENV='TOKEN_PLACE_DESKTOP_RUNTIME_BOOTSTRAP', ensure_desktop_llama_runtime=fake_ensure),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        'utils.compute_node_runtime',
+        SimpleNamespace(apply_compute_mode=fake_apply_mode, compute_mode_diagnostics=fake_compute_diagnostics),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        'utils.context_profiles',
+        SimpleNamespace(apply_context_profile=fake_apply_context),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        'utils.llm.model_manager',
+        SimpleNamespace(get_model_manager=fake_get_manager),
+    )
+
+    diagnostics = windows_gpu_smoke._load_compute_runtime_diagnostics(str(model_path), 'gpu', '64k-full')
+
+    assert calls['runtime_setup'] == ('gpu', '64k-full')
+    assert calls['mode'] == (fake_manager, 'gpu')
+    assert calls['context'] == (fake_manager, '64k-full')
+    assert calls['loaded_after_context'] == '64k-full'
+    assert diagnostics['context_tier'] == '64k-full'
+    assert diagnostics['runtime_setup'] == {'runtime_action': 'already_supported'}
 
 def test_run_bridge_ignores_provisioning_started_and_cancels_after_ready(monkeypatch, tmp_path):
     repo_root = _make_repo_root_with_bootstrap(tmp_path)

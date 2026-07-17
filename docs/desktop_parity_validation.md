@@ -17,7 +17,7 @@ The architectural source of truth is [Desktop operator parity contract](architec
 | Area | Windows CUDA expectation | macOS Metal expectation | CPU fallback expectation | Evidence to capture |
 | --- | --- | --- | --- | --- |
 | GPU runtime availability | CUDA-capable `llama-cpp-python` is installed or repaired for `auto`/`cuda`/GPU modes. | Metal-capable `llama-cpp-python` is installed or repaired for `auto`/`metal`/GPU modes. | Explicit `cpu` mode skips GPU bootstrap and reports CPU cleanly. | `verify_desktop_runtime.py` output and bridge `started` event fields. |
-| Dependency isolation | Desktop imports resolve from the desktop target/import root and never from user site packages or repo-local shims. | Same isolation inside `.app/Contents/Resources`. | Same isolation for CPU-only installs. | Packaged bridge e2e, `llama_module_path`, `interpreter`, `prefix`, and import-root diagnostics. |
+| Dependency isolation | Desktop imports resolve from the desktop target/import root and never from user site packages or repo-local shims. | Same isolation inside `.app/Contents/Resources`. | Same isolation for CPU-only installs. | Packaged bridge e2e, private runtime-origin checks, `interpreter`, `prefix`, and import-root diagnostics. |
 | Packaged resource resolution | Packaged app resolves the shared bridge, model bridge, runtime setup, requirements, and config files. | `.app/Contents/Resources` resolves the same shared files and launcher paths. | Same paths remain valid without GPU libraries. | `test_packaged_operator_e2e.py` logs. |
 | Warm-load before register | Bridge warms the relay-processing runtime before API v1 registration. | Same sequence. | Same sequence. | Bridge logs contain `model_init.ready` with `reason=pre_registration` before `api_v1_e2ee.register`. |
 | Relay registration | Registered only after warm-load and runtime readiness. | Same behavior. | Same behavior when CPU runtime is explicitly ready. | `/relay/diagnostics` and bridge status show `registered: true`. |
@@ -58,7 +58,7 @@ Do not make production two-node or round-robin claims until both Windows and mac
 - Packaged Apple Silicon releases use the bundled Python runtime; Command Line Tools are development-only and not an end-user prerequisite.
 - Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
-- Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. The runtime setup/status payload should show `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `llama_module_path`, `runtime_action`, and any pip/CMake tails from provisioning.
+- Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. Public runtime setup/status payloads should show safe fields such as `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `runtime_action`, safe origin booleans/categories, and any bounded pip/CMake tails from provisioning. Absolute `llama_module_path` values stay private to the internal runtime handoff and must not be copied into bridge events or public diagnostics.
 - If the bundled runtime is missing or invalid in a packaged app, reinstall token.place desktop or use a newer release; do not ask end users to install Python or Xcode Command Line Tools.
 
 ### Backend field meanings
@@ -225,7 +225,7 @@ When Start operator fails on macOS, capture:
 2. The **Operator debug log** path shown in the UI.
 3. The first `desktop.compute_node.session.start` and
    `desktop.compute_node.session.layout` lines.
-4. Any `desktop_runtime_setup`, `llama_module_path`, `interpreter`, `prefix`,
+4. Any public `desktop_runtime_setup`, runtime-origin, `interpreter`, `prefix`,
    `metal`, `llama_cpp`, `model_init`, registration, unregister, cancel, or
    bridge stderr lines from the log.
 

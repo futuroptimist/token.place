@@ -229,8 +229,8 @@ It prints:
   `runtime_install` or `cuda_build`, `runtime_verification`, optional `reexec`,
   `model_preflight`, `warm_load`, and ready/registered status. Long phases emit safe heartbeats
   at least every 5 seconds; a fast path may skip build/reexec while a repair path includes them.
-  Absolute module paths remain private: public payloads expose only safe origin booleans/categories,
-  while the helper verifies runtime origin internally. Fake-CUDA CI is not evidence of a successful
+  Absolute module paths remain private in bridge/runtime status: public payloads expose only safe origin booleans/categories,
+  while the helper verifies runtime origin internally and does not require public `llama_module_path`. Fake-CUDA CI is not evidence of a successful
   real Windows 11 NVIDIA run; use the command above for the packaged staging validation.
 
 ## Packaged operator debug logs

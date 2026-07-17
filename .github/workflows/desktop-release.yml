@@ -36,7 +36,7 @@ jobs:
             checksum_file: SHA256SUMS-macos-arm64.txt
           - os: windows-latest
             artifact_name: windows-x64-bundles
-            tauri_target: ''
+            tauri_target: x86_64-pc-windows-msvc
             checksum_file: SHA256SUMS-windows-x64.txt
     runs-on: ${{ matrix.os }}
     defaults:
@@ -406,8 +406,8 @@ jobs:
               exit 1
             fi
           elif [ "${{ runner.os }}" = "Windows" ]; then
-            nsis_dir="src-tauri/target/release/bundle/nsis"
-            msi_dir="src-tauri/target/release/bundle/msi"
+            nsis_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/nsis"
+            msi_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/msi"
 
             setup_files=("${nsis_dir}"/*-setup.exe)
             if [ ! -e "${setup_files[0]}" ]; then

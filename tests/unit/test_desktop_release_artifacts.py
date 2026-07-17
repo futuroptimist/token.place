@@ -1006,6 +1006,15 @@ def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime(
     assert 'test "$(uname -m)" = "arm64"' in workflow
 
 
+def test_release_workflow_uses_explicit_windows_x86_64_target_and_bundle_paths() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert "tauri_target: x86_64-pc-windows-msvc" in workflow
+    assert "npm run tauri build -- --target ${{ matrix.tauri_target }}" in workflow
+    assert "src-tauri/target/${{ matrix.tauri_target }}/release/bundle/nsis" in workflow
+    assert "src-tauri/target/${{ matrix.tauri_target }}/release/bundle/msi" in workflow
+    assert "aarch64-pc-windows-msvc" not in workflow
+
+
 def test_release_workflow_installs_pytest_before_macos_probe() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     install_index = workflow.index('- name: Install macOS validation test dependencies')

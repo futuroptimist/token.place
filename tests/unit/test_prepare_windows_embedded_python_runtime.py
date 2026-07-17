@@ -52,6 +52,30 @@ def test_load_manifest_requires_target_triple(tmp_path):
         prep.load_manifest(path)
 
 
+
+def test_load_manifest_requires_exact_windows_x86_64_target(tmp_path):
+    path = tmp_path / 'manifest.json'
+    write_manifest(path, manifest(target_triple='aarch64-pc-windows-msvc'))
+
+    with pytest.raises(prep.RuntimePrepError, match='x86_64-pc-windows-msvc'):
+        prep.load_manifest(path)
+
+
+def test_normalizes_vendor_neutral_windows_x86_64_architectures(monkeypatch):
+    assert prep.normalize_windows_x86_64_arch('AMD64') == 'x86_64'
+    assert prep.normalize_windows_x86_64_arch('x64') == 'x86_64'
+    assert prep.normalize_windows_x86_64_arch('x86-64') == 'x86_64'
+    monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
+    prep.validate_host_architecture()
+
+
+def test_rejects_windows_arm64_host_without_cpu_vendor_checks(monkeypatch):
+    monkeypatch.setattr(prep.platform, 'machine', lambda: 'ARM64')
+
+    with pytest.raises(prep.RuntimePrepError, match='x86-64 host'):
+        prep.validate_host_architecture()
+
+
 def test_safe_extract_tar_rejects_prefix_escape_and_links(tmp_path):
     archive = tmp_path / 'bad.tar.gz'
     with tarfile.open(archive, 'w:gz') as tf:

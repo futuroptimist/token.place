@@ -2,7 +2,7 @@
 """Prepare the deterministic Windows x86-64 CPython/CUDA runtime for Tauri."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -26,6 +26,7 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     missing=required-set(m)
     if missing: raise RuntimePrepError(f"windows runtime manifest missing keys: {sorted(missing)}")
     if m["schema_version"] != 1: raise RuntimePrepError("unsupported windows runtime manifest schema_version")
+    if m.get("target_triple") != "x86_64-pc-windows-msvc": raise RuntimePrepError("windows runtime target_triple must be x86_64-pc-windows-msvc")
     wheel=m["llama_cpp_cuda_wheel"]
     if wheel.get("name") != "llama_cpp_python-0.3.32-py3-none-win_amd64.whl": raise RuntimePrepError("unexpected llama-cpp-python wheel name")
     if wheel.get("version") != "0.3.32" or wheel.get("flavor") != "cu124": raise RuntimePrepError("unexpected llama-cpp-python CUDA wheel version/flavor")
@@ -50,6 +51,8 @@ def safe_extract_tar(archive: Path, dest: Path) -> None:
         for member in tf.getmembers():
             if member.issym() or member.islnk():
                 raise RuntimePrepError("archive member links are not allowed")
+            if member.isdev() or member.isfifo():
+                raise RuntimePrepError("archive member devices are not allowed")
             target=(dest/member.name).resolve()
             if not target.is_relative_to(base):
                 raise RuntimePrepError("archive member escapes destination")
@@ -82,7 +85,18 @@ def write_provenance(runtime: Path, m: dict) -> None:
     }
     (runtime/PROVENANCE).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
 
+def normalize_windows_x86_64_arch(machine: str) -> str:
+    arch=machine.strip().lower().replace('-', '_')
+    if arch in {"amd64", "x64", "x86_64"}:
+        return "x86_64"
+    return arch
+
+def validate_host_architecture() -> None:
+    if normalize_windows_x86_64_arch(platform.machine()) != "x86_64":
+        raise RuntimePrepError("windows embedded runtime preparation requires an x86-64 host")
+
 def prepare(m: dict) -> None:
+    validate_host_architecture()
     cache=ROOT/'.cache'/'windows-python-runtime'
     archive=fetch(m['archive_url'], m['sha256'], cache/Path(m['archive_url'].split('/')[-1].replace('%2B','+')).name)
     wheel_meta=m['llama_cpp_cuda_wheel']

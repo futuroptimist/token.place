@@ -869,10 +869,11 @@ class RelayClient:
     # Enforced in UTF-8 bytes so multi-byte payloads are bounded by transport size
     # while exact runtime token admission remains the only context-fit authority.
     _API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES = 512 * 1024
-    # API v1 no longer enforces an aggregate character ceiling; keep the
-    # legacy diagnostic field explicit as null instead of reporting a byte
-    # limit under a character-oriented name.
-    _API_V1_MAX_TOTAL_REQUEST_CHARS = None
+    # API v1 no longer enforces this legacy aggregate character ceiling; keep
+    # the conservative value only for the backward-compatible
+    # maximum_total_content_chars diagnostic. UTF-8 bytes below are the sole
+    # pre-tokenization abuse/transport ceiling.
+    _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192

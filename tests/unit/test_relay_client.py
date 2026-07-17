@@ -4684,6 +4684,43 @@ def test_api_v1_rejects_unpaired_surrogates_before_utf8_byte_counting():
     assert block_result.code == "compute_node_invalid_request"
     assert block_result.reason == "invalid_content"
 
+    input_text_block_result = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "bad surrogate: \ud800"}],
+            }
+        ]
+    )
+    assert input_text_block_result.valid is False
+    assert input_text_block_result.code == "compute_node_invalid_request"
+    assert input_text_block_result.reason == "invalid_content"
+
+
+def test_api_v1_unpaired_surrogate_full_path_fails_closed_without_plaintext(caplog):
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    sentinel = "PRIVATE_SURROGATE_SENTINEL"
+
+    with caplog.at_level("ERROR", logger="relay_client"):
+        envelope = client._generate_api_v1_response_with_runtime_model(
+            request_id="req-invalid-surrogate",
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": sentinel + "\ud800"}],
+            options={},
+        )
+
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_invalid_request"
+    assert error["message"] == "Invalid chat message format"
+    assert sentinel not in json.dumps(error)
+    assert sentinel not in caplog.text
+    assert "invalid_content" in caplog.text
+    manager.runtime.render_and_tokenize_chat.assert_not_called()
+    manager.runtime.apply_chat_template.assert_not_called()
+    manager.runtime.tokenize.assert_not_called()
+    manager.runtime.create_chat_completion.assert_not_called()
+
 
 def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(caplog):
     manager = _ApiV1RuntimeManager()
@@ -4708,7 +4745,7 @@ def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(cap
     assert error["code"] == "compute_node_request_too_large"
     assert error["type"] == "validation_error"
     assert error["message_count"] == 1
-    assert error["maximum_total_content_chars"] is None
+    assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
     assert error["total_content_utf8_bytes"] > RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     assert error["maximum_total_content_utf8_bytes"] == RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     assert error["retryable"] is False
@@ -4837,15 +4874,17 @@ def _admission_envelope(client, manager, content, *, options=None, requested_tie
     )
 
 
-def _large_natural_language_payload(target_chars=248 * 1024):
+def _large_natural_language_payload(target_bytes=248 * 1024):
     sentence = (
-        "A calm deterministic paragraph describes relay-safe token admission, "
-        "context windows, and neutral validation behavior for repeatable tests. "
+        b"A calm deterministic paragraph describes relay-safe token admission, "
+        b"context windows, and neutral validation behavior for repeatable tests. "
     )
-    repeats = (target_chars // len(sentence)) + 1
-    payload = (sentence * repeats)[:target_chars]
+    repeats = (target_bytes // len(sentence)) + 1
+    payload_bytes = (sentence * repeats)[:target_bytes]
+    payload = payload_bytes.decode("ascii")
+    assert len(payload_bytes) == target_bytes
     assert 240 * 1024 <= len(payload.encode("utf-8")) <= 260 * 1024
-    assert len(payload) > 131072
+    assert len(payload) > RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
     return payload
 
 

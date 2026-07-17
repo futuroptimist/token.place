@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import socket
@@ -70,6 +71,26 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
         time.sleep(0.25)
     raise RuntimeError(f"timeout waiting for {url}: {last_error}")
 
+
+
+def fetch_relay_diagnostics_count(relay_url: str) -> int:
+    with urlopen(f"{relay_url}/relay/diagnostics", timeout=2) as response:  # nosec B310
+        payload = json.loads(response.read().decode("utf-8"))
+    return int(payload["total_api_v1_registered_compute_nodes"])
+
+
+def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeout_seconds: float) -> float:
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_count: int | None = None
+    while time.monotonic() < deadline:
+        last_count = fetch_relay_diagnostics_count(relay_url)
+        if last_count == expected_count:
+            return time.monotonic() - started
+        time.sleep(0.1)
+    raise AssertionError(
+        f"expected relay diagnostics compute-node count {expected_count}, got {last_count}"
+    )
 
 def wait_for_port(
     host: str,
@@ -462,6 +483,7 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
+    env["TOKENPLACE_RELAY_API_V1_LEASE_SECONDS"] = "120"
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
         f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
@@ -562,6 +584,7 @@ def main() -> int:
             "//strong[starts-with(normalize-space(), 'yes')]"
         )
         wait.until(lambda d: d.find_element(By.XPATH, registered_ready_xpath))
+        wait_for_relay_diagnostics_count(relay_url, 1, timeout_seconds=5.0)
 
         prompt = driver.find_element(
             By.XPATH,
@@ -590,6 +613,26 @@ def main() -> int:
                 f"Last error contains forbidden marker `{marker}`: {last_error_text}"
             )
         assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
+
+        driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
+        stop_to_diagnostics_seconds = wait_for_relay_diagnostics_count(
+            relay_url, 0, timeout_seconds=2.0
+        )
+        operator_log = read_tail(relay_log) + read_tail(driver_log)
+        assert "desktop.compute_node_bridge.unregister.attempted" in operator_log
+        assert "desktop.compute_node_bridge.unregister.succeeded" in operator_log
+        assert "desktop.compute_node.bridge_kill_requested" not in operator_log
+
+        driver.get(relay_url)
+        landing_started = time.monotonic()
+        WebDriverWait(driver, 4).until(
+            lambda d: "Live compute nodes: 0" in d.page_source
+        )
+        print(
+            "desktop_operator_stop_latency "
+            f"stop_to_diagnostics_seconds={stop_to_diagnostics_seconds:.3f} "
+            f"diagnostics_to_widget_seconds={time.monotonic() - landing_started:.3f}"
+        )
     except TimeoutException as exc:
         raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc
     except AssertionError as exc:

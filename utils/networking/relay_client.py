@@ -1020,6 +1020,7 @@ class RelayClient:
         self._last_api_v1_work_relay_url: Optional[str] = None
         self._api_v1_registered_relays: Set[str] = set()
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
+        self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._unregister_attempted = False
         self._unregister_complete = False
         self._api_v1_heartbeat_lock = threading.Lock()
@@ -1107,15 +1108,19 @@ class RelayClient:
                     refreshed_lease = self._normalise_positive_seconds(
                         response.get("next_ping_in_x_seconds"), lease
                     )
-                    relay_wait_hints[candidate_url] = {
-                        "next_ping_in_x_seconds": refreshed_lease,
-                        "poll_wait_seconds": self._normalise_poll_wait_seconds(
-                            response.get("poll_wait_seconds", refreshed_lease)
-                        ),
-                        "server_public_key": self.crypto_manager.public_key_b64,
-                    }
-                    self._api_v1_registered_relays.add(candidate_url)
-                    self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
+                    if (
+                        not self._api_v1_heartbeat_stop.is_set()
+                        and not getattr(self, "_polling_stopped_by_request", False)
+                    ):
+                        relay_wait_hints[candidate_url] = {
+                            "next_ping_in_x_seconds": refreshed_lease,
+                            "poll_wait_seconds": self._normalise_poll_wait_seconds(
+                                response.get("poll_wait_seconds", refreshed_lease)
+                            ),
+                            "server_public_key": self.crypto_manager.public_key_b64,
+                        }
+                        self._api_v1_registered_relays.add(candidate_url)
+                        self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                     log_info(
                         "server.heartbeat.background relay={} lease_seconds={} key_fingerprint={}",
                         _sanitize_relay_target(candidate_url),
@@ -1492,6 +1497,12 @@ class RelayClient:
                     **request_kwargs,
                 )
 
+                if getattr(self, "_polling_stopped_by_request", False):
+                    return {
+                        'error': 'Relay polling stopped',
+                        'next_ping_in_x_seconds': 0,
+                        'poll_wait_seconds': 0,
+                    }
                 if response.status_code != 200:
                     log_error(
                         "Error from relay /sink: status {} ({} bytes)",
@@ -2012,6 +2023,12 @@ class RelayClient:
                             'poll_wait_seconds': poll_wait,
                         }
                     raise
+                if getattr(self, "_polling_stopped_by_request", False):
+                    return {
+                        'error': 'Relay polling stopped',
+                        'next_ping_in_x_seconds': 0,
+                        'poll_wait_seconds': 0,
+                    }
                 if response.status_code != 200:
                     if response.status_code == 404:
                         self._api_v1_registered_relays.discard(candidate_url)

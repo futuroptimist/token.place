@@ -583,6 +583,43 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
     assert "Updated" in status.inner_text()
 
 
+
+def test_compute_node_count_auto_refreshes_after_unregister(page: Page, base_url: str, setup_servers):
+    """Landing page should automatically refresh diagnostics from 1 to 0 within the SLA."""
+    counts = iter([1, 0])
+    latest_count = {"value": 0}
+    calls = {"count": 0}
+
+    def handle_diagnostics(route):
+        calls["count"] += 1
+        try:
+            latest_count["value"] = next(counts)
+        except StopIteration:
+            pass
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": latest_count["value"],
+                    "total_api_v1_registered_compute_nodes": latest_count["value"],
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
+
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=2500,
+    )
+    assert calls["count"] >= 2
+
+
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
     """Older diagnostics responses should not overwrite newer compute-node counts."""
     first_route = {}

@@ -655,6 +655,46 @@ class TestRelayClient:
         assert client._api_v1_last_heartbeat_at == {}
         assert client._api_v1_relay_wait_hints == {}
 
+
+    def test_stopped_heartbeat_response_does_not_resurrect_after_unregister(self, relay_client):
+        """An in-flight heartbeat must not repopulate local registration after Stop/unregister."""
+
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
+        relay_client._api_v1_relay_wait_hints[relay_client.relay_url] = {
+            "next_ping_in_x_seconds": 1,
+            "poll_wait_seconds": 1,
+            "server_public_key": relay_client.crypto_manager.public_key_b64,
+        }
+
+        heartbeat_entered = threading.Event()
+        allow_heartbeat_return = threading.Event()
+
+        def delayed_register(candidate_url):
+            assert candidate_url == relay_client.relay_url
+            heartbeat_entered.set()
+            assert allow_heartbeat_return.wait(timeout=2)
+            return {"next_ping_in_x_seconds": 120, "poll_wait_seconds": 1}
+
+        relay_client.register_api_v1_compute_node = delayed_register
+        heartbeat_thread = threading.Thread(target=relay_client._api_v1_heartbeat_worker)
+        heartbeat_thread.start()
+        assert heartbeat_entered.wait(timeout=2)
+
+        relay_client.stop_polling = True
+        relay_client._polling_stopped_by_request = True
+        relay_client._api_v1_heartbeat_stop.set()
+        relay_client._api_v1_registered_relays.clear()
+        relay_client._api_v1_last_heartbeat_at.clear()
+        relay_client._api_v1_relay_wait_hints.clear()
+        allow_heartbeat_return.set()
+        heartbeat_thread.join(timeout=2)
+
+        assert not heartbeat_thread.is_alive()
+        assert relay_client._api_v1_registered_relays == set()
+        assert relay_client._api_v1_last_heartbeat_at == {}
+        assert relay_client._api_v1_relay_wait_hints == {}
+
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_uses_registration_token(
         self,

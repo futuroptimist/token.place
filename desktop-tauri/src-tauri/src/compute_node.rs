@@ -21,7 +21,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -1479,11 +1479,10 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     }
 
     if let Some(mut child) = owned_child {
+        let shutdown_deadline = Duration::from_secs(12);
+        let shutdown_started = Instant::now();
         let mut exited = child.try_wait()?.is_some();
-        for _ in 0..20 {
-            if exited {
-                break;
-            }
+        while !exited && shutdown_started.elapsed() < shutdown_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             exited = child.try_wait()?.is_some();
         }
@@ -2297,6 +2296,48 @@ mod tests {
         assert!(
             state.stdin.lock().await.is_none(),
             "stdin handle should be cleared"
+        );
+
+        let final_status = state.status.lock().await.clone();
+        assert!(!final_status.running);
+        assert!(!final_status.registered);
+    }
+
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_waits_for_bounded_bridge_cleanup() {
+        let state = ComputeNodeState::default();
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; [ \"$line\" = '{\"type\":\"cancel\"}' ] && sleep 2",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn slow cleanup bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+        }
+
+        let started = Instant::now();
+        let stop_result =
+            tokio::time::timeout(Duration::from_secs(5), stop_compute_node(state.clone())).await;
+        assert!(stop_result.is_ok(), "stop should allow slow cleanup without timing out");
+        stop_result
+            .expect("timeout result")
+            .expect("stop should succeed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "stop should wait for the bridge cleanup outcome instead of killing after one second"
         );
 
         let final_status = state.status.lock().await.clone();

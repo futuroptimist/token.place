@@ -756,6 +756,7 @@
                 <tr><td><code>POST /api/v1/relay/servers/register</code></td><td>Compute node registration and heartbeat lease setup.</td></tr>
                 <tr><td><code>POST /api/v1/relay/servers/unregister</code></td><td>Compute node self-unregister with relay registration authentication.</td></tr>
                 <tr><td><code>POST /api/v1/relay/servers/poll</code></td><td>Compute node long-poll for the next encrypted workload envelope.</td></tr>
+                <tr><td><code>POST /api/v1/relay/requests/control</code></td><td>Authenticated owner-only compute control poll for in-flight request status, deadline TTL, and lease renewal.</td></tr>
                 <tr><td><code>POST /api/v1/relay/requests/cancel</code></td><td>Client request cancellation with a requester proof token.</td></tr>
                 <tr><td><code>POST /api/v1/relay/responses</code></td><td>Compute node stores an encrypted response envelope for client retrieval.</td></tr>
             </tbody>

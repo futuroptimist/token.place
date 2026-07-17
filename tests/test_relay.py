@@ -3986,6 +3986,37 @@ def test_api_v1_absolute_deadline_expiry_rejects_late_response(client, monkeypat
     assert late_response.get_json()['error']['code'] == 'expired'
 
 
+
+def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, monkeypatch):
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+    control_payload = server_payload | {'control_credential': register.get_json()['control_credential']}
+    request_id = 'req-expiry-ack-race'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    in_flight_entry = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
+    in_flight_entry['request_deadline_monotonic'] = time.monotonic() - 1.0
+    in_flight_entry['expires_at'] = time.monotonic() + 60.0
+    original_mark_terminal = relay_module._mark_request_terminal
+
+    def mark_terminal_and_ack_tombstone(*args, **kwargs):
+        result = original_mark_terminal(*args, **kwargs)
+        relay_module.api_v1_control_tombstones.pop(
+            relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id),
+            None,
+        )
+        return result
+
+    monkeypatch.setattr(relay_module, '_mark_request_terminal', mark_terminal_and_ack_tombstone)
+
+    control = client.post('/api/v1/relay/servers/control', json=control_payload | {'request_id': request_id})
+
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'expired'
+
+
 def test_api_v1_queued_cancellation_and_old_client_compatibility(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,

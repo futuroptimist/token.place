@@ -2947,6 +2947,12 @@ def api_v1_relay_servers_control():
                                 deadline_monotonic=deadline_monotonic,
                             )
                             _mark_request_terminal(client_public_key, request_id, status='expired', reason='provider_timeout')
+                            _record_compute_control_state("expired")
+                            return jsonify({
+                                'status': 'expired',
+                                'next_poll_seconds': min(_api_v1_poll_wait_seconds(), API_V1_CONTROL_NEXT_POLL_MAX_SECONDS),
+                                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
+                            }), 200
                         else:
                             lease_deadline = min(
                                 now + lease_seconds,

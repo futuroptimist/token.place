@@ -4565,23 +4565,65 @@ def test_api_v1_invalid_messages_are_rejected_before_worker(messages):
 
 
 def test_api_v1_large_messages_reach_structural_validation_boundaries():
-    limit = RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    limit = RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
 
-    for length in (32769, 65536, limit):
+    for length in (32769, 65536, 131073, limit):
         messages = [{"role": "user", "content": "x" * length}]
         result = RelayClient._validate_api_v1_chat_messages(messages)
         assert result.valid is True
         assert RelayClient._messages_are_valid_api_v1_chat(messages) is True
         assert result.total_content_chars == length
+        assert result.total_content_utf8_bytes == length
 
     too_large = RelayClient._validate_api_v1_chat_messages(
         [{"role": "user", "content": "x" * (limit + 1)}]
     )
     assert too_large.valid is False
     assert too_large.code == "compute_node_request_too_large"
+    assert too_large.total_content_utf8_bytes == limit + 1
     assert RelayClient._messages_are_valid_api_v1_chat(
         [{"role": "user", "content": "x" * (limit + 1)}]
     ) is False
+
+
+def test_api_v1_abuse_ceiling_uses_utf8_bytes_for_blocks_and_unicode():
+    limit = RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+
+    exact_blocks = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a" * (limit // 2)},
+                    {"type": "input_text", "text": "b" * (limit - (limit // 2))},
+                ],
+            }
+        ]
+    )
+    assert exact_blocks.valid is True
+    assert exact_blocks.total_content_utf8_bytes == limit
+
+    one_over_blocks = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a" * (limit // 2)},
+                    {"type": "input_text", "text": "b" * (limit - (limit // 2) + 1)},
+                ],
+            }
+        ]
+    )
+    assert one_over_blocks.code == "compute_node_request_too_large"
+    assert one_over_blocks.total_content_utf8_bytes == limit + 1
+
+    multibyte = "雪" * ((limit // len("雪".encode("utf-8"))) + 1)
+    unicode_result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": multibyte}]
+    )
+    assert unicode_result.code == "compute_node_request_too_large"
+    assert unicode_result.total_content_chars < limit
+    assert unicode_result.total_content_utf8_bytes > limit
 
 
 def test_api_v1_text_blocks_use_aggregate_limit_without_lower_message_cap():
@@ -4646,10 +4688,15 @@ def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(cap
     assert error["type"] == "validation_error"
     assert error["message_count"] == 1
     assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert error["total_content_utf8_bytes"] > RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+    assert error["maximum_total_content_utf8_bytes"] == RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     assert error["retryable"] is False
     assert distinctive_text not in json.dumps(error)
     assert distinctive_text not in caplog.text
     assert "aggregate_content_too_large" in caplog.text
+    manager.runtime.render_and_tokenize_chat.assert_not_called()
+    manager.runtime.apply_chat_template.assert_not_called()
+    manager.runtime.tokenize.assert_not_called()
     manager.runtime.create_chat_completion.assert_not_called()
 
 
@@ -4767,6 +4814,114 @@ def _admission_envelope(client, manager, content, *, options=None, requested_tie
         options=options or {},
         requested_context_tier=requested_tier or manager.context_tier,
     )
+
+
+def _large_natural_language_payload(target_bytes=248 * 1024):
+    sentence = (
+        "A calm deterministic paragraph describes relay-safe token admission, "
+        "context windows, and neutral validation behavior for repeatable tests. "
+    )
+    repeats = (target_bytes // len(sentence.encode("utf-8"))) + 1
+    payload = (sentence * repeats)[:target_bytes]
+    assert 240 * 1024 <= len(payload.encode("utf-8")) <= 260 * 1024
+    assert len(payload) > 131072
+    return payload
+
+
+class _QwenLikeAdmissionRuntime(_AdmissionRuntime):
+    def __init__(self, prompt_tokens):
+        super().__init__()
+        self.prompt_tokens = prompt_tokens
+        self.render_and_tokenize_calls = []
+
+    def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        self.render_and_tokenize_calls.append(
+            {
+                "messages": messages,
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+                "kwargs": kwargs,
+            }
+        )
+        return {"prompt_tokens": self.prompt_tokens}
+
+
+class _QwenLikeAdmissionManager(_AdmissionManager):
+    api_model_id = "qwen3-8b-instruct"
+
+    def __init__(self, *, tier, window, prompt_tokens):
+        super().__init__(tier=tier, window=window, default_max_tokens=512)
+        self.model_profile = {
+            "provider": "qwen",
+            "thinking_mode": "disabled",
+            "profile_id": "qwen3-8b-q4-k-m",
+        }
+        self.runtime = _QwenLikeAdmissionRuntime(prompt_tokens)
+
+
+def _qwen_large_payload_envelope(manager, payload):
+    client = _api_v1_validation_client(manager)
+    return client._generate_api_v1_response_with_runtime_model(
+        request_id="req-large-qwen",
+        model_id="qwen3-8b-instruct",
+        messages=[{"role": "user", "content": payload}],
+        options={"max_tokens": 512, "stream": False},
+        requested_context_tier=manager.context_tier,
+    )
+
+
+def test_api_v1_242kb_prompt_passes_abuse_validation_for_exact_admission():
+    payload = _large_natural_language_payload()
+
+    result = RelayClient._validate_api_v1_chat_messages([{"role": "user", "content": payload}])
+
+    assert result.valid is True
+    assert result.total_content_chars == len(payload)
+    assert result.total_content_utf8_bytes == len(payload.encode("utf-8"))
+    assert result.total_content_utf8_bytes > 131072
+    assert result.total_content_utf8_bytes < RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+
+
+def test_api_v1_large_qwen_prompt_reaches_exact_64k_admission_and_completes():
+    payload = _large_natural_language_payload()
+    manager = _QwenLikeAdmissionManager(tier="64k-full", window=65536, prompt_tokens=55229)
+
+    envelope = _qwen_large_payload_envelope(manager, payload)
+
+    assert manager.runtime.render_and_tokenize_calls
+    assert 55229 + 512 <= manager.context_window_tokens
+    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
+    assert "error" not in envelope["api_v1_response"]
+    assert manager.runtime.calls
+    assert manager.runtime.calls[-1]["max_tokens"] == 512
+
+
+def test_api_v1_large_qwen_prompt_reaches_8k_admission_before_context_rejection():
+    payload = _large_natural_language_payload()
+    manager = _QwenLikeAdmissionManager(tier="8k-fast", window=8192, prompt_tokens=55229)
+
+    envelope = _qwen_large_payload_envelope(manager, payload)
+
+    assert manager.runtime.render_and_tokenize_calls
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 55229
+    assert error["requested_output_tokens"] == 512
+    assert error["required_total_tokens"] == 55741
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_large_qwen_prompt_exact_64k_overflow_uses_context_error():
+    payload = _large_natural_language_payload()
+    manager = _QwenLikeAdmissionManager(tier="64k-full", window=65536, prompt_tokens=65025)
+
+    envelope = _qwen_large_payload_envelope(manager, payload)
+
+    assert manager.runtime.render_and_tokenize_calls
+    error = envelope["api_v1_response"]["error"]
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["required_total_tokens"] == 65537
+    assert manager.runtime.calls == []
 
 
 def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():

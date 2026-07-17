@@ -231,6 +231,21 @@ jobs:
           test -x src-tauri/python-runtime/bin/python3
           src-tauri/python-runtime/bin/python3 -m pip check
 
+      - name: Cache embedded Windows Python archive and wheels
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/token-place/embedded-python
+          key: embedded-python-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt') }}
+
+      - name: Prepare embedded Windows Python runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python scripts/prepare_windows_embedded_python_runtime.py
+          src-tauri\python-runtime\python.exe -m pip check
+
       - name: Build frontend assets
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
         # before Tauri's internal beforeBuildCommand hook on clean runners.

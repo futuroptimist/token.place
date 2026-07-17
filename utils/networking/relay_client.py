@@ -36,6 +36,8 @@ class _ApiV1ChatValidationResult(NamedTuple):
     message_index: Optional[int] = None
     message_content_chars: Optional[int] = None
     total_content_chars: int = 0
+    message_content_utf8_bytes: Optional[int] = None
+    total_content_utf8_bytes: int = 0
 
 
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
@@ -864,7 +866,9 @@ class RelayClient:
     _API_V1_MAX_MESSAGES = 64
     _API_V1_MAX_TEXT_BLOCKS = 32
     # Aggregate plaintext abuse/transport safety ceiling, not a token estimate.
-    _API_V1_MAX_TOTAL_REQUEST_CHARS = 131072
+    # Exact rendered-template token admission remains the sole context-fit authority.
+    _API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES = 512 * 1024
+    _API_V1_MAX_TOTAL_REQUEST_CHARS = _API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
     _API_V1_MAX_STOP_SEQUENCES = 16
     _API_V1_MAX_STOP_CHARS = 256
     _API_V1_MAX_TOKENS_LIMIT = 8192
@@ -2253,6 +2257,7 @@ class RelayClient:
                 message_count,
             )
         total_content_chars = 0
+        total_content_utf8_bytes = 0
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
                 return _ApiV1ChatValidationResult(
@@ -2262,6 +2267,7 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
             allowed_keys = {"role", "content", "name"}
             if set(message) - allowed_keys:
@@ -2272,6 +2278,7 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
             role = message.get("role")
             if (
@@ -2285,6 +2292,7 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
             name = message.get("name")
             if name is not None and (not isinstance(name, str) or len(name) > 128):
@@ -2295,6 +2303,7 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
             if "content" not in message:
                 return _ApiV1ChatValidationResult(
@@ -2304,9 +2313,12 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
-            content_size = cls._api_v1_content_validation_size(message.get("content"))
-            if content_size is None:
+            content_metrics = cls._api_v1_content_validation_metrics(
+                message.get("content")
+            )
+            if content_metrics is None:
                 return _ApiV1ChatValidationResult(
                     False,
                     "compute_node_invalid_request",
@@ -2314,22 +2326,28 @@ class RelayClient:
                     len(messages),
                     index,
                     total_content_chars=total_content_chars,
+                    total_content_utf8_bytes=total_content_utf8_bytes,
                 )
-            total_content_chars += content_size
-            if total_content_chars > cls._API_V1_MAX_TOTAL_REQUEST_CHARS:
+            content_chars, content_utf8_bytes = content_metrics
+            total_content_chars += content_chars
+            total_content_utf8_bytes += content_utf8_bytes
+            if total_content_utf8_bytes > cls._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES:
                 return _ApiV1ChatValidationResult(
                     False,
                     "compute_node_request_too_large",
                     "aggregate_content_too_large",
                     len(messages),
                     index,
-                    content_size,
+                    content_chars,
                     total_content_chars,
+                    content_utf8_bytes,
+                    total_content_utf8_bytes,
                 )
         return _ApiV1ChatValidationResult(
             True,
             message_count=len(messages),
             total_content_chars=total_content_chars,
+            total_content_utf8_bytes=total_content_utf8_bytes,
         )
 
     @classmethod
@@ -2340,7 +2358,9 @@ class RelayClient:
             (
                 "api_v1.chat_validation_rejected safe_error_code={} reason={} "
                 "message_count={} message_index={} message_content_chars={} "
-                "total_content_chars={} maximum_total_content_chars={}"
+                "total_content_chars={} maximum_total_content_chars={} "
+                "message_content_utf8_bytes={} total_content_utf8_bytes={} "
+                "maximum_total_content_utf8_bytes={}"
             ),
             result.code or "compute_node_invalid_request",
             result.reason or "unknown",
@@ -2353,6 +2373,13 @@ class RelayClient:
             ),
             result.total_content_chars,
             cls._API_V1_MAX_TOTAL_REQUEST_CHARS,
+            (
+                result.message_content_utf8_bytes
+                if result.message_content_utf8_bytes is not None
+                else "unknown"
+            ),
+            result.total_content_utf8_bytes,
+            cls._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES,
         )
 
     @classmethod
@@ -2367,6 +2394,8 @@ class RelayClient:
                 "message_count": result.message_count,
                 "total_content_chars": result.total_content_chars,
                 "maximum_total_content_chars": cls._API_V1_MAX_TOTAL_REQUEST_CHARS,
+                "total_content_utf8_bytes": result.total_content_utf8_bytes,
+                "maximum_total_content_utf8_bytes": cls._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES,
                 "retryable": False,
             }
         return {
@@ -2852,16 +2881,17 @@ class RelayClient:
         return True, None, None, normalised
 
     @classmethod
-    def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
+    def _api_v1_content_validation_metrics(cls, content: Any) -> Optional[Tuple[int, int]]:
         if isinstance(content, str):
-            return len(content)
+            return len(content), len(content.encode("utf-8"))
         if (
             not isinstance(content, list)
             or not content
             or len(content) > cls._API_V1_MAX_TEXT_BLOCKS
         ):
             return None
-        total = 0
+        total_chars = 0
+        total_utf8_bytes = 0
         for item in content:
             if not isinstance(item, dict) or set(item) - {"type", "text"}:
                 return None
@@ -2871,8 +2901,14 @@ class RelayClient:
             text = item.get("text")
             if not isinstance(text, str) or not text:
                 return None
-            total += len(text)
-        return total
+            total_chars += len(text)
+            total_utf8_bytes += len(text.encode("utf-8"))
+        return total_chars, total_utf8_bytes
+
+    @classmethod
+    def _api_v1_content_validation_size(cls, content: Any) -> Optional[int]:
+        metrics = cls._api_v1_content_validation_metrics(content)
+        return metrics[0] if metrics is not None else None
 
 
     @staticmethod

@@ -225,3 +225,120 @@ def test_write_provenance_records_windows_x86_64_runtime_contract(tmp_path):
     assert payload['llama_cpp_cuda_wheel']['name'].endswith('win_amd64.whl')
     assert payload['expected_backend'] == 'cuda'
     assert payload['required_native_dlls'] == ['llama.dll', 'python311.dll']
+
+def test_fetch_downloads_missing_github_artifact_and_safe_extracts_file(tmp_path, monkeypatch):
+    payload = b'downloaded-runtime'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+
+    class Response:
+        def __enter__(self):
+            return io.BytesIO(payload)
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda url, timeout: Response())
+
+    dest = tmp_path / 'cache' / 'runtime.tar.gz'
+    assert prep.fetch('https://github.com/example/runtime.tar.gz', digest, dest) == dest
+    assert dest.read_bytes() == payload
+
+    archive = tmp_path / 'good.tar.gz'
+    with tarfile.open(archive, 'w:gz') as tf:
+        data = b'ok'
+        info = tarfile.TarInfo('python/python.exe')
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    extract_to = tmp_path / 'extract'
+    prep.safe_extract_tar(archive, extract_to)
+    assert (extract_to / 'python' / 'python.exe').read_bytes() == data
+
+
+def test_safe_extract_tar_rejects_device_members(tmp_path):
+    archive = tmp_path / 'device.tar.gz'
+    with tarfile.open(archive, 'w:gz') as tf:
+        info = tarfile.TarInfo('python/device')
+        info.type = tarfile.CHRTYPE
+        tf.addfile(info)
+
+    with pytest.raises(prep.RuntimePrepError, match='devices are not allowed'):
+        prep.safe_extract_tar(archive, tmp_path / 'dest')
+
+
+def test_validate_wheel_rejects_wrong_filename_and_missing_metadata(tmp_path):
+    wrong = tmp_path / 'llama_cpp_python-0.3.32-py3-none-win_arm64.whl'
+    _write_wheel(wrong, metadata='Name: llama-cpp-python\nVersion: 0.3.32\n', wheel_text='Tag: py3-none-win_amd64\n')
+    with pytest.raises(prep.RuntimePrepError, match='wrong wheel filename'):
+        prep.validate_wheel(wrong, manifest())
+
+    missing_meta = tmp_path / manifest()['llama_cpp_cuda_wheel']['name']
+    import zipfile
+    with zipfile.ZipFile(missing_meta, 'w') as zf:
+        zf.writestr('llama_cpp_python-0.3.32.dist-info/WHEEL', 'Tag: py3-none-win_amd64\n')
+        zf.writestr('llama_cpp/lib/llama.dll', b'dll')
+    with pytest.raises(prep.RuntimePrepError, match='missing METADATA'):
+        prep.validate_wheel(missing_meta, manifest())
+
+
+def test_run_delegates_to_subprocess_with_fail_closed_defaults(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return 'completed'
+
+    monkeypatch.setattr(prep.subprocess, 'run', fake_run)
+
+    assert prep.run(['python.exe', '-V'], cwd='runtime') == 'completed'
+    assert calls == [(['python.exe', '-V'], {'check': True, 'text': True, 'capture_output': True, 'cwd': 'runtime'})]
+
+
+def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'
+    runtime_root.parent.mkdir(parents=True)
+    monkeypatch.setattr(prep, 'ROOT', tmp_path / 'desktop-tauri')
+    monkeypatch.setattr(prep, 'SRC_TAURI', tmp_path / 'desktop-tauri' / 'src-tauri')
+    monkeypatch.setattr(prep, 'OUTPUT', runtime_root)
+    monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
+    monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: tmp_path / ('wheel.whl' if url.endswith('.whl') else 'runtime.tar.gz'))
+    monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
+
+    def fake_extract_without_python(_archive, dest):
+        (dest / 'cpython').mkdir(parents=True)
+
+    monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_without_python)
+    with pytest.raises(prep.RuntimePrepError, match='archive missing python.exe'):
+        prep.prepare(manifest(expected_archive_root='cpython'))
+
+    def fake_extract_with_python(_archive, dest):
+        staged = dest / 'cpython'
+        staged.mkdir(parents=True)
+        (staged / 'python.exe').write_text('', encoding='utf-8')
+
+    class Result:
+        stdout = json.dumps({'version': [3, 10], 'machine': 'AMD64'})
+
+    monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_with_python)
+    monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: Result())
+    with pytest.raises(prep.RuntimePrepError, match='interpreter probe mismatch'):
+        prep.prepare(manifest(expected_archive_root='cpython'))
+
+    class GoodProbe:
+        stdout = json.dumps({'version': [3, 11], 'machine': 'AMD64'})
+
+    monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: GoodProbe())
+    with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
+        prep.prepare(manifest(expected_archive_root='cpython', required_native_dlls=['llama.dll']))
+
+
+def test_main_check_manifest_only_success_and_error(tmp_path, monkeypatch, capsys):
+    good = tmp_path / 'manifest.json'
+    write_manifest(good, manifest())
+    monkeypatch.setattr(prep.sys, 'argv', ['prepare', '--manifest', str(good), '--check-manifest-only'])
+    assert prep.main() == 0
+
+    bad = tmp_path / 'bad.json'
+    write_manifest(bad, manifest(schema_version=99))
+    monkeypatch.setattr(prep.sys, 'argv', ['prepare', '--manifest', str(bad), '--check-manifest-only'])
+    assert prep.main() == 1
+    assert 'windows embedded runtime preparation failed' in capsys.readouterr().err

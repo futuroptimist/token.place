@@ -1,6 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -40,6 +40,7 @@ new Vue({
         computeNodeCountStatus: 'loading',
         computeNodeCountLastUpdated: '',
         computeNodeCountPoller: null,
+        computeNodeCountRefreshInFlight: false,
         computeNodeCountRequestId: 0
     },
     mounted() {
@@ -47,10 +48,7 @@ new Vue({
         this.selectedContextTier = this.loadStoredContextTier();
         this.fetchModels();
         this.generateClientKeys();
-        this.refreshComputeNodeCount();
-        this.computeNodeCountPoller = setInterval(() => {
-            this.refreshComputeNodeCount();
-        }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
+        this.startComputeNodeCountPoller();
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
@@ -101,12 +99,45 @@ new Vue({
         }
     },
     methods: {
+        startComputeNodeCountPoller() {
+            const scheduleNext = () => {
+                if (this.computeNodeCountPoller) {
+                    clearTimeout(this.computeNodeCountPoller);
+                    this.computeNodeCountPoller = null;
+                }
+                this.computeNodeCountPoller = setTimeout(async () => {
+                    if (typeof document !== 'undefined' && document.hidden) {
+                        scheduleNext();
+                        return;
+                    }
+                    await this.refreshComputeNodeCount({ skipIfInFlight: true });
+                    scheduleNext();
+                }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
+            };
+            this.refreshComputeNodeCount({ skipIfInFlight: true });
+            scheduleNext();
+            if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+                document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
+            }
+        },
+
+        handleComputeNodeCountVisibilityChange() {
+            if (typeof document !== 'undefined' && !document.hidden) {
+                this.refreshComputeNodeCount({ skipIfInFlight: true });
+            }
+        },
+
         async refreshComputeNodeCount(options = {}) {
             // Failover capacity refreshes must be allowed to apply their own
             // successful diagnostics result even if the background poller starts
             // another request before they finish; otherwise a stale count of one
             // can incorrectly suppress probing for a newly registered replacement.
             const applySupersededSuccess = options && options.applySupersededSuccess === true;
+            const skipIfInFlight = options && options.skipIfInFlight === true;
+            if (skipIfInFlight && this.computeNodeCountRefreshInFlight) {
+                return false;
+            }
+            this.computeNodeCountRefreshInFlight = true;
             const requestId = this.computeNodeCountRequestId + 1;
             this.computeNodeCountRequestId = requestId;
 
@@ -148,6 +179,10 @@ new Vue({
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';
                 return false;
+            } finally {
+                if (requestId === this.computeNodeCountRequestId || !this.computeNodeCountRefreshInFlight) {
+                    this.computeNodeCountRefreshInFlight = false;
+                }
             }
         },
 
@@ -1333,8 +1368,11 @@ new Vue({
     },
     beforeDestroy() {
         if (this.computeNodeCountPoller) {
-            clearInterval(this.computeNodeCountPoller);
+            clearTimeout(this.computeNodeCountPoller);
             this.computeNodeCountPoller = null;
+        }
+        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }
         if (!Array.isArray(this.chatHistory)) {
             return;

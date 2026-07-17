@@ -22,6 +22,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const COMPUTE_NODE_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -1479,11 +1481,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     }
 
     if let Some(mut child) = owned_child {
+        let shutdown_deadline = tokio::time::Instant::now() + COMPUTE_NODE_BRIDGE_SHUTDOWN_TIMEOUT;
         let mut exited = child.try_wait()?.is_some();
-        for _ in 0..20 {
-            if exited {
-                break;
-            }
+        while !exited && tokio::time::Instant::now() < shutdown_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             exited = child.try_wait()?.is_some();
         }
@@ -2305,6 +2305,68 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_waits_for_bridge_cleanup_before_kill_deadline() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+        let completed_path = temp.path().join("cleanup-complete");
+        let log_path = temp.path().join("operator.log");
+        std::fs::write(&log_path, "").expect("create log");
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                r#"IFS= read -r line; printf '%s' "$line" > "$1"; sleep 2; printf done > "$2""#,
+                "sh",
+                observed_cancel_path
+                    .to_str()
+                    .expect("cancel path should be valid UTF-8"),
+                completed_path
+                    .to_str()
+                    .expect("completed path should be valid UTF-8"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn slow cleanup bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.operator_session_id = Some("slow-cleanup-session".into());
+            status.log_file_path = Some(log_path.to_string_lossy().into_owned());
+        }
+
+        let stop_result =
+            tokio::time::timeout(Duration::from_secs(5), stop_compute_node(state.clone())).await;
+        assert!(
+            stop_result.is_ok(),
+            "stop should honor bounded cleanup wait"
+        );
+        stop_result
+            .expect("timeout result")
+            .expect("stop should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&observed_cancel_path).expect("cancel message"),
+            r#"{"type":"cancel"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&completed_path).expect("cleanup marker"),
+            "done"
+        );
+        let log = std::fs::read_to_string(log_path).expect("operator log");
+        assert!(log.contains("desktop.compute_node.bridge_process_exited"));
+        assert!(log.contains("killed=false"));
+        assert!(!log.contains("desktop.compute_node.bridge_kill_requested"));
+    }
+
     #[tokio::test]
     async fn repeated_start_stop_start_does_not_leave_stale_child_handle() {
         let state = ComputeNodeState::default();

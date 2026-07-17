@@ -1104,6 +1104,15 @@ class RelayClient:
                     )
                     continue
                 if isinstance(response, dict) and not response.get("error"):
+                    if self._api_v1_heartbeat_stop.is_set() or getattr(
+                        self, "_polling_stopped_by_request", False
+                    ):
+                        log_info(
+                            "server.heartbeat.background_skipped relay={} reason=stop_requested key_fingerprint={}",
+                            _sanitize_relay_target(candidate_url),
+                            self._api_v1_public_key_fingerprint(self.crypto_manager.public_key_b64),
+                        )
+                        break
                     refreshed_lease = self._normalise_positive_seconds(
                         response.get("next_ping_in_x_seconds"), lease
                     )

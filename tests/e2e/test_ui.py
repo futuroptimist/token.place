@@ -525,11 +525,13 @@ def test_compute_node_status_keeps_first_paint_footprint_when_loading_label_is_b
 
 
 def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
-    """Landing page should render and refresh the relay diagnostics compute-node count."""
-    counts = iter([3, 5])
-    latest_count = {"value": 5}
+    """Landing page should automatically refresh the relay diagnostics compute-node count."""
+    counts = iter([1, 0])
+    latest_count = {"value": 0}
+    call_count = {"value": 0}
 
     def handle_diagnostics(route):
+        call_count["value"] += 1
         try:
             latest_count["value"] = next(counts)
         except StopIteration:
@@ -557,29 +559,30 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
             const status = document.querySelector('.compute-node-status');
             return Boolean(
                 status &&
-                status.textContent.includes('Live compute nodes: 3') &&
+                status.textContent.includes('Live compute nodes: 1') &&
                 status.textContent.includes('Updated')
             );
         }
         """
     )
-    assert "Live compute nodes: 3" in status.inner_text()
+    assert "Live compute nodes: 1" in status.inner_text()
     assert "Updated" in status.inner_text()
 
-    page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
     page.wait_for_function(
         """
         () => {
             const status = document.querySelector('.compute-node-status');
             return Boolean(
                 status &&
-                status.textContent.includes('Live compute nodes: 5') &&
+                status.textContent.includes('Live compute nodes: 0') &&
                 status.textContent.includes('Updated')
             );
         }
-        """
+        """,
+        timeout=2500,
     )
-    assert "Live compute nodes: 5" in status.inner_text()
+    assert call_count["value"] >= 2
+    assert "Live compute nodes: 0" in status.inner_text()
     assert "Updated" in status.inner_text()
 
 

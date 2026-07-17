@@ -6749,3 +6749,37 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
     assert "prompt" not in safe
     assert "token_ids" not in safe
     assert "SECRET_PROMPT" not in json.dumps(safe)
+
+
+def test_api_v1_in_flight_heartbeat_does_not_resurrect_after_stop():
+    relay_client = _api_v1_validation_client()
+    relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+    relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
+    relay_client._api_v1_relay_wait_hints = {
+        relay_client.relay_url: {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+    }
+    heartbeat_started = threading.Event()
+    release_heartbeat = threading.Event()
+
+    def register(url):
+        assert url == relay_client.relay_url
+        heartbeat_started.set()
+        assert release_heartbeat.wait(timeout=2.0)
+        return {"next_ping_in_x_seconds": 1, "poll_wait_seconds": 1}
+
+    relay_client.register_api_v1_compute_node = register
+    worker = threading.Thread(target=relay_client._api_v1_heartbeat_worker)
+    worker.start()
+    assert heartbeat_started.wait(timeout=1.0)
+
+    relay_client.stop_polling = True
+    relay_client._polling_stopped_by_request = True
+    relay_client._api_v1_heartbeat_stop.set()
+    relay_client._api_v1_registered_relays.clear()
+    relay_client._api_v1_last_heartbeat_at.clear()
+    release_heartbeat.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert relay_client._api_v1_registered_relays == set()
+    assert relay_client._api_v1_last_heartbeat_at == {}

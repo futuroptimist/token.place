@@ -4274,7 +4274,10 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
         requested_context_tier="64k-full",
     )
 
-    assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
+    assert envelope["api_v1_response"]["message"] == {
+        "role": "assistant",
+        "content": "ok",
+    }
     manager.runtime.create_chat_completion.assert_not_called()
     kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
     assert kwargs == {
@@ -4646,6 +4649,11 @@ def test_api_v1_oversize_request_returns_specific_safe_error_and_logs_counts(cap
     assert error["type"] == "validation_error"
     assert error["message_count"] == 1
     assert error["maximum_total_content_chars"] == RelayClient._API_V1_MAX_TOTAL_REQUEST_CHARS
+    assert (
+        error["maximum_total_content_utf8_bytes"]
+        == RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+    )
+    assert error["total_content_utf8_bytes"] > error["maximum_total_content_utf8_bytes"]
     assert error["retryable"] is False
     assert distinctive_text not in json.dumps(error)
     assert distinctive_text not in caplog.text
@@ -4768,6 +4776,174 @@ def _admission_envelope(client, manager, content, *, options=None, requested_tie
         requested_context_tier=requested_tier or manager.context_tier,
     )
 
+
+def _neutral_ascii_payload_between_240kb_and_260kb():
+    sentence = (
+        "This neutral deterministic sentence describes ordinary validation behavior "
+        "without carrying private data or special tokenizer fixtures. "
+    )
+    target = 242 * 1024
+    payload = (sentence * ((target // len(sentence)) + 1))[:target]
+    assert 240 * 1024 <= len(payload.encode("utf-8")) <= 260 * 1024
+    assert len(payload) > 131072
+    return payload
+
+
+class _FixedTokenRuntime(_AdmissionRuntime):
+    def __init__(self, prompt_tokens):
+        super().__init__()
+        self.prompt_tokens = prompt_tokens
+        self.render_and_tokenize_calls = []
+
+    def render_and_tokenize_chat(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        self.render_and_tokenize_calls.append(
+            {"messages": messages, "template_kwargs": kwargs}
+        )
+        return {"prompt_tokens": self.prompt_tokens}
+
+    def apply_chat_template(
+        self, *args, **kwargs
+    ):  # pragma: no cover - bridge must be authoritative
+        raise AssertionError("parent render/tokenize fallback should not run")
+
+
+class _FixedTokenManager(_AdmissionManager):
+    def __init__(self, *, tier, window, prompt_tokens, default_max_tokens=512):
+        super().__init__(tier=tier, window=window, default_max_tokens=default_max_tokens)
+        self.runtime = _FixedTokenRuntime(prompt_tokens)
+
+
+def test_api_v1_240kb_natural_language_payload_passes_abuse_validation():
+    payload = _neutral_ascii_payload_between_240kb_and_260kb()
+
+    result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": payload}]
+    )
+
+    assert result.valid is True
+    assert result.total_content_chars == len(payload)
+    assert result.total_content_utf8_bytes == len(payload.encode("utf-8"))
+    assert (
+        result.total_content_utf8_bytes
+        <= RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+    )
+
+
+def test_api_v1_240kb_payload_reaches_authoritative_admission_on_64k_full():
+    payload = _neutral_ascii_payload_between_240kb_and_260kb()
+    manager = _FixedTokenManager(
+        tier="64k-full", window=65536, prompt_tokens=55229, default_max_tokens=512
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client, manager, payload, options={"max_tokens": 512}, requested_tier="64k-full"
+    )
+
+    assert manager.runtime.render_and_tokenize_calls
+    assert manager.runtime.calls
+    assert manager.runtime.calls[-1]["max_tokens"] == 512
+    assert envelope["api_v1_response"]["message"] == {
+        "role": "assistant",
+        "content": "ok",
+    }
+    assert "error" not in envelope["api_v1_response"]
+
+
+def test_api_v1_240kb_payload_uses_context_window_error_on_8k_fast():
+    payload = _neutral_ascii_payload_between_240kb_and_260kb()
+    manager = _FixedTokenManager(
+        tier="8k-fast", window=8192, prompt_tokens=55229, default_max_tokens=512
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client, manager, payload, options={"max_tokens": 512}, requested_tier="8k-fast"
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert manager.runtime.render_and_tokenize_calls
+    assert manager.runtime.calls == []
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["prompt_tokens"] == 55229
+    assert error["requested_output_tokens"] == 512
+    assert error["required_total_tokens"] == 55741
+
+
+def test_api_v1_64k_exact_admission_rejects_one_token_over_window():
+    manager = _FixedTokenManager(
+        tier="64k-full", window=65536, prompt_tokens=65025, default_max_tokens=512
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(
+        client,
+        manager,
+        "small request",
+        options={"max_tokens": 512},
+        requested_tier="64k-full",
+    )
+
+    error = envelope["api_v1_response"]["error"]
+    assert manager.runtime.render_and_tokenize_calls
+    assert manager.runtime.calls == []
+    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["required_total_tokens"] == 65537
+
+
+def test_api_v1_utf8_abuse_ceiling_boundaries_and_text_blocks():
+    limit = RelayClient._API_V1_MAX_TOTAL_MESSAGE_UTF8_BYTES
+
+    exact = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": "x" * limit}]
+    )
+    assert exact.valid is True
+    assert exact.total_content_utf8_bytes == limit
+
+    one_over = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": "x" * (limit + 1)}]
+    )
+    assert one_over.code == "compute_node_request_too_large"
+    assert one_over.total_content_utf8_bytes == limit + 1
+
+    blocks = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a" * (limit // 2)},
+                    {"type": "input_text", "text": "b" * (limit - (limit // 2))},
+                ],
+            }
+        ]
+    )
+    assert blocks.valid is True
+    assert blocks.total_content_utf8_bytes == limit
+
+    block_over = RelayClient._validate_api_v1_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a" * (limit // 2)},
+                    {"type": "text", "text": "b" * (limit - (limit // 2) + 1)},
+                ],
+            }
+        ]
+    )
+    assert block_over.code == "compute_node_request_too_large"
+
+    multibyte = "雪" * ((limit // len("雪".encode("utf-8"))) + 1)
+    multibyte_result = RelayClient._validate_api_v1_chat_messages(
+        [{"role": "user", "content": multibyte}]
+    )
+    assert len(multibyte) < limit
+    assert multibyte_result.code == "compute_node_request_too_large"
+    assert multibyte_result.total_content_utf8_bytes > limit
 
 def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():
     manager = _AdmissionManager(window=32)
@@ -5200,7 +5376,9 @@ def test_qwen_context_admission_preserves_messages_without_no_think_injection():
 
 def test_qwen_context_admission_uses_packaged_render_tokenize_bridge():
     class Runtime(_AdmissionRuntime):
-        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        def render_and_tokenize_chat(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
             self.calls.append({
                 'bridge': 'render_and_tokenize_chat',
                 'messages': messages,
@@ -5334,7 +5512,9 @@ def test_qwen_context_admission_fails_closed_when_fallback_render_rejects_enable
             super().__init__()
             self.render_calls = []
 
-        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        def render_and_tokenize_chat(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
             self.render_calls.append({'bridge': kwargs, 'messages': messages})
             return None
 
@@ -5385,7 +5565,9 @@ def test_api_v1_qwen_paths_never_send_enable_thinking_true():
             super().__init__()
             self.render_calls = []
 
-        def render_and_tokenize_chat(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        def render_and_tokenize_chat(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
             self.render_calls.append(kwargs)
             assert kwargs['enable_thinking'] is False
             return {'prompt_tokens': 7}

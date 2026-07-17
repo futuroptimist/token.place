@@ -234,6 +234,17 @@ def run_managed_dependency_target_reuse_probe(tmp_root: Path, *, resources_root:
     resources_root = resources_root or (tmp_root / "resources")
     managed_target = tmp_root / "C_drive\\Users\\TokenPlace\\managed-dependencies"
     counter_path = tmp_root / "pip-call-count.txt"
+    bundled_runtime = resources_root / "python-runtime"
+    bundled_runtime.mkdir(parents=True, exist_ok=True)
+    (bundled_runtime / "python.exe").write_text("placeholder", encoding="utf-8")
+    (bundled_runtime / "embedded_python_runtime_provenance.json").write_text(
+        json.dumps({"runtime_id": "bundled-cpython-3.11-win-x86_64-cu124", "target_triple": "x86_64-pc-windows-msvc"}),
+        encoding="utf-8",
+    )
+    for name in ("psutil", "requests", "dotenv", "cryptography"):
+        package_dir = managed_target / name
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
     env = _packaged_env(
         tmp_root,
         resources_root,
@@ -246,6 +257,8 @@ import sys
 sys.path.insert(0, {str(resources_root / 'python')!r})
 counter = pathlib.Path({str(counter_path)!r})
 import desktop_runtime_setup as mod
+mod.sys.platform = 'win32'
+mod.sys.executable = str(pathlib.Path({str(resources_root / 'python-runtime' / 'python.exe')!r}))
 
 def fake_run(cmd, env, **kwargs):
     counter.write_text(str(int(counter.read_text() or '0') + 1) if counter.exists() else '1')
@@ -278,13 +291,14 @@ print(json.dumps({{'payload': payload, 'pip_calls': pip_calls}}, sort_keys=True)
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     first_payload = json.loads(first.stdout.strip())
     assert first_payload["payload"].get("ok") == "true", first.stdout
-    assert first_payload["pip_calls"] == 1, first.stdout
+    assert first_payload["pip_calls"] == 0, first.stdout
 
     second = subprocess.run([sys.executable, "-c", probe], cwd=tmp_root, env=env, capture_output=True, text=True, check=False)  # noqa: S603
     assert second.returncode == 0, f"{second.stdout}\n{second.stderr}"
     second_payload = json.loads(second.stdout.strip())
     assert second_payload["payload"].get("ok") == "true", second.stdout
-    assert second_payload["pip_calls"] == 1, second.stdout
+    assert second_payload["pip_calls"] == 0, second.stdout
+    assert "cuda_build" not in first.stdout + second.stdout
 
 def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
     resources_root = resources_root or (tmp_root / "resources")

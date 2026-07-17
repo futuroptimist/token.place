@@ -57,7 +57,7 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg("-c");
-        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:2]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
+        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
     }
 
@@ -248,7 +248,8 @@ fn metadata_probe_is_valid(
     expected_machine: &str,
 ) -> Result<(), PythonLauncherCategory> {
     let payload = stdout.trim();
-    if !(payload.contains("\"version\"") && payload.contains("[3, 11]")) {
+    let compact_payload = payload.replace(char::is_whitespace, "");
+    if !(compact_payload.contains("\"version\"") && compact_payload.contains("[3,11,13]")) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
     if json_string_field(payload, "machine") != Some(expected_machine) {
@@ -453,21 +454,6 @@ fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<Pat
 pub fn resolve_python_launcher_resource_aware(
     opts: PythonLauncherResolutionOptions<'_>,
 ) -> Result<PythonLauncher, PythonLauncherError> {
-    if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
-        return match env_candidate.command_for_version_check().output() {
-            Ok(output) => {
-                validate_launcher_with_output(&env_candidate, &output, opts.packaged, false)
-                    .map(|_| env_candidate)
-            }
-            Err(_) => Err(launcher_error(
-                DESKTOP_PYTHON_OVERRIDE_INVALID,
-                PythonLauncherCategory::OverrideMissing,
-                Some(&env_candidate),
-                opts.packaged,
-                None,
-            )),
-        };
-    }
     let is_bundled_required_platform = cfg!(target_os = "macos") || cfg!(target_os = "windows");
     let is_macos = cfg!(target_os = "macos")
         || opts
@@ -569,6 +555,19 @@ pub fn resolve_python_launcher_resource_aware(
                 None,
             ));
         }
+    }
+    if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
+        return match env_candidate.command_for_version_check().output() {
+            Ok(output) => validate_launcher_with_output(&env_candidate, &output, false, false)
+                .map(|_| env_candidate),
+            Err(_) => Err(launcher_error(
+                DESKTOP_PYTHON_OVERRIDE_INVALID,
+                PythonLauncherCategory::OverrideMissing,
+                Some(&env_candidate),
+                false,
+                None,
+            )),
+        };
     }
     resolve_python_launcher(opts.override_var_name).map_err(|_| {
         launcher_error(
@@ -1380,7 +1379,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
             py.display(),
             runtime_root.display()
         );

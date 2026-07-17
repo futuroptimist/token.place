@@ -564,7 +564,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     dependency_target, _dependency_target_error = _resolve_desktop_dependency_target(repo_root)
     dependency_target_env = str(dependency_target) if dependency_target is not None else ""
     dependency_target_text = dependency_target_env or "unknown"
-    pip_version = _pip_version_summary()
+    pip_version = "bundled-runtime-probe" if _is_exact_packaged_runtime_layout() else _pip_version_summary()
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
@@ -1302,16 +1302,34 @@ def _save_runtime_state(state: dict) -> None:
 
 
 
-def _is_bundled_packaged_runtime() -> bool:
+def _is_exact_packaged_runtime_layout() -> bool:
     exe = _safe_resolve_path(sys.executable)
     parts = {part.lower() for part in exe.parts}
     if _desktop_platform().startswith("win"):
-        return (
-            exe.name.lower() == "python.exe"
-            and exe.parent.name.lower() == "python-runtime"
-            and (exe.parent / "embedded_python_runtime_provenance.json").is_file()
-        )
+        return exe.name.lower() == "python.exe" and exe.parent.name.lower() == "python-runtime"
     return "python-runtime" in parts and "contents" in parts and "resources" in parts
+
+
+def _bundled_runtime_provenance_valid() -> bool:
+    exe = _safe_resolve_path(sys.executable)
+    provenance_path = exe.parent / "embedded_python_runtime_provenance.json"
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    runtime_id = str(provenance.get("runtime_id") or provenance.get("runtime_identity") or "")
+    target_triple = str(provenance.get("target_triple") or "")
+    return runtime_id == "bundled-cpython-3.11-win-x86_64-cu124" or target_triple == "x86_64-pc-windows-msvc"
+
+
+def _is_bundled_packaged_runtime() -> bool:
+    if not _is_exact_packaged_runtime_layout():
+        return False
+    # Invariant: exact packaged layouts are immutable; provenance decides validity,
+    # not whether startup may fall back to mutable bootstrap or repair paths.
+    if _desktop_platform().startswith("win"):
+        return _bundled_runtime_provenance_valid()
+    return True
 
 
 def _development_source_build_allowed() -> bool:
@@ -1636,7 +1654,7 @@ def _ensure_desktop_llama_runtime_impl(
     policy = _runtime_bootstrap_policy()
     expected_backend = policy.expected_backend
 
-    if _is_bundled_packaged_runtime():
+    if _is_exact_packaged_runtime_layout():
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
@@ -2202,6 +2220,8 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     missing = _module_missing(required_modules)
     if not missing:
         return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": str(target_dir) if target_dir is not None else ""}
+    if _is_exact_packaged_runtime_layout():
+        return {"ok": "false", "action": "bundled_runtime_probe_failed", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else "", "detail": "immutable packaged runtime will not run pip installers"}
     if not mutate:
         return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else ""}
 

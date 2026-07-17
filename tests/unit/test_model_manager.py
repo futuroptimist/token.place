@@ -2372,6 +2372,7 @@ def test_import_llama_cpp_runtime_no_signal_uses_subprocess_facade(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON', raising=False)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
     monkeypatch.setattr(
         model_manager_module,
@@ -2426,6 +2427,7 @@ def test_no_signal_warm_load_uses_subprocess_facade(monkeypatch, tmp_path):
     fake_runtime_path = '/site-packages/llama_cpp/__init__.py'
 
     sys.modules.pop('llama_cpp', None)
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON', raising=False)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
     monkeypatch.setattr(
         model_manager_module,
@@ -10286,3 +10288,115 @@ def test_llama_module_identity_consumer_rejects_sentinels_and_normalizes_windows
     mixed = r'c:/users/alice/runtime/lib/site-packages/LLAMA_CPP/__init__.py'
     assert model_manager_module.llama_module_identity_from_path(base) == model_manager_module.llama_module_identity_from_path(prefixed)
     assert model_manager_module.llama_module_identity_from_path(base) == model_manager_module.llama_module_identity_from_path(mixed)
+
+
+def test_import_llama_cpp_runtime_identity_only_probe_skips_discovery(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# fake runtime')
+    identity = model_manager_module.llama_module_identity_from_path(module_path)
+    probe = {
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'llama_module_path_present': True,
+        'llama_module_identity': identity,
+        'capability_source': 'desktop_runtime_setup_probe',
+    }
+    captured = {}
+
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: False)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('unexpected redundant discovery')),
+    )
+
+    def fake_import(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(__file__='identity-only-facade')
+
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_in_parent_with_timeout', fake_import)
+
+    runtime = model_manager_module._import_llama_cpp_runtime(desktop_runtime_probe=probe, timeout_seconds=0.01)
+
+    assert runtime.__file__ == 'identity-only-facade'
+    assert captured['module_path_hint'] is None
+    assert captured['expected_llama_module_identity'] == identity
+    assert captured['desktop_runtime_probe']['llama_module_identity'] == identity
+
+
+@pytest.mark.parametrize('identity_value', [None, 'sha256:not-valid'])
+def test_import_llama_cpp_runtime_identity_only_probe_missing_or_malformed_fails_closed(monkeypatch, tmp_path, identity_value):
+    from utils.llm import model_manager as model_manager_module
+
+    probe = {
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'llama_module_path_present': True,
+        'capability_source': 'desktop_runtime_setup_probe',
+    }
+    if identity_value is not None:
+        probe['llama_module_identity'] = identity_value
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: False)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('unexpected legacy discovery fallback')),
+    )
+
+    with pytest.raises(ImportError) as exc_info:
+        model_manager_module._import_llama_cpp_runtime(desktop_runtime_probe=probe, timeout_seconds=0.01)
+
+    message = str(exc_info.value)
+    assert 'identity is missing or malformed' in message
+    assert 'sha256:' not in message
+    assert str(tmp_path) not in message
+
+
+def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_leaks(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    site = tmp_path / 'space containing site'
+    package = site / 'llama_cpp'
+    package.mkdir(parents=True)
+    constructed = tmp_path / 'constructed.txt'
+    module_path = package / '__init__.py'
+    module_path.write_text(
+        'from pathlib import Path\n'
+        f'CONSTRUCTED = Path({str(constructed)!r})\n'
+        'class Llama:\n'
+        '    def __init__(self, *args, **kwargs):\n'
+        '        CONSTRUCTED.write_text("constructed")\n'
+    )
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    monkeypatch.syspath_prepend(str(site))
+
+    probe = {
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'runtime_action': 'already_supported',
+        'llama_module_path_present': True,
+        'llama_module_identity': model_manager_module.llama_module_identity_from_path(other),
+        'capability_source': 'desktop_runtime_setup_probe',
+    }
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        None,
+        timeout_seconds=5,
+        desktop_runtime_probe=probe,
+        expected_llama_module_identity=probe['llama_module_identity'],
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        facade.Llama(model_path=str(tmp_path / 'model.gguf'))
+
+    assert not constructed.exists()
+    message = str(exc_info.value)
+    assert str(module_path) not in message
+    assert str(other) not in message
+    assert probe['llama_module_identity'] not in message

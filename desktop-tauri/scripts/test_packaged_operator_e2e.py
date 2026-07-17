@@ -993,7 +993,8 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
     )
     assert str(fake_init) not in output, output
     assert "module_path_present=True" in output, output
-    assert "module_path=<path>" in output, output
+    assert "llama_cpp runtime discovery reused desktop probe identity" in output, output
+    assert "stage start stage=llama_cpp_runtime_discovery" not in output, output
     assert "cannot import name 'Sequence' from 'collections'" not in output, output
 
 

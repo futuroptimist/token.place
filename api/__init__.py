@@ -75,6 +75,7 @@ PUBLIC_API_V1_CORS_EXCLUDED_PATHS = frozenset(
     {
         "/api/v1/public-key/rotate",
         "/api/v1/relay/responses",
+        "/api/v1/relay/servers/control",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/servers/register",
         "/api/v1/relay/servers/unregister",
@@ -350,9 +351,37 @@ def _response_envelope_identity_for_rate_limit(data: Any) -> tuple[str, str] | N
     return None
 
 
+
+def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
+    if not isinstance(data, dict):
+        return None
+    server_public_key = data.get("server_public_key")
+    credential = data.get("control_credential")
+    if not (isinstance(server_public_key, str) and server_public_key.strip() and isinstance(credential, str) and credential):
+        return None
+    for module_name in ("relay", "__main__"):
+        module = sys.modules.get(module_name)
+        known_servers = getattr(module, "known_servers", None) if module is not None else None
+        digest_func = getattr(module, "_api_v1_control_credential_digest", None) if module is not None else None
+        if not isinstance(known_servers, dict) or digest_func is None:
+            continue
+        payload = known_servers.get(server_public_key.strip())
+        if not isinstance(payload, dict):
+            continue
+        expected_digest = payload.get("api_v1_control_credential_digest")
+        if isinstance(expected_digest, str) and secrets.compare_digest(digest_func(credential), expected_digest):
+            return "server_public_key", server_public_key.strip()
+    return None
+
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
     if path == "/api/v1/relay/responses":
         identity = _response_envelope_identity_for_rate_limit(data)
+        if identity is not None:
+            return identity
+        return "client_ip", get_remote_address()
+
+    if path == "/api/v1/relay/servers/control":
+        identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
         return "client_ip", get_remote_address()

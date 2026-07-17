@@ -2217,7 +2217,7 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     queued = client.post('/api/v1/relay/requests', json=request_payload)
     assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     polled_payload = poll.get_json()
     assert polled_payload['chat_history'] == 'ciphertext-request'
@@ -2527,7 +2527,7 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
     })
     assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     polled = poll.get_json()
     assert polled['request_id'] == 'req-no-sink-delegation'
@@ -2566,7 +2566,7 @@ def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
         },
     ]
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     payload = poll.get_json()
     assert payload['request_id'] == 'req-e2ee-only'
@@ -2628,7 +2628,7 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     # Register/heartbeat should not claim work.
     assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     claimed = poll.get_json()
     assert claimed['request_id'] == 'req-register-heartbeat'
@@ -2653,7 +2653,7 @@ def test_api_v1_poll_requires_registration_token_when_configured(client, monkeyp
 
     monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['expected-token'])
 
-    unauthorized = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    unauthorized = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert unauthorized.status_code == 401
     assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
 
@@ -2793,7 +2793,7 @@ def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(c
 
     monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', _pop_then_unregister)
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 404
 
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
@@ -2821,7 +2821,7 @@ def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypat
 
     def _poll():
         with app.test_client() as polling_client:
-            response = polling_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            response = polling_client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
             result['status'] = response.status_code
             result['json'] = response.get_json()
 
@@ -2852,7 +2852,7 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.01')
 
     started = time.monotonic()
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     elapsed = time.monotonic() - started
     assert poll.status_code == 200
     payload = poll.get_json()
@@ -2877,8 +2877,8 @@ def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
         })
         assert queued.status_code == 200
 
-    first = client.post('/api/v1/relay/servers/poll', json=server_payload)
-    second = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    first = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    second = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.get_json()['request_id'] == 'req-fifo-1'
@@ -2890,10 +2890,10 @@ def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     time.sleep(0.6)
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     time.sleep(0.6)
-    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
 
 
 def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch):
@@ -2902,7 +2902,7 @@ def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch)
     monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=2)
-    expired = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    expired = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert expired.status_code == 404
 
 
@@ -2957,7 +2957,7 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
 
     def _poll():
         with app.test_client() as polling_client:
-            response = polling_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            response = polling_client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
             result['status'] = response.status_code
             result['json'] = response.get_json()
 
@@ -3384,7 +3384,7 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
     })
     assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     assert poll.get_json()['request_id'] == 'req-inflight-1'
 
@@ -3416,7 +3416,7 @@ def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_r
     })
     assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     assert poll.get_json()['request_id'] == 'req-race-finished'
 
@@ -3453,8 +3453,8 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
         })
         assert queued.status_code == 200
 
-    first_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
-    second_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    first_poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    second_poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert first_poll.status_code == 200
     assert second_poll.status_code == 200
 
@@ -3516,7 +3516,7 @@ def test_api_v1_unregister_cancels_in_flight_request_promptly(client):
         'cipherkey': 'cipherkey-request',
         'iv': 'iv-request',
     }).status_code == 200
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     assert poll.get_json()['request_id'] == request_id
 
@@ -3843,16 +3843,20 @@ def test_api_v1_terminal_records_are_pruned_without_retrieve(client, monkeypatch
 def test_api_v1_control_owner_sees_in_flight_cancel_and_ack_cleans_up(client):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     wrong_server = _server_key('wrong-control-server')
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
-    assert client.post('/api/v1/relay/servers/register', json={'server_public_key': wrong_server}).status_code == 200
+    owner_register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    wrong_register = client.post('/api/v1/relay/servers/register', json={'server_public_key': wrong_server})
+    assert owner_register.status_code == 200
+    assert wrong_register.status_code == 200
+    server_payload = server_payload | {'control_credential': owner_register.get_json()['control_credential']}
+    wrong_server_payload = {'server_public_key': wrong_server, 'control_credential': wrong_register.get_json()['control_credential']}
     request_id = 'req-control-cancel'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     assert poll.get_json()['request_id'] == request_id
     assert 'request_ttl_seconds' in poll.get_json()
 
-    wrong_before = client.post('/api/v1/relay/servers/control', json={'server_public_key': wrong_server, 'request_id': request_id})
+    wrong_before = client.post('/api/v1/relay/servers/control', json=wrong_server_payload | {'request_id': request_id})
     assert wrong_before.status_code == 200
     assert wrong_before.get_json()['status'] == 'completed/unavailable'
 
@@ -3865,7 +3869,7 @@ def test_api_v1_control_owner_sees_in_flight_cancel_and_ack_cleans_up(client):
     })
     assert cancelled.status_code == 200
 
-    wrong_after = client.post('/api/v1/relay/servers/control', json={'server_public_key': wrong_server, 'request_id': request_id})
+    wrong_after = client.post('/api/v1/relay/servers/control', json=wrong_server_payload | {'request_id': request_id})
     owner = client.post('/api/v1/relay/servers/control', json=server_payload | {'request_id': request_id})
     ack = client.post('/api/v1/relay/servers/control', json=server_payload | {'request_id': request_id, 'acknowledge': True})
     after_ack = client.post('/api/v1/relay/servers/control', json=server_payload | {'request_id': request_id})
@@ -3881,23 +3885,42 @@ def test_api_v1_control_owner_sees_in_flight_cancel_and_ack_cleans_up(client):
     assert retrieved.get_json()['error']['reason'] == 'client_timeout'
 
 
+def test_api_v1_control_requires_owner_proof_without_registration_tokens(client):
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+
+    response = client.post(
+        '/api/v1/relay/servers/control',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'request_id': 'req'},
+    )
+
+    assert response.status_code == 403
+
+
 def test_api_v1_control_requires_registration_token_when_configured(client, monkeypatch):
     monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['secret-token'])
-    known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY,
-        'last_ping': datetime.now(),
-        'last_ping_duration': 60,
-        relay_module.API_V1_SERVER_MARKER: True,
-    }
+    register = client.post(
+        '/api/v1/relay/servers/register',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+        headers={'X-Relay-Server-Token': 'secret-token'},
+    )
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
 
     unsigned = client.post('/api/v1/relay/servers/control', json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'request_id': 'req'})
-    signed = client.post(
+    missing_owner_proof = client.post(
         '/api/v1/relay/servers/control',
         json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'request_id': 'req'},
         headers={'X-Relay-Server-Token': 'secret-token'},
     )
+    signed = client.post(
+        '/api/v1/relay/servers/control',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'request_id': 'req', 'control_credential': credential},
+        headers={'X-Relay-Server-Token': 'secret-token'},
+    )
 
     assert unsigned.status_code == 401
+    assert missing_owner_proof.status_code == 403
     assert signed.status_code == 200
 
 
@@ -3905,17 +3928,19 @@ def test_api_v1_control_renews_lease_without_extending_absolute_deadline(client,
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '5')
     monkeypatch.setenv(relay_module.API_V1_IN_FLIGHT_TTL_SECONDS_ENV, '30')
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+    control_payload = server_payload | {'control_credential': register.get_json()['control_credential']}
     request_id = 'req-lease-no-deadline-extension'
     queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id))
     assert queued.status_code == 200
     queued_ttl = queued.get_json()['request_ttl_seconds']
-    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert poll.status_code == 200
     initial = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
     initial_deadline = initial['request_deadline_monotonic']
 
-    control = client.post('/api/v1/relay/servers/control', json=server_payload | {'request_id': request_id})
+    control = client.post('/api/v1/relay/servers/control', json=control_payload | {'request_id': request_id})
     renewed = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
 
     assert control.status_code == 200
@@ -3943,14 +3968,16 @@ def test_expire_stale_pending_requests_uses_deadline_index_for_legacy_float_entr
 def test_api_v1_absolute_deadline_expiry_rejects_late_response(client, monkeypatch):
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+    control_payload = server_payload | {'control_credential': register.get_json()['control_credential']}
     request_id = 'req-absolute-deadline'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
-    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
     original_monotonic = time.monotonic
     monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 2.0)
 
-    control = client.post('/api/v1/relay/servers/control', json=server_payload | {'request_id': request_id})
+    control = client.post('/api/v1/relay/servers/control', json=control_payload | {'request_id': request_id})
     late_response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
 
     assert control.status_code == 200

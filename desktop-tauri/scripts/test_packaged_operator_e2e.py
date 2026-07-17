@@ -193,7 +193,7 @@ def _packaged_env(
     env["HOME"] = str(home_dir)
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
-    env["PYTHONPATH"] = str(resources_root / "python")
+    env["PYTHONPATH"] = os.pathsep.join([str(resources_root / "python"), str(resources_root)])
     if extra_env:
         env.update(extra_env)
     return env
@@ -209,6 +209,7 @@ def run_desktop_dependency_preflight(tmp_root: Path, *, resources_root: Path | N
             "-c",
             (
                 "import json, pathlib, sys; "
+                "sys.path.insert(0, r'" + str(resources_root) + "'); "
                 "sys.path.insert(0, r'" + str(resources_root / 'python') + "'); "
                 "import desktop_runtime_setup as mod; "
                 "print(json.dumps(mod.ensure_desktop_python_dependencies()))"
@@ -341,6 +342,8 @@ def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | Non
             (
                 "import pathlib,sys; "
                 "python_dir=pathlib.Path(r'" + str(model_bridge.parent) + "'); "
+                "resources_dir=python_dir.parent; "
+                "sys.path.insert(0,str(resources_dir)); "
                 "sys.path.insert(0,str(python_dir)); "
                 "import desktop_runtime_setup as mod; "
                 "payload=mod.ensure_desktop_python_dependencies(); "
@@ -480,12 +483,17 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
     fake_init.write_text(
         "import os, time\n"
         "__file__ = __file__\n"
+        "__version__ = '0.3.32'\n"
         "GGML_USE_CUDA = True\n"
+        "LLAMA_ROPE_SCALING_TYPE_YARN = 2\n"
+        "GGML_TYPE_Q8_0 = 8\n"
+        "GGML_TYPE_Q4_0 = 4\n"
+        "GGML_TYPE_F16 = 1\n"
         "def llama_supports_gpu_offload():\n"
         "    return True\n"
         "class Llama:\n"
-        "    def __init__(self, *args, **kwargs):\n"
-        "        self.args = args\n"
+        "    def __init__(self, model_path=None, *, n_ctx=512, n_gpu_layers=0, type_k=None, type_v=None, flash_attn=False, offload_kqv=True, n_batch=512, n_ubatch=512, rope_scaling_type=None, yarn_ext_factor=None, yarn_attn_factor=None, yarn_beta_fast=None, yarn_beta_slow=None, yarn_orig_ctx=None, rope_freq_base=None, rope_freq_scale=None, **kwargs):\n"
+        "        self.model_path = model_path\n"
         "        self.kwargs = kwargs\n"
         "    def create_chat_completion(self, *args, **kwargs):\n"
         "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n"
@@ -507,6 +515,9 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
         "        return ([0] if add_bos else []) + tokens\n",
         encoding="utf-8",
     )
+    dist_info = fake_site / "llama_cpp_python-0.3.32.dist-info"
+    dist_info.mkdir(parents=True, exist_ok=True)
+    (dist_info / "METADATA").write_text("Name: llama-cpp-python\nVersion: 0.3.32\n", encoding="utf-8")
     return fake_site, fake_init
 
 def run_llama_cpp_watchdog_regression_probe(
@@ -598,17 +609,20 @@ def run_compute_bridge_startup_probe(
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_layout_label = layout_label.replace(" ", "_").replace("/", "_")
     log_file = log_dir / f"packaged-bridge-startup-{safe_layout_label}.log"
+    bridge_args = [
+        sys.executable,
+        str(bridge_script),
+        "--model",
+        model_arg,
+        "--mode",
+        mode,
+        "--relay-url",
+        f"http://127.0.0.1:{relay_port}",
+    ]
+    if mode == "auto":
+        bridge_args.extend(["--context-tier", "64k-full"])
     bridge = subprocess.Popen(  # noqa: S603
-        [
-            sys.executable,
-            str(bridge_script),
-            "--model",
-            model_arg,
-            "--mode",
-            mode,
-            "--relay-url",
-            f"http://127.0.0.1:{relay_port}",
-        ],
+        bridge_args,
         cwd=tmp_root,
         env=env,
         stdin=subprocess.PIPE,
@@ -967,7 +981,11 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         mode="auto",
         model_path=fake_model,
         extra_env={
-            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
+            # Windows CI can spend more than five seconds importing the packaged
+            # fake runtime and completing the background Qwen 64K capability gate.
+            # Keep this lifecycle probe deterministic by giving the warm-load
+            # watchdog enough room while still bounding a genuinely wedged child.
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "15",
             "PYTHONPATH": os.pathsep.join(
                 [str(polluted_site), str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
@@ -985,12 +1003,17 @@ def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
     fake_pkg = fake_site / "llama_cpp"
     fake_pkg.mkdir(parents=True, exist_ok=True)
     (fake_pkg / "__init__.py").write_text(
+        "__version__ = '0.3.32'\n"
         "GGML_USE_METAL = True\n"
+        "LLAMA_ROPE_SCALING_TYPE_YARN = 2\n"
+        "GGML_TYPE_Q8_0 = 8\n"
+        "GGML_TYPE_Q4_0 = 4\n"
+        "GGML_TYPE_F16 = 1\n"
         "def llama_supports_gpu_offload():\n"
         "    return True\n"
         "class Llama:\n"
-        "    def __init__(self, *args, **kwargs):\n"
-        "        self.args = args\n"
+        "    def __init__(self, model_path=None, *, n_ctx=512, n_gpu_layers=0, type_k=None, type_v=None, flash_attn=False, offload_kqv=True, n_batch=512, n_ubatch=512, rope_scaling_type=None, yarn_ext_factor=None, yarn_attn_factor=None, yarn_beta_fast=None, yarn_beta_slow=None, yarn_orig_ctx=None, rope_freq_base=None, rope_freq_scale=None, **kwargs):\n"
+        "        self.model_path = model_path\n"
         "        self.kwargs = kwargs\n"
         "    def create_chat_completion(self, *args, **kwargs):\n"
         "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake metal ok'}}]}\n"
@@ -1012,6 +1035,9 @@ def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
         "        return ([0] if add_bos else []) + tokens\n",
         encoding="utf-8",
     )
+    dist_info = fake_site / "llama_cpp_python-0.3.32.dist-info"
+    dist_info.mkdir(parents=True, exist_ok=True)
+    (dist_info / "METADATA").write_text("Name: llama-cpp-python\nVersion: 0.3.32\n", encoding="utf-8")
     return fake_site
 
 
@@ -1051,8 +1077,17 @@ def run_macos_mock_metal_packaged_registration_probe(
             ),
         },
     )
+    sentinel_identity = __import__("hashlib").sha256(
+        f"token.place.llama_cpp.module_path.v1\0{fake_metal_site / 'llama_cpp' / '__init__.py'}".encode("utf-8")
+    ).hexdigest()
     assert '"registered": true' in output.lower(), output
     assert "runtime_action=metal_already_supported" in output, output
+    assert "warm_load_state" in output and "ready" in output, output
+    assert '"api_v1_readiness_result": "passed"' in output, output
+    assert '"api_v1_readiness_yarn_rope_scaling_type_source": "top_level_enum"' in output, output
+    assert "native_reprobe" not in output, output
+    assert str(fake_metal_site) not in output, output
+    assert sentinel_identity not in output, output
 
 
 def run_macos_gpu_failure_blocks_registration_probe(

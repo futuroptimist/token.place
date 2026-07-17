@@ -324,11 +324,17 @@ def _run_python_sanitized(py: Path, code: str, app_path: Path) -> str:
             "HOME": str(home_dir),
             "TMPDIR": str(tmpdir),
             "PIP_CACHE_DIR": str(app_data / "pip-cache"),
+            "PIP_NO_INDEX": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
             "PYTHONPYCACHEPREFIX": str(pycache),
             "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python"),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(app_for_subprocess / "Contents" / "Resources" / "python"),
+                    str(app_for_subprocess / "Contents" / "Resources"),
+                ]
+            ),
             "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(dependency_target),
             "TOKEN_PLACE_MODELS_DIR": str(app_data / "models"),
             "TOKEN_PLACE_MODEL_DIR": str(app_data / "models"),
@@ -658,6 +664,101 @@ def _validate_embedded_python_runtime(app_path: Path) -> None:
     for key in ("flash_attn", "offload_kqv", "n_batch", "n_ubatch"):
         if not constructor_support.get(key):
             _fail(f"embedded runtime probe missing capability: {key}")
+
+    background_probe = r"""
+import json, os, threading
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
+from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
+from pathlib import Path
+from utils.llm import model_manager
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('packaged runtime metadata missing: requirements.txt')
+
+result = {}
+
+def worker():
+    setup = ensure_desktop_llama_runtime(
+        'auto',
+        repo_root=runtime_import_root,
+        context_tier='64k-full',
+    )
+    private_runtime_setup = dict(setup)
+    private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
+    private_identity = private_probe.get('llama_module_identity')
+    if isinstance(private_identity, str):
+        private_runtime_setup['llama_module_identity'] = private_identity
+    facade = model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        timeout_seconds=10,
+        desktop_runtime_probe=private_runtime_setup,
+    )
+    gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    facade_capabilities = model_manager._safe_constructor_capability_payload(facade)
+    constructor = facade_capabilities.get('constructor_kwarg_support') or {}
+    result.update({
+        'runtime_action': setup.get('runtime_action'),
+        'runtime_action_ok': setup.get('runtime_action') in {'metal_already_supported', 'already_supported'},
+        'selected_backend': setup.get('selected_backend'),
+        'llama_cpp_python_version_match': setup.get('llama_cpp_python_version_match'),
+        'capability_source': gate.get('capability_source'),
+        'incomplete_probe_fields': gate.get('incomplete_probe_fields'),
+        'facade_type': type(facade).__name__,
+        'backend': facade_capabilities.get('backend'),
+        'gpu_offload_supported': facade_capabilities.get('gpu_offload_supported') is True,
+        'version': gate.get('llama_cpp_python_version'),
+        'yarn_resolver_source': gate.get('yarn_resolver_source'),
+        'constructor_signature_inspectable': gate.get('constructor_signature_inspectable') is True,
+        'required_kwargs_supported': all(constructor.get(name) for name in (
+            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')),
+        'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
+        'supported': gate.get('supported') is True,
+        'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
+        'secondary_reprobe_skipped': gate.get('child_probe_reprobe_skipped_reason') == 'desktop_probe_authoritative',
+    })
+
+thread = threading.Thread(target=worker, name='token-place-release-qwen64k-probe')
+thread.start()
+thread.join(timeout=30)
+if thread.is_alive():
+    raise SystemExit('background facade probe timed out')
+print(json.dumps(result, sort_keys=True))
+"""
+    background_data = json.loads(_run_python_sanitized(py, background_probe, app_path).splitlines()[-1])
+    expected_background = {
+        "runtime_action_ok": True,
+        "facade_type": "_SubprocessLlamaCppModule",
+        "backend": "metal",
+        "gpu_offload_supported": True,
+        "version": "0.3.32",
+        "yarn_resolver_source": "top_level_enum",
+        "constructor_signature_inspectable": True,
+        "required_kwargs_supported": True,
+        "llama_module_identity_match": True,
+        "supported": True,
+        "desktop_probe_authoritative": True,
+        "secondary_reprobe_skipped": True,
+    }
+    safe_background_diagnostics = {
+        key: background_data.get(key)
+        for key in ("runtime_action", "selected_backend", "llama_cpp_python_version_match", "capability_source", "llama_module_identity_match", "incomplete_probe_fields")
+    }
+    for key, expected in expected_background.items():
+        if background_data.get(key) != expected:
+            _fail(
+                f"embedded background Qwen 64K facade probe failed {key}: "
+                f"{background_data.get(key)!r}; diagnostics={safe_background_diagnostics!r}"
+            )
     model_bridge = app_path / "Contents" / "Resources" / "python" / "model_bridge.py"
     if model_bridge.is_file():
         model_bridge_for_subprocess = model_bridge if model_bridge.is_absolute() else model_bridge.absolute()

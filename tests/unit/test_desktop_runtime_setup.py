@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,68 @@ desktop_runtime_setup = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 sys.modules['desktop_runtime_setup'] = desktop_runtime_setup
 SPEC.loader.exec_module(desktop_runtime_setup)
+
+
+
+def test_packaged_runtime_setup_imports_utils_from_resources_root(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    utils_llm_dir = resources_root / 'utils' / 'llm'
+    python_dir.mkdir(parents=True)
+    utils_llm_dir.mkdir(parents=True)
+
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+    (resources_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
+    helper = REPO_ROOT / 'utils' / 'llm' / 'llama_module_identity.py'
+    (utils_llm_dir / 'llama_module_identity.py').write_text(helper.read_text(encoding='utf-8'), encoding='utf-8')
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(python_dir)
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', 'import desktop_runtime_setup; print(desktop_runtime_setup.__name__)'],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'desktop_runtime_setup'
+
+
+def test_packaged_runtime_setup_imports_without_bundled_utils(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    python_dir.mkdir(parents=True)
+
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    env = {'PYTHONPATH': str(python_dir), 'PATH': os.environ.get('PATH', '')}
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-B',
+            '-c',
+            (
+                'import desktop_runtime_setup as d; '
+                'print(d.llama_module_identity_from_path("/tmp/llama_cpp/__init__.py").startswith("sha256:"))'
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'True'
 
 
 class _SysStub:
@@ -3341,3 +3404,253 @@ def test_probe_heartbeat_failure_terminates_process_tree(monkeypatch, tmp_path):
 
     assert probe.error == 'desktop_runtime_probe_heartbeat_failed:RuntimeError'
     assert terminated == [65434]
+
+
+def test_probe_result_payload_carries_private_identity_but_public_result_redacts(monkeypatch, tmp_path):
+    support = {name: True for name in desktop_runtime_setup.LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS}
+    module_path = tmp_path / 'site-packages' / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text('# mock')
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='metal', gpu_offload_supported=True, detected_device='metal',
+        interpreter=sys.executable, prefix=sys.prefix, llama_module_path=str(module_path),
+        llama_cpp_python_version='0.3.32', yarn_rope_supported=True,
+        yarn_resolver_source='top_level_enum', constructor_kwarg_support=support,
+        constructor_signature_inspectable=True, qwen_64k_yarn_support='supported', yarn_enum_value=2,
+    )
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    identity = payload['llama_module_identity']
+    assert identity.startswith('sha256:') and len(identity) == 71
+    assert payload['llama_module_path_present'] is True
+    assert 'llama_module_path' not in payload
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ensure_desktop_llama_runtime_impl', lambda *_, **__: dict(payload, selected_backend='metal', runtime_action='metal_already_supported'))
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert 'llama_module_identity' not in result
+    assert str(module_path) not in json.dumps(result)
+    private_env = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+    assert private_env['llama_module_identity'] == identity
+    assert str(module_path) not in os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
+
+
+def test_llama_module_identity_canonicalizes_symlink_dotdot(tmp_path):
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_dir = tmp_path / 'link'
+    link_dir.symlink_to(real.parent.parent, target_is_directory=True)
+    via_link = link_dir / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    assert desktop_runtime_setup.llama_module_identity_from_path(real) == desktop_runtime_setup.llama_module_identity_from_path(via_link)
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    assert desktop_runtime_setup.llama_module_identity_from_path(real) != desktop_runtime_setup.llama_module_identity_from_path(other)
+
+
+def test_llama_module_identity_rejects_raw_path_sentinels():
+    assert desktop_runtime_setup.llama_module_identity_from_path('unknown') is None
+    assert desktop_runtime_setup.llama_module_identity_from_path('missing') is None
+    assert desktop_runtime_setup.llama_module_identity_from_path('') is None
+    assert desktop_runtime_setup._canonical_llama_module_identity_input(None) is None
+    assert desktop_runtime_setup._canonical_llama_module_identity_input('  UNKNOWN  ') is None
+
+
+def test_shared_llama_module_identity_helper_requires_string_identity(tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock')
+
+    identity = shared_identity.llama_module_identity_from_path(module_path)
+    assert shared_identity.valid_llama_module_identity(identity) == identity
+    assert shared_identity.valid_llama_module_identity(identity.upper()) is None
+    assert shared_identity.valid_llama_module_identity(123) is None
+    assert shared_identity.llama_module_identity_supplied(identity) is True
+    assert shared_identity.llama_module_identity_supplied('  ') is False
+    assert shared_identity.llama_module_identity_supplied(123) is False
+
+
+def test_shared_llama_module_identity_helper_fallback_paths(monkeypatch, tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock')
+
+    monkeypatch.setattr(shared_identity.os.path, 'abspath', lambda _path: (_ for _ in ()).throw(OSError('blocked')))
+    canonical = shared_identity.canonical_llama_module_identity_input(module_path)
+    assert canonical.endswith('/llama_cpp/__init__.py')
+    assert shared_identity.canonical_llama_module_identity_input(None) is None
+
+
+def test_shared_llama_module_identity_helper_edge_paths(monkeypatch):
+    from utils.llm import llama_module_identity as shared_identity
+
+    assert shared_identity.strip_windows_extended_path_prefix(
+        r'\\?\UNC\server\share\llama_cpp\__init__.py'
+    ) == r'\\server\share\llama_cpp\__init__.py'
+    assert shared_identity.strip_windows_extended_path_prefix(
+        r'\\?\C:\runtime\llama_cpp\__init__.py'
+    ) == r'C:\runtime\llama_cpp\__init__.py'
+    assert shared_identity.llama_module_identity_from_path('unknown') is None
+    assert shared_identity.llama_module_identity_from_path('missing') is None
+
+    class UnstringablePath:
+        def __str__(self):
+            raise ValueError('blocked')
+
+    assert shared_identity.canonical_llama_module_identity_input(UnstringablePath()) is None
+
+    good = 'sha256:' + 'b' * 64
+    assert shared_identity.valid_llama_module_identity(f' {good} ') == good
+
+
+def test_shared_llama_module_identity_helper_fail_closed_normalization_paths(monkeypatch, tmp_path):
+    from utils.llm import llama_module_identity as shared_identity
+
+    module_path = tmp_path / 'llama_cpp' / '__init__.py'
+    module_path.parent.mkdir()
+    module_path.write_text('# mock', encoding='utf-8')
+
+    identity = shared_identity.llama_module_identity_from_path(module_path)
+    assert identity is not None
+    assert shared_identity.valid_llama_module_identity(identity) == identity
+    assert shared_identity.llama_module_identity_supplied(identity) is True
+
+    with monkeypatch.context() as path_errors:
+        path_errors.setattr(
+            shared_identity.os.path,
+            'abspath',
+            lambda _path: (_ for _ in ()).throw(OSError('primary blocked')),
+        )
+        path_errors.setattr(
+            shared_identity.os.path,
+            'normpath',
+            lambda _path: (_ for _ in ()).throw(ValueError('fallback blocked')),
+        )
+
+        assert shared_identity.canonical_llama_module_identity_input(module_path) is None
+        assert shared_identity.llama_module_identity_from_path(module_path) is None
+    assert shared_identity.valid_llama_module_identity(object()) is None
+    assert shared_identity.llama_module_identity_supplied(object()) is False
+
+
+def test_llama_module_identity_windows_normalization_is_deterministic():
+    base = r'C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py'
+    prefixed = r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'
+    mixed = r'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/LLAMA_CPP/__init__.py'
+    assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(prefixed)
+    assert desktop_runtime_setup.llama_module_identity_from_path(base) == desktop_runtime_setup.llama_module_identity_from_path(mixed)
+
+
+def test_packaged_identity_fallback_matches_shared_helper_in_subprocess(tmp_path) -> None:
+    resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_dir = resources_root / 'python'
+    python_dir.mkdir(parents=True)
+    for name in ('desktop_runtime_setup.py', 'desktop_gpu_packaging.py'):
+        source = PYTHON_MODULE_DIR / name
+        (python_dir / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_root = tmp_path / 'link-root'
+    link_root.symlink_to(real.parent.parent, target_is_directory=True)
+    via_dotdot = link_root / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    cases = {
+        'posix_real': str(real),
+        'posix_dotdot_symlink': str(via_dotdot),
+        'windows_extended': r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib\site-packages\llama_cpp\__init__.py',
+        'windows_mixed_case': r'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/LLAMA_CPP/__init__.py',
+        'other': str(other),
+        'unknown': 'unknown',
+        'missing': 'missing',
+        'empty': '',
+    }
+    code = (
+        'import json, desktop_runtime_setup as d; '
+        f'cases = {cases!r}; '
+        'print(json.dumps({k: d.llama_module_identity_from_path(v) for k, v in cases.items()} | {'
+        '"valid_good": d._valid_llama_module_identity("sha256:" + "a" * 64), '
+        '"valid_bad": d._valid_llama_module_identity("sha256:" + "g" * 64), '
+        '"valid_non_string": d._valid_llama_module_identity(123)}))'
+    )
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={'PYTHONPATH': str(python_dir), 'PATH': os.environ.get('PATH', '')},
+        cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    fallback = json.loads(result.stdout)
+
+    from utils.llm import llama_module_identity as shared_identity
+
+    shared = {k: desktop_runtime_setup.llama_module_identity_from_path(v) for k, v in cases.items()}
+    assert fallback == {
+        **shared,
+        'valid_good': 'sha256:' + 'a' * 64,
+        'valid_bad': None,
+        'valid_non_string': None,
+    }
+    assert fallback['posix_real'] == fallback['posix_dotdot_symlink']
+    assert fallback['windows_extended'] == fallback['windows_mixed_case']
+    assert fallback['posix_real'] != fallback['other']
+
+
+def test_packaged_identity_inline_fallback_is_covered_without_utils(
+    monkeypatch, tmp_path
+) -> None:
+    original_is_file = Path.is_file
+
+    def packaged_helper_absent(path: Path) -> bool:
+        if str(path).replace('\\', '/').endswith('/utils/llm/llama_module_identity.py'):
+            return False
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, 'is_file', packaged_helper_absent)
+
+    module_name = 'desktop_runtime_setup_inline_identity_fallback_test'
+    spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock', encoding='utf-8')
+    link_root = tmp_path / 'linked'
+    link_root.symlink_to(real.parent.parent, target_is_directory=True)
+    via_dotdot = link_root / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    windows_prefixed = (
+        r'\\?\C:\Users\Alice\AppData\Local\token.place\runtime\Lib'
+        r'\site-packages\llama_cpp\__init__.py'
+    )
+    windows_mixed = (
+        'c:/users/alice/appdata/local/token.place/runtime/lib/site-packages/'
+        'LLAMA_CPP/__init__.py'
+    )
+
+    assert module.llama_module_identity_from_path(
+        real
+    ) == module.llama_module_identity_from_path(via_dotdot)
+    assert module.llama_module_identity_from_path(
+        windows_prefixed
+    ) == module.llama_module_identity_from_path(windows_mixed)
+    assert module.llama_module_identity_from_path('unknown') is None
+    assert module.llama_module_identity_from_path('missing') is None
+    assert module.llama_module_identity_from_path('') is None
+    good = 'sha256:' + 'a' * 64
+    assert module._valid_llama_module_identity(good) == good
+    assert module._valid_llama_module_identity('sha256:' + 'A' * 64) is None
+    assert module._valid_llama_module_identity(123) is None

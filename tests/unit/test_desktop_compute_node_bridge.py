@@ -4330,7 +4330,12 @@ def test_multi_relay_recovery_exhaustion_reports_none_registered_or_ready(capsys
 
 def test_multi_relay_network_failure_does_not_trigger_shared_model_recovery(capsys, monkeypatch):
     _reset_cancel_queue()
-    calls = {'warm': 0, 'poll': 0}
+    calls = {'warm': 0}
+    poll_attempts_by_relay = {}
+    poll_lock = threading.Lock()
+    first_poll_barrier = threading.Barrier(2, timeout=5)
+    registered_relay_emitted = threading.Event()
+    max_poll_attempts = 20
 
     class NetworkFailureRuntime(FakeRuntime):
         def __init__(self, config, *_, model_manager=None, crypto_manager=None):
@@ -4344,14 +4349,32 @@ def test_multi_relay_network_failure_does_not_trigger_shared_model_recovery(caps
             return True
 
         def register_and_poll_once(self):
-            calls['poll'] += 1
-            if self.relay_client.relay_url.endswith('a.example'):
+            relay_url = self.relay_client.relay_url
+            with poll_lock:
+                poll_attempts_by_relay[relay_url] = poll_attempts_by_relay.get(relay_url, 0) + 1
+                first_attempt_for_relay = poll_attempts_by_relay[relay_url] == 1
+            if first_attempt_for_relay:
+                first_poll_barrier.wait()
+            if relay_url.endswith('a.example'):
                 return {'error': 'temporary relay outage', 'next_ping_in_x_seconds': 0}
             return {'next_ping_in_x_seconds': 0}
 
+    original_emit = compute_node_bridge.emit
+
+    def observe_registered_relay_emit(payload):
+        original_emit(payload)
+        if payload.get('registered_relay_count', 0) > 0:
+            registered_relay_emitted.set()
+
+    def deterministic_stop_requested():
+        with poll_lock:
+            poll_attempt_count = sum(poll_attempts_by_relay.values())
+        return registered_relay_emitted.is_set() or poll_attempt_count >= max_poll_attempts
+
     _install_fake_runtime_module(monkeypatch, runtime_cls=NetworkFailureRuntime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: calls['poll'] > 3)
+    monkeypatch.setattr(compute_node_bridge, 'emit', observe_registered_relay_emit)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', deterministic_stop_requested)
     args = SimpleNamespace(
         model='/tmp/model.gguf',
         mode='cpu',

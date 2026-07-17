@@ -255,6 +255,7 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     import_root = resources_dir / '_up_' / '_up_'
     utils_llm_dir = import_root / 'utils' / 'llm'
     model_profiles_path = MODULE_PATH.parents[3] / 'utils' / 'llm' / 'model_profiles.py'
+    llama_identity_path = MODULE_PATH.parents[3] / 'utils' / 'llm' / 'llama_module_identity.py'
     python_dir.mkdir(parents=True)
     utils_llm_dir.mkdir(parents=True)
 
@@ -269,6 +270,7 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     (import_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / 'model_profiles.py').write_text(model_profiles_path.read_text(encoding='utf-8'), encoding='utf-8')
+    (utils_llm_dir / 'llama_module_identity.py').write_text(llama_identity_path.read_text(encoding='utf-8'), encoding='utf-8')
     (utils_llm_dir / 'model_manager.py').write_text(
         """
 class _Manager:

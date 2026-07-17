@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 WORKFLOW = Path('.github/workflows/desktop-release.yml')
 TAURI_CONFIG = Path('desktop-tauri/src-tauri/tauri.conf.json')
@@ -650,7 +653,9 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
 def test_validator_contains_embedded_runtime_guardrails() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'Contents" / "Resources" / "python-runtime' in text
-    assert '"PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert '"PYTHONPATH": os.pathsep.join(' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources")' in text
     assert 'xcode-select' in text
     assert 'otool' in text
     assert 'embedded runtime probe did not report Metal GPU offload' in text
@@ -658,7 +663,9 @@ def test_validator_contains_embedded_runtime_guardrails() -> None:
 
 def test_validator_uses_packaged_python_resources_for_runtime_probe() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
-    assert 'PYTHONPATH": str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert '"PYTHONPATH": os.pathsep.join(' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources" / "python")' in text
+    assert 'str(app_for_subprocess / "Contents" / "Resources")' in text
     assert "Path.cwd() / 'src-tauri' / 'python'" not in text
     assert "qwen_64k_yarn_support" in text
     assert "model_bridge.py" in text
@@ -689,12 +696,299 @@ def test_validator_sanitized_python_env_replaces_parent_environment(monkeypatch,
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
 
     assert validator._run_python_sanitized(py, 'print(1)', app) == 'ok'
+    assert captured['env']['PIP_NO_INDEX'] == '1'
     assert captured['env']['PYTHONNOUSERSITE'] == '1'
     assert captured['env']['PATH'] == '/usr/bin:/bin'
-    assert captured['env']['PYTHONPATH'] == str((app / 'Contents' / 'Resources' / 'python').absolute())
+    assert captured['env']['PYTHONPATH'] == subprocess.os.pathsep.join([
+        str((app / 'Contents' / 'Resources' / 'python').absolute()),
+        str((app / 'Contents' / 'Resources').absolute()),
+    ])
     for key in forbidden_parent_env:
         assert key not in captured['env']
 
+
+def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(tmp_path) -> None:
+    resources = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_resources = resources / 'python'
+    runtime_import_root = resources / '_up_' / '_up_'
+    nested_utils = runtime_import_root / 'utils' / 'llm'
+    python_resources.mkdir(parents=True)
+    nested_utils.mkdir(parents=True)
+    (runtime_import_root / 'requirements.txt').write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    (python_resources / 'desktop_runtime_setup.py').write_text(
+        """
+import json
+import os
+from pathlib import Path
+
+RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
+
+def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
+    root = Path(repo_root)
+    if mode != 'auto' or context_tier != '64k-full':
+        raise RuntimeError('unexpected runtime arguments')
+    if not (root / 'requirements.txt').is_file():
+        raise RuntimeError('missing packaged requirements metadata')
+    os.environ[RUNTIME_PROBE_ENV] = json.dumps({'private': True})
+    return {'repo_root_name': root.name, 'requirements_found': True}
+""",
+        encoding='utf-8',
+    )
+    (python_resources / 'path_bootstrap.py').write_text(
+        Path('desktop-tauri/src-tauri/python/path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (nested_utils.parent / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / 'model_manager.py').write_text('BOOTSTRAPPED = True\n', encoding='utf-8')
+
+    code = """
+import json
+from pathlib import Path
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
+from desktop_runtime_setup import ensure_desktop_llama_runtime
+from utils.llm import model_manager
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('requirements metadata not found')
+setup = ensure_desktop_llama_runtime(
+    'auto',
+    repo_root=runtime_import_root,
+    context_tier='64k-full',
+)
+print(json.dumps({
+    'bootstrapped': model_manager.BOOTSTRAPPED,
+    'repo_root_name': setup['repo_root_name'],
+    'requirements_found': setup['requirements_found'],
+}, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            'PYTHONPATH': str(python_resources),
+            'PYTHONNOUSERSITE': '1',
+        },
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        'bootstrapped': True,
+        'repo_root_name': '_up_',
+        'requirements_found': True,
+    }
+
+
+def test_background_probe_uses_production_runtime_import_and_private_identity(tmp_path) -> None:
+    resources = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'
+    python_resources = resources / 'python'
+    runtime_import_root = resources / '_up_' / '_up_'
+    nested_utils = runtime_import_root / 'utils' / 'llm'
+    python_resources.mkdir(parents=True)
+    nested_utils.mkdir(parents=True)
+    sentinel_path = str((tmp_path / 'private' / 'llama_cpp' / '__init__.py').resolve())
+    sentinel_digest = 'sha256:' + ('a' * 64)
+    (runtime_import_root / 'requirements.txt').write_text('llama-cpp-python==0.3.32\n', encoding='utf-8')
+    (python_resources / 'desktop_runtime_setup.py').write_text(
+        f"""
+import json
+import os
+from pathlib import Path
+
+RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
+
+def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
+    root = Path(repo_root)
+    if mode != 'auto' or context_tier != '64k-full':
+        raise RuntimeError('unexpected runtime arguments')
+    if not (root / 'requirements.txt').is_file():
+        raise RuntimeError('missing packaged requirements metadata')
+    os.environ[RUNTIME_PROBE_ENV] = json.dumps({{
+        'llama_module_identity': {sentinel_digest!r},
+        'llama_module_path': {sentinel_path!r},
+    }})
+    return {{
+        'runtime_action': 'metal_already_supported',
+        'selected_backend': 'metal',
+        'llama_cpp_python_version_match': 'match',
+        'llama_module_path_present': True,
+        'capability_source': 'desktop_runtime_setup_probe',
+    }}
+""",
+        encoding='utf-8',
+    )
+    (python_resources / 'path_bootstrap.py').write_text(
+        Path('desktop-tauri/src-tauri/python/path_bootstrap.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (nested_utils.parent / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / '__init__.py').write_text('', encoding='utf-8')
+    (nested_utils / 'model_manager.py').write_text(
+        f"""
+from pathlib import Path
+import threading
+
+RUNTIME_CALLS = []
+SUBPROCESS_CALLS = []
+
+class _SubprocessLlamaCppModule:
+    __file__ = {sentinel_path!r}
+    backend = 'metal'
+    class Llama:
+        pass
+
+def _import_llama_cpp_subprocess_module(*args, **kwargs):
+    SUBPROCESS_CALLS.append((args, kwargs))
+    raise AssertionError('direct subprocess facade constructor must not be used')
+
+def _import_llama_cpp_runtime(*, require_real_runtime, timeout_seconds, desktop_runtime_probe):
+    if threading.current_thread() is threading.main_thread():
+        raise AssertionError('runtime import did not run in background thread')
+    RUNTIME_CALLS.append(dict(desktop_runtime_probe))
+    if require_real_runtime is not True or timeout_seconds != 10:
+        raise AssertionError('unexpected import arguments')
+    if desktop_runtime_probe.get('llama_module_identity') != {sentinel_digest!r}:
+        raise AssertionError('private identity was not merged')
+    if 'llama_module_path' in desktop_runtime_probe:
+        raise AssertionError('raw private module path leaked into runtime setup')
+    return _SubprocessLlamaCppModule()
+
+def _safe_constructor_capability_payload(facade):
+    return {{
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'constructor_kwarg_support': {{name: True for name in (
+            'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')}},
+    }}
+
+def _runtime_supports_qwen_yarn_rope(facade, llama_cls):
+    return {{
+        'llama_cpp_python_version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'constructor_kwarg_support': {{name: True for name in (
+            'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+            'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale')}},
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'child_probe_reprobe_skipped_reason': 'desktop_probe_authoritative',
+        'capability_source': 'desktop_runtime_setup_probe',
+        'incomplete_probe_fields': [],
+    }}
+""",
+        encoding='utf-8',
+    )
+
+    code = """
+import json, os, threading
+import desktop_runtime_setup
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(
+    desktop_runtime_setup.__file__,
+    avoid_llama_cpp_shadowing=True,
+)
+
+from desktop_runtime_setup import RUNTIME_PROBE_ENV, ensure_desktop_llama_runtime
+from pathlib import Path
+from utils.llm import model_manager
+
+runtime_import_root = Path(model_manager.__file__).resolve().parents[2]
+if not (runtime_import_root / 'requirements.txt').is_file():
+    raise SystemExit('packaged runtime metadata missing: requirements.txt')
+
+result = {}
+
+def worker():
+    setup = ensure_desktop_llama_runtime('auto', repo_root=runtime_import_root, context_tier='64k-full')
+    private_runtime_setup = dict(setup)
+    private_probe = json.loads(os.environ.get(RUNTIME_PROBE_ENV) or '{}')
+    private_identity = private_probe.get('llama_module_identity')
+    if isinstance(private_identity, str):
+        private_runtime_setup['llama_module_identity'] = private_identity
+    facade = model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        timeout_seconds=10,
+        desktop_runtime_probe=private_runtime_setup,
+    )
+    gate = model_manager._runtime_supports_qwen_yarn_rope(facade, facade.Llama)
+    facade_capabilities = model_manager._safe_constructor_capability_payload(facade)
+    result.update({
+        'facade_type': type(facade).__name__,
+        'facade_file_discovered': bool(getattr(facade, '__file__', None)),
+        'backend': facade_capabilities.get('backend'),
+        'gpu_offload_supported': facade_capabilities.get('gpu_offload_supported') is True,
+        'required_kwargs_supported': all(
+            (facade_capabilities.get('constructor_kwarg_support') or {{}}).get(name)
+            for name in (
+                'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
+                'rope_scaling_type', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_fast',
+                'yarn_beta_slow', 'yarn_orig_ctx', 'rope_freq_base', 'rope_freq_scale'
+            )
+        ),
+        'llama_module_identity_match': gate.get('llama_module_identity_match') is True,
+        'supported': gate.get('supported') is True,
+        'desktop_probe_authoritative': gate.get('desktop_probe_authoritative') is True,
+        'runtime_call_count': len(model_manager.RUNTIME_CALLS),
+        'subprocess_call_count': len(model_manager.SUBPROCESS_CALLS),
+        'runtime_probe_keys': sorted(model_manager.RUNTIME_CALLS[0]),
+    })
+
+thread = threading.Thread(target=worker, name='token-place-release-qwen64k-probe')
+thread.start()
+thread.join(timeout=30)
+if thread.is_alive():
+    raise SystemExit('background facade probe timed out')
+print(json.dumps(result, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={'PYTHONPATH': str(python_resources), 'PYTHONNOUSERSITE': '1'},
+        cwd=str(tmp_path),
+    )
+
+    captured = result.stdout + result.stderr
+    assert result.returncode == 0, result.stderr
+    assert sentinel_path not in captured
+    assert sentinel_digest not in captured
+    payload = json.loads(result.stdout.strip())
+    assert payload == {
+        'backend': 'metal',
+        'desktop_probe_authoritative': True,
+        'facade_file_discovered': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'gpu_offload_supported': True,
+        'llama_module_identity_match': True,
+        'required_kwargs_supported': True,
+        'runtime_call_count': 1,
+        'runtime_probe_keys': [
+            'capability_source',
+            'llama_cpp_python_version_match',
+            'llama_module_identity',
+            'llama_module_path_present',
+            'runtime_action',
+            'selected_backend',
+        ],
+        'subprocess_call_count': 0,
+        'supported': True,
+    }
 
 def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
@@ -902,6 +1196,21 @@ def test_validate_embedded_python_runtime_absolutizes_packaged_model_bridge(monk
                     'n_batch': True,
                     'n_ubatch': True,
                 },
+            })
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps({
+                'runtime_action_ok': True,
+                'facade_type': '_SubprocessLlamaCppModule',
+                'backend': 'metal',
+                'gpu_offload_supported': True,
+                'version': '0.3.32',
+                'yarn_resolver_source': 'top_level_enum',
+                'constructor_signature_inspectable': True,
+                'required_kwargs_supported': True,
+                'llama_module_identity_match': True,
+                'supported': True,
+                'desktop_probe_authoritative': True,
+                'secondary_reprobe_skipped': True,
             })
         return 'ok'
 
@@ -1632,7 +1941,24 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(
         validator,
         '_run_python_sanitized',
-        lambda _python, code, app_path: calls.append(code) or json.dumps(payload if 'version_info' in code else probe),
+        lambda _python, code, app_path: calls.append(code) or json.dumps(
+            payload if 'version_info' in code else (
+                {
+                    'runtime_action_ok': True,
+                    'facade_type': '_SubprocessLlamaCppModule',
+                    'backend': 'metal',
+                    'gpu_offload_supported': True,
+                    'version': '0.3.32',
+                    'yarn_resolver_source': 'top_level_enum',
+                    'constructor_signature_inspectable': True,
+                    'required_kwargs_supported': True,
+                    'llama_module_identity_match': True,
+                    'supported': True,
+                    'desktop_probe_authoritative': True,
+                    'secondary_reprobe_skipped': True,
+                } if 'token-place-release-qwen64k-probe' in code else probe
+            )
+        ),
     )
 
     try:
@@ -1647,6 +1973,250 @@ def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None
     validator._validate_embedded_python_runtime(app)
     assert any('model_bridge.py' in code for code in calls)
 
+
+@pytest.mark.parametrize(
+    ('mutate_payload', 'mutate_probe', 'expected'),
+    (
+        (lambda payload: payload.update({'version': [3, 12]}), lambda probe: None, 'embedded Python is not CPython 3.11'),
+        (lambda payload: payload.update({'machine': 'x86_64'}), lambda probe: None, 'embedded Python is not arm64'),
+        (lambda payload: payload.update({'llama_cpp_python_version': '0.3.31'}), lambda probe: None, 'embedded runtime has wrong llama-cpp-python version'),
+        (lambda payload: payload.update({'prefix': '/tmp/outside-python-runtime'}), lambda probe: None, 'embedded Python prefix escaped app bundle'),
+        (lambda payload: None, lambda probe: probe.update({'backend': 'cpu'}), 'embedded runtime probe did not report Metal GPU offload'),
+        (lambda payload: None, lambda probe: probe.update({'qwen_64k_yarn_support': 'unsupported'}), 'embedded runtime probe missing capability: qwen_64k_yarn_support'),
+        (lambda payload: None, lambda probe: probe.update({'rope_freq_scale_supported': False}), 'embedded runtime probe missing capability: rope_freq_scale'),
+        (lambda payload: None, lambda probe: probe.update({'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True}}), 'embedded runtime probe missing capability: n_ubatch'),
+    ),
+)
+def test_validate_embedded_python_runtime_safe_capability_failures(
+    monkeypatch, tmp_path, mutate_payload, mutate_probe, expected
+) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python', encoding='utf-8')
+    py.chmod(0o755)
+    for notice in (
+        'embedded_python_runtime_provenance.json',
+        'LICENSE-PYTHON.txt',
+        'LICENSE-python-build-standalone.txt',
+    ):
+        (runtime / notice).write_text('notice', encoding='utf-8')
+
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+    mutate_payload(payload)
+    mutate_probe(probe)
+
+    def fake_run_python(_python, code, _app_path):
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if '_probe_llama_runtime' in code:
+            return json.dumps(probe)
+        return 'ok'
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python)
+
+    with pytest.raises(SystemExit) as excinfo:
+        validator._validate_embedded_python_runtime(app)
+
+    assert expected in str(excinfo.value)
+
+
+def test_validate_embedded_background_probe_failure_diagnostics_are_path_free(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python', encoding='utf-8')
+    py.chmod(0o755)
+    for notice in (
+        'embedded_python_runtime_provenance.json',
+        'LICENSE-PYTHON.txt',
+        'LICENSE-python-build-standalone.txt',
+    ):
+        (runtime / notice).write_text('notice', encoding='utf-8')
+    resources = app / 'Contents' / 'Resources' / 'python'
+    resources.mkdir(parents=True)
+    (resources / 'model_bridge.py').write_text('print("inspect")', encoding='utf-8')
+    private_path = str((tmp_path / 'private' / 'llama_cpp' / '__init__.py').resolve())
+    private_digest = 'sha256:' + ('b' * 64)
+
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {
+            'flash_attn': True,
+            'offload_kqv': True,
+            'n_batch': True,
+            'n_ubatch': True,
+        },
+    }
+    background = {
+        'runtime_action': 'metal_already_supported',
+        'runtime_action_ok': True,
+        'selected_backend': 'metal',
+        'llama_cpp_python_version_match': 'match',
+        'capability_source': 'desktop_runtime_setup_probe',
+        'incomplete_probe_fields': ['llama_module_identity_match'],
+        'facade_type': '_SubprocessLlamaCppModule',
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'required_kwargs_supported': True,
+        'llama_module_identity_match': False,
+        'supported': False,
+        'desktop_probe_authoritative': True,
+        'secondary_reprobe_skipped': True,
+        'llama_module_identity': private_digest,
+        'llama_module_path': private_path,
+    }
+
+    def fake_run_python(_python, code, _app_path):
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if 'token-place-release-qwen64k-probe' in code:
+            return 'probe log without secrets\n' + json.dumps(background)
+        if 'model_bridge.py' in code:
+            return 'model bridge ok'
+        return json.dumps(probe)
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python)
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        validator._validate_embedded_python_runtime(app)
+
+    message = str(excinfo.value)
+    assert 'embedded background Qwen 64K facade probe failed llama_module_identity_match: False' in message
+    assert "'capability_source': 'desktop_runtime_setup_probe'" in message
+    assert "'incomplete_probe_fields': ['llama_module_identity_match']" in message
+    assert private_digest not in message
+    assert private_path not in message
+
+
+@pytest.mark.parametrize(
+    ('missing_key', 'bad_value'),
+    (
+        ('runtime_action_ok', False),
+        ('backend', None),
+        ('gpu_offload_supported', False),
+        ('required_kwargs_supported', False),
+    ),
+)
+def test_validate_embedded_background_probe_reports_each_safe_failure_key(monkeypatch, tmp_path, missing_key, bad_value) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python', encoding='utf-8')
+    py.chmod(0o755)
+    for notice in (
+        'embedded_python_runtime_provenance.json',
+        'LICENSE-PYTHON.txt',
+        'LICENSE-python-build-standalone.txt',
+    ):
+        (runtime / notice).write_text('notice', encoding='utf-8')
+    resources = app / 'Contents' / 'Resources' / 'python'
+    resources.mkdir(parents=True)
+    (resources / 'model_bridge.py').write_text('print("inspect")', encoding='utf-8')
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True},
+    }
+    background = {
+        'runtime_action_ok': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'required_kwargs_supported': True,
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'secondary_reprobe_skipped': True,
+        'runtime_action': 'metal_already_supported',
+        'selected_backend': 'metal',
+        'llama_cpp_python_version_match': True,
+        'capability_source': 'desktop_runtime_setup_probe',
+        'incomplete_probe_fields': [],
+    }
+    background[missing_key] = bad_value
+
+    def fake_run_python(_python, code, _app_path):
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps(background)
+        if 'model_bridge.py' in code:
+            return 'model bridge ok'
+        return json.dumps(probe)
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64')
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python)
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        validator._validate_embedded_python_runtime(app)
+
+    message = str(excinfo.value)
+    assert f'embedded background Qwen 64K facade probe failed {missing_key}: {bad_value!r}' in message
+    assert 'desktop_runtime_setup_probe' in message
+    assert 'diagnostics=' in message
 
 def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locations(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -1670,7 +2240,10 @@ def test_run_python_sanitized_disables_bytecode_and_uses_external_writable_locat
     assert env['PYTHONDONTWRITEBYTECODE'] == '1'
     assert env['PYTHONNOUSERSITE'] == '1'
     assert env['PATH'] == '/usr/bin:/bin'
-    assert env['PYTHONPATH'] == str(app / 'Contents' / 'Resources' / 'python')
+    assert env['PYTHONPATH'] == subprocess.os.pathsep.join([
+        str(app / 'Contents' / 'Resources' / 'python'),
+        str(app / 'Contents' / 'Resources'),
+    ])
     writable_keys = [
         'PYTHONPYCACHEPREFIX',
         'TMPDIR',
@@ -1853,3 +2426,78 @@ def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(m
     assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
     assert runtime_apps == []
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
+
+
+def test_validate_embedded_python_runtime_requires_background_facade_probe(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, _tauri_config, _icon = _minimal_validator_app(validator, tmp_path)
+    runtime = app / 'Contents' / 'Resources' / 'python-runtime'
+    py = runtime / 'bin' / 'python3'
+    py.parent.mkdir(parents=True)
+    py.write_text('python')
+    py.chmod(0o755)
+    (runtime / 'embedded_python_runtime_provenance.json').write_text('{}')
+    (runtime / 'LICENSE-PYTHON.txt').write_text('notice')
+    (runtime / 'LICENSE-python-build-standalone.txt').write_text('notice')
+    resources_python = app / 'Contents' / 'Resources' / 'python'
+    resources_python.mkdir()
+    (resources_python / 'model_bridge.py').write_text('print("inspect")')
+    payload = {
+        'version': [3, 11],
+        'machine': 'arm64',
+        'executable': str(py),
+        'prefix': str(runtime),
+        'llama_cpp_python_version': '0.3.32',
+    }
+    probe = {
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'qwen_64k_yarn_support': 'supported',
+        'rope_scaling_type_supported': True,
+        'rope_freq_scale_supported': True,
+        'yarn_orig_ctx_supported': True,
+        'constructor_kwarg_support': {'flash_attn': True, 'offload_kqv': True, 'n_batch': True, 'n_ubatch': True},
+    }
+    background = {
+        'runtime_action_ok': True,
+        'facade_type': '_SubprocessLlamaCppModule',
+        'backend': 'metal',
+        'gpu_offload_supported': True,
+        'version': '0.3.32',
+        'yarn_resolver_source': 'top_level_enum',
+        'constructor_signature_inspectable': True,
+        'required_kwargs_supported': True,
+        'llama_module_identity_match': True,
+        'supported': True,
+        'desktop_probe_authoritative': True,
+        'secondary_reprobe_skipped': False,
+    }
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator, '_validate_macho_linkage', lambda path, app_path: None)
+
+    def fake_run_python_sanitized(_python, code, _app_path):
+        calls.append(code)
+        if 'version_info' in code:
+            return json.dumps(payload)
+        if 'token-place-release-qwen64k-probe' in code:
+            return json.dumps(background)
+        if '_probe_llama_runtime' in code:
+            return json.dumps(probe)
+        return 'ok'
+
+    monkeypatch.setattr(validator, '_run_python_sanitized', fake_run_python_sanitized)
+    with pytest.raises(SystemExit, match='secondary_reprobe_skipped'):
+        validator._validate_embedded_python_runtime(app)
+    background['secondary_reprobe_skipped'] = True
+    validator._validate_embedded_python_runtime(app)
+    assert any('ensure_runtime_import_paths(' in code for code in calls)
+    assert any("repo_root=runtime_import_root" in code for code in calls)
+    assert any('_runtime_supports_qwen_yarn_rope' in code for code in calls)
+    assert any('_import_llama_cpp_runtime' in code for code in calls)
+    assert any('_safe_constructor_capability_payload' in code for code in calls)
+    assert any("facade_capabilities.get('constructor_kwarg_support')" in code for code in calls)
+    assert not any("gate.get('backend')" in code for code in calls)
+    assert not any("gate.get('gpu_offload_supported')" in code for code in calls)
+    assert not any("gate.get('constructor_kwarg_support')" in code for code in calls)
+    assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)

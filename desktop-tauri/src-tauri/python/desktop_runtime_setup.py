@@ -239,6 +239,7 @@ INSTALL_LOG_TAIL_MAX_CHARS = 2000
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
+ENABLE_SOURCE_BUILD_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_SOURCE_BUILD_REPAIR"
 RUNTIME_PROBE_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON"
 PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
 PROBE_RESULT_MAX_BYTES = 1024 * 1024
@@ -1299,7 +1300,15 @@ def _save_runtime_state(state: dict) -> None:
         return
 
 
-def _should_attempt_source_repair() -> tuple[bool, str]:
+def _is_development_layout(target_root: Optional[Path] = None) -> bool:
+    root = target_root or _resolve_runtime_root(repo_root=None)
+    return (root / "src-tauri" / "python").is_dir() or (root / ".git").is_dir()
+
+def _should_attempt_source_repair(target_root: Optional[Path] = None) -> tuple[bool, str]:
+    if os.getenv(ENABLE_SOURCE_BUILD_ENV) != "1":
+        return False, f"CUDA source repair disabled; set {ENABLE_SOURCE_BUILD_ENV}=1 in an unbundled development layout to opt in"
+    if not _is_development_layout(target_root):
+        return False, "CUDA source repair requires an unbundled development layout"
     state = _load_runtime_state()
     failures = state.get("source_repair_failures", {})
     entry = failures.get(sys.executable, {})
@@ -1676,7 +1685,13 @@ def _ensure_desktop_llama_runtime_impl(
     attempted_cuda_source_build = False
     cuda_source_build_suppressed = False
     if expected_backend == "cuda":
-        should_repair, repair_skip_reason = _should_attempt_source_repair()
+        try:
+            should_repair, repair_skip_reason = _should_attempt_source_repair(target_root)
+        except TypeError as exc:
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                raise
+            should_repair, repair_skip_reason = _should_attempt_source_repair()
+
         if should_repair:
             if dependency_target is None:
                 last_error = (

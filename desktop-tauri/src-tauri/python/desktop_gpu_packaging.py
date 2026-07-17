@@ -11,6 +11,8 @@ LLAMA_CPP_PYPI_INDEX_URL = "https://pypi.org/simple"
 LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE = "https://abetlen.github.io/llama-cpp-python/whl"
 LLAMA_CPP_CPU_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/cpu"
 LLAMA_CPP_METAL_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/metal"
+LLAMA_CPP_CUDA124_WIN_WHEEL_URL = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
+LLAMA_CPP_CUDA124_WIN_WHEEL_SHA256 = "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
 
 
 @dataclass(frozen=True)
@@ -79,11 +81,11 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="cuda",
             package_spec=package_spec,
-            cmake_args="-DGGML_CUDA=on",
-            force_cmake=True,
-            index_url=LLAMA_CPP_PYPI_INDEX_URL,
-            only_binary=False,
-            no_binary=True,
+            cmake_args=None,
+            force_cmake=False,
+            index_url=None,
+            only_binary=True,
+            no_binary=False,
         )
 
     if detected_platform == "darwin":
@@ -118,22 +120,10 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
-        # If CUDA builds are unavailable for this ABI, fall back to
-        # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
-        # without entering another native compilation path.
-        plans.append(
-            LlamaCppInstallPlan(
-                platform=primary.platform,
-                backend="cpu",
-                package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url=LLAMA_CPP_PYPI_INDEX_URL,
-                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
-                only_binary=True,
-                no_binary=False,
-            )
-        )
+        # Packaged Windows releases use the resource-bundled CUDA 12.4 wheel.
+        # Do not provide CPU or source-build fallbacks from the release plan.
+        return plans
+
 
     if primary.platform == "darwin":
         # Prefer a prebuilt macOS wheel first so packaged apps do not require

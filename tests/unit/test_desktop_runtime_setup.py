@@ -1445,6 +1445,7 @@ def test_maybe_reexec_for_runtime_refresh_handles_execve_oserror(monkeypatch):
 def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_SOURCE_BUILD_ENV, '1')
     state_path = tmp_path / 'runtime_state.json'
     monkeypatch.setattr(desktop_runtime_setup, '_runtime_state_path', lambda: state_path)
     now = 1_000.0
@@ -1731,6 +1732,7 @@ def test_run_pip_install_emits_five_second_heartbeat(monkeypatch):
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_SOURCE_BUILD_ENV, '1')
     state_path = tmp_path / 'runtime_state.json'
     monkeypatch.setattr(desktop_runtime_setup, '_runtime_state_path', lambda: state_path)
     now = 2_000.0

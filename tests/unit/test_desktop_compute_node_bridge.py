@@ -3382,7 +3382,6 @@ class ShutdownTrackingRuntime(FakeRuntime):
     def stop(self):
         self.stop_calls += 1
         self.relay_client.stop()
-        self.relay_client.unregister_from_relay()
 
 
 def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch):
@@ -3410,6 +3409,13 @@ def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch
     assert 'desktop.compute_node_bridge.poll.cancel_requested' in output.err
     assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
     assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload["unregister_required"] is True
+    assert stopped_payload["unregister_attempted"] is True
+    assert stopped_payload["unregister_outcome"] == "complete"
+    assert stopped_payload["unregister_success_count"] == 1
+    assert stopped_payload["unregister_failure_count"] == 0
+    assert stopped_payload["cleanup_warning"] is None
 
 
 class StopFailureRelayClient(FakeRelayClient):
@@ -3524,7 +3530,17 @@ def test_run_continues_shutdown_when_unregister_raises(capsys, monkeypatch):
     assert 'desktop.compute_node_bridge.unregister.failed' in output.err
     assert 'exc_type=TimeoutError' in output.err
     assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
-    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['type'] == 'stopped'
+    assert stopped_payload["unregister_required"] is True
+    assert stopped_payload["unregister_attempted"] is True
+    assert stopped_payload["unregister_outcome"] in {"partial", "timed_out"}
+    assert stopped_payload["unregister_success_count"] == 0
+    assert stopped_payload["unregister_failure_count"] >= 1
+    assert "lease expiry" in (stopped_payload.get("cleanup_warning") or "")
+    assert "cipher" not in json.dumps(stopped_payload).lower()
+    assert "prompt" not in json.dumps(stopped_payload).lower()
+    assert "response" not in json.dumps(stopped_payload).lower()
 
 
 def test_cancelable_poll_worker_invokes_cancel_callback_promptly_during_long_poll():
@@ -3993,7 +4009,11 @@ def test_run_logs_unregister_skip_when_cancelled_before_registration(capsys, mon
 
     runtime = PreRegistrationCancelRuntime.last_instance
     assert runtime.relay_client.unregister_calls == 0
-    assert 'desktop.compute_node_bridge.unregister.skipped' in capsys.readouterr().err
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload["unregister_required"] is False
+    assert stopped_payload["unregister_attempted"] is False
+    assert stopped_payload["unregister_outcome"] == "not_required"
 
 
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):

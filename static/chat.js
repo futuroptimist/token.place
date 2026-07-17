@@ -1,8 +1,7 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const COMPUTE_NODE_COUNT_FAST_POLL_INTERVAL_MS = 1500;
-const COMPUTE_NODE_COUNT_STEADY_POLL_INTERVAL_MS = 15000;
-const COMPUTE_NODE_COUNT_FAST_POLL_WINDOW_MS = 10000;
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
+const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1200;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -44,14 +43,15 @@ new Vue({
         computeNodeCountRequestId: 0,
         computeNodeCountRefreshInFlight: false,
         computeNodeCountPollTimeout: null,
-        computeNodeCountFastPollUntil: 0
+        computeNodeCountRefreshQueued: false,
+        computeNodeCountFetchController: null,
+        computeNodeCountDestroyed: false
     },
     mounted() {
         this.detectTouchInput();
         this.selectedContextTier = this.loadStoredContextTier();
         this.fetchModels();
         this.generateClientKeys();
-        this.startComputeNodeCountFastPolling();
         this.refreshComputeNodeCount();
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
@@ -113,20 +113,15 @@ new Vue({
             }
         },
 
-        startComputeNodeCountFastPolling() {
-            this.computeNodeCountFastPollUntil = Date.now() + COMPUTE_NODE_COUNT_FAST_POLL_WINDOW_MS;
-        },
-
-        getComputeNodeCountPollDelay() {
-            if (Date.now() < this.computeNodeCountFastPollUntil) {
-                return COMPUTE_NODE_COUNT_FAST_POLL_INTERVAL_MS;
-            }
-            return COMPUTE_NODE_COUNT_STEADY_POLL_INTERVAL_MS;
-        },
-
         scheduleComputeNodeCountRefresh(delayMs = null) {
-            const nextDelayMs = delayMs === null ? this.getComputeNodeCountPollDelay() : delayMs;
+            if (this.computeNodeCountDestroyed) {
+                return;
+            }
+            const nextDelayMs = delayMs === null ? COMPUTE_NODE_COUNT_POLL_INTERVAL_MS : delayMs;
             if (this.computeNodeCountRefreshInFlight) {
+                if (nextDelayMs === 0) {
+                    this.computeNodeCountRefreshQueued = true;
+                }
                 return;
             }
             this.clearComputeNodeCountPoller();
@@ -144,7 +139,6 @@ new Vue({
                 this.clearComputeNodeCountPoller();
                 return;
             }
-            this.startComputeNodeCountFastPolling();
             this.scheduleComputeNodeCountRefresh(0);
         },
 
@@ -154,12 +148,34 @@ new Vue({
             // another request before they finish; otherwise a stale count of one
             // can incorrectly suppress probing for a newly registered replacement.
             const applySupersededSuccess = options && options.applySupersededSuccess === true;
+            if (this.computeNodeCountDestroyed) {
+                return false;
+            }
+            if (this.computeNodeCountRefreshInFlight) {
+                if (options && options.queueImmediate === true) {
+                    this.computeNodeCountRefreshQueued = true;
+                }
+                return false;
+            }
             this.computeNodeCountRefreshInFlight = true;
             const requestId = this.computeNodeCountRequestId + 1;
             this.computeNodeCountRequestId = requestId;
+            this.computeNodeCountRefreshQueued = false;
+            const controller = typeof AbortController !== 'undefined'
+                ? new AbortController()
+                : null;
+            this.computeNodeCountFetchController = controller;
+            const requestTimeoutId = setTimeout(() => {
+                if (this.computeNodeCountFetchController === controller && controller) {
+                    controller.abort();
+                }
+            }, COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS);
 
             try {
-                const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                const response = await fetch('/relay/diagnostics', {
+                    cache: 'no-store',
+                    signal: controller ? controller.signal : undefined
+                });
                 if (requestId !== this.computeNodeCountRequestId && !applySupersededSuccess) {
                     return false;
                 }
@@ -197,9 +213,22 @@ new Vue({
                 this.computeNodeCountLastUpdated = '';
                 return false;
             } finally {
+                clearTimeout(requestTimeoutId);
+                if (this.computeNodeCountFetchController === controller) {
+                    this.computeNodeCountFetchController = null;
+                }
                 if (requestId === this.computeNodeCountRequestId || applySupersededSuccess) {
                     this.computeNodeCountRefreshInFlight = false;
-                    this.scheduleComputeNodeCountRefresh();
+                    if (this.computeNodeCountDestroyed) {
+                        this.computeNodeCountRefreshQueued = false;
+                        return;
+                    }
+                    if (this.computeNodeCountRefreshQueued) {
+                        this.computeNodeCountRefreshQueued = false;
+                        this.scheduleComputeNodeCountRefresh(0);
+                    } else {
+                        this.scheduleComputeNodeCountRefresh();
+                    }
                 }
             }
         },
@@ -1385,7 +1414,16 @@ new Vue({
         }
     },
     beforeDestroy() {
+        this.computeNodeCountDestroyed = true;
+        this.computeNodeCountRefreshQueued = false;
         this.clearComputeNodeCountPoller();
+        if (
+            this.computeNodeCountFetchController
+            && typeof this.computeNodeCountFetchController.abort === 'function'
+        ) {
+            this.computeNodeCountFetchController.abort();
+        }
+        this.computeNodeCountFetchController = null;
         if (typeof document !== 'undefined') {
             document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }

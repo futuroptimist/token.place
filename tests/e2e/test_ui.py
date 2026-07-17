@@ -546,8 +546,7 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
@@ -615,9 +614,88 @@ def test_compute_node_count_auto_refreshes_after_unregister(page: Page, base_url
 
     page.wait_for_function(
         "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
-        timeout=2500,
+        timeout=2000,
     )
     assert calls["count"] >= 2
+
+
+def test_compute_node_count_stalled_fetch_is_bounded_without_overlap(page: Page, base_url: str, setup_servers):
+    """Bound stalled diagnostics requests and keep polling single-flight."""
+    call_count = {"value": 0}
+    in_flight = {"value": 0}
+    max_in_flight = {"value": 0}
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        in_flight["value"] += 1
+        max_in_flight["value"] = max(max_in_flight["value"], in_flight["value"])
+        try:
+            if call_count["value"] == 1:
+                time.sleep(1.6)
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": 0,
+                        "total_api_v1_registered_compute_nodes": 0,
+                    }
+                ),
+            )
+        except Exception:
+            return
+        finally:
+            in_flight["value"] -= 1
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=5000,
+    )
+    assert call_count["value"] >= 2
+    assert max_in_flight["value"] == 1
+
+
+def test_compute_node_count_destroy_does_not_reschedule_after_inflight(page: Page, base_url: str, setup_servers):
+    """Destroying the Vue app during an in-flight refresh should stop further polling."""
+    call_count = {"value": 0}
+    first_request_started = threading.Event()
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            first_request_started.set()
+            time.sleep(0.4)
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": 1,
+                        "total_api_v1_registered_compute_nodes": 1,
+                    }
+                ),
+            )
+        except Exception:
+            return
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_request_started.wait(timeout=5), "Expected first diagnostics request"
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.$destroy();
+        }
+        """
+    )
+    calls_after_destroy = call_count["value"]
+    page.wait_for_timeout(1500)
+    assert call_count["value"] == calls_after_destroy
 
 
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
@@ -676,8 +754,7 @@ def test_compute_node_count_rejects_null_diagnostics(page: Page, base_url: str, 
         )
 
     page.route("**/relay/diagnostics", handle_null_diagnostics)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
@@ -698,8 +775,7 @@ def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics_failure)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")

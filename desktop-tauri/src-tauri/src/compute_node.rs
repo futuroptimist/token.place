@@ -78,6 +78,12 @@ pub struct ComputeNodeStatus {
     pub last_worker_error_code: Option<String>,
     pub last_worker_exit_code: Option<i64>,
     pub last_worker_restart_at_ms: Option<u64>,
+    pub stop_cleanup_required: Option<bool>,
+    pub stop_cleanup_attempted: Option<bool>,
+    pub stop_cleanup_outcome: Option<String>,
+    pub stop_cleanup_success_count: Option<usize>,
+    pub stop_cleanup_failure_count: Option<usize>,
+    pub stop_cleanup_warning: Option<String>,
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
@@ -402,6 +408,12 @@ fn startup_failure_status(
         last_worker_error_code: None,
         last_worker_exit_code: None,
         last_worker_restart_at_ms: None,
+        stop_cleanup_required: None,
+        stop_cleanup_attempted: None,
+        stop_cleanup_outcome: None,
+        stop_cleanup_success_count: None,
+        stop_cleanup_failure_count: None,
+        stop_cleanup_warning: None,
         operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
@@ -598,6 +610,38 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
         status.last_worker_restart_at_ms = payload
             .get("last_worker_restart_at_ms")
             .and_then(Value::as_u64);
+    }
+    if payload.get("unregister_required").is_some() {
+        status.stop_cleanup_required = payload.get("unregister_required").and_then(Value::as_bool);
+    }
+    if payload.get("unregister_attempted").is_some() {
+        status.stop_cleanup_attempted = payload
+            .get("unregister_attempted")
+            .and_then(Value::as_bool);
+    }
+    if payload.get("unregister_outcome").is_some() {
+        status.stop_cleanup_outcome = payload
+            .get("unregister_outcome")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("unregister_success_count").is_some() {
+        status.stop_cleanup_success_count = payload
+            .get("unregister_success_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+    }
+    if payload.get("unregister_failure_count").is_some() {
+        status.stop_cleanup_failure_count = payload
+            .get("unregister_failure_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+    }
+    if payload.get("cleanup_warning").is_some() {
+        status.stop_cleanup_warning = payload
+            .get("cleanup_warning")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
@@ -1028,6 +1072,12 @@ pub async fn start_compute_node(
         status.log_file_path = None;
         status.last_error = None;
         status.updated_at_ms = Some(current_time_ms());
+        status.stop_cleanup_required = None;
+        status.stop_cleanup_attempted = None;
+        status.stop_cleanup_outcome = None;
+        status.stop_cleanup_success_count = None;
+        status.stop_cleanup_failure_count = None;
+        status.stop_cleanup_warning = None;
     }
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),
@@ -1295,6 +1345,12 @@ pub async fn start_compute_node(
                 last_worker_error_code: None,
                 last_worker_exit_code: None,
                 last_worker_restart_at_ms: None,
+                stop_cleanup_required: None,
+                stop_cleanup_attempted: None,
+                stop_cleanup_outcome: None,
+                stop_cleanup_success_count: None,
+                stop_cleanup_failure_count: None,
+                stop_cleanup_warning: None,
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
@@ -1478,6 +1534,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    let mut bridge_killed = false;
     if let Some(mut child) = owned_child {
         let shutdown_deadline = Duration::from_secs(12);
         let shutdown_started = Instant::now();
@@ -1488,6 +1545,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
+            bridge_killed = true;
             eprintln!(
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
                 stop_session_id.as_deref().unwrap_or("unknown")
@@ -1530,6 +1588,31 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
+    let stop_outcome_error = {
+        let status = state.status.lock().await.clone();
+        let session_matches = match (stop_session_id.as_deref(), status.operator_session_id.as_deref()) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => true,
+        };
+        let warning = status.stop_cleanup_warning.clone().unwrap_or_else(|| {
+            "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into()
+        });
+        if bridge_killed {
+            Some(warning)
+        } else if !session_matches {
+            Some(warning)
+        } else if status.stop_cleanup_outcome.is_none() {
+            Some(warning)
+        } else if matches!(
+            status.stop_cleanup_outcome.as_deref(),
+            Some("partial" | "timed_out")
+        ) {
+            Some(warning)
+        } else {
+            None
+        }
+    };
+
     {
         let mut status = state.status.lock().await;
         status.running = false;
@@ -1538,8 +1621,13 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         status.registered_relay_urls.clear();
         status.active_relay_urls.clear();
         status.relay_runtime_state = Some("stopped".into());
-        status.last_error = None;
+        if let Some(error) = stop_outcome_error.clone() {
+            status.last_error = Some(error);
+        }
         status.updated_at_ms = Some(current_time_ms());
+    }
+    if let Some(error) = stop_outcome_error {
+        anyhow::bail!(error);
     }
     Ok(())
 }
@@ -2277,6 +2365,7 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.stop_cleanup_outcome = Some("complete".into());
         }
 
         let stop_result =
@@ -2326,6 +2415,7 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.stop_cleanup_outcome = Some("complete".into());
         }
 
         let started = Instant::now();
@@ -2359,6 +2449,10 @@ mod tests {
         let first_stdin = first_child.stdin.take().expect("first stdin");
         *state.child.lock().await = Some(first_child);
         *state.stdin.lock().await = Some(first_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.stop_cleanup_outcome = Some("complete".into());
+        }
 
         stop_compute_node(state.clone()).await.expect("first stop");
         assert!(state.child.lock().await.is_none());
@@ -2374,10 +2468,80 @@ mod tests {
         let second_stdin = second_child.stdin.take().expect("second stdin");
         *state.child.lock().await = Some(second_child);
         *state.stdin.lock().await = Some(second_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.stop_cleanup_outcome = Some("complete".into());
+        }
 
         stop_compute_node(state.clone()).await.expect("second stop");
         assert!(state.child.lock().await.is_none());
         assert!(state.stdin.lock().await.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_surfaces_partial_cleanup_warning() {
+        let state = ComputeNodeState::default();
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.stop_cleanup_outcome = Some("partial".into());
+            status.stop_cleanup_warning = Some(
+                "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into(),
+            );
+        }
+
+        let error = stop_compute_node(state.clone())
+            .await
+            .expect_err("partial cleanup should return an error");
+        assert!(
+            error
+                .to_string()
+                .contains("Operator stopped locally, but unregister did not complete")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_requires_cleanup_acknowledgement() {
+        let state = ComputeNodeState::default();
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.operator_session_id = Some("session-current".into());
+            status.stop_cleanup_outcome = None;
+        }
+
+        let error = stop_compute_node(state.clone())
+            .await
+            .expect_err("missing cleanup ack should return an error");
+        assert!(
+            error
+                .to_string()
+                .contains("Operator stopped locally, but unregister did not complete")
+        );
     }
 
     #[test]
@@ -2411,6 +2575,29 @@ mod tests {
         assert_eq!(status.warm_load_duration_ms, Some(250));
         assert_eq!(status.runtime_path.as_deref(), Some("sidecar"));
         assert_eq!(status.relay_runtime_path.as_deref(), Some("bridge"));
+    }
+
+    #[test]
+    fn update_status_from_event_rejects_stale_stop_cleanup_outcome() {
+        let mut status = ComputeNodeStatus {
+            operator_session_id: Some("session-current".into()),
+            sequence: Some(10),
+            stop_cleanup_outcome: Some("complete".into()),
+            ..ComputeNodeStatus::default()
+        };
+
+        let stale_payload = serde_json::json!({
+            "type": "stopped",
+            "operator_session_id": "session-old",
+            "sequence": 11,
+            "unregister_outcome": "partial",
+            "cleanup_warning": "stale",
+        });
+
+        let updated = update_status_from_event(&mut status, &stale_payload);
+        assert!(!updated);
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("complete"));
+        assert_eq!(status.stop_cleanup_warning, None);
     }
 
     #[test]

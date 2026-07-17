@@ -73,8 +73,8 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
 
 
 
-def fetch_relay_diagnostics_count(relay_url: str) -> int:
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=2) as response:  # nosec B310
+def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> int:
+    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
         payload = json.loads(response.read().decode("utf-8"))
     return int(payload["total_api_v1_registered_compute_nodes"])
 
@@ -84,15 +84,22 @@ def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeou
     deadline = started + timeout_seconds
     last_count: int | None = None
     last_error: Exception | None = None
-    while time.monotonic() < deadline:
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        remaining = deadline - now
         try:
-            last_count = fetch_relay_diagnostics_count(relay_url)
+            last_count = fetch_relay_diagnostics_count(
+                relay_url,
+                timeout_seconds=max(0.05, min(remaining, 0.5)),
+            )
             last_error = None
         except Exception as exc:  # pragma: no cover - depends on transient relay timing
             last_error = exc
             time.sleep(0.1)
             continue
-        if last_count == expected_count:
+        if time.monotonic() <= deadline and last_count == expected_count:
             return time.monotonic() - started
         time.sleep(0.1)
     raise AssertionError(
@@ -492,7 +499,7 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
-    env["TOKENPLACE_RELAY_API_V1_LEASE_SECONDS"] = "120"
+    env["TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"] = "120"
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
         f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
@@ -594,6 +601,18 @@ def main() -> int:
         )
         wait.until(lambda d: d.find_element(By.XPATH, registered_ready_xpath))
         wait_for_relay_diagnostics_count(relay_url, 1, timeout_seconds=5.0)
+        operator_log = read_tail(relay_log) + read_tail(driver_log)
+        assert "lease_seconds=120" in operator_log
+        app_window = driver.current_window_handle
+        driver.execute_script("window.open(arguments[0], '_blank');", relay_url)
+        landing_window = next(
+            handle for handle in driver.window_handles if handle != app_window
+        )
+        driver.switch_to.window(landing_window)
+        WebDriverWait(driver, 4).until(
+            lambda d: "Live compute nodes: 1" in d.page_source
+        )
+        driver.switch_to.window(app_window)
 
         prompt = driver.find_element(
             By.XPATH,
@@ -623,6 +642,7 @@ def main() -> int:
             )
         assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
 
+        stop_clicked_at = time.monotonic()
         driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
         stop_to_diagnostics_seconds = wait_for_relay_diagnostics_count(
             relay_url, 0, timeout_seconds=2.0
@@ -630,17 +650,25 @@ def main() -> int:
         operator_log = read_tail(relay_log) + read_tail(driver_log)
         assert "desktop.compute_node_bridge.unregister.attempted" in operator_log
         assert "desktop.compute_node_bridge.unregister.succeeded" in operator_log
+        attempted_index = operator_log.find("desktop.compute_node_bridge.unregister.attempted")
+        succeeded_index = operator_log.find("desktop.compute_node_bridge.unregister.succeeded")
+        exited_index = operator_log.find("desktop.compute_node.bridge_process_exited")
+        assert attempted_index >= 0 and succeeded_index > attempted_index
+        assert exited_index > succeeded_index
+        assert "desktop.compute_node.bridge_process_exited operator_session_id=" in operator_log
+        assert "killed=false" in operator_log
         assert "desktop.compute_node.bridge_kill_requested" not in operator_log
 
-        driver.get(relay_url)
-        landing_started = time.monotonic()
+        driver.switch_to.window(landing_window)
+        diagnostics_zero_at = stop_clicked_at + stop_to_diagnostics_seconds
         WebDriverWait(driver, 4).until(
             lambda d: "Live compute nodes: 0" in d.page_source
         )
+        widget_zero_at = time.monotonic()
         print(
             "desktop_operator_stop_latency "
             f"stop_to_diagnostics_seconds={stop_to_diagnostics_seconds:.3f} "
-            f"diagnostics_to_widget_seconds={time.monotonic() - landing_started:.3f}"
+            f"diagnostics_to_widget_seconds={widget_zero_at - diagnostics_zero_at:.3f}"
         )
     except TimeoutException as exc:
         raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc

@@ -1332,9 +1332,11 @@ class RelayClient:
         self._polling_stopped_by_request = True
         self._api_v1_stop_heartbeat_worker()
 
-    def unregister_from_relay(self) -> bool:
+    def unregister_from_relay(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
+        self.stop_polling = True
+        self._polling_stopped_by_request = True
         self._api_v1_stop_heartbeat_worker()
 
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
@@ -1373,6 +1375,14 @@ class RelayClient:
         relay_index_by_url = {url: index for index, url in enumerate(self._relay_urls)}
 
         for candidate_url in target_urls:
+            request_timeout = self._request_timeout
+            if isinstance(shutdown_deadline, (int, float)):
+                remaining = float(shutdown_deadline) - time.monotonic()
+                if remaining <= 0:
+                    failed_relays.add(candidate_url)
+                    last_error = "shutdown deadline exceeded before unregister request"
+                    continue
+                request_timeout = max(0.1, min(float(self._request_timeout), remaining))
             try:
                 request_kwargs = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
@@ -1384,7 +1394,7 @@ class RelayClient:
                 unregister_url = self._build_api_v1_url(candidate_url, "/relay/servers/unregister")
                 response = requests.post(
                     unregister_url,
-                    timeout=self._request_timeout,
+                    timeout=request_timeout,
                     **request_kwargs,
                 )
                 if response.status_code == 404:
@@ -1394,7 +1404,7 @@ class RelayClient:
                     legacy_url = f"{legacy_base_url}/unregister"
                     response = requests.post(
                         legacy_url,
-                        timeout=self._request_timeout,
+                        timeout=request_timeout,
                         **request_kwargs,
                     )
                 if response.status_code == 200:

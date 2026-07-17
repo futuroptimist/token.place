@@ -83,6 +83,7 @@ PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
 PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
+STOP_CLEANUP_BUDGET_DEFAULT_SECONDS = 10.5
 
 
 def _drain_stale_stdin_cancel_messages() -> int:
@@ -791,6 +792,19 @@ def _sleep_with_cancel(seconds: float) -> bool:
             return True
         time.sleep(0.1)
     return stop_requested()
+
+
+def _stop_cleanup_budget_seconds(default: float = STOP_CLEANUP_BUDGET_DEFAULT_SECONDS) -> float:
+    raw = os.environ.get("TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS")
+    if raw is None or not str(raw).strip():
+        return max(float(default), 0.1)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return max(float(default), 0.1)
+    if not math.isfinite(parsed) or parsed <= 0:
+        return max(float(default), 0.1)
+    return parsed
 
 
 def _expand_relay_url_candidate(candidate: Any) -> List[str]:
@@ -1600,42 +1614,25 @@ def run(args: argparse.Namespace) -> int:
                     f"exc_type={type(exc).__name__}",
                     file=sys.stderr,
                 )
-        unregister = getattr(relay_client, "unregister_from_relay", None)
+
+    def _relay_requires_unregister(relay_runtime: Any, active_relay_url: str) -> bool:
+        relay_client = getattr(relay_runtime, "relay_client", None)
         registered_relays = getattr(relay_client, "_api_v1_registered_relays", None)
-        should_unregister = registration_succeeded_by_relay.get(active_relay_url, False) or (
+        return registration_succeeded_by_relay.get(active_relay_url, False) or (
             isinstance(registered_relays, set) and bool(registered_relays)
         )
-        if callable(unregister) and should_unregister:
-            print(
-                "desktop.compute_node_bridge.unregister.attempted "
-                f"relay={_sanitize_relay_target(active_relay_url)} "
-                f"key_fingerprint={_relay_key_fingerprint(relay_client)}",
-                file=sys.stderr,
-            )
-            try:
-                unregistered = bool(unregister())
-            except Exception as exc:
-                print(
-                    "desktop.compute_node_bridge.unregister.failed "
-                    f"relay={_sanitize_relay_target(active_relay_url)} "
-                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
-                    f"exc_type={type(exc).__name__}",
-                    file=sys.stderr,
-                )
-            else:
-                unregister_event = (
-                    "desktop.compute_node_bridge.unregister.succeeded"
-                    if unregistered
-                    else "desktop.compute_node_bridge.unregister.failed"
-                )
-                print(
-                    f"{unregister_event} "
-                    f"relay={_sanitize_relay_target(active_relay_url)} "
-                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
-                    f"success={unregistered}",
-                    file=sys.stderr,
-                )
-        elif callable(unregister):
+
+    def unregister_with_shared_deadline(
+        relay_runtime: Any,
+        active_relay_url: str,
+        shutdown_deadline: float,
+    ) -> bool:
+        relay_client = getattr(relay_runtime, "relay_client", None)
+        unregister = getattr(relay_client, "unregister_from_relay", None)
+        should_unregister = _relay_requires_unregister(relay_runtime, active_relay_url)
+        if not callable(unregister):
+            return True
+        if not should_unregister:
             print(
                 "desktop.compute_node_bridge.unregister.skipped "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1643,6 +1640,40 @@ def run(args: argparse.Namespace) -> int:
                 "reason=not_registered",
                 file=sys.stderr,
             )
+            return True
+        print(
+            "desktop.compute_node_bridge.unregister.attempted "
+            f"relay={_sanitize_relay_target(active_relay_url)} "
+            f"key_fingerprint={_relay_key_fingerprint(relay_client)}",
+            file=sys.stderr,
+        )
+        try:
+            try:
+                unregistered = bool(unregister(shutdown_deadline=shutdown_deadline))
+            except TypeError:
+                unregistered = bool(unregister())
+        except Exception as exc:
+            print(
+                "desktop.compute_node_bridge.unregister.failed "
+                f"relay={_sanitize_relay_target(active_relay_url)} "
+                f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                f"exc_type={type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return False
+        unregister_event = (
+            "desktop.compute_node_bridge.unregister.succeeded"
+            if unregistered
+            else "desktop.compute_node_bridge.unregister.failed"
+        )
+        print(
+            f"{unregister_event} "
+            f"relay={_sanitize_relay_target(active_relay_url)} "
+            f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+            f"success={unregistered}",
+            file=sys.stderr,
+        )
+        return unregistered
 
     def mark_all_relays_unregistered(
         *,
@@ -2222,6 +2253,13 @@ def run(args: argparse.Namespace) -> int:
                 )
                 break
 
+    stop_cleanup_outcome = "not_required"
+    stop_cleanup_warning: Optional[str] = None
+    stop_cleanup_required = False
+    stop_cleanup_attempted = False
+    stop_cleanup_success_count = 0
+    stop_cleanup_failure_count = 0
+
     try:
         if warm_runtime_before_registration():
             for relay_runtime in runtimes:
@@ -2239,6 +2277,9 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        cleanup_budget_seconds = _stop_cleanup_budget_seconds()
+        cleanup_started = time.monotonic()
+        cleanup_deadline = cleanup_started + cleanup_budget_seconds
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
             print(
@@ -2251,7 +2292,57 @@ def run(args: argparse.Namespace) -> int:
         for worker in relay_poll_workers.values():
             worker.shutdown()
         for thread in poll_threads:
-            thread.join(timeout=1)
+            thread.join(timeout=max(0.0, min(1.0, cleanup_deadline - time.monotonic())))
+        unregister_targets: List[Tuple[Any, str]] = []
+        for relay_runtime in runtimes:
+            active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
+            if _relay_requires_unregister(relay_runtime, active_relay_url):
+                unregister_targets.append((relay_runtime, active_relay_url))
+
+        stop_cleanup_required = bool(unregister_targets)
+        if unregister_targets:
+            stop_cleanup_attempted = True
+            futures: Dict[concurrent.futures.Future[Any], Tuple[Any, str]] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(unregister_targets)) as pool:
+                for target_runtime, target_relay_url in unregister_targets:
+                    futures[
+                        pool.submit(
+                            unregister_with_shared_deadline,
+                            target_runtime,
+                            target_relay_url,
+                            cleanup_deadline,
+                        )
+                    ] = (target_runtime, target_relay_url)
+                remaining = max(cleanup_deadline - time.monotonic(), 0)
+                try:
+                    iterator = concurrent.futures.as_completed(
+                        list(futures.keys()),
+                        timeout=remaining if remaining > 0 else 0.001,
+                    )
+                    for future in iterator:
+                        try:
+                            success = bool(future.result())
+                        except Exception:
+                            success = False
+                        if success:
+                            stop_cleanup_success_count += 1
+                        else:
+                            stop_cleanup_failure_count += 1
+                except concurrent.futures.TimeoutError:
+                    pending = sum(1 for future in futures if not future.done())
+                    stop_cleanup_failure_count += pending
+            if stop_cleanup_failure_count == 0:
+                stop_cleanup_outcome = "complete"
+            elif time.monotonic() >= cleanup_deadline:
+                stop_cleanup_outcome = "timed_out"
+            else:
+                stop_cleanup_outcome = "partial"
+            if stop_cleanup_outcome != "complete":
+                stop_cleanup_warning = (
+                    "Operator stopped locally, but unregister did not complete for one relay; "
+                    "it may remain listed until lease expiry."
+                )
+                last_error = last_error or stop_cleanup_warning
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
             print(
@@ -2288,6 +2379,14 @@ def run(args: argparse.Namespace) -> int:
             registered=False,
             active_relay_url=runtime.relay_client.relay_url,
             current_last_error=last_error,
+            extra={
+                "unregister_required": stop_cleanup_required,
+                "unregister_attempted": stop_cleanup_attempted,
+                "unregister_outcome": stop_cleanup_outcome,
+                "unregister_success_count": stop_cleanup_success_count,
+                "unregister_failure_count": stop_cleanup_failure_count,
+                "cleanup_warning": stop_cleanup_warning,
+            },
         )
     )
     return 1 if warm_load_fatal or poll_failure_fatal or recovery_fatal else 0

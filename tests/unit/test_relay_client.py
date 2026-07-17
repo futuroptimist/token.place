@@ -669,31 +669,95 @@ class TestRelayClient:
 
         heartbeat_entered = threading.Event()
         allow_heartbeat_return = threading.Event()
+        network_events = []
 
         def delayed_register(candidate_url):
             assert candidate_url == relay_client.relay_url
+            network_events.append("register_started")
             heartbeat_entered.set()
             assert allow_heartbeat_return.wait(timeout=2)
             return {"next_ping_in_x_seconds": 120, "poll_wait_seconds": 1}
 
         relay_client.register_api_v1_compute_node = delayed_register
-        heartbeat_thread = threading.Thread(target=relay_client._api_v1_heartbeat_worker)
-        heartbeat_thread.start()
-        assert heartbeat_entered.wait(timeout=2)
+        with patch('utils.networking.relay_client.requests.post') as mock_post:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            def unregister_side_effect(*args, **kwargs):
+                network_events.append("unregister_post")
+                return mock_response
+            mock_post.side_effect = unregister_side_effect
+            heartbeat_thread = threading.Thread(target=relay_client._api_v1_heartbeat_worker)
+            heartbeat_thread.start()
+            assert heartbeat_entered.wait(timeout=2)
 
-        relay_client.stop_polling = True
-        relay_client._polling_stopped_by_request = True
-        relay_client._api_v1_heartbeat_stop.set()
-        relay_client._api_v1_registered_relays.clear()
-        relay_client._api_v1_last_heartbeat_at.clear()
-        relay_client._api_v1_relay_wait_hints.clear()
-        allow_heartbeat_return.set()
-        heartbeat_thread.join(timeout=2)
+            relay_client.stop()
+            assert relay_client.unregister_from_relay() is True
+            allow_heartbeat_return.set()
+            heartbeat_thread.join(timeout=2)
 
-        assert not heartbeat_thread.is_alive()
-        assert relay_client._api_v1_registered_relays == set()
-        assert relay_client._api_v1_last_heartbeat_at == {}
-        assert relay_client._api_v1_relay_wait_hints == {}
+            assert not heartbeat_thread.is_alive()
+            assert relay_client._api_v1_registered_relays == set()
+            assert relay_client._api_v1_last_heartbeat_at == {}
+            assert relay_client._api_v1_relay_wait_hints == {}
+            assert network_events[-1] == "unregister_post"
+            assert network_events == ["register_started", "unregister_post"]
+
+    def test_unregister_from_relay_reports_partial_result_with_shared_deadline(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Partial multi-relay unregister should still remove healthy targets within deadline."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.additional_servers': ['http://backup-relay:6000'],
+        }
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        primary = 'http://primary-relay:5000'
+        backup = 'http://backup-relay:6000'
+        client._api_v1_registered_relays.update({primary, backup})
+        client._api_v1_last_heartbeat_at.update({primary: 1.0, backup: 2.0})
+        client._api_v1_relay_wait_hints = {
+            primary: {'next_ping_in_x_seconds': 30},
+            backup: {'next_ping_in_x_seconds': 30},
+        }
+
+        requested = []
+
+        def side_effect(url, **kwargs):
+            requested.append(url)
+            response = MagicMock()
+            if url.startswith(primary):
+                response.status_code = 200
+                return response
+            raise requests.Timeout("relay timeout")
+
+        with patch('utils.networking.relay_client.requests.post', side_effect=side_effect):
+            started = time.monotonic()
+            result = client.unregister_from_relay(shutdown_deadline=time.monotonic() + 0.2)
+            elapsed = time.monotonic() - started
+
+        assert result is False
+        assert elapsed < 1.0
+        assert requested == [
+            f'{primary}/api/v1/relay/servers/unregister',
+            f'{backup}/api/v1/relay/servers/unregister',
+        ]
+        assert client._api_v1_registered_relays == {backup}
+        assert primary not in client._api_v1_last_heartbeat_at
+        assert backup in client._api_v1_last_heartbeat_at
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_uses_registration_token(

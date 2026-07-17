@@ -51,6 +51,7 @@ COMPUTE_NODE_CONTROL_PLANE_ROUTES = {
     ("POST", "/api/v1/relay/servers/unregister"),
     ("POST", "/api/v1/relay/servers/poll"),
     ("POST", "/api/v1/relay/responses"),
+    ("POST", "/api/v1/relay/requests/control"),
 }
 
 INTERNAL_RELAY_LIFECYCLE_ROUTES = {

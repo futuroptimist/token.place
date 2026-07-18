@@ -1507,6 +1507,70 @@ class TestRelayClient:
             'https://relay.example.evilish/api/v1/relay/servers/control'
         ) == ''
 
+    def test_api_v1_control_credential_lookup_and_mutation_use_map_lock(
+        self, relay_client, caplog
+    ):
+        class GuardedCredentialMap(dict):
+            def __init__(self, guard, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._guard = guard
+                self.items_called = threading.Event()
+
+            def items(self):
+                assert self._guard.locked()
+                self.items_called.set()
+                return super().items()
+
+            def __setitem__(self, key, value):
+                assert self._guard.locked()
+                return super().__setitem__(key, value)
+
+            def pop(self, key, default=None):
+                assert self._guard.locked()
+                return super().pop(key, default)
+
+            def clear(self):
+                assert self._guard.locked()
+                return super().clear()
+
+        credential = 'guarded-base-path-control-secret'
+        guarded = GuardedCredentialMap(
+            relay_client._api_v1_control_credentials_lock,
+            {'https://relay.example/api/v1': credential},
+        )
+        relay_client._api_v1_control_credentials_by_relay = guarded
+
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v1/relay/servers/control'
+        ) == credential
+        assert guarded.items_called.is_set()
+
+        relay_client._store_api_v1_control_credential(
+            'https://relay.example/api/v1/blue', 'rotated-secret'
+        )
+        assert relay_client._api_v1_control_credential_for_relay(
+            'https://relay.example/api/v1/blue'
+        ) == 'rotated-secret'
+        relay_client._pop_api_v1_control_credential('https://relay.example/api/v1/blue')
+        assert relay_client._api_v1_control_credential_for_relay(
+            'https://relay.example/api/v1/blue'
+        ) == ''
+
+        response = MagicMock(status_code=403)
+        response.headers = {'content-type': 'text/plain'}
+        response.text = f'credential echoed without label {credential}'
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client._api_v1_http_error_result(
+                response,
+                method='POST',
+                url='https://relay.example/api/v1/relay/servers/control',
+                token_sent=False,
+                next_ping_in_x_seconds=relay_client._request_timeout,
+            )
+
+        assert credential not in json.dumps(result, sort_keys=True)
+        assert credential not in caplog.text
+
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
         self, mock_post, relay_client, caplog

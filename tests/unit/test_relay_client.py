@@ -1452,6 +1452,62 @@ class TestRelayClient:
             assert forbidden not in summary
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_api_v1_non_200_diagnostic_redacts_base_path_control_credential(
+        self, mock_post, relay_client, caplog
+    ):
+        credential = 'relay-control-secret-for-api-v1-base-path'
+        relay_client._api_v1_control_credentials_by_relay[
+            'https://relay.example/api/v1'
+        ] = credential
+        response = MagicMock(status_code=403)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.json.return_value = {
+            'error': f'bad owner credential {credential}',
+            'relayControlCredential': credential,
+            'controlCredential': credential,
+            'detail': {'message': f'unlabelled echo {credential}'},
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client._api_v1_http_error_result(
+                response,
+                method='POST',
+                url='https://relay.example/api/v1/relay/servers/unregister',
+                token_sent=False,
+                next_ping_in_x_seconds=relay_client._request_timeout,
+            )
+
+        rendered = json.dumps(result, sort_keys=True)
+        assert credential not in rendered
+        assert credential not in caplog.text
+        assert 'bad owner credential [redacted]' in result['relay_error']
+        body_snippet = result['relay_http_diagnostic']['body_snippet']
+        assert '"relayControlCredential":"[redacted]"' in body_snippet
+        assert '"controlCredential":"[redacted]"' in body_snippet
+
+    def test_api_v1_control_credential_lookup_uses_slash_delimited_longest_prefix(self, relay_client):
+        relay_client._api_v1_control_credentials_by_relay.update({
+            'https://relay.example': 'host-secret',
+            'https://relay.example/api/v1': 'base-path-secret',
+            'https://relay.example/api/v10': 'wrong-path-secret',
+            'https://relay.example.evil/api/v1': 'evil-secret',
+        })
+
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v1/relay/servers/control'
+        ) == 'base-path-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v10/relay/servers/control'
+        ) == 'wrong-path-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example.evil/api/v1/relay/servers/control'
+        ) == 'evil-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example.evilish/api/v1/relay/servers/control'
+        ) == ''
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
         self, mock_post, relay_client, caplog
     ):

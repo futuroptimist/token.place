@@ -498,6 +498,7 @@ _API_V1_SENSITIVE_BODY_KEYS = {
     "controlcred",
     "relay_control_credential",
     "relay_controlcredential",
+    "relaycontrolcredential",
     "token",
     "authorization",
     "private_key",
@@ -1567,6 +1568,25 @@ class RelayClient:
             'next_ping_in_x_seconds': self._request_timeout,
         }
 
+
+    def _api_v1_control_credential_for_request_url(self, url: str) -> str:
+        """Return the credential for the exact relay target that produced a request URL."""
+
+        request_target = self._compose_relay_url(url, None)
+        best_match = ""
+        best_credential = ""
+        for relay_target, credential in self._api_v1_control_credentials_by_relay.items():
+            if not isinstance(relay_target, str) or not isinstance(credential, str) or not credential:
+                continue
+            candidate = self._compose_relay_url(relay_target, None)
+            if not candidate:
+                continue
+            if request_target == candidate or request_target.startswith(f"{candidate}/"):
+                if len(candidate) > len(best_match):
+                    best_match = candidate
+                    best_credential = credential
+        return best_credential
+
     def _api_v1_non_200_diagnostic(
         self,
         response: Any,
@@ -1583,10 +1603,7 @@ class RelayClient:
         secrets = (
             self._registration_token or "",
             getattr(self.crypto_manager, "public_key_b64", ""),
-            self._api_v1_control_credentials_by_relay.get(
-                self._compose_relay_url(f"{parsed_url.scheme}://{parsed_url.netloc}", None) if parsed_url.netloc else url,
-                "",
-            ),
+            self._api_v1_control_credential_for_request_url(url),
         )
         body_snippet, parsed_json = _safe_api_v1_response_body_snippet(
             response,

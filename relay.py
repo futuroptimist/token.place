@@ -1181,10 +1181,10 @@ def _context_tier_can_satisfy(active_tier: Any, requested_tier: str) -> bool:
 
 def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: float | None = None) -> int:
     now = time.monotonic() if now_monotonic is None else now_monotonic
-    in_flight_requests = payload.get("api_v1_in_flight_requests")
-    if not isinstance(in_flight_requests, dict):
-        return 0
     with api_v1_in_flight_requests_lock:
+        in_flight_requests = payload.get("api_v1_in_flight_requests")
+        if not isinstance(in_flight_requests, dict):
+            return 0
         in_flight_entries = list(in_flight_requests.values())
     active = 0
     for entry in in_flight_entries:
@@ -1221,12 +1221,12 @@ def _prune_api_v1_stale_in_flight_entries(payload: dict[str, Any], *, now_monoto
     the owner-authenticated tombstone.  Only legacy entries without deadline
     metadata may be raw-pruned.
     """
-    in_flight_requests = payload.get("api_v1_in_flight_requests")
-    if not isinstance(in_flight_requests, dict):
-        return 0
     removed = 0
     expired_targets: list[tuple[str, str]] = []
     with api_v1_in_flight_requests_lock:
+        in_flight_requests = payload.get("api_v1_in_flight_requests")
+        if not isinstance(in_flight_requests, dict):
+            return 0
         for request_id, entry in list(in_flight_requests.items()):
             if not _api_v1_in_flight_entry_can_be_pruned(entry, now_monotonic=now_monotonic):
                 continue

@@ -4193,6 +4193,88 @@ def test_api_v1_absolute_deadline_expiry_rejects_late_response(client, monkeypat
     assert late_response.get_json()['error']['code'] == 'expired'
 
 
+def test_api_v1_control_expired_in_flight_path_creates_owner_tombstone(client, monkeypatch):
+    """An already-expired control poll must still terminalize through cancellation machinery."""
+
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    request_id = 'req-control-expired-inflight-tombstone'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    entry = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
+    deadline = time.monotonic() - 1.0
+    entry['request_deadline_monotonic'] = deadline
+    entry['expires_at'] = time.monotonic() + 60.0
+
+    control_payload = {
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    }
+    first = client.post('/api/v1/relay/servers/control', json=control_payload)
+    second = client.post('/api/v1/relay/servers/control', json=control_payload)
+    ack = client.post('/api/v1/relay/servers/control', json=control_payload | {'acknowledge': True})
+
+    assert first.status_code == 200
+    assert first.get_json()['status'] == 'expired'
+    assert second.status_code == 200
+    assert second.get_json()['status'] == 'expired'
+    assert ack.status_code == 200
+    assert ack.get_json()['status'] == 'expired'
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert relay_module._get_terminal_request(DUMMY_CLIENT_PUB_KEY, request_id)['status'] == 'expired'
+
+
+def test_api_v1_control_snapshots_in_flight_under_in_flight_lock(client, monkeypatch):
+    """Document lock ordering for owner/in-flight reads in the control route."""
+
+    class TrackingLock:
+        def __init__(self):
+            self.depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args):
+            self.depth -= 1
+
+    class GuardedPayload(dict):
+        def __init__(self, *args, tracking_lock, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._tracking_lock = tracking_lock
+
+        def get(self, key, default=None):
+            if key == 'api_v1_in_flight_requests':
+                assert self._tracking_lock.depth > 0
+            return super().get(key, default)
+
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    request_id = 'req-control-inflight-lock'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    tracking_lock = TrackingLock()
+    known_servers[DUMMY_SERVER_PUB_KEY] = GuardedPayload(
+        known_servers[DUMMY_SERVER_PUB_KEY],
+        tracking_lock=tracking_lock,
+    )
+    monkeypatch.setattr(relay_module, 'api_v1_in_flight_requests_lock', tracking_lock)
+
+    control = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    })
+
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'active'
+
 
 def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, monkeypatch):
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
@@ -4276,44 +4358,62 @@ def test_api_v1_cancel_and_response_race_has_single_winner(client, monkeypatch):
     assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
     barrier = threading.Barrier(2)
     results = {}
+    errors = []
 
     def submit_response():
-        with app.test_client() as race_client:
-            barrier.wait(timeout=5)
-            results['response'] = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code
+        try:
+            with app.test_client() as race_client:
+                barrier.wait(timeout=5)
+                response = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+                results['response'] = response.status_code
+                results['response_body'] = response.get_json()
+        except Exception as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
 
     def cancel_request():
-        with app.test_client() as race_client:
-            barrier.wait(timeout=5)
-            results['cancel'] = race_client.post('/api/v1/relay/requests/cancel', json={
-                'client_public_key': DUMMY_CLIENT_PUB_KEY,
-                'request_id': request_id,
-                'status': 'cancelled',
-                'reason': 'requester_cancelled',
-                'cancel_token': 'proof',
-            }).status_code
+        try:
+            with app.test_client() as race_client:
+                barrier.wait(timeout=5)
+                response = race_client.post('/api/v1/relay/requests/cancel', json={
+                    'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                    'request_id': request_id,
+                    'status': 'cancelled',
+                    'reason': 'requester_cancelled',
+                    'cancel_token': 'proof',
+                })
+                results['cancel'] = response.status_code
+                results['cancel_body'] = response.get_json()
+        except Exception as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
 
     threads = [threading.Thread(target=submit_response), threading.Thread(target=cancel_request)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
+    assert not errors
     assert all(not thread.is_alive() for thread in threads)
+    assert {'cancel', 'response'} <= results.keys()
     assert results['cancel'] in {200, 403}
     assert results['response'] in {200, 410}
-    assert 200 in {results['cancel'], results['response']}
 
     retrieve = client.post('/api/v1/relay/responses/retrieve', json={
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'request_id': request_id,
     })
     if results['response'] == 200:
+        assert results['cancel'] == 403 or results['cancel_body']['removed_from_queue'] == 0
         assert retrieve.status_code == 200
         assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+        assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) not in relay_module.api_v1_control_tombstones
     else:
+        assert results['cancel'] == 200
         assert retrieve.status_code == 410
         assert retrieve.get_json()['error']['code'] == 'cancelled'
+        assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) in relay_module.api_v1_control_tombstones
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
     assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
 
 

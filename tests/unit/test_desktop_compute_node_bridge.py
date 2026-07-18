@@ -4306,6 +4306,107 @@ def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_failure(
     assert 'desktop.compute_node_bridge.unregister.failed' in output.err
     assert 'reason=missing_unregister_hook' in output.err
 
+class QuiesceFailureRelayClient(MultiRelayShutdownRelayClient):
+    def __init__(self, relay_url, *, fail_wait=False, fail_heartbeat=False):
+        super().__init__(relay_url, unregister_result=True, unregister_delay=0.0)
+        self._api_v1_registered_relays = {relay_url}
+        self.fail_wait = fail_wait
+        self.fail_heartbeat = fail_heartbeat
+        self.latch_calls = 0
+        self.wait_calls = 0
+        self.heartbeat_stop_calls = 0
+
+    def _api_v1_latch_shutdown(self):
+        self.latch_calls += 1
+
+    def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline=None):
+        self.wait_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.fail_wait:
+            raise RuntimeError('wait failed with https://secret.example?token=abc')
+        return True
+
+    def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline=None):
+        self.heartbeat_stop_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.fail_heartbeat:
+            raise RuntimeError('heartbeat failed with https://secret.example?token=abc')
+        return True
+
+
+class QuiesceFailureRuntime(MultiRelayShutdownRuntime):
+    instances = []
+    fail_wait = False
+    fail_heartbeat = False
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = QuiesceFailureRelayClient(
+            config.relay_url,
+            fail_wait=self.fail_wait,
+            fail_heartbeat=self.fail_heartbeat,
+        )
+        QuiesceFailureRuntime.instances.append(self)
+
+
+def _run_quiesce_failure(monkeypatch, capsys, *, fail_wait=False, fail_heartbeat=False):
+    _reset_cancel_queue()
+    QuiesceFailureRuntime.instances = []
+    QuiesceFailureRuntime.fail_wait = fail_wait
+    QuiesceFailureRuntime.fail_heartbeat = fail_heartbeat
+    _install_fake_runtime_module(monkeypatch, runtime_cls=QuiesceFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example/path?token=secret',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    return capsys.readouterr(), QuiesceFailureRuntime.instances[0]
+
+
+def test_run_reports_partial_cleanup_when_mutation_quiescence_raises(capsys, monkeypatch):
+    output, runtime = _run_quiesce_failure(monkeypatch, capsys, fail_wait=True)
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.wait_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert 'desktop.compute_node_bridge.relay.quiesce_failed' in output.err
+    assert 'token=secret' not in output.err
+
+
+def test_run_reports_partial_cleanup_when_heartbeat_quiescence_raises(capsys, monkeypatch):
+    output, runtime = _run_quiesce_failure(monkeypatch, capsys, fail_heartbeat=True)
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.wait_calls == 1
+    assert runtime.relay_client.heartbeat_stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert 'desktop.compute_node_bridge.relay.quiesce_failed' in output.err
+    assert 'token=secret' not in output.err
+
+
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

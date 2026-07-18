@@ -3682,7 +3682,7 @@ def _api_v1_response_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_K
 
 
 def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):
-    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 60.0)
     monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '1')
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,
@@ -3692,9 +3692,7 @@ def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeyp
     }
     queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-expired-late-response'))
     assert queued.status_code == 200
-    original_time = time.time
     original_monotonic = time.monotonic
-    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
     monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 2.0)
 
     response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload('req-expired-late-response'))
@@ -3709,6 +3707,119 @@ def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeyp
     })
     assert retrieve.status_code == 410
     assert retrieve.get_json()['error']['code'] == 'expired'
+
+
+def test_api_v1_control_expiry_response_race_both_orderings(client, monkeypatch):
+    request_id = 'req-control-expiry-response-race'
+    server_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+
+    response_done = threading.Event()
+    first_errors = []
+    first_results = {}
+
+    def response_first_submit():
+        try:
+            with app.test_client() as race_client:
+                accepted = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+                first_results['response'] = accepted.status_code
+                first_results['response_body'] = accepted.get_json()
+                response_done.set()
+        except BaseException as exc:  # pragma: no cover - reported below
+            first_errors.append(exc)
+            response_done.set()
+
+    def response_first_control():
+        try:
+            with app.test_client() as race_client:
+                # Response-first ordering is forced by waiting for the response
+                # event before the owner asks for control.
+                assert response_done.wait(timeout=5)
+                first_results['control_ready'] = True
+                control = race_client.post(
+                    '/api/v1/relay/servers/control',
+                    json=server_payload | {'request_id': request_id},
+                )
+                first_results['control'] = control.status_code
+                first_results['control_body'] = control.get_json()
+        except BaseException as exc:  # pragma: no cover - reported below
+            first_errors.append(exc)
+
+    response_thread = threading.Thread(target=response_first_submit)
+    control_thread = threading.Thread(target=response_first_control)
+    response_thread.start()
+    control_thread.start()
+    for thread in (response_thread, control_thread):
+        thread.join(timeout=5)
+    assert not response_thread.is_alive()
+    assert not control_thread.is_alive()
+    assert first_errors == []
+    assert first_results['response'] == 200
+    assert first_results['control'] == 200
+    assert first_results['control_body']['status'] == 'completed/unavailable'
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    assert retrieved.status_code == 200
+    assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) not in relay_module.api_v1_control_tombstones
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+
+    terminal_request_id = 'req-control-expiry-response-race-terminal'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(terminal_request_id)).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    original_monotonic = time.monotonic
+    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 400.0)
+    second_barrier = threading.Barrier(2)
+    terminal_done = threading.Event()
+    second_errors = []
+    second_results = {}
+
+    def terminal_first_control():
+        try:
+            with app.test_client() as race_client:
+                second_barrier.wait(timeout=5)
+                control = race_client.post(
+                    '/api/v1/relay/servers/control',
+                    json=server_payload | {'request_id': terminal_request_id},
+                )
+                second_results['control'] = control.status_code
+                second_results['control_body'] = control.get_json()
+                terminal_done.set()
+        except BaseException as exc:  # pragma: no cover - reported below
+            second_errors.append(exc)
+            terminal_done.set()
+
+    def terminal_first_response():
+        try:
+            with app.test_client() as race_client:
+                second_barrier.wait(timeout=5)
+                assert terminal_done.wait(timeout=5)
+                late = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(terminal_request_id))
+                second_results['response'] = late.status_code
+                second_results['response_body'] = late.get_json()
+        except BaseException as exc:  # pragma: no cover - reported below
+            second_errors.append(exc)
+
+    threads = [threading.Thread(target=terminal_first_control), threading.Thread(target=terminal_first_response)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert second_errors == []
+    assert second_results['control'] == 200
+    assert second_results['control_body']['status'] == 'expired'
+    assert second_results['response'] == 410
+    assert second_results['response_body']['error']['code'] == 'expired'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+    assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, terminal_request_id) in relay_module.api_v1_control_tombstones
 
 
 def test_api_v1_queued_response_before_ttl_survives_delayed_retrieve(client, monkeypatch):

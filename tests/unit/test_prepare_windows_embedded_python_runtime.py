@@ -613,17 +613,23 @@ def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bu
 
 def test_prunes_only_known_distlib_non_x64_launchers_before_pe_validation(tmp_path):
     runtime = tmp_path / 'python-runtime'
-    runtime.mkdir()
+    distlib = runtime / 'Lib' / 'site-packages' / 'pip' / '_vendor' / 'distlib'
+    distlib.mkdir(parents=True)
     for name in ('t32.exe', 'w32.exe', 't64-arm.exe', 'w64-arm.exe'):
-        write_minimal_pe(runtime / name, machine=0x014C if name[1:3] == '32' else 0xAA64)
-    write_minimal_pe(runtime / 't64.exe')
-    write_minimal_pe(runtime / 'w64.exe')
+        write_minimal_pe(distlib / name, machine=0x014C if name[1:3] == '32' else 0xAA64)
+    write_minimal_pe(distlib / 't64.exe')
+    write_minimal_pe(distlib / 'w64.exe')
 
     removed = prep.prune_distlib_unused_non_x64_launchers(runtime)
 
-    assert removed == ['t32.exe', 't64-arm.exe', 'w32.exe', 'w64-arm.exe']
-    assert (runtime / 't64.exe').exists()
-    assert (runtime / 'w64.exe').exists()
+    assert removed == [
+        'Lib/site-packages/pip/_vendor/distlib/t32.exe',
+        'Lib/site-packages/pip/_vendor/distlib/t64-arm.exe',
+        'Lib/site-packages/pip/_vendor/distlib/w32.exe',
+        'Lib/site-packages/pip/_vendor/distlib/w64-arm.exe',
+    ]
+    assert (distlib / 't64.exe').exists()
+    assert (distlib / 'w64.exe').exists()
     prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
 
 
@@ -698,3 +704,57 @@ def test_validate_runtime_payload_reports_sorted_bounded_unresolved_import_set(t
     assert 'unresolved non-system DLL imports:' in message
     assert message.index('avendor.dll') < message.index('zvendor.dll')
     assert 'kernel32.dll' not in message
+
+
+def test_duplicate_non_pe_basenames_are_allowed_but_differing_duplicate_dlls_fail(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    (runtime / 'include').mkdir(parents=True)
+    (runtime / 'Lib' / 'site-packages' / 'pkg').mkdir(parents=True)
+    (runtime / 'include' / 'abstract.h').write_text('cpython', encoding='utf-8')
+    (runtime / 'Lib' / 'site-packages' / 'pkg' / 'abstract.h').write_text('numpy', encoding='utf-8')
+    write_minimal_pe(runtime / 'python.exe', imports=['python311.dll'])
+    write_minimal_pe(runtime / 'python311.dll')
+
+    prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+
+    (runtime / 'a').mkdir()
+    (runtime / 'b').mkdir()
+    write_minimal_pe(runtime / 'a' / 'vendor.dll')
+    write_minimal_pe(runtime / 'b' / 'vendor.dll', imports=['kernel32.dll'])
+    write_minimal_pe(runtime / 'uses_vendor.pyd', imports=['vendor.dll'])
+    with pytest.raises(prep.RuntimePrepError, match='ambiguous duplicate DLL basename: vendor.dll'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+
+
+def test_identical_duplicate_dlls_resolve_deterministically(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    (runtime / 'a').mkdir(parents=True)
+    (runtime / 'b').mkdir(parents=True)
+    write_minimal_pe(runtime / 'python.exe', imports=['vendor.dll'])
+    write_minimal_pe(runtime / 'a' / 'vendor.dll')
+    (runtime / 'b' / 'vendor.dll').write_bytes((runtime / 'a' / 'vendor.dll').read_bytes())
+
+    closure = prep.validate_runtime_payload(runtime, {'required_native_dlls': ['vendor.dll']})
+
+    assert {entry['name'] for entry in closure} >= {'python.exe', 'vendor.dll'}
+
+
+def test_distlib_launcher_pruning_is_restricted_to_distlib_resources(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    distlib = runtime / 'Lib' / 'site-packages' / 'pip' / '_vendor' / 'distlib'
+    distlib.mkdir(parents=True)
+    write_minimal_pe(distlib / 't32.exe', machine=0x014C)
+    write_minimal_pe(distlib / 'w64-arm.exe', machine=0xAA64)
+    unrelated = runtime / 'tools'
+    unrelated.mkdir()
+    write_minimal_pe(unrelated / 't32.exe', machine=0x014C)
+
+    removed = prep.prune_distlib_unused_non_x64_launchers(runtime)
+
+    assert removed == [
+        'Lib/site-packages/pip/_vendor/distlib/t32.exe',
+        'Lib/site-packages/pip/_vendor/distlib/w64-arm.exe',
+    ]
+    assert (unrelated / 't32.exe').exists()
+    with pytest.raises(prep.RuntimePrepError, match='x86 PE payload rejected: tools/t32.exe'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': []})

@@ -36,7 +36,8 @@
       "../../utils": "../../utils",
       "../../config.py": "../../config.py",
       "../../encrypt.py": "../../encrypt.py",
-      "../../requirements.txt": "../../requirements.txt"
+      "../../requirements.txt": "../../requirements.txt",
+      "python/embedded_python_runtime_windows_x86_64_manifest.json": "python/embedded_python_runtime_windows_x86_64_manifest.json"
     },
     "icon": [
       "icons/32x32.png",

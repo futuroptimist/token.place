@@ -199,8 +199,13 @@ def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[s
     optional_size = struct.unpack_from('<H', data, pe_offset + 20)[0]
     optional_offset = pe_offset + 24
     magic = struct.unpack_from('<H', data, optional_offset)[0]
-    data_directory_offset = optional_offset + (112 if magic == 0x20B else 96 if magic == 0x10B else -1)
-    if data_directory_offset < optional_offset:
+    if magic == 0x20B:
+        data_directory_offset = optional_offset + 112
+        image_base = struct.unpack_from('<Q', data, optional_offset + 24)[0]
+    elif magic == 0x10B:
+        data_directory_offset = optional_offset + 96
+        image_base = struct.unpack_from('<I', data, optional_offset + 28)[0]
+    else:
         raise RuntimePrepError(f'unsupported PE optional header: {label}')
     import_rva = 0
     delay_import_rva = 0
@@ -218,7 +223,14 @@ def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[s
         sections.append((virtual_address, virtual_size, raw_pointer, raw_size))
     imports: list[str] = []
 
-    def read_import_descriptors(rva: int, stride: int, name_index: int) -> None:
+    def pointer_to_rva(value: int, *, delay_attrs: int | None = None) -> int:
+        if delay_attrs is None or (delay_attrs & 1) or _rva_to_offset(sections, value) is not None:
+            return value
+        if value >= image_base:
+            return value - image_base
+        return value
+
+    def read_import_descriptors(rva: int, stride: int, name_index: int, *, delay: bool = False) -> None:
         if not rva:
             return
         desc_offset = _rva_to_offset(sections, rva)
@@ -226,7 +238,8 @@ def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[s
             fields = struct.unpack_from('<' + 'I' * (stride // 4), data, desc_offset)
             if not any(fields):
                 break
-            name_rva = fields[name_index]
+            delay_attrs = fields[0] if delay else None
+            name_rva = pointer_to_rva(fields[name_index], delay_attrs=delay_attrs)
             name_offset = _rva_to_offset(sections, name_rva)
             if name_offset is None:
                 raise RuntimePrepError(f'unresolved PE import name in {label}')
@@ -237,21 +250,33 @@ def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[s
             desc_offset += stride
 
     read_import_descriptors(import_rva, 20, 3)
-    read_import_descriptors(delay_import_rva, 32, 1)
+    read_import_descriptors(delay_import_rva, 32, 1, delay=True)
     return 'IMAGE_FILE_MACHINE_AMD64', imports
+
+def _resolve_import_target(importer: Path, dll: str, candidates: dict[str, list[Path]], runtime: Path) -> Path | None:
+    matches = candidates.get(dll.lower(), [])
+    if not matches:
+        return None
+    same_dir = [p for p in matches if p.parent == importer.parent]
+    pool = same_dir or matches
+    if len(pool) == 1:
+        return pool[0]
+    digests = {sha256_file(p) for p in pool}
+    if len(digests) == 1:
+        return sorted(pool, key=lambda p: p.relative_to(runtime).as_posix().lower())[0]
+    rels = [p.relative_to(runtime).as_posix() for p in pool]
+    raise RuntimePrepError(f"ambiguous duplicate DLL basename: {dll.lower()} ({sorted(rels)})")
 
 
 def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
-    files: dict[str, Path] = {}
-    for p in sorted((p for p in runtime.rglob('*') if p.is_file()), key=lambda item: item.relative_to(runtime).as_posix().lower()):
-        key = p.name.lower()
-        existing = files.get(key)
-        if existing is not None:
-            if sha256_file(existing) != sha256_file(p):
-                raise RuntimePrepError(f'ambiguous duplicate DLL basename: {key}')
-            continue
-        files[key] = p
-    queue = [p for p in files.values() if p.suffix.lower() in {'.exe', '.dll', '.pyd'}]
+    pe_files = sorted(
+        (p for p in runtime.rglob('*') if p.is_file() and p.suffix.lower() in {'.exe', '.dll', '.pyd'}),
+        key=lambda item: item.relative_to(runtime).as_posix().lower(),
+    )
+    candidates: dict[str, list[Path]] = {}
+    for p in pe_files:
+        candidates.setdefault(p.name.lower(), []).append(p)
+    queue = list(pe_files)
     seen: set[str] = set()
     closure: list[dict[str, object]] = []
     unresolved: list[str] = []
@@ -263,11 +288,11 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
             continue
         seen.add(key)
         machine, imports = inspect_pe(pe, rel)
-        closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports)})
+        closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports), 'sha256': sha256_file(pe)})
         for dll in imports:
             if is_windows_system_dll(dll):
                 continue
-            target = files.get(dll)
+            target = _resolve_import_target(pe, dll, candidates, runtime)
             if target is None:
                 unresolved.append(f'{dll} required by {rel}')
                 continue
@@ -277,21 +302,27 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
         suffix = '' if len(set(unresolved)) <= 25 else f' (and {len(set(unresolved)) - 25} more)'
         raise RuntimePrepError(f"unresolved non-system DLL imports: {bounded}{suffix}")
     required = {dll.lower() for dll in m.get('required_native_dlls', [])}
-    found = {entry['name'].lower() for entry in closure}
-    missing = sorted(required - found)
+    found_names = {entry['name'].lower() for entry in closure}
+    found_paths = {entry['path'].lower() for entry in closure}
+    missing = sorted(name for name in required if name not in found_names and name not in found_paths)
     if missing:
         raise RuntimePrepError(f'missing required PE DLL closure entry: {missing[0]}')
-    expected = {str(entry.get('name', '')).lower() for entry in m.get('pe_dll_closure', []) if isinstance(entry, dict)}
-    if expected and not expected.issubset(found):
-        raise RuntimePrepError(f'packaged PE closure incomplete: {sorted(expected - found)}')
+    expected = {str(entry.get('path') or entry.get('name', '')).lower() for entry in m.get('pe_dll_closure', []) if isinstance(entry, dict)}
+    if expected and not expected.issubset(found_paths | found_names):
+        raise RuntimePrepError(f'packaged PE closure incomplete: {sorted(expected - (found_paths | found_names))}')
     if not closure:
         raise RuntimePrepError('packaged PE closure must be non-empty')
     return closure
 
+def _is_distlib_launcher_resource(path: Path, runtime: Path) -> bool:
+    rel_parts = tuple(part.lower() for part in path.relative_to(runtime).parts)
+    return 'distlib' in rel_parts and ('pip' in rel_parts or rel_parts[-2:] == ('distlib', path.name.lower()))
+
+
 def prune_distlib_unused_non_x64_launchers(runtime: Path) -> list[str]:
     removed: list[str] = []
     for path in sorted(runtime.rglob('*.exe'), key=lambda p: p.relative_to(runtime).as_posix().lower()):
-        if path.name.lower() in DISTLIB_UNUSED_NON_X64_LAUNCHERS:
+        if path.name.lower() in DISTLIB_UNUSED_NON_X64_LAUNCHERS and _is_distlib_launcher_resource(path, runtime):
             removed.append(path.relative_to(runtime).as_posix())
             path.unlink()
     return removed

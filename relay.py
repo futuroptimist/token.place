@@ -1382,7 +1382,7 @@ def _evict_stale_servers() -> list[str]:
     default_stale_after = _server_stale_seconds()
     now_monotonic = time.monotonic()
     evicted: list[str] = []
-    stale_candidates: list[str] = []
+    stale_candidates: list[tuple[str, int, float]] = []
     with server_round_robin_lock:
         server_items = list(known_servers.items())
     for _, payload in server_items:
@@ -1408,31 +1408,15 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            stale_candidates.append(server_public_key)
+            stale_candidates.append((server_public_key, id(payload), now_monotonic))
 
-    for server_public_key in stale_candidates:
-        should_evict = False
-        with api_v1_terminal_transition_lock:
-            with server_round_robin_lock:
-                payload = known_servers.get(server_public_key)
-                if not isinstance(payload, dict):
-                    continue
-                polling_until = payload.get("polling_until_monotonic")
-                if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
-                    continue
-                in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
-                if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
-                    continue
-                stale_after = payload.get("last_ping_duration", default_stale_after)
-                if not isinstance(stale_after, (int, float)):
-                    stale_after = default_stale_after
-                stale_after = max(float(stale_after), 1.0)
-                if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
-                    continue
-                if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
-                    continue
-                should_evict = True
-        if should_evict and _unregister_server(server_public_key, eviction_reason="stale_lease"):
+    for server_public_key, expected_payload_id, stale_cutoff_monotonic in stale_candidates:
+        if _unregister_server(
+            server_public_key,
+            eviction_reason="stale_lease",
+            expected_payload_id=expected_payload_id,
+            stale_cutoff_monotonic=stale_cutoff_monotonic,
+        ):
             evicted.append(server_public_key)
     return evicted
 
@@ -1500,22 +1484,46 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
-def _unregister_server(server_public_key: str, *, eviction_reason: str = "unregistered") -> bool:
+def _unregister_server(
+    server_public_key: str,
+    *,
+    eviction_reason: str = "unregistered",
+    expected_payload_id: int | None = None,
+    stale_cutoff_monotonic: float | None = None,
+) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
-    _record_api_v1_server_unregistered(server_public_key)
     with api_v1_terminal_transition_lock:
         in_flight_requests: dict[str, Any] = {}
         owner_digest = None
         with server_round_robin_lock:
             server_payload = known_servers.get(server_public_key)
             if isinstance(server_payload, dict):
+                if expected_payload_id is not None and id(server_payload) != expected_payload_id:
+                    return False
+                if stale_cutoff_monotonic is not None:
+                    polling_until = server_payload.get("polling_until_monotonic")
+                    if isinstance(polling_until, (int, float)) and polling_until > stale_cutoff_monotonic:
+                        return False
+                    in_flight_until = server_payload.get("api_v1_in_flight_until_monotonic")
+                    if isinstance(in_flight_until, (int, float)) and in_flight_until > stale_cutoff_monotonic:
+                        return False
+                    stale_after = server_payload.get("last_ping_duration", _server_stale_seconds())
+                    if not isinstance(stale_after, (int, float)):
+                        stale_after = _server_stale_seconds()
+                    stale_after = max(float(stale_after), 1.0)
+                    if _server_ping_age_seconds(server_payload.get("last_ping")) <= stale_after:
+                        return False
+                    if _api_v1_active_in_flight_count(server_payload, now_monotonic=stale_cutoff_monotonic) > 0:
+                        return False
                 owner_digest = server_payload.get("api_v1_control_credential_digest")
                 with api_v1_in_flight_requests_lock:
                     raw_in_flight = server_payload.get("api_v1_in_flight_requests")
                     if isinstance(raw_in_flight, dict):
                         in_flight_requests = dict(raw_in_flight)
             removed = _remove_known_server(server_public_key)
+            if removed:
+                _record_api_v1_server_unregistered(server_public_key)
 
         with client_inference_requests_changed:
             dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
@@ -2498,8 +2506,7 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     with api_v1_terminal_transition_lock:
-        if _has_client_response_for_request(client_public_key, request_id):
-            return 0
+        completed_won = _has_client_response_for_request(client_public_key, request_id)
         removed = _remove_request_from_server_queues(client_public_key, request_id)
         pending_removed = _clear_pending_request(client_public_key, request_id)
         in_flight_removed = 0
@@ -2515,18 +2522,19 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
                         deadline_monotonic = entry.get("request_deadline_monotonic") if isinstance(entry, dict) else None
                         in_flight_requests.pop(request_id, None)
                         in_flight_removed += 1
-                        _add_api_v1_control_tombstone(
-                            server_public_key,
-                            request_id,
-                            client_public_key,
-                            status=status,
-                            reason=reason,
-                            deadline_monotonic=deadline_monotonic,
-                        )
+                        if not completed_won:
+                            _add_api_v1_control_tombstone(
+                                server_public_key,
+                                request_id,
+                                client_public_key,
+                                status=status,
+                                reason=reason,
+                                deadline_monotonic=deadline_monotonic,
+                            )
                         if not in_flight_requests:
                             server_payload.pop("api_v1_in_flight_requests", None)
         lifecycle_removed = bool(removed or pending_removed or in_flight_removed)
-        if lifecycle_removed and not _has_client_response_for_request(client_public_key, request_id):
+        if lifecycle_removed and not completed_won and not _has_client_response_for_request(client_public_key, request_id):
             _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",

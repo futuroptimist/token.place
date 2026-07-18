@@ -25,6 +25,13 @@ The route reuses the compute-node registration control-plane authentication (`X-
 
 A successful active or terminal state is visible only to the exact owner credential bound to the request. Polls for another server's request fail closed as `completed/unavailable`; they do not reveal cancellation state, ciphertext, client keys, cancel proofs, prompts, payloads, or model output.
 
+
+## Exact-owner unregister
+
+API v1 compute-node unregister uses the same exact-owner model as control polling. `POST /api/v1/relay/servers/unregister` requires the shared registration token when configured **and** the `control_credential` returned by that node's registration response while the node is live. Token-only, missing, wrong, or unsigned owner proof returns `403` without mutating the live registration, queues, in-flight request state, or owner-bound tombstones. Unregister remains idempotent for already-absent nodes and returns `removed: false` after the shared-token boundary succeeds.
+
+The legacy `/unregister` alias is retained only for old relay compatibility. Modern API v1 clients send the matching owner credential to both the API v1 route and, when falling back to the same relay's legacy alias after a `404`, the legacy route. Old relays that never issued a credential keep their existing fallback behavior.
+
 ## Response states
 
 Responses are JSON and intentionally bounded to control state:

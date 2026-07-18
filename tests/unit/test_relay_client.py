@@ -693,6 +693,72 @@ class TestRelayClient:
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_captures_control_credential(self, mock_post, relay_client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            'next_ping_in_x_seconds': 30,
+            'control_credential': 'relay-a-owner-secret',
+        }
+        mock_post.return_value = response
+
+        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+
+        assert result['control_credential'] == 'relay-a-owner-secret'
+        assert relay_client._api_v1_control_credentials_by_relay == {
+            'http://relay-a.example': 'relay-a-owner-secret'
+        }
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_sends_matching_control_credential_per_relay(self, mock_post, relay_client):
+        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+        relay_client._api_v1_registered_relays.update(relay_client._relay_urls)
+        relay_client._api_v1_last_heartbeat_at.update({
+            'http://relay-a.example': 1.0,
+            'http://relay-b.example': 2.0,
+        })
+        relay_client._api_v1_control_credentials_by_relay.update({
+            'http://relay-a.example': 'credential-a',
+            'http://relay-b.example': 'credential-b',
+        })
+        mock_post.side_effect = [MagicMock(status_code=200), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is True
+
+        assert [call.kwargs['json'] for call in mock_post.call_args_list] == [
+            {'server_public_key': 'mock_public_key_b64', 'control_credential': 'credential-a'},
+            {'server_public_key': 'mock_public_key_b64', 'control_credential': 'credential-b'},
+        ]
+        assert relay_client._api_v1_control_credentials_by_relay == {}
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_retains_failed_control_credential_for_retry(self, mock_post, relay_client):
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'retry-secret'
+        mock_post.side_effect = [MagicMock(status_code=503), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is False
+        assert relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] == 'retry-secret'
+        assert relay_client.unregister_from_relay() is True
+        assert relay_client._api_v1_control_credentials_by_relay == {}
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_legacy_fallback_uses_control_credential(self, mock_post, relay_client):
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'fallback-secret'
+        mock_post.side_effect = [MagicMock(status_code=404), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is True
+
+        assert [call.args[0] for call in mock_post.call_args_list] == [
+            'http://localhost:5000/api/v1/relay/servers/unregister',
+            'http://localhost:5000/unregister',
+        ]
+        assert all(call.kwargs['json']['control_credential'] == 'fallback-secret' for call in mock_post.call_args_list)
+
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
         """Test successful ping to relay."""

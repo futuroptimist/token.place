@@ -6,7 +6,7 @@ from typing import Iterator
 
 import pytest
 
-MODULES_TO_CLEAR = ("relay", "config", "api", "api.v1", "api.v1.routes")
+MODULES_TO_CLEAR = ("relay", "config")
 
 
 @pytest.fixture()
@@ -167,14 +167,39 @@ def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> N
     }
     assert list(relay_module.known_servers) == ["api-v1-node"]
 
-    authorised = client.post(
+    token_only = client.post(
         "/api/v1/relay/servers/unregister",
         json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert token_only.status_code == 403
+    assert token_only.get_json() == {
+        "error": {
+            "code": 403,
+            "message": "Missing or invalid relay server control credential",
+        }
+    }
+    assert list(relay_module.known_servers) == ["api-v1-node"]
+
+    authorised = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "api-v1-node",
+            "control_credential": register_response.get_json()["control_credential"],
+        },
         headers={"X-Relay-Server-Token": "unit-token"},
     )
     assert authorised.status_code == 200
     assert authorised.get_json() == {"message": "Server unregistered", "removed": True}
     assert relay_module.known_servers == {}
+
+    absent = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert absent.status_code == 200
+    assert absent.get_json() == {"message": "Server unregistered", "removed": False}
 
     diagnostics = client.get("/relay/diagnostics")
     assert diagnostics.status_code == 200

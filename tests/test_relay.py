@@ -1683,6 +1683,47 @@ def test_relay_diagnostics_separates_legacy_from_api_v1_compute_node_count(clien
     ]
 
 
+
+
+def test_evict_stale_servers_aborts_when_heartbeat_refreshes_candidate(client, monkeypatch):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now() - timedelta(seconds=120),
+        'last_ping_duration': 1,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+    discovered = threading.Event()
+    continue_unregister = threading.Event()
+    thread_errors = []
+    original_unregister = relay_module._unregister_server
+
+    def heartbeat_before_unregister(*args, **kwargs):
+        discovered.set()
+        assert continue_unregister.wait(timeout=2)
+        return original_unregister(*args, **kwargs)
+
+    monkeypatch.setattr(relay_module, '_unregister_server', heartbeat_before_unregister)
+    result = {}
+
+    def evict_worker():
+        try:
+            result['evicted'] = relay_module._evict_stale_servers()
+        except BaseException as exc:  # pragma: no cover - diagnostic assertion below
+            thread_errors.append(exc)
+
+    worker = threading.Thread(target=evict_worker)
+    worker.start()
+    assert discovered.wait(timeout=2)
+    with relay_module.server_round_robin_lock:
+        known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now()
+    continue_unregister.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert thread_errors == []
+    assert result['evicted'] == []
+    assert DUMMY_SERVER_PUB_KEY in known_servers
+
 def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client, monkeypatch):
     """Diagnostics should report only non-stale compute nodes after eviction."""
     monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS", "1")
@@ -2610,7 +2651,7 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
 
 def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '30')
-    response = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    response = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert response.status_code == 200
     payload = response.get_json()
     assert payload['next_ping_in_x_seconds'] == 30
@@ -4001,7 +4042,7 @@ def test_api_v1_reregister_backfills_public_key_for_owner_tombstones(client):
 
 
 def test_api_v1_control_requires_owner_proof_without_registration_tokens(client):
-    register = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert register.status_code == 200
 
     response = client.post(
@@ -4178,7 +4219,7 @@ def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, 
 
 
 def test_prune_api_v1_stale_in_flight_entries_expires_with_owner_tombstone(client):
-    register = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert register.status_code == 200
     credential = register.get_json()['control_credential']
     request_id = 'req-prune-expired-in-flight'

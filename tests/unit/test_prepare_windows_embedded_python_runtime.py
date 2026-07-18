@@ -578,10 +578,10 @@ def test_validate_runtime_payload_resolves_recursive_pe_imports(tmp_path):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
 
-def test_api_set_imports_are_os_provided_but_app_dependencies_must_bundle(tmp_path):
+def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bundle(tmp_path):
     runtime = tmp_path / 'python-runtime'
     runtime.mkdir()
-    write_minimal_pe(runtime / 'python.exe', imports=['api-ms-win-core-path-l1-1-0.dll', 'ext-ms-win-ntuser-window-l1-1-0.dll'])
+    write_minimal_pe(runtime / 'python.exe', imports=['api-ms-win-core-path-l1-1-0.dll', 'netapi32.dll'])
     write_minimal_pe(runtime / 'python311.dll')
 
     closure = prep.validate_runtime_payload(runtime, {
@@ -595,7 +595,7 @@ def test_api_set_imports_are_os_provided_but_app_dependencies_must_bundle(tmp_pa
         assert not prep.is_windows_system_dll(dll)
 
     write_minimal_pe(runtime / 'vendor.pyd', imports=['cudart64_12.dll'])
-    with pytest.raises(prep.RuntimePrepError, match='unresolved non-system DLL import cudart64_12.dll'):
+    with pytest.raises(prep.RuntimePrepError, match='unresolved non-system DLL imports: .*cudart64_12.dll'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
 
@@ -636,3 +636,17 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     with pytest.raises(OSError, match='final rename failed'):
         prep.prepare(m)
     assert marker.read_text(encoding='utf-8') == 'keep'
+
+
+def test_validate_runtime_payload_reports_sorted_bounded_unresolved_import_set(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    write_minimal_pe(runtime / 'python.exe', imports=['zvendor.dll', 'avendor.dll', 'kernel32.dll'])
+
+    with pytest.raises(prep.RuntimePrepError) as excinfo:
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
+
+    message = str(excinfo.value)
+    assert 'unresolved non-system DLL imports:' in message
+    assert message.index('avendor.dll') < message.index('zvendor.dll')
+    assert 'kernel32.dll' not in message

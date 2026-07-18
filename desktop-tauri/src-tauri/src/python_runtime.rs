@@ -883,12 +883,25 @@ where
     }
 }
 
+fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
+    import_root
+        .join("python")
+        .join("desktop_runtime_setup.py")
+        .is_file()
+        && !import_root
+            .join("python-runtime")
+            .join("embedded_python_runtime_provenance.json")
+            .exists()
+}
+
 pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
 where
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    sanitize_packaged_python_subprocess_env(command);
+    if !import_root_is_confirmed_unbundled_development(import_root) {
+        sanitize_packaged_python_subprocess_env(command);
+    }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
     let pythonpath = if python_dir.is_dir() {
@@ -1445,6 +1458,56 @@ mod tests {
         ))
         .collect();
         assert_eq!(pythonpath_entries, vec![root.clone(), root.join("python")]);
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_sanitizes_packaged_import_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("Resources");
+        std::fs::create_dir_all(root.join("python-runtime")).expect("create runtime dir");
+        std::fs::write(
+            root.join("python-runtime")
+                .join("embedded_python_runtime_provenance.json"),
+            "{}",
+        )
+        .expect("write provenance");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+
+        configure_python_subprocess_env(&mut command, &root);
+
+        let removed = command.get_envs().any(|(key, value)| {
+            key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD" && value.is_none()
+        });
+        assert!(
+            removed,
+            "packaged runtime must strip development repair opt-in"
+        );
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_preserves_dev_opt_in_for_confirmed_unbundled_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("src-tauri");
+        std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        std::fs::write(
+            root.join("python").join("desktop_runtime_setup.py"),
+            "# dev",
+        )
+        .expect("write dev marker");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+
+        configure_python_subprocess_env(&mut command, &root);
+
+        let value = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD")
+                    .then_some(value.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .flatten();
+        assert_eq!(value.as_deref(), Some("1"));
     }
 
     #[test]

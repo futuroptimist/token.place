@@ -14,7 +14,7 @@ PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_SYSTEM_DLLS = {
     "advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "kernel32.dll",
-    "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll",
+    "msvcrt.dll", "netapi32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll",
     "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
     "version.dll", "ws2_32.dll",
     # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
@@ -234,6 +234,7 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
     queue = [p for p in files.values() if p.suffix.lower() in {'.exe', '.dll', '.pyd'}]
     seen: set[str] = set()
     closure: list[dict[str, object]] = []
+    unresolved: list[str] = []
     while queue:
         pe = queue.pop(0)
         rel = pe.relative_to(runtime).as_posix()
@@ -248,8 +249,13 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
                 continue
             target = files.get(dll)
             if target is None:
-                raise RuntimePrepError(f'unresolved non-system DLL import {dll} required by {rel}')
+                unresolved.append(f'{dll} required by {rel}')
+                continue
             queue.append(target)
+    if unresolved:
+        bounded = sorted(set(unresolved))[:25]
+        suffix = '' if len(set(unresolved)) <= 25 else f' (and {len(set(unresolved)) - 25} more)'
+        raise RuntimePrepError(f"unresolved non-system DLL imports: {bounded}{suffix}")
     required = {dll.lower() for dll in m.get('required_native_dlls', [])}
     found = {entry['name'].lower() for entry in closure}
     missing = sorted(required - found)

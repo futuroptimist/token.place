@@ -1411,6 +1411,7 @@ def _evict_stale_servers() -> list[str]:
             stale_candidates.append(server_public_key)
 
     for server_public_key in stale_candidates:
+        should_evict = False
         with api_v1_terminal_transition_lock:
             with server_round_robin_lock:
                 payload = known_servers.get(server_public_key)
@@ -1430,8 +1431,9 @@ def _evict_stale_servers() -> list[str]:
                     continue
                 if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
                     continue
-                if _unregister_server(server_public_key, eviction_reason="stale_lease"):
-                    evicted.append(server_public_key)
+                should_evict = True
+        if should_evict and _unregister_server(server_public_key, eviction_reason="stale_lease"):
+            evicted.append(server_public_key)
     return evicted
 
 
@@ -1502,56 +1504,57 @@ def _unregister_server(server_public_key: str, *, eviction_reason: str = "unregi
     """Remove a compute node and associated per-server queue/session state."""
 
     _record_api_v1_server_unregistered(server_public_key)
-    in_flight_requests = {}
-    owner_digest = None
-    with server_round_robin_lock:
-        server_payload = known_servers.get(server_public_key)
-        if isinstance(server_payload, dict):
-            owner_digest = server_payload.get("api_v1_control_credential_digest")
-            with api_v1_in_flight_requests_lock:
-                raw_in_flight = server_payload.get("api_v1_in_flight_requests")
-                if isinstance(raw_in_flight, dict):
-                    in_flight_requests = dict(raw_in_flight)
+    with api_v1_terminal_transition_lock:
+        in_flight_requests: dict[str, Any] = {}
+        owner_digest = None
+        with server_round_robin_lock:
+            server_payload = known_servers.get(server_public_key)
+            if isinstance(server_payload, dict):
+                owner_digest = server_payload.get("api_v1_control_credential_digest")
+                with api_v1_in_flight_requests_lock:
+                    raw_in_flight = server_payload.get("api_v1_in_flight_requests")
+                    if isinstance(raw_in_flight, dict):
+                        in_flight_requests = dict(raw_in_flight)
+            removed = _remove_known_server(server_public_key)
 
-    removed = _remove_known_server(server_public_key)
-    dropped_requests = []
-    with client_inference_requests_changed:
-        dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
-        client_inference_requests_changed.notify_all()
+        with client_inference_requests_changed:
+            dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
+            client_inference_requests_changed.notify_all()
 
-    cancelled_queue_depth = 0
-    for item in dropped_requests:
-        if not isinstance(item, dict) or not bool(item.get("e2ee_v1")):
-            continue
-        _cancel_api_v1_request(
-            item.get("client_public_key"),
-            item.get("request_id"),
-            status="cancelled",
-            reason="server_unregistered",
-        )
-        cancelled_queue_depth += 1
+        cancelled_queue_depth = 0
+        for item in dropped_requests:
+            if not isinstance(item, dict) or not bool(item.get("e2ee_v1")):
+                continue
+            _cancel_api_v1_request(
+                item.get("client_public_key"),
+                item.get("request_id"),
+                status="cancelled",
+                reason="server_unregistered",
+            )
+            cancelled_queue_depth += 1
 
-    for request_id, entry in in_flight_requests.items():
-        if not isinstance(request_id, str) or not request_id:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        _add_api_v1_control_tombstone(
-            server_public_key,
-            request_id,
-            entry.get("client_public_key"),
-            status="cancelled",
-            reason="server_unregistered",
-            deadline_monotonic=entry.get("request_deadline_monotonic"),
-            owner_digest=owner_digest,
-        )
-        _cancel_api_v1_request(
-            entry.get("client_public_key"),
-            request_id,
-            status="cancelled",
-            reason="server_unregistered",
-        )
-        cancelled_queue_depth += 1
+        for request_id, entry in in_flight_requests.items():
+            if not isinstance(request_id, str) or not request_id or not isinstance(entry, dict):
+                continue
+            client_public_key = entry.get("client_public_key")
+            if _has_client_response_for_request(client_public_key, request_id):
+                continue
+            _add_api_v1_control_tombstone(
+                server_public_key,
+                request_id,
+                client_public_key,
+                status="cancelled",
+                reason="server_unregistered",
+                deadline_monotonic=entry.get("request_deadline_monotonic"),
+                owner_digest=owner_digest,
+            )
+            _cancel_api_v1_request(
+                client_public_key,
+                request_id,
+                status="cancelled",
+                reason="server_unregistered",
+            )
+            cancelled_queue_depth += 1
 
     with stream_lock:
         stale_session_ids = [
@@ -2495,6 +2498,8 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     with api_v1_terminal_transition_lock:
+        if _has_client_response_for_request(client_public_key, request_id):
+            return 0
         removed = _remove_request_from_server_queues(client_public_key, request_id)
         pending_removed = _clear_pending_request(client_public_key, request_id)
         in_flight_removed = 0
@@ -3009,8 +3014,8 @@ def api_v1_relay_servers_control():
 
     lease_seconds = _api_v1_in_flight_ttl_seconds()
     now = time.monotonic()
-    deadline_expiry_target: tuple[str, str, Any] | None = None
     with api_v1_terminal_transition_lock:
+        deadline_expiry_target: tuple[str, str, Any] | None = None
         with server_round_robin_lock:
             server_payload = known_servers.get(public_key)
             if server_payload is not None and bool(server_payload.get(API_V1_SERVER_MARKER)):
@@ -3039,9 +3044,8 @@ def api_v1_relay_servers_control():
                             }
                             return jsonify(payload), 200
 
-    if deadline_expiry_target is not None:
-        client_public_key, deadline_request_id, deadline_monotonic = deadline_expiry_target
-        with api_v1_terminal_transition_lock:
+        if deadline_expiry_target is not None:
+            client_public_key, deadline_request_id, deadline_monotonic = deadline_expiry_target
             _cancel_api_v1_request(
                 client_public_key,
                 deadline_request_id,
@@ -3049,15 +3053,15 @@ def api_v1_relay_servers_control():
                 reason='provider_timeout',
             )
             terminal = _get_terminal_request(client_public_key, deadline_request_id) or {}
-        terminal_status = _sanitize_terminal_status(terminal.get('status'))
-        control_status = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed/unavailable'
-        control_state = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed_unavailable'
-        _record_compute_control_state(control_state)
-        return jsonify({
-            'status': control_status,
-            'next_poll_seconds': _bounded_control_next_poll_seconds(),
-            **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
-        }), 200
+            terminal_status = _sanitize_terminal_status(terminal.get('status'))
+            control_status = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed/unavailable'
+            control_state = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed_unavailable'
+            _record_compute_control_state(control_state)
+            return jsonify({
+                'status': control_status,
+                'next_poll_seconds': _bounded_control_next_poll_seconds(),
+                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
+            }), 200
 
     key = _control_tombstone_key(public_key, request_id)
     tombstone_found = False

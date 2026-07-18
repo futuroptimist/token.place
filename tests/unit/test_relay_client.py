@@ -6967,3 +6967,49 @@ def test_register_api_v1_compute_node_preserves_and_rotates_control_credential(m
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
     client.register_api_v1_compute_node()
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mock_post, monkeypatch):
+    ticks = iter([10.0, 20.0, 30.0, 40.0, 50.0])
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: next(ticks, 60.0))
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = -100.0
+    client._api_v1_relay_wait_hints = {
+        'http://localhost:5000': {'next_ping_in_x_seconds': 1, 'poll_wait_seconds': 1}
+    }
+    client._store_api_v1_control_credential('http://localhost:5000', 'current-secret')
+
+    class StopAfterTwo:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, _timeout):
+            self.calls += 1
+            return self.calls > 2
+
+        def is_set(self):
+            return False
+
+    responses = [
+        {'registered': True, 'next_ping_in_x_seconds': 1},
+        {'registered': True, 'control_credential': 'rotated-secret', 'next_ping_in_x_seconds': 1},
+    ]
+    observed = []
+
+    def register(url):
+        observed.append(client._api_v1_control_credential_for_relay(url))
+        response = responses.pop(0)
+        credential = response.get('control_credential')
+        if credential:
+            client._store_api_v1_control_credential(url, credential)
+        return response
+
+    client.register_api_v1_compute_node = register
+    client._api_v1_heartbeat_stop = StopAfterTwo()
+
+    client._api_v1_heartbeat_worker()
+
+    assert observed == ['current-secret', 'current-secret']
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'

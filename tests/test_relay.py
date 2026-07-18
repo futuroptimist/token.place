@@ -4688,3 +4688,169 @@ def test_api_v1_control_tombstone_ttl_cleanup_runs_during_housekeeping(client, m
     assert key not in relay_module.api_v1_control_tombstones
     assert control.status_code == 200
     assert control.get_json()['status'] == 'completed/unavailable'
+
+def test_api_v1_same_public_key_replacement_survives_old_stale_candidate(client):
+    server_key = _server_key('same-key-replacement')
+    old_payload = _api_v1_registered_control_payload(client, server_key)
+    old_payload_id = id(known_servers[server_key])
+    known_servers[server_key]['last_ping'] = datetime.now() - timedelta(seconds=120)
+    client_inference_requests[server_key] = [{'request_id': 'req-old-generation', 'client_public_key': 'client-old', 'e2ee_v1': True}]
+
+    replacement_credential = 'replacement-control-secret'
+    replacement_payload = {'server_public_key': server_key, 'control_credential': replacement_credential}
+    known_servers[server_key] = {
+        'public_key': server_key,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+        'api_v1_control_credential_digest': relay_module._api_v1_control_credential_digest(replacement_credential),
+    }
+    client_inference_requests[server_key].append({'request_id': 'req-replacement-generation', 'client_public_key': 'client-new', 'e2ee_v1': True})
+
+    removed = relay_module._unregister_server(
+        server_key,
+        eviction_reason='stale_lease',
+        expected_payload_id=old_payload_id,
+        stale_cutoff_monotonic=time.monotonic(),
+        owner_credential=old_payload['control_credential'],
+    )
+
+    assert removed is False
+    assert server_key in known_servers
+    assert known_servers[server_key]['api_v1_control_credential_digest'] == relay_module._api_v1_control_credential_digest(
+        replacement_payload['control_credential']
+    )
+    queued_ids = {entry['request_id'] for entry in client_inference_requests[server_key]}
+    assert {'req-old-generation', 'req-replacement-generation'} <= queued_ids
+    control = client.post('/api/v1/relay/servers/control', json=replacement_payload | {'request_id': 'req-replacement-generation'})
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'completed/unavailable'
+
+
+def test_api_v1_stale_eviction_tombstone_owner_only_ack_and_late_response(client):
+    owner_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
+    wrong_payload = _api_v1_registered_control_payload(client, _server_key('stale-tombstone-wrong'))
+    request_id = 'req-stale-owner-tombstone'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=120)
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping_duration'] = 1
+    known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]['expires_at'] = time.monotonic() - 1
+    known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]['request_deadline_monotonic'] = time.monotonic() - 1
+
+    evicted = relay_module._evict_stale_servers()
+
+    assert DUMMY_SERVER_PUB_KEY in evicted
+    assert DUMMY_SERVER_PUB_KEY not in known_servers
+    wrong = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': wrong_payload['control_credential'],
+    })
+    owner = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
+    late = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+    ack = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id, 'acknowledge': True})
+
+    assert wrong.status_code == 403
+    assert owner.status_code == 200
+    assert owner.get_json()['status'] == 'expired'
+    assert late.status_code == 410
+    assert late.get_json()['error']['code'] == 'expired'
+    assert ack.status_code == 200
+    assert ack.get_json()['status'] == 'expired'
+    assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) not in relay_module.api_v1_control_tombstones
+
+
+def test_api_v1_unregister_response_race_both_orderings(client):
+    for label, response_first in (('response-first', True), ('unregister-first', False)):
+        server = _server_key(f'unregister-race-{label}')
+        client_key = f'{DUMMY_CLIENT_PUB_KEY}-{label}'
+        request_id = f'req-unregister-race-{label}'
+        owner_payload = _api_v1_registered_control_payload(client, server)
+        assert client.post('/api/v1/relay/requests', json=(_api_v1_request_payload(request_id, client_public_key=client_key) | {'server_public_key': server})).status_code == 200
+        assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
+        first_done = threading.Event()
+        errors = []
+        results = {}
+
+        def submit_response():
+            try:
+                with app.test_client() as race_client:
+                    if not response_first:
+                        assert first_done.wait(timeout=5)
+                    response = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id, client_public_key=client_key, ciphertext=f'cipher-{label}'))
+                    results['response'] = response.status_code
+                    results['response_body'] = response.get_json()
+                    first_done.set()
+            except BaseException as exc:
+                errors.append(exc)
+                first_done.set()
+
+        def unregister():
+            try:
+                with app.test_client() as race_client:
+                    if response_first:
+                        assert first_done.wait(timeout=5)
+                    response = race_client.post('/api/v1/relay/servers/unregister', json=owner_payload)
+                    results['unregister'] = response.status_code
+                    results['unregister_body'] = response.get_json()
+                    first_done.set()
+            except BaseException as exc:
+                errors.append(exc)
+                first_done.set()
+
+        threads = [threading.Thread(target=submit_response), threading.Thread(target=unregister)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert {'response', 'unregister'} <= results.keys()
+        retrieve = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': client_key, 'request_id': request_id})
+        tombstone_key = relay_module._control_tombstone_key(server, request_id)
+        if response_first:
+            assert results['response'] == 200
+            assert results['unregister'] == 200
+            assert retrieve.status_code == 200
+            assert tombstone_key not in relay_module.api_v1_control_tombstones
+        else:
+            assert results['unregister'] == 200
+            assert results['response'] == 410
+            assert retrieve.status_code == 410
+            assert retrieve.get_json()['error']['code'] == 'cancelled'
+            assert tombstone_key in relay_module.api_v1_control_tombstones
+        assert client_key not in client_pending_request_ids
+        assert client_key not in relay_module.client_pending_request_deadlines
+        assert server not in client_inference_requests
+        assert server not in known_servers
+
+
+def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client):
+    server = _server_key('deadlock-node')
+    owner_payload = _api_v1_registered_control_payload(client, server)
+    request_id = 'req-deadlock-regression'
+    assert client.post('/api/v1/relay/requests', json=(_api_v1_request_payload(request_id) | {'server_public_key': server})).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def run_endpoint(path, payload):
+        try:
+            with app.test_client() as race_client:
+                barrier.wait(timeout=5)
+                race_client.post(path, json=payload)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run_endpoint, args=('/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
+        threading.Thread(target=run_endpoint, args=('/api/v1/relay/responses', _api_v1_response_payload(request_id))),
+        threading.Thread(target=run_endpoint, args=('/api/v1/relay/servers/unregister', owner_payload)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []

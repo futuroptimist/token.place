@@ -902,6 +902,9 @@ def test_compute_control_metrics_are_bounded_and_privacy_safe(relay_client, capl
     sensitive_values = {
         "server-metric-control",
         "client-metric-control",
+        "client-metric-control-cancelled",
+        "client-metric-control-expired",
+        "client-metric-control-completed",
         "request-control-metric-active",
         "request-control-metric-cancelled",
         "request-control-metric-expired",

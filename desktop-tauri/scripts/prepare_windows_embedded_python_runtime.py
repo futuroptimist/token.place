@@ -12,7 +12,16 @@ MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_windows_x86_64_manife
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-WINDOWS_SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "kernel32.dll", "msvcp140.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "version.dll", "vcomp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "ws2_32.dll", "nvcuda.dll", "cudart64_12.dll", "cublas64_12.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll", "api-ms-win-crt-time-l1-1-0.dll", "api-ms-win-crt-math-l1-1-0.dll", "api-ms-win-crt-string-l1-1-0.dll", "api-ms-win-crt-environment-l1-1-0.dll", "api-ms-win-crt-convert-l1-1-0.dll", "api-ms-win-crt-utility-l1-1-0.dll", "api-ms-win-crt-locale-l1-1-0.dll", "api-ms-win-crt-filesystem-l1-1-0.dll"}
+WINDOWS_SYSTEM_DLLS = {
+    "advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "kernel32.dll",
+    "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll",
+    "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
+    "version.dll", "ws2_32.dll",
+    # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
+    # payloads must be bundled and validated as part of the runtime closure.
+    "nvcuda.dll",
+}
+WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 
 class RuntimePrepError(RuntimeError): pass
@@ -58,6 +67,10 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     if missing_wheels: raise RuntimePrepError(f"missing python wheel artifacts for required packages: {sorted(missing_wheels)}")
     if extra_wheels: raise RuntimePrepError(f"extra python wheel artifacts not in required_packages: {sorted(extra_wheels)}")
     return m
+
+def is_windows_system_dll(name: str) -> bool:
+    dll = name.lower()
+    return dll in WINDOWS_SYSTEM_DLLS or bool(WINDOWS_API_SET_DLL_RE.fullmatch(dll))
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
     if not url.startswith(("https://github.com/", "https://files.pythonhosted.org/")):
@@ -231,7 +244,7 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
         machine, imports = inspect_pe(pe)
         closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports)})
         for dll in imports:
-            if dll in WINDOWS_SYSTEM_DLLS:
+            if is_windows_system_dll(dll):
                 continue
             target = files.get(dll)
             if target is None:

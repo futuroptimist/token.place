@@ -577,6 +577,28 @@ def test_validate_runtime_payload_resolves_recursive_pe_imports(tmp_path):
     with pytest.raises(prep.RuntimePrepError, match='ARM64 PE payload rejected'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
+
+def test_api_set_imports_are_os_provided_but_app_dependencies_must_bundle(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    write_minimal_pe(runtime / 'python.exe', imports=['api-ms-win-core-path-l1-1-0.dll', 'ext-ms-win-ntuser-window-l1-1-0.dll'])
+    write_minimal_pe(runtime / 'python311.dll')
+
+    closure = prep.validate_runtime_payload(runtime, {
+        'required_native_dlls': ['python311.dll'],
+        'pe_dll_closure': [{'name': 'python311.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'}],
+    })
+    assert {entry['name'] for entry in closure} >= {'python.exe', 'python311.dll'}
+
+    assert prep.is_windows_system_dll('nvcuda.dll')
+    for dll in ('cudart64_12.dll', 'cublas64_12.dll', 'libssl-3-x64.dll', 'vcruntime140.dll'):
+        assert not prep.is_windows_system_dll(dll)
+
+    write_minimal_pe(runtime / 'vendor.pyd', imports=['cudart64_12.dll'])
+    with pytest.raises(prep.RuntimePrepError, match='unresolved non-system DLL import cudart64_12.dll'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+
+
 def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'
     runtime_root.mkdir(parents=True)

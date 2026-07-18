@@ -449,7 +449,7 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
                 c.layout == ResourceLayoutKind::MacOsAppResources
                     || c.layout == ResourceLayoutKind::WindowsResources
                     || c.layout == ResourceLayoutKind::TauriResourceDir
-                    || c.layout == ResourceLayoutKind::DevSourceTree
+                    || (c.layout == ResourceLayoutKind::DevSourceTree && !opts.packaged)
             })
             .map(|c| c.root)
     }?;
@@ -461,6 +461,26 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
         PythonLauncherSource::BundledRuntime,
         bundled_runtime_id(),
     ))
+}
+
+fn has_confirmed_unbundled_dev_source_tree(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
+    if opts.packaged {
+        return false;
+    }
+    resource_root_candidates(
+        opts.current_exe_path,
+        opts.manifest_dir,
+        opts.tauri_resource_dir,
+    )
+    .into_iter()
+    .any(|c| {
+        c.layout == ResourceLayoutKind::DevSourceTree
+            && c.root.join("python").is_dir()
+            && c.root
+                .join("python")
+                .join("desktop_runtime_setup.py")
+                .is_file()
+    })
 }
 
 fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
@@ -597,18 +617,20 @@ pub fn resolve_python_launcher_resource_aware(
             ));
         }
     }
-    if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
-        return match env_candidate.command_for_version_check().output() {
-            Ok(output) => validate_launcher_with_output(&env_candidate, &output, false, false)
-                .map(|_| env_candidate),
-            Err(_) => Err(launcher_error(
-                DESKTOP_PYTHON_OVERRIDE_INVALID,
-                PythonLauncherCategory::OverrideMissing,
-                Some(&env_candidate),
-                false,
-                None,
-            )),
-        };
+    if has_confirmed_unbundled_dev_source_tree(&opts) {
+        if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
+            return match env_candidate.command_for_version_check().output() {
+                Ok(output) => validate_launcher_with_output(&env_candidate, &output, false, false)
+                    .map(|_| env_candidate),
+                Err(_) => Err(launcher_error(
+                    DESKTOP_PYTHON_OVERRIDE_INVALID,
+                    PythonLauncherCategory::OverrideMissing,
+                    Some(&env_candidate),
+                    false,
+                    None,
+                )),
+            };
+        }
     }
     resolve_python_launcher(opts.override_var_name).map_err(|_| {
         launcher_error(
@@ -995,12 +1017,10 @@ mod tests {
         std::fs::write(&provenance, valid).expect("write provenance");
         assert!(bundled_windows_provenance_is_valid(runtime));
 
-        std::fs::write(&provenance, valid.replace("cu124", "cpu"))
-            .expect("write stale provenance");
+        std::fs::write(&provenance, valid.replace("cu124", "cpu")).expect("write stale provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
 
-        std::fs::write(&provenance, "{not-json")
-            .expect("write corrupt provenance");
+        std::fs::write(&provenance, "{not-json").expect("write corrupt provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
     }
 

@@ -34,6 +34,40 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _sanitize_env_for_bundled_runtime(resource_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in list(env):
+        upper = key.upper()
+        if (
+            upper.startswith('PIP_')
+            or upper.startswith('CMAKE_')
+            or upper in {'PYTHONHOME', 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', 'TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD', 'TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP', 'FORCE_CMAKE'}
+        ):
+            env.pop(key, None)
+    python_root = resource_root / 'python'
+    env['PYTHONPATH'] = str(python_root)
+    env['PYTHONNOUSERSITE'] = '1'
+    env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] = '1'
+    return env
+
+
+def _maybe_reexec_with_bundled_python(python_exe: Path | None, resource_root: Path | None, argv: list[str]) -> None:
+    if python_exe is None:
+        return
+    try:
+        current = Path(sys.executable).resolve()
+        target = python_exe.resolve()
+    except OSError:
+        target = python_exe
+        current = Path(sys.executable)
+    if current == target:
+        return
+    if not python_exe.is_file():
+        raise RuntimeError('bundled interpreter is missing from release artifact')
+    env = _sanitize_env_for_bundled_runtime(resource_root or python_exe.parent.parent)
+    os.execve(str(python_exe), [str(python_exe), str(Path(__file__).resolve()), *argv], env)
+
+
 def _offloaded_layer_count(value: Any) -> int:
     if isinstance(value, str):
         normalized = value.strip().lower()
@@ -137,9 +171,9 @@ def _load_compute_runtime_diagnostics(model_path: str, mode: str, context_tier: 
     return diagnostics
 
 
-def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str, resource_root: Path | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     repo_root = _repo_root()
-    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     bridge_path = python_root / 'compute_node_bridge.py'
     env = os.environ.copy()
     existing_pythonpath = env.get('PYTHONPATH', '')
@@ -243,7 +277,14 @@ def main() -> int:
     parser.add_argument('--model', required=True, help='Path to GGUF model used by desktop sidecars')
     parser.add_argument('--mode', default='auto', choices=['auto', 'gpu', 'hybrid'])
     parser.add_argument('--context-tier', default='64k-full', choices=['8k-fast', '64k-full'])
+    parser.add_argument('--resource-root', type=Path, help='Extracted release artifact resources root')
+    parser.add_argument('--python-exe', type=Path, help='Bundled release artifact python.exe')
     args = parser.parse_args()
+
+    try:
+        _maybe_reexec_with_bundled_python(getattr(args, 'python_exe', None), getattr(args, 'resource_root', None), sys.argv[1:])
+    except Exception as exc:
+        return _fail(str(exc))
 
     if not sys.platform.startswith('win'):
         return _fail('this smoke test is only valid on Windows')
@@ -251,7 +292,8 @@ def main() -> int:
         return _fail(f'model path does not exist: {args.model}')
 
     repo_root = _repo_root()
-    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    resource_root = getattr(args, 'resource_root', None)
+    python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     if str(python_root) not in sys.path:
         sys.path.insert(0, str(python_root))
     from path_bootstrap import ensure_runtime_import_paths
@@ -282,7 +324,11 @@ def main() -> int:
         kv_cache = str(payload.get('kv_cache_device') or '').lower()
         _require(kv_cache not in {'', 'cpu'}, 'kv_cache_device indicates CPU-only execution')
 
-        started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier)
+        smoke_resource_root = getattr(args, 'resource_root', None)
+        if smoke_resource_root is None:
+            started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier)
+        else:
+            started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier, smoke_resource_root)
         print(
             json.dumps(
                 {

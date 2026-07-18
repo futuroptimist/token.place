@@ -147,6 +147,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'OUTPUT', runtime_root)
     monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: wheel if url.endswith('.whl') else archive)
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
+    monkeypatch.setattr(prep, 'validate_python_package_wheel', lambda whl, artifact: None)
 
     def fake_extract(_archive, dest):
         staged = dest / archive_root
@@ -283,6 +284,35 @@ def test_validate_wheel_rejects_metadata_tag_and_native_runtime_mismatches(tmp_p
     _write_wheel(wheel, metadata='Name: llama-cpp-python\nVersion: 0.3.32\n', wheel_text='Tag: py3-none-win_amd64\n', include_dll=False)
     with pytest.raises(prep.RuntimePrepError, match='llama.dll'):
         prep.validate_wheel(wheel, m)
+
+
+def test_validate_python_package_wheel_rejects_metadata_and_tag_mismatches(tmp_path):
+    import zipfile
+
+    artifact = {
+        'package': 'typing-extensions',
+        'version': '4.15.0',
+        'filename': 'typing_extensions-4.15.0-py3-none-any.whl',
+        'url': 'https://files.pythonhosted.org/packages/typing_extensions.whl',
+        'sha256': 'f' * 64,
+    }
+    wheel = tmp_path / artifact['filename']
+
+    def write_pkg_wheel(metadata: str, wheel_text: str) -> None:
+        with zipfile.ZipFile(wheel, 'w') as zf:
+            zf.writestr('typing_extensions-4.15.0.dist-info/METADATA', metadata)
+            zf.writestr('typing_extensions-4.15.0.dist-info/WHEEL', wheel_text)
+
+    write_pkg_wheel('Name: typing-extensions\nVersion: 4.15.0\n', 'Tag: py3-none-any\n')
+    prep.validate_python_package_wheel(wheel, artifact)
+
+    write_pkg_wheel('Name: typing-extensions\nVersion: 4.14.0\n', 'Tag: py3-none-any\n')
+    with pytest.raises(prep.RuntimePrepError, match='metadata mismatch'):
+        prep.validate_python_package_wheel(wheel, artifact)
+
+    write_pkg_wheel('Name: typing-extensions\nVersion: 4.15.0\n', 'Tag: py3-none-win_arm64\n')
+    with pytest.raises(prep.RuntimePrepError, match='win_amd64 or none-any'):
+        prep.validate_python_package_wheel(wheel, artifact)
 
 
 def test_write_provenance_records_windows_x86_64_runtime_contract(tmp_path):

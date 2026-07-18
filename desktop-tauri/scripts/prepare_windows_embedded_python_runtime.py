@@ -99,6 +99,33 @@ def validate_wheel(whl: Path, m: dict) -> None:
         if not any(n.lower().endswith('llama.dll') for n in names): raise RuntimePrepError("wheel missing llama.dll native runtime")
 
 
+def validate_python_package_wheel(whl: Path, artifact: dict) -> None:
+    with zipfile.ZipFile(whl) as zf:
+        names = set(zf.namelist())
+        meta_name = next((n for n in names if n.endswith('.dist-info/METADATA')), '')
+        wheel_name = next((n for n in names if n.endswith('.dist-info/WHEEL')), '')
+        if not meta_name or not wheel_name:
+            raise RuntimePrepError(f"python wheel missing METADATA/WHEEL: {whl.name}")
+        meta = zf.read(meta_name).decode('utf-8', 'replace')
+        wheel_text = zf.read(wheel_name).decode('utf-8', 'replace')
+    expected_name = artifact['package'].lower().replace('_', '-')
+    found_name = ''
+    found_version = ''
+    tags = []
+    for line in meta.splitlines():
+        if line.lower().startswith('name:'):
+            found_name = line.split(':', 1)[1].strip().lower().replace('_', '-')
+        elif line.lower().startswith('version:'):
+            found_version = line.split(':', 1)[1].strip()
+    for line in wheel_text.splitlines():
+        if line.lower().startswith('tag:'):
+            tags.append(line.split(':', 1)[1].strip())
+    if found_name != expected_name or found_version != artifact['version']:
+        raise RuntimePrepError(f"python wheel metadata mismatch: {whl.name}")
+    if not any(tag.endswith('win_amd64') or tag.endswith('none-any') for tag in tags):
+        raise RuntimePrepError(f"python wheel tag must be win_amd64 or none-any: {whl.name}")
+
+
 def validate_installed_inventory(py: Path, m: dict) -> None:
     script = """
 import importlib.metadata as md, json
@@ -163,7 +190,9 @@ def provenance_timestamp() -> str:
 def fetch_wheelhouse(m: dict, cache: Path) -> list[Path]:
     wheels = []
     for artifact in m.get("python_package_wheels", []):
-        wheels.append(fetch(artifact["url"], artifact["sha256"], cache / artifact["filename"]))
+        wheel = fetch(artifact["url"], artifact["sha256"], cache / artifact["filename"])
+        validate_python_package_wheel(wheel, artifact)
+        wheels.append(wheel)
     return wheels
 
 def write_hash_requirements(path: Path, m: dict) -> list[str]:

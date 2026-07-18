@@ -4264,11 +4264,9 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
         'http://localhost:5000/api/v1/relay/servers/register',
-        'http://localhost:5000/api/v1/relay/servers/unregister',
     ]
-    assert client._api_v1_registered_relays == set()
-    assert client._api_v1_last_heartbeat_at == {}
-    assert client._unregister_complete is True
+    assert client._api_v1_registered_relays == {'http://localhost:5000'}
+    assert client._unregister_complete is False
 
 
 def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(monkeypatch):

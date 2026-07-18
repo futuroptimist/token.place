@@ -1775,7 +1775,15 @@ class RelayClient:
         if not self._api_v1_begin_mutation():
             return {'error': 'Relay polling stopped', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 0}
         try:
-            return self._register_api_v1_compute_node_unlatched(target_url)
+            result = self._register_api_v1_compute_node_unlatched(target_url)
+            if isinstance(result, dict) and not result.get('error'):
+                self._api_v1_registered_relays.add(target_url)
+                self._api_v1_last_heartbeat_at.setdefault(target_url, 0.0)
+                relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+                self._api_v1_relay_wait_hints = relay_wait_hints
+                relay_wait_hints.setdefault(target_url, {})["server_public_key"] = self.crypto_manager.public_key_b64
+                self._unregister_complete = False
+            return result
         finally:
             self._api_v1_end_mutation()
 
@@ -2024,7 +2032,6 @@ class RelayClient:
                     self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                     self._unregister_complete = False
                     if getattr(self, "_polling_stopped_by_request", False):
-                        self.unregister_from_relay()
                         return {
                             'error': 'Relay polling stopped',
                             'next_ping_in_x_seconds': 0,
@@ -2097,14 +2104,14 @@ class RelayClient:
                         next_refresh = self._api_v1_refresh_threshold_seconds(register_wait)
                         log_info(
                             "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} "
-                            "lease_seconds={} next_refresh_seconds={} key_fingerprint={} error={}",
+                            "lease_seconds={} next_refresh_seconds={} key_fingerprint={} exc_type={}",
                             candidate_url,
                             poll_wait,
                             poll_timeout_seconds,
                             register_wait,
                             round(next_refresh, 3),
                             self._api_v1_public_key_fingerprint(current_public_key),
-                            str(exc),
+                            type(exc).__name__,
                         )
                         return {
                             'message': 'No requests available',

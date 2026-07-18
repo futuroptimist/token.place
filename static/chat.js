@@ -1,7 +1,7 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
-const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1200;
+const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -171,6 +171,7 @@ new Vue({
                 }
             }, COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS);
 
+            const requestStartedAt = Date.now();
             try {
                 const response = await fetch('/relay/diagnostics', {
                     cache: 'no-store',
@@ -227,7 +228,8 @@ new Vue({
                         this.computeNodeCountRefreshQueued = false;
                         this.scheduleComputeNodeCountRefresh(0);
                     } else {
-                        this.scheduleComputeNodeCountRefresh();
+                        const elapsedMs = Date.now() - requestStartedAt;
+                        this.scheduleComputeNodeCountRefresh(Math.max(0, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS - elapsedMs));
                     }
                 }
             }

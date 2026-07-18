@@ -3512,12 +3512,18 @@ def test_run_continues_shutdown_when_relay_stop_raises(capsys, monkeypatch):
     runtime = StopFailureRuntime.last_instance
     assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls == 1
-    assert runtime.relay_client.unregister_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.relay.stop_failed' in output.err
     assert 'exc_type=RuntimeError' in output.err
-    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
-    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+    assert 'desktop.compute_node_bridge.unregister.succeeded' not in output.err
+    stopped = json.loads(output.out.splitlines()[-1])
+    assert stopped['type'] == 'stopped'
+    assert stopped['unregister_required'] is True
+    assert stopped['unregister_attempted'] is False
+    assert stopped['unregister_outcome'] == 'partial'
+    assert stopped['unregister_success_count'] == 0
+    assert stopped['unregister_failure_count'] == 1
 
 
 class UnregisterFailureRelayClient(FakeRelayClient):

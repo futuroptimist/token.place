@@ -1642,7 +1642,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
             status.operator_session_id.as_deref(),
         ) {
             (Some(expected), Some(actual)) => expected == actual,
-            _ => true,
+            _ => !had_child,
         };
         let warning = status.stop_cleanup_warning.clone().unwrap_or_else(|| {
             "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into()
@@ -1652,7 +1652,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let required = status.stop_cleanup_required.unwrap_or(false);
         let attempted = status.stop_cleanup_attempted.unwrap_or(false);
         let coherent_success = match status.stop_cleanup_outcome.as_deref() {
-            Some("complete") => failure_count == 0,
+            Some("complete") => required && attempted && success_count > 0 && failure_count == 0,
             Some("not_required") => !required && !attempted && success_count == 0 && failure_count == 0,
             _ => false,
         };
@@ -2454,7 +2454,11 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
         }
 
         let stop_result =
@@ -2503,7 +2507,11 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
         }
 
         let started = Instant::now();
@@ -2542,7 +2550,11 @@ mod tests {
         *state.stdin.lock().await = Some(first_stdin);
         {
             let mut status = state.status.lock().await;
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
         }
 
         stop_compute_node(state.clone()).await.expect("first stop");
@@ -2561,7 +2573,11 @@ mod tests {
         *state.stdin.lock().await = Some(second_stdin);
         {
             let mut status = state.status.lock().await;
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
         }
 
         stop_compute_node(state.clone()).await.expect("second stop");

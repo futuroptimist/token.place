@@ -1596,9 +1596,10 @@ def run(args: argparse.Namespace) -> int:
     recovery_done.set()
     recovery_fatal = False
 
-    def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> None:
+    def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> bool:
         if poll_cancel_requested_by_relay.get(active_relay_url):
-            return
+            return True
+        latch_ok = True
         poll_cancel_requested_by_relay[active_relay_url] = True
         relay_client = getattr(relay_runtime, "relay_client", None)
         print(
@@ -1613,6 +1614,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 relay_latch()
             except Exception as exc:
+                latch_ok = False
                 print(
                     "desktop.compute_node_bridge.relay.latch_failed "
                     f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1624,6 +1626,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 relay_stop()
             except Exception as exc:
+                latch_ok = False
                 print(
                     "desktop.compute_node_bridge.relay.stop_failed "
                     f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1631,6 +1634,7 @@ def run(args: argparse.Namespace) -> int:
                     f"exc_type={type(exc).__name__}",
                     file=sys.stderr,
                 )
+        return latch_ok
 
     def _relay_requires_unregister(relay_runtime: Any, active_relay_url: str) -> bool:
         relay_client = getattr(relay_runtime, "relay_client", None)
@@ -2326,7 +2330,7 @@ def run(args: argparse.Namespace) -> int:
             )
             latch_ok = True
             try:
-                request_poll_cancel(relay_runtime, active_relay_url)
+                latch_ok = bool(request_poll_cancel(relay_runtime, active_relay_url))
             except Exception as exc:
                 latch_ok = False
                 print(
@@ -2363,10 +2367,14 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
+            # Long-poll workers are non-mutating after the stop latch. Do not
+            # wait for a blocked poll before unregistering a registered relay;
+            # only unregistered relays need their poll thread joined for tidy exit.
             if not required:
                 worker = relay_poll_workers.get(active_relay_url)
                 if worker is not None:
                     worker.join(shutdown_deadline=cleanup_deadline)
+            required = _relay_requires_unregister(relay_runtime, active_relay_url)
             stop_heartbeat = getattr(relay_client, "_api_v1_stop_heartbeat_worker", None)
             if barrier_ok and callable(stop_heartbeat):
                 try:

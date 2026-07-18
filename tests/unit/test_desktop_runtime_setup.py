@@ -1760,6 +1760,24 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
     assert reason == ''
 
 
+def test_should_attempt_source_repair_allows_real_desktop_tauri_dev_tree(monkeypatch, tmp_path):
+    repo_root = tmp_path / 'repo'
+    source_tree = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    source_tree.mkdir(parents=True)
+    (source_tree / 'desktop_runtime_setup.py').write_text('# runtime setup\n', encoding='utf-8')
+    (source_tree / 'desktop_gpu_packaging.py').write_text('# packaging\n', encoding='utf-8')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path / 'repo')
+    monkeypatch.setattr(desktop_runtime_setup, '_load_runtime_state', lambda: {})
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+
+    can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
+
+    assert can_retry is True
+    assert reason == ''
+
+
 def test_windows_packaged_layout_without_requirements_falls_back_without_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')

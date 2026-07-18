@@ -1371,7 +1371,11 @@ def _development_source_build_allowed() -> bool:
     if os.getenv(DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, "").strip() != "1":
         return False
     target_root = _resolve_runtime_root()
-    return (target_root / "python").is_dir() and (target_root / "src-tauri").is_dir()
+    source_tree = target_root / "desktop-tauri" / "src-tauri" / "python"
+    return (
+        (source_tree / "desktop_runtime_setup.py").is_file()
+        and (source_tree / "desktop_gpu_packaging.py").is_file()
+    )
 
 def _should_attempt_source_repair() -> tuple[bool, str]:
     state = _load_runtime_state()

@@ -1027,6 +1027,9 @@ class RelayClient:
         self._api_v1_heartbeat_stop = threading.Event()
         self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
         self._api_v1_heartbeat_stopping = False
+        self._api_v1_mutation_lock = threading.Condition()
+        self._api_v1_mutation_count = 0
+        self._api_v1_mutation_latched = False
 
 
     def _api_v1_start_heartbeat_worker(self) -> None:
@@ -1055,9 +1058,50 @@ class RelayClient:
 
         self.stop_polling = True
         self._polling_stopped_by_request = True
+        # Stop latching is a mutation barrier: no new register/heartbeat
+        # mutations may start, in-flight mutations are counted until they
+        # quiesce, and stopped long-poll results must not change registration.
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is not None:
+            with condition:
+                self._api_v1_mutation_latched = True
+                condition.notify_all()
         stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
         if stop_event is not None:
             stop_event.set()
+
+    def _api_v1_begin_mutation(self) -> bool:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return not getattr(self, "_polling_stopped_by_request", False)
+        with condition:
+            if getattr(self, "_api_v1_mutation_latched", False):
+                return False
+            self._api_v1_mutation_count = int(getattr(self, "_api_v1_mutation_count", 0)) + 1
+            return True
+
+    def _api_v1_end_mutation(self) -> None:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return
+        with condition:
+            self._api_v1_mutation_count = max(0, int(getattr(self, "_api_v1_mutation_count", 0)) - 1)
+            condition.notify_all()
+
+    def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline: Optional[float] = None) -> bool:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return True
+        with condition:
+            while int(getattr(self, "_api_v1_mutation_count", 0)) > 0:
+                if isinstance(shutdown_deadline, (int, float)):
+                    remaining = float(shutdown_deadline) - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    condition.wait(timeout=min(0.05, remaining))
+                else:
+                    condition.wait(timeout=0.05)
+            return True
 
     def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Stop the API v1 heartbeat worker without leaving shutdown heartbeats behind."""
@@ -1118,7 +1162,7 @@ class RelayClient:
                     log_error(
                         "server.heartbeat.background_failed relay={} error={}",
                         _sanitize_relay_target(candidate_url),
-                        str(exc),
+                        type(exc).__name__,
                     )
                     continue
                 if isinstance(response, dict) and not response.get("error"):
@@ -1321,6 +1365,11 @@ class RelayClient:
         self._polling_stopped_by_request = False
         self._unregister_attempted = False
         self._unregister_complete = False
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is not None:
+            with condition:
+                self._api_v1_mutation_latched = False
+                condition.notify_all()
         if clear_registration:
             self._api_v1_registered_relays.clear()
             self._api_v1_last_heartbeat_at.clear()
@@ -1723,6 +1772,14 @@ class RelayClient:
 
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
+        if not self._api_v1_begin_mutation():
+            return {'error': 'Relay polling stopped', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 0}
+        try:
+            return self._register_api_v1_compute_node_unlatched(target_url)
+        finally:
+            self._api_v1_end_mutation()
+
+    def _register_api_v1_compute_node_unlatched(self, target_url: str) -> Dict[str, Any]:
         payload = {
             'server_public_key': self.crypto_manager.public_key_b64,
             'capabilities': self._api_v1_compute_node_capabilities(),

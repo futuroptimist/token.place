@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
@@ -802,14 +802,14 @@ def _sleep_with_cancel(seconds: float) -> bool:
 def _stop_cleanup_budget_seconds(default: float = STOP_CLEANUP_BUDGET_DEFAULT_SECONDS) -> float:
     raw = os.environ.get("TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS")
     if raw is None or not str(raw).strip():
-        return max(float(default), 0.1)
+        return min(max(float(default), 0.1), 11.5)
     try:
         parsed = float(raw)
     except (TypeError, ValueError):
-        return max(float(default), 0.1)
+        return min(max(float(default), 0.1), 11.5)
     if not math.isfinite(parsed) or parsed <= 0:
-        return max(float(default), 0.1)
-    return parsed
+        return min(max(float(default), 0.1), 11.5)
+    return min(parsed, 11.5)
 
 
 def _expand_relay_url_candidate(candidate: Any) -> List[str]:
@@ -2314,85 +2314,127 @@ def run(args: argparse.Namespace) -> int:
         cleanup_budget_seconds = _stop_cleanup_budget_seconds()
         cleanup_started = time.monotonic()
         cleanup_deadline = cleanup_started + cleanup_budget_seconds
+        cleanup_targets: List[Tuple[Any, str, bool]] = []
         for relay_runtime in runtimes:
-            active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            active_relay_url = getattr(relay_client, "relay_url", relay_url)
             print(
                 "desktop.compute_node_bridge.stop "
                 f"operator_session_id={bridge_session_id} "
                 f"relay={_sanitize_relay_target(active_relay_url)}",
                 file=sys.stderr,
             )
-            request_poll_cancel(relay_runtime, active_relay_url)
+            latch_ok = True
+            try:
+                request_poll_cancel(relay_runtime, active_relay_url)
+            except Exception as exc:
+                latch_ok = False
+                print(
+                    "desktop.compute_node_bridge.relay.latch_failed "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+            cleanup_targets.append((relay_runtime, active_relay_url, latch_ok))
         for worker in relay_poll_workers.values():
             worker.shutdown()
-        for worker in relay_poll_workers.values():
-            if not worker.join(shutdown_deadline=cleanup_deadline):
-                stop_cleanup_failure_count += 1
-        for relay_runtime in runtimes:
+
+        result_queue: "queue.Queue[Tuple[str, bool, bool, bool]]" = queue.Queue()
+        cleanup_threads: List[threading.Thread] = []
+
+        def cleanup_one_relay(relay_runtime: Any, active_relay_url: str, latch_ok: bool) -> None:
             relay_client = getattr(relay_runtime, "relay_client", None)
-            stop_heartbeat = getattr(relay_client, "_api_v1_stop_heartbeat_worker", None)
-            if callable(stop_heartbeat):
+            required = _relay_requires_unregister(relay_runtime, active_relay_url)
+            if not latch_ok:
+                result_queue.put((active_relay_url, required, False, True))
+                return
+            barrier_ok = True
+            wait_mutations = getattr(relay_client, "_api_v1_wait_for_mutation_quiescence", None)
+            if callable(wait_mutations):
                 try:
-                    if not stop_heartbeat(shutdown_deadline=cleanup_deadline):
-                        stop_cleanup_failure_count += 1
+                    barrier_ok = bool(wait_mutations(shutdown_deadline=cleanup_deadline))
                 except Exception as exc:
-                    stop_cleanup_failure_count += 1
+                    barrier_ok = False
                     print(
                         "desktop.compute_node_bridge.relay.quiesce_failed "
-                        f"relay={_sanitize_relay_target(getattr(relay_client, 'relay_url', relay_url))} "
+                        f"relay={_sanitize_relay_target(active_relay_url)} "
                         f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
-        for thread in poll_threads:
-            thread.join(timeout=max(0.0, min(1.0, cleanup_deadline - time.monotonic())))
-            if thread.is_alive():
-                stop_cleanup_failure_count += 1
-        unregister_targets: List[Tuple[Any, str]] = []
-        for relay_runtime in runtimes:
-            active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
-            if _relay_requires_unregister(relay_runtime, active_relay_url):
-                unregister_targets.append((relay_runtime, active_relay_url))
-
-        stop_cleanup_required = bool(unregister_targets)
-        if unregister_targets:
-            stop_cleanup_attempted = True
-            futures: Dict[concurrent.futures.Future[Any], Tuple[Any, str]] = {}
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(unregister_targets))
-            try:
-                for target_runtime, target_relay_url in unregister_targets:
-                    futures[
-                        pool.submit(
-                            unregister_with_shared_deadline,
-                            target_runtime,
-                            target_relay_url,
-                            cleanup_deadline,
-                        )
-                    ] = (target_runtime, target_relay_url)
-                remaining = max(cleanup_deadline - time.monotonic(), 0)
+            if not required:
+                worker = relay_poll_workers.get(active_relay_url)
+                if worker is not None:
+                    worker.join(shutdown_deadline=cleanup_deadline)
+            stop_heartbeat = getattr(relay_client, "_api_v1_stop_heartbeat_worker", None)
+            if barrier_ok and callable(stop_heartbeat):
                 try:
-                    iterator = concurrent.futures.as_completed(
-                        list(futures.keys()),
-                        timeout=remaining if remaining > 0 else 0.001,
+                    barrier_ok = bool(stop_heartbeat(shutdown_deadline=cleanup_deadline))
+                except Exception as exc:
+                    barrier_ok = False
+                    print(
+                        "desktop.compute_node_bridge.relay.quiesce_failed "
+                        f"relay={_sanitize_relay_target(active_relay_url)} "
+                        f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                        f"exc_type={type(exc).__name__}",
+                        file=sys.stderr,
                     )
-                    for future in iterator:
-                        try:
-                            success = bool(future.result(timeout=0))
-                        except Exception:
-                            success = False
-                        if success:
-                            stop_cleanup_success_count += 1
-                        else:
-                            stop_cleanup_failure_count += 1
-                except concurrent.futures.TimeoutError:
-                    pass
-                pending = sum(1 for future in futures if not future.done())
-                stop_cleanup_failure_count += pending
-            finally:
-                pool.shutdown(wait=False, cancel_futures=True)
+            if required and not barrier_ok:
+                result_queue.put((active_relay_url, True, False, True))
+                return
+            success = True
+            if required:
+                success = unregister_with_shared_deadline(relay_runtime, active_relay_url, cleanup_deadline)
+            else:
+                unregister_with_shared_deadline(relay_runtime, active_relay_url, cleanup_deadline)
+            result_queue.put((active_relay_url, required, bool(success), False))
+
+        for relay_runtime, active_relay_url, latch_ok in cleanup_targets:
+            if _relay_requires_unregister(relay_runtime, active_relay_url):
+                stop_cleanup_required = True
+                if latch_ok:
+                    stop_cleanup_attempted = True
+            thread = threading.Thread(
+                target=cleanup_one_relay,
+                args=(relay_runtime, active_relay_url, latch_ok),
+                name=f"tokenplace-stop-cleanup-{_sanitize_relay_target(active_relay_url)}",
+                daemon=True,
+            )
+            cleanup_threads.append(thread)
+            thread.start()
+
+        seen_cleanup_relays: Set[str] = set()
+        while len(seen_cleanup_relays) < len(cleanup_targets):
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                active_relay_url, required, success, barrier_failed = result_queue.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if active_relay_url in seen_cleanup_relays:
+                continue
+            seen_cleanup_relays.add(active_relay_url)
+            if required:
+                stop_cleanup_required = True
+                stop_cleanup_attempted = stop_cleanup_attempted or not barrier_failed
+                if success and not barrier_failed:
+                    stop_cleanup_success_count += 1
+                else:
+                    stop_cleanup_failure_count += 1
+            elif not success or barrier_failed:
+                stop_cleanup_failure_count += 1
+        for _, active_relay_url, _ in cleanup_targets:
+            if active_relay_url not in seen_cleanup_relays:
+                if _relay_requires_unregister(next(rt for rt, url, _ok in cleanup_targets if url == active_relay_url), active_relay_url):
+                    stop_cleanup_required = True
+                stop_cleanup_failure_count += 1
+
+        if stop_cleanup_required or stop_cleanup_failure_count > 0:
             if stop_cleanup_failure_count == 0:
                 stop_cleanup_outcome = "complete"
-            elif time.monotonic() >= cleanup_deadline:
+            elif time.monotonic() >= cleanup_deadline or len(seen_cleanup_relays) < len(cleanup_targets):
                 stop_cleanup_outcome = "timed_out"
             else:
                 stop_cleanup_outcome = "partial"

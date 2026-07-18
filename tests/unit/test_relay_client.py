@@ -6885,3 +6885,44 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
     assert "prompt" not in safe
     assert "token_ids" not in safe
     assert "SECRET_PROMPT" not in json.dumps(safe)
+
+
+def test_api_v1_shutdown_latch_waits_for_inflight_mutation_and_blocks_new_register(monkeypatch):
+    client = _standalone_relay_client()
+    client.start()
+    request_started = threading.Event()
+    release_request = threading.Event()
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"next_ping_in_x_seconds": 120, "poll_wait_seconds": 0}
+
+    def fake_post(*args, **kwargs):
+        request_started.set()
+        assert release_request.wait(timeout=1.0)
+        return response
+
+    monkeypatch.setattr(relay_client_module.requests, "post", fake_post)
+    result_holder = {}
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            "response", client.register_api_v1_compute_node("http://localhost:5000")
+        )
+    )
+    worker.start()
+    try:
+        assert request_started.wait(timeout=1.0)
+        client._api_v1_latch_shutdown()
+        assert client._api_v1_wait_for_mutation_quiescence(
+            shutdown_deadline=time.monotonic() + 0.01
+        ) is False
+        assert client.register_api_v1_compute_node("http://localhost:5000")["error"] == "Relay polling stopped"
+        release_request.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert client._api_v1_wait_for_mutation_quiescence(
+            shutdown_deadline=time.monotonic() + 1.0
+        ) is True
+        assert result_holder["response"] == response.json.return_value
+    finally:
+        release_request.set()
+        worker.join(timeout=1.0)

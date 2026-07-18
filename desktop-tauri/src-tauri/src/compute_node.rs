@@ -1647,18 +1647,22 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let warning = status.stop_cleanup_warning.clone().unwrap_or_else(|| {
             "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into()
         });
+        let success_count = status.stop_cleanup_success_count.unwrap_or(0);
+        let failure_count = status.stop_cleanup_failure_count.unwrap_or(0);
+        let required = status.stop_cleanup_required.unwrap_or(false);
+        let attempted = status.stop_cleanup_attempted.unwrap_or(false);
+        let coherent_success = match status.stop_cleanup_outcome.as_deref() {
+            Some("complete") => failure_count == 0,
+            Some("not_required") => !required && !attempted && success_count == 0 && failure_count == 0,
+            _ => false,
+        };
         if bridge_killed {
             Some(warning)
         } else if child_exit_failed {
             Some(warning)
         } else if !session_matches {
             Some(warning)
-        } else if had_child && status.stop_cleanup_outcome.is_none() {
-            Some(warning)
-        } else if matches!(
-            status.stop_cleanup_outcome.as_deref(),
-            Some("partial" | "timed_out")
-        ) {
+        } else if had_child && !coherent_success {
             Some(warning)
         } else {
             None

@@ -1062,7 +1062,8 @@ class RelayClient:
     def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Stop the API v1 heartbeat worker without leaving shutdown heartbeats behind."""
 
-        self._api_v1_latch_shutdown()
+        # Per-request heartbeat teardown is safe because it only stops the
+        # temporary lease-refresh worker; explicit Stop owns the global polling latch.
         stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
         if stop_event is None:
             return True

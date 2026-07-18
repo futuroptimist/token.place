@@ -2858,6 +2858,7 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
     events = []
     poll_started = threading.Event()
     release_poll = threading.Event()
+    latch_started = threading.Event()
 
     class BlockingPollRuntime(FakeRuntime):
         def register_and_poll_once(self):
@@ -2869,6 +2870,20 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
 
         def stop(self):
             events.append("stop")
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.relay_client._api_v1_latch_shutdown = self._latch_shutdown
+            self.relay_client._api_v1_stop_heartbeat_worker = self._stop_heartbeat_worker
+
+        def _latch_shutdown(self):
+            events.append("latch")
+            latch_started.set()
+            release_poll.set()
+
+        def _stop_heartbeat_worker(self, *, shutdown_deadline=None):
+            events.append("heartbeat-joined")
+            return True
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingPollRuntime)
     stop_calls = {"count": 0}
@@ -2888,8 +2903,10 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
 
     try:
         assert status == 0
+        assert latch_started.is_set()
         assert "stop" not in events
-        assert "poll-done" not in events[: events.index("stop") + 1]
+        assert events.index("poll-start") < events.index("latch") < events.index("poll-done")
+        assert events.index("poll-done") < events.index("heartbeat-joined")
     finally:
         release_poll.set()
     _ = capsys.readouterr()

@@ -1657,7 +1657,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
             Some(warning)
         } else if matches!(
             status.stop_cleanup_outcome.as_deref(),
-            Some("partial" | "timed_out") | Some(_)
+            Some("partial" | "timed_out")
         ) {
             Some(warning)
         } else {

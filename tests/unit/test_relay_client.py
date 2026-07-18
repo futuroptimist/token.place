@@ -5452,6 +5452,38 @@ def test_api_v1_heartbeat_stops_when_response_posting_raises():
     assert client._api_v1_heartbeat_thread is None
 
 
+def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
+    manager = _ApiV1RuntimeManager()
+    client = _api_v1_validation_client(manager)
+    client.stop_polling = False
+    client._api_v1_registered_relays.add(client.relay_url)
+    client._api_v1_last_heartbeat_at[client.relay_url] = time.monotonic()
+    client.crypto_manager.decrypt_message.side_effect = [
+        _api_v1_decrypted_payload(request_id="req-heartbeat-1"),
+        _api_v1_decrypted_payload(request_id="req-heartbeat-2"),
+    ]
+    client.crypto_manager.encrypt_message.return_value = {
+        "chat_history": "encrypted_chat_history",
+        "cipherkey": "encrypted_key",
+        "iv": "encrypted_iv",
+    }
+    client._post_api_v1_response = MagicMock(return_value=True)
+
+    first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert first_result.submitted is True
+    assert client._api_v1_heartbeat_thread is None
+    assert client.stop_polling is False
+    assert client._polling_stopped_by_request is False
+
+    second_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert second_result.submitted is True
+    assert client.stop_polling is False
+    assert client._polling_stopped_by_request is False
+    assert client._post_api_v1_response.call_count == 2
+
+
 def test_api_v1_heartbeat_logs_sanitized_relay_targets():
     relay_client = _api_v1_validation_client()
     relay_url = "https://user:secret@example.test:443/path?token=abc#frag"

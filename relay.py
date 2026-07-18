@@ -2782,6 +2782,7 @@ def api_v1_relay_servers_register():
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
         known_servers[public_key]['capabilities'] = capabilities
+        known_servers[public_key]['public_key'] = public_key
         control_credential = _store_api_v1_control_credential(known_servers[public_key])
     LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 

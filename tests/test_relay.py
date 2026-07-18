@@ -3945,6 +3945,47 @@ def test_api_v1_control_owner_sees_in_flight_cancel_and_ack_cleans_up(client):
     assert retrieved.get_json()['error']['reason'] == 'client_timeout'
 
 
+def test_api_v1_reregister_backfills_public_key_for_owner_tombstones(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+    register = client.post(
+        '/api/v1/relay/servers/register',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+    )
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    assert known_servers[DUMMY_SERVER_PUB_KEY]['public_key'] == DUMMY_SERVER_PUB_KEY
+
+    request_id = 'req-reregister-tombstone-owner'
+    assert client.post(
+        '/api/v1/relay/requests',
+        json=_api_v1_request_payload(request_id, cancel_token='proof'),
+    ).status_code == 200
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == request_id
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'proof',
+    })
+    control = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    })
+
+    assert cancelled.status_code == 200
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'cancelled'
+
+
 def test_api_v1_control_requires_owner_proof_without_registration_tokens(client):
     register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert register.status_code == 200

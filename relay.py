@@ -1197,18 +1197,43 @@ def _api_v1_in_flight_entry_can_be_pruned(entry: Any, *, now_monotonic: float) -
 
 
 def _prune_api_v1_stale_in_flight_entries(payload: dict[str, Any], *, now_monotonic: float) -> int:
-    """Drop expired in-flight accounting entries whose owner window is over."""
+    """Expire deadline-backed in-flight work and drop legacy stale entries.
+
+    Deadline-backed requests must use the normal terminal-state machinery so an
+    expiry races atomically with response acceptance/cancellation and produces
+    the owner-authenticated tombstone.  Only legacy entries without deadline
+    metadata may be raw-pruned.
+    """
     in_flight_requests = payload.get("api_v1_in_flight_requests")
     if not isinstance(in_flight_requests, dict):
         return 0
     removed = 0
+    expired_targets: list[tuple[str, str]] = []
     with api_v1_in_flight_requests_lock:
         for request_id, entry in list(in_flight_requests.items()):
-            if _api_v1_in_flight_entry_can_be_pruned(entry, now_monotonic=now_monotonic):
-                in_flight_requests.pop(request_id, None)
-                removed += 1
+            if not _api_v1_in_flight_entry_can_be_pruned(entry, now_monotonic=now_monotonic):
+                continue
+            deadline_monotonic = (
+                _valid_request_deadline_monotonic(entry.get("request_deadline_monotonic"))
+                if isinstance(entry, dict)
+                else None
+            )
+            client_public_key = entry.get("client_public_key") if isinstance(entry, dict) else None
+            if deadline_monotonic is not None and isinstance(client_public_key, str) and client_public_key:
+                expired_targets.append((client_public_key, request_id))
+                continue
+            in_flight_requests.pop(request_id, None)
+            removed += 1
         if not in_flight_requests:
             payload.pop("api_v1_in_flight_requests", None)
+    for client_public_key, request_id in expired_targets:
+        _cancel_api_v1_request(
+            client_public_key,
+            request_id,
+            status="expired",
+            reason="provider_timeout",
+        )
+        removed += 1
     return removed
 
 def _api_v1_node_load_snapshot(server_public_key: str, payload: dict[str, Any], *, now_monotonic: float | None = None) -> dict[str, int | float]:
@@ -1360,11 +1385,15 @@ def _evict_stale_servers() -> list[str]:
     stale_candidates: list[str] = []
     with server_round_robin_lock:
         server_items = list(known_servers.items())
+    for _, payload in server_items:
+        if isinstance(payload, dict):
+            _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
+    with server_round_robin_lock:
+        server_items = list(known_servers.items())
         for server_public_key, payload in server_items:
             polling_until = payload.get("polling_until_monotonic")
             if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
                 continue
-            _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
             if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
                 continue
 
@@ -1399,7 +1428,6 @@ def _evict_stale_servers() -> list[str]:
                 stale_after = max(float(stale_after), 1.0)
                 if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                     continue
-                _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
                 if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
                     continue
                 if _unregister_server(server_public_key, eviction_reason="stale_lease"):
@@ -2493,12 +2521,7 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
                         if not in_flight_requests:
                             server_payload.pop("api_v1_in_flight_requests", None)
         lifecycle_removed = bool(removed or pending_removed or in_flight_removed)
-        if lifecycle_removed:
-            # A queued response means response acceptance already won the terminal
-            # transition. Removing a response alone must never authorize stale
-            # cancellation/expiration work that selected a request before taking
-            # api_v1_terminal_transition_lock.
-            _remove_client_responses_for_request(client_public_key, request_id)
+        if lifecycle_removed and not _has_client_response_for_request(client_public_key, request_id):
             _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",
@@ -3017,13 +3040,14 @@ def api_v1_relay_servers_control():
 
     if deadline_expiry_target is not None:
         client_public_key, deadline_request_id, deadline_monotonic = deadline_expiry_target
-        _cancel_api_v1_request(
-            client_public_key,
-            deadline_request_id,
-            status='expired',
-            reason='provider_timeout',
-        )
-        terminal = _get_terminal_request(client_public_key, deadline_request_id) or {}
+        with api_v1_terminal_transition_lock:
+            _cancel_api_v1_request(
+                client_public_key,
+                deadline_request_id,
+                status='expired',
+                reason='provider_timeout',
+            )
+            terminal = _get_terminal_request(client_public_key, deadline_request_id) or {}
         terminal_status = _sanitize_terminal_status(terminal.get('status'))
         control_status = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed/unavailable'
         control_state = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed_unavailable'

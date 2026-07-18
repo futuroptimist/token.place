@@ -3779,14 +3779,14 @@ def test_api_v1_cancel_sanitizes_status_and_reason(client):
     assert error['reason'] == 'cancelled'
 
 
-def test_api_v1_cancelled_queued_response_retrieve_returns_gone(client):
+def test_api_v1_response_accepted_first_survives_later_cancellation(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
         relay_module.API_V1_SERVER_MARKER: True,
     }
-    request_id = 'req-response-then-cancel'
+    request_id = 'req-response-wins-before-cancel'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
     assert client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code == 200
 
@@ -3803,9 +3803,9 @@ def test_api_v1_cancelled_queued_response_retrieve_returns_gone(client):
     })
 
     assert cancelled.status_code == 200
-    assert retrieved.status_code == 410
-    assert retrieved.get_json()['error']['code'] == 'cancelled'
-    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['request_id'] == request_id
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
 
 
 def test_api_v1_response_after_in_flight_cancel_is_rejected_and_queue_depth_zero(client):
@@ -4120,6 +4120,98 @@ def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, 
 
     assert control.status_code == 200
     assert control.get_json()['status'] == 'expired'
+
+
+def test_prune_api_v1_stale_in_flight_entries_expires_with_owner_tombstone(client):
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    request_id = 'req-prune-expired-in-flight'
+    relay_module._mark_request_pending(
+        DUMMY_CLIENT_PUB_KEY,
+        request_id,
+        cancel_token='proof',
+        deadline_monotonic=time.monotonic() - 1.0,
+    )
+    known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'] = {
+        request_id: {
+            'expires_at': time.monotonic() - 1.0,
+            'started_at_monotonic': time.monotonic() - 3.0,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'cancel_token': 'proof',
+            'request_deadline_monotonic': time.monotonic() - 1.0,
+        }
+    }
+
+    removed = relay_module._prune_api_v1_stale_in_flight_entries(
+        known_servers[DUMMY_SERVER_PUB_KEY],
+        now_monotonic=time.monotonic(),
+    )
+    control = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    })
+
+    assert removed == 1
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert relay_module._get_terminal_request(DUMMY_CLIENT_PUB_KEY, request_id)['status'] == 'expired'
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'expired'
+
+
+def test_api_v1_cancel_and_response_race_has_single_winner(client, monkeypatch):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+    request_id = 'req-cancel-response-race'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def submit_response():
+        with app.test_client() as race_client:
+            barrier.wait(timeout=5)
+            results['response'] = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code
+
+    def cancel_request():
+        with app.test_client() as race_client:
+            barrier.wait(timeout=5)
+            results['cancel'] = race_client.post('/api/v1/relay/requests/cancel', json={
+                'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                'request_id': request_id,
+                'status': 'cancelled',
+                'reason': 'requester_cancelled',
+                'cancel_token': 'proof',
+            }).status_code
+
+    threads = [threading.Thread(target=submit_response), threading.Thread(target=cancel_request)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert results['cancel'] == 200
+    assert results['response'] in {200, 410}
+
+    retrieve = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    if results['response'] == 200:
+        assert retrieve.status_code == 200
+        assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+    else:
+        assert retrieve.status_code == 410
+        assert retrieve.get_json()['error']['code'] == 'cancelled'
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
 
 
 def test_api_v1_control_next_poll_seconds_has_positive_floor(client, monkeypatch):

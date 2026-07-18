@@ -492,6 +492,12 @@ _API_V1_SENSITIVE_BODY_KEYS = {
     "relay_server_token",
     "server_registration_token",
     "registration_token",
+    "control_credential",
+    "controlcredential",
+    "control_cred",
+    "controlcred",
+    "relay_control_credential",
+    "relay_controlcredential",
     "token",
     "authorization",
     "private_key",
@@ -528,6 +534,7 @@ def _redact_sensitive_text(text: Any, *, secrets: Tuple[str, ...] = ()) -> str:
         (
             r"(?i)((?:private[_-]?key|public[_-]?key|server[_-]?public[_-]?key|"
             r"client[_-]?public[_-]?key|ciphertext|cipherkey|chat_history|iv|"
+            r"control[_-]?credential|controlcred|control[_-]?cred|"
             r"prompt|content)\s*[=:]\s*)([^\s,;}<]+)",
             r"\1[redacted]",
         ),
@@ -1576,6 +1583,10 @@ class RelayClient:
         secrets = (
             self._registration_token or "",
             getattr(self.crypto_manager, "public_key_b64", ""),
+            self._api_v1_control_credentials_by_relay.get(
+                self._compose_relay_url(f"{parsed_url.scheme}://{parsed_url.netloc}", None) if parsed_url.netloc else url,
+                "",
+            ),
         )
         body_snippet, parsed_json = _safe_api_v1_response_body_snippet(
             response,

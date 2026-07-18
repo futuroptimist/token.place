@@ -30,7 +30,7 @@ A successful active or terminal state is visible only to the exact owner credent
 
 API v1 compute-node unregister uses the same exact-owner model as control polling. `POST /api/v1/relay/servers/unregister` requires the shared registration token when configured **and** the `control_credential` returned by that node's registration response while the node is live. Token-only, missing, wrong, or unsigned owner proof returns `403` without mutating the live registration, queues, in-flight request state, or owner-bound tombstones. Unregister remains idempotent for already-absent nodes and returns `removed: false` after the shared-token boundary succeeds.
 
-The legacy `/unregister` alias is retained only for old relay compatibility. Modern API v1 clients send the matching owner credential to both the API v1 route and, when falling back to the same relay's legacy alias after a `404`, the legacy route. Old relays that never issued a credential keep their existing fallback behavior.
+The legacy `/unregister` alias is retained only for old relay compatibility. When its live target is an API v1 registration, the relay applies the same exact-owner credential check atomically with detaching that exact registration generation. Genuine legacy registrations that do not carry the API v1 marker keep token-only behavior. Modern API v1 clients send the matching owner credential to both the API v1 route and, when falling back to the same relay's legacy alias after a `404`, the legacy route. Old relays that never issued a credential keep their existing fallback behavior.
 
 ## Response states
 

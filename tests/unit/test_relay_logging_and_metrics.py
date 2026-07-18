@@ -681,7 +681,7 @@ def test_unknown_terminal_attempts_do_not_increment_outcomes(relay_client) -> No
         },
     )
 
-    assert orphan_response.status_code == 200
+    assert orphan_response.status_code == 410
     assert _outcome_value(relay_client, "cancelled") == before["cancelled"]
     assert _outcome_value(relay_client, "completed") == before["completed"]
 

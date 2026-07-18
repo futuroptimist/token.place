@@ -197,6 +197,9 @@ def test_two_api_v1_nodes_poll_and_round_robin_without_control_plane_429(client,
 def test_api_v1_response_submissions_do_not_use_public_quota(client):
     """Encrypted response submissions have a higher control-plane budget."""
 
+    client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {
+        f'rate-response-{index}': time.time() for index in range(65)
+    }
     responses = [
         client.post(
             '/api/v1/relay/responses',
@@ -2442,6 +2445,8 @@ def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_resp
         'iv': 'iv-response-2',
     }
 
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-1')
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-2')
     assert client.post('/api/v1/relay/responses', json=response_one).status_code == 200
     assert client.post('/api/v1/relay/responses', json=response_two).status_code == 200
 
@@ -2562,7 +2567,7 @@ def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_dro
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
     response_payload = {
-        'request_id': 'req-1',
+        'request_id': 'req-mismatch-1',
         'protocol': 'tokenplace_api_v1_relay_e2ee',
         'version': 1,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
@@ -2570,6 +2575,7 @@ def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(clie
         'cipherkey': 'cipherkey-response',
         'iv': 'iv-response',
     }
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-mismatch-1')
     assert client.post('/api/v1/relay/responses', json=response_payload).status_code == 200
 
     mismatch = client.post(
@@ -2577,14 +2583,14 @@ def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(clie
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-other'},
     )
     assert mismatch.status_code == 404
-    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-mismatch-1'
 
     retrieved = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-mismatch-1'},
     )
     assert retrieved.status_code == 200
-    assert retrieved.get_json()['request_id'] == 'req-1'
+    assert retrieved.get_json()['request_id'] == 'req-mismatch-1'
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
@@ -3857,7 +3863,7 @@ def test_api_v1_response_accepted_first_survives_later_cancellation(client):
         'request_id': request_id,
     })
 
-    assert cancelled.status_code == 200
+    assert cancelled.status_code == 403
     assert retrieved.status_code == 200
     assert retrieved.get_json()['request_id'] == request_id
     assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
@@ -4293,8 +4299,9 @@ def test_api_v1_cancel_and_response_race_has_single_winner(client, monkeypatch):
     for thread in threads:
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
-    assert results['cancel'] == 200
+    assert results['cancel'] in {200, 403}
     assert results['response'] in {200, 410}
+    assert 200 in {results['cancel'], results['response']}
 
     retrieve = client.post('/api/v1/relay/responses/retrieve', json={
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
@@ -4375,3 +4382,50 @@ def test_api_v1_unregister_requires_exact_owner_control_credential(client):
     control = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
     assert control.status_code == 200
     assert control.get_json()['status'] == 'cancelled'
+
+
+def test_legacy_unregister_alias_requires_owner_for_live_api_v1_server(client):
+    owner_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
+    wrong_payload = _api_v1_registered_control_payload(client, _server_key('legacy-unregister-wrong'))
+
+    missing = client.post('/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    wrong = client.post('/unregister', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'control_credential': wrong_payload['control_credential'],
+    })
+
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+    assert DUMMY_SERVER_PUB_KEY in known_servers
+
+    removed = client.post('/unregister', json=owner_payload)
+    absent = client.post('/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    assert removed.status_code == 200
+    assert removed.get_json()['removed'] is True
+    assert absent.status_code == 200
+    assert absent.get_json()['removed'] is False
+
+
+def test_api_v1_response_for_queued_work_removes_queue_and_post_retrieval_duplicate_rejected(client):
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
+    request_id = 'req-response-removes-queue'
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id))
+    assert queued.status_code == 200
+
+    accepted = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+    assert accepted.status_code == 200
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['message'] == 'No requests available'
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    duplicate = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+
+    assert retrieved.status_code == 200
+    assert duplicate.status_code == 410

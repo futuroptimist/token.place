@@ -694,6 +694,23 @@ def _record_request_terminal_outcome_once(
     return True
 
 
+def _has_request_terminal_outcome(client_public_key: str | None, request_id: str | None) -> bool:
+    if not client_public_key or not request_id:
+        return False
+    with client_terminal_outcomes_lock:
+        recorded_ids = client_terminal_outcomes.get(client_public_key)
+        if not isinstance(recorded_ids, dict):
+            return False
+        expires_at = recorded_ids.get(request_id)
+        if isinstance(expires_at, (int, float)) and expires_at > time.time():
+            return True
+        if request_id in recorded_ids:
+            recorded_ids.pop(request_id, None)
+            if not recorded_ids:
+                client_terminal_outcomes.pop(client_public_key, None)
+    return False
+
+
 def _is_relay_inference_route(route: str) -> bool:
     return route == "/api/v1/relay/requests"
 
@@ -1484,13 +1501,17 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
+_OWNER_CREDENTIAL_NOT_REQUIRED = object()
+
+
 def _unregister_server(
     server_public_key: str,
     *,
     eviction_reason: str = "unregistered",
     expected_payload_id: int | None = None,
     stale_cutoff_monotonic: float | None = None,
-) -> bool:
+    owner_credential: Any = _OWNER_CREDENTIAL_NOT_REQUIRED,
+) -> bool | None:
     """Remove a compute node and associated per-server queue/session state."""
 
     with api_v1_terminal_transition_lock:
@@ -1517,6 +1538,9 @@ def _unregister_server(
                     if _api_v1_active_in_flight_count(server_payload, now_monotonic=stale_cutoff_monotonic) > 0:
                         return False
                 owner_digest = server_payload.get("api_v1_control_credential_digest")
+                if bool(server_payload.get(API_V1_SERVER_MARKER)) and owner_credential is not _OWNER_CREDENTIAL_NOT_REQUIRED:
+                    if not _api_v1_server_control_credential_valid(server_payload, owner_credential):
+                        return None
                 with api_v1_in_flight_requests_lock:
                     raw_in_flight = server_payload.get("api_v1_in_flight_requests")
                     if isinstance(raw_in_flight, dict):
@@ -1524,10 +1548,11 @@ def _unregister_server(
             removed = _remove_known_server(server_public_key)
             if removed:
                 _record_api_v1_server_unregistered(server_public_key)
-
-        with client_inference_requests_changed:
-            dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
-            client_inference_requests_changed.notify_all()
+                with client_inference_requests_changed:
+                    dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
+                    client_inference_requests_changed.notify_all()
+            else:
+                dropped_requests = []
 
         cancelled_queue_depth = 0
         for item in dropped_requests:
@@ -2808,7 +2833,7 @@ def api_v1_relay_servers_register():
     return jsonify(response_payload), 200
 
 
-def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1", require_owner_credential: bool = False):
+def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
     """Handle idempotent compute-node unregister requests for relay routes."""
 
     auth_error = _validate_server_registration()
@@ -2827,18 +2852,9 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1", re
             return jsonify({'error': 'Invalid public key'}), 400
         return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
 
-    if require_owner_credential:
-        with server_round_robin_lock:
-            server_payload = known_servers.get(public_key)
-            requires_owner = isinstance(server_payload, dict) and bool(server_payload.get(API_V1_SERVER_MARKER))
-            owner_valid = _api_v1_server_control_credential_valid(
-                server_payload,
-                data.get('control_credential'),
-            )
-        if requires_owner and not owner_valid:
-            return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-
-    removed = _unregister_server(public_key)
+    removed = _unregister_server(public_key, owner_credential=data.get('control_credential'))
+    if removed is None:
+        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
 
 
@@ -2846,7 +2862,7 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1", re
 def api_v1_relay_servers_unregister():
     """Explicitly unregister an API v1 compute node and cancel its queued work."""
 
-    return _handle_server_unregister_request(require_owner_credential=True)
+    return _handle_server_unregister_request()
 
 
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
@@ -3265,11 +3281,16 @@ def api_v1_relay_responses():
                             if not in_flight_requests:
                                 server_payload.pop('api_v1_in_flight_requests', None)
                             break
+            lifecycle_owned = _remove_request_from_server_queues(client_public_key, request_id) or lifecycle_owned
             lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
             terminal = _get_terminal_request(client_public_key, request_id)
             if terminal is not None:
                 status = terminal.get('status', 'cancelled')
                 return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if not lifecycle_owned:
+                if _has_request_terminal_outcome(client_public_key, request_id):
+                    return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'completed', 'status': 'completed'}}), 410
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'gone', 'status': 'gone'}}), 410
             if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
                 terminal = _get_terminal_request(client_public_key, request_id)
                 status = terminal.get('status', 'cancelled') if terminal else 'cancelled'

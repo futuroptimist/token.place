@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -3741,7 +3742,7 @@ def test_windows_packaged_runtime_layout_validates_runtime_id_and_target_triple(
     monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
 
     # Every immutable identity field must match.
-    valid_provenance = _valid_windows_runtime_provenance()
+    valid_provenance = _valid_windows_runtime_provenance(runtime_dir)
     provenance.write_text(json.dumps(valid_provenance), encoding='utf-8')
     assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
     assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
@@ -3847,13 +3848,39 @@ def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, 
 
 
 
-def _valid_windows_runtime_provenance() -> dict:
+def _valid_windows_runtime_provenance(runtime_dir: Path | None = None) -> dict:
     manifest_path = (
         Path(__file__).resolve().parents[2]
         / 'desktop-tauri' / 'src-tauri' / 'python'
         / 'embedded_python_runtime_windows_x86_64_manifest.json'
     )
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    closure = []
+    for name in manifest['required_native_dlls']:
+        path = runtime_dir / name if runtime_dir is not None else None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f'pe:{name}'.encode('utf-8'))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            digest = '0' * 64
+        closure.append({
+            'name': name,
+            'path': name,
+            'machine': 'IMAGE_FILE_MACHINE_AMD64',
+            'imports': [],
+            'sha256': digest,
+        })
+    if runtime_dir is not None:
+        python_exe = runtime_dir / 'python.exe'
+        python_exe.write_bytes(b'python-exe')
+        closure.append({
+            'name': 'python.exe',
+            'path': 'python.exe',
+            'machine': 'IMAGE_FILE_MACHINE_AMD64',
+            'imports': ['python311.dll'],
+            'sha256': hashlib.sha256(python_exe.read_bytes()).hexdigest(),
+        })
     return {
         'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
         'cpython_version': manifest['cpython_version'],
@@ -3863,10 +3890,7 @@ def _valid_windows_runtime_provenance() -> dict:
         'required_packages': manifest['required_packages'],
         'python_package_wheels': manifest.get('python_package_wheels', []),
         'required_native_dlls': manifest['required_native_dlls'],
-        'pe_dll_closure': [
-            {'name': name, 'machine': 'IMAGE_FILE_MACHINE_AMD64'}
-            for name in manifest['required_native_dlls']
-        ],
+        'pe_dll_closure': closure,
     }
 
 def _setup_windows_packaged_layout(monkeypatch, tmp_path):
@@ -3950,7 +3974,7 @@ def test_valid_provenance_does_not_block_cuda_probe_success(monkeypatch, tmp_pat
     """A valid provenance must allow a successful CUDA probe to return cuda_already_supported."""
     runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
     (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
-        json.dumps(_valid_windows_runtime_provenance()),
+        json.dumps(_valid_windows_runtime_provenance(runtime_dir)),
         encoding='utf-8',
     )
 

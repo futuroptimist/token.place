@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
@@ -301,12 +303,60 @@ fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
     if closure.is_empty() {
         return false;
     }
-    let required_names: std::collections::BTreeSet<&str> =
-        required_dlls.iter().filter_map(|v| v.as_str()).collect();
-    let closure_names: std::collections::BTreeSet<&str> = closure
+    let required_names: std::collections::BTreeSet<String> = required_dlls
         .iter()
-        .filter_map(|entry| entry.get("name").and_then(|v| v.as_str()))
+        .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
         .collect();
+    let mut closure_names = std::collections::BTreeSet::new();
+    let mut closure_paths = std::collections::BTreeSet::new();
+    for entry in closure {
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let Some(rel) = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("name").and_then(|v| v.as_str()))
+        else {
+            return false;
+        };
+        if rel.is_empty()
+            || Path::new(rel).is_absolute()
+            || rel.split(&['/', '\\']).any(|p| p == "..")
+        {
+            return false;
+        }
+        let rel_key = rel.replace('\\', "/").to_ascii_lowercase();
+        if !closure_paths.insert(rel_key) {
+            return false;
+        }
+        let Some(expected_sha) = entry.get("sha256").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let file_path = runtime_root.join(rel);
+        let Ok(resolved_root) = runtime_root.canonicalize() else {
+            return false;
+        };
+        let Ok(resolved_file) = file_path.canonicalize() else {
+            return false;
+        };
+        if !resolved_file.starts_with(&resolved_root) || !resolved_file.is_file() {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(&resolved_file) else {
+            return false;
+        };
+        let actual_sha = format!("{:x}", Sha256::digest(&bytes));
+        if actual_sha != expected_sha {
+            return false;
+        }
+        if entry.get("machine").and_then(|v| v.as_str()) != Some("IMAGE_FILE_MACHINE_AMD64")
+            || !entry.get("imports").is_some_and(|v| v.is_array())
+        {
+            return false;
+        }
+        closure_names.insert(name.to_ascii_lowercase());
+    }
     value.get("runtime_id").and_then(|v| v.as_str())
         == Some("bundled-cpython-3.11-win-x86_64-cu124")
         && value.get("cpython_version") == manifest.get("cpython_version")
@@ -318,10 +368,7 @@ fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
         && value.get("required_packages") == manifest.get("required_packages")
         && value.get("python_package_wheels") == manifest.get("python_package_wheels")
         && value.get("required_native_dlls") == manifest.get("required_native_dlls")
-        && closure_names == required_names
-        && closure.iter().all(|entry| {
-            entry.get("machine").and_then(|v| v.as_str()) == Some("IMAGE_FILE_MACHINE_AMD64")
-        })
+        && required_names.is_subset(&closure_names)
 }
 
 fn launcher_error(
@@ -1099,11 +1146,30 @@ mod tests {
             .get("required_native_dlls")
             .and_then(|v| v.as_array())
             .expect("required dlls");
-        let pe_dll_closure: Vec<serde_json::Value> = required_dlls
+        let mut pe_dll_closure: Vec<serde_json::Value> = required_dlls
             .iter()
             .filter_map(|name| name.as_str())
-            .map(|name| serde_json::json!({"name": name, "machine": "IMAGE_FILE_MACHINE_AMD64"}))
+            .map(|name| {
+                let file = runtime.join(name);
+                std::fs::write(&file, format!("pe:{name}")).expect("write required dll");
+                let digest = format!("{:x}", Sha256::digest(std::fs::read(&file).unwrap()));
+                serde_json::json!({
+                    "name": name,
+                    "path": name,
+                    "machine": "IMAGE_FILE_MACHINE_AMD64",
+                    "imports": [],
+                    "sha256": digest,
+                })
+            })
             .collect();
+        std::fs::write(runtime.join("python.exe"), b"python-exe").expect("write python.exe");
+        pe_dll_closure.push(serde_json::json!({
+            "name": "python.exe",
+            "path": "python.exe",
+            "machine": "IMAGE_FILE_MACHINE_AMD64",
+            "imports": ["python311.dll"],
+            "sha256": format!("{:x}", Sha256::digest(std::fs::read(runtime.join("python.exe")).unwrap())),
+        }));
         let mut valid = serde_json::json!({
             "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
             "cpython_version": manifest.get("cpython_version").cloned().unwrap(),

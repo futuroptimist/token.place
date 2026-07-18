@@ -758,3 +758,37 @@ def test_distlib_launcher_pruning_is_restricted_to_distlib_resources(tmp_path):
     assert (unrelated / 't32.exe').exists()
     with pytest.raises(prep.RuntimePrepError, match='x86 PE payload rejected: tools/t32.exe'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
+
+def test_prunes_known_setuptools_non_x64_launchers_but_preserves_x64(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    setuptools = runtime / 'Lib' / 'site-packages' / 'setuptools'
+    setuptools.mkdir(parents=True)
+    for name in ('cli-32.exe', 'gui-32.exe'):
+        write_minimal_pe(setuptools / name, machine=0x014C)
+    for name in ('cli-arm64.exe', 'gui-arm64.exe'):
+        write_minimal_pe(setuptools / name, machine=0xAA64)
+    write_minimal_pe(setuptools / 'cli.exe')
+    write_minimal_pe(setuptools / 'gui.exe')
+
+    removed = prep.prune_packaging_unused_non_x64_launchers(runtime)
+
+    assert removed == [
+        'Lib/site-packages/setuptools/cli-32.exe',
+        'Lib/site-packages/setuptools/cli-arm64.exe',
+        'Lib/site-packages/setuptools/gui-32.exe',
+        'Lib/site-packages/setuptools/gui-arm64.exe',
+    ]
+    assert (setuptools / 'cli.exe').exists()
+    assert (setuptools / 'gui.exe').exists()
+    prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
+
+
+def test_setuptools_launcher_names_outside_setuptools_still_fail(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    tools = runtime / 'tools'
+    tools.mkdir(parents=True)
+    write_minimal_pe(tools / 'cli-32.exe', machine=0x014C)
+
+    assert prep.prune_packaging_unused_non_x64_launchers(runtime) == []
+    with pytest.raises(prep.RuntimePrepError, match='x86 PE payload rejected: tools/cli-32.exe'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': []})

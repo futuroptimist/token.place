@@ -1340,7 +1340,34 @@ def _bundled_runtime_provenance_valid() -> bool:
     required_dlls = manifest.get("required_native_dlls")
     if not isinstance(required_dlls, list):
         return False
-    closure_names = {entry.get("name") for entry in pe_closure if isinstance(entry, dict)}
+    seen_paths: set[str] = set()
+    closure_names: set[str] = set()
+    for entry in pe_closure:
+        if not isinstance(entry, dict):
+            return False
+        rel = entry.get("path") or entry.get("name")
+        digest = entry.get("sha256")
+        imports = entry.get("imports")
+        name = entry.get("name")
+        if not isinstance(rel, str) or not rel or Path(rel).is_absolute() or ".." in Path(rel).parts:
+            return False
+        rel_norm = rel.replace("\\", "/").lower()
+        if rel_norm in seen_paths:
+            return False
+        seen_paths.add(rel_norm)
+        if not isinstance(name, str) or not name:
+            return False
+        closure_names.add(name.lower())
+        file_path = exe.parent / rel
+        try:
+            if not file_path.resolve().is_relative_to(exe.parent.resolve()):
+                return False
+            if not file_path.is_file() or hashlib.sha256(file_path.read_bytes()).hexdigest() != digest:
+                return False
+        except OSError:
+            return False
+        if entry.get("machine") != "IMAGE_FILE_MACHINE_AMD64" or not isinstance(imports, list):
+            return False
     return (
         provenance.get("runtime_id") == "bundled-cpython-3.11-win-x86_64-cu124"
         and provenance.get("cpython_version") == manifest.get("cpython_version") == "3.11.13"
@@ -1350,8 +1377,7 @@ def _bundled_runtime_provenance_valid() -> bool:
         and provenance.get("required_packages") == manifest.get("required_packages")
         and provenance.get("python_package_wheels") == manifest.get("python_package_wheels", [])
         and provenance.get("required_native_dlls") == required_dlls
-        and closure_names == set(required_dlls)
-        and all(isinstance(entry, dict) and entry.get("machine") == "IMAGE_FILE_MACHINE_AMD64" for entry in pe_closure)
+        and set(dll.lower() for dll in required_dlls).issubset(closure_names)
     )
 
 

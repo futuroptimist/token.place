@@ -24,6 +24,7 @@ WINDOWS_SYSTEM_DLLS = {
 WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 DISTLIB_UNUSED_NON_X64_LAUNCHERS = {"t32.exe", "w32.exe", "t64-arm.exe", "w64-arm.exe"}
+SETUPTOOLS_UNUSED_NON_X64_LAUNCHERS = {"cli-32.exe", "gui-32.exe", "cli-arm64.exe", "gui-arm64.exe"}
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -319,13 +320,26 @@ def _is_distlib_launcher_resource(path: Path, runtime: Path) -> bool:
     return 'distlib' in rel_parts and ('pip' in rel_parts or rel_parts[-2:] == ('distlib', path.name.lower()))
 
 
-def prune_distlib_unused_non_x64_launchers(runtime: Path) -> list[str]:
+def _is_setuptools_launcher_resource(path: Path, runtime: Path) -> bool:
+    rel_parts = tuple(part.lower() for part in path.relative_to(runtime).parts)
+    return len(rel_parts) >= 3 and rel_parts[:3] == ('lib', 'site-packages', 'setuptools')
+
+
+def prune_packaging_unused_non_x64_launchers(runtime: Path) -> list[str]:
     removed: list[str] = []
     for path in sorted(runtime.rglob('*.exe'), key=lambda p: p.relative_to(runtime).as_posix().lower()):
-        if path.name.lower() in DISTLIB_UNUSED_NON_X64_LAUNCHERS and _is_distlib_launcher_resource(path, runtime):
+        name = path.name.lower()
+        if (
+            (name in DISTLIB_UNUSED_NON_X64_LAUNCHERS and _is_distlib_launcher_resource(path, runtime))
+            or (name in SETUPTOOLS_UNUSED_NON_X64_LAUNCHERS and _is_setuptools_launcher_resource(path, runtime))
+        ):
             removed.append(path.relative_to(runtime).as_posix())
             path.unlink()
     return removed
+
+
+def prune_distlib_unused_non_x64_launchers(runtime: Path) -> list[str]:
+    return prune_packaging_unused_non_x64_launchers(runtime)
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
@@ -403,7 +417,7 @@ def prepare(m: dict) -> None:
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
         validate_installed_inventory(py, m)
-        prune_distlib_unused_non_x64_launchers(staged)
+        prune_packaging_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m, pe_closure)

@@ -6935,3 +6935,35 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
     assert "prompt" not in safe
     assert "token_ids" not in safe
     assert "SECRET_PROMPT" not in json.dumps(safe)
+
+@patch('utils.networking.relay_client.requests.post')
+def test_reset_api_v1_polling_session_clear_registration_clears_control_credentials(mock_post):
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._store_api_v1_control_credential('http://localhost:5000', 'reset-secret')
+
+    client.reset_api_v1_polling_session(clear_registration=True)
+
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == ''
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_register_api_v1_compute_node_preserves_and_rotates_control_credential(mock_post):
+    client = _standalone_relay_client()
+    first = MagicMock(status_code=200)
+    first.json.return_value = {'registered': True, 'control_credential': 'first-secret'}
+    refresh = MagicMock(status_code=200)
+    refresh.json.return_value = {'registered': True}
+    rotated = MagicMock(status_code=200)
+    rotated.json.return_value = {'registered': True, 'control_credential': 'rotated-secret'}
+    mock_post.side_effect = [first, refresh, rotated]
+
+    assert client.register_api_v1_compute_node()['control_credential'] == 'first-secret'
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
+    client.register_api_v1_compute_node()
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
+    client.register_api_v1_compute_node()
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'

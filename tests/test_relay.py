@@ -4529,3 +4529,51 @@ def test_api_v1_response_for_queued_work_removes_queue_and_post_retrieval_duplic
 
     assert retrieved.status_code == 200
     assert duplicate.status_code == 410
+
+
+def test_api_v1_completed_response_control_returns_completed_unavailable(client):
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    request_id = 'req-completed-control-unavailable'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code == 200
+
+    control = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    })
+
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'completed/unavailable'
+    assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) not in relay_module.api_v1_control_tombstones
+
+
+def test_api_v1_control_tombstone_ttl_cleanup_runs_during_housekeeping(client, monkeypatch):
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert register.status_code == 200
+    credential = register.get_json()['control_credential']
+    request_id = 'req-tombstone-housekeeping-cleanup'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    assert client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'cancel_token': 'proof',
+    }).status_code == 200
+    key = relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id)
+    assert key in relay_module.api_v1_control_tombstones
+    relay_module.api_v1_control_tombstones[key]['expires_at_monotonic'] = time.monotonic() - 1.0
+
+    relay_module._evict_stale_servers()
+    control = client.post('/api/v1/relay/servers/control', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'request_id': request_id,
+        'control_credential': credential,
+    })
+
+    assert key not in relay_module.api_v1_control_tombstones
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'completed/unavailable'

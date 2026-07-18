@@ -1317,9 +1317,10 @@ def _bundled_runtime_provenance_valid() -> bool:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    runtime_id = str(provenance.get("runtime_id") or provenance.get("runtime_identity") or "")
+    runtime_id = str(provenance.get("runtime_id") or "")
     target_triple = str(provenance.get("target_triple") or "")
-    return runtime_id == "bundled-cpython-3.11-win-x86_64-cu124" or target_triple == "x86_64-pc-windows-msvc"
+    # Both identity fields must match; a stale/mismatched/partial provenance is not valid.
+    return runtime_id == "bundled-cpython-3.11-win-x86_64-cu124" and target_triple == "x86_64-pc-windows-msvc"
 
 
 def _is_bundled_packaged_runtime() -> bool:
@@ -1632,6 +1633,19 @@ def _ensure_desktop_llama_runtime_impl(
             and before_version_payload.get("llama_cpp_python_version_match") == "match"
         )
     )
+
+    # On Windows, an exact packaged layout with invalid provenance must fail closed before a
+    # successful CUDA probe can bypass the immutability check.  Check this before accepting any
+    # GPU-success early return so stale/corrupt/missing provenance is never silently accepted.
+    if _desktop_platform().startswith("win") and _is_exact_packaged_runtime_layout() and not _bundled_runtime_provenance_valid():
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": "immutable bundled GPU runtime probe failed: invalid or missing provenance; packaged startup will not run pip, compilers, or CPU/model/context fallback",
+            "runtime_action": "bundled_runtime_probe_failed",
+            "runtime_origin": "bundled",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
 
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
         if (not qwen_64k_required or before.yarn_rope_supported) and qwen_64k_version_ok:

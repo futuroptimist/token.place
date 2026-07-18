@@ -3710,7 +3710,7 @@ def test_windows_packaged_runtime_layout_with_missing_provenance_is_exact_but_no
     assert desktop_runtime_setup._is_bundled_packaged_runtime() is False
 
 
-def test_windows_packaged_runtime_layout_validates_runtime_id_or_target_triple(
+def test_windows_packaged_runtime_layout_validates_runtime_id_and_target_triple(
     monkeypatch, tmp_path
 ):
     runtime_dir = tmp_path / 'resources' / 'python-runtime'
@@ -3722,19 +3722,46 @@ def test_windows_packaged_runtime_layout_validates_runtime_id_or_target_triple(
     sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
     monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
 
+    # Both runtime_id and target_triple must match.
     provenance.write_text(
-        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}),
+        json.dumps({
+            'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+            'target_triple': 'x86_64-pc-windows-msvc',
+        }),
         encoding='utf-8',
     )
     assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
     assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
 
+    # Only runtime_id present (missing target_triple): not valid.
+    provenance.write_text(
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Only target_triple present (missing runtime_id): not valid.
+    provenance.write_text(
+        json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Stale runtime_id with correct target_triple: not valid.
     provenance.write_text(
         json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}),
         encoding='utf-8',
     )
-    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
 
+    # Correct runtime_id with wrong target_triple: not valid.
+    provenance.write_text(
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Malformed JSON: not valid.
     provenance.write_text('{not-json', encoding='utf-8')
     assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
 
@@ -3804,3 +3831,104 @@ def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, 
     assert result['action'] == 'bundled_runtime_probe_failed'
     assert result['missing'] == 'psutil,requests,dotenv,cryptography'
     assert result['detail'] == 'immutable packaged runtime will not run pip installers'
+
+
+def _setup_windows_packaged_layout(monkeypatch, tmp_path):
+    """Helper: set up an exact Windows packaged runtime layout and return (runtime_dir, python_exe)."""
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    return runtime_dir, python_exe
+
+
+def _common_packaged_mocks(monkeypatch, tmp_path, before_probe):
+    """Helper: monkeypatch common mocks for ensure_desktop_llama_runtime tests."""
+    calls = {'pip': 0, 'source': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_runtime_bootstrap_policy',
+        lambda: SimpleNamespace(expected_backend='cuda', bootstrap_supported=True),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda *a, **k: before_probe)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *a, **k: calls.__setitem__('source', calls['source'] + 1) or (False, 'no'),
+    )
+    return calls
+
+
+@pytest.mark.parametrize('provenance_content,label', [
+    (None, 'missing'),
+    ('{bad-json', 'corrupt'),
+    (json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}), 'stale_runtime_id'),
+    (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}), 'wrong_triple'),
+    (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}), 'missing_triple'),
+    (json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}), 'missing_runtime_id'),
+])
+def test_cuda_probe_success_bypassed_by_invalid_provenance_fails_closed(
+    monkeypatch, tmp_path, provenance_content, label
+):
+    """CUDA probe success must not bypass an invalid provenance on a Windows packaged layout."""
+    runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
+    prov_path = runtime_dir / 'embedded_python_runtime_provenance.json'
+    if provenance_content is not None:
+        prov_path.write_text(provenance_content, encoding='utf-8')
+    # else: provenance file absent (missing case)
+
+    # A CUDA probe that would normally succeed.
+    before = _probe(backend='cuda', gpu=True, device='cuda:0', yarn=True)
+    calls = _common_packaged_mocks(monkeypatch, tmp_path, before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_required_llama_cpp_spec',
+        lambda _: ('llama-cpp-python==0.3.32', '0.3.32'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed', (
+        f"[{label}] expected bundled_runtime_probe_failed, got {result['runtime_action']!r}"
+    )
+    assert result.get('runtime_origin') == 'bundled', f"[{label}] expected runtime_origin=bundled"
+    assert calls == {'pip': 0, 'source': 0}, f"[{label}] pip/source repair must not be called"
+    assert 'cuda_build' not in str(result), f"[{label}] cuda_build must not appear in result"
+
+
+def test_valid_provenance_does_not_block_cuda_probe_success(monkeypatch, tmp_path):
+    """A valid provenance must allow a successful CUDA probe to return cuda_already_supported."""
+    runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
+        json.dumps({
+            'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+            'target_triple': 'x86_64-pc-windows-msvc',
+        }),
+        encoding='utf-8',
+    )
+
+    before = _probe(backend='cuda', gpu=True, device='cuda:0', yarn=True)
+    _common_packaged_mocks(monkeypatch, tmp_path, before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_required_llama_cpp_spec',
+        lambda _: ('llama-cpp-python==0.3.32', '0.3.32'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['selected_backend'] == 'cuda'

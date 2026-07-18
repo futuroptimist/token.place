@@ -267,6 +267,7 @@ def test_write_provenance_records_windows_x86_64_runtime_contract(tmp_path):
     prep.write_provenance(runtime, m)
 
     payload = json.loads((runtime / prep.PROVENANCE).read_text(encoding='utf-8'))
+    assert payload['runtime_id'] == 'bundled-cpython-3.11-win-x86_64-cu124'
     assert payload['target_triple'] == 'x86_64-pc-windows-msvc'
     assert payload['llama_cpp_cuda_wheel']['name'].endswith('win_amd64.whl')
     assert payload['expected_backend'] == 'cuda'

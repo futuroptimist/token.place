@@ -96,6 +96,7 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 def write_provenance(runtime: Path, m: dict) -> None:
     payload={
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
         'cpython_version': m['cpython_version'], 'target_triple': m['target_triple'],
         'source_archive_sha256': m['sha256'], 'llama_cpp_cuda_wheel': m['llama_cpp_cuda_wheel'],
         'required_packages': m['required_packages'], 'required_native_dlls': m['required_native_dlls'],

@@ -58,6 +58,33 @@ def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
 @pytest.mark.parametrize(
     ('raw_value', 'expected'),
     [
+        (None, 3.25),
+        ('', 3.25),
+        ('  ', 3.25),
+        ('2.5', 2.5),
+        ('not-a-float', 3.25),
+        ('nan', 3.25),
+        ('inf', 3.25),
+        ('0', 3.25),
+        ('-1', 3.25),
+    ],
+)
+def test_stop_cleanup_budget_seconds_parses_positive_finite_values(
+    monkeypatch,
+    raw_value,
+    expected,
+):
+    if raw_value is None:
+        monkeypatch.delenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', raising=False)
+    else:
+        monkeypatch.setenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', raw_value)
+
+    assert compute_node_bridge._stop_cleanup_budget_seconds(default=3.25) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw_value', 'expected'),
+    [
         (None, 4),
         ('0', 0),
         ('5', 5),

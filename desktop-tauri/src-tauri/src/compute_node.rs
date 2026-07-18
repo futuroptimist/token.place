@@ -1637,6 +1637,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|exit_status| !exit_status.success())
                 .unwrap_or(true);
+        // Every production child is owned by an operator session. A child-backed
+        // stop without a matching session is intentionally malformed and fails
+        // closed so stale/missing cleanup acknowledgments cannot be accepted.
         let session_matches = match (
             stop_session_id.as_deref(),
             status.operator_session_id.as_deref(),
@@ -2454,6 +2457,7 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.operator_session_id = Some("cancel-session".into());
             status.stop_cleanup_required = Some(true);
             status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
@@ -2507,6 +2511,7 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.operator_session_id = Some("cleanup-session".into());
             status.stop_cleanup_required = Some(true);
             status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
@@ -2550,6 +2555,7 @@ mod tests {
         *state.stdin.lock().await = Some(first_stdin);
         {
             let mut status = state.status.lock().await;
+            status.operator_session_id = Some("restart-session-1".into());
             status.stop_cleanup_required = Some(true);
             status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
@@ -2573,6 +2579,7 @@ mod tests {
         *state.stdin.lock().await = Some(second_stdin);
         {
             let mut status = state.status.lock().await;
+            status.operator_session_id = Some("restart-session-2".into());
             status.stop_cleanup_required = Some(true);
             status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("complete".into());
@@ -2583,6 +2590,39 @@ mod tests {
         stop_compute_node(state.clone()).await.expect("second stop");
         assert!(state.child.lock().await.is_none());
         assert!(state.stdin.lock().await.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_rejects_child_cleanup_without_session() {
+        let state = ComputeNodeState::default();
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+
+        let error = stop_compute_node(state.clone())
+            .await
+            .expect_err("child-backed cleanup without session should fail closed");
+        assert!(error
+            .to_string()
+            .contains("Operator stopped locally, but unregister did not complete"));
     }
 
     #[cfg(not(windows))]

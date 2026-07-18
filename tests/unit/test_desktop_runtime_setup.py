@@ -3830,29 +3830,24 @@ def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, 
 
 
 def _valid_windows_runtime_provenance() -> dict:
+    manifest_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri' / 'src-tauri' / 'python'
+        / 'embedded_python_runtime_windows_x86_64_manifest.json'
+    )
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     return {
         'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
-        'cpython_version': '3.11.13',
-        'target_triple': 'x86_64-pc-windows-msvc',
-        'source_archive_sha256': '008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660',
-        'llama_cpp_cuda_wheel': {
-            'name': 'llama_cpp_python-0.3.32-py3-none-win_amd64.whl',
-            'version': '0.3.32',
-            'flavor': 'cu124',
-            'sha256': 'c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0',
-        },
-        'required_packages': {
-            'psutil': '7.1.0', 'requests': '2.32.5', 'python-dotenv': '1.1.1',
-            'cryptography': '46.0.1', 'numpy': '2.3.3', 'diskcache': '5.6.3',
-            'Jinja2': '3.1.6', 'typing-extensions': '4.15.0',
-            'charset-normalizer': '3.4.9', 'idna': '3.18', 'urllib3': '2.7.0',
-            'certifi': '2026.6.17', 'cffi': '2.1.0', 'pycparser': '3.0',
-            'MarkupSafe': '3.0.3', 'llama-cpp-python': '0.3.32',
-        },
-        'required_native_dlls': ['python311.dll', 'vcruntime140.dll', 'llama.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll', 'ggml.dll', 'llama-common.dll', 'mtmd.dll'],
+        'cpython_version': manifest['cpython_version'],
+        'target_triple': manifest['target_triple'],
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest.get('python_package_wheels', []),
+        'required_native_dlls': manifest['required_native_dlls'],
         'pe_dll_closure': [
             {'name': name, 'machine': 'IMAGE_FILE_MACHINE_AMD64'}
-            for name in ['python311.dll', 'vcruntime140.dll', 'llama.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll', 'ggml.dll', 'llama-common.dll', 'mtmd.dll']
+            for name in manifest['required_native_dlls']
         ],
     }
 

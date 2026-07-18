@@ -489,11 +489,18 @@ jobs:
             echo "Expected staged Windows NSIS and MSI artifacts before validation." >&2
             exit 1
           fi
-          tag_name="${INPUT_TAG_NAME:-${GITHUB_REF_NAME:-desktop-v0.1.2}}"
+          validator_version_args=(--expected-version "0.1.2")
+          tag_name="${INPUT_TAG_NAME:-}"
+          if [ -z "${tag_name}" ] && [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ]; then
+            tag_name="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ "${tag_name}" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            validator_version_args=(--release-tag "${tag_name}")
+          fi
           python ../scripts/validate_windows_desktop_release_artifacts.py \
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
-            --release-tag "${tag_name}"
+            "${validator_version_args[@]}"
 
       - name: Generate SHA256 checksums
         shell: bash
@@ -525,6 +532,8 @@ jobs:
           path: desktop-tauri/release-artifacts/*
           if-no-files-found: error
 
+  # Publication intentionally depends on this real self-hosted Windows x64 NVIDIA/RTX gate;
+  # mocked CUDA checks must not satisfy release hardware validation.
   windows-nvidia-release-gate:
     name: Windows x64 NVIDIA artifact smoke gate
     needs: build

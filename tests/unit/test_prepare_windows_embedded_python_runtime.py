@@ -14,8 +14,9 @@ prep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prep)
 
 
-def write_minimal_pe(path: Path, *, machine: int = 0x8664, imports: list[str] | None = None) -> None:
+def write_minimal_pe(path: Path, *, machine: int = 0x8664, imports: list[str] | None = None, delay_imports: list[str] | None = None) -> None:
     imports = imports or []
+    delay_imports = delay_imports or []
     data = bytearray(0x600)
     data[0:2] = b'MZ'
     data[0x3C:0x40] = (0x80).to_bytes(4, 'little')
@@ -26,6 +27,8 @@ def write_minimal_pe(path: Path, *, machine: int = 0x8664, imports: list[str] | 
     opt = 0x98
     data[opt:opt+2] = (0x20B).to_bytes(2, 'little')
     data[opt+112+8:opt+112+12] = (0x1100).to_bytes(4, 'little')
+    if delay_imports:
+        data[opt+112+(8*13):opt+112+(8*13)+4] = (0x1300).to_bytes(4, 'little')
     sec = opt + 0xF0
     data[sec:sec+8] = b'.rdata\0\0'
     data[sec+8:sec+12] = (0x400).to_bytes(4, 'little')
@@ -37,6 +40,14 @@ def write_minimal_pe(path: Path, *, machine: int = 0x8664, imports: list[str] | 
         desc = base + idx * 20
         name_rva = 0x1200 + idx * 32
         data[desc+12:desc+16] = name_rva.to_bytes(4, 'little')
+        name_off = 0x200 + (name_rva - 0x1000)
+        data[name_off:name_off+len(name)] = name.encode('ascii')
+    delay_base = 0x500
+    for idx, name in enumerate(delay_imports):
+        desc = delay_base + idx * 32
+        name_rva = 0x1380 + idx * 32
+        data[desc+4:desc+8] = name_rva.to_bytes(4, 'little')
+        data[desc+16:desc+20] = (0x13c0 + idx * 8).to_bytes(4, 'little')
         name_off = 0x200 + (name_rva - 0x1000)
         data[name_off:name_off+len(name)] = name.encode('ascii')
     path.write_bytes(data)
@@ -598,6 +609,43 @@ def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bu
     with pytest.raises(prep.RuntimePrepError, match='unresolved non-system DLL imports: .*cudart64_12.dll'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
+
+
+def test_prunes_only_known_distlib_non_x64_launchers_before_pe_validation(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    for name in ('t32.exe', 'w32.exe', 't64-arm.exe', 'w64-arm.exe'):
+        write_minimal_pe(runtime / name, machine=0x014C if name[1:3] == '32' else 0xAA64)
+    write_minimal_pe(runtime / 't64.exe')
+    write_minimal_pe(runtime / 'w64.exe')
+
+    removed = prep.prune_distlib_unused_non_x64_launchers(runtime)
+
+    assert removed == ['t32.exe', 't64-arm.exe', 'w32.exe', 'w64-arm.exe']
+    assert (runtime / 't64.exe').exists()
+    assert (runtime / 'w64.exe').exists()
+    prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
+
+
+def test_unexpected_wrong_architecture_pe_fails_with_relative_path(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    nested = runtime / 'Lib' / 'site-packages'
+    nested.mkdir(parents=True)
+    write_minimal_pe(nested / 'unexpected.exe', machine=0x014C)
+
+    with pytest.raises(prep.RuntimePrepError, match=r'x86 PE payload rejected: Lib/site-packages/unexpected.exe'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
+
+
+def test_delay_load_imports_are_included_in_pe_closure(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    write_minimal_pe(runtime / 'python.exe', delay_imports=['delayed.dll'])
+    write_minimal_pe(runtime / 'delayed.dll')
+
+    closure = prep.validate_runtime_payload(runtime, {'required_native_dlls': ['delayed.dll']})
+
+    assert {entry['name'] for entry in closure} >= {'python.exe', 'delayed.dll'}
 
 def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'

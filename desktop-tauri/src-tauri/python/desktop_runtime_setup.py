@@ -1310,6 +1310,15 @@ def _is_exact_packaged_runtime_layout() -> bool:
     return "python-runtime" in parts and "contents" in parts and "resources" in parts
 
 
+def _bundled_runtime_manifest() -> dict:
+    manifest_path = Path(__file__).with_name("embedded_python_runtime_windows_x86_64_manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
 def _bundled_runtime_provenance_valid() -> bool:
     exe = _safe_resolve_path(sys.executable)
     provenance_path = exe.parent / "embedded_python_runtime_provenance.json"
@@ -1317,25 +1326,32 @@ def _bundled_runtime_provenance_valid() -> bool:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    wheel = provenance.get("llama_cpp_cuda_wheel") if isinstance(provenance.get("llama_cpp_cuda_wheel"), dict) else {}
-    required_packages = provenance.get("required_packages") if isinstance(provenance.get("required_packages"), dict) else {}
-    required_dlls = provenance.get("required_native_dlls") if isinstance(provenance.get("required_native_dlls"), list) else []
-    pe_closure = provenance.get("pe_dll_closure") if isinstance(provenance.get("pe_dll_closure"), list) else []
+    if not isinstance(provenance, dict):
+        return False
+    manifest = _bundled_runtime_manifest()
+    if not manifest:
+        return False
+    expected_wheel = manifest.get("llama_cpp_cuda_wheel")
+    if not isinstance(expected_wheel, dict):
+        return False
+    pe_closure = provenance.get("pe_dll_closure")
+    if not isinstance(pe_closure, list) or not pe_closure:
+        return False
+    required_dlls = manifest.get("required_native_dlls")
+    if not isinstance(required_dlls, list):
+        return False
+    closure_names = {entry.get("name") for entry in pe_closure if isinstance(entry, dict)}
     return (
         provenance.get("runtime_id") == "bundled-cpython-3.11-win-x86_64-cu124"
-        and provenance.get("cpython_version") == "3.11.13"
-        and provenance.get("target_triple") == "x86_64-pc-windows-msvc"
-        and provenance.get("source_archive_sha256") == "008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660"
-        and wheel.get("name") == "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
-        and wheel.get("version") == "0.3.32"
-        and wheel.get("flavor") == "cu124"
-        and wheel.get("sha256") == "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
-        and required_packages.get("llama-cpp-python") == "0.3.32"
-        and all(required_packages.get(name) for name in ("psutil", "requests", "python-dotenv", "cryptography", "numpy", "diskcache", "Jinja2", "typing-extensions", "charset-normalizer", "idna", "urllib3", "certifi", "cffi", "pycparser", "MarkupSafe"))
-        and bool(pe_closure)
-        and all(name in required_dlls for name in ("python311.dll", "vcruntime140.dll", "llama.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama-common.dll", "mtmd.dll"))
-        and {entry.get("name") for entry in pe_closure if isinstance(entry, dict)} >= set(required_dlls)
-        and all(entry.get("machine") == "IMAGE_FILE_MACHINE_AMD64" for entry in pe_closure if isinstance(entry, dict))
+        and provenance.get("cpython_version") == manifest.get("cpython_version") == "3.11.13"
+        and provenance.get("target_triple") == manifest.get("target_triple") == "x86_64-pc-windows-msvc"
+        and provenance.get("source_archive_sha256") == manifest.get("sha256")
+        and provenance.get("llama_cpp_cuda_wheel") == expected_wheel
+        and provenance.get("required_packages") == manifest.get("required_packages")
+        and provenance.get("python_package_wheels") == manifest.get("python_package_wheels", [])
+        and provenance.get("required_native_dlls") == required_dlls
+        and closure_names == set(required_dlls)
+        and all(isinstance(entry, dict) and entry.get("machine") == "IMAGE_FILE_MACHINE_AMD64" for entry in pe_closure)
     )
 
 

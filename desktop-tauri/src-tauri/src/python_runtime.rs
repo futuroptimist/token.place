@@ -271,6 +271,13 @@ fn metadata_probe_is_valid(
     Ok(())
 }
 
+fn bundled_windows_manifest() -> Option<serde_json::Value> {
+    serde_json::from_str(include_str!(
+        "../python/embedded_python_runtime_windows_x86_64_manifest.json"
+    ))
+    .ok()
+}
+
 fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
     let path = runtime_root.join("embedded_python_runtime_provenance.json");
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -279,21 +286,42 @@ fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    let Some(wheel) = value.get("llama_cpp_cuda_wheel") else {
+    let Some(manifest) = bundled_windows_manifest() else {
         return false;
     };
+    let Some(required_dlls) = manifest
+        .get("required_native_dlls")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    let Some(closure) = value.get("pe_dll_closure").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if closure.is_empty() {
+        return false;
+    }
+    let required_names: std::collections::BTreeSet<&str> =
+        required_dlls.iter().filter_map(|v| v.as_str()).collect();
+    let closure_names: std::collections::BTreeSet<&str> = closure
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(|v| v.as_str()))
+        .collect();
     value.get("runtime_id").and_then(|v| v.as_str())
         == Some("bundled-cpython-3.11-win-x86_64-cu124")
+        && value.get("cpython_version") == manifest.get("cpython_version")
         && value.get("cpython_version").and_then(|v| v.as_str()) == Some("3.11.13")
+        && value.get("target_triple") == manifest.get("target_triple")
         && value.get("target_triple").and_then(|v| v.as_str()) == Some("x86_64-pc-windows-msvc")
-        && value.get("source_archive_sha256").and_then(|v| v.as_str())
-            == Some("008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660")
-        && wheel.get("name").and_then(|v| v.as_str())
-            == Some("llama_cpp_python-0.3.32-py3-none-win_amd64.whl")
-        && wheel.get("version").and_then(|v| v.as_str()) == Some("0.3.32")
-        && wheel.get("flavor").and_then(|v| v.as_str()) == Some("cu124")
-        && wheel.get("sha256").and_then(|v| v.as_str())
-            == Some("c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0")
+        && value.get("source_archive_sha256") == manifest.get("sha256")
+        && value.get("llama_cpp_cuda_wheel") == manifest.get("llama_cpp_cuda_wheel")
+        && value.get("required_packages") == manifest.get("required_packages")
+        && value.get("python_package_wheels") == manifest.get("python_package_wheels")
+        && value.get("required_native_dlls") == manifest.get("required_native_dlls")
+        && closure_names == required_names
+        && closure.iter().all(|entry| {
+            entry.get("machine").and_then(|v| v.as_str()) == Some("IMAGE_FILE_MACHINE_AMD64")
+        })
 }
 
 fn launcher_error(
@@ -1066,22 +1094,32 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let runtime = temp.path();
         let provenance = runtime.join("embedded_python_runtime_provenance.json");
-        let valid = r#"{
-            "runtime_id":"bundled-cpython-3.11-win-x86_64-cu124",
-            "cpython_version":"3.11.13",
-            "target_triple":"x86_64-pc-windows-msvc",
-            "source_archive_sha256":"008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660",
-            "llama_cpp_cuda_wheel":{
-                "name":"llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
-                "version":"0.3.32",
-                "flavor":"cu124",
-                "sha256":"c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
-            }
-        }"#;
-        std::fs::write(&provenance, valid).expect("write provenance");
+        let manifest = bundled_windows_manifest().expect("manifest");
+        let required_dlls = manifest
+            .get("required_native_dlls")
+            .and_then(|v| v.as_array())
+            .expect("required dlls");
+        let pe_dll_closure: Vec<serde_json::Value> = required_dlls
+            .iter()
+            .filter_map(|name| name.as_str())
+            .map(|name| serde_json::json!({"name": name, "machine": "IMAGE_FILE_MACHINE_AMD64"}))
+            .collect();
+        let mut valid = serde_json::json!({
+            "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "cpython_version": manifest.get("cpython_version").cloned().unwrap(),
+            "target_triple": manifest.get("target_triple").cloned().unwrap(),
+            "source_archive_sha256": manifest.get("sha256").cloned().unwrap(),
+            "llama_cpp_cuda_wheel": manifest.get("llama_cpp_cuda_wheel").cloned().unwrap(),
+            "required_packages": manifest.get("required_packages").cloned().unwrap(),
+            "python_package_wheels": manifest.get("python_package_wheels").cloned().unwrap(),
+            "required_native_dlls": manifest.get("required_native_dlls").cloned().unwrap(),
+            "pe_dll_closure": pe_dll_closure,
+        });
+        std::fs::write(&provenance, valid.to_string()).expect("write provenance");
         assert!(bundled_windows_provenance_is_valid(runtime));
 
-        std::fs::write(&provenance, valid.replace("cu124", "cpu")).expect("write stale provenance");
+        valid["llama_cpp_cuda_wheel"]["flavor"] = serde_json::json!("cpu");
+        std::fs::write(&provenance, valid.to_string()).expect("write stale provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
 
         std::fs::write(&provenance, "{not-json").expect("write corrupt provenance");

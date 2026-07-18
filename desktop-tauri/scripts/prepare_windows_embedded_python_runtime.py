@@ -23,6 +23,7 @@ WINDOWS_SYSTEM_DLLS = {
 }
 WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
+DISTLIB_UNUSED_NON_X64_LAUNCHERS = {"t32.exe", "w32.exe", "t64-arm.exe", "w64-arm.exe"}
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -179,30 +180,34 @@ def _rva_to_offset(sections: list[tuple[int, int, int, int]], rva: int) -> int |
     return None
 
 
-def inspect_pe(path: Path) -> tuple[str, list[str]]:
+def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[str]]:
+    label = display_name or path.name
     data = path.read_bytes()
     if len(data) < 0x40 or data[:2] != b'MZ':
-        raise RuntimePrepError(f'not a PE file: {path.name}')
+        raise RuntimePrepError(f'not a PE file: {label}')
     pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
     if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b'PE\0\0':
-        raise RuntimePrepError(f'invalid PE header: {path.name}')
+        raise RuntimePrepError(f'invalid PE header: {label}')
     machine = struct.unpack_from('<H', data, pe_offset + 4)[0]
     if machine != 0x8664:
         if machine == 0xAA64:
-            raise RuntimePrepError(f'ARM64 PE payload rejected: {path.name}')
+            raise RuntimePrepError(f'ARM64 PE payload rejected: {label}')
         if machine == 0x014C:
-            raise RuntimePrepError(f'x86 PE payload rejected: {path.name}')
-        raise RuntimePrepError(f'unsupported PE machine 0x{machine:04x}: {path.name}')
+            raise RuntimePrepError(f'x86 PE payload rejected: {label}')
+        raise RuntimePrepError(f'unsupported PE machine 0x{machine:04x}: {label}')
     section_count = struct.unpack_from('<H', data, pe_offset + 6)[0]
     optional_size = struct.unpack_from('<H', data, pe_offset + 20)[0]
     optional_offset = pe_offset + 24
     magic = struct.unpack_from('<H', data, optional_offset)[0]
     data_directory_offset = optional_offset + (112 if magic == 0x20B else 96 if magic == 0x10B else -1)
     if data_directory_offset < optional_offset:
-        raise RuntimePrepError(f'unsupported PE optional header: {path.name}')
+        raise RuntimePrepError(f'unsupported PE optional header: {label}')
     import_rva = 0
+    delay_import_rva = 0
     if data_directory_offset + 8 * 2 <= len(data):
         import_rva = struct.unpack_from('<II', data, data_directory_offset + 8)[0]
+    if data_directory_offset + 8 * 14 <= len(data):
+        delay_import_rva = struct.unpack_from('<II', data, data_directory_offset + 8 * 13)[0]
     sections = []
     section_offset = optional_offset + optional_size
     for index in range(section_count):
@@ -212,25 +217,40 @@ def inspect_pe(path: Path) -> tuple[str, list[str]]:
         virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from('<IIII', data, off + 8)
         sections.append((virtual_address, virtual_size, raw_pointer, raw_size))
     imports: list[str] = []
-    if import_rva:
-        desc_offset = _rva_to_offset(sections, import_rva)
-        while desc_offset is not None and desc_offset + 20 <= len(data):
-            original_first_thunk, _time, _chain, name_rva, first_thunk = struct.unpack_from('<IIIII', data, desc_offset)
-            if not any((original_first_thunk, name_rva, first_thunk)):
+
+    def read_import_descriptors(rva: int, stride: int, name_index: int) -> None:
+        if not rva:
+            return
+        desc_offset = _rva_to_offset(sections, rva)
+        while desc_offset is not None and desc_offset + stride <= len(data):
+            fields = struct.unpack_from('<' + 'I' * (stride // 4), data, desc_offset)
+            if not any(fields):
                 break
+            name_rva = fields[name_index]
             name_offset = _rva_to_offset(sections, name_rva)
             if name_offset is None:
-                raise RuntimePrepError(f'unresolved PE import name in {path.name}')
+                raise RuntimePrepError(f'unresolved PE import name in {label}')
             end = data.find(b'\0', name_offset)
             if end < 0:
-                raise RuntimePrepError(f'unterminated PE import name in {path.name}')
+                raise RuntimePrepError(f'unterminated PE import name in {label}')
             imports.append(data[name_offset:end].decode('ascii', 'replace').lower())
-            desc_offset += 20
+            desc_offset += stride
+
+    read_import_descriptors(import_rva, 20, 3)
+    read_import_descriptors(delay_import_rva, 32, 1)
     return 'IMAGE_FILE_MACHINE_AMD64', imports
 
 
 def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
-    files = {p.name.lower(): p for p in runtime.rglob('*') if p.is_file()}
+    files: dict[str, Path] = {}
+    for p in sorted((p for p in runtime.rglob('*') if p.is_file()), key=lambda item: item.relative_to(runtime).as_posix().lower()):
+        key = p.name.lower()
+        existing = files.get(key)
+        if existing is not None:
+            if sha256_file(existing) != sha256_file(p):
+                raise RuntimePrepError(f'ambiguous duplicate DLL basename: {key}')
+            continue
+        files[key] = p
     queue = [p for p in files.values() if p.suffix.lower() in {'.exe', '.dll', '.pyd'}]
     seen: set[str] = set()
     closure: list[dict[str, object]] = []
@@ -242,7 +262,7 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
         if key in seen:
             continue
         seen.add(key)
-        machine, imports = inspect_pe(pe)
+        machine, imports = inspect_pe(pe, rel)
         closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports)})
         for dll in imports:
             if is_windows_system_dll(dll):
@@ -267,6 +287,14 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
     if not closure:
         raise RuntimePrepError('packaged PE closure must be non-empty')
     return closure
+
+def prune_distlib_unused_non_x64_launchers(runtime: Path) -> list[str]:
+    removed: list[str] = []
+    for path in sorted(runtime.rglob('*.exe'), key=lambda p: p.relative_to(runtime).as_posix().lower()):
+        if path.name.lower() in DISTLIB_UNUSED_NON_X64_LAUNCHERS:
+            removed.append(path.relative_to(runtime).as_posix())
+            path.unlink()
+    return removed
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
@@ -344,6 +372,7 @@ def prepare(m: dict) -> None:
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
         validate_installed_inventory(py, m)
+        prune_distlib_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m, pe_closure)

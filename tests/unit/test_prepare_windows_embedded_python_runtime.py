@@ -99,6 +99,28 @@ def test_safe_extract_tar_rejects_prefix_escape_and_links(tmp_path):
         prep.safe_extract_tar(link_archive, tmp_path / 'dest')
 
 
+
+def test_validate_runtime_payload_allows_inert_cpython_headers_but_rejects_tools(tmp_path):
+    runtime = tmp_path / 'runtime'
+    (runtime / 'include').mkdir(parents=True)
+    (runtime / 'include' / 'abstract.h').write_text('/* CPython header */', encoding='utf-8')
+    for dll in ('python311.dll', 'vcruntime140.dll', 'llama.dll'):
+        (runtime / dll).write_text('', encoding='utf-8')
+
+    prep.validate_runtime_payload(
+        runtime,
+        manifest(required_native_dlls=['python311.dll', 'vcruntime140.dll', 'llama.dll']),
+    )
+
+    tools = runtime / 'CUDA Toolkit' / 'bin'
+    tools.mkdir(parents=True)
+    (tools / 'nvcc.exe').write_text('', encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='forbidden compiler/toolkit'):
+        prep.validate_runtime_payload(
+            runtime,
+            manifest(required_native_dlls=['python311.dll', 'vcruntime140.dll', 'llama.dll']),
+        )
+
 def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'
     archive_root = 'cpython'

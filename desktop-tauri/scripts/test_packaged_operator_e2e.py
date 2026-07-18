@@ -232,7 +232,6 @@ def run_managed_dependency_target_reuse_probe(tmp_root: Path, *, resources_root:
     """Assert two packaged preflight launches reuse one clean managed dependency target."""
 
     resources_root = resources_root or (tmp_root / "resources")
-    managed_target = tmp_root / "C_drive\\Users\\TokenPlace\\managed-dependencies"
     counter_path = tmp_root / "pip-call-count.txt"
     bundled_runtime = resources_root / "python-runtime"
     bundled_runtime.mkdir(parents=True, exist_ok=True)
@@ -241,14 +240,17 @@ def run_managed_dependency_target_reuse_probe(tmp_root: Path, *, resources_root:
         json.dumps({"runtime_id": "bundled-cpython-3.11-win-x86_64-cu124", "target_triple": "x86_64-pc-windows-msvc"}),
         encoding="utf-8",
     )
+    site_packages = bundled_runtime / "Lib" / "site-packages"
     for name in ("psutil", "requests", "dotenv", "cryptography"):
-        package_dir = managed_target / name
+        package_dir = site_packages / name
         package_dir.mkdir(parents=True, exist_ok=True)
         (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    hostile_target = tmp_root / "C_drive\\Users\\TokenPlace\\hostile-dependencies"
+    (hostile_target / "psutil").mkdir(parents=True, exist_ok=True)
     env = _packaged_env(
         tmp_root,
         resources_root,
-        extra_env={"TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(managed_target)},
+        extra_env={"TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(hostile_target)},
     )
     probe = f"""
 import json
@@ -262,22 +264,17 @@ mod.sys.executable = str(pathlib.Path({str(resources_root / 'python-runtime' / '
 
 def fake_run(cmd, env, **kwargs):
     counter.write_text(str(int(counter.read_text() or '0') + 1) if counter.exists() else '1')
-    target = pathlib.Path(env['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
-    for name in ('psutil', 'requests', 'dotenv', 'cryptography'):
-        package_dir = target / name
-        package_dir.mkdir(parents=True, exist_ok=True)
-        (package_dir / '__init__.py').write_text('')
-    return True, 'fake install ok'
+    raise AssertionError('packaged startup must not invoke pip installers')
 
 mod._run_pip_install = fake_run
 
 def fake_missing(required_modules):
     module_to_package = {{'dotenv': 'dotenv'}}
     missing = []
-    target = pathlib.Path(__import__('os').environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
+    runtime_site = pathlib.Path(mod.sys.executable).parent / 'Lib' / 'site-packages'
     for module_name in required_modules:
         package_name = module_to_package.get(module_name, module_name)
-        if not (target / package_name / '__init__.py').is_file():
+        if not (runtime_site / package_name / '__init__.py').is_file():
             missing.append(module_name)
     return missing
 

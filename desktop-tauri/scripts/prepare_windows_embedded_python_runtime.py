@@ -13,7 +13,7 @@ OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "version.dll", "ws2_32.dll"}
-FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(\.c$|\.cc$|\.cpp$|\.h$|\.hpp$|cmake|ninja|nvcc|cuda[-_]?toolkit|visual studio|msbuild)", re.I)
+FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -121,7 +121,11 @@ def validate_runtime_payload(runtime: Path, m: dict) -> None:
     missing = sorted(required - present)
     if missing:
         raise RuntimePrepError(f"missing required DLL: {missing[0]}")
-    forbidden = [p.relative_to(runtime).as_posix() for p in runtime.rglob('*') if p.is_file() and FORBIDDEN_RUNTIME_PAYLOAD_RE.search(p.name)]
+    forbidden = [
+        p.relative_to(runtime).as_posix()
+        for p in runtime.rglob('*')
+        if p.is_file() and FORBIDDEN_RUNTIME_PAYLOAD_RE.search(p.relative_to(runtime).as_posix())
+    ]
     if forbidden:
         raise RuntimePrepError(f"forbidden compiler/toolkit/source payload in bundled runtime: {forbidden[0]}")
 

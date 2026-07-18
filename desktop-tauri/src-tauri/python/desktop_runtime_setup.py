@@ -1317,10 +1317,24 @@ def _bundled_runtime_provenance_valid() -> bool:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    runtime_id = str(provenance.get("runtime_id") or "")
-    target_triple = str(provenance.get("target_triple") or "")
-    # Both identity fields must match; a stale/mismatched/partial provenance is not valid.
-    return runtime_id == "bundled-cpython-3.11-win-x86_64-cu124" and target_triple == "x86_64-pc-windows-msvc"
+    wheel = provenance.get("llama_cpp_cuda_wheel") if isinstance(provenance.get("llama_cpp_cuda_wheel"), dict) else {}
+    required_packages = provenance.get("required_packages") if isinstance(provenance.get("required_packages"), dict) else {}
+    required_dlls = provenance.get("required_native_dlls") if isinstance(provenance.get("required_native_dlls"), list) else []
+    pe_closure = provenance.get("pe_dll_closure") if isinstance(provenance.get("pe_dll_closure"), list) else []
+    return (
+        provenance.get("runtime_id") == "bundled-cpython-3.11-win-x86_64-cu124"
+        and provenance.get("cpython_version") == "3.11.13"
+        and provenance.get("target_triple") == "x86_64-pc-windows-msvc"
+        and provenance.get("source_archive_sha256") == "008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660"
+        and wheel.get("name") == "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
+        and wheel.get("version") == "0.3.32"
+        and wheel.get("flavor") == "cu124"
+        and wheel.get("sha256") == "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
+        and required_packages.get("llama-cpp-python") == "0.3.32"
+        and all(required_packages.get(name) for name in ("psutil", "requests", "python-dotenv", "cryptography", "numpy", "diskcache", "Jinja2", "typing-extensions"))
+        and all(name in required_dlls for name in ("python311.dll", "vcruntime140.dll", "llama.dll"))
+        and all(entry.get("machine") == "IMAGE_FILE_MACHINE_AMD64" for entry in pe_closure if isinstance(entry, dict))
+    )
 
 
 def _is_bundled_packaged_runtime() -> bool:
@@ -1329,7 +1343,7 @@ def _is_bundled_packaged_runtime() -> bool:
     # Invariant: exact packaged layouts are immutable; provenance decides validity,
     # not whether startup may fall back to mutable bootstrap or repair paths.
     if _desktop_platform().startswith("win"):
-        return _bundled_runtime_provenance_valid()
+        return True
     return True
 
 
@@ -2223,13 +2237,17 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     requirements_path = _resolve_desktop_requirements_path(root)
     required_modules = ("psutil", "requests", "dotenv", "cryptography")
 
-    if mutate:
+    if _is_exact_packaged_runtime_layout():
+        target_dir, target_error = _safe_resolve_path(sys.executable).parent / "Lib" / "site-packages", None
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+    elif mutate:
         target_dir, target_error = _resolve_desktop_dependency_target(root)
     else:
         target_dir, target_error = _existing_desktop_dependency_target(root)
     if target_dir is not None:
         target_dir_str = str(target_dir)
-        os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
+        if not _is_exact_packaged_runtime_layout():
+            os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
         if target_dir_str not in sys.path:
             sys.path.insert(1 if sys.path else 0, target_dir_str)
 

@@ -992,16 +992,14 @@ mod tests {
                 "sha256":"c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
             }
         }"#;
-        provenance.write_text(valid).expect("write provenance");
+        std::fs::write(&provenance, valid).expect("write provenance");
         assert!(bundled_windows_provenance_is_valid(runtime));
 
-        provenance
-            .write_text(valid.replace("cu124", "cpu"))
+        std::fs::write(&provenance, valid.replace("cu124", "cpu"))
             .expect("write stale provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
 
-        provenance
-            .write_text("{not-json")
+        std::fs::write(&provenance, "{not-json")
             .expect("write corrupt provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
     }

@@ -3707,7 +3707,7 @@ def test_windows_packaged_runtime_layout_with_missing_provenance_is_exact_but_no
 
     assert desktop_runtime_setup._is_exact_packaged_runtime_layout() is True
     assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
-    assert desktop_runtime_setup._is_bundled_packaged_runtime() is False
+    assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
 
 
 def test_windows_packaged_runtime_layout_validates_runtime_id_and_target_triple(
@@ -3722,18 +3722,13 @@ def test_windows_packaged_runtime_layout_validates_runtime_id_and_target_triple(
     sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
     monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
 
-    # Both runtime_id and target_triple must match.
-    provenance.write_text(
-        json.dumps({
-            'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
-            'target_triple': 'x86_64-pc-windows-msvc',
-        }),
-        encoding='utf-8',
-    )
+    # Every immutable identity field must match.
+    valid_provenance = _valid_windows_runtime_provenance()
+    provenance.write_text(json.dumps(valid_provenance), encoding='utf-8')
     assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
     assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
 
-    # Only runtime_id present (missing target_triple): not valid.
+    # Only runtime_id present (missing target_triple and remaining identity): not valid.
     provenance.write_text(
         json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}),
         encoding='utf-8',
@@ -3833,6 +3828,33 @@ def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, 
     assert result['detail'] == 'immutable packaged runtime will not run pip installers'
 
 
+
+def _valid_windows_runtime_provenance() -> dict:
+    return {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': '3.11.13',
+        'target_triple': 'x86_64-pc-windows-msvc',
+        'source_archive_sha256': '008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660',
+        'llama_cpp_cuda_wheel': {
+            'name': 'llama_cpp_python-0.3.32-py3-none-win_amd64.whl',
+            'version': '0.3.32',
+            'flavor': 'cu124',
+            'sha256': 'c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0',
+        },
+        'required_packages': {
+            'psutil': '7.1.0', 'requests': '2.32.5', 'python-dotenv': '1.1.1',
+            'cryptography': '46.0.1', 'numpy': '2.3.3', 'diskcache': '5.6.3',
+            'Jinja2': '3.1.6', 'typing-extensions': '4.15.0',
+            'llama-cpp-python': '0.3.32',
+        },
+        'required_native_dlls': ['python311.dll', 'vcruntime140.dll', 'llama.dll'],
+        'pe_dll_closure': [
+            {'name': 'python311.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'},
+            {'name': 'vcruntime140.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'},
+            {'name': 'llama.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'},
+        ],
+    }
+
 def _setup_windows_packaged_layout(monkeypatch, tmp_path):
     """Helper: set up an exact Windows packaged runtime layout and return (runtime_dir, python_exe)."""
     runtime_dir = tmp_path / 'resources' / 'python-runtime'
@@ -3914,10 +3936,7 @@ def test_valid_provenance_does_not_block_cuda_probe_success(monkeypatch, tmp_pat
     """A valid provenance must allow a successful CUDA probe to return cuda_already_supported."""
     runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
     (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
-        json.dumps({
-            'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
-            'target_triple': 'x86_64-pc-windows-msvc',
-        }),
+        json.dumps(_valid_windows_runtime_provenance()),
         encoding='utf-8',
     )
 

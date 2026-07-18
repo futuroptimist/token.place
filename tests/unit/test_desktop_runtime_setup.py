@@ -3872,7 +3872,10 @@ def _common_packaged_mocks(monkeypatch, tmp_path, before_probe):
     (None, 'missing'),
     ('{bad-json', 'corrupt'),
     (json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}), 'stale_runtime_id'),
-    (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}), 'wrong_triple'),
+    (
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}),
+        'wrong_triple',
+    ),
     (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}), 'missing_triple'),
     (json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}), 'missing_runtime_id'),
 ])

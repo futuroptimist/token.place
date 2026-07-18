@@ -1637,7 +1637,9 @@ def _ensure_desktop_llama_runtime_impl(
     # On Windows, an exact packaged layout with invalid provenance must fail closed before a
     # successful CUDA probe can bypass the immutability check.  Check this before accepting any
     # GPU-success early return so stale/corrupt/missing provenance is never silently accepted.
-    if _desktop_platform().startswith("win") and _is_exact_packaged_runtime_layout() and not _bundled_runtime_provenance_valid():
+    is_windows_packaged = _desktop_platform().startswith("win") and _is_exact_packaged_runtime_layout()
+    provenance_invalid = is_windows_packaged and not _bundled_runtime_provenance_valid()
+    if provenance_invalid:
         return {
             "selected_backend": "cpu",
             "fallback_reason": "immutable bundled GPU runtime probe failed: invalid or missing provenance; packaged startup will not run pip, compilers, or CPU/model/context fallback",

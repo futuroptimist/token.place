@@ -172,7 +172,6 @@ new Vue({
             }, COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS);
 
             const requestStartedAt = Date.now();
-            let nextDelayOverrideMs = null;
             try {
                 const response = await fetch('/relay/diagnostics', {
                     cache: 'no-store',
@@ -210,11 +209,6 @@ new Vue({
                 if (requestId !== this.computeNodeCountRequestId) {
                     return false;
                 }
-                if (error && error.name === 'AbortError') {
-                    // Give the aborted diagnostics handler a short grace window before
-                    // retrying so a timed-out fetch cannot overlap the next background poll.
-                    nextDelayOverrideMs = 700;
-                }
                 console.warn('Unable to refresh compute-node count:', error);
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';
@@ -235,9 +229,7 @@ new Vue({
                         this.scheduleComputeNodeCountRefresh(0);
                     } else {
                         const elapsedMs = Date.now() - requestStartedAt;
-                        const nextDelayMs = nextDelayOverrideMs === null
-                            ? Math.max(0, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS - elapsedMs)
-                            : nextDelayOverrideMs;
+                        const nextDelayMs = Math.max(0, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS - elapsedMs);
                         this.scheduleComputeNodeCountRefresh(nextDelayMs);
                     }
                 }

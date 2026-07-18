@@ -2189,11 +2189,16 @@ class RelayClient:
                 )
                 return payload
             except Exception as exc:
-                log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
+                safe_error = type(exc).__name__
+                log_error(
+                    "API v1 relay poll failed for {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
+                    safe_error,
+                )
                 self._api_v1_registered_relays.discard(candidate_url)
                 self._api_v1_last_heartbeat_at.pop(candidate_url, None)
                 relay_wait_hints.pop(candidate_url, None)
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {'error': safe_error, 'next_ping_in_x_seconds': self._request_timeout}
 
         return last_error or {
             'error': 'No relay targets responded',

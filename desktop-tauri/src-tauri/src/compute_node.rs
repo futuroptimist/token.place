@@ -1650,13 +1650,17 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let warning = status.stop_cleanup_warning.clone().unwrap_or_else(|| {
             "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into()
         });
-        let success_count = status.stop_cleanup_success_count.unwrap_or(0);
-        let failure_count = status.stop_cleanup_failure_count.unwrap_or(0);
-        let required = status.stop_cleanup_required.unwrap_or(false);
-        let attempted = status.stop_cleanup_attempted.unwrap_or(false);
-        let coherent_success = match status.stop_cleanup_outcome.as_deref() {
-            Some("complete") => required && attempted && success_count > 0 && failure_count == 0,
-            Some("not_required") => !required && !attempted && success_count == 0 && failure_count == 0,
+        let coherent_success = match (
+            status.stop_cleanup_outcome.as_deref(),
+            status.stop_cleanup_required,
+            status.stop_cleanup_attempted,
+            status.stop_cleanup_success_count,
+            status.stop_cleanup_failure_count,
+        ) {
+            (Some("complete"), Some(true), Some(true), Some(success_count), Some(0)) => {
+                success_count > 0
+            }
+            (Some("not_required"), Some(false), Some(false), Some(0), Some(0)) => true,
             _ => false,
         };
         if bridge_killed {
@@ -2643,7 +2647,12 @@ mod tests {
             let mut status = state.status.lock().await;
             status.running = true;
             status.registered = true;
+            status.operator_session_id = Some("partial-session".into());
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
             status.stop_cleanup_outcome = Some("partial".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(1);
             status.stop_cleanup_warning = Some(
                 "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into(),
             );

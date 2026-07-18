@@ -619,6 +619,53 @@ def test_compute_node_count_auto_refreshes_after_unregister(page: Page, base_url
     assert calls["count"] >= 2
 
 
+def test_compute_node_count_near_timeout_auto_refreshes_to_zero(page: Page, base_url: str, setup_servers):
+    """A near-timeout diagnostics response should still render 1, then auto-refresh to 0 within two seconds."""
+    responses = iter([(1, 0.9), (0, 0.0)])
+    latest = {"count": 0}
+    calls = {"count": 0}
+    in_flight = {"value": 0}
+    max_in_flight = {"value": 0}
+
+    def handle_diagnostics(route):
+        calls["count"] += 1
+        in_flight["value"] += 1
+        max_in_flight["value"] = max(max_in_flight["value"], in_flight["value"])
+        try:
+            try:
+                latest["count"], delay = next(responses)
+            except StopIteration:
+                delay = 0.0
+            if delay:
+                time.sleep(delay)
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": latest["count"],
+                        "total_api_v1_registered_compute_nodes": latest["count"],
+                    }
+                ),
+            )
+        finally:
+            in_flight["value"] -= 1
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')",
+        timeout=2000,
+    )
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=2000,
+    )
+
+    assert calls["count"] == 2
+    assert max_in_flight["value"] == 1
+
+
 def test_compute_node_count_stalled_fetch_is_bounded_without_overlap(page: Page, base_url: str, setup_servers):
     """Bound stalled diagnostics requests and keep polling single-flight."""
     call_count = {"value": 0}
@@ -631,7 +678,7 @@ def test_compute_node_count_stalled_fetch_is_bounded_without_overlap(page: Page,
         max_in_flight["value"] = max(max_in_flight["value"], in_flight["value"])
         try:
             if call_count["value"] == 1:
-                time.sleep(1.6)
+                time.sleep(0.9)
             route.fulfill(
                 status=200,
                 headers={"Content-Type": "application/json"},

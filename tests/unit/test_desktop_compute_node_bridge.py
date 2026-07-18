@@ -1798,7 +1798,7 @@ def test_run_reports_relay_poll_exception_as_structured_error(capsys, monkeypatc
     assert 'desktop.compute_node_bridge.poll.exception' in output.err
     assert error_event['relay_runtime_state'] == 'failed'
     assert error_event['registered'] is False
-    assert error_event['last_error'] == 'relay poll failed: RuntimeError: network unavailable'
+    assert error_event['last_error'] == 'relay poll failed: RuntimeError; check relay connectivity'
     assert error_event['message'] == error_event['last_error']
     assert error_event['relay_statuses'][0]['last_error'] == error_event['last_error']
 
@@ -4304,7 +4304,7 @@ def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_failure(
     output = capsys.readouterr()
     stopped_payload = json.loads(output.out.splitlines()[-1])
     assert stopped_payload['unregister_required'] is True
-    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_attempted'] is False
     assert stopped_payload['unregister_outcome'] == 'partial'
     assert stopped_payload['unregister_success_count'] == 0
     assert stopped_payload['unregister_failure_count'] == 1
@@ -4385,7 +4385,7 @@ def test_run_reports_partial_cleanup_when_mutation_quiescence_raises(capsys, mon
     stopped_payload = json.loads(output.out.splitlines()[-1])
 
     assert stopped_payload['unregister_required'] is True
-    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_attempted'] is False
     assert stopped_payload['unregister_outcome'] == 'partial'
     assert stopped_payload['unregister_success_count'] == 0
     assert stopped_payload['unregister_failure_count'] == 1
@@ -4401,7 +4401,7 @@ def test_run_reports_partial_cleanup_when_heartbeat_quiescence_raises(capsys, mo
     stopped_payload = json.loads(output.out.splitlines()[-1])
 
     assert stopped_payload['unregister_required'] is True
-    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_attempted'] is False
     assert stopped_payload['unregister_outcome'] == 'partial'
     assert stopped_payload['unregister_success_count'] == 0
     assert stopped_payload['unregister_failure_count'] == 1

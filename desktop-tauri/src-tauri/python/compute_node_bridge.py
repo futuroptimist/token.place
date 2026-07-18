@@ -1589,7 +1589,9 @@ def run(args: argparse.Namespace) -> int:
         for relay_runtime in runtimes
     }
     poll_cancel_requested_by_relay: Dict[str, bool] = {}
+    poll_cancel_result_by_relay: Dict[str, bool] = {}
     registration_succeeded_by_relay: Dict[str, bool] = {}
+    unregister_attempted_by_relay: Set[str] = set()
     poll_threads: List[threading.Thread] = []
     recovery_lock = threading.Lock()
     recovery_done = threading.Event()
@@ -1598,7 +1600,7 @@ def run(args: argparse.Namespace) -> int:
 
     def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> bool:
         if poll_cancel_requested_by_relay.get(active_relay_url):
-            return True
+            return poll_cancel_result_by_relay.get(active_relay_url, False)
         latch_ok = True
         poll_cancel_requested_by_relay[active_relay_url] = True
         relay_client = getattr(relay_runtime, "relay_client", None)
@@ -1634,6 +1636,7 @@ def run(args: argparse.Namespace) -> int:
                     f"exc_type={type(exc).__name__}",
                     file=sys.stderr,
                 )
+        poll_cancel_result_by_relay[active_relay_url] = latch_ok
         return latch_ok
 
     def _relay_requires_unregister(relay_runtime: Any, active_relay_url: str) -> bool:
@@ -1669,6 +1672,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return False
+        unregister_attempted_by_relay.add(active_relay_url)
         print(
             "desktop.compute_node_bridge.unregister.attempted "
             f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1991,9 +1995,7 @@ def run(args: argparse.Namespace) -> int:
             except KeyboardInterrupt:
                 break
             except Exception as exc:
-                relay_last_error = f"relay poll failed: {type(exc).__name__}"
-                if str(exc):
-                    relay_last_error = f"{relay_last_error}: {exc}"
+                relay_last_error = f"relay poll failed: {type(exc).__name__}; check relay connectivity"
                 last_error = relay_last_error
                 poll_failure_fatal = True
                 update_relay_status(
@@ -2344,14 +2346,14 @@ def run(args: argparse.Namespace) -> int:
         for worker in relay_poll_workers.values():
             worker.shutdown()
 
-        result_queue: "queue.Queue[Tuple[str, bool, bool, bool]]" = queue.Queue()
+        result_queue: "queue.Queue[Tuple[str, bool, bool, bool, bool]]" = queue.Queue()
         cleanup_threads: List[threading.Thread] = []
 
         def cleanup_one_relay(relay_runtime: Any, active_relay_url: str, latch_ok: bool) -> None:
             relay_client = getattr(relay_runtime, "relay_client", None)
             required = _relay_requires_unregister(relay_runtime, active_relay_url)
             if not latch_ok:
-                result_queue.put((active_relay_url, required, False, True))
+                result_queue.put((active_relay_url, required, False, False, True))
                 return
             barrier_ok = True
             wait_mutations = getattr(relay_client, "_api_v1_wait_for_mutation_quiescence", None)
@@ -2370,10 +2372,6 @@ def run(args: argparse.Namespace) -> int:
             # Long-poll workers are non-mutating after the stop latch. Do not
             # wait for a blocked poll before unregistering a registered relay;
             # only unregistered relays need their poll thread joined for tidy exit.
-            if not required:
-                worker = relay_poll_workers.get(active_relay_url)
-                if worker is not None:
-                    worker.join(shutdown_deadline=cleanup_deadline)
             required = _relay_requires_unregister(relay_runtime, active_relay_url)
             stop_heartbeat = getattr(relay_client, "_api_v1_stop_heartbeat_worker", None)
             if barrier_ok and callable(stop_heartbeat):
@@ -2388,21 +2386,21 @@ def run(args: argparse.Namespace) -> int:
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
-            if required and not barrier_ok:
-                result_queue.put((active_relay_url, True, False, True))
+            if not barrier_ok:
+                result_queue.put((active_relay_url, required, False, False, True))
                 return
             success = True
+            attempted = False
             if required:
+                unregister = getattr(relay_client, "unregister_from_relay", None)
+                if callable(unregister):
+                    attempted = True
                 success = unregister_with_shared_deadline(relay_runtime, active_relay_url, cleanup_deadline)
-            else:
-                unregister_with_shared_deadline(relay_runtime, active_relay_url, cleanup_deadline)
-            result_queue.put((active_relay_url, required, bool(success), False))
+            result_queue.put((active_relay_url, required, attempted, bool(success), False))
 
         for relay_runtime, active_relay_url, latch_ok in cleanup_targets:
             if _relay_requires_unregister(relay_runtime, active_relay_url):
                 stop_cleanup_required = True
-                if latch_ok:
-                    stop_cleanup_attempted = True
             thread = threading.Thread(
                 target=cleanup_one_relay,
                 args=(relay_runtime, active_relay_url, latch_ok),
@@ -2418,7 +2416,7 @@ def run(args: argparse.Namespace) -> int:
             if remaining <= 0:
                 break
             try:
-                active_relay_url, required, success, barrier_failed = result_queue.get(timeout=min(0.05, remaining))
+                active_relay_url, required, attempted, success, barrier_failed = result_queue.get(timeout=min(0.05, remaining))
             except queue.Empty:
                 continue
             if active_relay_url in seen_cleanup_relays:
@@ -2426,7 +2424,7 @@ def run(args: argparse.Namespace) -> int:
             seen_cleanup_relays.add(active_relay_url)
             if required:
                 stop_cleanup_required = True
-                stop_cleanup_attempted = stop_cleanup_attempted or not barrier_failed
+                stop_cleanup_attempted = stop_cleanup_attempted or attempted
                 if success and not barrier_failed:
                     stop_cleanup_success_count += 1
                 else:
@@ -2437,6 +2435,7 @@ def run(args: argparse.Namespace) -> int:
             if active_relay_url not in seen_cleanup_relays:
                 if _relay_requires_unregister(next(rt for rt, url, _ok in cleanup_targets if url == active_relay_url), active_relay_url):
                     stop_cleanup_required = True
+                stop_cleanup_attempted = stop_cleanup_attempted or active_relay_url in unregister_attempted_by_relay
                 stop_cleanup_failure_count += 1
 
         if stop_cleanup_required or stop_cleanup_failure_count > 0:

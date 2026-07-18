@@ -1081,7 +1081,9 @@ def test_cuda_source_repair_lock_timeout_returns_structured_failure(monkeypatch,
         lambda *_args, **_kwargs: pytest.fail('source repair must not run without the lock'),
     )
 
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
 
     assert result['runtime_action'] == 'install_timeout'
     assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
@@ -1128,7 +1130,9 @@ def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, 
         lambda *_args, **_kwargs: pytest.fail('pip install must not run without the lock'),
     )
 
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
 
     assert result['runtime_action'] == 'install_cancelled'
     assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
@@ -3439,7 +3443,9 @@ def test_probe_result_payload_carries_private_identity_but_public_result_redacts
     assert 'llama_module_path' not in payload
 
     monkeypatch.setattr(desktop_runtime_setup, '_ensure_desktop_llama_runtime_impl', lambda *_, **__: dict(payload, selected_backend='metal', runtime_action='metal_already_supported'))
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
     assert 'llama_module_identity' not in result
     assert str(module_path) not in json.dumps(result)
     private_env = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
@@ -3686,3 +3692,115 @@ def test_macos_bundled_runtime_probe_failure_is_fatal_for_auto(monkeypatch):
     assert message is not None
     assert 'desktop macOS launch' in message
     assert 'action=bundled_runtime_probe_failed' in message
+
+
+def test_windows_packaged_runtime_layout_with_missing_provenance_is_exact_but_not_valid(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+
+    assert desktop_runtime_setup._is_exact_packaged_runtime_layout() is True
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+    assert desktop_runtime_setup._is_bundled_packaged_runtime() is False
+
+
+def test_windows_packaged_runtime_layout_validates_runtime_id_or_target_triple(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    provenance = runtime_dir / 'embedded_python_runtime_provenance.json'
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+
+    provenance.write_text(
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
+    assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
+
+    provenance.write_text(
+        json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
+
+    provenance.write_text('{not-json', encoding='utf-8')
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+
+def test_exact_packaged_runtime_fails_closed_before_bootstrap_when_provenance_is_corrupt(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
+        '{bad-json', encoding='utf-8'
+    )
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_runtime_bootstrap_policy',
+        lambda: SimpleNamespace(expected_backend='cuda', bootstrap_supported=True),
+    )
+    before = _probe(backend='missing', error='llama_cpp missing')
+    calls = {'pip': 0, 'source': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda *a, **k: before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *a, **k: calls.__setitem__('source', calls['source'] + 1)
+        or (False, 'no'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed'
+    assert result['runtime_origin'] == 'bundled'
+    assert calls == {'pip': 0, 'source': 0}
+    assert 'cuda_build' not in str(result)
+
+
+def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: pytest.fail('packaged dependency check must not invoke pip'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'bundled_runtime_probe_failed'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
+    assert result['detail'] == 'immutable packaged runtime will not run pip installers'

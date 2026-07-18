@@ -13,6 +13,7 @@ OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "version.dll", "ws2_32.dll"}
+FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(\.c$|\.cc$|\.cpp$|\.h$|\.hpp$|cmake|ninja|nvcc|cuda[-_]?toolkit|visual studio|msbuild)", re.I)
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -50,6 +51,12 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         key = artifact["package"].lower().replace("_", "-")
         if key in seen: raise RuntimePrepError(f"duplicate python wheel package: {artifact['package']}")
         seen.add(key)
+    bootstrap_packages = {"pip", "setuptools", "wheel"}
+    required_wheel_packages = {k.lower().replace("_", "-") for k in m["required_packages"] if k.lower().replace("_", "-") not in ({"llama-cpp-python"} | bootstrap_packages)}
+    missing_wheels = required_wheel_packages - seen
+    extra_wheels = seen - required_wheel_packages
+    if missing_wheels: raise RuntimePrepError(f"missing python wheel artifacts for required packages: {sorted(missing_wheels)}")
+    if extra_wheels: raise RuntimePrepError(f"extra python wheel artifacts not in required_packages: {sorted(extra_wheels)}")
     return m
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
@@ -90,6 +97,34 @@ def validate_wheel(whl: Path, m: dict) -> None:
         wheel_text=zf.read(wheel_name).decode('utf-8','replace') if wheel_name else ''
         if 'Tag: py3-none-win_amd64' not in wheel_text: raise RuntimePrepError("wheel tag must be py3-none-win_amd64")
         if not any(n.lower().endswith('llama.dll') for n in names): raise RuntimePrepError("wheel missing llama.dll native runtime")
+
+
+def validate_installed_inventory(py: Path, m: dict) -> None:
+    script = """
+import importlib.metadata as md, json
+print(json.dumps({dist.metadata['Name'].lower().replace('_','-'): dist.version for dist in md.distributions()}))
+"""
+    installed = json.loads(run([str(py), '-c', script]).stdout)
+    expected = {k.lower().replace('_', '-'): v for k, v in m['required_packages'].items()}
+    missing = {k: v for k, v in expected.items() if installed.get(k) != v}
+    if missing:
+        raise RuntimePrepError(f"installed package inventory mismatch: {sorted(missing)}")
+    unmanaged = sorted(k for k in installed if k not in expected and k not in {'pip', 'setuptools', 'wheel'})
+    if unmanaged:
+        raise RuntimePrepError(f"unexpected installed packages in bundled runtime: {unmanaged}")
+    run([str(py), '-m', 'pip', 'check', '--disable-pip-version-check'])
+
+
+def validate_runtime_payload(runtime: Path, m: dict) -> None:
+    required = {dll.lower() for dll in m['required_native_dlls']}
+    present = {p.name.lower() for p in runtime.rglob('*') if p.is_file()}
+    missing = sorted(required - present)
+    if missing:
+        raise RuntimePrepError(f"missing required DLL: {missing[0]}")
+    forbidden = [p.relative_to(runtime).as_posix() for p in runtime.rglob('*') if p.is_file() and FORBIDDEN_RUNTIME_PAYLOAD_RE.search(p.name)]
+    if forbidden:
+        raise RuntimePrepError(f"forbidden compiler/toolkit/source payload in bundled runtime: {forbidden[0]}")
+
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
@@ -164,13 +199,18 @@ def prepare(m: dict) -> None:
         expected_version=[int(part) for part in m['cpython_version'].split('.')[:3]]
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
-        for dll in m['required_native_dlls']:
-            if not any(p.name.lower()==dll.lower() for p in staged.rglob('*')): raise RuntimePrepError(f'missing required DLL: {dll}')
+        validate_installed_inventory(py, m)
+        validate_runtime_payload(staged, m)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m)
         backup=tmp/'old-runtime'
         if OUTPUT.exists(): OUTPUT.rename(backup)
-        staged.rename(OUTPUT)
+        try:
+            staged.rename(OUTPUT)
+        except BaseException:
+            if backup.exists() and not OUTPUT.exists():
+                backup.rename(OUTPUT)
+            raise
 
 def main() -> int:
     ap=argparse.ArgumentParser(); ap.add_argument('--manifest', type=Path, default=MANIFEST); ap.add_argument('--check-manifest-only', action='store_true')

@@ -271,6 +271,31 @@ fn metadata_probe_is_valid(
     Ok(())
 }
 
+fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
+    let path = runtime_root.join("embedded_python_runtime_provenance.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(wheel) = value.get("llama_cpp_cuda_wheel") else {
+        return false;
+    };
+    value.get("runtime_id").and_then(|v| v.as_str())
+        == Some("bundled-cpython-3.11-win-x86_64-cu124")
+        && value.get("cpython_version").and_then(|v| v.as_str()) == Some("3.11.13")
+        && value.get("target_triple").and_then(|v| v.as_str()) == Some("x86_64-pc-windows-msvc")
+        && value.get("source_archive_sha256").and_then(|v| v.as_str())
+            == Some("008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660")
+        && wheel.get("name").and_then(|v| v.as_str())
+            == Some("llama_cpp_python-0.3.32-py3-none-win_amd64.whl")
+        && wheel.get("version").and_then(|v| v.as_str()) == Some("0.3.32")
+        && wheel.get("flavor").and_then(|v| v.as_str()) == Some("cu124")
+        && wheel.get("sha256").and_then(|v| v.as_str())
+            == Some("c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0")
+}
+
 fn launcher_error(
     public_code: &'static str,
     category: PythonLauncherCategory,
@@ -512,17 +537,33 @@ pub fn resolve_python_launcher_resource_aware(
                                     output_status_code(&output),
                                 )
                             })?;
-                        metadata_probe_is_valid(&stdout, &runtime_root, expected_runtime_arch())
-                            .map(|_| candidate.clone())
-                            .map_err(|category| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    category,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })
+                        match metadata_probe_is_valid(
+                            &stdout,
+                            &runtime_root,
+                            expected_runtime_arch(),
+                        ) {
+                            Ok(()) => {
+                                if cfg!(target_os = "windows")
+                                    && !bundled_windows_provenance_is_valid(&runtime_root)
+                                {
+                                    return Err(launcher_error(
+                                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                                        Some(&candidate),
+                                        opts.packaged,
+                                        output_status_code(&output),
+                                    ));
+                                }
+                                Ok(candidate.clone())
+                            }
+                            Err(category) => Err(launcher_error(
+                                DESKTOP_PYTHON_RUNTIME_INVALID,
+                                category,
+                                Some(&candidate),
+                                opts.packaged,
+                                output_status_code(&output),
+                            )),
+                        }
                     }
                     Err(_) => Err(launcher_error(
                         if opts.packaged {
@@ -932,6 +973,37 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn bundled_windows_provenance_requires_complete_immutable_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path();
+        let provenance = runtime.join("embedded_python_runtime_provenance.json");
+        let valid = r#"{
+            "runtime_id":"bundled-cpython-3.11-win-x86_64-cu124",
+            "cpython_version":"3.11.13",
+            "target_triple":"x86_64-pc-windows-msvc",
+            "source_archive_sha256":"008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660",
+            "llama_cpp_cuda_wheel":{
+                "name":"llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+                "version":"0.3.32",
+                "flavor":"cu124",
+                "sha256":"c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
+            }
+        }"#;
+        provenance.write_text(valid).expect("write provenance");
+        assert!(bundled_windows_provenance_is_valid(runtime));
+
+        provenance
+            .write_text(valid.replace("cu124", "cpu"))
+            .expect("write stale provenance");
+        assert!(!bundled_windows_provenance_is_valid(runtime));
+
+        provenance
+            .write_text("{not-json")
+            .expect("write corrupt provenance");
+        assert!(!bundled_windows_provenance_is_valid(runtime));
     }
 
     #[test]

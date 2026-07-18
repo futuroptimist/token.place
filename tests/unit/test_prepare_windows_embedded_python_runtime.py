@@ -138,6 +138,10 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
             requirement_texts.append(Path(cmd[-1]).read_text(encoding='utf-8'))
         class Result:
             stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
+        if cmd[1:3] == ['-m', 'pip'] or 'pip' in cmd:
+            return Result()
+        if 'importlib.metadata' in cmd[-1]:
+            Result.stdout = json.dumps({'alpha': '1.0', 'llama-cpp-python': '0.3.32'})
         return Result()
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
@@ -209,7 +213,7 @@ def test_manifest_validates_local_wheelhouse_contract(tmp_path):
         'url': 'https://files.pythonhosted.org/packages/requests-2.32.5-py3-none-any.whl',
         'sha256': 'a' * 64,
     }
-    write_manifest(path, manifest(python_package_wheels=[wheel_artifact]))
+    write_manifest(path, manifest(required_packages={'pip': '25.2', 'requests': '2.32.5', 'llama-cpp-python': '0.3.32'}, python_package_wheels=[wheel_artifact]))
     assert prep.load_manifest(path)['python_package_wheels'] == [wheel_artifact]
 
     bad = dict(wheel_artifact, filename='requests-2.32.5.tar.gz')
@@ -373,7 +377,14 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
     class GoodProbe:
         stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
 
-    monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: GoodProbe())
+    def fake_good_run(cmd, **kwargs):
+        if 'importlib.metadata' in cmd[-1]:
+            class Inventory:
+                stdout = json.dumps({'llama-cpp-python': '0.3.32'})
+            return Inventory()
+        return GoodProbe()
+
+    monkeypatch.setattr(prep, 'run', fake_good_run)
     with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
         prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}, required_native_dlls=['llama.dll']))
 
@@ -413,3 +424,92 @@ def test_production_manifest_includes_llama_direct_dependency_closure(tmp_path):
     llama_direct_dependencies = {'diskcache', 'Jinja2', 'numpy', 'typing-extensions'}
     assert llama_direct_dependencies <= set(required)
     assert llama_direct_dependencies <= set(wheels)
+
+
+def test_validate_installed_inventory_rejects_missing_extra_and_runs_pip_check(monkeypatch, tmp_path):
+    py = tmp_path / 'python.exe'
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        class Result:
+            stdout = json.dumps({'alpha': '1.0', 'llama-cpp-python': '0.3.32'})
+        return Result()
+
+    monkeypatch.setattr(prep, 'run', fake_run)
+    prep.validate_installed_inventory(py, {
+        'required_packages': {'alpha': '1.0', 'llama-cpp-python': '0.3.32'},
+    })
+    assert calls[-1][1:3] == ['-m', 'pip']
+    assert 'check' in calls[-1]
+
+    def missing_run(cmd, **kwargs):
+        class Result:
+            stdout = json.dumps({'alpha': '2.0'})
+        return Result()
+
+    monkeypatch.setattr(prep, 'run', missing_run)
+    with pytest.raises(prep.RuntimePrepError, match='inventory mismatch'):
+        prep.validate_installed_inventory(py, {'required_packages': {'alpha': '1.0'}})
+
+    def extra_run(cmd, **kwargs):
+        class Result:
+            stdout = json.dumps({'alpha': '1.0', 'surprise': '9.9'})
+        return Result()
+
+    monkeypatch.setattr(prep, 'run', extra_run)
+    with pytest.raises(prep.RuntimePrepError, match='unexpected installed packages'):
+        prep.validate_installed_inventory(py, {'required_packages': {'alpha': '1.0'}})
+
+
+def test_validate_runtime_payload_rejects_missing_dll_and_toolkit_source(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    (runtime / 'python311.dll').write_bytes(b'MZ')
+    prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+
+    with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['llama.dll']})
+
+    (runtime / 'nvcc.exe').write_bytes(b'MZ')
+    with pytest.raises(prep.RuntimePrepError, match='forbidden compiler/toolkit/source payload'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+
+
+def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkeypatch):
+    runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'
+    runtime_root.mkdir(parents=True)
+    marker = runtime_root / 'previous.txt'
+    marker.write_text('keep', encoding='utf-8')
+    m = manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'})
+    monkeypatch.setattr(prep, 'ROOT', tmp_path / 'desktop-tauri')
+    monkeypatch.setattr(prep, 'SRC_TAURI', tmp_path / 'desktop-tauri' / 'src-tauri')
+    monkeypatch.setattr(prep, 'OUTPUT', runtime_root)
+    monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
+    monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: tmp_path / ('wheel.whl' if url.endswith('.whl') else 'runtime.tar.gz'))
+    monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
+    monkeypatch.setattr(prep, 'validate_installed_inventory', lambda py, data: None)
+    monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: None)
+
+    def fake_extract(_archive, dest):
+        staged = dest / 'cpython'
+        staged.mkdir(parents=True)
+        (staged / 'python.exe').write_text('', encoding='utf-8')
+
+    class Probe:
+        stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
+
+    original_rename = Path.rename
+
+    def flaky_rename(self, target):
+        if self.name == 'python-runtime' and Path(target) == runtime_root:
+            raise OSError('final rename failed')
+        return original_rename(self, target)
+
+    monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
+    monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: Probe())
+    monkeypatch.setattr(Path, 'rename', flaky_rename)
+
+    with pytest.raises(OSError, match='final rename failed'):
+        prep.prepare(m)
+    assert marker.read_text(encoding='utf-8') == 'keep'

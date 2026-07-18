@@ -4155,6 +4155,111 @@ def test_run_reports_timed_out_cleanup_when_registered_relay_exceeds_budget(
     assert MultiRelayShutdownRuntime.instances[0].relay_client.unregister_calls == 1
     assert 'desktop.compute_node_bridge.unregister.attempted' in output.err
 
+
+class LegacySignatureRelayClient(MultiRelayShutdownRelayClient):
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        self.shutdown_deadlines.append('legacy-signature')
+        return self.unregister_result
+
+
+class LegacySignatureShutdownRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        result, delay = self.outcomes_by_relay.get(config.relay_url, (True, 0.0))
+        self.relay_client = LegacySignatureRelayClient(
+            config.relay_url,
+            unregister_result=result,
+            unregister_delay=delay,
+        )
+        LegacySignatureShutdownRuntime.instances.append(self)
+
+
+def test_run_supports_legacy_unregister_signature_during_cleanup(capsys, monkeypatch):
+    _reset_cancel_queue()
+    LegacySignatureShutdownRuntime.instances = []
+    LegacySignatureShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.0),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LegacySignatureShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_outcome'] == 'complete'
+    assert stopped_payload['unregister_success_count'] == 1
+    assert stopped_payload['unregister_failure_count'] == 0
+    runtime = LegacySignatureShutdownRuntime.instances[0]
+    assert runtime.relay_client.shutdown_deadlines == ['legacy-signature']
+    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
+
+
+class NoUnregisterRelayClient(FakeRelayClient):
+    def __init__(self, relay_url):
+        self.relay_url = relay_url
+        self.stop_calls = 0
+        self._api_v1_registered_relays = {relay_url}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class NoUnregisterRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = NoUnregisterRelayClient(config.relay_url)
+        NoUnregisterRuntime.instances.append(self)
+
+
+def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_complete(capsys, monkeypatch):
+    _reset_cancel_queue()
+    NoUnregisterRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NoUnregisterRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'complete'
+    assert stopped_payload['unregister_success_count'] == 1
+    assert stopped_payload['unregister_failure_count'] == 0
+    assert 'desktop.compute_node_bridge.unregister.attempted' not in output.err
+
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

@@ -401,7 +401,7 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
             return identity
         return "client_ip", get_remote_address()
 
-    if path == "/api/v1/relay/servers/control":
+    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister"}:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity

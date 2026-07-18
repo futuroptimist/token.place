@@ -331,6 +331,18 @@ def _register_api_v1_server_with_capabilities(client, server_public_key, capabil
     return response
 
 
+def _api_v1_registered_control_payload(client, server_public_key, *, capabilities=None):
+    if capabilities is None:
+        response = _register_api_v1_server_without_capabilities(client, server_public_key)
+    else:
+        response = _register_api_v1_server_with_capabilities(client, server_public_key, capabilities)
+    payload = {'server_public_key': server_public_key}
+    credential = response.get_json().get('control_credential')
+    if credential:
+        payload['control_credential'] = credential
+    return payload
+
+
 def _next_api_v1_server_key(client):
     response = client.get('/api/v1/relay/servers/next')
     assert response.status_code == 200
@@ -358,11 +370,11 @@ def test_api_v1_capability_registration_and_tier_selection(client):
 def test_api_v1_old_node_compatibility_and_64k_can_satisfy_8k(client):
     old = _server_key("old-node")
     full = _server_key("full-only")
-    _register_api_v1_server(client, old)
+    old_payload = _api_v1_registered_control_payload(client, old, capabilities=_capabilities("8k-fast"))
     _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
 
     assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == old
-    client.post("/api/v1/relay/servers/unregister", json={"server_public_key": old})
+    client.post("/api/v1/relay/servers/unregister", json=old_payload)
     assert client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()["server_public_key"] == full
 
 
@@ -2417,7 +2429,7 @@ def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_resp
 
 
 def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(
         '/api/v1/relay/requests',
         json={
@@ -2442,7 +2454,7 @@ def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
 
 
 def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(client, monkeypatch):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(
         '/api/v1/relay/requests',
         json={
@@ -2472,7 +2484,7 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
 
 
 def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_drops_queue(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(
         '/api/v1/relay/requests',
         json={
@@ -2495,7 +2507,7 @@ def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_dro
     assert pending.status_code == 202
     assert pending.get_json() == {'status': 'pending'}
 
-    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'control_credential': register.get_json()['control_credential']})
     assert unregistered.status_code == 200
 
     unknown = client.post(
@@ -2536,7 +2548,7 @@ def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(clie
 
 
 def test_api_v1_relay_plaintext_messages_are_rejected(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     plaintext = 'PLAINTEXT_SENTINEL_DO_NOT_STORE'
     payload = {
@@ -2556,7 +2568,7 @@ def test_api_v1_relay_plaintext_messages_are_rejected(client):
 
 
 def test_api_v1_relay_requests_requires_client_public_key(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     response = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-missing-client-key',
@@ -2598,7 +2610,7 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
 
 def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '30')
-    response = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    response = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert response.status_code == 200
     payload = response.get_json()
     assert payload['next_ping_in_x_seconds'] == 30
@@ -2638,7 +2650,7 @@ def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
 
 
 def test_api_v1_relay_response_plaintext_is_rejected(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
     response_payload = {
@@ -2766,7 +2778,7 @@ def test_legacy_next_server_can_be_enabled_with_compatibility_flag(client, monke
 
 
 def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphertext_only(client):
-    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     request_plaintext = 'PLAINTEXT_REQUEST_SENTINEL_DO_NOT_STORE'
     request_payload = {
@@ -2832,8 +2844,7 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
 
 
 def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    server_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities('8k-fast'))
 
     queued = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-requeue-on-unregister-race',
@@ -3067,8 +3078,9 @@ def test_api_v1_next_round_robins_three_registered_compute_nodes(client):
     server_a = _server_key('round_robin_three_a')
     server_b = _server_key('round_robin_three_b')
     server_c = _server_key('round_robin_three_c')
+    control_payloads = {}
     for server_key in (server_a, server_b, server_c):
-        _register_api_v1_server(client, server_key)
+        control_payloads[server_key] = _api_v1_registered_control_payload(client, server_key, capabilities=_capabilities('8k-fast'))
 
     selections = [_next_api_v1_server_key(client) for _ in range(6)]
 
@@ -3095,12 +3107,13 @@ def test_api_v1_round_robin_preserves_next_node_after_selected_server_unregister
     server_a = _server_key('cursor_selected_removed_a')
     server_b = _server_key('cursor_selected_removed_b')
     server_c = _server_key('cursor_selected_removed_c')
+    control_payloads = {}
     for server_key in (server_a, server_b, server_c):
-        _register_api_v1_server(client, server_key)
+        control_payloads[server_key] = _api_v1_registered_control_payload(client, server_key, capabilities=_capabilities('8k-fast'))
 
     assert _next_api_v1_server_key(client) == server_a
 
-    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_a})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=control_payloads[server_a])
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
 
@@ -3315,8 +3328,8 @@ def test_api_v1_request_enqueue_rejects_legacy_only_server_without_queue_entry(c
 
 def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(client):
     server_key = _server_key('enqueue_removed')
-    _register_api_v1_server(client, server_key)
-    assert client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_key}).status_code == 200
+    control_payload = _api_v1_registered_control_payload(client, server_key, capabilities=_capabilities('8k-fast'))
+    assert client.post('/api/v1/relay/servers/unregister', json=control_payload).status_code == 200
 
     response = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-removed-server',
@@ -3368,8 +3381,9 @@ def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeyp
     server_a = _server_key('skip_a')
     server_b = _server_key('skip_b')
     server_c = _server_key('skip_c')
+    control_payloads = {}
     for server_key in (server_a, server_b, server_c):
-        _register_api_v1_server(client, server_key)
+        control_payloads[server_key] = _api_v1_registered_control_payload(client, server_key, capabilities=_capabilities('8k-fast'))
 
     assert [_next_api_v1_server_key(client) for _ in range(3)] == [server_a, server_b, server_c]
 
@@ -3377,7 +3391,7 @@ def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeyp
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [server_a, server_c, server_a, server_c]
     assert server_b not in known_servers
 
-    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_a})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=control_payloads[server_a])
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
     assert [_next_api_v1_server_key(client) for _ in range(2)] == [server_c, server_c]
@@ -3387,11 +3401,13 @@ def test_api_v1_reregistered_round_robin_node_reenters_at_end(client):
     server_a = _server_key('reregister_a')
     server_b = _server_key('reregister_b')
     server_c = _server_key('reregister_c')
-    _register_api_v1_server(client, server_a)
-    _register_api_v1_server(client, server_b)
-    _register_api_v1_server(client, server_c)
+    control_payloads = {
+        server_a: _api_v1_registered_control_payload(client, server_a, capabilities=_capabilities('8k-fast')),
+        server_b: _api_v1_registered_control_payload(client, server_b, capabilities=_capabilities('8k-fast')),
+        server_c: _api_v1_registered_control_payload(client, server_c, capabilities=_capabilities('8k-fast')),
+    }
 
-    assert client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_b}).status_code == 200
+    assert client.post('/api/v1/relay/servers/unregister', json=control_payloads[server_b]).status_code == 200
     _register_api_v1_server(client, server_b)
 
     assert [_next_api_v1_server_key(client) for _ in range(6)] == [
@@ -3541,8 +3557,7 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
 
 
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    server_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities('8k-fast'))
     assert client.get('/api/v1/relay/servers/next').status_code == 200
 
     unregistered = client.post('/api/v1/relay/servers/unregister', json=server_payload)
@@ -3568,9 +3583,8 @@ def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
 
 
 def test_api_v1_unregister_cancels_in_flight_request_promptly(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    server_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
     request_id = 'req-inflight-unregister'
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     assert client.post('/api/v1/relay/requests', json={
         'request_id': request_id,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
@@ -3987,7 +4001,7 @@ def test_api_v1_reregister_backfills_public_key_for_owner_tombstones(client):
 
 
 def test_api_v1_control_requires_owner_proof_without_registration_tokens(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert register.status_code == 200
 
     response = client.post(
@@ -4164,7 +4178,7 @@ def test_api_v1_control_expiry_returns_expired_when_tombstone_ack_races(client, 
 
 
 def test_prune_api_v1_stale_in_flight_entries_expires_with_owner_tombstone(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    register = register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert register.status_code == 200
     credential = register.get_json()['control_credential']
     request_id = 'req-prune-expired-in-flight'
@@ -4290,3 +4304,33 @@ def test_api_v1_queued_cancellation_and_old_client_compatibility(client):
     assert cancelled.status_code == 200
     assert poll.status_code == 200
     assert poll.get_json()['message'] == 'No requests available'
+
+
+def test_api_v1_unregister_requires_exact_owner_control_credential(client):
+    owner_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
+    wrong_server = _server_key('unregister-wrong-owner')
+    wrong_payload = _api_v1_registered_control_payload(client, wrong_server)
+    request_id = 'req-unregister-owner-proof'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+
+    unsigned = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    wrong = client.post('/api/v1/relay/servers/unregister', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'control_credential': wrong_payload['control_credential'],
+    })
+
+    assert unsigned.status_code == 403
+    assert wrong.status_code == 403
+    assert DUMMY_SERVER_PUB_KEY in known_servers
+    assert request_id in known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests']
+    assert client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id}).get_json()['status'] == 'active'
+
+    removed = client.post('/api/v1/relay/servers/unregister', json=owner_payload)
+    assert removed.status_code == 200
+    assert removed.get_json()['removed'] is True
+    assert DUMMY_SERVER_PUB_KEY not in known_servers
+    control = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
+    assert control.status_code == 200
+    assert control.get_json()['status'] == 'cancelled'

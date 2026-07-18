@@ -2800,7 +2800,7 @@ def api_v1_relay_servers_register():
     return jsonify(response_payload), 200
 
 
-def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
+def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1", require_owner_credential: bool = False):
     """Handle idempotent compute-node unregister requests for relay routes."""
 
     auth_error = _validate_server_registration()
@@ -2819,6 +2819,17 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
             return jsonify({'error': 'Invalid public key'}), 400
         return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
 
+    if require_owner_credential:
+        with server_round_robin_lock:
+            server_payload = known_servers.get(public_key)
+            requires_owner = isinstance(server_payload, dict) and bool(server_payload.get(API_V1_SERVER_MARKER))
+            owner_valid = _api_v1_server_control_credential_valid(
+                server_payload,
+                data.get('control_credential'),
+            )
+        if requires_owner and not owner_valid:
+            return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+
     removed = _unregister_server(public_key)
     return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
 
@@ -2827,7 +2838,7 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
 def api_v1_relay_servers_unregister():
     """Explicitly unregister an API v1 compute node and cancel its queued work."""
 
-    return _handle_server_unregister_request()
+    return _handle_server_unregister_request(require_owner_credential=True)
 
 
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])

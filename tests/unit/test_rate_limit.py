@@ -491,6 +491,11 @@ def test_control_server_owner_identity_requires_matching_bound_credential(monkey
             "/api/v1/relay/servers/control", valid_control_payload
         ) == ("server_public_key", "server-a")
 
+    with app.test_request_context("/api/v1/relay/servers/unregister", method="POST"):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/unregister", valid_control_payload
+        ) == ("server_public_key", "server-a")
+
 
 def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
     monkeypatch,
@@ -513,6 +518,10 @@ def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
     ):
         assert _control_plane_identity_for_request(
             "/api/v1/relay/servers/control",
+            {"server_public_key": "victim", "control_credential": "wrong"},
+        ) == ("client_ip", "203.0.113.9")
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/unregister",
             {"server_public_key": "victim", "control_credential": "wrong"},
         ) == ("client_ip", "203.0.113.9")
 

@@ -8,8 +8,10 @@ import json
 import os
 import queue
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -50,6 +52,30 @@ def _sanitize_env_for_bundled_runtime(resource_root: Path) -> dict[str, str]:
     env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] = '1'
     return env
 
+
+def _extract_release_artifact(installer: Path, artifact_root: Path | None = None) -> tuple[Path, Path]:
+    base = artifact_root or installer.parent
+    extract_root = Path(tempfile.mkdtemp(prefix='token-place-win-smoke-'))
+    if installer.is_dir():
+        extract_root = installer
+    else:
+        seven_zip = shutil.which('7z') or shutil.which('7za') or shutil.which('7zz')
+        if seven_zip is None:
+            raise RuntimeError('7z/7za/7zz is required to extract the Windows release artifact')
+        subprocess.run([seven_zip, 'x', '-y', f'-o{extract_root}', str(installer)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    candidates = [p for p in extract_root.rglob('python.exe') if p.parent.name.lower() == 'python-runtime']
+    if len(candidates) != 1:
+        raise RuntimeError(f'expected exactly one bundled python-runtime/python.exe in release artifact, found {len(candidates)}')
+    python_exe = candidates[0]
+    resources = python_exe.parent.parent
+    if not (resources / 'python' / 'compute_node_bridge.py').is_file():
+        # Some extractor layouts add extra wrapper directories; locate the bridge and
+        # use its parent as the resource root while retaining the bundled interpreter.
+        bridges = list(extract_root.rglob('compute_node_bridge.py'))
+        if not bridges:
+            raise RuntimeError('release artifact resources are missing compute_node_bridge.py')
+        resources = bridges[0].parent.parent
+    return python_exe, resources
 
 def _maybe_reexec_with_bundled_python(python_exe: Path | None, resource_root: Path | None, argv: list[str]) -> None:
     if python_exe is None:
@@ -274,20 +300,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description='Validate desktop sidecar GPU path on a Windows NVIDIA machine'
     )
-    parser.add_argument('--model', required=True, help='Path to GGUF model used by desktop sidecars')
+    parser.add_argument('--model', default=os.environ.get('TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL'), help='Path to GGUF model used by desktop sidecars')
     parser.add_argument('--mode', default='auto', choices=['auto', 'gpu', 'hybrid'])
     parser.add_argument('--context-tier', default='64k-full', choices=['8k-fast', '64k-full'])
     parser.add_argument('--resource-root', type=Path, help='Extracted release artifact resources root')
     parser.add_argument('--python-exe', type=Path, help='Bundled release artifact python.exe')
+    parser.add_argument('--artifact-root', type=Path, help='Directory containing the built Windows artifacts')
+    parser.add_argument('--installer', type=Path, help='Built NSIS/MSI artifact to extract for hardware smoke testing')
     args = parser.parse_args()
 
     try:
+        if getattr(args, 'installer', None) and not getattr(args, 'python_exe', None):
+            args.python_exe, args.resource_root = _extract_release_artifact(args.installer, getattr(args, 'artifact_root', None))
         _maybe_reexec_with_bundled_python(getattr(args, 'python_exe', None), getattr(args, 'resource_root', None), sys.argv[1:])
     except Exception as exc:
         return _fail(str(exc))
 
     if not sys.platform.startswith('win'):
         return _fail('this smoke test is only valid on Windows')
+    if not args.model:
+        return _fail('model path is required via --model or TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL')
     if not os.path.exists(args.model):
         return _fail(f'model path does not exist: {args.model}')
 

@@ -848,6 +848,39 @@ where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONHOME"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONUSERBASE"));
+}
+
+const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
+const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
+    "TOKEN_PLACE_DESKTOP_PYTHON",
+    "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
+    "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
+    "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "FORCE_CMAKE",
+];
+
+pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
+where
+    C: PythonEnvCommand,
+{
+    for key in PACKAGED_MUTABLE_ENV_KEYS {
+        command.remove_env(std::ffi::OsStr::new(key));
+    }
+    // std::process::Command cannot remove dynamic prefixes without enumerating
+    // the parent env; remove every currently inherited pip/CMake variable.
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if PACKAGED_MUTABLE_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+        {
+            command.remove_env(key);
+        }
+    }
 }
 
 pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
@@ -855,6 +888,7 @@ where
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
+    sanitize_packaged_python_subprocess_env(command);
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
     let pythonpath = if python_dir.is_dir() {
@@ -871,6 +905,9 @@ pub trait PythonEnvCommand {
     where
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>;
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>;
 }
 
 impl PythonEnvCommand for Command {
@@ -881,6 +918,13 @@ impl PythonEnvCommand for Command {
     {
         self.env(key, value);
     }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.env_remove(key);
+    }
 }
 
 impl PythonEnvCommand for tokio::process::Command {
@@ -890,6 +934,13 @@ impl PythonEnvCommand for tokio::process::Command {
         V: AsRef<std::ffi::OsStr>,
     {
         self.env(key, value);
+    }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.env_remove(key);
     }
 }
 

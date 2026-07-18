@@ -14,6 +14,33 @@ prep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prep)
 
 
+def write_minimal_pe(path: Path, *, machine: int = 0x8664, imports: list[str] | None = None) -> None:
+    imports = imports or []
+    data = bytearray(0x600)
+    data[0:2] = b'MZ'
+    data[0x3C:0x40] = (0x80).to_bytes(4, 'little')
+    data[0x80:0x84] = b'PE\0\0'
+    data[0x84:0x86] = machine.to_bytes(2, 'little')
+    data[0x86:0x88] = (1).to_bytes(2, 'little')
+    data[0x94:0x96] = (0xF0).to_bytes(2, 'little')
+    opt = 0x98
+    data[opt:opt+2] = (0x20B).to_bytes(2, 'little')
+    data[opt+112+8:opt+112+12] = (0x1100).to_bytes(4, 'little')
+    sec = opt + 0xF0
+    data[sec:sec+8] = b'.rdata\0\0'
+    data[sec+8:sec+12] = (0x400).to_bytes(4, 'little')
+    data[sec+12:sec+16] = (0x1000).to_bytes(4, 'little')
+    data[sec+16:sec+20] = (0x400).to_bytes(4, 'little')
+    data[sec+20:sec+24] = (0x200).to_bytes(4, 'little')
+    base = 0x300
+    for idx, name in enumerate(imports):
+        desc = base + idx * 20
+        name_rva = 0x1200 + idx * 32
+        data[desc+12:desc+16] = name_rva.to_bytes(4, 'little')
+        name_off = 0x200 + (name_rva - 0x1000)
+        data[name_off:name_off+len(name)] = name.encode('ascii')
+    path.write_bytes(data)
+
 def manifest(**overrides):
     data = {
         'schema_version': 1,
@@ -105,7 +132,7 @@ def test_validate_runtime_payload_allows_inert_cpython_headers_but_rejects_tools
     (runtime / 'include').mkdir(parents=True)
     (runtime / 'include' / 'abstract.h').write_text('/* CPython header */', encoding='utf-8')
     for dll in ('python311.dll', 'vcruntime140.dll', 'llama.dll'):
-        (runtime / dll).write_text('', encoding='utf-8')
+        write_minimal_pe(runtime / dll)
 
     prep.validate_runtime_payload(
         runtime,
@@ -169,6 +196,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
     monkeypatch.setattr(prep, 'run', fake_run)
+    monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
     monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
 
     prep.prepare(m)
@@ -517,16 +545,37 @@ def test_validate_installed_inventory_rejects_missing_extra_and_runs_pip_check(m
 def test_validate_runtime_payload_rejects_missing_dll_and_toolkit_source(tmp_path):
     runtime = tmp_path / 'python-runtime'
     runtime.mkdir()
-    (runtime / 'python311.dll').write_bytes(b'MZ')
-    prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
+    write_minimal_pe(runtime / 'python311.dll')
+    prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll'], 'pe_dll_closure': [{'name': 'python311.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'}]})
 
     with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['llama.dll']})
 
-    (runtime / 'nvcc.exe').write_bytes(b'MZ')
+    write_minimal_pe(runtime / 'nvcc.exe')
     with pytest.raises(prep.RuntimePrepError, match='forbidden compiler/toolkit/source payload'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll'], 'pe_dll_closure': [{'name': 'python311.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'}]})
+
+
+
+def test_validate_runtime_payload_resolves_recursive_pe_imports(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    write_minimal_pe(runtime / 'python.exe', imports=['python311.dll'])
+    write_minimal_pe(runtime / 'python311.dll', imports=['kernel32.dll'])
+    closure = prep.validate_runtime_payload(runtime, {
+        'required_native_dlls': ['python311.dll'],
+        'pe_dll_closure': [{'name': 'python311.dll', 'machine': 'IMAGE_FILE_MACHINE_AMD64'}],
+    })
+    assert {entry['name'] for entry in closure} >= {'python.exe', 'python311.dll'}
+
+    write_minimal_pe(runtime / 'bad.pyd', imports=['missing_vendor.dll'])
+    with pytest.raises(prep.RuntimePrepError, match='unresolved non-system DLL import'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
+    (runtime / 'bad.pyd').unlink()
+    write_minimal_pe(runtime / 'arm64.dll', machine=0xAA64)
+    with pytest.raises(prep.RuntimePrepError, match='ARM64 PE payload rejected'):
+        prep.validate_runtime_payload(runtime, {'required_native_dlls': ['python311.dll']})
 
 def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'desktop-tauri' / 'src-tauri' / 'python-runtime'
@@ -541,7 +590,7 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: tmp_path / ('wheel.whl' if url.endswith('.whl') else 'runtime.tar.gz'))
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
     monkeypatch.setattr(prep, 'validate_installed_inventory', lambda py, data: None)
-    monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: None)
+    monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
 
     def fake_extract(_archive, dest):
         staged = dest / 'cpython'

@@ -38,7 +38,13 @@
   "required_native_dlls": [
     "python311.dll",
     "vcruntime140.dll",
-    "llama.dll"
+    "llama.dll",
+    "ggml-base.dll",
+    "ggml-cpu.dll",
+    "ggml-cuda.dll",
+    "ggml.dll",
+    "llama-common.dll",
+    "mtmd.dll"
   ],
   "runtime_notices": [
     {
@@ -175,6 +181,30 @@
     },
     {
       "name": "llama.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-base.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-cpu.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-cuda.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "llama-common.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "mtmd.dll",
       "machine": "IMAGE_FILE_MACHINE_AMD64"
     }
   ]

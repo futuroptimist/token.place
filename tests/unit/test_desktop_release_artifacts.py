@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -718,6 +719,7 @@ def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(
     (python_resources / 'desktop_runtime_setup.py').write_text(
         """
 import json
+import shutil
 import os
 from pathlib import Path
 
@@ -744,6 +746,7 @@ def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
 
     code = """
 import json
+import shutil
 from pathlib import Path
 import desktop_runtime_setup
 from path_bootstrap import ensure_runtime_import_paths
@@ -803,6 +806,7 @@ def test_background_probe_uses_production_runtime_import_and_private_identity(tm
     (python_resources / 'desktop_runtime_setup.py').write_text(
         f"""
 import json
+import shutil
 import os
 from pathlib import Path
 
@@ -2510,3 +2514,73 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert not any("gate.get('gpu_offload_supported')" in code for code in calls)
     assert not any("gate.get('constructor_kwarg_support')" in code for code in calls)
     assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)
+
+
+def _load_windows_release_validator():
+    import importlib.util
+    script_path = Path('scripts/validate_windows_desktop_release_artifacts.py')
+    spec = importlib.util.spec_from_file_location('validate_windows_desktop_release_artifacts', script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.2') -> tuple[Path, Path]:
+    validator = _load_windows_release_validator()
+    manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
+    runtime = root / 'resources' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    for name in manifest['required_native_dlls']:
+        (runtime / name).write_bytes(b'MZ placeholder')
+    (runtime / 'python.exe').write_bytes(b'MZ placeholder')
+    provenance = {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': '3.11.13',
+        'target_triple': 'x86_64-pc-windows-msvc',
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest['python_package_wheels'],
+        'required_native_dlls': manifest['required_native_dlls'],
+        'pe_dll_closure': [
+            {'name': name, 'path': name, 'machine': 'IMAGE_FILE_MACHINE_AMD64', 'imports': []}
+            for name in manifest['required_native_dlls']
+        ],
+    }
+    (runtime / validator.PROVENANCE).write_text(json.dumps(provenance), encoding='utf-8')
+    nsis = root / f'token.place-desktop-{version}-setup.exe'
+    msi = root / f'token.place-desktop-{version}.msi'
+    nsis.mkdir()
+    msi.mkdir()
+    shutil.copytree(root / 'resources', nsis / 'resources')
+    shutil.copytree(root / 'resources', msi / 'resources')
+    return nsis, msi
+
+
+def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
+    validator = _load_windows_release_validator()
+    nsis, msi = _write_windows_runtime_fixture(tmp_path)
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2']) == 0
+
+
+def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
+    validator = _load_windows_release_validator()
+    nsis, msi = _write_windows_runtime_fixture(tmp_path)
+    with pytest.raises(validator.ValidationError, match='filename does not contain'):
+        validator.validate_artifact(nsis, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
+    provenance = next(msi.rglob('embedded_python_runtime_provenance.json'))
+    data = json.loads(provenance.read_text(encoding='utf-8'))
+    data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
+    provenance.write_text(json.dumps(data), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2'])
+
+
+def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_gate() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'Validate Windows MSI and NSIS artifact contents' in text
+    assert 'validate_windows_desktop_release_artifacts.py' in text
+    assert 'windows-nvidia-release-gate' in text
+    assert 'needs: [build, windows-nvidia-release-gate]' in text
+    assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text

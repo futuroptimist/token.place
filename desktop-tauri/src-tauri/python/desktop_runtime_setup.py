@@ -1331,8 +1331,10 @@ def _bundled_runtime_provenance_valid() -> bool:
         and wheel.get("flavor") == "cu124"
         and wheel.get("sha256") == "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
         and required_packages.get("llama-cpp-python") == "0.3.32"
-        and all(required_packages.get(name) for name in ("psutil", "requests", "python-dotenv", "cryptography", "numpy", "diskcache", "Jinja2", "typing-extensions"))
-        and all(name in required_dlls for name in ("python311.dll", "vcruntime140.dll", "llama.dll"))
+        and all(required_packages.get(name) for name in ("psutil", "requests", "python-dotenv", "cryptography", "numpy", "diskcache", "Jinja2", "typing-extensions", "charset-normalizer", "idna", "urllib3", "certifi", "cffi", "pycparser", "MarkupSafe"))
+        and bool(pe_closure)
+        and all(name in required_dlls for name in ("python311.dll", "vcruntime140.dll", "llama.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama-common.dll", "mtmd.dll"))
+        and {entry.get("name") for entry in pe_closure if isinstance(entry, dict)} >= set(required_dlls)
         and all(entry.get("machine") == "IMAGE_FILE_MACHINE_AMD64" for entry in pe_closure if isinstance(entry, dict))
     )
 

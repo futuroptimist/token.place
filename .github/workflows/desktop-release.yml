@@ -476,6 +476,25 @@ jobs:
           cd ..
           python -m pytest --confcutdir=tests/integration tests/integration/test_macos_release_probe.py -q
 
+      - name: Validate Windows MSI and NSIS artifact contents
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          nsis_path="$(find release-artifacts -maxdepth 1 -type f -name '*-setup.exe' | sort | head -n 1)"
+          msi_path="$(find release-artifacts -maxdepth 1 -type f -name '*.msi' | sort | head -n 1)"
+          if [ -z "${nsis_path}" ] || [ -z "${msi_path}" ]; then
+            echo "Expected staged Windows NSIS and MSI artifacts before validation." >&2
+            exit 1
+          fi
+          tag_name="${INPUT_TAG_NAME:-${GITHUB_REF_NAME:-desktop-v0.1.2}}"
+          python ../scripts/validate_windows_desktop_release_artifacts.py \
+            --windows-nsis "${nsis_path}" \
+            --windows-msi "${msi_path}" \
+            --release-tag "${tag_name}"
+
       - name: Generate SHA256 checksums
         shell: bash
         run: |
@@ -506,9 +525,31 @@ jobs:
           path: desktop-tauri/release-artifacts/*
           if-no-files-found: error
 
+  windows-nvidia-release-gate:
+    name: Windows x64 NVIDIA artifact smoke gate
+    needs: build
+    runs-on: [self-hosted, Windows, X64, NVIDIA, RTX]
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download Windows release artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: windows-x64-bundles
+          path: release-assets/windows
+      - name: Run artifact-backed Windows NVIDIA smoke test
+        shell: pwsh
+        env:
+          TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL: ${{ secrets.WINDOWS_NVIDIA_SMOKE_MODEL }}
+        run: |
+          $setup = Get-ChildItem release-assets/windows -Filter '*-setup.exe' | Sort-Object Name | Select-Object -First 1
+          if (-not $setup) { throw 'Windows NSIS setup artifact was not downloaded.' }
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 64k-full
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, windows-nvidia-release-gate]
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
     permissions:

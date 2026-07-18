@@ -2,7 +2,7 @@
 """Prepare the deterministic Windows x86-64 CPython/CUDA runtime for Tauri."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, re, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, json, os, platform, re, shutil, struct, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -12,7 +12,7 @@ MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_windows_x86_64_manife
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-WINDOWS_SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "version.dll", "ws2_32.dll"}
+WINDOWS_SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "kernel32.dll", "msvcp140.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "version.dll", "vcomp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "ws2_32.dll", "nvcuda.dll", "cudart64_12.dll", "cublas64_12.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll", "api-ms-win-crt-time-l1-1-0.dll", "api-ms-win-crt-math-l1-1-0.dll", "api-ms-win-crt-string-l1-1-0.dll", "api-ms-win-crt-environment-l1-1-0.dll", "api-ms-win-crt-convert-l1-1-0.dll", "api-ms-win-crt-utility-l1-1-0.dll", "api-ms-win-crt-locale-l1-1-0.dll", "api-ms-win-crt-filesystem-l1-1-0.dll"}
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 
 class RuntimePrepError(RuntimeError): pass
@@ -142,7 +142,7 @@ print(json.dumps({dist.metadata['Name'].lower().replace('_','-'): dist.version f
     run([str(py), '-m', 'pip', 'check', '--disable-pip-version-check'])
 
 
-def validate_runtime_payload(runtime: Path, m: dict) -> None:
+def validate_runtime_payload(runtime: Path, m: dict) -> list[dict[str, object]]:
     required = {dll.lower() for dll in m['required_native_dlls']}
     present = {p.name.lower() for p in runtime.rglob('*') if p.is_file()}
     missing = sorted(required - present)
@@ -155,19 +155,111 @@ def validate_runtime_payload(runtime: Path, m: dict) -> None:
     ]
     if forbidden:
         raise RuntimePrepError(f"forbidden compiler/toolkit/source payload in bundled runtime: {forbidden[0]}")
+    return validate_pe_dll_closure(runtime, m)
 
+
+def _rva_to_offset(sections: list[tuple[int, int, int, int]], rva: int) -> int | None:
+    for virtual_address, virtual_size, raw_pointer, raw_size in sections:
+        size = max(virtual_size, raw_size)
+        if virtual_address <= rva < virtual_address + size:
+            return raw_pointer + (rva - virtual_address)
+    return None
+
+
+def inspect_pe(path: Path) -> tuple[str, list[str]]:
+    data = path.read_bytes()
+    if len(data) < 0x40 or data[:2] != b'MZ':
+        raise RuntimePrepError(f'not a PE file: {path.name}')
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b'PE\0\0':
+        raise RuntimePrepError(f'invalid PE header: {path.name}')
+    machine = struct.unpack_from('<H', data, pe_offset + 4)[0]
+    if machine != 0x8664:
+        if machine == 0xAA64:
+            raise RuntimePrepError(f'ARM64 PE payload rejected: {path.name}')
+        if machine == 0x014C:
+            raise RuntimePrepError(f'x86 PE payload rejected: {path.name}')
+        raise RuntimePrepError(f'unsupported PE machine 0x{machine:04x}: {path.name}')
+    section_count = struct.unpack_from('<H', data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from('<H', data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    magic = struct.unpack_from('<H', data, optional_offset)[0]
+    data_directory_offset = optional_offset + (112 if magic == 0x20B else 96 if magic == 0x10B else -1)
+    if data_directory_offset < optional_offset:
+        raise RuntimePrepError(f'unsupported PE optional header: {path.name}')
+    import_rva = 0
+    if data_directory_offset + 8 * 2 <= len(data):
+        import_rva = struct.unpack_from('<II', data, data_directory_offset + 8)[0]
+    sections = []
+    section_offset = optional_offset + optional_size
+    for index in range(section_count):
+        off = section_offset + index * 40
+        if off + 40 > len(data):
+            break
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from('<IIII', data, off + 8)
+        sections.append((virtual_address, virtual_size, raw_pointer, raw_size))
+    imports: list[str] = []
+    if import_rva:
+        desc_offset = _rva_to_offset(sections, import_rva)
+        while desc_offset is not None and desc_offset + 20 <= len(data):
+            original_first_thunk, _time, _chain, name_rva, first_thunk = struct.unpack_from('<IIIII', data, desc_offset)
+            if not any((original_first_thunk, name_rva, first_thunk)):
+                break
+            name_offset = _rva_to_offset(sections, name_rva)
+            if name_offset is None:
+                raise RuntimePrepError(f'unresolved PE import name in {path.name}')
+            end = data.find(b'\0', name_offset)
+            if end < 0:
+                raise RuntimePrepError(f'unterminated PE import name in {path.name}')
+            imports.append(data[name_offset:end].decode('ascii', 'replace').lower())
+            desc_offset += 20
+    return 'IMAGE_FILE_MACHINE_AMD64', imports
+
+
+def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
+    files = {p.name.lower(): p for p in runtime.rglob('*') if p.is_file()}
+    queue = [p for p in files.values() if p.suffix.lower() in {'.exe', '.dll', '.pyd'}]
+    seen: set[str] = set()
+    closure: list[dict[str, object]] = []
+    while queue:
+        pe = queue.pop(0)
+        rel = pe.relative_to(runtime).as_posix()
+        key = rel.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        machine, imports = inspect_pe(pe)
+        closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports)})
+        for dll in imports:
+            if dll in WINDOWS_SYSTEM_DLLS:
+                continue
+            target = files.get(dll)
+            if target is None:
+                raise RuntimePrepError(f'unresolved non-system DLL import {dll} required by {rel}')
+            queue.append(target)
+    required = {dll.lower() for dll in m.get('required_native_dlls', [])}
+    found = {entry['name'].lower() for entry in closure}
+    missing = sorted(required - found)
+    if missing:
+        raise RuntimePrepError(f'missing required PE DLL closure entry: {missing[0]}')
+    expected = {str(entry.get('name', '')).lower() for entry in m.get('pe_dll_closure', []) if isinstance(entry, dict)}
+    if expected and not expected.issubset(found):
+        raise RuntimePrepError(f'packaged PE closure incomplete: {sorted(expected - found)}')
+    if not closure:
+        raise RuntimePrepError('packaged PE closure must be non-empty')
+    return closure
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
 
-def write_provenance(runtime: Path, m: dict) -> None:
+def write_provenance(runtime: Path, m: dict, pe_closure: list[dict[str, object]] | None = None) -> None:
     payload={
         'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
         'cpython_version': m['cpython_version'], 'target_triple': m['target_triple'],
         'source_archive_sha256': m['sha256'], 'llama_cpp_cuda_wheel': m['llama_cpp_cuda_wheel'],
         'required_packages': m['required_packages'], 'required_native_dlls': m['required_native_dlls'],
         'expected_backend': 'cuda', 'build_timestamp': provenance_timestamp(),
-        'python_package_wheels': m.get('python_package_wheels', []), 'pe_dll_closure': m.get('pe_dll_closure', []),
+        'python_package_wheels': m.get('python_package_wheels', []), 'pe_dll_closure': pe_closure if pe_closure is not None else m.get('pe_dll_closure', []),
     }
     (runtime/PROVENANCE).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
 
@@ -233,9 +325,9 @@ def prepare(m: dict) -> None:
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
         validate_installed_inventory(py, m)
-        validate_runtime_payload(staged, m)
+        pe_closure=validate_runtime_payload(staged, m)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
-        write_provenance(staged, m)
+        write_provenance(staged, m, pe_closure)
         backup=tmp/'old-runtime'
         if OUTPUT.exists(): OUTPUT.rename(backup)
         try:

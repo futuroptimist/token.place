@@ -1562,16 +1562,17 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 
     let mut bridge_killed = false;
     let had_child = owned_child.is_some();
+    let mut child_exit_status = None;
     if let Some(mut child) = owned_child {
         let shutdown_deadline = Duration::from_secs(12);
         let shutdown_started = Instant::now();
-        let mut exited = child.try_wait()?.is_some();
-        while !exited && shutdown_started.elapsed() < shutdown_deadline {
+        child_exit_status = child.try_wait()?;
+        while child_exit_status.is_none() && shutdown_started.elapsed() < shutdown_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            exited = child.try_wait()?.is_some();
+            child_exit_status = child.try_wait()?;
         }
 
-        if !exited {
+        if child_exit_status.is_none() {
             bridge_killed = true;
             eprintln!(
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
@@ -1600,16 +1601,22 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 ),
             );
         } else {
+            let status_text = child_exit_status
+                .as_ref()
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown".into());
             eprintln!(
-                "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false",
-                stop_session_id.as_deref().unwrap_or("unknown")
+                "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false exit_status={}",
+                stop_session_id.as_deref().unwrap_or("unknown"),
+                status_text
             );
             append_operator_log_path_line(
                 stop_log_file_path.as_deref(),
                 "desktop.compute_node.bridge_process_exited",
                 &format!(
-                    "operator_session_id={} killed=false",
-                    stop_session_id.as_deref().unwrap_or("unknown")
+                    "operator_session_id={} killed=false exit_status={}",
+                    stop_session_id.as_deref().unwrap_or("unknown"),
+                    status_text
                 ),
             );
         }
@@ -1624,6 +1631,12 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 
     let stop_outcome_error = {
         let status = state.status.lock().await.clone();
+        let child_exit_failed = had_child
+            && !bridge_killed
+            && child_exit_status
+                .as_ref()
+                .map(|exit_status| !exit_status.success())
+                .unwrap_or(true);
         let session_matches = match (
             stop_session_id.as_deref(),
             status.operator_session_id.as_deref(),
@@ -1636,13 +1649,15 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         });
         if bridge_killed {
             Some(warning)
+        } else if child_exit_failed {
+            Some(warning)
         } else if !session_matches {
             Some(warning)
         } else if had_child && status.stop_cleanup_outcome.is_none() {
             Some(warning)
         } else if matches!(
             status.stop_cleanup_outcome.as_deref(),
-            Some("partial" | "timed_out")
+            Some("partial" | "timed_out") | Some(_)
         ) {
             Some(warning)
         } else {

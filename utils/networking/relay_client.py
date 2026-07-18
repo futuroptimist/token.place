@@ -1050,29 +1050,45 @@ class RelayClient:
             self._api_v1_heartbeat_thread = thread
             thread.start()
 
-    def _api_v1_stop_heartbeat_worker(self) -> None:
+    def _api_v1_latch_shutdown(self) -> None:
+        """Prevent new API v1 polling/heartbeat work without waiting on workers."""
+
+        self.stop_polling = True
+        self._polling_stopped_by_request = True
+        stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+
+    def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Stop the API v1 heartbeat worker without leaving shutdown heartbeats behind."""
 
+        self._api_v1_latch_shutdown()
         stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
         if stop_event is None:
-            return
+            return True
         lock = getattr(self, "_api_v1_heartbeat_lock", None)
         if lock is None:
             stop_event.set()
-            return
+            return True
         with lock:
             self._api_v1_heartbeat_stopping = True
             stop_event.set()
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             join_timeout = max(float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0)
-            thread.join(timeout=join_timeout)
+            if isinstance(shutdown_deadline, (int, float)):
+                remaining = float(shutdown_deadline) - time.monotonic()
+                if remaining <= 0:
+                    return False
+                join_timeout = min(join_timeout, remaining)
+            thread.join(timeout=max(0.0, join_timeout))
         with lock:
             if getattr(self, "_api_v1_heartbeat_thread", None) is thread and (
                 thread is None or not thread.is_alive()
             ):
                 self._api_v1_heartbeat_thread = None
             self._api_v1_heartbeat_stopping = False
+        return bool(thread is None or not thread.is_alive())
 
     def _api_v1_heartbeat_worker(self) -> None:
         """Refresh relay leases independently from polling/inference work."""
@@ -1328,16 +1344,16 @@ class RelayClient:
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""
         log_info("Stopping relay polling")
-        self.stop_polling = True
-        self._polling_stopped_by_request = True
+        self._api_v1_latch_shutdown()
         self._api_v1_stop_heartbeat_worker()
 
     def unregister_from_relay(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
-        self.stop_polling = True
-        self._polling_stopped_by_request = True
-        self._api_v1_stop_heartbeat_worker()
+        self._api_v1_latch_shutdown()
+        if not self._api_v1_stop_heartbeat_worker(shutdown_deadline=shutdown_deadline):
+            log_error("Timed out waiting for heartbeat worker before unregister")
+
 
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
         if not isinstance(registered_relays, set):
@@ -1382,7 +1398,7 @@ class RelayClient:
                     failed_relays.add(candidate_url)
                     last_error = "shutdown deadline exceeded before unregister request"
                     continue
-                request_timeout = max(0.1, min(float(self._request_timeout), remaining))
+                request_timeout = min(float(self._request_timeout), remaining)
             try:
                 request_kwargs = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
@@ -1402,6 +1418,13 @@ class RelayClient:
                     if legacy_base_url.endswith('/api/v1'):
                         legacy_base_url = legacy_base_url[: -len('/api/v1')]
                     legacy_url = f"{legacy_base_url}/unregister"
+                    if isinstance(shutdown_deadline, (int, float)):
+                        remaining = float(shutdown_deadline) - time.monotonic()
+                        if remaining <= 0:
+                            failed_relays.add(candidate_url)
+                            last_error = "shutdown deadline exceeded before legacy unregister request"
+                            continue
+                        request_timeout = min(float(self._request_timeout), remaining)
                     response = requests.post(
                         legacy_url,
                         timeout=request_timeout,
@@ -1410,7 +1433,7 @@ class RelayClient:
                 if response.status_code == 200:
                     if candidate_url in relay_index_by_url:
                         self._active_relay_index = relay_index_by_url[candidate_url]
-                    log_info("Unregistered compute node from relay {}", candidate_url)
+                    log_info("Unregistered compute node from relay {}", _sanitize_relay_target(candidate_url))
                     unregistered_relays.add(candidate_url)
                     self._api_v1_registered_relays.discard(candidate_url)
                     self._api_v1_last_heartbeat_at.pop(candidate_url, None)
@@ -1427,26 +1450,24 @@ class RelayClient:
                 last_error = f"HTTP {diagnostic['status_code']}"
                 log_error(
                     "Failed to unregister compute node from {}: {}",
-                    candidate_url,
+                    _sanitize_relay_target(candidate_url),
                     last_error,
                 )
             except requests.RequestException as exc:
                 failed_relays.add(candidate_url)
-                last_error = str(exc)
+                last_error = type(exc).__name__
                 log_error(
-                    "Error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "Error unregistering compute node from {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
                     last_error,
-                    exc_info=True,
                 )
             except Exception as exc:  # pragma: no cover - unexpected edge cases
                 failed_relays.add(candidate_url)
-                last_error = str(exc)
+                last_error = type(exc).__name__
                 log_error(
-                    "Unexpected error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "Unexpected error unregistering compute node from {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
                     last_error,
-                    exc_info=True,
                 )
 
         if failed_relays:

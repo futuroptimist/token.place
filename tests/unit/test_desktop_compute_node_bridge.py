@@ -599,7 +599,7 @@ def test_run_start_stop_start_resets_stale_cancel_and_registers_again(capsys, mo
     assert first_events[-1]['type'] == 'stopped'
     assert RestartTrackingRuntime.instances[0].relay_session_starts == 1
     assert RestartTrackingRuntime.instances[0].register_attempts >= 1
-    assert RestartTrackingRuntime.instances[0].stopped is True
+    assert RestartTrackingRuntime.instances[0].stopped is False
 
     compute_node_bridge._stop_requested_latched.set()
     compute_node_bridge._stdin_lines.put('{"type":"cancel"}')
@@ -2778,8 +2778,8 @@ def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeyp
 
     try:
         assert status == 0
-        assert "stop" in events
-        assert "warm-done" not in events[: events.index("stop") + 1]
+        assert "stop" not in events
+        assert "warm-done" not in events
         # Coarse guard: the behavioral assertions above prove shutdown did not
         # wait for warmup completion. This only catches regressions that block
         # on the full 1s warmup, without making the test depend on CI host speed.
@@ -2832,7 +2832,7 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     )
     assert "poll" not in events
     assert "warm-done" not in events
-    assert "stop" in events
+    assert "stop" not in events
     captured = capsys.readouterr()
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
     error_event = next(event for event in output_events if event.get("type") == "error")
@@ -2888,7 +2888,7 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
 
     try:
         assert status == 0
-        assert "stop" in events
+        assert "stop" not in events
         assert "poll-done" not in events[: events.index("stop") + 1]
     finally:
         release_poll.set()
@@ -3429,7 +3429,7 @@ def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch
     assert status == 0
     runtime = ShutdownTrackingRuntime.last_instance
     assert runtime.poll_calls == 1
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls >= 1
     assert runtime.relay_client.unregister_calls == 1
     output = capsys.readouterr()
@@ -3493,7 +3493,7 @@ def test_run_continues_shutdown_when_relay_stop_raises(capsys, monkeypatch):
 
     assert status == 0
     runtime = StopFailureRuntime.last_instance
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls == 1
     assert runtime.relay_client.unregister_calls == 1
     output = capsys.readouterr()
@@ -3550,7 +3550,7 @@ def test_run_continues_shutdown_when_unregister_raises(capsys, monkeypatch):
 
     assert status == 0
     runtime = UnregisterFailureRuntime.last_instance
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls == 1
     assert runtime.relay_client.unregister_calls == 1
     output = capsys.readouterr()
@@ -4257,7 +4257,7 @@ class NoUnregisterRuntime(MultiRelayShutdownRuntime):
         NoUnregisterRuntime.instances.append(self)
 
 
-def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_complete(capsys, monkeypatch):
+def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_failure(capsys, monkeypatch):
     _reset_cancel_queue()
     NoUnregisterRuntime.instances = []
     _install_fake_runtime_module(monkeypatch, runtime_cls=NoUnregisterRuntime)
@@ -4282,10 +4282,12 @@ def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_complete
     stopped_payload = json.loads(output.out.splitlines()[-1])
     assert stopped_payload['unregister_required'] is True
     assert stopped_payload['unregister_attempted'] is True
-    assert stopped_payload['unregister_outcome'] == 'complete'
-    assert stopped_payload['unregister_success_count'] == 1
-    assert stopped_payload['unregister_failure_count'] == 0
-    assert 'desktop.compute_node_bridge.unregister.attempted' not in output.err
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert 'desktop.compute_node_bridge.unregister.failed' in output.err
+    assert 'reason=missing_unregister_hook' in output.err
 
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
     _reset_cancel_queue()

@@ -62,8 +62,9 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         member = artifact.get("archive_member_path", "")
         if not member or Path(member).is_absolute() or ".." in Path(member).parts:
             raise RuntimePrepError("native DLL artifact archive_member_path must be exact and relative")
-        if not artifact["url"].lower().endswith(".zip"):
-            raise RuntimePrepError("native DLL artifacts must be pinned zip archives")
+        url_lower = artifact["url"].lower()
+        if not (url_lower.endswith(".zip") or (url_lower.endswith(".exe") and "download.visualstudio.microsoft.com/" in url_lower)):
+            raise RuntimePrepError("native DLL artifacts must be pinned zip archives or official Microsoft redistributable containers")
         if artifact["name"].lower().startswith("cudart") and artifact.get("version") != "12.4.127":
             raise RuntimePrepError("CUDA runtime native DLL version must be 12.4.127")
         if artifact["name"].lower().startswith("cublas") and artifact.get("version") != "12.4.5.8":
@@ -137,6 +138,46 @@ def fetch(url: str, sha: str, dest: Path) -> Path:
     if got != sha: raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
     return dest
 
+def _find_cab_offsets(data: bytes) -> list[int]:
+    offsets: list[int] = []
+    start = 0
+    while True:
+        offset = data.find(b"MSCF", start)
+        if offset < 0:
+            return offsets
+        offsets.append(offset)
+        start = offset + 1
+
+def _expand_cab_member(cab: Path, member: str, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # expand.exe is the documented Windows cabinet extractor. We use it only for
+    # non-executing extraction of pinned Microsoft redistributable containers.
+    result = subprocess.run(["expand", f"-F:{member}", str(cab), str(out_dir)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        raise RuntimePrepError(f"native DLL artifact member missing or duplicate: {member}")
+    matches = [p for p in out_dir.rglob("*") if p.is_file() and p.name.lower() == Path(member).name.lower()]
+    if len(matches) != 1:
+        raise RuntimePrepError(f"native DLL artifact member missing or duplicate: {member}")
+    return matches[0]
+
+def extract_microsoft_burn_member(archive: Path, member: str, dest: Path) -> None:
+    parts = Path(member).parts
+    if len(parts) != 2 or parts[0].lower().startswith(("..", "/")) or ".." in parts:
+        raise RuntimePrepError("Microsoft redistributable member must be '<cab-key>/<file>'")
+    if platform.system() != "Windows":
+        raise RuntimePrepError("Microsoft redistributable EXE extraction requires Windows expand.exe")
+    data = archive.read_bytes()
+    offsets = _find_cab_offsets(data)
+    if not offsets:
+        raise RuntimePrepError("Microsoft redistributable container missing cabinet payload")
+    with tempfile.TemporaryDirectory(prefix="token-place-msvc-") as td:
+        tmp = Path(td)
+        outer = tmp / "attached.cab"
+        outer.write_bytes(data[offsets[-1]:])
+        nested = _expand_cab_member(outer, parts[0], tmp / "outer")
+        extracted = _expand_cab_member(nested, parts[1], tmp / "inner")
+        shutil.copyfile(extracted, dest)
+
 def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
     """Stage pinned native redistributable DLLs beside python.exe for Windows loader visibility."""
     seen: set[str] = set()
@@ -155,18 +196,21 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
         dest = (staged / destination).resolve()
         if not dest.is_relative_to(staged.resolve()) or dest.name.lower() != lower:
             raise RuntimePrepError(f"native DLL destination must stay in runtime root: {name}")
-        if archive.suffix.lower() != ".zip":
-            raise RuntimePrepError(f"native DLL artifact must be a zip archive with exact members: {name}")
-        with zipfile.ZipFile(archive) as zf:
-            matches = [item for item in zf.infolist() if item.filename == member]
-            if len(matches) != 1:
-                raise RuntimePrepError(f"native DLL artifact member missing or duplicate: {name}")
-            info = matches[0]
-            if info.is_dir() or Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
-                raise RuntimePrepError(f"unsafe native DLL artifact member: {name}")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, dest.open("wb") as out:
-                shutil.copyfileobj(src, out)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(archive) as zf:
+                matches = [item for item in zf.infolist() if item.filename == member]
+                if len(matches) != 1:
+                    raise RuntimePrepError(f"native DLL artifact member missing or duplicate: {name}")
+                info = matches[0]
+                if info.is_dir() or Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
+                    raise RuntimePrepError(f"unsafe native DLL artifact member: {name}")
+                with zf.open(info) as src, dest.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+        elif archive.suffix.lower() == ".exe":
+            extract_microsoft_burn_member(archive, member, dest)
+        else:
+            raise RuntimePrepError(f"native DLL artifact must be a supported archive with exact members: {name}")
         got = sha256_file(dest)
         if got != expected_file_sha:
             dest.unlink(missing_ok=True)

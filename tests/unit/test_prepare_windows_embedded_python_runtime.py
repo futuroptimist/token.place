@@ -873,7 +873,10 @@ def test_manifest_pins_native_vendor_runtime_dll_artifacts():
         assert prep.SHA256_RE.fullmatch(artifacts[name]['sha256'])
         assert prep.SHA256_RE.fullmatch(artifacts[name]['extracted_sha256'])
         assert artifacts[name]['archive_member_path']
-        assert artifacts[name]['url'].endswith('.zip')
+        if artifacts[name]['url'].startswith('https://download.visualstudio.microsoft.com/'):
+            assert artifacts[name]['url'].endswith('.exe')
+        else:
+            assert artifacts[name]['url'].endswith('.zip')
         assert artifacts[name]['url'].startswith(('https://developer.download.nvidia.com/', 'https://download.visualstudio.microsoft.com/'))
     assert artifacts['cudart64_12.dll']['version'] == '12.4.127'
     assert artifacts['cublas64_12.dll']['version'] == '12.4.5.8'
@@ -964,3 +967,34 @@ def test_manifest_rejects_non_exact_native_versions(tmp_path):
 
     with pytest.raises(prep.RuntimePrepError, match='versions must be exact'):
         prep.load_manifest(path)
+
+
+def test_extract_microsoft_burn_member_uses_last_attached_cab_and_exact_nested_member(tmp_path, monkeypatch):
+    archive = tmp_path / 'VC_redist.x64.exe'
+    archive.write_bytes(b'MZfirstMSCFignored' + b'payload' + b'MSCFouter')
+    dest = tmp_path / 'msvcp140.dll'
+    calls = []
+
+    def fake_expand(cab, member, out_dir):
+        calls.append((cab.name, member))
+        out = out_dir / member
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b'dll')
+        return out
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(prep, '_expand_cab_member', fake_expand)
+
+    prep.extract_microsoft_burn_member(archive, 'a12/msvcp140.dll_amd64', dest)
+
+    assert dest.read_bytes() == b'dll'
+    assert calls == [('attached.cab', 'a12'), ('a12', 'msvcp140.dll_amd64')]
+
+
+def test_extract_microsoft_burn_member_rejects_traversal(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Windows')
+    archive = tmp_path / 'VC_redist.x64.exe'
+    archive.write_bytes(b'MZMSCFouter')
+
+    with pytest.raises(prep.RuntimePrepError, match='Microsoft redistributable member'):
+        prep.extract_microsoft_burn_member(archive, '../evil.dll', tmp_path / 'evil.dll')

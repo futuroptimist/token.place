@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from utils.processing_result import RelayProcessingResult
@@ -838,7 +839,34 @@ def _extract_api_v1_request_payload(
         "messages": messages,
         "options": options,
         "routing": {"context_tier": context_tier},
+        "request_deadline_remaining_seconds": decrypted_payload.get("request_deadline_remaining_seconds"),
+        "request_ttl_seconds": decrypted_payload.get("request_ttl_seconds"),
     }
+
+
+def _api_v1_valid_remaining_seconds(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        remaining = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(remaining) or remaining < 0:
+        return None
+    return remaining
+
+
+def _api_v1_initial_deadline(*values: Any, now: Optional[float] = None) -> float:
+    valid = [v for v in (_api_v1_valid_remaining_seconds(value) for value in values) if v is not None]
+    remaining = min(valid) if valid else DEFAULT_API_V1_LEASE_SECONDS
+    return (time.monotonic() if now is None else now) + remaining
+
+
+def _api_v1_bounded_next_poll_seconds(value: Any) -> float:
+    seconds = _api_v1_valid_remaining_seconds(value)
+    if seconds is None or seconds <= 0:
+        return 1.0
+    return min(10.0, max(1.0, seconds))
 
 
 class RelayClient:
@@ -2159,6 +2187,128 @@ class RelayClient:
             'error': 'No relay targets responded',
             'next_ping_in_x_seconds': self._request_timeout,
         }
+
+
+    def _api_v1_control_request(self, *, relay_url: str, request_id: str, acknowledge: bool, timeout: float) -> Dict[str, Any]:
+        credential = self._api_v1_control_credential_for_relay(relay_url)
+        if not credential:
+            return {"state": "owner_proof_failed", "http_status": 403}
+        payload = {
+            "server_public_key": getattr(self.crypto_manager, "public_key_b64", ""),
+            "request_id": request_id,
+            "control_credential": credential,
+            "acknowledge": bool(acknowledge),
+        }
+        kwargs: Dict[str, Any] = {"json": payload}
+        headers = self._auth_headers()
+        if headers:
+            kwargs["headers"] = headers
+        response = requests.post(
+            self._build_api_v1_url(relay_url, "/relay/servers/control"),
+            timeout=max(0.05, timeout),
+            **kwargs,
+        )
+        if response.status_code in {401, 403}:
+            return {"state": "owner_proof_failed", "http_status": response.status_code}
+        if response.status_code in {429, 500, 502, 503, 504}:
+            return {"state": "transient_failure", "http_status": response.status_code}
+        if response.status_code != 200:
+            return {"state": "transient_failure", "http_status": response.status_code}
+        body = response.json()
+        return body if isinstance(body, dict) else {"state": "transient_failure"}
+
+    def _api_v1_shorten_deadline_from_control(self, deadline: float, control: Dict[str, Any]) -> float:
+        now = time.monotonic()
+        candidates = [
+            _api_v1_valid_remaining_seconds(control.get("request_deadline_remaining_seconds")),
+            _api_v1_valid_remaining_seconds(control.get("request_ttl_seconds")),
+        ]
+        valid = [value for value in candidates if value is not None]
+        if not valid:
+            return deadline
+        return min(deadline, now + min(valid))
+
+    def _api_v1_cancel_current_worker(self, reason: str) -> None:
+        manager = self.model_manager
+        with getattr(manager, "llm_lock", threading.Lock()):
+            llm = getattr(manager, "llm", None)
+        invalidate = getattr(manager, "_invalidate_llm_if_current", None)
+        if callable(invalidate) and llm is not None:
+            invalidate(llm, RuntimeError(reason))
+            return
+        close = getattr(llm, "close", None)
+        if callable(close):
+            close()
+
+    def _generate_api_v1_response_with_desktop_control(
+        self,
+        *,
+        api_v1_request_payload: Dict[str, Any],
+        relay_url: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        request_id = api_v1_request_payload["request_id"]
+        deadline = _api_v1_initial_deadline(
+            api_v1_request_payload.get("request_deadline_remaining_seconds"),
+            api_v1_request_payload.get("request_ttl_seconds"),
+        )
+        terminal_ack = False
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                self._generate_api_v1_response_with_runtime_model,
+                request_id=request_id,
+                model_id=api_v1_request_payload["model"],
+                messages=api_v1_request_payload["messages"],
+                options=dict(api_v1_request_payload["options"]),
+                requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
+            )
+            backoff = 1.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._api_v1_cancel_current_worker("api_v1_authoritative_deadline_expired")
+                    terminal_ack = True
+                    outcome = "expired"
+                    break
+                try:
+                    return future.result(timeout=min(remaining, 0.05)), None
+                except FutureTimeoutError:
+                    pass
+                if getattr(self, "_polling_stopped_by_request", False) or getattr(self, "stop_polling", False):
+                    self._api_v1_cancel_current_worker("api_v1_operator_stop")
+                    outcome = "operator_stop"
+                    break
+                timeout = min(max(0.05, remaining / 2.0), 2.0)
+                try:
+                    control = self._api_v1_control_request(relay_url=relay_url, request_id=request_id, acknowledge=False, timeout=timeout)
+                except requests.RequestException:
+                    control = {"state": "transient_failure"}
+                state = str(control.get("state") or control.get("status") or "active").lower()
+                deadline = self._api_v1_shorten_deadline_from_control(deadline, control)
+                if state == "active" or state == "transient_failure":
+                    sleep_for = backoff if state == "transient_failure" else _api_v1_bounded_next_poll_seconds(control.get("next_poll_seconds"))
+                    backoff = min(10.0, backoff * 2.0) if state == "transient_failure" else 1.0
+                    try:
+                        return future.result(timeout=min(max(0.0, deadline - time.monotonic()), sleep_for)) , None
+                    except FutureTimeoutError:
+                        continue
+                if state in {"cancelled", "expired", "completed", "unavailable", "owner_proof_failed"}:
+                    self._api_v1_cancel_current_worker(f"api_v1_control_{state}")
+                    terminal_ack = state in {"cancelled", "expired"}
+                    outcome = state
+                    break
+            try:
+                future.result(timeout=1.5)
+            except Exception:
+                pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if terminal_ack:
+            try:
+                self._api_v1_control_request(relay_url=relay_url, request_id=request_id, acknowledge=True, timeout=1.0)
+            except Exception:
+                pass
+        return None, outcome
 
     def _api_v1_response_relay_url(self) -> str:
         """Return the relay URL that supplied the current API v1 work item."""
@@ -4402,13 +4552,29 @@ class RelayClient:
                 try:
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    response_envelope = self._generate_api_v1_response_with_runtime_model(
-                        request_id=api_v1_request_payload["request_id"],
-                        model_id=api_v1_request_payload["model"],
-                        messages=api_v1_request_payload["messages"],
-                        options=dict(api_v1_request_payload["options"]),
-                        requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
-                    )
+                    if getattr(self, "_api_v1_registered_relays", set()):
+                        response_envelope, terminal_outcome = self._generate_api_v1_response_with_desktop_control(
+                            api_v1_request_payload=api_v1_request_payload,
+                            relay_url=self._api_v1_response_relay_url(),
+                        )
+                    else:
+                        response_envelope = self._generate_api_v1_response_with_runtime_model(
+                            request_id=api_v1_request_payload["request_id"],
+                            model_id=api_v1_request_payload["model"],
+                            messages=api_v1_request_payload["messages"],
+                            options=dict(api_v1_request_payload["options"]),
+                            requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
+                        )
+                        terminal_outcome = None
+                    if response_envelope is None:
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code=terminal_outcome,
+                            runtime_healthy=True,
+                            recovery_attempted=True,
+                            recovery_succeeded=True,
+                        )
                     api_v1_response = response_envelope.get("api_v1_response", {})
                     error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
                     safe_error_code = error.get("code") if isinstance(error, dict) else None

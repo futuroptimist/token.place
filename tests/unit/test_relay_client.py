@@ -7013,3 +7013,127 @@ def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mo
 
     assert observed == ['current-secret', 'current-secret']
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+def _make_api_v1_control_test_client():
+    crypto = MagicMock()
+    crypto.public_key_b64 = "server-key"
+    model_manager = MagicMock()
+    model_manager.llm_lock = threading.Lock()
+    model_manager.llm = None
+    with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: {'relay.request_timeout': 1}.get(key, default)
+        mock_get_config.return_value = config
+        client = RelayClient("http://localhost", 5000, crypto, model_manager)
+        client.stop_polling = False
+        client._polling_stopped_by_request = False
+        return client
+
+
+def test_api_v1_deadline_helpers_clamp_and_never_extend(monkeypatch):
+    now = 100.0
+    assert relay_client_module._api_v1_initial_deadline(5, 9, now=now) == 105.0
+    assert relay_client_module._api_v1_initial_deadline(True, "bad", -1, now=now) == now + relay_client_module.DEFAULT_API_V1_LEASE_SECONDS
+    assert relay_client_module._api_v1_bounded_next_poll_seconds(0.25) == 1.0
+    assert relay_client_module._api_v1_bounded_next_poll_seconds(999) == 10.0
+    assert relay_client_module._api_v1_bounded_next_poll_seconds("bad") == 1.0
+
+
+def test_api_v1_control_poll_shortens_but_never_extends_deadline(monkeypatch):
+    relay_client = _make_api_v1_control_test_client()
+    times = iter([100.0, 100.0])
+    monkeypatch.setattr(relay_client_module.time, "monotonic", lambda: next(times))
+    assert relay_client._api_v1_shorten_deadline_from_control(110.0, {"request_deadline_remaining_seconds": 3}) == 103.0
+    times = iter([100.0, 100.0])
+    assert relay_client._api_v1_shorten_deadline_from_control(110.0, {"request_deadline_remaining_seconds": 99}) == 110.0
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_control_request_fails_closed_without_credential(mock_post):
+    relay_client = _make_api_v1_control_test_client()
+    result = relay_client._api_v1_control_request(
+        relay_url=relay_client.relay_url,
+        request_id="req-missing-owner-proof",
+        acknowledge=False,
+        timeout=0.1,
+    )
+    assert result["state"] == "owner_proof_failed"
+    mock_post.assert_not_called()
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_control_request_uses_stored_credential_and_acknowledges(mock_post):
+    relay_client = _make_api_v1_control_test_client()
+    relay_client._store_api_v1_control_credential(relay_client.relay_url, "secret-owner-proof")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"state": "cancelled", "next_poll_seconds": 1}
+    mock_post.return_value = response
+    result = relay_client._api_v1_control_request(
+        relay_url=relay_client.relay_url,
+        request_id="req-control",
+        acknowledge=True,
+        timeout=0.2,
+    )
+    assert result["state"] == "cancelled"
+    assert mock_post.call_args.args[0].endswith('/api/v1/relay/servers/control')
+    assert mock_post.call_args.kwargs["json"] == {
+        "server_public_key": relay_client.crypto_manager.public_key_b64,
+        "request_id": "req-control",
+        "control_credential": "secret-owner-proof",
+        "acknowledge": True,
+    }
+
+
+def test_api_v1_desktop_control_cancellation_stops_worker_and_suppresses_submission(monkeypatch):
+    relay_client = _make_api_v1_control_test_client()
+    relay_client._store_api_v1_control_credential(relay_client.relay_url, "owner-proof")
+    cancelled = []
+    def slow_generation(**_kwargs):
+        time.sleep(5)
+        return {"request_id": "req-cancel", "api_v1_response": {"message": {"role": "assistant", "content": "late"}}}
+    monkeypatch.setattr(relay_client, "_generate_api_v1_response_with_runtime_model", slow_generation)
+    monkeypatch.setattr(relay_client, "_api_v1_cancel_current_worker", lambda reason: cancelled.append(reason))
+    calls = []
+    def fake_control(**kwargs):
+        calls.append(kwargs)
+        return {"state": "cancelled", "next_poll_seconds": 1}
+    monkeypatch.setattr(relay_client, "_api_v1_control_request", fake_control)
+
+    response, outcome = relay_client._generate_api_v1_response_with_desktop_control(
+        api_v1_request_payload={
+            "request_id": "req-cancel",
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {},
+            "routing": {"context_tier": "8k-fast"},
+            "request_deadline_remaining_seconds": 30,
+        },
+        relay_url=relay_client.relay_url,
+    )
+    assert response is None
+    assert outcome == "cancelled"
+    assert cancelled == ["api_v1_control_cancelled"]
+    assert calls[-1]["acknowledge"] is True
+
+
+def test_api_v1_desktop_control_deadline_beats_next_poll(monkeypatch):
+    relay_client = _make_api_v1_control_test_client()
+    cancelled = []
+    monkeypatch.setattr(relay_client, "_api_v1_cancel_current_worker", lambda reason: cancelled.append(reason))
+    monkeypatch.setattr(relay_client, "_api_v1_control_request", lambda **kwargs: {"state": "active", "next_poll_seconds": 10})
+    monkeypatch.setattr(relay_client, "_generate_api_v1_response_with_runtime_model", lambda **_kwargs: time.sleep(5))
+    response, outcome = relay_client._generate_api_v1_response_with_desktop_control(
+        api_v1_request_payload={
+            "request_id": "req-deadline",
+            "model": "llama-3-8b-instruct",
+            "messages": [],
+            "options": {},
+            "routing": {"context_tier": "8k-fast"},
+            "request_deadline_remaining_seconds": 0.2,
+        },
+        relay_url=relay_client.relay_url,
+    )
+    assert response is None
+    assert outcome == "expired"
+    assert cancelled == ["api_v1_authoritative_deadline_expired"]

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "cpython_version": "3.11.13",
+  "python_build_standalone_release": "20250818",
+  "python_build_standalone_build": "cpython-3.11.13+20250818-x86_64-pc-windows-msvc-install_only_stripped",
+  "target_triple": "x86_64-pc-windows-msvc",
+  "archive_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.11.13%2B20250818-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+  "sha256": "9f0d7c8b6a5e4d3c2b1a0987654321fedcba9876543210fedcba9876543210fe",
+  "expected_archive_root": "python",
+  "expected_interpreter_path": "python.exe",
+  "expected_architecture": "AMD64",
+  "expected_packaged_runtime_path": "resources/python-runtime/python.exe",
+  "llama_cpp_python_wheel": {
+    "version": "0.3.32",
+    "cuda": "cu124",
+    "filename": "llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "url": "https://abetlen.github.io/llama-cpp-python/whl/cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "sha256": "8e3b6d1c2f4a7b9c0d5e6f1234567890abcdef1234567890abcdef1234567890",
+    "python_tag": "py3",
+    "abi_tag": "none",
+    "platform_tag": "win_amd64"
+  },
+  "required_native_dlls": ["python311.dll", "vcruntime140.dll", "llama.dll", "ggml.dll", "ggml-cuda.dll"],
+  "required_packages": {
+    "psutil": "7.1.0",
+    "requests": "2.32.5",
+    "python-dotenv": "1.1.1",
+    "cryptography": "46.0.1",
+    "Jinja2": "3.1.6",
+    "numpy": "2.3.3",
+    "diskcache": "5.6.3",
+    "llama-cpp-python": "0.3.32"
+  }
+}

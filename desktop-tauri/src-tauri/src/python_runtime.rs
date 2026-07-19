@@ -5,7 +5,11 @@ use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = "python-runtime/bin/python3";
+pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = if cfg!(target_os = "windows") {
+    "python-runtime/python.exe"
+} else {
+    "python-runtime/bin/python3"
+};
 pub const DESKTOP_PYTHON_RUNTIME_MISSING: &str = "desktop_python_runtime_missing";
 pub const DESKTOP_PYTHON_RUNTIME_INVALID: &str = "desktop_python_runtime_invalid";
 pub const DESKTOP_PYTHON_OVERRIDE_INVALID: &str = "desktop_python_override_invalid";
@@ -116,7 +120,7 @@ pub struct PythonLauncherError {
 
 impl std::fmt::Display for PythonLauncherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=arm64 packaged={}{}",
+        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=target packaged={}{}",
             self.public_code, self.category.as_str(), self.source, self.executable_basename, self.packaged,
             self.exit_status.map(|s| format!(" exit_status={s}")).unwrap_or_default())
     }
@@ -385,6 +389,45 @@ pub struct PythonLauncherResolutionOptions<'a> {
     pub packaged: bool,
 }
 
+fn bundled_runtime_relative_python_for(opts: &PythonLauncherResolutionOptions<'_>) -> &'static str {
+    if is_windows_packaged_layout(opts) {
+        "python-runtime/python.exe"
+    } else {
+        BUNDLED_RUNTIME_RELATIVE_PYTHON
+    }
+}
+
+fn bundled_runtime_id_for(opts: &PythonLauncherResolutionOptions<'_>) -> &'static str {
+    if is_windows_packaged_layout(opts) {
+        "bundled-cpython-3.11-win-amd64-cu124"
+    } else {
+        "bundled-cpython-3.11-arm64"
+    }
+}
+
+fn bundled_runtime_expected_machine_for(
+    opts: &PythonLauncherResolutionOptions<'_>,
+) -> &'static str {
+    if is_windows_packaged_layout(opts) {
+        "AMD64"
+    } else {
+        "arm64"
+    }
+}
+
+fn is_windows_packaged_layout(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
+    cfg!(target_os = "windows")
+        || opts
+            .current_exe_path
+            .map(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("exe"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+}
+
 fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Option<PythonLauncher> {
     let root = if let Some(resource_dir) = opts.tauri_resource_dir {
         Some(resource_dir.to_path_buf())
@@ -398,12 +441,12 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .map(|c| c.root)
     }?;
     Some(PythonLauncher::new(
-        root.join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
+        root.join(bundled_runtime_relative_python_for(opts))
             .to_string_lossy()
             .to_string(),
         vec![],
         PythonLauncherSource::BundledRuntime,
-        "bundled-cpython-3.11-arm64",
+        bundled_runtime_id_for(opts),
     ))
 }
 
@@ -437,7 +480,8 @@ pub fn resolve_python_launcher_resource_aware(
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_macos {
+    let requires_bundled_runtime = is_macos || (opts.packaged && is_windows_packaged_layout(&opts));
+    if requires_bundled_runtime {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -489,17 +533,21 @@ pub fn resolve_python_launcher_resource_aware(
                                     output_status_code(&output),
                                 )
                             })?;
-                        metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
-                            .map(|_| candidate.clone())
-                            .map_err(|category| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    category,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })
+                        metadata_probe_is_valid(
+                            &stdout,
+                            &runtime_root,
+                            bundled_runtime_expected_machine_for(&opts),
+                        )
+                        .map(|_| candidate.clone())
+                        .map_err(|category| {
+                            launcher_error(
+                                DESKTOP_PYTHON_RUNTIME_INVALID,
+                                category,
+                                Some(&candidate),
+                                opts.packaged,
+                                output_status_code(&output),
+                            )
+                        })
                     }
                     Err(_) => Err(launcher_error(
                         if opts.packaged {
@@ -1365,6 +1413,58 @@ mod tests {
         .expect("bundled runtime");
         assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
         assert_eq!(Path::new(&launcher.program), py.as_path());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn packaged_windows_layout_selects_bundled_python_exe_without_system_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().expect("tempdir");
+        let resources = temp.path().join("App/resources");
+        let py = resources.join("python-runtime/python.exe");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        let runtime_root = resources.join("python-runtime");
+        let probe = format!(
+            r#"{{"version":[3,11],"machine":"AMD64","executable":"{}","prefix":"{}"}}"#,
+            py.display(),
+            runtime_root.display()
+        );
+        std::fs::write(&py, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", probe)).unwrap();
+        let mut perms = std::fs::metadata(&py).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&py, perms).unwrap();
+        let exe = temp.path().join("App/token.place.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&resources),
+            current_exe_path: Some(&exe),
+            manifest_dir: temp.path(),
+            packaged: true,
+        })
+        .expect("bundled runtime");
+        assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
+        assert_eq!(launcher.runtime_id, "bundled-cpython-3.11-win-amd64-cu124");
+        assert_eq!(Path::new(&launcher.program), py.as_path());
+    }
+
+    #[test]
+    fn packaged_windows_missing_runtime_fails_closed_without_py_fallback() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("App/token.place.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        let err = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&temp.path().join("App/resources")),
+            current_exe_path: Some(&exe),
+            manifest_dir: temp.path(),
+            packaged: true,
+        })
+        .expect_err("missing bundled runtime must fail");
+        assert_eq!(err.public_code, DESKTOP_PYTHON_RUNTIME_MISSING);
+        assert_eq!(err.category, PythonLauncherCategory::BundledRuntimeMissing);
+        assert_eq!(err.source, PythonLauncherSource::BundledRuntime);
+        assert_ne!(err.executable_basename, "py");
     }
 
     #[test]

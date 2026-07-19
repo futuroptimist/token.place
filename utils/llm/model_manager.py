@@ -5769,6 +5769,7 @@ class ModelManager:
     def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True) -> bool:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
         safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
+        should_recreate_without_active_worker = False
         with self.llm_lock:
             llm = self.llm
             if llm is None:
@@ -5781,20 +5782,23 @@ class ModelManager:
                 self._llm_cancel_generation_event = threading.Event()
                 if not recreate:
                     return True
-                try:
-                    return self.get_llm_instance() is not None
-                except Exception:
-                    self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
-                    return False
-            self.last_worker_exit_code = self._worker_exit_code(llm)
-            self.last_worker_error_code = safe_reason
-            self.worker_state = 'recovering'
-            self.worker_restart_count += 1
-            self.last_worker_restart_at_ms = int(time.time() * 1000)
-            self.llm = None
-            self._llm_generation += 1
-            self._llm_cancel_generation_event.set()
-            self._llm_cancel_generation_event = threading.Event()
+                should_recreate_without_active_worker = True
+            else:
+                self.last_worker_exit_code = self._worker_exit_code(llm)
+                self.last_worker_error_code = safe_reason
+                self.worker_state = 'recovering'
+                self.worker_restart_count += 1
+                self.last_worker_restart_at_ms = int(time.time() * 1000)
+                self.llm = None
+                self._llm_generation += 1
+                self._llm_cancel_generation_event.set()
+                self._llm_cancel_generation_event = threading.Event()
+        if should_recreate_without_active_worker:
+            try:
+                return self.get_llm_instance() is not None
+            except Exception:
+                self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+                return False
         self._close_llm_proxy(llm, terminate_process=True)
         if not recreate:
             return True

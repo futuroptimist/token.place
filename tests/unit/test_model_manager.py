@@ -4825,6 +4825,43 @@ def test_model_manager_cancellation_advances_generation_without_active_worker(mo
     assert manager._llm_cancel_generation_event.is_set() is False
 
 
+def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.Lock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 70
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    monkeypatch.setattr(time, "time", lambda: 50.0)
+
+    replacement = object()
+
+    def get_llm_instance():
+        assert manager.llm_lock.acquire(blocking=False) is True
+        manager.llm_lock.release()
+        manager.llm = replacement
+        return replacement
+
+    monkeypatch.setattr(manager, "get_llm_instance", get_llm_instance)
+
+    old_event = manager._llm_cancel_generation_event
+    assert manager.terminate_active_worker_for_cancellation(reason="cancelled") is True
+
+    assert manager.llm is replacement
+    assert manager.worker_state == "recovering"
+    assert manager.last_worker_error_code == "cancelled"
+    assert manager.worker_restart_count == 1
+    assert manager.last_worker_restart_at_ms == 50000
+    assert manager._llm_generation == 71
+    assert old_event.is_set() is True
+    manager.log_warning.assert_not_called()
+
+
 def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
 

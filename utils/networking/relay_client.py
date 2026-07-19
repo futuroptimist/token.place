@@ -843,8 +843,6 @@ def _extract_api_v1_request_payload(
         "messages": messages,
         "options": options,
         "routing": {"context_tier": context_tier},
-        "request_deadline_remaining_seconds": decrypted_payload.get("request_deadline_remaining_seconds"),
-        "request_ttl_seconds": decrypted_payload.get("request_ttl_seconds"),
     }
 
 
@@ -2250,7 +2248,7 @@ class RelayClient:
         response = requests.post(control_url, **request_kwargs)
         if response.status_code in {401, 403}:
             raise PermissionError('api_v1_control_owner_proof_failed')
-        if response.status_code in {429, 500, 502, 503, 504}:
+        if response.status_code == 429 or 500 <= response.status_code <= 599:
             raise requests.RequestException(f'HTTP {response.status_code}')
         if response.status_code != 200:
             return {'status': 'unavailable', 'http_status': response.status_code}
@@ -2282,15 +2280,8 @@ class RelayClient:
     def _run_api_v1_inference_with_control(self, api_v1_request_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
-        if relay_url not in getattr(self, '_api_v1_registered_relays', set()):
-            return self._generate_api_v1_response_with_runtime_model(
-                request_id=request_id,
-                model_id=api_v1_request_payload['model'],
-                messages=api_v1_request_payload['messages'],
-                options=dict(api_v1_request_payload['options']),
-                requested_context_tier=api_v1_request_payload['routing']['context_tier'],
-            )
-        if not self._api_v1_control_credential_for_relay(relay_url):
+        control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
+        if control_available and not self._api_v1_control_credential_for_relay(relay_url):
             self._terminate_current_llama_worker('missing_control_credential')
             return None
         local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
@@ -2310,7 +2301,7 @@ class RelayClient:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
         future = executor.submit(_generate)
         try:
-            next_poll_at = time.monotonic()
+            next_poll_at = time.monotonic() if control_available else local_deadline
             backoff = 1.0
             while True:
                 now = time.monotonic()
@@ -2327,14 +2318,18 @@ class RelayClient:
                         continue
                     future_result = future.result()
                     break
-                if now >= next_poll_at:
-                    remaining = max(0.0, local_deadline - now)
+                if control_available and now >= next_poll_at:
+                    remaining = max(0.0, local_deadline - time.monotonic())
+                    if remaining <= 0.002:
+                        terminal_status = 'local_deadline'
+                        terminal_reason = 'local_deadline'
+                        break
                     try:
                         control = self._post_api_v1_request_control(
                             relay_url=relay_url,
                             request_id=request_id,
                             acknowledge=False,
-                            timeout_seconds=min(self._request_timeout, max(0.001, remaining * 0.5)),
+                            timeout_seconds=max(0.001, min(self._request_timeout, remaining * 0.5)),
                         )
                         backoff = 1.0
                         local_deadline = self._api_v1_deadline_after_response(local_deadline, control, now=time.monotonic())
@@ -2369,12 +2364,10 @@ class RelayClient:
                     wakeup.clear()
                     continue
                 try:
-                    future.result(timeout=0)
+                    future_result = future.result(timeout=0)
+                    break
                 except FutureTimeoutError:
                     pass
-                except Exception:
-                    future_result = future.result()
-                    break
             if terminal_status is not None:
                 recovery_succeeded = False
                 try:
@@ -2390,7 +2383,7 @@ class RelayClient:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
                 return None
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         return future_result
 
     def _api_v1_response_relay_url(self) -> str:

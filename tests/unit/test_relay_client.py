@@ -7182,3 +7182,156 @@ def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreate
     assert manager.llm is None
     assert manager.last_worker_error_code == 'cancelled'
     assert manager.worker_restart_count == 1
+
+
+def test_extract_api_v1_request_payload_ignores_plaintext_deadline_metadata():
+    payload = relay_client_module._extract_api_v1_request_payload({
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'request_id': 'req-plaintext-deadline',
+        'client_public_key': 'client-key',
+        'api_v1_request': {
+            'model': 'llama-3-8b-instruct',
+            'messages': [{'role': 'user', 'content': 'hello'}],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+        },
+        'request_deadline_remaining_seconds': 9999,
+        'request_ttl_seconds': 9999,
+    }, 'client-key')
+
+    assert payload is not None
+    assert 'request_deadline_remaining_seconds' not in payload
+    assert 'request_ttl_seconds' not in payload
+
+
+def test_api_v1_legacy_unregistered_inference_is_supervised_for_deadline():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://legacy-relay.example'
+    release = threading.Event()
+    stopped = []
+    control_calls = []
+
+    def generate(**_kwargs):
+        release.wait(2)
+        return {'request_id': 'late', 'api_v1_response': {'message': {'content': 'late'}}}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **kwargs: control_calls.append(kwargs)
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    started = time.monotonic()
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req-legacy-deadline',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.05,
+    })
+
+    assert result is None
+    assert stopped == ['local_deadline']
+    assert control_calls == []
+    assert time.monotonic() - started < 1.0
+
+
+def test_api_v1_control_timeout_is_strictly_less_than_remaining_deadline(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    timeouts = []
+    stopped = []
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+
+    def control(**kwargs):
+        timeouts.append(kwargs['timeout_seconds'])
+        return {'status': 'cancelled'}
+
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req-timeout',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.1,
+    }) is None
+
+    assert stopped == ['cancelled']
+    assert timeouts
+    assert all(0 < timeout < 0.1 for timeout in timeouts if timeout != relay_client_module._API_V1_CONTROL_ACK_TIMEOUT_SECONDS)
+
+
+def test_api_v1_control_retries_transient_statuses_and_network_errors(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    stopped = []
+    sleeps = []
+    now = {'value': 1000.0}
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+    responses = [
+        requests.RequestException('network'),
+        requests.RequestException('HTTP 429'),
+        requests.RequestException('HTTP 500'),
+        requests.RequestException('HTTP 502'),
+        requests.RequestException('HTTP 503'),
+        requests.RequestException('HTTP 504'),
+        {'status': 'cancelled'},
+    ]
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+
+    def control(**_kwargs):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    class Wakeup:
+        def wait(self, seconds):
+            sleeps.append(seconds)
+            now['value'] += max(seconds, 1.0)
+            return False
+
+        def clear(self):
+            pass
+
+    client._api_v1_control_wakeup = Wakeup()
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req-retry',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 120,
+    }) is None
+
+    assert stopped == ['cancelled']
+    assert responses == []
+    assert sleeps
+
+
+@pytest.mark.parametrize('status_code', [429, 500, 501, 502, 503, 504, 599])
+def test_post_api_v1_request_control_retries_all_5xx_and_429(monkeypatch, status_code):
+    client = _standalone_relay_client()
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    response = MagicMock(status_code=status_code)
+    monkeypatch.setattr(relay_client_module.requests, 'post', MagicMock(return_value=response))
+
+    with pytest.raises(relay_client_module.requests.RequestException):
+        client._post_api_v1_request_control(
+            relay_url='https://relay.example',
+            request_id='req-status',
+            timeout_seconds=0.1,
+        )

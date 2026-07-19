@@ -16,8 +16,9 @@ WINDOWS_SYSTEM_DLLS = {
     "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cabinet.dll", "comctl32.dll",
     "comdlg32.dll", "crypt32.dll", "gdi32.dll", "imm32.dll", "iphlpapi.dll",
     "kernel32.dll", "msi.dll", "msvcrt.dll", "netapi32.dll", "ntdll.dll",
-    "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll",
-    "shlwapi.dll", "ucrtbase.dll", "user32.dll", "version.dll", "ws2_32.dll",
+    "ole32.dll", "oleaut32.dll", "pdh.dll", "powrprof.dll", "psapi.dll", "rpcrt4.dll",
+    "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
+    "userenv.dll", "version.dll", "ws2_32.dll",
     # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
     # payloads must be bundled and validated as part of the runtime closure.
     "nvcuda.dll",
@@ -45,6 +46,20 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     if wheel.get("version") != "0.3.32" or wheel.get("flavor") != "cu124": raise RuntimePrepError("unexpected llama-cpp-python CUDA wheel version/flavor")
     if "win_amd64" not in wheel.get("name","") or "cu124" not in wheel.get("url",""): raise RuntimePrepError("CUDA wheel must be cu124 win_amd64")
     if m.get("expected_architecture") != "AMD64": raise RuntimePrepError("windows runtime architecture must be AMD64")
+    native_artifacts = m.get("native_dll_artifacts", [])
+    if native_artifacts and not isinstance(native_artifacts, list): raise RuntimePrepError("native_dll_artifacts must be a list")
+    for artifact in native_artifacts:
+        for key in ("name", "version", "url", "sha256", "architecture", "license", "provenance"):
+            if key not in artifact: raise RuntimePrepError(f"native_dll_artifacts entry missing {key}")
+        if artifact.get("architecture") != "AMD64": raise RuntimePrepError("native DLL artifacts must be AMD64")
+        if not artifact.get("url", "").startswith(("https://developer.download.nvidia.com/", "https://download.visualstudio.microsoft.com/")):
+            raise RuntimePrepError("native DLL artifacts must use approved immutable vendor URLs")
+        if not SHA256_RE.fullmatch(artifact.get("sha256", "")): raise RuntimePrepError("native DLL artifact sha256 must be 64 lowercase hex characters")
+    if native_artifacts:
+        native_names = {a["name"].lower() for a in native_artifacts if isinstance(a, dict) and "name" in a}
+        required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll"}
+        missing_vendor = sorted(required_vendor - native_names)
+        if missing_vendor: raise RuntimePrepError(f"missing native DLL artifact pins: {missing_vendor}")
     if not SHA256_RE.fullmatch(m.get("sha256", "")): raise RuntimePrepError("archive sha256 must be 64 lowercase hex characters")
     if not SHA256_RE.fullmatch(wheel.get("sha256", "")): raise RuntimePrepError("llama-cpp-python wheel sha256 must be 64 lowercase hex characters")
     wheelhouse = m.get("python_package_wheels", [])

@@ -462,6 +462,10 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
+    # This harness is a confirmed DevSourceTree launch, so provide the explicit
+    # interpreter override required by the fail-closed launcher policy without
+    # restoring PATH probing for packaged/runtime launches.
+    env["TOKEN_PLACE_DESKTOP_PYTHON"] = sys.executable
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
         f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)

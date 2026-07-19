@@ -87,7 +87,20 @@ fn configure_runtime_pythonpath_for(
     let import_root =
         python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        python_runtime::configure_python_subprocess_env(command, import_root);
+        let current_exe = std::env::current_exe().ok();
+        let (_resource_root, layout) = python_runtime::describe_resource_layout(
+            bridge_script,
+            current_exe.as_deref(),
+            manifest_dir,
+            None,
+        );
+        let packaged = layout != python_runtime::ResourceLayoutKind::DevSourceTree;
+        python_runtime::configure_python_subprocess_env_for_layout(
+            command,
+            import_root,
+            layout,
+            packaged,
+        );
     }
     import_root
 }

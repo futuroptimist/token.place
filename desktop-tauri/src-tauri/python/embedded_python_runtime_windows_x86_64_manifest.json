@@ -44,7 +44,12 @@
     "ggml-cuda.dll",
     "ggml.dll",
     "llama-common.dll",
-    "mtmd.dll"
+    "mtmd.dll",
+    "cudart64_12.dll",
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "msvcp140.dll",
+    "vcomp140.dll"
   ],
   "runtime_notices": [
     {
@@ -206,6 +211,58 @@
     {
       "name": "mtmd.dll",
       "machine": "IMAGE_FILE_MACHINE_AMD64"
+    }
+  ],
+  "native_dll_artifacts": [
+    {
+      "name": "cudart64_12.dll",
+      "version": "12.4",
+      "flavor": "cuda-12.4-runtime",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 runtime redistributable DLL; runtime payload only, not CUDA Toolkit developer tools",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
+      "sha256": "6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb"
+    },
+    {
+      "name": "cublas64_12.dll",
+      "version": "12.4",
+      "flavor": "cuda-12.4-cublas",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 cuBLAS redistributable DLL; runtime payload only, not CUDA Toolkit developer tools",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+      "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5"
+    },
+    {
+      "name": "cublasLt64_12.dll",
+      "version": "12.4",
+      "flavor": "cuda-12.4-cublas",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 cuBLASLt redistributable DLL when imported by cuBLAS/llama CUDA closure",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+      "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5"
+    },
+    {
+      "name": "msvcp140.dll",
+      "version": "14.x",
+      "flavor": "msvc-app-local-redist",
+      "architecture": "AMD64",
+      "license": "Microsoft Visual C++ Redistributable EULA",
+      "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+    },
+    {
+      "name": "vcomp140.dll",
+      "version": "14.x",
+      "flavor": "msvc-openmp-app-local-redist",
+      "architecture": "AMD64",
+      "license": "Microsoft Visual C++ Redistributable EULA",
+      "provenance": "Microsoft Visual C++ OpenMP app-local runtime redistributable for Windows x64",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
     }
   ]
 }

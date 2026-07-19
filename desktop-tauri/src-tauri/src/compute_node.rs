@@ -1529,7 +1529,15 @@ async fn wait_for_stop_cleanup_ack(
     expected_session_id: &str,
     deadline: Instant,
 ) -> bool {
-    wait_for_stop_cleanup_ack_inner(state, expected_session_id, deadline, None).await
+    wait_for_stop_cleanup_ack_inner(
+        state,
+        expected_session_id,
+        deadline,
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 
 async fn wait_for_stop_cleanup_ack_inner(
@@ -1539,6 +1547,7 @@ async fn wait_for_stop_cleanup_ack_inner(
     #[cfg_attr(not(test), allow(unused_mut))] mut registered_hook: Option<
         tokio::sync::oneshot::Sender<()>,
     >,
+    #[cfg(test)] mut deadline_wake: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> bool {
     loop {
         let notified = state.stopped_event_ack_notify.notified();
@@ -1561,9 +1570,18 @@ async fn wait_for_stop_cleanup_ack_inner(
         if Instant::now() >= deadline {
             return false;
         }
+        #[cfg(test)]
+        if let Some(wake) = deadline_wake.take() {
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = wake => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
+            }
+            continue;
+        }
         tokio::select! {
             _ = &mut notified => {},
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return false,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
         }
     }
 }
@@ -1821,6 +1839,7 @@ mod tests {
             expected.stop_cleanup_failure_count
         );
         assert_eq!(status.stop_cleanup_warning, expected.stop_cleanup_warning);
+        assert_eq!(status.operator_session_id, expected.operator_session_id);
         assert_eq!(status.last_error, expected.last_error);
     }
 
@@ -2872,13 +2891,14 @@ mod tests {
             status.stop_cleanup_required = Some(false);
             status.stop_cleanup_attempted = Some(false);
             status.stop_cleanup_outcome = Some("not_required".into());
-            status.stop_cleanup_success_count = Some(0);
-            status.stop_cleanup_failure_count = Some(0);
+            status.stop_cleanup_success_count = Some(7);
+            status.stop_cleanup_failure_count = Some(3);
+            status.stop_cleanup_warning = Some("original warning".into());
         }
         let original = state.status.lock().await.clone();
 
         let cleanup_status = parse_compute_node_event_line(
-            r#"{"type":"status","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0}"#,
+            r#"{"type":"status","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":4,"cleanup_warning":"hostile status warning"}"#,
         )
         .expect("status payload");
         assert!(apply_compute_node_event_to_state(&state, &cleanup_status).await);
@@ -2889,7 +2909,7 @@ mod tests {
         }
 
         let missing_session_stopped = parse_compute_node_event_line(
-            r#"{"type":"stopped","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":2}"#,
+            r#"{"type":"stopped","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":2,"unregister_failure_count":5,"cleanup_warning":"hostile missing-session warning","sequence":2}"#,
         )
         .expect("missing-session stopped payload");
         assert!(!apply_compute_node_event_to_state(&state, &missing_session_stopped).await);
@@ -2897,7 +2917,7 @@ mod tests {
         assert_preserved_stop_rejection_state(&state, &original).await;
 
         let empty_session_stopped = parse_compute_node_event_line(
-            r#"{"type":"stopped","operator_session_id":"","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":3,"last_error":"bad"}"#,
+            r#"{"type":"stopped","operator_session_id":"","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":3,"unregister_failure_count":6,"cleanup_warning":"hostile empty-session warning","sequence":3,"last_error":"bad"}"#,
         )
         .expect("empty-session stopped payload");
         assert!(!apply_compute_node_event_to_state(&state, &empty_session_stopped).await);
@@ -2905,7 +2925,7 @@ mod tests {
         assert_preserved_stop_rejection_state(&state, &original).await;
 
         let stale_session_stopped = parse_compute_node_event_line(
-            r#"{"type":"stopped","operator_session_id":"session-stale","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":4,"last_error":"bad"}"#,
+            r#"{"type":"stopped","operator_session_id":"session-stale","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":4,"unregister_failure_count":7,"cleanup_warning":"hostile stale-session warning","sequence":4,"last_error":"bad"}"#,
         )
         .expect("stale stopped payload");
         assert!(!apply_compute_node_event_to_state(&state, &stale_session_stopped).await);
@@ -2979,6 +2999,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_rechecks_persisted_ack_after_deadline_wake() {
+        let state = ComputeNodeState::default();
+        state.status.lock().await.operator_session_id = Some("session-1".into());
+
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_stop_cleanup_ack_inner(
+                &waiter_state,
+                "session-1",
+                Instant::now() + Duration::from_secs(30),
+                Some(registered_tx),
+                Some(deadline_rx),
+            )
+            .await
+        });
+        registered_rx
+            .await
+            .expect("waiter should register notification before deadline wake");
+        {
+            let status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            assert_eq!(status.operator_session_id.as_deref(), Some("session-1"));
+            *ack = Some("session-1".into());
+        }
+        deadline_tx
+            .send(())
+            .expect("deadline wake should be delivered to waiter");
+
+        assert!(waiter.await.expect("waiter task"));
+    }
+
+    #[tokio::test]
     async fn wait_for_stop_cleanup_ack_observes_matching_ack_published_while_waiting() {
         let state = ComputeNodeState::default();
         state.status.lock().await.operator_session_id = Some("session-1".into());
@@ -2991,6 +3045,7 @@ mod tests {
                 "session-1",
                 Instant::now() + Duration::from_secs(30),
                 Some(registered_tx),
+                None,
             )
             .await
         });
@@ -3021,6 +3076,7 @@ mod tests {
                 "session-1",
                 Instant::now() + Duration::from_secs(30),
                 Some(registered_tx),
+                None,
             )
             .await
         });

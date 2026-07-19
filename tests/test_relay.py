@@ -4779,8 +4779,11 @@ def test_api_v1_stale_eviction_response_race_both_orderings(client):
         # authoritative request deadline.  The server itself is stale, so the
         # eviction-first ordering must terminalize via unregister rather than
         # preliminary deadline pruning.
-        known_servers[server]['api_v1_in_flight_requests'][request_id]['expires_at'] = time.monotonic() - 1
-        known_servers[server]['api_v1_in_flight_requests'][request_id]['request_deadline_monotonic'] = time.monotonic() + 60
+        in_flight_entry = known_servers[server]['api_v1_in_flight_requests'][request_id]
+        in_flight_deadline = in_flight_entry['request_deadline_monotonic']
+        assert in_flight_deadline == relay_module.client_pending_request_deadlines[client_key][request_id]
+        assert in_flight_deadline > time.monotonic()
+        in_flight_entry['expires_at'] = time.monotonic() - 1
         first_done = threading.Event()
         results = {}
         errors = []
@@ -4832,7 +4835,12 @@ def test_api_v1_stale_eviction_response_race_both_orderings(client):
             assert results['evicted'] == [server]
             assert results['response'] == 410
             assert retrieve.status_code == 410
-            assert retrieve.get_json()['error']['code'] == 'cancelled'
+            retrieve_body = retrieve.get_json()
+            assert retrieve_body['error']['code'] == 'cancelled'
+            assert retrieve_body['error']['reason'] == 'server_unregistered'
+            terminal = relay_module._get_terminal_request(client_key, request_id)
+            assert terminal['status'] == 'cancelled'
+            assert terminal['reason'] == 'server_unregistered'
             assert tombstone_key in relay_module.api_v1_control_tombstones
             owner = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
             assert owner.status_code == 200
@@ -5015,15 +5023,32 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client, mon
             errors.append(exc)
 
     threads = [
-        threading.Thread(name='control-deadlock-probe', target=run_endpoint, args=('control', '/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
-        threading.Thread(name='response-deadlock-probe', target=run_endpoint, args=('response', '/api/v1/relay/responses', _api_v1_response_payload(request_id))),
-        threading.Thread(name='unregister-deadlock-probe', target=run_endpoint, args=('unregister', '/api/v1/relay/servers/unregister', owner_payload)),
+        threading.Thread(
+            name='control-deadlock-probe',
+            target=run_endpoint,
+            args=('control', '/api/v1/relay/servers/control', owner_payload | {'request_id': request_id}),
+            daemon=True,
+        ),
+        threading.Thread(
+            name='response-deadlock-probe',
+            target=run_endpoint,
+            args=('response', '/api/v1/relay/responses', _api_v1_response_payload(request_id)),
+            daemon=True,
+        ),
+        threading.Thread(
+            name='unregister-deadlock-probe',
+            target=run_endpoint,
+            args=('unregister', '/api/v1/relay/servers/unregister', owner_payload),
+            daemon=True,
+        ),
     ]
     for thread in threads:
         thread.start()
-    assert first_holder_entered.wait(timeout=5)
-    assert all_terminal_attempts_seen.wait(timeout=5)
-    release_first_holder.set()
+    try:
+        assert first_holder_entered.wait(timeout=5)
+        assert all_terminal_attempts_seen.wait(timeout=5)
+    finally:
+        release_first_holder.set()
     for thread in threads:
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)

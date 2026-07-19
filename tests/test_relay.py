@@ -4761,6 +4761,143 @@ def test_api_v1_stale_eviction_tombstone_owner_only_ack_and_late_response(client
     assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) not in relay_module.api_v1_control_tombstones
 
 
+
+def test_api_v1_stale_eviction_response_race_both_orderings(client):
+    for label, response_first in (('response-first', True), ('eviction-first', False)):
+        server = _server_key(f'stale-response-race-{label}')
+        client_key = f'{DUMMY_CLIENT_PUB_KEY}-{label}'
+        request_id = f'req-stale-response-race-{label}'
+        owner_payload = _api_v1_registered_control_payload(client, server)
+        assert client.post('/api/v1/relay/requests', json=(
+            _api_v1_request_payload(request_id, client_public_key=client_key, cancel_token=f'proof-{label}')
+            | {'server_public_key': server}
+        )).status_code == 200
+        assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
+        known_servers[server]['last_ping'] = datetime.now() - timedelta(seconds=120)
+        known_servers[server]['last_ping_duration'] = 1
+        known_servers[server]['api_v1_in_flight_requests'][request_id]['expires_at'] = time.monotonic() - 1
+        known_servers[server]['api_v1_in_flight_requests'][request_id]['request_deadline_monotonic'] = time.monotonic() - 1
+        first_done = threading.Event()
+        results = {}
+        errors = []
+
+        def submit_response():
+            try:
+                with app.test_client() as race_client:
+                    if not response_first:
+                        assert first_done.wait(timeout=5)
+                    response = race_client.post('/api/v1/relay/responses', json=_api_v1_response_payload(
+                        request_id,
+                        client_public_key=client_key,
+                        ciphertext=f'ciphertext-{label}',
+                    ))
+                    results['response'] = response.status_code
+                    first_done.set()
+            except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+                errors.append(exc)
+                first_done.set()
+
+        def evict_stale():
+            try:
+                if response_first:
+                    assert first_done.wait(timeout=5)
+                results['evicted'] = relay_module._evict_stale_servers()
+                first_done.set()
+            except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+                errors.append(exc)
+                first_done.set()
+
+        threads = [threading.Thread(target=submit_response), threading.Thread(target=evict_stale)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert {'response', 'evicted'} <= results.keys()
+        tombstone_key = relay_module._control_tombstone_key(server, request_id)
+        retrieve = client.post('/api/v1/relay/responses/retrieve', json={
+            'client_public_key': client_key,
+            'request_id': request_id,
+        })
+        if response_first:
+            assert results['response'] == 200
+            assert retrieve.status_code == 200
+            assert tombstone_key not in relay_module.api_v1_control_tombstones
+        else:
+            assert results['evicted'] == [server]
+            assert results['response'] == 410
+            assert retrieve.status_code == 410
+            assert retrieve.get_json()['error']['code'] == 'expired'
+            assert tombstone_key in relay_module.api_v1_control_tombstones
+            owner = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
+            assert owner.status_code == 200
+            assert owner.get_json()['status'] == 'expired'
+        assert client_key not in client_pending_request_ids
+        assert client_key not in relay_module.client_pending_request_deadlines
+        assert server not in client_inference_requests
+        assert server not in known_servers
+
+
+def test_api_v1_control_expiry_and_stale_prune_single_terminal_winner(client, monkeypatch):
+    owner_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY)
+    request_id = 'req-control-expiry-prune-race'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    entry = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
+    entry['expires_at'] = time.monotonic() - 1
+    entry['request_deadline_monotonic'] = time.monotonic() - 1
+    barrier = threading.Barrier(2)
+    original_cancel = relay_module._cancel_api_v1_request
+    cancel_calls = []
+
+    def synchronized_cancel(*args, **kwargs):
+        cancel_calls.append((args, kwargs))
+        barrier.wait(timeout=5)
+        return original_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(relay_module, '_cancel_api_v1_request', synchronized_cancel)
+    results = {}
+    errors = []
+
+    def control_expiry():
+        try:
+            with app.test_client() as race_client:
+                response = race_client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
+                results['control'] = response.status_code
+                results['control_body'] = response.get_json()
+        except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
+
+    def prune_stale():
+        try:
+            results['prune'] = relay_module._prune_api_v1_stale_in_flight_entries(
+                known_servers[DUMMY_SERVER_PUB_KEY],
+                now_monotonic=time.monotonic(),
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=control_expiry), threading.Thread(target=prune_stale)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(cancel_calls) == 2
+    assert results['control'] == 200
+    assert results['control_body']['status'] == 'expired'
+    assert results['prune'] in {0, 1}
+    assert relay_module._get_terminal_request(DUMMY_CLIENT_PUB_KEY, request_id)['status'] == 'expired'
+    assert relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id) in relay_module.api_v1_control_tombstones
+    assert list(relay_module.api_v1_control_tombstones) == [relay_module._control_tombstone_key(DUMMY_SERVER_PUB_KEY, request_id)]
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+    late_response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+    assert late_response.status_code == 410
+
 def test_api_v1_unregister_response_race_both_orderings(client):
     for label, response_first in (('response-first', True), ('unregister-first', False)):
         server = _server_key(f'unregister-race-{label}')
@@ -4834,19 +4971,21 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client):
     assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
     barrier = threading.Barrier(3)
     errors = []
+    results = {}
 
-    def run_endpoint(path, payload):
+    def run_endpoint(name, path, payload):
         try:
             with app.test_client() as race_client:
                 barrier.wait(timeout=5)
-                race_client.post(path, json=payload)
+                response = race_client.post(path, json=payload)
+                results[name] = (response.status_code, response.get_json())
         except BaseException as exc:
             errors.append(exc)
 
     threads = [
-        threading.Thread(target=run_endpoint, args=('/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
-        threading.Thread(target=run_endpoint, args=('/api/v1/relay/responses', _api_v1_response_payload(request_id))),
-        threading.Thread(target=run_endpoint, args=('/api/v1/relay/servers/unregister', owner_payload)),
+        threading.Thread(target=run_endpoint, args=('control', '/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
+        threading.Thread(target=run_endpoint, args=('response', '/api/v1/relay/responses', _api_v1_response_payload(request_id))),
+        threading.Thread(target=run_endpoint, args=('unregister', '/api/v1/relay/servers/unregister', owner_payload)),
     ]
     for thread in threads:
         thread.start()
@@ -4854,3 +4993,23 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client):
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []
+    assert {'control', 'response', 'unregister'} <= results.keys()
+    assert results['control'][0] in {200, 403}
+    assert results['response'][0] in {200, 410}
+    assert results['unregister'][0] == 200
+    retrieve = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    if results['response'][0] == 200:
+        assert retrieve.status_code == 200
+        assert relay_module._control_tombstone_key(server, request_id) not in relay_module.api_v1_control_tombstones
+        assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+    else:
+        assert retrieve.status_code == 410
+        assert retrieve.get_json()['error']['code'] == 'cancelled'
+        assert relay_module._control_tombstone_key(server, request_id) in relay_module.api_v1_control_tombstones
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
+    assert server not in client_inference_requests
+    assert server not in known_servers

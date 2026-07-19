@@ -1529,14 +1529,25 @@ async fn wait_for_stop_cleanup_ack(
     expected_session_id: &str,
     deadline: Instant,
 ) -> bool {
+    wait_for_stop_cleanup_ack_inner(state, expected_session_id, deadline, None).await
+}
+
+async fn wait_for_stop_cleanup_ack_inner(
+    state: &ComputeNodeState,
+    expected_session_id: &str,
+    deadline: Instant,
+    #[cfg_attr(not(test), allow(unused_mut))] mut registered_hook: Option<
+        tokio::sync::oneshot::Sender<()>,
+    >,
+) -> bool {
     loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
         let notified = state.stopped_event_ack_notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        #[cfg(test)]
+        if let Some(hook) = registered_hook.take() {
+            let _ = hook.send(());
+        }
         {
             let status = state.status.lock().await;
             let ack = state.stopped_event_ack_session_id.lock().await;
@@ -1546,6 +1557,9 @@ async fn wait_for_stop_cleanup_ack(
             if ack.as_deref() == Some(expected_session_id) {
                 return true;
             }
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         tokio::select! {
             _ = &mut notified => {},
@@ -1782,6 +1796,32 @@ mod tests {
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
         *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());
         state.stopped_event_ack_notify.notify_waiters();
+    }
+
+    async fn assert_preserved_stop_rejection_state(
+        state: &ComputeNodeState,
+        expected: &ComputeNodeStatus,
+    ) {
+        let status = state.status.lock().await;
+        assert_eq!(status.running, expected.running);
+        assert_eq!(status.registered, expected.registered);
+        assert_eq!(status.sequence, expected.sequence);
+        assert_eq!(status.stop_cleanup_required, expected.stop_cleanup_required);
+        assert_eq!(
+            status.stop_cleanup_attempted,
+            expected.stop_cleanup_attempted
+        );
+        assert_eq!(status.stop_cleanup_outcome, expected.stop_cleanup_outcome);
+        assert_eq!(
+            status.stop_cleanup_success_count,
+            expected.stop_cleanup_success_count
+        );
+        assert_eq!(
+            status.stop_cleanup_failure_count,
+            expected.stop_cleanup_failure_count
+        );
+        assert_eq!(status.stop_cleanup_warning, expected.stop_cleanup_warning);
+        assert_eq!(status.last_error, expected.last_error);
     }
 
     fn success_exit_status() -> ExitStatus {
@@ -2824,6 +2864,10 @@ mod tests {
         let state = ComputeNodeState::default();
         {
             let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.sequence = Some(10);
+            status.last_error = Some("preserve me".into());
             status.operator_session_id = Some("session-current".into());
             status.stop_cleanup_required = Some(false);
             status.stop_cleanup_attempted = Some(false);
@@ -2831,9 +2875,10 @@ mod tests {
             status.stop_cleanup_success_count = Some(0);
             status.stop_cleanup_failure_count = Some(0);
         }
+        let original = state.status.lock().await.clone();
 
         let cleanup_status = parse_compute_node_event_line(
-            r#"{"type":"status","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":1}"#,
+            r#"{"type":"status","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0}"#,
         )
         .expect("status payload");
         assert!(apply_compute_node_event_to_state(&state, &cleanup_status).await);
@@ -2849,16 +2894,26 @@ mod tests {
         .expect("missing-session stopped payload");
         assert!(!apply_compute_node_event_to_state(&state, &missing_session_stopped).await);
         assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+        assert_preserved_stop_rejection_state(&state, &original).await;
+
+        let empty_session_stopped = parse_compute_node_event_line(
+            r#"{"type":"stopped","operator_session_id":"","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":3,"last_error":"bad"}"#,
+        )
+        .expect("empty-session stopped payload");
+        assert!(!apply_compute_node_event_to_state(&state, &empty_session_stopped).await);
+        assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+        assert_preserved_stop_rejection_state(&state, &original).await;
 
         let stale_session_stopped = parse_compute_node_event_line(
-            r#"{"type":"stopped","operator_session_id":"session-stale","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":3}"#,
+            r#"{"type":"stopped","operator_session_id":"session-stale","running":false,"registered":false,"unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":4,"last_error":"bad"}"#,
         )
         .expect("stale stopped payload");
         assert!(!apply_compute_node_event_to_state(&state, &stale_session_stopped).await);
         assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+        assert_preserved_stop_rejection_state(&state, &original).await;
 
         let matching_stopped = parse_compute_node_event_line(
-            r#"{"type":"stopped","operator_session_id":"session-current","unregister_required":false,"unregister_attempted":false,"unregister_outcome":"not_required","unregister_success_count":0,"unregister_failure_count":0,"sequence":4}"#,
+            r#"{"type":"stopped","operator_session_id":"session-current","unregister_required":false,"unregister_attempted":false,"unregister_outcome":"not_required","unregister_success_count":0,"unregister_failure_count":0,"sequence":11}"#,
         )
         .expect("matching stopped payload");
         assert!(apply_compute_node_event_to_state(&state, &matching_stopped).await);
@@ -2889,20 +2944,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_accepts_matching_ack_after_expired_deadline() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            status.operator_session_id = Some("session-1".into());
+            *ack = Some("session-1".into());
+        }
+
+        assert!(
+            wait_for_stop_cleanup_ack(
+                &state,
+                "session-1",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_rejects_pending_cleanup_after_expired_deadline() {
+        let state = ComputeNodeState::default();
+        state.status.lock().await.operator_session_id = Some("session-1".into());
+
+        assert!(
+            !wait_for_stop_cleanup_ack(
+                &state,
+                "session-1",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn wait_for_stop_cleanup_ack_observes_matching_ack_published_while_waiting() {
         let state = ComputeNodeState::default();
         state.status.lock().await.operator_session_id = Some("session-1".into());
 
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
         let waiter_state = state.clone();
         let waiter = tokio::spawn(async move {
-            wait_for_stop_cleanup_ack(
+            wait_for_stop_cleanup_ack_inner(
                 &waiter_state,
                 "session-1",
                 Instant::now() + Duration::from_secs(30),
+                Some(registered_tx),
             )
             .await
         });
-        tokio::task::yield_now().await;
+        registered_rx
+            .await
+            .expect("waiter should register notification before publication");
         {
             let status = state.status.lock().await;
             let mut ack = state.stopped_event_ack_session_id.lock().await;
@@ -2919,16 +3013,20 @@ mod tests {
         let state = ComputeNodeState::default();
         state.status.lock().await.operator_session_id = Some("session-1".into());
 
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
         let waiter_state = state.clone();
         let waiter = tokio::spawn(async move {
-            wait_for_stop_cleanup_ack(
+            wait_for_stop_cleanup_ack_inner(
                 &waiter_state,
                 "session-1",
                 Instant::now() + Duration::from_secs(30),
+                Some(registered_tx),
             )
             .await
         });
-        tokio::task::yield_now().await;
+        registered_rx
+            .await
+            .expect("waiter should register notification before replacement");
         {
             let mut status = state.status.lock().await;
             let mut ack = state.stopped_event_ack_session_id.lock().await;
@@ -2958,7 +3056,7 @@ mod tests {
             !wait_for_stop_cleanup_ack(
                 &state,
                 "session-2",
-                Instant::now() + Duration::from_millis(25),
+                Instant::now() - Duration::from_millis(1),
             )
             .await
         );

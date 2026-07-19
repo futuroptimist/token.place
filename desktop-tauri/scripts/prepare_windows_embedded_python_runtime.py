@@ -13,10 +13,11 @@ OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_SYSTEM_DLLS = {
-    "advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "kernel32.dll",
-    "msvcrt.dll", "netapi32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll",
-    "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
-    "version.dll", "ws2_32.dll",
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cabinet.dll", "comctl32.dll",
+    "comdlg32.dll", "crypt32.dll", "gdi32.dll", "imm32.dll", "iphlpapi.dll",
+    "kernel32.dll", "msi.dll", "msvcrt.dll", "netapi32.dll", "ntdll.dll",
+    "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "sechost.dll", "shell32.dll",
+    "shlwapi.dll", "ucrtbase.dll", "user32.dll", "version.dll", "ws2_32.dll",
     # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
     # payloads must be bundled and validated as part of the runtime closure.
     "nvcuda.dll",

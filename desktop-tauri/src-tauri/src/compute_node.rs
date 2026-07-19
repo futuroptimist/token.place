@@ -2969,10 +2969,12 @@ mod tests {
 
         assert!(error.contains("compute_node_bridge.py"));
         assert!(error.contains("attempted_resource_roots="));
-        assert!(error.contains("attempted_bridge_paths="));
+        assert!(error.contains("attempted_bridge_basenames="));
         assert!(error.contains("MacOsAppResources"));
-        assert!(error.contains("Contents/Resources/python/compute_node_bridge.py"));
-        assert!(error.contains("interpreter=<unresolved>"));
+        assert!(error.contains("compute_node_bridge.py"));
+        assert!(error.contains("interpreter_basename=<unresolved>"));
+        assert!(!error.contains(temp.path().to_string_lossy().as_ref()));
+        assert!(!error.contains("Contents/Resources/python/compute_node_bridge.py"));
     }
 
     #[test]

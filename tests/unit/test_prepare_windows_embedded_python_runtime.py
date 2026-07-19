@@ -763,23 +763,25 @@ def test_prunes_known_setuptools_non_x64_launchers_but_preserves_x64(tmp_path):
     runtime = tmp_path / 'python-runtime'
     setuptools = runtime / 'Lib' / 'site-packages' / 'setuptools'
     setuptools.mkdir(parents=True)
-    for name in ('cli-32.exe', 'gui-32.exe'):
+    for name in ('cli.exe', 'cli-32.exe', 'gui-32.exe'):
         write_minimal_pe(setuptools / name, machine=0x014C)
-    for name in ('cli-arm64.exe', 'gui-arm64.exe'):
+    for name in ('gui.exe', 'cli-arm64.exe', 'gui-arm64.exe'):
         write_minimal_pe(setuptools / name, machine=0xAA64)
-    write_minimal_pe(setuptools / 'cli.exe')
-    write_minimal_pe(setuptools / 'gui.exe')
+    write_minimal_pe(setuptools / 'cli-64.exe')
+    write_minimal_pe(setuptools / 'gui-64.exe')
 
     removed = prep.prune_packaging_unused_non_x64_launchers(runtime)
 
     assert removed == [
         'Lib/site-packages/setuptools/cli-32.exe',
         'Lib/site-packages/setuptools/cli-arm64.exe',
+        'Lib/site-packages/setuptools/cli.exe',
         'Lib/site-packages/setuptools/gui-32.exe',
         'Lib/site-packages/setuptools/gui-arm64.exe',
+        'Lib/site-packages/setuptools/gui.exe',
     ]
-    assert (setuptools / 'cli.exe').exists()
-    assert (setuptools / 'gui.exe').exists()
+    assert (setuptools / 'cli-64.exe').exists()
+    assert (setuptools / 'gui-64.exe').exists()
     prep.validate_runtime_payload(runtime, {'required_native_dlls': []})
 
 
@@ -787,8 +789,8 @@ def test_setuptools_launcher_names_outside_setuptools_still_fail(tmp_path):
     runtime = tmp_path / 'python-runtime'
     tools = runtime / 'tools'
     tools.mkdir(parents=True)
-    write_minimal_pe(tools / 'cli-32.exe', machine=0x014C)
+    write_minimal_pe(tools / 'cli.exe', machine=0x014C)
 
     assert prep.prune_packaging_unused_non_x64_launchers(runtime) == []
-    with pytest.raises(prep.RuntimePrepError, match='x86 PE payload rejected: tools/cli-32.exe'):
+    with pytest.raises(prep.RuntimePrepError, match='x86 PE payload rejected: tools/cli.exe'):
         prep.validate_runtime_payload(runtime, {'required_native_dlls': []})

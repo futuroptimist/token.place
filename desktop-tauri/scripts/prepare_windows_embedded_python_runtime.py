@@ -23,8 +23,6 @@ WINDOWS_SYSTEM_DLLS = {
 }
 WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
-DISTLIB_UNUSED_NON_X64_LAUNCHERS = {"t32.exe", "w32.exe", "t64-arm.exe", "w64-arm.exe"}
-SETUPTOOLS_UNUSED_NON_X64_LAUNCHERS = {"cli-32.exe", "gui-32.exe", "cli-arm64.exe", "gui-arm64.exe"}
 
 class RuntimePrepError(RuntimeError): pass
 
@@ -254,6 +252,16 @@ def inspect_pe(path: Path, display_name: str | None = None) -> tuple[str, list[s
     read_import_descriptors(delay_import_rva, 32, 1, delay=True)
     return 'IMAGE_FILE_MACHINE_AMD64', imports
 
+def pe_machine(path: Path, display_name: str | None = None) -> int:
+    label = display_name or path.name
+    data = path.read_bytes()
+    if len(data) < 0x40 or data[:2] != b'MZ':
+        raise RuntimePrepError(f'not a PE file: {label}')
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b'PE\0\0':
+        raise RuntimePrepError(f'invalid PE header: {label}')
+    return struct.unpack_from('<H', data, pe_offset + 4)[0]
+
 def _resolve_import_target(importer: Path, dll: str, candidates: dict[str, list[Path]], runtime: Path) -> Path | None:
     matches = candidates.get(dll.lower(), [])
     if not matches:
@@ -329,10 +337,18 @@ def prune_packaging_unused_non_x64_launchers(runtime: Path) -> list[str]:
     removed: list[str] = []
     for path in sorted(runtime.rglob('*.exe'), key=lambda p: p.relative_to(runtime).as_posix().lower()):
         name = path.name.lower()
-        if (
-            (name in DISTLIB_UNUSED_NON_X64_LAUNCHERS and _is_distlib_launcher_resource(path, runtime))
-            or (name in SETUPTOOLS_UNUSED_NON_X64_LAUNCHERS and _is_setuptools_launcher_resource(path, runtime))
-        ):
+        is_verified_launcher_resource = (
+            _is_distlib_launcher_resource(path, runtime)
+            or _is_setuptools_launcher_resource(path, runtime)
+        )
+        if not is_verified_launcher_resource:
+            continue
+        rel = path.relative_to(runtime).as_posix()
+        try:
+            machine = pe_machine(path, rel)
+        except RuntimePrepError:
+            continue
+        if machine != 0x8664:
             removed.append(path.relative_to(runtime).as_posix())
             path.unlink()
     return removed

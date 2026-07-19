@@ -71,6 +71,26 @@ def manifest(**overrides):
         },
         'required_packages': {'pip': '25.2', 'llama-cpp-python': '0.3.32'},
         'required_native_dlls': ['llama.dll'],
+        'native_dll_artifacts': [
+            {
+                'name': name,
+                'version': version,
+                'url': f'https://developer.download.nvidia.com/example/{name}.zip' if name.startswith(('cuda', 'cublas')) else f'https://download.visualstudio.microsoft.com/example/{name}.zip',
+                'sha256': '3' * 64,
+                'architecture': 'AMD64',
+                'license': 'test license',
+                'provenance': 'test provenance',
+                'archive_member_path': f'bin/{name}',
+                'destination': name,
+                'extracted_sha256': '4' * 64,
+            }
+            for name, version in [
+                ('cudart64_12.dll', '12.4.127'),
+                ('cublas64_12.dll', '12.4.5.8'),
+                ('msvcp140.dll', '14.44.35211.0'),
+                ('vcomp140.dll', '14.44.35211.0'),
+            ]
+        ],
         'python_package_wheels': [],
     }
     data.update(overrides)
@@ -172,6 +192,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
             'sha256': '2' * 64,
         }],
     )
+    m['native_dll_artifacts'] = []
     wheel = tmp_path / m['llama_cpp_cuda_wheel']['name']
     wheel.write_bytes(b'wheel')
     archive = tmp_path / 'runtime.tar.gz'
@@ -234,6 +255,41 @@ def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path
 
     with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
         prep.fetch('https://github.com/example/runtime.tar.gz', 'f' * 64, artifact)
+
+
+
+def test_fetch_uses_part_file_and_does_not_poison_cache_on_mismatch(tmp_path, monkeypatch):
+    dest = tmp_path / 'artifact.zip'
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda *args, **kwargs: Response(b'bad-bytes'))
+
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/example/artifact.zip', '0' * 64, dest)
+
+    assert not dest.exists()
+    assert not (tmp_path / 'artifact.zip.part').exists()
+
+
+def test_load_manifest_requires_native_inventory_and_unique_destinations(tmp_path):
+    path = tmp_path / 'manifest.json'
+    data = manifest()
+    data['native_dll_artifacts'] = []
+    write_manifest(path, data)
+    with pytest.raises(prep.RuntimePrepError, match='non-empty'):
+        prep.load_manifest(path)
+
+    data = manifest()
+    data['native_dll_artifacts'][1]['destination'] = data['native_dll_artifacts'][0]['destination']
+    write_manifest(path, data)
+    with pytest.raises(prep.RuntimePrepError, match='duplicate native DLL destination'):
+        prep.load_manifest(path)
 
 
 def test_load_manifest_rejects_wrong_schema_wheel_flavor_and_architecture(tmp_path):
@@ -445,12 +501,17 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
     monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: tmp_path / ('wheel.whl' if url.endswith('.whl') else 'runtime.tar.gz'))
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
 
+    def no_native(data):
+        data = dict(data)
+        data['native_dll_artifacts'] = []
+        return data
+
     def fake_extract_without_python(_archive, dest):
         (dest / 'cpython').mkdir(parents=True)
 
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_without_python)
     with pytest.raises(prep.RuntimePrepError, match='archive missing python.exe'):
-        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}))
+        prep.prepare(no_native(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'})))
 
     def fake_extract_with_python(_archive, dest):
         staged = dest / 'cpython'
@@ -463,7 +524,7 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract_with_python)
     monkeypatch.setattr(prep, 'run', lambda cmd, **kwargs: Result())
     with pytest.raises(prep.RuntimePrepError, match='interpreter probe mismatch'):
-        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}))
+        prep.prepare(no_native(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'})))
 
     class GoodProbe:
         stdout = json.dumps({'version': [3, 11, 13], 'machine': 'AMD64'})
@@ -477,7 +538,7 @@ def test_prepare_error_paths_for_missing_python_probe_mismatch_and_missing_dll(t
 
     monkeypatch.setattr(prep, 'run', fake_good_run)
     with pytest.raises(prep.RuntimePrepError, match='missing required DLL'):
-        prep.prepare(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}, required_native_dlls=['llama.dll']))
+        prep.prepare(no_native(manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'}, required_native_dlls=['llama.dll'])))
 
 
 def test_main_check_manifest_only_success_and_error(tmp_path, monkeypatch, capsys):
@@ -661,6 +722,7 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     marker = runtime_root / 'previous.txt'
     marker.write_text('keep', encoding='utf-8')
     m = manifest(expected_archive_root='cpython', required_packages={'llama-cpp-python': '0.3.32'})
+    m['native_dll_artifacts'] = []
     monkeypatch.setattr(prep, 'ROOT', tmp_path / 'desktop-tauri')
     monkeypatch.setattr(prep, 'SRC_TAURI', tmp_path / 'desktop-tauri' / 'src-tauri')
     monkeypatch.setattr(prep, 'OUTPUT', runtime_root)

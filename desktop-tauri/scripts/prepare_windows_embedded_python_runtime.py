@@ -46,8 +46,9 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     if wheel.get("version") != "0.3.32" or wheel.get("flavor") != "cu124": raise RuntimePrepError("unexpected llama-cpp-python CUDA wheel version/flavor")
     if "win_amd64" not in wheel.get("name","") or "cu124" not in wheel.get("url",""): raise RuntimePrepError("CUDA wheel must be cu124 win_amd64")
     if m.get("expected_architecture") != "AMD64": raise RuntimePrepError("windows runtime architecture must be AMD64")
-    native_artifacts = m.get("native_dll_artifacts", [])
-    if native_artifacts and not isinstance(native_artifacts, list): raise RuntimePrepError("native_dll_artifacts must be a list")
+    native_artifacts = m.get("native_dll_artifacts")
+    if not isinstance(native_artifacts, list) or not native_artifacts: raise RuntimePrepError("native_dll_artifacts must be a non-empty list")
+    native_destinations: set[str] = set()
     for artifact in native_artifacts:
         for key in ("name", "version", "url", "sha256", "architecture", "license", "provenance"):
             if key not in artifact: raise RuntimePrepError(f"native_dll_artifacts entry missing {key}")
@@ -57,6 +58,9 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         if not artifact.get("url", "").startswith(("https://developer.download.nvidia.com/", "https://download.visualstudio.microsoft.com/")):
             raise RuntimePrepError("native DLL artifacts must use approved immutable vendor URLs")
         if not SHA256_RE.fullmatch(artifact.get("sha256", "")): raise RuntimePrepError("native DLL artifact sha256 must be 64 lowercase hex characters")
+        destination = artifact.get("destination", artifact["name"]).lower().replace("\\", "/")
+        if destination in native_destinations: raise RuntimePrepError(f"duplicate native DLL destination: {destination}")
+        native_destinations.add(destination)
     if native_artifacts:
         native_names = {a["name"].lower() for a in native_artifacts if isinstance(a, dict) and "name" in a}
         required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll"}
@@ -100,8 +104,17 @@ def fetch(url: str, sha: str, dest: Path) -> Path:
         raise RuntimePrepError("runtime artifacts must be fetched from pinned immutable HTTPS URLs")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
-        with urllib.request.urlopen(url, timeout=120) as r, dest.open('wb') as f:  # nosec B310 - URL scheme/host is validated and SHA-256 pinned
-            shutil.copyfileobj(r, f)
+        part = dest.with_name(dest.name + '.part')
+        part.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r, part.open('wb') as f:  # nosec B310 - URL scheme/host is validated and SHA-256 pinned
+                shutil.copyfileobj(r, f)
+            got = sha256_file(part)
+            if got != sha:
+                raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
+            part.replace(dest)
+        finally:
+            part.unlink(missing_ok=True)
     got=sha256_file(dest)
     if got != sha: raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
     return dest

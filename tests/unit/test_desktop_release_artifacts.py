@@ -2516,6 +2516,19 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)
 
 
+
+
+def _load_prepare_module():
+    import importlib.util
+
+    script_path = Path('desktop-tauri/scripts/prepare_windows_embedded_python_runtime.py')
+    spec = importlib.util.spec_from_file_location('prepare_windows_embedded_python_runtime', script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_windows_release_validator():
     import importlib.util
     script_path = Path('scripts/validate_windows_desktop_release_artifacts.py')
@@ -2584,3 +2597,219 @@ def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_ga
     assert 'windows-nvidia-release-gate' in text
     assert 'needs: [build, windows-nvidia-release-gate]' in text
     assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text
+
+
+def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    assert validator.expected_version_from_tag(None, '0.1.2') == '0.1.2'
+    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.2') == '1.2.3'
+    with pytest.raises(validator.ValidationError, match='desktop-vX.Y.Z'):
+        validator.expected_version_from_tag('1495/merge', '0.1.2')
+
+    package = tmp_path / 'package.json'
+    lock = tmp_path / 'package-lock.json'
+    tauri = tmp_path / 'tauri.conf.json'
+    package.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    lock.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    tauri.write_text(json.dumps({'version': '9.9.9'}), encoding='utf-8')
+    monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
+    monkeypatch.setattr(validator, 'PACKAGE_LOCK', lock)
+    monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
+    with pytest.raises(validator.ValidationError, match='Windows release version mismatch'):
+        validator.validate_config_versions('0.1.2')
+    tauri.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    validator.validate_config_versions('0.1.2')
+
+    source_dir = tmp_path / 'already-extracted'
+    source_dir.mkdir()
+    (source_dir / 'marker.txt').write_text('ok', encoding='utf-8')
+    dest = tmp_path / 'dest'
+    validator._run_extract(source_dir, dest)
+    assert (dest / 'marker.txt').read_text(encoding='utf-8') == 'ok'
+
+    artifact = tmp_path / 'installer.exe'
+    artifact.write_bytes(b'fake')
+    monkeypatch.setattr(validator.shutil, 'which', lambda _name: None)
+    with pytest.raises(validator.ValidationError, match='7z/7za/7zz not available'):
+        validator._run_extract(artifact, tmp_path / 'no-7z')
+
+    calls = []
+    monkeypatch.setattr(validator.shutil, 'which', lambda _name: '/usr/bin/7z')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda cmd, **kwargs: calls.append((cmd, kwargs)))
+    validator._run_extract(artifact, tmp_path / 'with-7z')
+    assert calls and calls[0][0][:3] == ['/usr/bin/7z', 'x', '-y']
+
+
+def test_windows_validator_runtime_and_provenance_fail_closed_edges(tmp_path):
+    validator = _load_windows_release_validator()
+    manifest = json.loads(validator.MANIFEST.read_text(encoding='utf-8'))
+
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator._find_runtime(empty)
+    for idx in range(2):
+        runtime = empty / f'app{idx}' / 'python-runtime'
+        runtime.mkdir(parents=True)
+        (runtime / 'python.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='found 2'):
+        validator._find_runtime(empty)
+
+    runtime_root = tmp_path / 'runtime' / 'python-runtime'
+    runtime_root.mkdir(parents=True)
+    with pytest.raises(validator.ValidationError, match='bundled python.exe is missing'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    (runtime_root / 'python.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='missing required DLLs'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    for name in manifest['required_native_dlls']:
+        (runtime_root / name).write_bytes(b'MZ')
+    (runtime_root / 'cmake.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='forbidden compiler/toolkit'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    (runtime_root / 'cmake.exe').unlink()
+    with pytest.raises(validator.ValidationError, match='missing or corrupt Windows runtime provenance'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+
+    provenance = {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': '3.11.13',
+        'target_triple': 'x86_64-pc-windows-msvc',
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest['python_package_wheels'],
+        'required_native_dlls': manifest['required_native_dlls'],
+        'pe_dll_closure': [],
+    }
+    prov_path = runtime_root / validator.PROVENANCE
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='non-empty PE DLL closure'):
+        validator._validate_provenance(runtime_root, manifest)
+    provenance['pe_dll_closure'] = [
+        {'name': manifest['required_native_dlls'][0], 'path': manifest['required_native_dlls'][0], 'machine': 'IMAGE_FILE_MACHINE_I386', 'imports': []}
+    ]
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='missing required entries'):
+        validator._validate_provenance(runtime_root, manifest)
+    provenance['pe_dll_closure'] = [
+        {'name': name, 'path': name, 'machine': 'IMAGE_FILE_MACHINE_I386', 'imports': []}
+        for name in manifest['required_native_dlls']
+    ]
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='non-AMD64'):
+        validator._validate_provenance(runtime_root, manifest)
+
+
+def test_prepare_url_and_microsoft_extraction_failure_edges(tmp_path, monkeypatch):
+    prep = _load_prepare_module()
+    with pytest.raises(prep.RuntimePrepError, match='HTTPS'):
+        prep._validated_artifact_url('http://github.com/example/runtime.zip')
+    with pytest.raises(prep.RuntimePrepError, match='credentials'):
+        prep._validated_artifact_url('https://user:pass@github.com/example/runtime.zip')
+    with pytest.raises(prep.RuntimePrepError, match='default HTTPS port'):
+        prep._validated_artifact_url('https://github.com:444/example/runtime.zip')
+    original = prep._validated_artifact_url('https://github.com/futuroptimist/token.place/releases/download/a/runtime.zip')
+    for redirect in [
+        'http://release-assets.githubusercontent.com/file',
+        'https://token@release-assets.githubusercontent.com/file',
+        'https://files.pythonhosted.org/file',
+    ]:
+        with pytest.raises(prep.RuntimePrepError, match='redirected to an unapproved'):
+            prep._validate_redirect_url(original, redirect)
+
+    cabinet = tmp_path / 'payload.cab'
+    cabinet.write_bytes(b'MSCFfake')
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: type('R', (), {'returncode': 1})())
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep._expand_cab_member(cabinet, 'msvcp140.dll', tmp_path / 'out')
+    def fake_expand(*args, **kwargs):
+        out = Path(args[0][-1])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'a' / 'msvcp140.dll').parent.mkdir(parents=True, exist_ok=True)
+        (out / 'a' / 'msvcp140.dll').write_bytes(b'one')
+        (out / 'b' / 'msvcp140.dll').parent.mkdir(parents=True, exist_ok=True)
+        (out / 'b' / 'msvcp140.dll').write_bytes(b'two')
+        return type('R', (), {'returncode': 0})()
+    monkeypatch.setattr(prep.subprocess, 'run', fake_expand)
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep._expand_cab_member(cabinet, 'msvcp140.dll', tmp_path / 'multi')
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Windows')
+    with pytest.raises(prep.RuntimePrepError, match="'<cab-key>/<file>'"):
+        prep.extract_microsoft_burn_member(tmp_path / 'redist.exe', '../msvcp140.dll', tmp_path / 'dll')
+    redist = tmp_path / 'redist.exe'
+    redist.write_bytes(b'not-a-cab')
+    with pytest.raises(prep.RuntimePrepError, match='missing cabinet payload'):
+        prep.extract_microsoft_burn_member(redist, 'a12/msvcp140.dll', tmp_path / 'dll')
+
+
+def test_prepare_fetch_success_redirect_digest_and_cached_digest_edges(tmp_path, monkeypatch):
+    prep = _load_prepare_module()
+    payload = b'pinned-runtime-artifact'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+    dest = tmp_path / 'runtime.zip'
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_exc):
+            return False
+        def geturl(self):
+            return 'https://release-assets.githubusercontent.com/runtime.zip'
+        def read(self, size=-1):
+            if getattr(self, '_read', False):
+                return b''
+            self._read = True
+            return payload
+
+    calls = []
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda url, timeout: calls.append((url, timeout)) or Response())
+    assert prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', digest, dest) == dest
+    assert dest.read_bytes() == payload
+    assert calls == [('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', 120)]
+
+    # A subsequent cached mismatch is quarantined before failing closed.
+    dest.write_bytes(b'corrupt-after-cache')
+    good_digest_for_other_payload = prep.hashlib.sha256(b'other-payload').hexdigest()
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', good_digest_for_other_payload, dest)
+    assert (tmp_path / 'runtime.zip.poisoned').exists()
+
+
+def test_prepare_load_manifest_additional_rejection_branches(tmp_path):
+    prep = _load_prepare_module()
+    manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
+
+    cases = [
+        ('schema_version', 2, 'schema_version'),
+        ('expected_architecture', 'ARM64', 'architecture must be AMD64'),
+    ]
+    for key, value, message in cases:
+        bad = json.loads(json.dumps(manifest))
+        bad[key] = value
+        path = tmp_path / f'{key}.json'
+        path.write_text(json.dumps(bad), encoding='utf-8')
+        with pytest.raises(prep.RuntimePrepError, match=message):
+            prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['llama_cpp_cuda_wheel']['name'] = 'llama_cpp_python-0.3.32-py3-none-win_arm64.whl'
+    path = tmp_path / 'bad-wheel-name.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='unexpected llama-cpp-python wheel name'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['native_dll_artifacts'][0]['architecture'] = 'I386'
+    path = tmp_path / 'bad-native-arch.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='native DLL artifacts must be AMD64'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['python_package_wheels'] = 'not-a-list'
+    path = tmp_path / 'bad-wheelhouse-shape.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='python_package_wheels must be a list'):
+        prep.load_manifest(path)

@@ -1064,3 +1064,32 @@ def test_load_manifest_rejects_placeholder_pattern_hashes(tmp_path):
     write_manifest(path, data)
     with pytest.raises(prep.RuntimePrepError, match='placeholder-pattern'):
         prep.load_manifest(path)
+
+
+def test_fetch_success_and_final_cache_mismatch_paths(tmp_path, monkeypatch):
+    payload = b'covered-fetch-payload'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+    dest = tmp_path / 'runtime.zip'
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_exc):
+            return False
+        def geturl(self):
+            return 'https://release-assets.githubusercontent.com/runtime.zip'
+        def read(self, size=-1):
+            if getattr(self, '_done', False):
+                return b''
+            self._done = True
+            return payload
+
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda url, timeout: Response())
+    assert prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', digest, dest) == dest
+    assert dest.read_bytes() == payload
+
+    dest.write_bytes(b'poison')
+    other_digest = prep.hashlib.sha256(b'other').hexdigest()
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', other_digest, dest)
+    assert (tmp_path / 'runtime.zip.poisoned').exists()

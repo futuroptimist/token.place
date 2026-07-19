@@ -5012,6 +5012,28 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
     ModelManager._close_llm_proxy(manager, processless_worker, terminate_process=True)
     processless_worker.close.assert_called_once_with()
 
+
+def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
+
+    manager._close_llm_proxy(close_fails, terminate_process=False)
+
+    close_fails.close.assert_called_once_with()
+
+    kill_fails_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(side_effect=RuntimeError("kill failed")),
+    )
+
+    manager._close_llm_proxy(SimpleNamespace(_process=kill_fails_process), terminate_process=True)
+
+    kill_fails_process.terminate.assert_called_once_with()
+    kill_fails_process.kill.assert_called_once_with()
+    kill_fails_process.wait.assert_called_once_with(timeout=1.0)
+
 def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
     first = _RestartableFakeWorker("first", fail="dead")
     replacement = _RestartableFakeWorker("replacement")

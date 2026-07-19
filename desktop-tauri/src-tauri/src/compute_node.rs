@@ -432,6 +432,13 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
         && !status.running
         && payload_session
             .is_some_and(|session| status.operator_session_id.as_deref() != Some(session));
+    if payload.get("type").and_then(Value::as_str) == Some("stopped") {
+        match (status.operator_session_id.as_deref(), payload_session) {
+            (Some(current_session), Some(payload_session))
+                if !payload_session.is_empty() && current_session == payload_session => {}
+            _ => return false,
+        }
+    }
     if let (Some(current_session), Some(payload_session)) =
         (status.operator_session_id.as_deref(), payload_session)
     {
@@ -1114,6 +1121,7 @@ pub async fn start_compute_node(
         status.stop_cleanup_warning = None;
     }
     *state.stopped_event_ack_session_id.lock().await = None;
+    state.stopped_event_ack_notify.notify_waiters();
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),
         Err(err) => {
@@ -1533,8 +1541,16 @@ async fn wait_for_stop_cleanup_ack(
             return false;
         }
         let notified = state.stopped_event_ack_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let ack = state.stopped_event_ack_session_id.lock().await;
+            if ack.as_deref() == Some(expected_session_id) {
+                return true;
+            }
+        }
         tokio::select! {
-            _ = notified => {},
+            _ = &mut notified => {},
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return false,
         }
     }
@@ -1586,15 +1602,19 @@ async fn stop_compute_node_with_shutdown_timeout(
         let _ = stdin.flush().await;
     }
 
+    let child_handoff_deadline = std::cmp::min(
+        parent_shutdown_deadline,
+        Instant::now() + Duration::from_millis(500),
+    );
     let mut owned_child = None;
-    while Instant::now() < parent_shutdown_deadline {
+    while Instant::now() < child_handoff_deadline {
         if let Some(child) = state.child.lock().await.take() {
             owned_child = Some(child);
             break;
         }
         tokio::time::sleep(std::cmp::min(
             Duration::from_millis(25),
-            parent_shutdown_deadline.saturating_duration_since(Instant::now()),
+            child_handoff_deadline.saturating_duration_since(Instant::now()),
         ))
         .await;
     }
@@ -2829,7 +2849,7 @@ mod tests {
             r#"{"type":"stopped","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":2}"#,
         )
         .expect("missing-session stopped payload");
-        assert!(apply_compute_node_event_to_state(&state, &missing_session_stopped).await);
+        assert!(!apply_compute_node_event_to_state(&state, &missing_session_stopped).await);
         assert!(state.stopped_event_ack_session_id.lock().await.is_none());
 
         let stale_session_stopped = parse_compute_node_event_line(
@@ -2902,7 +2922,7 @@ mod tests {
 
         let updated = update_status_from_event(&mut status, &stale_payload);
         assert!(!updated);
-        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("complete"));
         assert_eq!(status.stop_cleanup_warning, None);
     }
 

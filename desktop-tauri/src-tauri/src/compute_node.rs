@@ -186,7 +186,9 @@ fn configure_runtime_pythonpath(
             manifest_dir,
             None,
         );
-        let packaged = layout != crate::python_runtime::ResourceLayoutKind::DevSourceTree;
+        let current_exe = std::env::current_exe().ok();
+        let packaged =
+            crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
         configure_python_subprocess_env_for_layout(command, import_root, layout, packaged);
     }
     import_root
@@ -1092,14 +1094,16 @@ pub async fn start_compute_node(
         let resource_dir = app.path().resource_dir().ok();
         let current_exe = std::env::current_exe().ok();
         match tokio::task::spawn_blocking(move || {
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
             resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
                 override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
                 tauri_resource_dir: resource_dir.as_deref(),
                 current_exe_path: current_exe.as_deref(),
-                manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
-                packaged: resource_dir
-                    .as_deref()
-                    .is_some_and(|dir| !dir.ends_with("src-tauri")),
+                manifest_dir,
+                packaged: crate::python_runtime::is_packaged_execution(
+                    current_exe.as_deref(),
+                    manifest_dir,
+                ),
             })
         })
         .await

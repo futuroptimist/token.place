@@ -94,7 +94,7 @@ fn configure_runtime_pythonpath_for(
             manifest_dir,
             None,
         );
-        let packaged = layout != python_runtime::ResourceLayoutKind::DevSourceTree;
+        let packaged = python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
         python_runtime::configure_python_subprocess_env_for_layout(
             command,
             import_root,
@@ -184,7 +184,7 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
             tauri_resource_dir: app.path().resource_dir().ok().as_deref(),
             current_exe_path: exe_path.as_deref(),
             manifest_dir,
-            packaged: !cfg!(debug_assertions),
+            packaged: python_runtime::is_packaged_execution(exe_path.as_deref(), manifest_dir),
         },
     )
     .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;

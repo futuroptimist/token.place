@@ -516,6 +516,49 @@ pub struct PythonLauncherResolutionOptions<'a> {
     pub packaged: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonExecutionLayout {
+    Packaged,
+    UnbundledDevelopment,
+}
+
+fn path_is_beneath(path: &Path, ancestor: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(ancestor) = ancestor.canonicalize() else {
+        return false;
+    };
+    path.starts_with(ancestor)
+}
+
+pub fn classify_python_execution_layout(
+    current_exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> PythonExecutionLayout {
+    let Some(exe_path) = current_exe_path else {
+        return PythonExecutionLayout::Packaged;
+    };
+    let source_marker = manifest_dir.join("python").join("desktop_runtime_setup.py");
+    if source_marker.is_file() && path_is_beneath(exe_path, &manifest_dir.join("target")) {
+        PythonExecutionLayout::UnbundledDevelopment
+    } else {
+        PythonExecutionLayout::Packaged
+    }
+}
+
+pub fn is_unbundled_development_execution(
+    current_exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> bool {
+    classify_python_execution_layout(current_exe_path, manifest_dir)
+        == PythonExecutionLayout::UnbundledDevelopment
+}
+
+pub fn is_packaged_execution(current_exe_path: Option<&Path>, manifest_dir: &Path) -> bool {
+    !is_unbundled_development_execution(current_exe_path, manifest_dir)
+}
+
 fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Option<PythonLauncher> {
     let root = if let Some(resource_dir) = opts.tauri_resource_dir {
         Some(resource_dir.to_path_buf())
@@ -541,23 +584,16 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
 }
 
 fn has_confirmed_unbundled_dev_source_tree(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
-    if opts.packaged {
+    if opts.packaged
+        || classify_python_execution_layout(opts.current_exe_path, opts.manifest_dir)
+            != PythonExecutionLayout::UnbundledDevelopment
+    {
         return false;
     }
-    resource_root_candidates(
-        opts.current_exe_path,
-        opts.manifest_dir,
-        opts.tauri_resource_dir,
-    )
-    .into_iter()
-    .any(|c| {
-        c.layout == ResourceLayoutKind::DevSourceTree
-            && c.root.join("python").is_dir()
-            && c.root
-                .join("python")
-                .join("desktop_runtime_setup.py")
-                .is_file()
-    })
+    opts.manifest_dir
+        .join("python")
+        .join("desktop_runtime_setup.py")
+        .is_file()
 }
 
 fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
@@ -1531,6 +1567,97 @@ mod tests {
         let (_root, layout) = describe_resource_layout(&script, Some(&exe), &manifest_dir, None);
 
         assert_eq!(layout, ResourceLayoutKind::LinuxResources);
+    }
+
+    #[test]
+    fn debug_no_bundle_executable_under_target_is_unbundled_development() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+
+        assert_eq!(
+            classify_python_execution_layout(Some(&exe), &manifest),
+            PythonExecutionLayout::UnbundledDevelopment
+        );
+        assert!(!is_packaged_execution(Some(&exe), &manifest));
+    }
+
+    #[test]
+    fn installed_executable_python_sibling_shape_remains_packaged() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("repo/desktop-tauri/src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = temp.path().join("installed/app/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+
+        assert_eq!(
+            classify_python_execution_layout(Some(&exe), &manifest),
+            PythonExecutionLayout::Packaged
+        );
+        assert!(is_packaged_execution(Some(&exe), &manifest));
+    }
+
+    #[test]
+    fn tauri_resource_dir_equal_to_manifest_dir_does_not_hide_dev_source_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let opts = PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&manifest),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: false,
+        };
+
+        assert!(has_confirmed_unbundled_dev_source_tree(&opts));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn confirmed_development_selects_explicit_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let override_python = temp.path().join("python-ok");
+        std::fs::write(&override_python, "#!/bin/sh\nprintf 'Python 3.11.13\\n'\n").unwrap();
+        let mut perms = std::fs::metadata(&override_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&override_python, perms).unwrap();
+        let var = "TOKEN_PLACE_TEST_CONFIRMED_DEV_PYTHON";
+        std::env::set_var(var, &override_python);
+
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: var,
+            tauri_resource_dir: Some(&manifest),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: false,
+        })
+        .expect("dev override selected");
+        std::env::remove_var(var);
+
+        assert_eq!(launcher.source, PythonLauncherSource::EnvironmentOverride);
+        assert_eq!(Path::new(&launcher.program), override_python.as_path());
     }
 
     #[test]

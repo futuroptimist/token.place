@@ -4313,6 +4313,62 @@ def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_failure(
     assert 'desktop.compute_node_bridge.unregister.failed' in output.err
     assert 'reason=missing_unregister_hook' in output.err
 
+class LatchFailureRelayClient(MultiRelayShutdownRelayClient):
+    def __init__(self, relay_url):
+        super().__init__(relay_url, unregister_result=True, unregister_delay=0.0)
+        self._api_v1_registered_relays = {relay_url}
+        self.latch_calls = 0
+
+    def _api_v1_latch_shutdown(self):
+        self.latch_calls += 1
+        raise RuntimeError('latch failed with https://secret.example?token=abc')
+
+
+class LatchFailureRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = LatchFailureRelayClient(config.relay_url)
+        LatchFailureRuntime.instances.append(self)
+
+
+def test_run_reports_partial_cleanup_when_shutdown_latch_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    LatchFailureRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LatchFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example/path?token=secret',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    runtime = LatchFailureRuntime.instances[0]
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is False
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'desktop.compute_node_bridge.relay.latch_failed' in output.err
+    assert 'token=secret' not in output.err
+    assert 'secret.example' not in output.err
+
+
 class QuiesceFailureRelayClient(MultiRelayShutdownRelayClient):
     def __init__(self, relay_url, *, fail_wait=False, fail_heartbeat=False):
         super().__init__(relay_url, unregister_result=True, unregister_delay=0.0)

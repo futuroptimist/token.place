@@ -1480,11 +1480,14 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 
     if let Some(mut child) = owned_child {
         let mut exited = child.try_wait()?.is_some();
-        for _ in 0..20 {
+        let shutdown_deadline = Duration::from_secs(12);
+        let poll_interval = Duration::from_millis(100);
+        let max_attempts = (shutdown_deadline.as_millis() / poll_interval.as_millis()) as usize;
+        for _ in 0..max_attempts {
             if exited {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(poll_interval).await;
             exited = child.try_wait()?.is_some();
         }
 

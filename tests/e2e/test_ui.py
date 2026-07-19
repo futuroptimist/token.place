@@ -583,6 +583,41 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
     assert "Updated" in status.inner_text()
 
 
+
+def test_compute_node_count_auto_polls_within_two_seconds(page: Page, base_url: str, setup_servers):
+    """Landing page should automatically refresh diagnostics without a manual method call."""
+    calls = {"count": 0}
+
+    def handle_diagnostics(route):
+        calls["count"] += 1
+        count = 1 if calls["count"] == 1 else 0
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": count,
+                    "total_api_v1_registered_compute_nodes": count,
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url)
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
+
+    deadline = time.monotonic() + 2.0
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+    )
+    assert calls["count"] >= 2
+    assert "Live compute nodes: 0" in status.inner_text()
+
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
     """Older diagnostics responses should not overwrite newer compute-node counts."""
     first_route = {}

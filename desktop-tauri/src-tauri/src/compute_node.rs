@@ -6,7 +6,7 @@ use crate::operator_logs::{
     sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
-    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
+    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
@@ -180,7 +180,18 @@ fn configure_runtime_pythonpath(
     disable_python_user_site(command);
     let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        configure_python_subprocess_env(command, import_root);
+        let (_, layout) = describe_resource_layout(
+            Path::new(bridge_script),
+            std::env::current_exe().ok().as_deref(),
+            manifest_dir,
+            None,
+        );
+        configure_python_subprocess_env_for_layout(
+            command,
+            import_root,
+            layout,
+            !cfg!(debug_assertions),
+        );
     }
     import_root
 }

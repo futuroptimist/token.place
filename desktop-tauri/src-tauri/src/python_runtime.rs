@@ -280,6 +280,8 @@ fn bundled_windows_manifest() -> Option<serde_json::Value> {
     .ok()
 }
 
+// Rust validates bundled Windows provenance before launching the interpreter,
+// closing the pre-launch trust boundary without relying on mutable mtimes/sizes.
 fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
     let path = runtime_root.join("embedded_python_runtime_provenance.json");
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -992,12 +994,16 @@ fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
             .exists()
 }
 
-pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
-where
+pub fn configure_python_subprocess_env_for_layout<C>(
+    command: &mut C,
+    import_root: &Path,
+    layout: ResourceLayoutKind,
+    packaged: bool,
+) where
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    if !import_root_is_confirmed_unbundled_development(import_root) {
+    if packaged || layout != ResourceLayoutKind::DevSourceTree {
         sanitize_packaged_python_subprocess_env(command);
     }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
@@ -1009,6 +1015,18 @@ where
         import_root.as_os_str().to_owned()
     };
     command.set_env("PYTHONPATH", pythonpath);
+}
+
+pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+where
+    C: PythonEnvCommand,
+{
+    let layout = if import_root_is_confirmed_unbundled_development(import_root) {
+        ResourceLayoutKind::DevSourceTree
+    } else {
+        ResourceLayoutKind::TauriResourceDir
+    };
+    configure_python_subprocess_env_for_layout(command, import_root, layout, false);
 }
 
 pub trait PythonEnvCommand {
@@ -1627,6 +1645,39 @@ mod tests {
             removed,
             "packaged runtime must strip development repair opt-in"
         );
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_for_layout_sanitizes_packaged_even_with_dev_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("Resources");
+        std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        std::fs::write(
+            root.join("python").join("desktop_runtime_setup.py"),
+            "# stale packaged copy",
+        )
+        .expect("write marker");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+        command.env("FORCE_CMAKE", "1");
+
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &root,
+            ResourceLayoutKind::WindowsResources,
+            true,
+        );
+
+        let removed_keys: std::collections::BTreeSet<_> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value
+                    .is_none()
+                    .then_some(key.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(removed_keys.contains("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"));
+        assert!(removed_keys.contains("FORCE_CMAKE"));
     }
 
     #[test]

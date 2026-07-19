@@ -1320,6 +1320,8 @@ def _bundled_runtime_manifest() -> dict:
 
 
 def _bundled_runtime_provenance_valid() -> bool:
+    # Python revalidates provenance for direct/standalone entry, closing the
+    # post-launch mutation/TOCTOU boundary without trusting mtime/size caches.
     exe = _safe_resolve_path(sys.executable)
     provenance_path = exe.parent / "embedded_python_runtime_provenance.json"
     try:

@@ -54,7 +54,7 @@ def _validate_redirect_url(original: urllib.parse.SplitResult, final_url: str) -
 WINDOWS_SYSTEM_DLLS = {
     "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cabinet.dll", "comctl32.dll",
     "comdlg32.dll", "crypt32.dll", "gdi32.dll", "imm32.dll", "iphlpapi.dll",
-    "kernel32.dll", "msi.dll", "msvcrt.dll", "netapi32.dll", "ntdll.dll",
+    "kernel32.dll", "msi.dll", "winmm.dll", "msvcrt.dll", "netapi32.dll", "ntdll.dll",
     "ole32.dll", "oleaut32.dll", "pdh.dll", "powrprof.dll", "psapi.dll", "rpcrt4.dll",
     "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
     "userenv.dll", "version.dll", "ws2_32.dll",

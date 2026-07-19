@@ -665,7 +665,7 @@ def test_validate_runtime_payload_resolves_recursive_pe_imports(tmp_path):
 def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bundle(tmp_path):
     runtime = tmp_path / 'python-runtime'
     runtime.mkdir()
-    write_minimal_pe(runtime / 'python.exe', imports=['api-ms-win-core-path-l1-1-0.dll', 'netapi32.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll'])
+    write_minimal_pe(runtime / 'python.exe', imports=['api-ms-win-core-path-l1-1-0.dll', 'netapi32.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll', 'winmm.dll'])
     write_minimal_pe(runtime / 'python311.dll')
 
     closure = prep.validate_runtime_payload(runtime, {
@@ -674,7 +674,7 @@ def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bu
     })
     assert {entry['name'] for entry in closure} >= {'python.exe', 'python311.dll'}
 
-    for dll in ('bcryptprimitives.dll', 'cabinet.dll', 'comctl32.dll', 'comdlg32.dll', 'imm32.dll', 'iphlpapi.dll', 'msi.dll', 'netapi32.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll'):
+    for dll in ('bcryptprimitives.dll', 'cabinet.dll', 'comctl32.dll', 'comdlg32.dll', 'imm32.dll', 'iphlpapi.dll', 'msi.dll', 'netapi32.dll', 'winmm.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll'):
         assert prep.is_windows_system_dll(dll)
     assert prep.is_windows_system_dll('nvcuda.dll')
     for dll in ('cudart64_12.dll', 'cublas64_12.dll', 'libssl-3-x64.dll', 'vcruntime140.dll'):

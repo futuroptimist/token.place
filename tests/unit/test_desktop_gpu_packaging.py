@@ -13,6 +13,7 @@ from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
     LLAMA_CPP_CPU_WHEEL_INDEX_URL,
     LLAMA_CPP_METAL_WHEEL_INDEX_URL,
+    LLAMA_CPP_CUDA124_WHEEL_INDEX_URL,
     backend_probe_satisfies_install_plan,
     llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
@@ -20,25 +21,21 @@ from desktop_gpu_packaging import (
 )
 
 
-def test_windows_install_plan_requests_cuda_then_cpu_fallback():
+def test_windows_install_plan_requests_cuda_cu124_wheel_only_without_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 2
+    assert len(plans) == 1
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
-    assert gpu_plan.package_spec.startswith("llama-cpp-python==")
+    assert gpu_plan.package_spec == "llama-cpp-python==0.3.32"
     assert gpu_plan.index_url == "https://pypi.org/simple"
-    assert gpu_plan.only_binary is False
-    assert gpu_plan.no_binary is True
-    assert gpu_plan.pip_env() == {"CMAKE_ARGS": "-DGGML_CUDA=on", "FORCE_CMAKE": "1"}
-
-    cpu_fallback = plans[1]
-    assert cpu_fallback.backend == "cpu"
-    assert cpu_fallback.package_spec == "llama-cpp-python"
-    assert cpu_fallback.index_url == "https://pypi.org/simple"
-    assert cpu_fallback.extra_index_url == LLAMA_CPP_CPU_WHEEL_INDEX_URL
-    assert cpu_fallback.only_binary is True
-    assert cpu_fallback.no_binary is False
+    assert gpu_plan.extra_index_url == LLAMA_CPP_CUDA124_WHEEL_INDEX_URL
+    assert gpu_plan.only_binary is True
+    assert gpu_plan.no_binary is False
+    assert gpu_plan.pip_env() == {}
+    args = gpu_plan.pip_install_args()
+    assert "--no-binary" not in args
+    assert "--only-binary" in args
 
 
 def test_macos_install_plan_requests_metal_then_cpu_fallback():
@@ -166,17 +163,17 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
     assert plan.backend == "cpu"
 
 
-def test_windows_cpu_fallback_install_args_only_accept_wheels():
+def test_windows_cuda_install_args_only_accept_cu124_wheels():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    cpu_fallback = plans[1]
+    cuda_plan = plans[0]
 
-    assert cpu_fallback.pip_install_args() == [
+    assert cuda_plan.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
         "--extra-index-url",
-        LLAMA_CPP_CPU_WHEEL_INDEX_URL,
+        LLAMA_CPP_CUDA124_WHEEL_INDEX_URL,
         "--only-binary",
         "llama-cpp-python",
         "--prefer-binary",
@@ -234,8 +231,9 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
 
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
-    assert plan.only_binary is False
-    assert plan.no_binary is True
+    assert plan.only_binary is True
+    assert plan.no_binary is False
+    assert plan.extra_index_url == LLAMA_CPP_CUDA124_WHEEL_INDEX_URL
 
 
 def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
@@ -328,3 +326,16 @@ def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
     probe = SimpleNamespace(backend="missing", llama_module_path="missing", error="import failed")
 
     assert backend_probe_satisfies_install_plan(plan, probe) is False
+
+
+def test_windows_release_plan_never_emits_source_build_markers():
+    plan = llama_cpp_install_plan(platform="win32", requirements_path=ROOT / "requirements.txt")
+    args = plan.pip_install_args()
+    env = plan.pip_env()
+
+    assert plan.backend == "cuda"
+    assert plan.only_binary is True
+    assert plan.no_binary is False
+    assert "--no-binary" not in args
+    assert "FORCE_CMAKE" not in env
+    assert "CMAKE_ARGS" not in env

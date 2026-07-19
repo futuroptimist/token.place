@@ -5,7 +5,11 @@ use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = "python-runtime/bin/python3";
+pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = if cfg!(target_os = "windows") {
+    "python-runtime/python.exe"
+} else {
+    "python-runtime/bin/python3"
+};
 pub const DESKTOP_PYTHON_RUNTIME_MISSING: &str = "desktop_python_runtime_missing";
 pub const DESKTOP_PYTHON_RUNTIME_INVALID: &str = "desktop_python_runtime_invalid";
 pub const DESKTOP_PYTHON_OVERRIDE_INVALID: &str = "desktop_python_override_invalid";
@@ -116,7 +120,7 @@ pub struct PythonLauncherError {
 
 impl std::fmt::Display for PythonLauncherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=arm64 packaged={}{}",
+        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=target packaged={}{}",
             self.public_code, self.category.as_str(), self.source, self.executable_basename, self.packaged,
             self.exit_status.map(|s| format!(" exit_status={s}")).unwrap_or_default())
     }
@@ -217,13 +221,17 @@ fn json_string_field<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
 fn metadata_probe_is_valid(
     stdout: &str,
     runtime_root: &Path,
-    expected_machine: &str,
+    expected_machines: &[&str],
 ) -> Result<(), PythonLauncherCategory> {
     let payload = stdout.trim();
     if !(payload.contains("\"version\"") && payload.contains("[3, 11]")) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
-    if json_string_field(payload, "machine") != Some(expected_machine) {
+    let machine = json_string_field(payload, "machine").unwrap_or("");
+    if !expected_machines
+        .iter()
+        .any(|expected| machine.eq_ignore_ascii_case(expected))
+    {
         return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
     }
     let runtime_root = runtime_root
@@ -393,25 +401,38 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .into_iter()
             .find(|c| {
                 c.layout == ResourceLayoutKind::MacOsAppResources
+                    || c.layout == ResourceLayoutKind::WindowsResources
                     || c.layout == ResourceLayoutKind::DevSourceTree
             })
             .map(|c| c.root)
     }?;
+    let runtime_id = if cfg!(target_os = "windows") {
+        "bundled-cpython-3.11-win-amd64-cu124"
+    } else {
+        "bundled-cpython-3.11-arm64"
+    };
     Some(PythonLauncher::new(
         root.join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
             .to_string_lossy()
             .to_string(),
         vec![],
         PythonLauncherSource::BundledRuntime,
-        "bundled-cpython-3.11-arm64",
+        runtime_id,
     ))
 }
 
 fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
-    Path::new(&candidate.program)
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
+    let path = Path::new(&candidate.program);
+    if cfg!(target_os = "windows")
+        || path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.eq_ignore_ascii_case("python.exe"))
+            .unwrap_or(false)
+    {
+        return path.parent().map(Path::to_path_buf);
+    }
+    path.parent().and_then(Path::parent).map(Path::to_path_buf)
 }
 
 pub fn resolve_python_launcher_resource_aware(
@@ -437,7 +458,14 @@ pub fn resolve_python_launcher_resource_aware(
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_macos {
+    let is_windows = cfg!(target_os = "windows")
+        || opts
+            .current_exe_path
+            .and_then(|p| p.extension())
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false);
+    if is_macos || is_windows {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -489,17 +517,25 @@ pub fn resolve_python_launcher_resource_aware(
                                     output_status_code(&output),
                                 )
                             })?;
-                        metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
-                            .map(|_| candidate.clone())
-                            .map_err(|category| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    category,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })
+                        metadata_probe_is_valid(
+                            &stdout,
+                            &runtime_root,
+                            if is_windows {
+                                &["AMD64", "x86_64"]
+                            } else {
+                                &["arm64", "aarch64"]
+                            },
+                        )
+                        .map(|_| candidate.clone())
+                        .map_err(|category| {
+                            launcher_error(
+                                DESKTOP_PYTHON_RUNTIME_INVALID,
+                                category,
+                                Some(&candidate),
+                                opts.packaged,
+                                output_status_code(&output),
+                            )
+                        })
                     }
                     Err(_) => Err(launcher_error(
                         if opts.packaged {
@@ -1365,6 +1401,24 @@ mod tests {
         .expect("bundled runtime");
         assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
         assert_eq!(Path::new(&launcher.program), py.as_path());
+    }
+
+    #[test]
+    fn packaged_windows_layout_fails_closed_without_system_python_fallback() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("App").join("token.place.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        let err = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: None,
+            current_exe_path: Some(&exe),
+            manifest_dir: temp.path(),
+            packaged: true,
+        })
+        .expect_err("packaged Windows must not fall back to py/python");
+        assert_eq!(err.public_code, DESKTOP_PYTHON_RUNTIME_MISSING);
+        assert_eq!(err.source, PythonLauncherSource::BundledRuntime);
+        assert_ne!(err.executable_basename, "py");
     }
 
     #[test]

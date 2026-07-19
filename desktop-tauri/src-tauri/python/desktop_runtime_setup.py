@@ -239,6 +239,7 @@ INSTALL_LOG_TAIL_MAX_CHARS = 2000
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
+ENABLE_DEVELOPMENT_SOURCE_BUILD_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_DEVELOPMENT_SOURCE_BUILD"
 RUNTIME_PROBE_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON"
 PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
 PROBE_RESULT_MAX_BYTES = 1024 * 1024
@@ -1430,15 +1431,27 @@ def _runtime_bootstrap_policy() -> RuntimeBootstrapPolicy:
     )
 
 
+def _is_bundled_packaged_runtime() -> bool:
+    executable = _safe_resolve_path(sys.executable)
+    parts = {part.lower() for part in executable.parts}
+    return "python-runtime" in parts
+
+
 def _bootstrap_disabled_reason() -> Optional[str]:
     if os.getenv(DISABLE_BOOTSTRAP_ENV) == "1":
         return f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1"
+    if _is_bundled_packaged_runtime():
+        return "packaged bundled runtime is immutable; installer/source repair disabled"
     if os.getenv(ENABLE_BOOTSTRAP_ENV) != "1":
         return (
             "desktop runtime bootstrap skipped during normal startup; set "
             f"{ENABLE_BOOTSTRAP_ENV}=1 to allow runtime repair/install"
         )
     return None
+
+
+def _development_source_build_enabled() -> bool:
+    return (not _is_bundled_packaged_runtime()) and os.getenv(ENABLE_DEVELOPMENT_SOURCE_BUILD_ENV) == "1"
 
 
 def _installed_reexec_action(backend: str) -> str:
@@ -1676,7 +1689,14 @@ def _ensure_desktop_llama_runtime_impl(
     attempted_cuda_source_build = False
     cuda_source_build_suppressed = False
     if expected_backend == "cuda":
-        should_repair, repair_skip_reason = _should_attempt_source_repair()
+        if _development_source_build_enabled():
+            should_repair, repair_skip_reason = _should_attempt_source_repair()
+        else:
+            should_repair, repair_skip_reason = (
+                False,
+                "CUDA source repair requires unbundled development layout and "
+                "TOKEN_PLACE_DESKTOP_ENABLE_DEVELOPMENT_SOURCE_BUILD=1",
+            )
         if should_repair:
             if dependency_target is None:
                 last_error = (

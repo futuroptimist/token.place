@@ -688,24 +688,23 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
 async fn apply_compute_node_event_to_state(state: &ComputeNodeState, payload: &Value) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str);
     let payload_session = event_session_id(payload).filter(|session| !session.is_empty());
-    let mut accepted_stopped_session = None;
+    let mut should_notify_ack = false;
     {
         let mut status = state.status.lock().await;
-        let active_session = status.operator_session_id.clone();
         let accepted = update_status_from_event(&mut status, payload);
-        if accepted
-            && event_type == Some("stopped")
-            && payload_session.is_some()
-            && active_session.as_deref() == payload_session
-        {
-            accepted_stopped_session = payload_session.map(ToOwned::to_owned);
-        }
         if !accepted {
             return false;
         }
+        if event_type == Some("stopped")
+            && payload_session.is_some()
+            && status.operator_session_id.as_deref() == payload_session
+        {
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            *ack = payload_session.map(ToOwned::to_owned);
+            should_notify_ack = true;
+        }
     }
-    if let Some(session_id) = accepted_stopped_session {
-        *state.stopped_event_ack_session_id.lock().await = Some(session_id);
+    if should_notify_ack {
         state.stopped_event_ack_notify.notify_waiters();
     }
     true
@@ -1109,6 +1108,7 @@ pub async fn start_compute_node(
     };
     {
         let mut status = state.status.lock().await;
+        let mut ack = state.stopped_event_ack_session_id.lock().await;
         status.operator_session_id = Some(session_id.clone());
         status.log_file_path = None;
         status.last_error = None;
@@ -1119,8 +1119,8 @@ pub async fn start_compute_node(
         status.stop_cleanup_success_count = None;
         status.stop_cleanup_failure_count = None;
         status.stop_cleanup_warning = None;
+        *ack = None;
     }
-    *state.stopped_event_ack_session_id.lock().await = None;
     state.stopped_event_ack_notify.notify_waiters();
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),
@@ -1530,12 +1530,6 @@ async fn wait_for_stop_cleanup_ack(
     deadline: Instant,
 ) -> bool {
     loop {
-        {
-            let ack = state.stopped_event_ack_session_id.lock().await;
-            if ack.as_deref() == Some(expected_session_id) {
-                return true;
-            }
-        }
         let now = Instant::now();
         if now >= deadline {
             return false;
@@ -1544,7 +1538,11 @@ async fn wait_for_stop_cleanup_ack(
         tokio::pin!(notified);
         notified.as_mut().enable();
         {
+            let status = state.status.lock().await;
             let ack = state.stopped_event_ack_session_id.lock().await;
+            if status.operator_session_id.as_deref() != Some(expected_session_id) {
+                return false;
+            }
             if ack.as_deref() == Some(expected_session_id) {
                 return true;
             }
@@ -2867,6 +2865,102 @@ mod tests {
         assert_eq!(
             state.stopped_event_ack_session_id.lock().await.as_deref(),
             Some("session-current")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_accepts_persisted_matching_ack() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            status.operator_session_id = Some("session-1".into());
+            *ack = Some("session-1".into());
+        }
+
+        assert!(
+            wait_for_stop_cleanup_ack(
+                &state,
+                "session-1",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_observes_matching_ack_published_while_waiting() {
+        let state = ComputeNodeState::default();
+        state.status.lock().await.operator_session_id = Some("session-1".into());
+
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_stop_cleanup_ack(
+                &waiter_state,
+                "session-1",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        {
+            let status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            assert_eq!(status.operator_session_id.as_deref(), Some("session-1"));
+            *ack = Some("session-1".into());
+        }
+        state.stopped_event_ack_notify.notify_waiters();
+
+        assert!(waiter.await.expect("waiter task"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_cleanup_ack_fails_promptly_when_session_replaced() {
+        let state = ComputeNodeState::default();
+        state.status.lock().await.operator_session_id = Some("session-1".into());
+
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_stop_cleanup_ack(
+                &waiter_state,
+                "session-1",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            status.operator_session_id = Some("session-2".into());
+            *ack = None;
+        }
+        state.stopped_event_ack_notify.notify_waiters();
+
+        let failed = tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("session replacement should wake waiter")
+            .expect("waiter task");
+        assert!(!failed);
+    }
+
+    #[tokio::test]
+    async fn stopped_event_ack_for_session_one_cannot_satisfy_session_two_waiter() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            let mut ack = state.stopped_event_ack_session_id.lock().await;
+            status.operator_session_id = Some("session-2".into());
+            *ack = Some("session-1".into());
+        }
+
+        assert!(
+            !wait_for_stop_cleanup_ack(
+                &state,
+                "session-2",
+                Instant::now() + Duration::from_millis(25),
+            )
+            .await
         );
     }
 

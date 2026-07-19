@@ -20,6 +20,7 @@ class RelayProcessingResult:
     runtime_healthy: bool = True
     recovery_attempted: bool = False
     recovery_succeeded: bool = False
+    submission_allowed: bool = True
 
     def __bool__(self) -> bool:
         """Compatibility: True means encrypted response/error submission succeeded."""
@@ -37,4 +38,5 @@ class RelayProcessingResult:
             runtime_healthy=runtime_healthy,
             recovery_attempted=False,
             recovery_succeeded=False,
+            submission_allowed=False,
         )

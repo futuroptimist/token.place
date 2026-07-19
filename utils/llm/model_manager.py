@@ -5766,7 +5766,7 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
         self._close_llm_proxy(failed_runtime)
 
-    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled') -> None:
+    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True) -> bool:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
         safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
         with self.llm_lock:
@@ -5779,7 +5779,13 @@ class ModelManager:
                 self._llm_generation += 1
                 self._llm_cancel_generation_event.set()
                 self._llm_cancel_generation_event = threading.Event()
-                return
+                if not recreate:
+                    return True
+                try:
+                    return self.get_llm_instance() is not None
+                except Exception:
+                    self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+                    return False
             self.last_worker_exit_code = self._worker_exit_code(llm)
             self.last_worker_error_code = safe_reason
             self.worker_state = 'recovering'
@@ -5790,11 +5796,14 @@ class ModelManager:
             self._llm_cancel_generation_event.set()
             self._llm_cancel_generation_event = threading.Event()
         self._close_llm_proxy(llm, terminate_process=True)
+        if not recreate:
+            return True
         # Eagerly validate a clean worker for the next request when possible.
         try:
-            self.get_llm_instance()
+            return self.get_llm_instance() is not None
         except Exception:
             self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+            return False
 
     def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> None:
         close = getattr(llm, 'close', None)
@@ -5813,7 +5822,7 @@ class ModelManager:
             if callable(poll) and poll() is not None:
                 return
         except Exception:
-            return
+            pass
         terminated = False
         terminate = getattr(process, 'terminate', None)
         if callable(terminate):

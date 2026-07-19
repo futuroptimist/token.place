@@ -1428,6 +1428,8 @@ pub async fn start_compute_node(
     Ok(())
 }
 
+const BRIDGE_CLEANUP_EXIT_GRACE: Duration = Duration::from_secs(8);
+
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     let (stop_session_id, stop_log_file_path) = {
         let status = state.status.lock().await;
@@ -1479,11 +1481,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     }
 
     if let Some(mut child) = owned_child {
+        let cleanup_deadline = tokio::time::Instant::now() + BRIDGE_CLEANUP_EXIT_GRACE;
         let mut exited = child.try_wait()?.is_some();
-        for _ in 0..20 {
-            if exited {
-                break;
-            }
+        while !exited && tokio::time::Instant::now() < cleanup_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             exited = child.try_wait()?.is_some();
         }

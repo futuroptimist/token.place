@@ -2182,6 +2182,7 @@ class RelayClient:
 
 
     @staticmethod
+    @staticmethod
     def _api_v1_valid_relative_seconds(value: Any) -> Optional[float]:
         if isinstance(value, bool):
             return None
@@ -2193,11 +2194,23 @@ class RelayClient:
             return None
         return seconds
 
+    @staticmethod
+    def _api_v1_initial_relative_seconds(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
+
     @classmethod
     def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
         candidates = [
-            cls._api_v1_valid_relative_seconds(request_payload.get('request_deadline_remaining_seconds')),
-            cls._api_v1_valid_relative_seconds(request_payload.get('request_ttl_seconds')),
+            cls._api_v1_initial_relative_seconds(request_payload.get('request_deadline_remaining_seconds')),
+            cls._api_v1_initial_relative_seconds(request_payload.get('request_ttl_seconds')),
         ]
         valid = [value for value in candidates if value is not None]
         # Legacy relays may omit deadline metadata; cap such requests at the
@@ -2266,16 +2279,21 @@ class RelayClient:
         response_payload = response.json()
         return response_payload if isinstance(response_payload, dict) else {'status': 'unavailable'}
 
-    def _terminate_current_llama_worker(self, reason: str) -> None:
+    def _terminate_current_llama_worker(self, reason: str, *, recreate: bool = True) -> bool:
         manager = getattr(self, 'model_manager', None)
         terminate = getattr(manager, 'terminate_active_worker_for_cancellation', None)
         if callable(terminate):
-            terminate(reason=reason)
-            return
+            try:
+                return bool(terminate(reason=reason, recreate=recreate))
+            except TypeError:
+                terminate(reason=reason)
+                return True
         llm = getattr(manager, 'llm', None)
         close = getattr(llm, 'close', None)
         if callable(close):
             close()
+            return True
+        return True
 
     def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
         try:
@@ -2288,7 +2306,7 @@ class RelayClient:
         except Exception:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
-    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any]) -> _ApiV1SupervisorOutcome:
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
         control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
@@ -2301,7 +2319,8 @@ class RelayClient:
                 recovery_succeeded=False,
                 submission_allowed=False,
             )
-        local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        if local_deadline is None:
+            local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2388,8 +2407,13 @@ class RelayClient:
             if terminal_status is not None:
                 recovery_succeeded = False
                 try:
-                    self._terminate_current_llama_worker(terminal_reason)
-                    recovery_succeeded = True
+                    try:
+                        recovery_succeeded = self._terminate_current_llama_worker(
+                            terminal_reason, recreate=terminal_status != 'operator_stop'
+                        )
+                    except TypeError:
+                        self._terminate_current_llama_worker(terminal_reason)
+                        recovery_succeeded = True
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
                 if terminal_status in {'cancelled', 'expired'}:
@@ -2404,13 +2428,21 @@ class RelayClient:
                 )
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
-        return _ApiV1SupervisorOutcome(response_envelope=future_result)
+        runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+        if not isinstance(runtime_health, dict):
+            runtime_health = {}
+        return _ApiV1SupervisorOutcome(
+            response_envelope=future_result,
+            runtime_healthy=bool(runtime_health.get("runtime_healthy", True)),
+            recovery_attempted=bool(runtime_health.get("recovery_attempted", False)),
+            recovery_succeeded=bool(runtime_health.get("recovery_succeeded", False)),
+            submission_allowed=True,
+        )
 
     def _run_api_v1_inference_with_control(self, api_v1_request_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Compatibility wrapper returning only the response envelope."""
 
         outcome = self._supervise_api_v1_inference(api_v1_request_payload)
-        self._last_api_v1_supervisor_outcome = outcome
         return outcome.response_envelope
 
     def _api_v1_response_relay_url(self) -> str:
@@ -4621,6 +4653,8 @@ class RelayClient:
 
     def process_client_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
         """Process a client request and return a typed, privacy-safe outcome."""
+        entry_monotonic = time.monotonic()
+        outer_api_v1_deadline = self._api_v1_initial_deadline_from_metadata(request_data, now=entry_monotonic)
         try:
             try:
                 _validate_with_fallback(request_data, MESSAGE_SCHEMA)
@@ -4652,13 +4686,10 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
-                for metadata_key in ('request_deadline_remaining_seconds', 'request_ttl_seconds'):
-                    if metadata_key in request_data:
-                        api_v1_request_payload[metadata_key] = request_data.get(metadata_key)
                 try:
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload)
+                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
                     response_envelope = supervisor_outcome.response_envelope
                     if response_envelope is None:
                         return RelayProcessingResult(
@@ -4668,14 +4699,14 @@ class RelayClient:
                             runtime_healthy=supervisor_outcome.runtime_healthy,
                             recovery_attempted=supervisor_outcome.recovery_attempted,
                             recovery_succeeded=supervisor_outcome.recovery_succeeded,
+                            submission_allowed=supervisor_outcome.submission_allowed,
                         )
                     api_v1_response = response_envelope.get("api_v1_response", {})
                     error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
                     safe_error_code = error.get("code") if isinstance(error, dict) else None
-                    runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
-                    runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
-                    recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
-                    recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
+                    runtime_healthy = supervisor_outcome.runtime_healthy
+                    recovery_attempted = supervisor_outcome.recovery_attempted
+                    recovery_succeeded = supervisor_outcome.recovery_succeeded
                     if safe_error_code not in {
                         "compute_node_internal_error",
                         "compute_node_process_failed",

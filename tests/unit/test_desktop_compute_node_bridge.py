@@ -4156,6 +4156,45 @@ def test_run_error_envelope_submission_is_not_success_marker(capsys, monkeypatch
     assert status_events[-1]['last_error'] == 'relay request failed: compute_node_internal_error'
 
 
+
+def test_run_suppresses_generic_error_when_submission_not_allowed(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+
+    class NoSubmitRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            NoSubmitRuntime.last_instance = self
+
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=False,
+                safe_error_code="completed_unavailable",
+                runtime_healthy=True,
+                recovery_attempted=True,
+                recovery_succeeded=True,
+                submission_allowed=False,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NoSubmitRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(NoSubmitRuntime.last_instance and NoSubmitRuntime.last_instance._processed),
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped' in output.err
+    assert len(NoSubmitRuntime.last_instance.relay_client.endpoint_calls) == 0
+
 def test_multi_relay_shared_dead_worker_uses_one_recovery_and_restores_registrations(capsys, monkeypatch):
     _reset_cancel_queue()
 

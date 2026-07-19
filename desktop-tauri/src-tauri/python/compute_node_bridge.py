@@ -75,6 +75,8 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 _stop_requested_latched = threading.Event()
+_active_relay_clients: Dict[int, Any] = {}
+_active_relay_clients_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -84,6 +86,36 @@ PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 
+
+
+def _signal_active_relay_clients() -> None:
+    with _active_relay_clients_lock:
+        clients = list(_active_relay_clients.values())
+    for relay_client in clients:
+        stop = getattr(relay_client, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception as exc:
+                print(
+                    "desktop.compute_node_bridge.active_relay_stop.failed "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+
+def _register_active_relay_clients(runtimes: List[Any]) -> None:
+    with _active_relay_clients_lock:
+        for relay_runtime in runtimes:
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            if relay_client is not None:
+                _active_relay_clients[id(relay_client)] = relay_client
+
+def _unregister_active_relay_clients(runtimes: List[Any]) -> None:
+    with _active_relay_clients_lock:
+        for relay_runtime in runtimes:
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            if relay_client is not None:
+                _active_relay_clients.pop(id(relay_client), None)
 
 def _drain_stale_stdin_cancel_messages() -> int:
     """Discard queued cancel controls before a fresh operator session starts."""
@@ -456,6 +488,13 @@ def _start_stdin_reader() -> None:
                 if line == "":
                     break
                 _stdin_lines.put(line)
+                try:
+                    payload = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "cancel":
+                    _stop_requested_latched.set()
+                    _signal_active_relay_clients()
 
         threading.Thread(target=_reader, daemon=True).start()
         _stdin_reader_started = True
@@ -479,6 +518,7 @@ def stop_requested() -> bool:
             continue
         if payload.get("type") == "cancel":
             _stop_requested_latched.set()
+            _signal_active_relay_clients()
             return True
 
 
@@ -1035,6 +1075,7 @@ def run(args: argparse.Namespace) -> int:
     emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
+    _register_active_relay_clients(runtimes)
     for relay_runtime in runtimes:
         start_relay_session = getattr(relay_runtime, "start_relay_session", None)
         if callable(start_relay_session):
@@ -2147,7 +2188,11 @@ def run(args: argparse.Namespace) -> int:
                             f"request_id={request_id} safe_error_code={safe_error_code or 'unknown'}",
                             file=sys.stderr,
                         )
-                    elif runtime_healthy:
+                    elif runtime_healthy and (
+                        getattr(process_result, "submission_allowed", True)
+                        if not isinstance(process_result, dict)
+                        else process_result.get("submission_allowed", True)
+                    ):
                         submit_api_v1_error_response(
                             relay_response,
                             code="compute_node_process_failed",

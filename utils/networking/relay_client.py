@@ -4457,6 +4457,21 @@ class RelayClient:
                         "compute_node_process_failed",
                     }:
                         runtime_healthy = True
+                    if getattr(self, "_api_v1_mutation_latched", False) or getattr(self, "_polling_stopped_by_request", False):
+                        log_info(
+                            "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
+                            api_v1_request_payload["request_id"],
+                            "tokenplace_api_v1_relay_e2ee",
+                            "/api/v1/relay/responses",
+                        )
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code="shutdown_requested",
+                            runtime_healthy=True,
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                        )
                     submitted = self._post_api_v1_response(
                         response_envelope,
                         client_pub_key_b64=client_pub_key_b64,

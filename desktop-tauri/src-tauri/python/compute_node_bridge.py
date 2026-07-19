@@ -2219,14 +2219,22 @@ def run(args: argparse.Namespace) -> int:
                             file=sys.stderr,
                         )
                     elif runtime_healthy:
-                        submit_api_v1_error_response(
-                            relay_response,
-                            code="compute_node_process_failed",
-                            message=last_error,
-                            active_relay_url=active_relay_url,
-                            request_id=request_id,
-                            relay_runtime=relay_runtime,
-                        )
+                        if stop_requested():
+                            print(
+                                "desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped "
+                                f"relay={_sanitize_relay_target(active_relay_url)} "
+                                f"request_id={request_id} reason=shutdown_latched",
+                                file=sys.stderr,
+                            )
+                        else:
+                            submit_api_v1_error_response(
+                                relay_response,
+                                code="compute_node_process_failed",
+                                message=last_error,
+                                active_relay_url=active_relay_url,
+                                request_id=request_id,
+                                relay_runtime=relay_runtime,
+                            )
                     else:
                         print(
                             "desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped "
@@ -2314,6 +2322,12 @@ def run(args: argparse.Namespace) -> int:
             while any(thread.is_alive() for thread in poll_threads):
                 for thread in poll_threads:
                     thread.join(timeout=0.05)
+                if stop_requested():
+                    for relay_runtime in runtimes:
+                        relay_client = getattr(relay_runtime, "relay_client", None)
+                        active_relay_url = getattr(relay_client, "relay_url", relay_url)
+                        request_poll_cancel(relay_runtime, active_relay_url)
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -2451,6 +2465,10 @@ def run(args: argparse.Namespace) -> int:
                     "it may remain listed until lease expiry."
                 )
                 last_error = last_error or stop_cleanup_warning
+        for thread in poll_threads:
+            if thread.is_alive():
+                thread.join(timeout=0.05)
+
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
             print(

@@ -7050,3 +7050,43 @@ def test_api_v1_shutdown_latch_waits_for_inflight_mutation_and_blocks_new_regist
     finally:
         release_request.set()
         worker.join(timeout=1.0)
+
+
+def test_process_client_request_does_not_submit_response_after_shutdown_latch():
+    manager = _AdmissionManager()
+    client = _api_v1_validation_client(manager)
+    client._api_v1_registered_relays.add(client.relay_url)
+    client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
+        request_id="req-shutdown-latched"
+    )
+    generation_entered = threading.Event()
+    release_generation = threading.Event()
+    original_generate = client._generate_api_v1_response_with_runtime_model
+
+    def blocked_generate(*args, **kwargs):
+        generation_entered.set()
+        assert release_generation.wait(timeout=2.0)
+        return original_generate(*args, **kwargs)
+
+    client._generate_api_v1_response_with_runtime_model = blocked_generate
+    client._post_api_v1_response = MagicMock(return_value=True)
+    result_holder = {}
+
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            "result", client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert generation_entered.wait(timeout=2.0)
+    client._api_v1_latch_shutdown()
+    release_generation.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    result = result_holder["result"]
+    assert result.submitted is False
+    assert result.runtime_healthy is True
+    assert result.safe_error_code == "shutdown_requested"
+    client._post_api_v1_response.assert_not_called()

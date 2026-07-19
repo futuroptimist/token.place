@@ -2905,8 +2905,9 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
         assert status == 0
         assert latch_started.is_set()
         assert "stop" not in events
-        assert events.index("poll-start") < events.index("latch") < events.index("poll-done")
-        assert events.index("poll-done") < events.index("heartbeat-joined")
+        assert events.index("poll-start") < events.index("latch")
+        assert events.index("latch") < events.index("heartbeat-joined")
+        assert events.index("latch") < events.index("poll-done")
     finally:
         release_poll.set()
     _ = capsys.readouterr()
@@ -5682,3 +5683,112 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     ]
     assert warming_status_events
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
+
+
+def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+    inference_entered = threading.Event()
+    release_inference = threading.Event()
+    unregister_called = threading.Event()
+    latch_called = threading.Event()
+    heartbeat_stopped = threading.Event()
+    submitted_after_latch = []
+
+    class BlockingRelayClient(FakeRelayClient):
+        def __init__(self):
+            self.relay_url = 'https://token.place'
+            self._api_v1_registered_relays = {self.relay_url}
+            self.unregister_calls = 0
+            self.latch_calls = 0
+
+        def _api_v1_latch_shutdown(self):
+            self.latch_calls += 1
+            latch_called.set()
+
+        def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline=None):
+            return True
+
+        def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline=None):
+            heartbeat_stopped.set()
+            return True
+
+        def unregister_from_relay(self, *, shutdown_deadline=None):
+            self.unregister_calls += 1
+            unregister_called.set()
+            self._api_v1_registered_relays.clear()
+            return True
+
+        def submit_api_v1_error_response(self, *args, **kwargs):
+            submitted_after_latch.append(('fallback', args, kwargs))
+            return True
+
+    class BlockingInferenceRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, config):
+            BlockingInferenceRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = BlockingRelayClient()
+            self._responses = [{
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-blocked-inference',
+                'client_public_key': 'client-key',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
+                'next_ping_in_x_seconds': 0,
+            }]
+            self._processed = []
+
+        def register_and_poll_once(self):
+            if self._responses:
+                return self._responses.pop(0)
+            time.sleep(0.01)
+            return {'next_ping_in_x_seconds': 0}
+
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            inference_entered.set()
+            release_inference.wait(timeout=5.0)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=False,
+                safe_error_code='compute_node_process_failed',
+                runtime_healthy=True,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingInferenceRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', '1.0')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    result_holder = {}
+    started = time.monotonic()
+    worker = threading.Thread(target=lambda: result_holder.setdefault('status', compute_node_bridge.run(args)))
+    worker.start()
+    try:
+        assert inference_entered.wait(timeout=2.0)
+        compute_node_bridge._stdin_lines.put('{"type":"cancel"}\n')
+        assert latch_called.wait(timeout=1.0)
+        assert heartbeat_stopped.wait(timeout=1.0)
+        assert unregister_called.wait(timeout=1.0)
+        worker.join(timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert not worker.is_alive()
+        assert elapsed < 2.0
+        assert result_holder['status'] == 0
+        runtime = BlockingInferenceRuntime.last_instance
+        assert runtime.relay_client.unregister_calls == 1
+        assert not submitted_after_latch
+        output = capsys.readouterr()
+        events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+        stopped = [event for event in events if event.get('type') == 'stopped'][-1]
+        assert stopped['unregister_outcome'] == 'complete'
+        assert stopped['unregister_attempted'] is True
+        assert stopped['unregister_success_count'] == 1
+        assert stopped['unregister_failure_count'] == 0
+    finally:
+        release_inference.set()
+        worker.join(timeout=2.0)

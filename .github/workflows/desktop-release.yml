@@ -483,19 +483,27 @@ jobs:
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
         run: |
           set -euo pipefail
-          nsis_path="$(find release-artifacts -maxdepth 1 -type f -name '*-setup.exe' | sort | head -n 1)"
-          msi_path="$(find release-artifacts -maxdepth 1 -type f -name '*.msi' | sort | head -n 1)"
-          if [ -z "${nsis_path}" ] || [ -z "${msi_path}" ]; then
-            echo "Expected staged Windows NSIS and MSI artifacts before validation." >&2
+          mapfile -t nsis_paths < <(find release-artifacts -maxdepth 1 -type f -name '*-setup.exe' | sort)
+          mapfile -t msi_paths < <(find release-artifacts -maxdepth 1 -type f -name '*.msi' | sort)
+          if [ "${#nsis_paths[@]}" -ne 1 ] || [ "${#msi_paths[@]}" -ne 1 ]; then
+            echo "Expected exactly one staged Windows NSIS and one MSI artifact before validation." >&2
+            printf 'NSIS count=%s MSI count=%s\n' "${#nsis_paths[@]}" "${#msi_paths[@]}" >&2
             exit 1
           fi
+          nsis_path="${nsis_paths[0]}"
+          msi_path="${msi_paths[0]}"
           validator_version_args=(--expected-version "0.1.2")
           tag_name="${INPUT_TAG_NAME:-}"
           if [ -z "${tag_name}" ] && [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ]; then
             tag_name="${GITHUB_REF#refs/tags/}"
           fi
-          if [[ "${tag_name}" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            validator_version_args=(--release-tag "${tag_name}")
+          if [ -n "${tag_name}" ]; then
+            if [[ "${tag_name}" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              validator_version_args=(--release-tag "${tag_name}")
+            elif [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ] || [ -n "${INPUT_TAG_NAME:-}" ]; then
+              echo "Unexpected desktop release tag '${tag_name}'; expected desktop-vX.Y.Z." >&2
+              exit 1
+            fi
           fi
           python ../scripts/validate_windows_desktop_release_artifacts.py \
             --windows-nsis "${nsis_path}" \

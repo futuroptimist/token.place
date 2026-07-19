@@ -706,16 +706,21 @@ pub fn resolve_python_launcher_resource_aware(
                 )),
             };
         }
-    }
-    resolve_python_launcher(opts.override_var_name).map_err(|_| {
-        launcher_error(
+        return Err(launcher_error(
             DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING,
             PythonLauncherCategory::SystemRuntimeMissing,
             None,
             false,
             None,
-        )
-    })
+        ));
+    }
+    Err(launcher_error(
+        DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING,
+        PythonLauncherCategory::SystemRuntimeMissing,
+        None,
+        false,
+        None,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,7 +881,17 @@ pub fn format_bridge_script_resolution_error(
     } else {
         root_candidates
             .iter()
-            .map(|candidate| format!("{:?}:{}", candidate.layout, candidate.root.display()))
+            .map(|candidate| {
+                format!(
+                    "{:?}:{}",
+                    candidate.layout,
+                    candidate
+                        .root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<root>")
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -885,7 +900,13 @@ pub fn format_bridge_script_resolution_error(
     } else {
         bridge_candidates
             .iter()
-            .map(|candidate| candidate.display().to_string())
+            .map(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<script>")
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -893,9 +914,11 @@ pub fn format_bridge_script_resolution_error(
         .first()
         .map(|candidate| format!("{:?}", candidate.layout))
         .unwrap_or_else(|| "<unknown>".into());
-    let interpreter = interpreter.unwrap_or("<unresolved>");
+    let interpreter = interpreter
+        .and_then(|p| Path::new(p).file_name().and_then(|s| s.to_str()))
+        .unwrap_or("<unresolved>");
     format!(
-        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_paths=[{attempted_bridge_paths}]"
+        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter_basename={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_basenames=[{attempted_bridge_paths}]"
     )
 }
 
@@ -1376,20 +1399,18 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn packaged_linux_retains_system_python_fallback() {
-        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+    fn packaged_linux_fails_closed_without_confirmed_bundled_runtime() {
+        let err = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
             override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
             tauri_resource_dir: None,
             current_exe_path: None,
             manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
             packaged: true,
         })
-        .expect("packaged Linux should probe installed system Python");
+        .expect_err("packaged Linux must not fall back to system Python");
 
-        assert_eq!(
-            launcher.source,
-            PythonLauncherSource::SystemDevelopmentRuntime
-        );
+        assert_eq!(err.public_code, DESKTOP_PYTHON_RUNTIME_MISSING);
+        assert_eq!(err.category, PythonLauncherCategory::BundledRuntimeMissing);
     }
 
     #[test]
@@ -1529,6 +1550,25 @@ mod tests {
         assert!(compute_candidates.iter().any(|candidate| {
             candidate.ends_with("Contents/Resources/python/compute_node_bridge.py")
         }));
+    }
+
+    #[test]
+    fn bridge_resolution_error_omits_raw_paths_and_interpreter() {
+        let root = PathBuf::from("/Users/alice/secret/project/resources");
+        let bridge = root.join("python").join("compute_node_bridge.py");
+        let message = format_bridge_script_resolution_error(
+            "compute_node_bridge.py",
+            &[ResourceRootCandidate {
+                root: root.clone(),
+                layout: ResourceLayoutKind::TauriResourceDir,
+            }],
+            &[bridge],
+            Some("/Users/alice/secret/python-runtime/python.exe"),
+        );
+        assert!(!message.contains("/Users/alice/secret"));
+        assert!(message.contains("interpreter_basename=python.exe"));
+        assert!(message.contains("TauriResourceDir:resources"));
+        assert!(message.contains("compute_node_bridge.py"));
     }
 
     #[test]

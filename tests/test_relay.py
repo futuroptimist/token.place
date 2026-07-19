@@ -4775,8 +4775,12 @@ def test_api_v1_stale_eviction_response_race_both_orderings(client):
         assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
         known_servers[server]['last_ping'] = datetime.now() - timedelta(seconds=120)
         known_servers[server]['last_ping_duration'] = 1
+        # Expire only the renewable accounting lease while preserving the
+        # authoritative request deadline.  The server itself is stale, so the
+        # eviction-first ordering must terminalize via unregister rather than
+        # preliminary deadline pruning.
         known_servers[server]['api_v1_in_flight_requests'][request_id]['expires_at'] = time.monotonic() - 1
-        known_servers[server]['api_v1_in_flight_requests'][request_id]['request_deadline_monotonic'] = time.monotonic() - 1
+        known_servers[server]['api_v1_in_flight_requests'][request_id]['request_deadline_monotonic'] = time.monotonic() + 60
         first_done = threading.Event()
         results = {}
         errors = []
@@ -4828,11 +4832,11 @@ def test_api_v1_stale_eviction_response_race_both_orderings(client):
             assert results['evicted'] == [server]
             assert results['response'] == 410
             assert retrieve.status_code == 410
-            assert retrieve.get_json()['error']['code'] == 'expired'
+            assert retrieve.get_json()['error']['code'] == 'cancelled'
             assert tombstone_key in relay_module.api_v1_control_tombstones
             owner = client.post('/api/v1/relay/servers/control', json=owner_payload | {'request_id': request_id})
             assert owner.status_code == 200
-            assert owner.get_json()['status'] == 'expired'
+            assert owner.get_json()['status'] == 'cancelled'
         assert client_key not in client_pending_request_ids
         assert client_key not in relay_module.client_pending_request_deadlines
         assert server not in client_inference_requests
@@ -4844,6 +4848,7 @@ def test_api_v1_control_expiry_and_stale_prune_single_terminal_winner(client, mo
     request_id = 'req-control-expiry-prune-race'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
     assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
+    monkeypatch.setattr(relay_module, '_evict_stale_servers', lambda: [])
     entry = known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'][request_id]
     entry['expires_at'] = time.monotonic() - 1
     entry['request_deadline_monotonic'] = time.monotonic() - 1
@@ -4963,32 +4968,62 @@ def test_api_v1_unregister_response_race_both_orderings(client):
         assert server not in known_servers
 
 
-def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client):
+def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client, monkeypatch):
     server = _server_key('deadlock-node')
     owner_payload = _api_v1_registered_control_payload(client, server)
     request_id = 'req-deadlock-regression'
     assert client.post('/api/v1/relay/requests', json=(_api_v1_request_payload(request_id) | {'server_public_key': server})).status_code == 200
     assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': server}).status_code == 200
-    barrier = threading.Barrier(3)
+
+    real_terminal_lock = relay_module.api_v1_terminal_transition_lock
+    first_holder_entered = threading.Event()
+    release_first_holder = threading.Event()
+    all_terminal_attempts_seen = threading.Event()
+    attempt_lock = threading.Lock()
+    terminal_attempts = 0
+
+    class DelegatingTerminalProbe:
+        def __enter__(self):
+            nonlocal terminal_attempts
+            with attempt_lock:
+                terminal_attempts += 1
+                attempt_number = terminal_attempts
+                if terminal_attempts >= 3:
+                    all_terminal_attempts_seen.set()
+            real_terminal_lock.__enter__()
+            if attempt_number == 1:
+                first_holder_entered.set()
+                assert all_terminal_attempts_seen.wait(timeout=5)
+                assert release_first_holder.wait(timeout=5)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return real_terminal_lock.__exit__(exc_type, exc, tb)
+
+    monkeypatch.setattr(relay_module, 'api_v1_terminal_transition_lock', DelegatingTerminalProbe())
+    start_barrier = threading.Barrier(3)
     errors = []
     results = {}
 
     def run_endpoint(name, path, payload):
         try:
             with app.test_client() as race_client:
-                barrier.wait(timeout=5)
+                start_barrier.wait(timeout=5)
                 response = race_client.post(path, json=payload)
                 results[name] = (response.status_code, response.get_json())
         except BaseException as exc:
             errors.append(exc)
 
     threads = [
-        threading.Thread(target=run_endpoint, args=('control', '/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
-        threading.Thread(target=run_endpoint, args=('response', '/api/v1/relay/responses', _api_v1_response_payload(request_id))),
-        threading.Thread(target=run_endpoint, args=('unregister', '/api/v1/relay/servers/unregister', owner_payload)),
+        threading.Thread(name='control-deadlock-probe', target=run_endpoint, args=('control', '/api/v1/relay/servers/control', owner_payload | {'request_id': request_id})),
+        threading.Thread(name='response-deadlock-probe', target=run_endpoint, args=('response', '/api/v1/relay/responses', _api_v1_response_payload(request_id))),
+        threading.Thread(name='unregister-deadlock-probe', target=run_endpoint, args=('unregister', '/api/v1/relay/servers/unregister', owner_payload)),
     ]
     for thread in threads:
         thread.start()
+    assert first_holder_entered.wait(timeout=5)
+    assert all_terminal_attempts_seen.wait(timeout=5)
+    release_first_holder.set()
     for thread in threads:
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
@@ -5001,14 +5036,15 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client):
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'request_id': request_id,
     })
+    tombstone_key = relay_module._control_tombstone_key(server, request_id)
     if results['response'][0] == 200:
         assert retrieve.status_code == 200
-        assert relay_module._control_tombstone_key(server, request_id) not in relay_module.api_v1_control_tombstones
+        assert tombstone_key not in relay_module.api_v1_control_tombstones
         assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
     else:
         assert retrieve.status_code == 410
         assert retrieve.get_json()['error']['code'] == 'cancelled'
-        assert relay_module._control_tombstone_key(server, request_id) in relay_module.api_v1_control_tombstones
+        assert tombstone_key in relay_module.api_v1_control_tombstones
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
     assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
     assert server not in client_inference_requests

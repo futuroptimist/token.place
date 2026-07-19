@@ -45,6 +45,17 @@ class _ApiV1ChatValidationResult(NamedTuple):
     total_content_utf8_bytes: int = 0
 
 
+class _ApiV1SupervisorOutcome(NamedTuple):
+    """Request-scoped, privacy-safe result from API v1 inference supervision."""
+
+    response_envelope: Optional[Dict[str, Any]]
+    terminal_code: Optional[str] = None
+    runtime_healthy: bool = True
+    recovery_attempted: bool = False
+    recovery_succeeded: bool = False
+    submission_allowed: bool = True
+
+
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     """Return True for request-scoped llama.cpp inference validation failures."""
 
@@ -2277,13 +2288,19 @@ class RelayClient:
         except Exception:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
-    def _run_api_v1_inference_with_control(self, api_v1_request_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any]) -> _ApiV1SupervisorOutcome:
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
         control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
         if control_available and not self._api_v1_control_credential_for_relay(relay_url):
-            self._terminate_current_llama_worker('missing_control_credential')
-            return None
+            return _ApiV1SupervisorOutcome(
+                response_envelope=None,
+                terminal_code='missing_control_credential',
+                runtime_healthy=True,
+                recovery_attempted=False,
+                recovery_succeeded=False,
+                submission_allowed=False,
+            )
         local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
@@ -2373,18 +2390,28 @@ class RelayClient:
                 try:
                     self._terminate_current_llama_worker(terminal_reason)
                     recovery_succeeded = True
-                finally:
-                    self._last_api_v1_runtime_health = {
-                        'runtime_healthy': terminal_status in {'completed', 'unavailable', 'completed/unavailable'},
-                        'recovery_attempted': True,
-                        'recovery_succeeded': recovery_succeeded,
-                    }
+                except Exception:
+                    log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
-                return None
+                return _ApiV1SupervisorOutcome(
+                    response_envelope=None,
+                    terminal_code=terminal_reason,
+                    runtime_healthy=terminal_status in {'completed', 'unavailable', 'completed/unavailable'},
+                    recovery_attempted=True,
+                    recovery_succeeded=recovery_succeeded,
+                    submission_allowed=False,
+                )
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
-        return future_result
+        return _ApiV1SupervisorOutcome(response_envelope=future_result)
+
+    def _run_api_v1_inference_with_control(self, api_v1_request_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper returning only the response envelope."""
+
+        outcome = self._supervise_api_v1_inference(api_v1_request_payload)
+        self._last_api_v1_supervisor_outcome = outcome
+        return outcome.response_envelope
 
     def _api_v1_response_relay_url(self) -> str:
         """Return the relay URL that supplied the current API v1 work item."""
@@ -4631,18 +4658,16 @@ class RelayClient:
                 try:
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    response_envelope = self._run_api_v1_inference_with_control(api_v1_request_payload)
+                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload)
+                    response_envelope = supervisor_outcome.response_envelope
                     if response_envelope is None:
-                        runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
-                        if not isinstance(runtime_health, dict):
-                            runtime_health = {}
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
-                            safe_error_code="api_v1_request_cancelled",
-                            runtime_healthy=bool(runtime_health.get("runtime_healthy", False)),
-                            recovery_attempted=bool(runtime_health.get("recovery_attempted", True)),
-                            recovery_succeeded=bool(runtime_health.get("recovery_succeeded", False)),
+                            safe_error_code=supervisor_outcome.terminal_code or "api_v1_request_cancelled",
+                            runtime_healthy=supervisor_outcome.runtime_healthy,
+                            recovery_attempted=supervisor_outcome.recovery_attempted,
+                            recovery_succeeded=supervisor_outcome.recovery_succeeded,
                         )
                     api_v1_response = response_envelope.get("api_v1_response", {})
                     error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None

@@ -7162,6 +7162,34 @@ def test_api_v1_control_403_fail_closed_stops_without_ack():
     assert stopped == ['owner_proof_failed']
 
 
+def test_api_v1_missing_control_credential_fails_closed_without_worker_termination():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    generate = MagicMock(return_value={'request_id': 'unexpected'})
+    terminate = MagicMock()
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = terminate
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-missing-credential',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.response_envelope is None
+    assert outcome.terminal_code == 'missing_control_credential'
+    assert outcome.runtime_healthy is True
+    assert outcome.recovery_attempted is False
+    assert outcome.submission_allowed is False
+    generate.assert_not_called()
+    terminate.assert_not_called()
+
+
 def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreates():
     from utils.llm.model_manager import ModelManager
 

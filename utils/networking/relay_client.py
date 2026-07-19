@@ -492,6 +492,13 @@ _API_V1_SENSITIVE_BODY_KEYS = {
     "relay_server_token",
     "server_registration_token",
     "registration_token",
+    "control_credential",
+    "controlcredential",
+    "control_cred",
+    "controlcred",
+    "relay_control_credential",
+    "relay_controlcredential",
+    "relaycontrolcredential",
     "token",
     "authorization",
     "private_key",
@@ -528,6 +535,7 @@ def _redact_sensitive_text(text: Any, *, secrets: Tuple[str, ...] = ()) -> str:
         (
             r"(?i)((?:private[_-]?key|public[_-]?key|server[_-]?public[_-]?key|"
             r"client[_-]?public[_-]?key|ciphertext|cipherkey|chat_history|iv|"
+            r"control[_-]?credential|controlcred|control[_-]?cred|"
             r"prompt|content)\s*[=:]\s*)([^\s,;}<]+)",
             r"\1[redacted]",
         ),
@@ -1020,6 +1028,8 @@ class RelayClient:
         self._last_api_v1_work_relay_url: Optional[str] = None
         self._api_v1_registered_relays: Set[str] = set()
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
+        self._api_v1_control_credentials_by_relay: Dict[str, str] = {}
+        self._api_v1_control_credentials_lock = threading.Lock()
         self._unregister_attempted = False
         self._unregister_complete = False
         self._api_v1_heartbeat_lock = threading.Lock()
@@ -1301,6 +1311,7 @@ class RelayClient:
         self._unregister_complete = False
         if clear_registration:
             self._api_v1_registered_relays.clear()
+            self._clear_api_v1_control_credentials()
             self._api_v1_last_heartbeat_at.clear()
             getattr(self, "_api_v1_relay_wait_hints", {}).clear()
 
@@ -1369,8 +1380,12 @@ class RelayClient:
 
         for candidate_url in target_urls:
             try:
+                payload = {'server_public_key': self.crypto_manager.public_key_b64}
+                control_credential = self._api_v1_control_credential_for_relay(candidate_url)
+                if isinstance(control_credential, str) and control_credential:
+                    payload['control_credential'] = control_credential
                 request_kwargs = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'json': payload,
                 }
                 headers = self._auth_headers()
                 if headers:
@@ -1398,6 +1413,7 @@ class RelayClient:
                     log_info("Unregistered compute node from relay {}", candidate_url)
                     unregistered_relays.add(candidate_url)
                     self._api_v1_registered_relays.discard(candidate_url)
+                    self._pop_api_v1_control_credential(candidate_url)
                     self._api_v1_last_heartbeat_at.pop(candidate_url, None)
                     relay_wait_hints.pop(candidate_url, None)
                     continue
@@ -1443,6 +1459,7 @@ class RelayClient:
         self._unregister_complete = True
         if len(unregistered_relays) == len(target_urls):
             self._api_v1_registered_relays.clear()
+            self._clear_api_v1_control_credentials()
             self._api_v1_last_heartbeat_at.clear()
             relay_wait_hints.clear()
         return True
@@ -1552,6 +1569,56 @@ class RelayClient:
             'next_ping_in_x_seconds': self._request_timeout,
         }
 
+
+    def _api_v1_control_credential_for_request_url(self, url: str) -> str:
+        """Return the credential for the exact relay target that produced a request URL."""
+
+        request_target = self._compose_relay_url(url, None)
+        best_match = ""
+        best_credential = ""
+        for relay_target, credential in self._api_v1_control_credentials_snapshot():
+            if not isinstance(relay_target, str) or not isinstance(credential, str) or not credential:
+                continue
+            candidate = self._compose_relay_url(relay_target, None)
+            if not candidate:
+                continue
+            if request_target == candidate or request_target.startswith(f"{candidate}/"):
+                if len(candidate) > len(best_match):
+                    best_match = candidate
+                    best_credential = credential
+        return best_credential
+
+    def _api_v1_control_credentials_snapshot(self) -> Tuple[Tuple[str, str], ...]:
+        """Return a locked snapshot of relay control credentials for safe iteration."""
+
+        with self._api_v1_control_credentials_lock:
+            return tuple(self._api_v1_control_credentials_by_relay.items())
+
+    def _api_v1_control_credential_for_relay(self, relay_url: str) -> str:
+        """Return the stored control credential for an exact relay target."""
+
+        with self._api_v1_control_credentials_lock:
+            credential = self._api_v1_control_credentials_by_relay.get(relay_url, "")
+        return credential if isinstance(credential, str) else ""
+
+    def _store_api_v1_control_credential(self, relay_url: str, credential: str) -> None:
+        """Store a relay control credential under the dedicated credential-map lock."""
+
+        with self._api_v1_control_credentials_lock:
+            self._api_v1_control_credentials_by_relay[relay_url] = credential
+
+    def _pop_api_v1_control_credential(self, relay_url: str) -> None:
+        """Remove a relay control credential under the dedicated credential-map lock."""
+
+        with self._api_v1_control_credentials_lock:
+            self._api_v1_control_credentials_by_relay.pop(relay_url, None)
+
+    def _clear_api_v1_control_credentials(self) -> None:
+        """Clear all relay control credentials under the dedicated credential-map lock."""
+
+        with self._api_v1_control_credentials_lock:
+            self._api_v1_control_credentials_by_relay.clear()
+
     def _api_v1_non_200_diagnostic(
         self,
         response: Any,
@@ -1568,6 +1635,7 @@ class RelayClient:
         secrets = (
             self._registration_token or "",
             getattr(self.crypto_manager, "public_key_b64", ""),
+            self._api_v1_control_credential_for_request_url(url),
         )
         body_snippet, parsed_json = _safe_api_v1_response_body_snippet(
             response,
@@ -1703,7 +1771,12 @@ class RelayClient:
                 token_sent=token_sent,
                 next_ping_in_x_seconds=self._request_timeout,
             )
-        return response.json()
+        payload = response.json()
+        if isinstance(payload, dict):
+            control_credential = payload.get('control_credential')
+            if isinstance(control_credential, str) and control_credential:
+                self._store_api_v1_control_credential(target_url, control_credential)
+        return payload
 
     @staticmethod
     def _api_v1_model_path_basename(model_path: Any) -> Optional[str]:

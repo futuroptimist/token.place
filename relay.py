@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -549,6 +551,23 @@ RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
     "tokenplace_relay_request_outcomes_total",
     lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=RELAY_METRICS_REGISTRY),
 )
+RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL = _collector(
+    "tokenplace_relay_compute_control_requests_total",
+    lambda: Counter(
+        "tokenplace_relay_compute_control_requests_total",
+        "Privacy-safe API v1 compute-control polls by bounded state.",
+        ["state"],
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = _collector(
+    "tokenplace_relay_compute_control_lease_renewals_total",
+    lambda: Counter(
+        "tokenplace_relay_compute_control_lease_renewals_total",
+        "Privacy-safe API v1 compute-control lease renewals.",
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
 BUILD_INFO = _collector(
     "tokenplace_build_info",
     lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
@@ -567,6 +586,8 @@ def _initialise_metric_labels() -> None:
         RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
     for reason in EVICTION_REASON_ENUM:
         COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
+    for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
+        RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
     RELAY_QUEUE_DEPTH.labels("relay").set(0)
     RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
     BUILD_INFO.labels(
@@ -616,6 +637,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_servers_register": "/api/v1/relay/servers/register",
         "api_v1_relay_servers_unregister": "/api/v1/relay/servers/unregister",
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
+        "api_v1_relay_servers_control": "/api/v1/relay/servers/control",
         "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
         "healthz": "/healthz",
         "livez": "/livez",
@@ -670,6 +692,23 @@ def _record_request_terminal_outcome_once(
         recorded_ids[request_id] = expires_at
     _record_terminal_outcome(outcome)
     return True
+
+
+def _has_request_terminal_outcome(client_public_key: str | None, request_id: str | None) -> bool:
+    if not client_public_key or not request_id:
+        return False
+    with client_terminal_outcomes_lock:
+        recorded_ids = client_terminal_outcomes.get(client_public_key)
+        if not isinstance(recorded_ids, dict):
+            return False
+        expires_at = recorded_ids.get(request_id)
+        if isinstance(expires_at, (int, float)) and expires_at > time.time():
+            return True
+        if request_id in recorded_ids:
+            recorded_ids.pop(request_id, None)
+            if not recorded_ids:
+                client_terminal_outcomes.pop(client_public_key, None)
+    return False
 
 
 def _is_relay_inference_route(route: str) -> bool:
@@ -836,6 +875,7 @@ client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
 client_pending_request_ids = {}
+client_pending_request_deadlines = {}
 client_pending_request_ids_lock = threading.Lock()
 client_terminal_request_ids = {}
 client_terminal_request_ids_lock = threading.Lock()
@@ -859,6 +899,18 @@ DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
 API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
+API_V1_REQUEST_DEADLINE_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_SECONDS"
+API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MIN_SECONDS"
+API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MAX_SECONDS"
+DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS = 300.0
+DEFAULT_API_V1_REQUEST_DEADLINE_MIN_SECONDS = 1.0
+DEFAULT_API_V1_REQUEST_DEADLINE_MAX_SECONDS = 3600.0
+HARD_MIN_API_V1_REQUEST_DEADLINE_SECONDS = 1.0
+HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS = 3600.0
+HARD_MAX_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS = 300.0
+API_V1_CONTROL_TOMBSTONE_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS"
+DEFAULT_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS = 60.0
+API_V1_CONTROL_NEXT_POLL_MAX_SECONDS = 10.0
 API_V1_MAX_QUEUE_DEPTH_ENV = "TOKEN_PLACE_API_V1_MAX_QUEUE_DEPTH_PER_NODE"
 DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
@@ -930,6 +982,104 @@ def _api_v1_in_flight_ttl_seconds() -> float:
         return max(float(_api_v1_lease_seconds()), 1.0)
     return max(value, 1.0)
 
+
+def _bounded_float_env(name: str, default: float, *, floor: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(value, floor)
+
+
+def _api_v1_request_deadline_seconds() -> float:
+    min_seconds = _bounded_float_env(
+        API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV,
+        DEFAULT_API_V1_REQUEST_DEADLINE_MIN_SECONDS,
+        floor=0.001,
+    )
+    max_seconds = _bounded_float_env(
+        API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV,
+        DEFAULT_API_V1_REQUEST_DEADLINE_MAX_SECONDS,
+        floor=min_seconds,
+    )
+    min_seconds = min(max(min_seconds, HARD_MIN_API_V1_REQUEST_DEADLINE_SECONDS), HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS)
+    max_seconds = min(max(max_seconds, min_seconds), HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS)
+    configured = _bounded_float_env(
+        API_V1_REQUEST_DEADLINE_SECONDS_ENV,
+        DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS,
+        floor=min_seconds,
+    )
+    return min(max(configured, min_seconds), max_seconds)
+
+
+def _api_v1_control_tombstone_ttl_seconds() -> float:
+    configured = _bounded_float_env(
+        API_V1_CONTROL_TOMBSTONE_TTL_SECONDS_ENV,
+        DEFAULT_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS,
+        floor=1.0,
+    )
+    return min(configured, HARD_MAX_API_V1_CONTROL_TOMBSTONE_TTL_SECONDS)
+
+
+def _api_v1_deadline_metadata(deadline_monotonic: Any, *, now_monotonic: float | None = None) -> dict[str, float]:
+    if not isinstance(deadline_monotonic, (int, float)) or not math.isfinite(float(deadline_monotonic)):
+        return {}
+    now_monotonic = time.monotonic() if now_monotonic is None else now_monotonic
+    remaining = max(float(deadline_monotonic) - now_monotonic, 0.0)
+    return {
+        "request_deadline_remaining_seconds": remaining,
+        "request_ttl_seconds": remaining,
+    }
+
+
+def _valid_request_deadline_monotonic(value: Any) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _bounded_control_next_poll_seconds(*, hint: float | None = None) -> float:
+    base = min(_api_v1_poll_wait_seconds(), API_V1_CONTROL_NEXT_POLL_MAX_SECONDS)
+    if hint is not None:
+        base = min(base, hint)
+    return max(base, 1.0)
+
+
+
+
+def _api_v1_control_credential_digest(credential: str) -> str:
+    return hashlib.sha256(credential.encode("utf-8")).hexdigest()
+
+
+def _new_api_v1_control_credential() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _store_api_v1_control_credential(server_payload: dict[str, Any]) -> str:
+    existing_digest = server_payload.get("api_v1_control_credential_digest")
+    if isinstance(existing_digest, str) and existing_digest:
+        # Existing owner credentials are never disclosed or rotated by re-registering.
+        return ""
+    credential = _new_api_v1_control_credential()
+    server_payload["api_v1_control_credential_digest"] = _api_v1_control_credential_digest(credential)
+    return credential
+
+
+def _api_v1_server_control_credential_valid(server_payload: Any, credential: Any) -> bool:
+    if not isinstance(server_payload, dict) or not isinstance(credential, str) or not credential:
+        return False
+    expected_digest = server_payload.get("api_v1_control_credential_digest")
+    if not isinstance(expected_digest, str) or not expected_digest:
+        return False
+    return secrets.compare_digest(_api_v1_control_credential_digest(credential), expected_digest)
 
 def _api_v1_default_capabilities() -> dict[str, Any]:
     return {
@@ -1031,10 +1181,10 @@ def _context_tier_can_satisfy(active_tier: Any, requested_tier: str) -> bool:
 
 def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: float | None = None) -> int:
     now = time.monotonic() if now_monotonic is None else now_monotonic
-    in_flight_requests = payload.get("api_v1_in_flight_requests")
-    if not isinstance(in_flight_requests, dict):
-        return 0
     with api_v1_in_flight_requests_lock:
+        in_flight_requests = payload.get("api_v1_in_flight_requests")
+        if not isinstance(in_flight_requests, dict):
+            return 0
         in_flight_entries = list(in_flight_requests.values())
     active = 0
     for entry in in_flight_entries:
@@ -1043,6 +1193,65 @@ def _api_v1_active_in_flight_count(payload: dict[str, Any], *, now_monotonic: fl
             active += 1
     return active
 
+
+def _api_v1_in_flight_entry_can_be_pruned(entry: Any, *, now_monotonic: float) -> bool:
+    """Return whether an expired accounting entry has no live owner state left.
+
+    Lease expiry alone is not terminal: a compute node can renew an expired
+    accounting lease until the absolute request deadline.  Housekeeping may only
+    prune legacy entries without deadline metadata, or deadline-backed entries
+    after that authoritative deadline has elapsed.
+    """
+    expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+    if not isinstance(expires_at, (int, float)) or expires_at > now_monotonic:
+        return False
+    deadline_monotonic = (
+        _valid_request_deadline_monotonic(entry.get("request_deadline_monotonic"))
+        if isinstance(entry, dict)
+        else None
+    )
+    return deadline_monotonic is None or deadline_monotonic <= now_monotonic
+
+
+def _prune_api_v1_stale_in_flight_entries(payload: dict[str, Any], *, now_monotonic: float) -> int:
+    """Expire deadline-backed in-flight work and drop legacy stale entries.
+
+    Deadline-backed requests must use the normal terminal-state machinery so an
+    expiry races atomically with response acceptance/cancellation and produces
+    the owner-authenticated tombstone.  Only legacy entries without deadline
+    metadata may be raw-pruned.
+    """
+    removed = 0
+    expired_targets: list[tuple[str, str]] = []
+    with api_v1_in_flight_requests_lock:
+        in_flight_requests = payload.get("api_v1_in_flight_requests")
+        if not isinstance(in_flight_requests, dict):
+            return 0
+        for request_id, entry in list(in_flight_requests.items()):
+            if not _api_v1_in_flight_entry_can_be_pruned(entry, now_monotonic=now_monotonic):
+                continue
+            deadline_monotonic = (
+                _valid_request_deadline_monotonic(entry.get("request_deadline_monotonic"))
+                if isinstance(entry, dict)
+                else None
+            )
+            client_public_key = entry.get("client_public_key") if isinstance(entry, dict) else None
+            if deadline_monotonic is not None and isinstance(client_public_key, str) and client_public_key:
+                expired_targets.append((client_public_key, request_id))
+                continue
+            in_flight_requests.pop(request_id, None)
+            removed += 1
+        if not in_flight_requests:
+            payload.pop("api_v1_in_flight_requests", None)
+    for client_public_key, request_id in expired_targets:
+        _cancel_api_v1_request(
+            client_public_key,
+            request_id,
+            status="expired",
+            reason="provider_timeout",
+        )
+        removed += 1
+    return removed
 
 def _api_v1_node_load_snapshot(server_public_key: str, payload: dict[str, Any], *, now_monotonic: float | None = None) -> dict[str, int | float]:
     capabilities = payload.get("capabilities") if isinstance(payload, dict) else {}
@@ -1186,36 +1395,24 @@ def _pop_next_api_v1_request(public_key: str):
 def _evict_stale_servers() -> list[str]:
     _prune_terminal_requests()
     _expire_stale_pending_requests()
+    _prune_api_v1_control_tombstones()
     default_stale_after = _server_stale_seconds()
     now_monotonic = time.monotonic()
     evicted: list[str] = []
-    stale_candidates: list[str] = []
+    stale_candidates: list[tuple[str, int, float]] = []
+    with server_round_robin_lock:
+        server_items = list(known_servers.items())
+    for _, payload in server_items:
+        if isinstance(payload, dict):
+            _prune_api_v1_stale_in_flight_entries(payload, now_monotonic=now_monotonic)
     with server_round_robin_lock:
         server_items = list(known_servers.items())
         for server_public_key, payload in server_items:
             polling_until = payload.get("polling_until_monotonic")
             if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
                 continue
-            with api_v1_in_flight_requests_lock:
-                in_flight_requests = payload.get("api_v1_in_flight_requests")
-                if isinstance(in_flight_requests, dict):
-                    for request_id, entry in list(in_flight_requests.items()):
-                        if not isinstance(request_id, str) or not request_id:
-                            continue
-                        expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
-                        if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
-                            continue
-                        if in_flight_requests.get(request_id) == entry:
-                            in_flight_requests.pop(request_id, None)
-
-                    has_active_in_flight_requests = any(
-                        isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                        and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
-                        for entry in in_flight_requests.values()
-                    )
-                    if has_active_in_flight_requests:
-                        continue
-                    payload.pop("api_v1_in_flight_requests", None)
+            if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
+                continue
 
             in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
             if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
@@ -1228,38 +1425,16 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            stale_candidates.append(server_public_key)
+            stale_candidates.append((server_public_key, id(payload), now_monotonic))
 
-    for server_public_key in stale_candidates:
-        with api_v1_terminal_transition_lock:
-            with server_round_robin_lock:
-                payload = known_servers.get(server_public_key)
-                if not isinstance(payload, dict):
-                    continue
-                polling_until = payload.get("polling_until_monotonic")
-                if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
-                    continue
-                in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
-                if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
-                    continue
-                stale_after = payload.get("last_ping_duration", default_stale_after)
-                if not isinstance(stale_after, (int, float)):
-                    stale_after = default_stale_after
-                stale_after = max(float(stale_after), 1.0)
-                if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
-                    continue
-                with api_v1_in_flight_requests_lock:
-                    in_flight_requests = payload.get("api_v1_in_flight_requests")
-                    if isinstance(in_flight_requests, dict):
-                        has_active_in_flight_requests = any(
-                            isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                            and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
-                            for entry in in_flight_requests.values()
-                        )
-                        if has_active_in_flight_requests:
-                            continue
-                if _unregister_server(server_public_key, eviction_reason="stale_lease"):
-                    evicted.append(server_public_key)
+    for server_public_key, expected_payload_id, stale_cutoff_monotonic in stale_candidates:
+        if _unregister_server(
+            server_public_key,
+            eviction_reason="stale_lease",
+            expected_payload_id=expected_payload_id,
+            stale_cutoff_monotonic=stale_cutoff_monotonic,
+        ):
+            evicted.append(server_public_key)
     return evicted
 
 
@@ -1326,49 +1501,93 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
-def _unregister_server(server_public_key: str, *, eviction_reason: str = "unregistered") -> bool:
+_OWNER_CREDENTIAL_NOT_REQUIRED = object()
+
+
+def _unregister_server(
+    server_public_key: str,
+    *,
+    eviction_reason: str = "unregistered",
+    expected_payload_id: int | None = None,
+    stale_cutoff_monotonic: float | None = None,
+    owner_credential: Any = _OWNER_CREDENTIAL_NOT_REQUIRED,
+) -> bool | None:
     """Remove a compute node and associated per-server queue/session state."""
 
-    _record_api_v1_server_unregistered(server_public_key)
-    in_flight_requests = {}
-    with server_round_robin_lock:
-        server_payload = known_servers.get(server_public_key)
-        if isinstance(server_payload, dict):
-            with api_v1_in_flight_requests_lock:
-                raw_in_flight = server_payload.get("api_v1_in_flight_requests")
-                if isinstance(raw_in_flight, dict):
-                    in_flight_requests = dict(raw_in_flight)
+    with api_v1_terminal_transition_lock:
+        in_flight_requests: dict[str, Any] = {}
+        owner_digest = None
+        with server_round_robin_lock:
+            server_payload = known_servers.get(server_public_key)
+            if isinstance(server_payload, dict):
+                if expected_payload_id is not None and id(server_payload) != expected_payload_id:
+                    return False
+                if stale_cutoff_monotonic is not None:
+                    polling_until = server_payload.get("polling_until_monotonic")
+                    if isinstance(polling_until, (int, float)) and polling_until > stale_cutoff_monotonic:
+                        return False
+                    in_flight_until = server_payload.get("api_v1_in_flight_until_monotonic")
+                    if isinstance(in_flight_until, (int, float)) and in_flight_until > stale_cutoff_monotonic:
+                        return False
+                    stale_after = server_payload.get("last_ping_duration", _server_stale_seconds())
+                    if not isinstance(stale_after, (int, float)):
+                        stale_after = _server_stale_seconds()
+                    stale_after = max(float(stale_after), 1.0)
+                    if _server_ping_age_seconds(server_payload.get("last_ping")) <= stale_after:
+                        return False
+                    if _api_v1_active_in_flight_count(server_payload, now_monotonic=stale_cutoff_monotonic) > 0:
+                        return False
+                owner_digest = server_payload.get("api_v1_control_credential_digest")
+                if bool(server_payload.get(API_V1_SERVER_MARKER)) and owner_credential is not _OWNER_CREDENTIAL_NOT_REQUIRED:
+                    if not _api_v1_server_control_credential_valid(server_payload, owner_credential):
+                        return None
+                with api_v1_in_flight_requests_lock:
+                    raw_in_flight = server_payload.get("api_v1_in_flight_requests")
+                    if isinstance(raw_in_flight, dict):
+                        in_flight_requests = dict(raw_in_flight)
+            removed = _remove_known_server(server_public_key)
+            if removed:
+                _record_api_v1_server_unregistered(server_public_key)
+                with client_inference_requests_changed:
+                    dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
+                    client_inference_requests_changed.notify_all()
+            else:
+                dropped_requests = []
 
-    removed = _remove_known_server(server_public_key)
-    dropped_requests = []
-    with client_inference_requests_changed:
-        dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
-        client_inference_requests_changed.notify_all()
+        cancelled_queue_depth = 0
+        for item in dropped_requests:
+            if not isinstance(item, dict) or not bool(item.get("e2ee_v1")):
+                continue
+            _cancel_api_v1_request(
+                item.get("client_public_key"),
+                item.get("request_id"),
+                status="cancelled",
+                reason="server_unregistered",
+            )
+            cancelled_queue_depth += 1
 
-    cancelled_queue_depth = 0
-    for item in dropped_requests:
-        if not isinstance(item, dict) or not bool(item.get("e2ee_v1")):
-            continue
-        _cancel_api_v1_request(
-            item.get("client_public_key"),
-            item.get("request_id"),
-            status="cancelled",
-            reason="server_unregistered",
-        )
-        cancelled_queue_depth += 1
-
-    for request_id, entry in in_flight_requests.items():
-        if not isinstance(request_id, str) or not request_id:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        _cancel_api_v1_request(
-            entry.get("client_public_key"),
-            request_id,
-            status="cancelled",
-            reason="server_unregistered",
-        )
-        cancelled_queue_depth += 1
+        for request_id, entry in in_flight_requests.items():
+            if not isinstance(request_id, str) or not request_id or not isinstance(entry, dict):
+                continue
+            client_public_key = entry.get("client_public_key")
+            if _has_client_response_for_request(client_public_key, request_id):
+                continue
+            _add_api_v1_control_tombstone(
+                server_public_key,
+                request_id,
+                client_public_key,
+                status="cancelled",
+                reason="server_unregistered",
+                deadline_monotonic=entry.get("request_deadline_monotonic"),
+                owner_digest=owner_digest,
+            )
+            _cancel_api_v1_request(
+                client_public_key,
+                request_id,
+                status="cancelled",
+                reason="server_unregistered",
+            )
+            cancelled_queue_depth += 1
 
     with stream_lock:
         stale_session_ids = [
@@ -2077,6 +2296,7 @@ def _api_v1_server_was_recently_unregistered(server_public_key: str) -> bool:
 
 _ALLOWED_API_V1_TERMINAL_REASONS = {
     "cancelled",
+    "client_timeout",
     "expired",
     "requester_cancelled",
     "requester_gave_up",
@@ -2084,6 +2304,72 @@ _ALLOWED_API_V1_TERMINAL_REASONS = {
     "pending_request_ttl_exceeded",
     "server_unregistered",
 }
+api_v1_control_tombstones: dict[str, dict[str, Any]] = {}
+api_v1_control_tombstones_lock = threading.Lock()
+
+
+def _record_compute_control_state(state: str) -> None:
+    if state not in {"active", "cancelled", "expired", "acknowledged", "completed_unavailable"}:
+        state = "completed_unavailable"
+    try:
+        RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state).inc()
+    except Exception:
+        LOGGER.debug("metrics.compute_control_increment_failed", extra={"state": state})
+
+
+def _record_compute_control_lease_renewal() -> None:
+    try:
+        RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL.inc()
+    except Exception:
+        LOGGER.debug("metrics.compute_control_lease_renewal_increment_failed")
+
+
+def _control_tombstone_key(server_public_key: str, request_id: str) -> str:
+    return f"{server_public_key}\0{request_id}"
+
+
+def _prune_api_v1_control_tombstones(*, now_monotonic: float | None = None) -> None:
+    now_monotonic = time.monotonic() if now_monotonic is None else now_monotonic
+    with api_v1_control_tombstones_lock:
+        for key, tombstone in list(api_v1_control_tombstones.items()):
+            expires_at = tombstone.get("expires_at_monotonic") if isinstance(tombstone, dict) else None
+            if not isinstance(expires_at, (int, float)) or expires_at <= now_monotonic:
+                api_v1_control_tombstones.pop(key, None)
+
+
+def _add_api_v1_control_tombstone(
+    server_public_key: str | None,
+    request_id: str | None,
+    client_public_key: str | None,
+    *,
+    status: str,
+    reason: str | None,
+    deadline_monotonic: Any = None,
+    owner_digest: str | None = None,
+) -> None:
+    if not server_public_key or not request_id:
+        return
+    status = _sanitize_terminal_status(status)
+    reason = _sanitize_terminal_reason(reason, status)
+    now = time.monotonic()
+    if owner_digest is None:
+        with server_round_robin_lock:
+            server_payload = known_servers.get(server_public_key)
+            if isinstance(server_payload, dict):
+                owner_digest = server_payload.get("api_v1_control_credential_digest")
+    tombstone = {
+        "server_public_key": server_public_key,
+        "request_id": request_id,
+        "client_public_key": client_public_key,
+        "status": status,
+        "reason": reason,
+        "deadline_monotonic": deadline_monotonic,
+        "control_credential_digest": owner_digest,
+        "expires_at_monotonic": now + _api_v1_control_tombstone_ttl_seconds(),
+    }
+    _prune_api_v1_control_tombstones(now_monotonic=now)
+    with api_v1_control_tombstones_lock:
+        api_v1_control_tombstones[_control_tombstone_key(server_public_key, request_id)] = tombstone
 
 
 def _sanitize_terminal_status(value):
@@ -2245,27 +2531,35 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     with api_v1_terminal_transition_lock:
+        completed_won = _has_client_response_for_request(client_public_key, request_id)
         removed = _remove_request_from_server_queues(client_public_key, request_id)
         pending_removed = _clear_pending_request(client_public_key, request_id)
         in_flight_removed = 0
         with server_round_robin_lock:
             with api_v1_in_flight_requests_lock:
                 for server_payload in known_servers.values():
+                    server_public_key = server_payload.get("public_key") if isinstance(server_payload, dict) else None
                     in_flight_requests = server_payload.get("api_v1_in_flight_requests")
                     if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
                         continue
-                    if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
+                    entry = in_flight_requests.get(request_id)
+                    if _in_flight_entry_matches_client(entry, client_public_key):
+                        deadline_monotonic = entry.get("request_deadline_monotonic") if isinstance(entry, dict) else None
                         in_flight_requests.pop(request_id, None)
                         in_flight_removed += 1
+                        if not completed_won:
+                            _add_api_v1_control_tombstone(
+                                server_public_key,
+                                request_id,
+                                client_public_key,
+                                status=status,
+                                reason=reason,
+                                deadline_monotonic=deadline_monotonic,
+                            )
                         if not in_flight_requests:
                             server_payload.pop("api_v1_in_flight_requests", None)
         lifecycle_removed = bool(removed or pending_removed or in_flight_removed)
-        if lifecycle_removed:
-            # A queued response means response acceptance already won the terminal
-            # transition. Removing a response alone must never authorize stale
-            # cancellation/expiration work that selected a request before taking
-            # api_v1_terminal_transition_lock.
-            _remove_client_responses_for_request(client_public_key, request_id)
+        if lifecycle_removed and not completed_won and not _has_client_response_for_request(client_public_key, request_id):
             _mark_request_terminal(client_public_key, request_id, status=status, reason=reason)
     LOGGER.info(
         "relay.api_v1.request_cancelled",
@@ -2279,18 +2573,20 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     return removed
 
 
-def _mark_request_pending(client_public_key, request_id, *, cancel_token=None):
+def _mark_request_pending(client_public_key, request_id, *, cancel_token=None, deadline_monotonic=None):
     if not client_public_key or not request_id:
         return
     with client_pending_request_ids_lock:
         pending_ids = client_pending_request_ids.setdefault(client_public_key, {})
+        pending_entry = {
+            "queued_at": time.time(),
+            "request_deadline_monotonic": _valid_request_deadline_monotonic(deadline_monotonic),
+        }
         if isinstance(cancel_token, str) and cancel_token:
-            pending_ids[request_id] = {
-                "queued_at": time.time(),
-                "cancel_token": cancel_token,
-            }
-        else:
-            pending_ids[request_id] = time.time()
+            pending_entry["cancel_token"] = cancel_token
+        pending_ids[request_id] = pending_entry
+        if pending_entry["request_deadline_monotonic"] is not None:
+            client_pending_request_deadlines.setdefault(client_public_key, {})[request_id] = pending_entry["request_deadline_monotonic"]
 
 
 def _clear_pending_request(client_public_key, request_id):
@@ -2304,6 +2600,11 @@ def _clear_pending_request(client_public_key, request_id):
         pending_ids.pop(request_id, None)
         if not pending_ids:
             client_pending_request_ids.pop(client_public_key, None)
+        deadline_ids = client_pending_request_deadlines.get(client_public_key)
+        if isinstance(deadline_ids, dict):
+            deadline_ids.pop(request_id, None)
+            if not deadline_ids:
+                client_pending_request_deadlines.pop(client_public_key, None)
         return existed
 
 
@@ -2317,7 +2618,13 @@ def _clear_pending_requests_for_queued_items(queued_items):
         _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
 
 
-def _pending_request_entry_is_expired(pending_entry, *, now=None):
+def _pending_request_entry_is_expired(pending_entry, *, now=None, deadline_monotonic=None):
+    entry_deadline = pending_entry.get("request_deadline_monotonic") if isinstance(pending_entry, dict) else None
+    deadline = _valid_request_deadline_monotonic(entry_deadline)
+    if deadline is None:
+        deadline = _valid_request_deadline_monotonic(deadline_monotonic)
+    if deadline is not None:
+        return deadline <= time.monotonic()
     if PENDING_REQUEST_TTL_SECONDS <= 0:
         return False
     now = time.time() if now is None else now
@@ -2328,13 +2635,23 @@ def _pending_request_entry_is_expired(pending_entry, *, now=None):
         return True
 
 
+def _pending_request_deadline(client_public_key, request_id):
+    with client_pending_request_ids_lock:
+        deadline_ids = client_pending_request_deadlines.get(client_public_key)
+        if isinstance(deadline_ids, dict):
+            return deadline_ids.get(request_id)
+    return None
+
+
 def _expire_pending_request_if_stale(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
     with client_pending_request_ids_lock:
         pending_entry = client_pending_request_ids.get(client_public_key, {}).get(request_id)
     if pending_entry is None or not _pending_request_entry_is_expired(pending_entry):
-        return False
+        deadline = _pending_request_deadline(client_public_key, request_id)
+        if not isinstance(deadline, (int, float)) or deadline > time.monotonic():
+            return False
     _cancel_api_v1_request(
         client_public_key,
         request_id,
@@ -2351,7 +2668,10 @@ def _is_request_pending(client_public_key, request_id):
         pending_entry = client_pending_request_ids.get(client_public_key, {}).get(request_id)
     if pending_entry is None:
         return False
-    if _pending_request_entry_is_expired(pending_entry):
+    deadline = _pending_request_deadline(client_public_key, request_id)
+    if _pending_request_entry_is_expired(pending_entry) or (
+        isinstance(deadline, (int, float)) and deadline <= time.monotonic()
+    ):
         _expire_pending_request_if_stale(client_public_key, request_id)
         return False
     return True
@@ -2398,8 +2718,6 @@ def _cancel_token_for_queued_or_in_flight_request(client_public_key, request_id)
 
 
 def _expire_stale_pending_requests():
-    if PENDING_REQUEST_TTL_SECONDS <= 0:
-        return
     now = time.time()
     expired = []
     with client_pending_request_ids_lock:
@@ -2407,8 +2725,10 @@ def _expire_stale_pending_requests():
             if not isinstance(pending_ids, dict):
                 client_pending_request_ids.pop(client_public_key, None)
                 continue
+            deadline_ids = client_pending_request_deadlines.get(client_public_key)
             for request_id, pending_entry in list(pending_ids.items()):
-                if _pending_request_entry_is_expired(pending_entry, now=now):
+                deadline = deadline_ids.get(request_id) if isinstance(deadline_ids, dict) else None
+                if _pending_request_entry_is_expired(pending_entry, now=now, deadline_monotonic=deadline):
                     expired.append((client_public_key, request_id))
     for client_public_key, request_id in expired:
         if _has_client_response_for_request(client_public_key, request_id):
@@ -2475,6 +2795,7 @@ def api_v1_relay_servers_register():
         return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
 
     lease_seconds = _api_v1_lease_seconds()
+    control_credential = ""
     with server_round_robin_lock:
         existing_payload = known_servers.get(public_key)
         existing_api_v1_count = len(_api_v1_round_robin_keys())
@@ -2499,12 +2820,17 @@ def api_v1_relay_servers_register():
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
         known_servers[public_key]['capabilities'] = capabilities
+        known_servers[public_key]['public_key'] = public_key
+        control_credential = _store_api_v1_control_credential(known_servers[public_key])
     LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 
-    return jsonify({
+    response_payload = {
         'next_ping_in_x_seconds': lease_seconds,
         'poll_wait_seconds': _api_v1_poll_wait_seconds(),
-    }), 200
+    }
+    if control_credential:
+        response_payload['control_credential'] = control_credential
+    return jsonify(response_payload), 200
 
 
 def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
@@ -2526,7 +2852,9 @@ def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
             return jsonify({'error': 'Invalid public key'}), 400
         return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
 
-    removed = _unregister_server(public_key)
+    removed = _unregister_server(public_key, owner_credential=data.get('control_credential'))
+    if removed is None:
+        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
 
 
@@ -2600,11 +2928,34 @@ def api_v1_relay_servers_poll():
         with client_inference_requests_changed:
             first_request = _pop_next_api_v1_request(public_key)
             if first_request is not None:
-                break
+                request_deadline_monotonic = _valid_request_deadline_monotonic(first_request.get('_request_deadline_monotonic'))
+                if request_deadline_monotonic is not None and request_deadline_monotonic <= time.monotonic():
+                    first_request = dict(first_request)
+                else:
+                    break
+            if first_request is not None:
+                expired_request = first_request
+                first_request = None
+                # Drop expired queue heads and continue draining immediately.
+                should_continue = True
+            else:
+                expired_request = None
+                should_continue = False
             remaining = deadline - time.monotonic()
-            if poll_wait_seconds <= 0 or remaining <= 0:
+            if should_continue:
+                pass
+            elif poll_wait_seconds <= 0 or remaining <= 0:
                 break
-            client_inference_requests_changed.wait(timeout=remaining)
+            else:
+                client_inference_requests_changed.wait(timeout=remaining)
+        if expired_request is not None:
+            _cancel_api_v1_request(
+                expired_request.get('client_public_key'),
+                expired_request.get('request_id'),
+                status='expired',
+                reason='provider_timeout',
+            )
+            continue
 
     server_missing = False
     with server_round_robin_lock:
@@ -2629,6 +2980,20 @@ def api_v1_relay_servers_poll():
     if isinstance(queued_at, (int, float)):
         queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
     request_id = first_request.get('request_id')
+    request_deadline_monotonic = _valid_request_deadline_monotonic(first_request.pop('_request_deadline_monotonic', None))
+    if request_deadline_monotonic is not None and request_deadline_monotonic <= time.monotonic():
+        _cancel_api_v1_request(
+            first_request.get('client_public_key'),
+            request_id,
+            status='expired',
+            reason='provider_timeout',
+        )
+        return jsonify({
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else lease_seconds,
+            'poll_wait_seconds': poll_wait_seconds,
+        }), 200
+    first_request.update(_api_v1_deadline_metadata(request_deadline_monotonic))
     if isinstance(request_id, str) and request_id:
         server_missing = False
         with server_round_robin_lock:
@@ -2640,10 +3005,14 @@ def api_v1_relay_servers_poll():
                     in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
                     if isinstance(in_flight_requests, dict):
                         in_flight_requests[request_id] = {
-                            'expires_at': time.monotonic() + _api_v1_in_flight_ttl_seconds(),
+                            'expires_at': min(
+                                time.monotonic() + _api_v1_in_flight_ttl_seconds(),
+                                request_deadline_monotonic if request_deadline_monotonic is not None else time.monotonic() + _api_v1_in_flight_ttl_seconds(),
+                            ),
                             'started_at_monotonic': time.monotonic(),
                             'client_public_key': first_request.get('client_public_key'),
                             'cancel_token': first_request.get('cancel_token'),
+                            'request_deadline_monotonic': request_deadline_monotonic,
                         }
         if server_missing:
             return _server_not_found_response(first_request)
@@ -2656,6 +3025,123 @@ def api_v1_relay_servers_poll():
         },
     )
     return jsonify(first_request), 200
+
+
+@app.route('/api/v1/relay/servers/control', methods=['POST'])
+def api_v1_relay_servers_control():
+    """Authenticated owner-only control poll for one in-flight API v1 request."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    _evict_stale_servers()
+    _prune_api_v1_control_tombstones()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    request_id = data.get('request_id')
+    control_credential = data.get('control_credential')
+    acknowledge = data.get('acknowledge') is True or data.get('ack') is True
+    if not public_key or not request_id:
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    lease_seconds = _api_v1_in_flight_ttl_seconds()
+    now = time.monotonic()
+    with api_v1_terminal_transition_lock:
+        deadline_expiry_target: tuple[str, str, Any] | None = None
+        with server_round_robin_lock:
+            server_payload = known_servers.get(public_key)
+            if server_payload is not None and bool(server_payload.get(API_V1_SERVER_MARKER)):
+                if not _api_v1_server_control_credential_valid(server_payload, control_credential):
+                    return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+                with api_v1_in_flight_requests_lock:
+                    in_flight_requests = server_payload.get('api_v1_in_flight_requests')
+                    entry = in_flight_requests.get(request_id) if isinstance(in_flight_requests, dict) else None
+                    if isinstance(entry, dict):
+                        deadline_monotonic = _valid_request_deadline_monotonic(entry.get('request_deadline_monotonic'))
+                        if deadline_monotonic is not None and deadline_monotonic <= now:
+                            client_public_key = entry.get('client_public_key')
+                            if isinstance(client_public_key, str) and client_public_key:
+                                deadline_expiry_target = (client_public_key, request_id, deadline_monotonic)
+                        else:
+                            lease_deadline = now + lease_seconds
+                            if deadline_monotonic is not None:
+                                lease_deadline = min(lease_deadline, deadline_monotonic)
+                            entry['expires_at'] = lease_deadline
+                            _record_compute_control_state("active")
+                            _record_compute_control_lease_renewal()
+                            payload = {
+                                'status': 'active',
+                                'next_poll_seconds': _bounded_control_next_poll_seconds(hint=max(lease_seconds / 2.0, 1.0)),
+                                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
+                            }
+                            return jsonify(payload), 200
+
+        if deadline_expiry_target is not None:
+            client_public_key, deadline_request_id, deadline_monotonic = deadline_expiry_target
+            _cancel_api_v1_request(
+                client_public_key,
+                deadline_request_id,
+                status='expired',
+                reason='provider_timeout',
+            )
+            terminal = _get_terminal_request(client_public_key, deadline_request_id) or {}
+            terminal_status = _sanitize_terminal_status(terminal.get('status'))
+            control_status = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed/unavailable'
+            control_state = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed_unavailable'
+            _record_compute_control_state(control_state)
+            return jsonify({
+                'status': control_status,
+                'next_poll_seconds': _bounded_control_next_poll_seconds(),
+                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
+            }), 200
+
+    key = _control_tombstone_key(public_key, request_id)
+    tombstone_found = False
+    with api_v1_control_tombstones_lock:
+        tombstone = api_v1_control_tombstones.get(key)
+        if isinstance(tombstone, dict) and tombstone.get('expires_at_monotonic', 0) > time.monotonic():
+            tombstone_found = True
+            expected_digest = tombstone.get('control_credential_digest')
+            if not (
+                isinstance(expected_digest, str)
+                and isinstance(control_credential, str)
+                and control_credential
+                and secrets.compare_digest(_api_v1_control_credential_digest(control_credential), expected_digest)
+            ):
+                return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+            status = tombstone.get('status')
+            if acknowledge:
+                removed = api_v1_control_tombstones.pop(key, None)
+                if removed is not None:
+                    _record_compute_control_state("acknowledged")
+                else:
+                    _record_compute_control_state(status if status in {"cancelled", "expired"} else "completed_unavailable")
+            else:
+                _record_compute_control_state(status if status in {"cancelled", "expired"} else "completed_unavailable")
+            return jsonify({
+                'status': status if status in {'cancelled', 'expired'} else 'completed/unavailable',
+                'next_poll_seconds': _bounded_control_next_poll_seconds(),
+                **_api_v1_deadline_metadata(tombstone.get('deadline_monotonic')),
+            }), 200
+
+    with server_round_robin_lock:
+        live_payload = known_servers.get(public_key)
+        live_owner_authenticated = (
+            live_payload is not None
+            and bool(live_payload.get(API_V1_SERVER_MARKER))
+            and _api_v1_server_control_credential_valid(live_payload, control_credential)
+        )
+    if not live_owner_authenticated and not tombstone_found:
+        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+
+    _record_compute_control_state("completed_unavailable")
+    return jsonify({
+        'status': 'completed/unavailable',
+        'next_poll_seconds': _bounded_control_next_poll_seconds(),
+    }), 200
 
 @app.route('/api/v1/relay/requests', methods=['POST'])
 def api_v1_relay_requests():
@@ -2678,7 +3164,12 @@ def api_v1_relay_requests():
 
     envelope['e2ee_v1'] = True
     queued_at = time.time()
+    deadline_seconds = _api_v1_request_deadline_seconds()
+    deadline_monotonic = time.monotonic() + deadline_seconds
     envelope['_queued_at'] = queued_at
+    envelope['request_deadline_remaining_seconds'] = deadline_seconds
+    envelope['request_ttl_seconds'] = deadline_seconds
+    envelope['_request_deadline_monotonic'] = deadline_monotonic
     with server_round_robin_lock:
         server_payload = known_servers.get(server_public_key)
         if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
@@ -2687,6 +3178,7 @@ def api_v1_relay_requests():
             envelope.get('client_public_key'),
             envelope.get('request_id'),
             cancel_token=envelope.get('cancel_token'),
+            deadline_monotonic=deadline_monotonic,
         )
         with client_inference_requests_changed:
             client_inference_requests.setdefault(server_public_key, []).append(envelope)
@@ -2699,7 +3191,7 @@ def api_v1_relay_requests():
             "queue_depth": queue_depth,
         },
     )
-    return jsonify({'message': 'Request received'}), 200
+    return jsonify({'message': 'Request received', **_api_v1_deadline_metadata(deadline_monotonic)}), 200
 
 
 
@@ -2789,11 +3281,16 @@ def api_v1_relay_responses():
                             if not in_flight_requests:
                                 server_payload.pop('api_v1_in_flight_requests', None)
                             break
+            lifecycle_owned = _remove_request_from_server_queues(client_public_key, request_id) or lifecycle_owned
             lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
             terminal = _get_terminal_request(client_public_key, request_id)
             if terminal is not None:
                 status = terminal.get('status', 'cancelled')
                 return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            if not lifecycle_owned:
+                if _has_request_terminal_outcome(client_public_key, request_id):
+                    return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'completed', 'status': 'completed'}}), 410
+                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'gone', 'status': 'gone'}}), 410
             if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
                 terminal = _get_terminal_request(client_public_key, request_id)
                 status = terminal.get('status', 'cancelled') if terminal else 'cancelled'

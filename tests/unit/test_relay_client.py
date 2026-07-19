@@ -693,6 +693,72 @@ class TestRelayClient:
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_captures_control_credential(self, mock_post, relay_client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            'next_ping_in_x_seconds': 30,
+            'control_credential': 'relay-a-owner-secret',
+        }
+        mock_post.return_value = response
+
+        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+
+        assert result['control_credential'] == 'relay-a-owner-secret'
+        assert relay_client._api_v1_control_credentials_by_relay == {
+            'http://relay-a.example': 'relay-a-owner-secret'
+        }
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_sends_matching_control_credential_per_relay(self, mock_post, relay_client):
+        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+        relay_client._api_v1_registered_relays.update(relay_client._relay_urls)
+        relay_client._api_v1_last_heartbeat_at.update({
+            'http://relay-a.example': 1.0,
+            'http://relay-b.example': 2.0,
+        })
+        relay_client._api_v1_control_credentials_by_relay.update({
+            'http://relay-a.example': 'credential-a',
+            'http://relay-b.example': 'credential-b',
+        })
+        mock_post.side_effect = [MagicMock(status_code=200), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is True
+
+        assert [call.kwargs['json'] for call in mock_post.call_args_list] == [
+            {'server_public_key': 'mock_public_key_b64', 'control_credential': 'credential-a'},
+            {'server_public_key': 'mock_public_key_b64', 'control_credential': 'credential-b'},
+        ]
+        assert relay_client._api_v1_control_credentials_by_relay == {}
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_retains_failed_control_credential_for_retry(self, mock_post, relay_client):
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'retry-secret'
+        mock_post.side_effect = [MagicMock(status_code=503), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is False
+        assert relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] == 'retry-secret'
+        assert relay_client.unregister_from_relay() is True
+        assert relay_client._api_v1_control_credentials_by_relay == {}
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_legacy_fallback_uses_control_credential(self, mock_post, relay_client):
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'fallback-secret'
+        mock_post.side_effect = [MagicMock(status_code=404), MagicMock(status_code=200)]
+
+        assert relay_client.unregister_from_relay() is True
+
+        assert [call.args[0] for call in mock_post.call_args_list] == [
+            'http://localhost:5000/api/v1/relay/servers/unregister',
+            'http://localhost:5000/unregister',
+        ]
+        assert all(call.kwargs['json']['control_credential'] == 'fallback-secret' for call in mock_post.call_args_list)
+
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
         """Test successful ping to relay."""
@@ -1384,6 +1450,126 @@ class TestRelayClient:
             assert forbidden not in body_snippet
             assert forbidden not in result['relay_error']
             assert forbidden not in summary
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_api_v1_non_200_diagnostic_redacts_base_path_control_credential(
+        self, mock_post, relay_client, caplog
+    ):
+        credential = 'relay-control-secret-for-api-v1-base-path'
+        relay_client._api_v1_control_credentials_by_relay[
+            'https://relay.example/api/v1'
+        ] = credential
+        response = MagicMock(status_code=403)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.json.return_value = {
+            'error': f'bad owner credential {credential}',
+            'relayControlCredential': credential,
+            'controlCredential': credential,
+            'detail': {'message': f'unlabelled echo {credential}'},
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client._api_v1_http_error_result(
+                response,
+                method='POST',
+                url='https://relay.example/api/v1/relay/servers/unregister',
+                token_sent=False,
+                next_ping_in_x_seconds=relay_client._request_timeout,
+            )
+
+        rendered = json.dumps(result, sort_keys=True)
+        assert credential not in rendered
+        assert credential not in caplog.text
+        assert 'bad owner credential [redacted]' in result['relay_error']
+        body_snippet = result['relay_http_diagnostic']['body_snippet']
+        assert '"relayControlCredential":"[redacted]"' in body_snippet
+        assert '"controlCredential":"[redacted]"' in body_snippet
+
+    def test_api_v1_control_credential_lookup_uses_slash_delimited_longest_prefix(self, relay_client):
+        relay_client._api_v1_control_credentials_by_relay.update({
+            'https://relay.example': 'host-secret',
+            'https://relay.example/api/v1': 'base-path-secret',
+            'https://relay.example/api/v10': 'wrong-path-secret',
+            'https://relay.example.evil/api/v1': 'evil-secret',
+        })
+
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v1/relay/servers/control'
+        ) == 'base-path-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v10/relay/servers/control'
+        ) == 'wrong-path-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example.evil/api/v1/relay/servers/control'
+        ) == 'evil-secret'
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example.evilish/api/v1/relay/servers/control'
+        ) == ''
+
+    def test_api_v1_control_credential_lookup_and_mutation_use_map_lock(
+        self, relay_client, caplog
+    ):
+        class GuardedCredentialMap(dict):
+            def __init__(self, guard, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._guard = guard
+                self.items_called = threading.Event()
+
+            def items(self):
+                assert self._guard.locked()
+                self.items_called.set()
+                return super().items()
+
+            def __setitem__(self, key, value):
+                assert self._guard.locked()
+                return super().__setitem__(key, value)
+
+            def pop(self, key, default=None):
+                assert self._guard.locked()
+                return super().pop(key, default)
+
+            def clear(self):
+                assert self._guard.locked()
+                return super().clear()
+
+        credential = 'guarded-base-path-control-secret'
+        guarded = GuardedCredentialMap(
+            relay_client._api_v1_control_credentials_lock,
+            {'https://relay.example/api/v1': credential},
+        )
+        relay_client._api_v1_control_credentials_by_relay = guarded
+
+        assert relay_client._api_v1_control_credential_for_request_url(
+            'https://relay.example/api/v1/relay/servers/control'
+        ) == credential
+        assert guarded.items_called.is_set()
+
+        relay_client._store_api_v1_control_credential(
+            'https://relay.example/api/v1/blue', 'rotated-secret'
+        )
+        assert relay_client._api_v1_control_credential_for_relay(
+            'https://relay.example/api/v1/blue'
+        ) == 'rotated-secret'
+        relay_client._pop_api_v1_control_credential('https://relay.example/api/v1/blue')
+        assert relay_client._api_v1_control_credential_for_relay(
+            'https://relay.example/api/v1/blue'
+        ) == ''
+
+        response = MagicMock(status_code=403)
+        response.headers = {'content-type': 'text/plain'}
+        response.text = f'credential echoed without label {credential}'
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client._api_v1_http_error_result(
+                response,
+                method='POST',
+                url='https://relay.example/api/v1/relay/servers/control',
+                token_sent=False,
+                next_ping_in_x_seconds=relay_client._request_timeout,
+            )
+
+        assert credential not in json.dumps(result, sort_keys=True)
+        assert credential not in caplog.text
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
@@ -6749,3 +6935,81 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
     assert "prompt" not in safe
     assert "token_ids" not in safe
     assert "SECRET_PROMPT" not in json.dumps(safe)
+
+@patch('utils.networking.relay_client.requests.post')
+def test_reset_api_v1_polling_session_clear_registration_clears_control_credentials(mock_post):
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._store_api_v1_control_credential('http://localhost:5000', 'reset-secret')
+
+    client.reset_api_v1_polling_session(clear_registration=True)
+
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == ''
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_register_api_v1_compute_node_preserves_and_rotates_control_credential(mock_post):
+    client = _standalone_relay_client()
+    first = MagicMock(status_code=200)
+    first.json.return_value = {'registered': True, 'control_credential': 'first-secret'}
+    refresh = MagicMock(status_code=200)
+    refresh.json.return_value = {'registered': True}
+    rotated = MagicMock(status_code=200)
+    rotated.json.return_value = {'registered': True, 'control_credential': 'rotated-secret'}
+    mock_post.side_effect = [first, refresh, rotated]
+
+    assert client.register_api_v1_compute_node()['control_credential'] == 'first-secret'
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
+    client.register_api_v1_compute_node()
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
+    client.register_api_v1_compute_node()
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mock_post, monkeypatch):
+    ticks = iter([10.0, 20.0, 30.0, 40.0, 50.0])
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: next(ticks, 60.0))
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = -100.0
+    client._api_v1_relay_wait_hints = {
+        'http://localhost:5000': {'next_ping_in_x_seconds': 1, 'poll_wait_seconds': 1}
+    }
+    client._store_api_v1_control_credential('http://localhost:5000', 'current-secret')
+
+    class StopAfterTwo:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, _timeout):
+            self.calls += 1
+            return self.calls > 2
+
+        def is_set(self):
+            return False
+
+    responses = [
+        {'registered': True, 'next_ping_in_x_seconds': 1},
+        {'registered': True, 'control_credential': 'rotated-secret', 'next_ping_in_x_seconds': 1},
+    ]
+    observed = []
+
+    def register(url):
+        observed.append(client._api_v1_control_credential_for_relay(url))
+        response = responses.pop(0)
+        credential = response.get('control_credential')
+        if credential:
+            client._store_api_v1_control_credential(url, credential)
+        return response
+
+    client.register_api_v1_compute_node = register
+    client._api_v1_heartbeat_stop = StopAfterTwo()
+
+    client._api_v1_heartbeat_worker()
+
+    assert observed == ['current-secret', 'current-secret']
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'

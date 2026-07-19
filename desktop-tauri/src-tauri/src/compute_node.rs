@@ -186,12 +186,8 @@ fn configure_runtime_pythonpath(
             manifest_dir,
             None,
         );
-        configure_python_subprocess_env_for_layout(
-            command,
-            import_root,
-            layout,
-            !cfg!(debug_assertions),
-        );
+        let packaged = layout != crate::python_runtime::ResourceLayoutKind::DevSourceTree;
+        configure_python_subprocess_env_for_layout(command, import_root, layout, packaged);
     }
     import_root
 }
@@ -1101,7 +1097,9 @@ pub async fn start_compute_node(
                 tauri_resource_dir: resource_dir.as_deref(),
                 current_exe_path: current_exe.as_deref(),
                 manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
-                packaged: !cfg!(debug_assertions),
+                packaged: resource_dir
+                    .as_deref()
+                    .is_some_and(|dir| !dir.ends_with("src-tauri")),
             })
         })
         .await

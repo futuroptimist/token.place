@@ -51,6 +51,8 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     for artifact in native_artifacts:
         for key in ("name", "version", "url", "sha256", "architecture", "license", "provenance"):
             if key not in artifact: raise RuntimePrepError(f"native_dll_artifacts entry missing {key}")
+        if "x" in str(artifact.get("version", "")).lower():
+            raise RuntimePrepError("native DLL artifact versions must be exact")
         if artifact.get("architecture") != "AMD64": raise RuntimePrepError("native DLL artifacts must be AMD64")
         if not artifact.get("url", "").startswith(("https://developer.download.nvidia.com/", "https://download.visualstudio.microsoft.com/")):
             raise RuntimePrepError("native DLL artifacts must use approved immutable vendor URLs")
@@ -89,7 +91,12 @@ def is_windows_system_dll(name: str) -> bool:
     return dll in WINDOWS_SYSTEM_DLLS or bool(WINDOWS_API_SET_DLL_RE.fullmatch(dll))
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
-    if not url.startswith(("https://github.com/", "https://files.pythonhosted.org/")):
+    if not url.startswith((
+        "https://github.com/",
+        "https://files.pythonhosted.org/",
+        "https://developer.download.nvidia.com/",
+        "https://download.visualstudio.microsoft.com/",
+    )):
         raise RuntimePrepError("runtime artifacts must be fetched from pinned immutable HTTPS URLs")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
@@ -98,6 +105,44 @@ def fetch(url: str, sha: str, dest: Path) -> Path:
     got=sha256_file(dest)
     if got != sha: raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
     return dest
+
+def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
+    """Stage pinned native redistributable DLLs beside python.exe for Windows loader visibility."""
+    seen: set[str] = set()
+    for artifact in m.get("native_dll_artifacts", []):
+        name = artifact["name"]
+        lower = name.lower()
+        if lower in seen:
+            raise RuntimePrepError(f"duplicate native DLL artifact: {name}")
+        seen.add(lower)
+        archive = fetch(artifact["url"], artifact["sha256"], cache / Path(artifact["url"]).name)
+        member = artifact.get("archive_member_path")
+        destination = artifact.get("destination", name)
+        expected_file_sha = artifact.get("extracted_sha256")
+        if not member or not expected_file_sha:
+            raise RuntimePrepError(f"native DLL artifact missing exact member/hash: {name}")
+        dest = (staged / destination).resolve()
+        if not dest.is_relative_to(staged.resolve()) or dest.name.lower() != lower:
+            raise RuntimePrepError(f"native DLL destination must stay in runtime root: {name}")
+        if archive.suffix.lower() != ".zip":
+            raise RuntimePrepError(f"native DLL artifact must be a zip archive with exact members: {name}")
+        with zipfile.ZipFile(archive) as zf:
+            matches = [item for item in zf.infolist() if item.filename == member]
+            if len(matches) != 1:
+                raise RuntimePrepError(f"native DLL artifact member missing or duplicate: {name}")
+            info = matches[0]
+            if info.is_dir() or Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
+                raise RuntimePrepError(f"unsafe native DLL artifact member: {name}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, dest.open("wb") as out:
+                shutil.copyfileobj(src, out)
+        got = sha256_file(dest)
+        if got != expected_file_sha:
+            dest.unlink(missing_ok=True)
+            raise RuntimePrepError(f"native DLL file digest mismatch for {name}: expected {expected_file_sha} got {got}")
+        machine, _ = inspect_pe(dest, dest.relative_to(staged).as_posix())
+        if machine != "IMAGE_FILE_MACHINE_AMD64":
+            raise RuntimePrepError(f"native DLL artifact is not AMD64: {name}")
 
 def safe_extract_tar(archive: Path, dest: Path) -> None:
     with tarfile.open(archive, 'r:*') as tf:
@@ -449,6 +494,7 @@ def prepare(m: dict) -> None:
         data=json.loads(run([str(py), '-c', "import json,platform,sys; print(json.dumps({'version':list(sys.version_info[:3]),'machine':platform.machine()}))"]).stdout)
         if data != {'version':expected_version, 'machine':'AMD64'}: raise RuntimePrepError(f'interpreter probe mismatch: {data}')
         validate_installed_inventory(py, m)
+        stage_native_dll_artifacts(m, cache, staged)
         prune_packaging_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')

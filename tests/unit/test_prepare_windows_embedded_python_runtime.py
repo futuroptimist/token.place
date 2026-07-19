@@ -823,3 +823,46 @@ def test_manifest_rejects_missing_native_vendor_artifact_pin(tmp_path):
 
     with pytest.raises(prep.RuntimePrepError, match='missing native DLL artifact pins'):
         prep.load_manifest(path)
+
+
+def test_stage_native_dll_artifacts_extracts_exact_pinned_member(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    member = 'vendor/bin/cudart64_12.dll'
+    dll_bytes = bytearray(0x600)
+    dll = tmp_path / 'cudart64_12.dll'
+    write_minimal_pe(dll)
+    dll_bytes = dll.read_bytes()
+    archive = tmp_path / 'cuda.zip'
+    import zipfile
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr(member, dll_bytes)
+    digest = prep.sha256_file(archive)
+    file_digest = prep.sha256_file(dll)
+    m = {'native_dll_artifacts': [{
+        'name': 'cudart64_12.dll',
+        'version': '12.4.127',
+        'url': 'https://developer.download.nvidia.com/example/cuda.zip',
+        'sha256': digest,
+        'architecture': 'AMD64',
+        'license': 'NVIDIA CUDA Toolkit EULA',
+        'provenance': 'test pinned runtime DLL',
+        'archive_member_path': member,
+        'destination': 'cudart64_12.dll',
+        'extracted_sha256': file_digest,
+    }]}
+    monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: archive)
+
+    prep.stage_native_dll_artifacts(m, tmp_path / 'cache', runtime)
+
+    assert (runtime / 'cudart64_12.dll').read_bytes() == dll_bytes
+
+
+def test_manifest_rejects_non_exact_native_versions(tmp_path):
+    m = prep.load_manifest()
+    m['native_dll_artifacts'][0]['version'] = '12.x'
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps(m), encoding='utf-8')
+
+    with pytest.raises(prep.RuntimePrepError, match='versions must be exact'):
+        prep.load_manifest(path)

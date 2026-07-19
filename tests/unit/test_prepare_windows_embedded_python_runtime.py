@@ -58,7 +58,7 @@ def manifest(**overrides):
         'cpython_version': '3.11.13',
         'target_triple': 'x86_64-pc-windows-msvc',
         'archive_url': 'https://github.com/example/runtime.tar.gz',
-        'sha256': '0' * 64,
+        'sha256': '0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210',
         'expected_archive_root': 'python',
         'expected_interpreter_path': 'python.exe',
         'expected_architecture': 'AMD64',
@@ -67,7 +67,7 @@ def manifest(**overrides):
             'version': '0.3.32',
             'flavor': 'cu124',
             'url': 'https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl',
-            'sha256': '1' * 64,
+            'sha256': '123456789abcdeffedcba98765432100123456789abcdeffedcba98765432101',
         },
         'required_packages': {'pip': '25.2', 'llama-cpp-python': '0.3.32'},
         'required_native_dlls': ['llama.dll'],
@@ -76,13 +76,13 @@ def manifest(**overrides):
                 'name': name,
                 'version': version,
                 'url': f'https://developer.download.nvidia.com/example/{name}.zip' if name.startswith(('cuda', 'cublas')) else f'https://download.visualstudio.microsoft.com/example/{name}.zip',
-                'sha256': '3' * 64,
+                'sha256': '3456789abcdeffedcba98765432100123456789abcdeffedcba9876543210123',
                 'architecture': 'AMD64',
                 'license': 'test license',
                 'provenance': 'test provenance',
                 'archive_member_path': f'bin/{name}',
                 'destination': name,
-                'extracted_sha256': '4' * 64,
+                'extracted_sha256': '456789abcdeffedcba98765432100123456789abcdeffedcba98765432101234',
             }
             for name, version in [
                 ('cudart64_12.dll', '12.4.127'),
@@ -189,7 +189,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
             'package': 'alpha', 'version': '1.0',
             'filename': 'alpha-1.0-py3-none-any.whl',
             'url': 'https://files.pythonhosted.org/packages/alpha-1.0-py3-none-any.whl',
-            'sha256': '2' * 64,
+            'sha256': '23456789abcdeffedcba98765432100123456789abcdeffedcba987654321012',
         }],
     )
     m['native_dll_artifacts'] = []
@@ -241,7 +241,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     assert '--no-index' in baseline_cmd
     assert '--require-hashes' in baseline_cmd
     assert '--find-links' in baseline_cmd
-    assert requirement_texts == ['alpha==1.0 --hash=sha256:' + '2' * 64 + '\n']
+    assert requirement_texts == ['alpha==1.0 --hash=sha256:23456789abcdeffedcba98765432100123456789abcdeffedcba987654321012' + '\n']
 
 
 def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path):
@@ -253,8 +253,20 @@ def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path
     with pytest.raises(prep.RuntimePrepError, match='immutable HTTPS'):
         prep.fetch('https://example.com/runtime.tar.gz', digest, artifact)
 
-    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
-        prep.fetch('https://github.com/example/runtime.tar.gz', 'f' * 64, artifact)
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda *args, **kwargs: Response(b'wrong-download'))
+    try:
+        with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+            prep.fetch('https://github.com/example/runtime.tar.gz', 'fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef', artifact)
+    finally:
+        monkeypatch.undo()
 
 
 
@@ -271,7 +283,7 @@ def test_fetch_uses_part_file_and_does_not_poison_cache_on_mismatch(tmp_path, mo
     monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda *args, **kwargs: Response(b'bad-bytes'))
 
     with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
-        prep.fetch('https://github.com/example/artifact.zip', '0' * 64, dest)
+        prep.fetch('https://github.com/example/artifact.zip', '0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210', dest)
 
     assert not dest.exists()
     assert not (tmp_path / 'artifact.zip.part').exists()
@@ -329,7 +341,7 @@ def test_manifest_validates_local_wheelhouse_contract(tmp_path):
         'version': '2.32.5',
         'filename': 'requests-2.32.5-py3-none-any.whl',
         'url': 'https://files.pythonhosted.org/packages/requests-2.32.5-py3-none-any.whl',
-        'sha256': 'a' * 64,
+        'sha256': 'abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd',
     }
     write_manifest(path, manifest(required_packages={'pip': '25.2', 'requests': '2.32.5', 'llama-cpp-python': '0.3.32'}, python_package_wheels=[wheel_artifact]))
     assert prep.load_manifest(path)['python_package_wheels'] == [wheel_artifact]
@@ -389,7 +401,7 @@ def test_validate_python_package_wheel_rejects_metadata_and_tag_mismatches(tmp_p
         'version': '4.15.0',
         'filename': 'typing_extensions-4.15.0-py3-none-any.whl',
         'url': 'https://files.pythonhosted.org/packages/typing_extensions.whl',
-        'sha256': 'f' * 64,
+        'sha256': 'fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef',
     }
     wheel = tmp_path / artifact['filename']
 
@@ -998,3 +1010,57 @@ def test_extract_microsoft_burn_member_rejects_traversal(tmp_path, monkeypatch):
 
     with pytest.raises(prep.RuntimePrepError, match='Microsoft redistributable member'):
         prep.extract_microsoft_burn_member(archive, '../evil.dll', tmp_path / 'evil.dll')
+
+
+def test_fetch_rejects_hostile_redirect_and_quarantines_poisoned_cache(tmp_path, monkeypatch):
+    dest = tmp_path / 'artifact.zip'
+    dest.write_bytes(b'poisoned-cache')
+    payload = b'fresh-artifact'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+
+    class RedirectResponse(io.BytesIO):
+        def __init__(self, data: bytes, final_url: str):
+            super().__init__(data)
+            self._final_url = final_url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def geturl(self):
+            return self._final_url
+
+    monkeypatch.setattr(
+        prep.urllib.request,
+        'urlopen',
+        lambda *args, **kwargs: RedirectResponse(payload, 'https://github.com.evil.example/artifact.zip'),
+    )
+    with pytest.raises(prep.RuntimePrepError, match='unapproved HTTPS host'):
+        prep.fetch('https://github.com/example/artifact.zip', digest, dest)
+    assert not dest.exists()
+    assert (tmp_path / 'artifact.zip.poisoned').read_bytes() == b'poisoned-cache'
+
+    monkeypatch.setattr(
+        prep.urllib.request,
+        'urlopen',
+        lambda *args, **kwargs: RedirectResponse(payload, 'https://release-assets.githubusercontent.com/github-production-release-asset'),
+    )
+    assert prep.fetch('https://github.com/example/artifact.zip', digest, dest) == dest
+    assert dest.read_bytes() == payload
+
+
+def test_load_manifest_rejects_placeholder_pattern_hashes(tmp_path):
+    path = tmp_path / 'manifest.json'
+    data = manifest()
+    data['native_dll_artifacts'][0]['sha256'] = '1' * 64
+    write_manifest(path, data)
+    with pytest.raises(prep.RuntimePrepError, match='placeholder-pattern'):
+        prep.load_manifest(path)
+
+    data = manifest()
+    data['native_dll_artifacts'][0]['extracted_sha256'] = '0123456789abcdef' * 4
+    write_manifest(path, data)
+    with pytest.raises(prep.RuntimePrepError, match='placeholder-pattern'):
+        prep.load_manifest(path)

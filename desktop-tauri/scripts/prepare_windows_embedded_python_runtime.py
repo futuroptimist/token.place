@@ -2,7 +2,7 @@
 """Prepare the deterministic Windows x86-64 CPython/CUDA runtime for Tauri."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, re, shutil, struct, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, json, os, platform, re, shutil, struct, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -12,6 +12,45 @@ MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_windows_x86_64_manife
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PLACEHOLDER_SHA_RE = re.compile(r"^(?:([0-9a-f])\1{63}|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)$")
+
+APPROVED_ORIGIN_HOSTS = {
+    "github.com": {"github.com", "release-assets.githubusercontent.com"},
+    "files.pythonhosted.org": {"files.pythonhosted.org"},
+    "developer.download.nvidia.com": {"developer.download.nvidia.com"},
+    "download.visualstudio.microsoft.com": {"download.visualstudio.microsoft.com"},
+}
+
+def _validate_sha256_pin(value: str, label: str) -> None:
+    if not SHA256_RE.fullmatch(value or ""):
+        raise RuntimePrepError(f"{label} must be 64 lowercase hex characters")
+    if PLACEHOLDER_SHA_RE.fullmatch(value):
+        raise RuntimePrepError(f"{label} must not use placeholder-pattern SHA-256 values")
+
+def _validated_artifact_url(url: str) -> urllib.parse.SplitResult:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise RuntimePrepError("runtime artifacts must be fetched from pinned immutable HTTPS URLs")
+    if parsed.username or parsed.password:
+        raise RuntimePrepError("runtime artifact URLs must not include credentials")
+    if parsed.port not in (None, 443):
+        raise RuntimePrepError("runtime artifact URLs must use the default HTTPS port")
+    host = parsed.hostname.lower().rstrip(".")
+    if host not in APPROVED_ORIGIN_HOSTS:
+        raise RuntimePrepError("runtime artifacts must be fetched from pinned immutable HTTPS URLs")
+    return parsed
+
+def _validate_redirect_url(original: urllib.parse.SplitResult, final_url: str) -> None:
+    final = urllib.parse.urlsplit(final_url)
+    if final.scheme != "https" or not final.hostname:
+        raise RuntimePrepError("runtime artifact redirected to an unapproved HTTPS host")
+    if final.username or final.password or final.port not in (None, 443):
+        raise RuntimePrepError("runtime artifact redirected to an unapproved HTTPS host")
+    origin_host = (original.hostname or "").lower().rstrip(".")
+    final_host = final.hostname.lower().rstrip(".")
+    if final_host not in APPROVED_ORIGIN_HOSTS.get(origin_host, set()):
+        raise RuntimePrepError("runtime artifact redirected to an unapproved HTTPS host")
+
 WINDOWS_SYSTEM_DLLS = {
     "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cabinet.dll", "comctl32.dll",
     "comdlg32.dll", "crypt32.dll", "gdi32.dll", "imm32.dll", "iphlpapi.dll",
@@ -57,8 +96,8 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         if artifact.get("architecture") != "AMD64": raise RuntimePrepError("native DLL artifacts must be AMD64")
         if not artifact.get("url", "").startswith(("https://developer.download.nvidia.com/", "https://download.visualstudio.microsoft.com/")):
             raise RuntimePrepError("native DLL artifacts must use approved immutable vendor URLs")
-        if not SHA256_RE.fullmatch(artifact.get("sha256", "")): raise RuntimePrepError("native DLL artifact sha256 must be 64 lowercase hex characters")
-        if not SHA256_RE.fullmatch(artifact.get("extracted_sha256", "")): raise RuntimePrepError("native DLL extracted_sha256 must be 64 lowercase hex characters")
+        _validate_sha256_pin(artifact.get("sha256", ""), "native DLL artifact sha256")
+        _validate_sha256_pin(artifact.get("extracted_sha256", ""), "native DLL extracted_sha256")
         member = artifact.get("archive_member_path", "")
         if not member or Path(member).is_absolute() or ".." in Path(member).parts:
             raise RuntimePrepError("native DLL artifact archive_member_path must be exact and relative")
@@ -77,8 +116,8 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll"}
         missing_vendor = sorted(required_vendor - native_names)
         if missing_vendor: raise RuntimePrepError(f"missing native DLL artifact pins: {missing_vendor}")
-    if not SHA256_RE.fullmatch(m.get("sha256", "")): raise RuntimePrepError("archive sha256 must be 64 lowercase hex characters")
-    if not SHA256_RE.fullmatch(wheel.get("sha256", "")): raise RuntimePrepError("llama-cpp-python wheel sha256 must be 64 lowercase hex characters")
+    _validate_sha256_pin(m.get("sha256", ""), "archive sha256")
+    _validate_sha256_pin(wheel.get("sha256", ""), "llama-cpp-python wheel sha256")
     wheelhouse = m.get("python_package_wheels", [])
     if not isinstance(wheelhouse, list): raise RuntimePrepError("python_package_wheels must be a list")
     seen = set()
@@ -88,7 +127,7 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         if not artifact["filename"].endswith(".whl"): raise RuntimePrepError("python_package_wheels entries must be wheels")
         if artifact["package"].lower().replace("_", "-") == "llama-cpp-python": raise RuntimePrepError("llama-cpp-python must be pinned only by llama_cpp_cuda_wheel")
         if not artifact["url"].startswith(("https://files.pythonhosted.org/", "https://github.com/")): raise RuntimePrepError("python wheel URLs must be immutable HTTPS artifact URLs")
-        if not SHA256_RE.fullmatch(artifact["sha256"]): raise RuntimePrepError("python wheel sha256 must be 64 lowercase hex characters")
+        _validate_sha256_pin(artifact["sha256"], "python wheel sha256")
         if "win_amd64" not in artifact["filename"] and "none-any" not in artifact["filename"]: raise RuntimePrepError("python wheels must be win_amd64 or none-any")
         key = artifact["package"].lower().replace("_", "-")
         if key in seen: raise RuntimePrepError(f"duplicate python wheel package: {artifact['package']}")
@@ -106,27 +145,20 @@ def is_windows_system_dll(name: str) -> bool:
     return dll in WINDOWS_SYSTEM_DLLS or bool(WINDOWS_API_SET_DLL_RE.fullmatch(dll))
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
-    if not url.startswith((
-        "https://github.com/",
-        "https://files.pythonhosted.org/",
-        "https://developer.download.nvidia.com/",
-        "https://download.visualstudio.microsoft.com/",
-    )):
-        raise RuntimePrepError("runtime artifacts must be fetched from pinned immutable HTTPS URLs")
+    original = _validated_artifact_url(url)
+    _validate_sha256_pin(sha, "runtime artifact sha256")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and sha256_file(dest) != sha:
+        poisoned = dest.with_name(dest.name + ".poisoned")
+        poisoned.unlink(missing_ok=True)
+        dest.replace(poisoned)
     if not dest.exists():
         part = dest.with_name(dest.name + '.part')
         part.unlink(missing_ok=True)
         try:
             with urllib.request.urlopen(url, timeout=120) as r, part.open('wb') as f:  # nosec B310 - URL scheme/host is validated and SHA-256 pinned
                 final_url = getattr(r, "geturl", lambda: url)()
-                if not final_url.startswith((
-                    "https://github.com/",
-                    "https://files.pythonhosted.org/",
-                    "https://developer.download.nvidia.com/",
-                    "https://download.visualstudio.microsoft.com/",
-                )):
-                    raise RuntimePrepError("runtime artifact redirected to an unapproved HTTPS host")
+                _validate_redirect_url(original, final_url)
                 shutil.copyfileobj(r, f)
             got = sha256_file(part)
             if got != sha:
@@ -135,7 +167,11 @@ def fetch(url: str, sha: str, dest: Path) -> Path:
         finally:
             part.unlink(missing_ok=True)
     got=sha256_file(dest)
-    if got != sha: raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
+    if got != sha:
+        poisoned = dest.with_name(dest.name + ".poisoned")
+        poisoned.unlink(missing_ok=True)
+        dest.replace(poisoned)
+        raise RuntimePrepError(f"digest mismatch for {dest.name}: expected {sha} got {got}")
     return dest
 
 def _find_cab_offsets(data: bytes) -> list[int]:

@@ -36,14 +36,31 @@ def relay_client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_terminal_outcomes.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     api_v1_recently_unregistered_servers.clear()
+    relay_module.api_v1_control_tombstones.clear()
     api_v1_filtered_round_robin_next_positions.clear()
     relay_module.server_round_robin_next_index = 0
+    for limiter in app.extensions.get("limiter", set()):
+        storage = getattr(getattr(limiter, "limiter", None), "storage", None)
+        if storage is None:
+            continue
+        if hasattr(storage, "reset"):
+            storage.reset()
+        elif hasattr(storage, "clear"):
+            storage.clear()
+    control_plane_limiter = app.config.get("relay_control_plane_rate_limiter")
+    control_plane_storage = getattr(control_plane_limiter, "storage", None)
+    if control_plane_storage is not None:
+        if hasattr(control_plane_storage, "reset"):
+            control_plane_storage.reset()
+        elif hasattr(control_plane_storage, "clear"):
+            control_plane_storage.clear()
     os.environ.pop("TOKENPLACE_METRICS_DISABLED", None)
     os.environ.pop("TOKENPLACE_METRICS_TOKEN", None)
     with app.test_client() as client:
@@ -51,14 +68,31 @@ def relay_client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_terminal_outcomes.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     api_v1_recently_unregistered_servers.clear()
+    relay_module.api_v1_control_tombstones.clear()
     api_v1_filtered_round_robin_next_positions.clear()
     relay_module.server_round_robin_next_index = 0
+    for limiter in app.extensions.get("limiter", set()):
+        storage = getattr(getattr(limiter, "limiter", None), "storage", None)
+        if storage is None:
+            continue
+        if hasattr(storage, "reset"):
+            storage.reset()
+        elif hasattr(storage, "clear"):
+            storage.clear()
+    control_plane_limiter = app.config.get("relay_control_plane_rate_limiter")
+    control_plane_storage = getattr(control_plane_limiter, "storage", None)
+    if control_plane_storage is not None:
+        if hasattr(control_plane_storage, "reset"):
+            control_plane_storage.reset()
+        elif hasattr(control_plane_storage, "clear"):
+            control_plane_storage.clear()
 
 
 def test_json_formatter_outputs_structured_payload() -> None:
@@ -298,8 +332,10 @@ def test_request_outcomes_cover_cancel_expire_timeout_and_rate_limit(relay_clien
     )
 
     monkeypatch.setattr(relay_module, "PENDING_REQUEST_TTL_SECONDS", 0.001)
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, "1")
     _queue_request(relay_client, request_id="request-expire")
-    time.sleep(0.01)
+    original_monotonic = time.monotonic
+    monkeypatch.setattr(relay_module.time, "monotonic", lambda: original_monotonic() + 2.0)
     relay_module._expire_stale_pending_requests()
 
     before_rate_limit_body = _metric_body(relay_client)
@@ -645,7 +681,7 @@ def test_unknown_terminal_attempts_do_not_increment_outcomes(relay_client) -> No
         },
     )
 
-    assert orphan_response.status_code == 200
+    assert orphan_response.status_code == 410
     assert _outcome_value(relay_client, "cancelled") == before["cancelled"]
     assert _outcome_value(relay_client, "completed") == before["completed"]
 
@@ -810,10 +846,17 @@ def test_metrics_do_not_expose_high_cardinality_or_sensitive_values(relay_client
     sensitive_values = set()
     caplog.set_level(logging.INFO, logger="tokenplace.relay")
     before_body = _metric_body(relay_client)
-    before_label_lines = {
-        line for line in before_body.splitlines()
-        if line.startswith("tokenplace_http_requests_total{")
-    }
+    def _http_request_label_keys(metric_body: str) -> set[str]:
+        labels = set()
+        for line in metric_body.splitlines():
+            if not line.startswith("tokenplace_http_requests_total{"):
+                continue
+            end = line.find("}")
+            if end != -1:
+                labels.add(line[: end + 1])
+        return labels
+
+    before_label_lines = _http_request_label_keys(before_body)
     for idx in range(25):
         server_key = f"server-sensitive-{idx}"
         client_key = f"client-sensitive-{idx}"
@@ -843,15 +886,183 @@ def test_metrics_do_not_expose_high_cardinality_or_sensitive_values(relay_client
     for value in sensitive_values:
         assert value not in body
 
-    label_lines = {
-        line for line in body.splitlines()
-        if line.startswith("tokenplace_http_requests_total{")
-    }
+    label_lines = _http_request_label_keys(body)
     assert len(label_lines - before_label_lines) <= 3
 
     logs = "\n".join(record.getMessage() + json.dumps(record.__dict__, default=str) for record in caplog.records)
     for value in sensitive_values:
         assert value not in logs
+
+
+def test_compute_control_metrics_are_bounded_and_privacy_safe(relay_client, caplog) -> None:
+    caplog.set_level(logging.DEBUG)
+    register = _register_node(relay_client, server_key="server-metric-control")
+    credential = register.get_json()["control_credential"]
+
+    sensitive_values = {
+        "server-metric-control",
+        "client-metric-control",
+        "client-metric-control-cancelled",
+        "client-metric-control-expired",
+        "client-metric-control-completed",
+        "request-control-metric-active",
+        "request-control-metric-cancelled",
+        "request-control-metric-expired",
+        "request-control-metric-completed",
+        "proof-metric-control-active",
+        "proof-metric-control-cancelled",
+        "proof-metric-control-expired",
+        "proof-metric-control-completed",
+        "cipher-metric-control-active",
+        "cipher-metric-control-cancelled",
+        "cipher-metric-control-expired",
+        "cipher-metric-control-completed",
+        "key-metric-control-active",
+        "iv-metric-control-active",
+        credential,
+    }
+
+    def queue_and_dispatch(request_id: str, *, client_key: str, cancel_token: str, ciphertext: str):
+        queued = relay_client.post(
+            "/api/v1/relay/requests",
+            json={
+                "server_public_key": "server-metric-control",
+                "client_public_key": client_key,
+                "request_id": request_id,
+                "ciphertext": ciphertext,
+                "cipherkey": "key-metric-control-active",
+                "iv": "iv-metric-control-active",
+                "cancel_token": cancel_token,
+            },
+        )
+        assert queued.status_code == 200
+        poll = relay_client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": "server-metric-control"},
+        )
+        assert poll.status_code == 200
+        assert poll.get_json()["request_id"] == request_id
+
+    active_request_id = "request-control-metric-active"
+    queue_and_dispatch(
+        active_request_id,
+        client_key="client-metric-control",
+        cancel_token="proof-metric-control-active",
+        ciphertext="cipher-metric-control-active",
+    )
+    control = relay_client.post(
+        "/api/v1/relay/servers/control",
+        json={
+            "server_public_key": "server-metric-control",
+            "request_id": active_request_id,
+            "control_credential": credential,
+        },
+    )
+    assert control.status_code == 200
+    assert control.get_json()["status"] == "active"
+
+    cancelled_request_id = "request-control-metric-cancelled"
+    queue_and_dispatch(
+        cancelled_request_id,
+        client_key="client-metric-control-cancelled",
+        cancel_token="proof-metric-control-cancelled",
+        ciphertext="cipher-metric-control-cancelled",
+    )
+    cancelled = relay_client.post(
+        "/api/v1/relay/requests/cancel",
+        json={
+            "client_public_key": "client-metric-control-cancelled",
+            "request_id": cancelled_request_id,
+            "cancel_token": "proof-metric-control-cancelled",
+        },
+    )
+    assert cancelled.status_code == 200
+    cancelled_control = relay_client.post(
+        "/api/v1/relay/servers/control",
+        json={
+            "server_public_key": "server-metric-control",
+            "request_id": cancelled_request_id,
+            "control_credential": credential,
+        },
+    )
+    assert cancelled_control.status_code == 200
+    assert cancelled_control.get_json()["status"] == "cancelled"
+    acknowledged = relay_client.post(
+        "/api/v1/relay/servers/control",
+        json={
+            "server_public_key": "server-metric-control",
+            "request_id": cancelled_request_id,
+            "control_credential": credential,
+            "acknowledge": True,
+        },
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.get_json()["status"] == "cancelled"
+
+    expired_request_id = "request-control-metric-expired"
+    queue_and_dispatch(
+        expired_request_id,
+        client_key="client-metric-control-expired",
+        cancel_token="proof-metric-control-expired",
+        ciphertext="cipher-metric-control-expired",
+    )
+    known_servers["server-metric-control"]["api_v1_in_flight_requests"][expired_request_id][
+        "request_deadline_monotonic"
+    ] = time.monotonic() - 1.0
+    expired = relay_client.post(
+        "/api/v1/relay/servers/control",
+        json={
+            "server_public_key": "server-metric-control",
+            "request_id": expired_request_id,
+            "control_credential": credential,
+        },
+    )
+    assert expired.status_code == 200
+    assert expired.get_json()["status"] == "expired"
+
+    completed_request_id = "request-control-metric-completed"
+    queue_and_dispatch(
+        completed_request_id,
+        client_key="client-metric-control-completed",
+        cancel_token="proof-metric-control-completed",
+        ciphertext="cipher-metric-control-completed",
+    )
+    completed = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-metric-control-completed",
+            "request_id": completed_request_id,
+            "ciphertext": "cipher-response-metric-completed",
+            "cipherkey": "key-response-metric-completed",
+            "iv": "iv-response-metric-completed",
+        },
+    )
+    assert completed.status_code == 200
+    completed_control = relay_client.post(
+        "/api/v1/relay/servers/control",
+        json={
+            "server_public_key": "server-metric-control",
+            "request_id": completed_request_id,
+            "control_credential": credential,
+        },
+    )
+    assert completed_control.status_code == 200
+    assert completed_control.get_json()["status"] == "completed/unavailable"
+
+    metrics_body = _metric_body(relay_client)
+    for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
+        assert _metric_value(
+            metrics_body,
+            "tokenplace_relay_compute_control_requests_total",
+            f'{{state="{state}"}}',
+        ) >= 1
+    assert "state=\"lease_renewed\"" not in metrics_body
+    assert _metric_value(metrics_body, "tokenplace_relay_compute_control_lease_renewals_total") >= 1
+
+    log_body = "\n".join(record.getMessage() + json.dumps(record.__dict__, default=str) for record in caplog.records)
+    for raw in sensitive_values | {"cipher-response-metric-completed", "key-response-metric-completed", "iv-response-metric-completed"}:
+        assert raw not in metrics_body
+        assert raw not in log_body
 
 
 def test_metrics_scrape_uses_bounded_relay_registry(relay_client) -> None:

@@ -2304,6 +2304,15 @@ class RelayClient:
     ) -> bool:
         """Encrypt and submit an API v1 response to the relay that supplied work."""
 
+        if not self._api_v1_begin_mutation():
+            log_info(
+                "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
+                response_envelope.get("request_id"),
+                response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
+                "/api/v1/relay/responses",
+            )
+            return False
+
         try:
             bound_response_envelope = {
                 **response_envelope,
@@ -2369,6 +2378,8 @@ class RelayClient:
                 exc_info=True,
             )
             return False
+        finally:
+            self._api_v1_end_mutation()
 
 
     def submit_api_v1_error_response(
@@ -4550,6 +4561,15 @@ class RelayClient:
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                     )
+                    if (
+                        not submitted
+                        and (
+                            getattr(self, "_api_v1_mutation_latched", False)
+                            or getattr(self, "_polling_stopped_by_request", False)
+                        )
+                    ):
+                        safe_error_code = "shutdown_requested"
+                        runtime_healthy = True
                     return RelayProcessingResult(
                         inference_succeeded=safe_error_code is None and submitted,
                         submitted=submitted,

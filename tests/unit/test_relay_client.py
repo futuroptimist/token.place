@@ -7355,3 +7355,132 @@ def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mo
 
     assert observed == ['current-secret', 'current-secret']
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+def test_process_client_request_post_race_after_generation_returns_shutdown_without_network():
+    manager = _AdmissionManager()
+    client = _api_v1_validation_client(manager)
+    client._api_v1_registered_relays.add(client.relay_url)
+    client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
+        request_id="req-post-race"
+    )
+    client.crypto_manager.encrypt_message.return_value = {"ciphertext": "cipher", "nonce": "nonce"}
+    original_begin = client._api_v1_begin_mutation
+    begin_entered = threading.Event()
+    release_begin = threading.Event()
+
+    def blocked_begin():
+        begin_entered.set()
+        assert release_begin.wait(timeout=2.0)
+        return original_begin()
+
+    client._api_v1_begin_mutation = blocked_begin
+    result_holder = {}
+
+    with patch("utils.networking.relay_client.requests.post") as mock_post:
+        worker = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                "result", client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert begin_entered.wait(timeout=2.0)
+            client._api_v1_latch_shutdown()
+            release_begin.set()
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
+        finally:
+            release_begin.set()
+            worker.join(timeout=2.0)
+
+        mock_post.assert_not_called()
+
+    result = result_holder["result"]
+    assert result.submitted is False
+    assert result.runtime_healthy is True
+    assert result.safe_error_code == "shutdown_requested"
+
+
+def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add("http://localhost:5000")
+    client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
+    client.crypto_manager.encrypt_message.return_value = {"ciphertext": "cipher", "nonce": "nonce"}
+    response_envelope = client._api_v1_response_envelope(
+        "req-admitted", message={"role": "assistant", "content": "ok"}
+    )
+    response_post_entered = threading.Event()
+    release_response_post = threading.Event()
+    unregister_entered = threading.Event()
+    mutations = []
+
+    def fake_post(url, **kwargs):
+        if url.endswith("/api/v1/relay/responses"):
+            mutations.append("response")
+            response_post_entered.set()
+            assert release_response_post.wait(timeout=2.0)
+            return MagicMock(status_code=200)
+        if url.endswith("/api/v1/relay/servers/unregister"):
+            mutations.append("unregister")
+            unregister_entered.set()
+            return MagicMock(status_code=200)
+        raise AssertionError(f"unexpected POST {url}")
+
+    response_worker = threading.Thread(
+        target=lambda: client._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64=TEST_VALID_RESPONSE["client_public_key"],
+            client_pub_key=base64.b64decode(TEST_VALID_RESPONSE["client_public_key"], validate=True),
+        ),
+        daemon=True,
+    )
+    with patch("utils.networking.relay_client.requests.post", side_effect=fake_post):
+        response_worker.start()
+        try:
+            assert response_post_entered.wait(timeout=2.0)
+            client._api_v1_latch_shutdown()
+            unregister_worker = threading.Thread(
+                target=lambda: (
+                    client._api_v1_wait_for_mutation_quiescence(
+                        shutdown_deadline=time.monotonic() + 2.0
+                    ),
+                    client.unregister_from_relay(shutdown_deadline=time.monotonic() + 2.0),
+                ),
+                daemon=True,
+            )
+            unregister_worker.start()
+            assert not unregister_entered.wait(timeout=0.1)
+            release_response_post.set()
+            response_worker.join(timeout=2.0)
+            unregister_worker.join(timeout=2.0)
+            assert not response_worker.is_alive()
+            assert not unregister_worker.is_alive()
+        finally:
+            release_response_post.set()
+            response_worker.join(timeout=2.0)
+
+    assert mutations == ["response", "unregister"]
+    assert client._api_v1_registered_relays == set()
+
+
+@patch("utils.networking.relay_client.requests.post")
+def test_submit_api_v1_error_response_after_shutdown_latch_skips_network(mock_post):
+    client = _standalone_relay_client()
+    client.crypto_manager.encrypt_message.return_value = {"ciphertext": "cipher", "nonce": "nonce"}
+    request_data = {
+        **TEST_VALID_RESPONSE,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-error-after-latch",
+    }
+    client._api_v1_latch_shutdown()
+
+    assert client.submit_api_v1_error_response(
+        request_data,
+        code="compute_node_internal_error",
+        message="Desktop runtime inference failed",
+    ) is False
+    client.crypto_manager.encrypt_message.assert_not_called()
+    mock_post.assert_not_called()

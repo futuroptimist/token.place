@@ -4796,6 +4796,95 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     assert stale.closed is True
 
 
+def test_model_manager_cancellation_advances_generation_without_active_worker(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 3
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    monkeypatch.setattr(time, "time", lambda: 12.345)
+
+    old_event = manager._llm_cancel_generation_event
+    manager.terminate_active_worker_for_cancellation(reason="bad reason with spaces")
+
+    assert manager.llm is None
+    assert manager.worker_state == "recovering"
+    assert manager.last_worker_error_code == "cancelled"
+    assert manager.worker_restart_count == 4
+    assert manager.last_worker_restart_at_ms == 12345
+    assert manager._llm_generation == 8
+    assert old_event.is_set() is True
+    assert manager._llm_cancel_generation_event is not old_event
+    assert manager._llm_cancel_generation_event.is_set() is False
+
+
+def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    already_dead = SimpleNamespace(
+        close=MagicMock(),
+        _process=SimpleNamespace(poll=MagicMock(return_value=9), terminate=MagicMock(), kill=MagicMock()),
+    )
+    manager._close_llm_proxy(already_dead, terminate_process=True)
+    already_dead.close.assert_called_once_with()
+    already_dead._process.terminate.assert_not_called()
+    already_dead._process.kill.assert_not_called()
+
+    terminate_fails_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=terminate_fails_process), terminate_process=True)
+    terminate_fails_process.terminate.assert_called_once_with()
+    terminate_fails_process.kill.assert_called_once_with()
+    terminate_fails_process.wait.assert_called_once_with(timeout=1.0)
+
+    stubborn_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still running"), 0]),
+        kill=MagicMock(),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=stubborn_process), terminate_process=True)
+    stubborn_process.terminate.assert_called_once_with()
+    stubborn_process.kill.assert_called_once_with()
+    assert stubborn_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+    broken_poll_process = SimpleNamespace(
+        poll=MagicMock(side_effect=RuntimeError("poll failed")),
+        terminate=MagicMock(),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=broken_poll_process), terminate_process=True)
+    broken_poll_process.terminate.assert_not_called()
+
+
+def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement = _RestartableFakeWorker("replacement")
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, replacement])
+
+    def _invalidate_and_signal(_llm, _exc):
+        manager._llm_cancel_generation_event.set()
+        return manager._llm_generation + 1
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_and_signal)
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", MagicMock(return_value=replacement))
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert first.calls == 1
+    assert replacement.calls == 0
+    manager._ensure_replacement_llm.assert_not_called()
+    assert created == [first]
+
 def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog, capsys):
     """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
     from utils.llm import model_manager as model_manager_module

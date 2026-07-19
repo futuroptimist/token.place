@@ -5765,6 +5765,32 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
         self._close_llm_proxy(failed_runtime)
 
+    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled') -> None:
+        """Terminate the active subprocess-backed llama worker and require clean recreation."""
+        safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
+        with self.llm_lock:
+            llm = self.llm
+            if llm is None:
+                self.worker_state = 'recovering'
+                self.last_worker_error_code = safe_reason
+                self.worker_restart_count += 1
+                self.last_worker_restart_at_ms = int(time.time() * 1000)
+                self._llm_generation += 1
+                return
+            self.last_worker_exit_code = self._worker_exit_code(llm)
+            self.last_worker_error_code = safe_reason
+            self.worker_state = 'recovering'
+            self.worker_restart_count += 1
+            self.last_worker_restart_at_ms = int(time.time() * 1000)
+            self.llm = None
+            self._llm_generation += 1
+        self._close_llm_proxy(llm)
+        # Eagerly validate a clean worker for the next request when possible.
+        try:
+            self.get_llm_instance()
+        except Exception:
+            self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+
     def _close_llm_proxy(self, llm: Any) -> None:
         close = getattr(llm, 'close', None)
         if callable(close):

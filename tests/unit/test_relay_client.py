@@ -7013,3 +7013,165 @@ def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mo
 
     assert observed == ['current-secret', 'current-secret']
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+def test_api_v1_deadline_metadata_uses_smaller_and_never_extends(monkeypatch):
+    client = _standalone_relay_client()
+    now = {'value': 1000.0}
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+
+    deadline = client._api_v1_initial_deadline_from_metadata({
+        'request_deadline_remaining_seconds': 10,
+        'request_ttl_seconds': 30,
+    })
+    assert deadline == 1010.0
+    shortened = client._api_v1_deadline_after_response(deadline, {'request_ttl_seconds': 3})
+    assert shortened == 1003.0
+    extended = client._api_v1_deadline_after_response(shortened, {'request_deadline_remaining_seconds': 300})
+    assert extended == shortened
+    assert client._api_v1_initial_deadline_from_metadata({'request_ttl_seconds': True}) == 1300.0
+
+
+@pytest.mark.parametrize('raw,expected', [(0, 1.0), (0.25, 1.0), (11, 10.0), ('bad', 1.0), (3, 3.0)])
+def test_api_v1_control_next_poll_seconds_clamped(raw, expected):
+    assert RelayClient._api_v1_control_next_poll_seconds(raw) == expected
+
+
+def test_api_v1_registration_heartbeat_omission_preserves_independent_credentials(monkeypatch):
+    client = _standalone_relay_client()
+    responses = [
+        {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-a'},
+        {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-b'},
+        {'next_ping_in_x_seconds': 30},
+    ]
+
+    def fake_post(*_args, **_kwargs):
+        response = MagicMock(status_code=200)
+        response.json.return_value = responses.pop(0)
+        return response
+
+    monkeypatch.setattr(relay_client_module.requests, 'post', fake_post)
+    assert client.register_api_v1_compute_node('https://relay-a.example') == {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-a'}
+    assert client.register_api_v1_compute_node('https://relay-b.example') == {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-b'}
+    assert client.register_api_v1_compute_node('https://relay-a.example') == {'next_ping_in_x_seconds': 30}
+    assert client._api_v1_control_credential_for_relay('https://relay-a.example') == 'cred-a'
+    assert client._api_v1_control_credential_for_relay('https://relay-b.example') == 'cred-b'
+
+
+@pytest.mark.parametrize('status,ack_count', [('cancelled', 1), ('expired', 1), ('completed', 0), ('unavailable', 0)])
+def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monkeypatch, status, ack_count):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def generate(**_kwargs):
+        started.set()
+        release.wait(2)
+        return {'request_id': 'late', 'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}}}
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': status}
+        started.wait(1)
+        return {'status': status, 'next_poll_seconds': 1}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert result is None
+    assert stopped == [status]
+    assert len(acks) == ack_count
+
+
+def test_api_v1_local_deadline_stops_before_next_control_poll(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    control_calls = []
+    stopped = []
+
+    def generate(**_kwargs):
+        release.wait(2)
+        return {'request_id': 'late'}
+
+    def control(**_kwargs):
+        control_calls.append(time.monotonic())
+        return {'status': 'active', 'next_poll_seconds': 10}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    started = time.monotonic()
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.2,
+    })
+
+    assert result is None
+    assert stopped == ['local_deadline']
+    assert control_calls
+    assert time.monotonic() - started < 1.0
+
+
+def test_api_v1_control_403_fail_closed_stops_without_ack():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    stopped = []
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+    client._post_api_v1_request_control = lambda **_kwargs: (_ for _ in ()).throw(PermissionError('api_v1_control_owner_proof_failed'))
+    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req', 'model': 'm', 'messages': [], 'options': {},
+        'routing': {'context_tier': '8k-fast'}, 'request_ttl_seconds': 30,
+    }) is None
+    assert stopped == ['owner_proof_failed']
+
+
+def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreates():
+    from utils.llm.model_manager import ModelManager
+
+    config = MagicMock()
+    config.get.side_effect = lambda key, default=None: {'model.use_mock': True, 'paths.models_dir': '/tmp'}.get(key, default)
+    manager = ModelManager(config)
+    old = MagicMock()
+    old.is_alive.return_value = True
+    manager.llm = old
+    manager.worker_state = 'ready'
+    created = MagicMock()
+    manager.get_llm_instance = MagicMock(return_value=created)
+
+    manager.terminate_active_worker_for_cancellation(reason='cancelled')
+
+    old.close.assert_called_once()
+    manager.get_llm_instance.assert_called_once()
+    assert manager.llm is None
+    assert manager.last_worker_error_code == 'cancelled'
+    assert manager.worker_restart_count == 1

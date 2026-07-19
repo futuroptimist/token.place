@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -103,6 +103,8 @@ pub struct ComputeNodeState {
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
     pub next_session_id: Arc<Mutex<u64>>,
+    pub stopped_event_ack_session_id: Arc<Mutex<Option<String>>>,
+    pub stopped_event_ack_notify: Arc<Notify>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -611,36 +613,43 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .get("last_worker_restart_at_ms")
             .and_then(Value::as_u64);
     }
-    if payload.get("unregister_required").is_some() {
-        status.stop_cleanup_required = payload.get("unregister_required").and_then(Value::as_bool);
-    }
-    if payload.get("unregister_attempted").is_some() {
-        status.stop_cleanup_attempted =
-            payload.get("unregister_attempted").and_then(Value::as_bool);
-    }
-    if payload.get("unregister_outcome").is_some() {
-        status.stop_cleanup_outcome = payload
-            .get("unregister_outcome")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-    if payload.get("unregister_success_count").is_some() {
-        status.stop_cleanup_success_count = payload
-            .get("unregister_success_count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize);
-    }
-    if payload.get("unregister_failure_count").is_some() {
-        status.stop_cleanup_failure_count = payload
-            .get("unregister_failure_count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize);
-    }
-    if payload.get("cleanup_warning").is_some() {
-        status.stop_cleanup_warning = payload
-            .get("cleanup_warning")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+    let accepts_stop_cleanup_fields = payload.get("type").and_then(Value::as_str)
+        == Some("stopped")
+        && payload_session.is_some_and(|session| !session.is_empty())
+        && status.operator_session_id.as_deref() == payload_session;
+    if accepts_stop_cleanup_fields {
+        if payload.get("unregister_required").is_some() {
+            status.stop_cleanup_required =
+                payload.get("unregister_required").and_then(Value::as_bool);
+        }
+        if payload.get("unregister_attempted").is_some() {
+            status.stop_cleanup_attempted =
+                payload.get("unregister_attempted").and_then(Value::as_bool);
+        }
+        if payload.get("unregister_outcome").is_some() {
+            status.stop_cleanup_outcome = payload
+                .get("unregister_outcome")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        if payload.get("unregister_success_count").is_some() {
+            status.stop_cleanup_success_count = payload
+                .get("unregister_success_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if payload.get("unregister_failure_count").is_some() {
+            status.stop_cleanup_failure_count = payload
+                .get("unregister_failure_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if payload.get("cleanup_warning").is_some() {
+            status.stop_cleanup_warning = payload
+                .get("cleanup_warning")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
@@ -665,6 +674,32 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .or_else(|| Some("compute-node bridge error".into()));
+    }
+    true
+}
+
+async fn apply_compute_node_event_to_state(state: &ComputeNodeState, payload: &Value) -> bool {
+    let event_type = payload.get("type").and_then(Value::as_str);
+    let payload_session = event_session_id(payload).filter(|session| !session.is_empty());
+    let mut accepted_stopped_session = None;
+    {
+        let mut status = state.status.lock().await;
+        let active_session = status.operator_session_id.clone();
+        let accepted = update_status_from_event(&mut status, payload);
+        if accepted
+            && event_type == Some("stopped")
+            && payload_session.is_some()
+            && active_session.as_deref() == payload_session
+        {
+            accepted_stopped_session = payload_session.map(ToOwned::to_owned);
+        }
+        if !accepted {
+            return false;
+        }
+    }
+    if let Some(session_id) = accepted_stopped_session {
+        *state.stopped_event_ack_session_id.lock().await = Some(session_id);
+        state.stopped_event_ack_notify.notify_waiters();
     }
     true
 }
@@ -1078,6 +1113,7 @@ pub async fn start_compute_node(
         status.stop_cleanup_failure_count = None;
         status.stop_cleanup_warning = None;
     }
+    *state.stopped_event_ack_session_id.lock().await = None;
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),
         Err(err) => {
@@ -1406,11 +1442,8 @@ pub async fn start_compute_node(
                         saw_startup_event = true;
                     }
                 }
-                {
-                    let mut status = state.status.lock().await;
-                    if !update_status_from_event(&mut status, &payload) {
-                        continue;
-                    }
+                if !apply_compute_node_event_to_state(&state, &payload).await {
+                    continue;
                 }
                 app.emit("compute_node_event", payload)?;
             }
@@ -1486,31 +1519,31 @@ pub async fn start_compute_node(
 async fn wait_for_stop_cleanup_ack(
     state: &ComputeNodeState,
     expected_session_id: &str,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
+    deadline: Instant,
+) -> bool {
     loop {
         {
-            let status = state.status.lock().await;
-            if status.operator_session_id.as_deref() == Some(expected_session_id)
-                && status.stop_cleanup_outcome.is_some()
-            {
-                return;
+            let ack = state.stopped_event_ack_session_id.lock().await;
+            if ack.as_deref() == Some(expected_session_id) {
+                return true;
             }
         }
         let now = Instant::now();
         if now >= deadline {
-            return;
+            return false;
         }
-        tokio::time::sleep(std::cmp::min(
-            Duration::from_millis(25),
-            deadline.saturating_duration_since(now),
-        ))
-        .await;
+        let notified = state.stopped_event_ack_notify.notified();
+        tokio::select! {
+            _ = notified => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return false,
+        }
     }
 }
 
-pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+async fn stop_compute_node_with_shutdown_timeout(
+    state: ComputeNodeState,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<()> {
     let (stop_session_id, stop_log_file_path) = {
         let status = state.status.lock().await;
         (
@@ -1530,6 +1563,8 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
             stop_session_id.as_deref().unwrap_or("unknown")
         ),
     );
+    let parent_shutdown_deadline = Instant::now() + shutdown_timeout;
+
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
@@ -1552,23 +1587,29 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     }
 
     let mut owned_child = None;
-    for _ in 0..20 {
+    while Instant::now() < parent_shutdown_deadline {
         if let Some(child) = state.child.lock().await.take() {
             owned_child = Some(child);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(std::cmp::min(
+            Duration::from_millis(25),
+            parent_shutdown_deadline.saturating_duration_since(Instant::now()),
+        ))
+        .await;
     }
 
     let mut bridge_killed = false;
     let had_child = owned_child.is_some();
     let mut child_exit_status = None;
     if let Some(mut child) = owned_child {
-        let shutdown_deadline = Duration::from_secs(12);
-        let shutdown_started = Instant::now();
         child_exit_status = child.try_wait()?;
-        while child_exit_status.is_none() && shutdown_started.elapsed() < shutdown_deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        while child_exit_status.is_none() && Instant::now() < parent_shutdown_deadline {
+            tokio::time::sleep(std::cmp::min(
+                Duration::from_millis(50),
+                parent_shutdown_deadline.saturating_duration_since(Instant::now()),
+            ))
+            .await;
             child_exit_status = child.try_wait()?;
         }
 
@@ -1622,10 +1663,12 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
+    let mut cleanup_acknowledged = !had_child || bridge_killed;
     if had_child && !bridge_killed {
         if let Some(expected_session_id) = stop_session_id.as_deref() {
-            wait_for_stop_cleanup_ack(&state, expected_session_id, Duration::from_millis(750))
-                .await;
+            cleanup_acknowledged =
+                wait_for_stop_cleanup_ack(&state, expected_session_id, parent_shutdown_deadline)
+                    .await;
         }
     }
 
@@ -1669,7 +1712,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
             Some(warning)
         } else if !session_matches {
             Some(warning)
-        } else if had_child && !coherent_success {
+        } else if had_child && (!cleanup_acknowledged || !coherent_success) {
             Some(warning)
         } else {
             None
@@ -1678,21 +1721,35 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 
     {
         let mut status = state.status.lock().await;
-        status.running = false;
-        status.registered = false;
-        status.registered_relay_count = 0;
-        status.registered_relay_urls.clear();
-        status.active_relay_urls.clear();
-        status.relay_runtime_state = Some("stopped".into());
-        if let Some(error) = stop_outcome_error.clone() {
-            status.last_error = Some(error);
+        let session_still_current = match (
+            stop_session_id.as_deref(),
+            status.operator_session_id.as_deref(),
+        ) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, None) => true,
+            _ => !had_child,
+        };
+        if session_still_current {
+            status.running = false;
+            status.registered = false;
+            status.registered_relay_count = 0;
+            status.registered_relay_urls.clear();
+            status.active_relay_urls.clear();
+            status.relay_runtime_state = Some("stopped".into());
+            if let Some(error) = stop_outcome_error.clone() {
+                status.last_error = Some(error);
+            }
+            status.updated_at_ms = Some(current_time_ms());
         }
-        status.updated_at_ms = Some(current_time_ms());
     }
     if let Some(error) = stop_outcome_error {
         anyhow::bail!(error);
     }
     Ok(())
+}
+
+pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+    stop_compute_node_with_shutdown_timeout(state, Duration::from_secs(12)).await
 }
 
 #[cfg(test)]
@@ -1703,6 +1760,11 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
+        *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());
+        state.stopped_event_ack_notify.notify_waiters();
+    }
 
     fn success_exit_status() -> ExitStatus {
         #[cfg(windows)]
@@ -2468,6 +2530,7 @@ mod tests {
             status.stop_cleanup_success_count = Some(1);
             status.stop_cleanup_failure_count = Some(0);
         }
+        acknowledge_stopped_event_for_test(&state, "cancel-session").await;
 
         let stop_result =
             tokio::time::timeout(Duration::from_secs(2), stop_compute_node(state.clone())).await;
@@ -2522,6 +2585,7 @@ mod tests {
             status.stop_cleanup_success_count = Some(1);
             status.stop_cleanup_failure_count = Some(0);
         }
+        acknowledge_stopped_event_for_test(&state, "cleanup-session").await;
 
         let started = Instant::now();
         let stop_result =
@@ -2566,6 +2630,7 @@ mod tests {
             status.stop_cleanup_success_count = Some(1);
             status.stop_cleanup_failure_count = Some(0);
         }
+        acknowledge_stopped_event_for_test(&state, "restart-session-1").await;
 
         stop_compute_node(state.clone()).await.expect("first stop");
         assert!(state.child.lock().await.is_none());
@@ -2590,6 +2655,7 @@ mod tests {
             status.stop_cleanup_success_count = Some(1);
             status.stop_cleanup_failure_count = Some(0);
         }
+        acknowledge_stopped_event_for_test(&state, "restart-session-2").await;
 
         stop_compute_node(state.clone()).await.expect("second stop");
         assert!(state.child.lock().await.is_none());
@@ -2657,10 +2723,12 @@ mod tests {
                 "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".into(),
             );
         }
+        acknowledge_stopped_event_for_test(&state, "partial-session").await;
 
-        let error = stop_compute_node(state.clone())
-            .await
-            .expect_err("partial cleanup should return an error");
+        let error =
+            stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_millis(200))
+                .await
+                .expect_err("partial cleanup should return an error");
         assert!(error
             .to_string()
             .contains("Operator stopped locally, but unregister did not complete"));
@@ -2690,17 +2758,13 @@ mod tests {
 
         let event_reader_state = state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(75)).await;
-            let mut status = event_reader_state.status.lock().await;
-            status.operator_session_id = Some("session-current".into());
-            status.stop_cleanup_required = Some(true);
-            status.stop_cleanup_attempted = Some(true);
-            status.stop_cleanup_outcome = Some("complete".into());
-            status.stop_cleanup_success_count = Some(1);
-            status.stop_cleanup_failure_count = Some(0);
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let line = r#"{"type":"stopped","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":1}"#;
+            let payload = parse_compute_node_event_line(line).expect("stopped payload");
+            assert!(apply_compute_node_event_to_state(&event_reader_state, &payload).await);
         });
 
-        stop_compute_node(state.clone())
+        stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_secs(2))
             .await
             .expect("delayed cleanup ack should be accepted");
         assert!(state.status.lock().await.last_error.is_none());
@@ -2728,12 +2792,62 @@ mod tests {
             status.stop_cleanup_outcome = None;
         }
 
-        let error = stop_compute_node(state.clone())
-            .await
-            .expect_err("missing cleanup ack should return an error");
+        let error =
+            stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_millis(200))
+                .await
+                .expect_err("missing cleanup ack should return an error");
         assert!(error
             .to_string()
             .contains("Operator stopped locally, but unregister did not complete"));
+    }
+
+    #[tokio::test]
+    async fn stopped_event_ack_requires_matching_nonempty_session_and_stopped_type() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("session-current".into());
+            status.stop_cleanup_required = Some(false);
+            status.stop_cleanup_attempted = Some(false);
+            status.stop_cleanup_outcome = Some("not_required".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+
+        let cleanup_status = parse_compute_node_event_line(
+            r#"{"type":"status","operator_session_id":"session-current","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":1}"#,
+        )
+        .expect("status payload");
+        assert!(apply_compute_node_event_to_state(&state, &cleanup_status).await);
+        assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+        {
+            let status = state.status.lock().await;
+            assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
+        }
+
+        let missing_session_stopped = parse_compute_node_event_line(
+            r#"{"type":"stopped","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":2}"#,
+        )
+        .expect("missing-session stopped payload");
+        assert!(apply_compute_node_event_to_state(&state, &missing_session_stopped).await);
+        assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+
+        let stale_session_stopped = parse_compute_node_event_line(
+            r#"{"type":"stopped","operator_session_id":"session-stale","unregister_required":true,"unregister_attempted":true,"unregister_outcome":"complete","unregister_success_count":1,"unregister_failure_count":0,"sequence":3}"#,
+        )
+        .expect("stale stopped payload");
+        assert!(!apply_compute_node_event_to_state(&state, &stale_session_stopped).await);
+        assert!(state.stopped_event_ack_session_id.lock().await.is_none());
+
+        let matching_stopped = parse_compute_node_event_line(
+            r#"{"type":"stopped","operator_session_id":"session-current","unregister_required":false,"unregister_attempted":false,"unregister_outcome":"not_required","unregister_success_count":0,"unregister_failure_count":0,"sequence":4}"#,
+        )
+        .expect("matching stopped payload");
+        assert!(apply_compute_node_event_to_state(&state, &matching_stopped).await);
+        assert_eq!(
+            state.stopped_event_ack_session_id.lock().await.as_deref(),
+            Some("session-current")
+        );
     }
 
     #[test]
@@ -2788,7 +2902,7 @@ mod tests {
 
         let updated = update_status_from_event(&mut status, &stale_payload);
         assert!(!updated);
-        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("complete"));
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
         assert_eq!(status.stop_cleanup_warning, None);
     }
 

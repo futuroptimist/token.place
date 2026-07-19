@@ -2182,7 +2182,6 @@ class RelayClient:
 
 
     @staticmethod
-    @staticmethod
     def _api_v1_valid_relative_seconds(value: Any) -> Optional[float]:
         if isinstance(value, bool):
             return None

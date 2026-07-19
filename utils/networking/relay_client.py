@@ -936,6 +936,7 @@ class RelayClient:
         self._api_v1_generation_kwarg_cache: Dict[Tuple[Any, ...], Dict[str, Set[str]]] = {}
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
+        self._api_v1_control_wakeup = threading.Event()
         self._registration_token: Optional[str] = None
         configured_servers: List[Any] = []
         self._cluster_only = False
@@ -1343,6 +1344,9 @@ class RelayClient:
         log_info("Stopping relay polling")
         self.stop_polling = True
         self._polling_stopped_by_request = True
+        wakeup = getattr(self, '_api_v1_control_wakeup', None)
+        if wakeup is not None:
+            wakeup.set()
         self._api_v1_stop_heartbeat_worker()
 
     def unregister_from_relay(self) -> bool:
@@ -2181,17 +2185,19 @@ class RelayClient:
         return seconds
 
     @classmethod
-    def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any]) -> float:
+    def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
         candidates = [
             cls._api_v1_valid_relative_seconds(request_payload.get('request_deadline_remaining_seconds')),
             cls._api_v1_valid_relative_seconds(request_payload.get('request_ttl_seconds')),
         ]
         valid = [value for value in candidates if value is not None]
+        # Legacy relays may omit deadline metadata; cap such requests at the
+        # documented 300-second compatibility deadline rather than running forever.
         remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
-        return time.monotonic() + remaining
+        return (time.monotonic() if now is None else now) + remaining
 
     @classmethod
-    def _api_v1_deadline_after_response(cls, current_deadline: float, response_payload: Any) -> float:
+    def _api_v1_deadline_after_response(cls, current_deadline: float, response_payload: Any, *, now: Optional[float] = None) -> float:
         if not isinstance(response_payload, dict):
             return current_deadline
         candidates = [
@@ -2201,7 +2207,7 @@ class RelayClient:
         valid = [value for value in candidates if value is not None]
         if not valid:
             return current_deadline
-        candidate_deadline = time.monotonic() + min(valid)
+        candidate_deadline = (time.monotonic() if now is None else now) + min(valid)
         return min(current_deadline, candidate_deadline)
 
     @staticmethod
@@ -2287,7 +2293,7 @@ class RelayClient:
         if not self._api_v1_control_credential_for_relay(relay_url):
             self._terminate_current_llama_worker('missing_control_credential')
             return None
-        local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload)
+        local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2308,9 +2314,6 @@ class RelayClient:
             backoff = 1.0
             while True:
                 now = time.monotonic()
-                if future.done():
-                    future_result = future.result()
-                    break
                 if getattr(self, '_polling_stopped_by_request', False):
                     terminal_status = 'operator_stop'
                     terminal_reason = 'operator_stop'
@@ -2319,6 +2322,11 @@ class RelayClient:
                     terminal_status = 'local_deadline'
                     terminal_reason = 'local_deadline'
                     break
+                if future.done():
+                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= local_deadline:
+                        continue
+                    future_result = future.result()
+                    break
                 if now >= next_poll_at:
                     remaining = max(0.0, local_deadline - now)
                     try:
@@ -2326,10 +2334,10 @@ class RelayClient:
                             relay_url=relay_url,
                             request_id=request_id,
                             acknowledge=False,
-                            timeout_seconds=max(0.1, min(self._request_timeout, remaining * 0.5, max(0.1, remaining - 0.05))),
+                            timeout_seconds=min(self._request_timeout, max(0.001, remaining * 0.5)),
                         )
                         backoff = 1.0
-                        local_deadline = self._api_v1_deadline_after_response(local_deadline, control)
+                        local_deadline = self._api_v1_deadline_after_response(local_deadline, control, now=time.monotonic())
                         status = str(control.get('status') or '').lower()
                         if status == 'active':
                             hint = self._api_v1_control_next_poll_seconds(control.get('next_poll_seconds'))
@@ -2355,8 +2363,13 @@ class RelayClient:
                         next_poll_at = min(time.monotonic() + backoff, local_deadline)
                         backoff = min(_API_V1_CONTROL_MAX_POLL_SECONDS, backoff * 2)
                 wait_until = min(next_poll_at, local_deadline)
+                wait_seconds = max(0.0, min(0.2, wait_until - time.monotonic()))
+                wakeup = getattr(self, '_api_v1_control_wakeup', None)
+                if wakeup is not None and wakeup.wait(wait_seconds):
+                    wakeup.clear()
+                    continue
                 try:
-                    future.result(timeout=max(0.0, min(0.2, wait_until - time.monotonic())))
+                    future.result(timeout=0)
                 except FutureTimeoutError:
                     pass
                 except Exception:

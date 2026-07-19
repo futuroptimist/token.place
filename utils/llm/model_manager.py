@@ -4403,6 +4403,7 @@ class ModelManager:
         self.child_model_path_exists = False
         self.llm_lock = Lock()
         self._llm_generation = 0
+        self._llm_cancel_generation_event = threading.Event()
         self.worker_restart_count = 0
         self.last_worker_error_code: Optional[str] = None
         self.last_worker_exit_code: Optional[int] = None
@@ -5776,6 +5777,8 @@ class ModelManager:
                 self.worker_restart_count += 1
                 self.last_worker_restart_at_ms = int(time.time() * 1000)
                 self._llm_generation += 1
+                self._llm_cancel_generation_event.set()
+                self._llm_cancel_generation_event = threading.Event()
                 return
             self.last_worker_exit_code = self._worker_exit_code(llm)
             self.last_worker_error_code = safe_reason
@@ -5784,20 +5787,59 @@ class ModelManager:
             self.last_worker_restart_at_ms = int(time.time() * 1000)
             self.llm = None
             self._llm_generation += 1
-        self._close_llm_proxy(llm)
+            self._llm_cancel_generation_event.set()
+            self._llm_cancel_generation_event = threading.Event()
+        self._close_llm_proxy(llm, terminate_process=True)
         # Eagerly validate a clean worker for the next request when possible.
         try:
             self.get_llm_instance()
         except Exception:
             self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
 
-    def _close_llm_proxy(self, llm: Any) -> None:
+    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> None:
         close = getattr(llm, 'close', None)
         if callable(close):
             try:
                 close()
             except Exception:
                 self.log_warning("Failed to close old llama.cpp worker during invalidation")
+        if not terminate_process:
+            return
+        process = getattr(llm, '_process', None)
+        if process is None:
+            return
+        poll = getattr(process, 'poll', None)
+        try:
+            if callable(poll) and poll() is not None:
+                return
+        except Exception:
+            return
+        terminated = False
+        terminate = getattr(process, 'terminate', None)
+        if callable(terminate):
+            try:
+                terminate()
+                terminated = True
+            except Exception:
+                terminated = False
+        wait = getattr(process, 'wait', None)
+        if callable(wait) and terminated:
+            try:
+                wait(timeout=1.0)
+                return
+            except Exception:
+                pass
+        kill = getattr(process, 'kill', None)
+        if callable(kill):
+            try:
+                kill()
+            except Exception:
+                pass
+        if callable(wait):
+            try:
+                wait(timeout=1.0)
+            except Exception:
+                pass
 
     def _llm_is_usable(self, llm: Any) -> bool:
         is_alive = getattr(llm, 'is_alive', None)
@@ -5911,6 +5953,7 @@ class ModelManager:
             raise RuntimeError('LLM runtime is unavailable')
         with self.llm_lock:
             observed_generation = self._llm_generation
+            observed_cancel_event = self._llm_cancel_generation_event
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
@@ -5934,6 +5977,11 @@ class ModelManager:
         except LlamaCppRestartableWorkerError as exc:
             self._invalidate_llm_if_current(llm_instance, exc)
 
+        if observed_cancel_event.is_set():
+            raise RuntimeError('LLM inference request cancelled before worker retry')
+        with self.llm_lock:
+            if self._llm_generation != observed_generation and observed_cancel_event.is_set():
+                raise RuntimeError('LLM inference request cancelled before worker retry')
         replacement = self._ensure_replacement_llm(observed_generation)
         if replacement is None:
             raise RuntimeError('LLM runtime replacement failed')

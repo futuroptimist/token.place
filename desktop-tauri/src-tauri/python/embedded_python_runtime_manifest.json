@@ -22,7 +22,35 @@
     "llama-cpp-python": "0.3.32"
   },
   "runtime_notices": [
-    {"name": "Python", "license": "PSF-2.0", "path": "LICENSE-PYTHON.txt"},
-    {"name": "python-build-standalone", "license": "MPL-2.0", "path": "LICENSE-python-build-standalone.txt"}
-  ]
+    {
+      "name": "Python",
+      "license": "PSF-2.0",
+      "path": "LICENSE-PYTHON.txt"
+    },
+    {
+      "name": "python-build-standalone",
+      "license": "MPL-2.0",
+      "path": "LICENSE-python-build-standalone.txt"
+    }
+  ],
+  "windows_x86_64": {
+    "cpython_version": "3.11.13",
+    "python_build_standalone_release": "20250818",
+    "python_build_standalone_build": "cpython-3.11.13+20250818-x86_64-pc-windows-msvc-install_only",
+    "target_triple": "x86_64-pc-windows-msvc",
+    "archive_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.11.13%2B20250818-x86_64-pc-windows-msvc-install_only.tar.gz",
+    "sha256": "008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660",
+    "expected_archive_root": "python",
+    "expected_interpreter_path": "python.exe",
+    "expected_architecture": "AMD64",
+    "expected_packaged_runtime_path": "resources/python-runtime/python.exe",
+    "llama_cpp_cuda124_wheel_url": "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "llama_cpp_cuda124_wheel_sha256": "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0",
+    "llama_cpp_cuda124_wheel_filename": "llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "required_native_dlls": [
+      "llama.dll",
+      "ggml.dll",
+      "ggml-cuda.dll"
+    ]
+  }
 }

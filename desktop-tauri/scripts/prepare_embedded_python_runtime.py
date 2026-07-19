@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the relocatable Apple Silicon CPython runtime bundled in the .app."""
+"""Prepare the relocatable CPython runtime bundled in desktop artifacts."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ SRC_TAURI = ROOT / "src-tauri"
 MANIFEST = SRC_TAURI / "python" / "embedded_python_runtime_manifest.json"
 OUTPUT = SRC_TAURI / "python-runtime"
 PROVENANCE = "embedded_python_runtime_provenance.json"
-BUILD_PROFILE = "metal-relocatable-no-openssl-libpython-rpath-v2"
+BUILD_PROFILE = "embedded-runtime-v3"
 IMPORTS = ["psutil", "requests", "dotenv", "cryptography", "jinja2", "numpy", "diskcache", "llama_cpp"]
 if str(SRC_TAURI / "python") not in sys.path:
     sys.path.insert(0, str(SRC_TAURI / "python"))
@@ -30,17 +30,36 @@ from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks  # noqa: E402
 
 class RuntimePrepError(RuntimeError): pass
 
-def load_manifest(path: Path = MANIFEST) -> dict:
-    m = json.loads(path.read_text(encoding="utf-8"))
-    if m.get("schema_version") != 1: raise RuntimePrepError("unsupported embedded runtime manifest schema_version")
+def _target_manifest(m: dict, target: str | None = None) -> dict:
+    requested = (target or os.environ.get("TOKEN_PLACE_EMBEDDED_PYTHON_TARGET") or "").strip().lower()
+    if requested in {"windows", "win", "win32", "x86_64-pc-windows-msvc"}:
+        merged = dict(m)
+        merged.update(m.get("windows_x86_64") or {})
+        merged["target_key"] = "windows_x86_64"
+        return merged
+    m = dict(m)
+    m["target_key"] = "macos_aarch64"
+    return m
+
+def load_manifest(path: Path = MANIFEST, target: str | None = None) -> dict:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("schema_version") != 1: raise RuntimePrepError("unsupported embedded runtime manifest schema_version")
+    m = _target_manifest(raw, target)
     if not str(m.get("archive_url", "")).startswith("https://"): raise RuntimePrepError("archive_url must be HTTPS")
     sha = str(m.get("sha256", ""))
     if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha): raise RuntimePrepError("sha256 must be a lowercase 64-character hex digest")
-    if m.get("target_triple") != "aarch64-apple-darwin": raise RuntimePrepError("manifest target_triple must be aarch64-apple-darwin")
-    if m.get("expected_packaged_runtime_path") != "Contents/Resources/python-runtime/bin/python3": raise RuntimePrepError("unexpected packaged runtime path")
-    for key in ["cpython_version","python_build_standalone_release","python_build_standalone_build","expected_archive_root","expected_interpreter_path","expected_architecture","minimum_macos_version","required_packages","runtime_notices"]:
+    if m.get("target_triple") not in {"aarch64-apple-darwin", "x86_64-pc-windows-msvc"}: raise RuntimePrepError("manifest target_triple must be a supported desktop ABI")
+    expected_path = "resources/python-runtime/python.exe" if m.get("target_triple") == "x86_64-pc-windows-msvc" else "Contents/Resources/python-runtime/bin/python3"
+    if m.get("expected_packaged_runtime_path") != expected_path: raise RuntimePrepError("unexpected packaged runtime path")
+    for key in ["cpython_version","python_build_standalone_release","python_build_standalone_build","expected_archive_root","expected_interpreter_path","expected_architecture","required_packages","runtime_notices"]:
         if key not in m: raise RuntimePrepError(f"missing manifest field: {key}")
     if "latest" in str(m["archive_url"]).lower(): raise RuntimePrepError("archive_url must not use latest")
+    if m.get("target_triple") == "x86_64-pc-windows-msvc":
+        wheel = str(m.get("llama_cpp_cuda124_wheel_filename", ""))
+        if wheel != "llama_cpp_python-0.3.32-py3-none-win_amd64.whl": raise RuntimePrepError("unexpected Windows CUDA wheel filename")
+        if not str(m.get("llama_cpp_cuda124_wheel_url", "")).startswith("https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/"): raise RuntimePrepError("unexpected Windows CUDA wheel URL")
+        wheel_sha = str(m.get("llama_cpp_cuda124_wheel_sha256", ""))
+        if len(wheel_sha) != 64 or any(c not in "0123456789abcdef" for c in wheel_sha): raise RuntimePrepError("Windows CUDA wheel sha256 must be pinned")
     expected_packages = {
         "psutil": "7.1.0",
         "requests": "2.32.5",
@@ -418,6 +437,19 @@ def _validate_candidate_install(py: Path, m: dict, runtime: Path) -> None:
     probe_runtime(py, m)
     audit_macho_runtime(runtime)
 
+def _download_verified_url(url: str, expected_sha256: str, cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / Path(urllib.parse.urlparse(url).path).name.replace("%2B", "+")
+    if out.exists() and sha256(out) == expected_sha256: return out
+    if out.exists(): out.unlink()
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    urllib.request.urlretrieve(url, tmp)  # nosec B310 - URL is HTTPS and SHA-256 pinned
+    digest = sha256(tmp)
+    if digest != expected_sha256:
+        tmp.unlink(missing_ok=True); raise RuntimePrepError(f"digest mismatch for {out.name}: expected {expected_sha256} got {digest}")
+    tmp.replace(out)
+    return out
+
 def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     run([str(py), "-m", "ensurepip", "--upgrade"])
     run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"], env={"PIP_CACHE_DIR": str(pip_cache)})
@@ -425,6 +457,13 @@ def install_packages(py: Path, m: dict, pip_cache: Path) -> None:
     pinned_packages = [f"{name}=={version}" for name, version in sorted(m["required_packages"].items()) if name != "llama-cpp-python"]
     # Install all non-llama packages first, independently of the llama wheel index.
     run([str(py), "-m", "pip", "install", "-r", str(req), *pinned_packages, "--upgrade", "--no-cache-dir"], env={"PIP_CACHE_DIR": str(pip_cache)})
+    if m.get("target_triple") == "x86_64-pc-windows-msvc":
+        wheel = _download_verified_url(m["llama_cpp_cuda124_wheel_url"], m["llama_cpp_cuda124_wheel_sha256"], pip_cache / "wheels")
+        if wheel.name != m["llama_cpp_cuda124_wheel_filename"] or "win_amd64" not in wheel.name or "cu124" not in m["llama_cpp_cuda124_wheel_url"]:
+            raise RuntimePrepError("wrong Windows CUDA wheel flavor")
+        run([str(py), "-m", "pip", "install", "--no-index", "--find-links", str(wheel.parent), str(wheel)], env={"PIP_CACHE_DIR": str(pip_cache)})
+        _validate_candidate_install(py, m, py.parent)
+        return
     # Try each Metal-capable plan in order: prebuilt wheel first, then Metal source build.
     plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT.parent / "requirements.txt")
     metal_plans = [p for p in plans if p.backend == "metal"]
@@ -478,7 +517,8 @@ def probe_runtime(py: Path, m: dict) -> dict:
     code = "import json,importlib.metadata as im; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
     env = {"PYTHONPATH": str(SRC_TAURI / "python") + os.pathsep + str(SRC_TAURI.parent.parent)}
     payload = json.loads(run([str(py), "-c", code], env=env).stdout)
-    if payload.get("backend") != "metal" or not payload.get("gpu_offload_supported"): raise RuntimePrepError("embedded llama_cpp runtime is not Metal-capable")
+    expected_backend = "cuda" if m.get("target_triple") == "x86_64-pc-windows-msvc" else "metal"
+    if payload.get("backend") != expected_backend or not payload.get("gpu_offload_supported"): raise RuntimePrepError(f"embedded llama_cpp runtime is not {expected_backend.capitalize()}-capable")
     if payload.get("llama_cpp_python_version") != m["required_packages"]["llama-cpp-python"]: raise RuntimePrepError("wrong llama-cpp-python version")
     missing = _missing_runtime_capabilities(payload)
     if missing: raise RuntimePrepError("missing Qwen 64K runtime capabilities: " + ", ".join(missing))
@@ -492,14 +532,17 @@ def clean(runtime: Path) -> None:
 def provenance(m: dict, packages: dict) -> dict:
     try: commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT.parent, text=True).strip()
     except Exception: commit = "unknown"
-    return {"cpython_version":m["cpython_version"],"target_triple":m["target_triple"],"source_archive_sha256":m["sha256"],"installed_packages":packages,"expected_backend":"metal","build_profile":BUILD_PROFILE,"build_timestamp":datetime.now(timezone.utc).isoformat(),"repository_commit":commit}
+    expected_backend = "cuda" if m.get("target_triple") == "x86_64-pc-windows-msvc" else "metal"
+    return {"cpython_version":m["cpython_version"],"target_triple":m["target_triple"],"source_archive_sha256":m["sha256"],"installed_packages":packages,"expected_backend":expected_backend,"build_profile":BUILD_PROFILE,"build_timestamp":datetime.now(timezone.utc).isoformat(),"repository_commit":commit,"llama_cpp_cuda124_wheel_sha256":m.get("llama_cpp_cuda124_wheel_sha256")}
 
 def existing_valid(m: dict) -> bool:
-    prov = OUTPUT / PROVENANCE; py = OUTPUT / "bin" / "python3"
+    py_rel = Path(m["expected_interpreter_path"])
+    prov = OUTPUT / PROVENANCE; py = OUTPUT / py_rel
     if not prov.is_file() or not py.is_file(): return False
     try:
         data=json.loads(prov.read_text());
-        if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal" or data.get("build_profile") != BUILD_PROFILE: return False
+        expected_backend = "cuda" if m.get("target_triple") == "x86_64-pc-windows-msvc" else "metal"
+        if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != expected_backend or data.get("build_profile") != BUILD_PROFILE: return False
         installed = data.get("installed_packages") or {}
         for name, version in m["required_packages"].items():
             if installed.get(name) != version:
@@ -513,7 +556,7 @@ def prepare(cache_dir: Path) -> None:
     archive=download_verified(m, cache_dir)
     with tempfile.TemporaryDirectory(prefix="token-place-python-runtime-", dir=str(OUTPUT.parent)) as td:
         tmp=Path(td); extracted=extract_archive(archive,m,tmp); staging=tmp/"python-runtime"; shutil.move(str(extracted), staging)
-        py=staging/"bin"/"python3"; py.chmod(py.stat().st_mode | 0o755)
+        py=staging/m["expected_interpreter_path"]; py.chmod(py.stat().st_mode | 0o755)
         normalize_python_build_standalone_macos_runtime(staging, m); audit_macho_runtime(staging); prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
         packages=json.loads(run([str(py),"-c","import json,importlib.metadata as im; print(json.dumps({d.metadata['Name']: d.version for d in im.distributions()}))"]).stdout)
         (staging/PROVENANCE).write_text(json.dumps(provenance(m, packages), indent=2, sort_keys=True)+"\n")

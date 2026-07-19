@@ -2233,7 +2233,10 @@ class RelayClient:
             'control_credential': credential,
             'acknowledge': bool(acknowledge),
         }
-        request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': timeout_seconds or self._request_timeout}
+        request_kwargs: Dict[str, Any] = {
+            'json': payload,
+            'timeout': timeout_seconds if timeout_seconds is not None else self._request_timeout,
+        }
         headers = self._auth_headers()
         if headers:
             request_kwargs['headers'] = headers
@@ -2245,8 +2248,8 @@ class RelayClient:
             raise requests.RequestException(f'HTTP {response.status_code}')
         if response.status_code != 200:
             return {'status': 'unavailable', 'http_status': response.status_code}
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {'status': 'unavailable'}
+        response_payload = response.json()
+        return response_payload if isinstance(response_payload, dict) else {'status': 'unavailable'}
 
     def _terminate_current_llama_worker(self, reason: str) -> None:
         manager = getattr(self, 'model_manager', None)
@@ -2313,7 +2316,7 @@ class RelayClient:
                     terminal_reason = 'operator_stop'
                     break
                 if now >= local_deadline:
-                    terminal_status = 'expired'
+                    terminal_status = 'local_deadline'
                     terminal_reason = 'local_deadline'
                     break
                 if now >= next_poll_at:
@@ -2332,9 +2335,16 @@ class RelayClient:
                             hint = self._api_v1_control_next_poll_seconds(control.get('next_poll_seconds'))
                             next_poll_at = min(time.monotonic() + hint, local_deadline)
                             continue
-                        if status in {'cancelled', 'expired', 'completed', 'unavailable'}:
+                        terminal_status_by_control_status = {
+                            'cancelled': 'cancelled',
+                            'expired': 'expired',
+                            'completed': 'completed',
+                            'unavailable': 'unavailable',
+                            'completed/unavailable': 'completed_unavailable',
+                        }
+                        if status in terminal_status_by_control_status:
                             terminal_status = status
-                            terminal_reason = status
+                            terminal_reason = terminal_status_by_control_status[status]
                             break
                         next_poll_at = min(time.monotonic() + _API_V1_CONTROL_MIN_POLL_SECONDS, local_deadline)
                     except PermissionError:
@@ -2353,8 +2363,16 @@ class RelayClient:
                     future_result = future.result()
                     break
             if terminal_status is not None:
-                self._last_api_v1_runtime_health = {'runtime_healthy': False, 'recovery_attempted': True, 'recovery_succeeded': False}
-                self._terminate_current_llama_worker(terminal_reason)
+                recovery_succeeded = False
+                try:
+                    self._terminate_current_llama_worker(terminal_reason)
+                    recovery_succeeded = True
+                finally:
+                    self._last_api_v1_runtime_health = {
+                        'runtime_healthy': terminal_status in {'completed', 'unavailable', 'completed/unavailable'},
+                        'recovery_attempted': True,
+                        'recovery_succeeded': recovery_succeeded,
+                    }
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
                 return None
@@ -4601,18 +4619,24 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
+                for metadata_key in ('request_deadline_remaining_seconds', 'request_ttl_seconds'):
+                    if metadata_key in request_data:
+                        api_v1_request_payload[metadata_key] = request_data.get(metadata_key)
                 try:
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
                     response_envelope = self._run_api_v1_inference_with_control(api_v1_request_payload)
                     if response_envelope is None:
+                        runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+                        if not isinstance(runtime_health, dict):
+                            runtime_health = {}
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
                             safe_error_code="api_v1_request_cancelled",
-                            runtime_healthy=False,
-                            recovery_attempted=True,
-                            recovery_succeeded=False,
+                            runtime_healthy=bool(runtime_health.get("runtime_healthy", False)),
+                            recovery_attempted=bool(runtime_health.get("recovery_attempted", True)),
+                            recovery_succeeded=bool(runtime_health.get("recovery_succeeded", False)),
                         )
                     api_v1_response = response_envelope.get("api_v1_response", {})
                     error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None

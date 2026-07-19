@@ -7058,8 +7058,15 @@ def test_api_v1_registration_heartbeat_omission_preserves_independent_credential
     assert client._api_v1_control_credential_for_relay('https://relay-b.example') == 'cred-b'
 
 
-@pytest.mark.parametrize('status,ack_count', [('cancelled', 1), ('expired', 1), ('completed', 0), ('unavailable', 0)])
-def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monkeypatch, status, ack_count):
+@pytest.mark.parametrize(
+    'status,expected_reason,ack_count',
+    [
+        ('cancelled', 'cancelled', 1),
+        ('expired', 'expired', 1),
+        ('completed/unavailable', 'completed_unavailable', 0),
+    ],
+)
+def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monkeypatch, status, expected_reason, ack_count):
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
     client._api_v1_registered_relays.add('https://relay.example')
@@ -7095,7 +7102,7 @@ def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monk
     })
 
     assert result is None
-    assert stopped == [status]
+    assert stopped == [expected_reason]
     assert len(acks) == ack_count
 
 

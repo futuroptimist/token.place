@@ -871,7 +871,43 @@ def test_manifest_pins_native_vendor_runtime_dll_artifacts():
     assert artifacts['msvcp140.dll']['architecture'] == 'AMD64'
     for name in required:
         assert prep.SHA256_RE.fullmatch(artifacts[name]['sha256'])
+        assert prep.SHA256_RE.fullmatch(artifacts[name]['extracted_sha256'])
+        assert artifacts[name]['archive_member_path']
+        assert artifacts[name]['url'].endswith('.zip')
         assert artifacts[name]['url'].startswith(('https://developer.download.nvidia.com/', 'https://download.visualstudio.microsoft.com/'))
+    assert artifacts['cudart64_12.dll']['version'] == '12.4.127'
+    assert artifacts['cublas64_12.dll']['version'] == '12.4.5.8'
+    assert artifacts['cublaslt64_12.dll']['version'] == '12.4.5.8'
+
+
+def test_manifest_rejects_native_artifact_missing_exact_member_or_hash(tmp_path):
+    m = prep.load_manifest()
+    del m['native_dll_artifacts'][0]['archive_member_path']
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps(m), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='archive_member_path'):
+        prep.load_manifest(path)
+
+    m = prep.load_manifest()
+    del m['native_dll_artifacts'][0]['extracted_sha256']
+    path.write_text(json.dumps(m), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='extracted_sha256'):
+        prep.load_manifest(path)
+
+
+def test_manifest_rejects_native_artifact_non_zip_and_coarse_cuda_version(tmp_path):
+    m = prep.load_manifest()
+    m['native_dll_artifacts'][0]['url'] = 'https://developer.download.nvidia.com/example/cuda.exe'
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps(m), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='zip archives'):
+        prep.load_manifest(path)
+
+    m = prep.load_manifest()
+    m['native_dll_artifacts'][0]['version'] = '12.4'
+    path.write_text(json.dumps(m), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='12.4.127'):
+        prep.load_manifest(path)
 
 
 def test_manifest_rejects_missing_native_vendor_artifact_pin(tmp_path):

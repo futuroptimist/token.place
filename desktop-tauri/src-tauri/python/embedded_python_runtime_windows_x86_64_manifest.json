@@ -216,7 +216,7 @@
   "native_dll_artifacts": [
     {
       "name": "cudart64_12.dll",
-      "version": "12.4",
+      "version": "12.4.127",
       "flavor": "cuda-12.4-runtime",
       "architecture": "AMD64",
       "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
@@ -229,7 +229,7 @@
     },
     {
       "name": "cublas64_12.dll",
-      "version": "12.4",
+      "version": "12.4.5.8",
       "flavor": "cuda-12.4-cublas",
       "architecture": "AMD64",
       "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
@@ -242,7 +242,7 @@
     },
     {
       "name": "cublasLt64_12.dll",
-      "version": "12.4",
+      "version": "12.4.5.8",
       "flavor": "cuda-12.4-cublas",
       "architecture": "AMD64",
       "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
@@ -260,9 +260,11 @@
       "architecture": "AMD64",
       "license": "Microsoft Visual C++ Redistributable EULA",
       "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
-      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
-      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
-      "destination": "msvcp140.dll"
+      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/microsoft.vc143.crt.x64.14.44.35211.zip",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "destination": "msvcp140.dll",
+      "archive_member_path": "Microsoft.VC143.CRT.x64/Microsoft.VC143.CRT/msvcp140.dll",
+      "extracted_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
     },
     {
       "name": "vcomp140.dll",
@@ -271,9 +273,11 @@
       "architecture": "AMD64",
       "license": "Microsoft Visual C++ Redistributable EULA",
       "provenance": "Microsoft Visual C++ OpenMP app-local runtime redistributable for Windows x64",
-      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
-      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
-      "destination": "vcomp140.dll"
+      "url": "https://download.visualstudio.microsoft.com/download/pr/65f6a2c9-1b34-43ef-8a5d-4bbdd407197a/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/microsoft.vc143.openmp.x64.14.44.35211.zip",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "destination": "vcomp140.dll",
+      "archive_member_path": "Microsoft.VC143.OpenMP.x64/Microsoft.VC143.OpenMP/vcomp140.dll",
+      "extracted_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
     }
   ]
 }

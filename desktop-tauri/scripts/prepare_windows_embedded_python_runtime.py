@@ -50,7 +50,7 @@ def load_manifest(path: Path=MANIFEST) -> dict:
     if not isinstance(native_artifacts, list) or not native_artifacts: raise RuntimePrepError("native_dll_artifacts must be a non-empty list")
     native_destinations: set[str] = set()
     for artifact in native_artifacts:
-        for key in ("name", "version", "url", "sha256", "architecture", "license", "provenance"):
+        for key in ("name", "version", "url", "sha256", "architecture", "license", "provenance", "archive_member_path", "destination", "extracted_sha256"):
             if key not in artifact: raise RuntimePrepError(f"native_dll_artifacts entry missing {key}")
         if "x" in str(artifact.get("version", "")).lower():
             raise RuntimePrepError("native DLL artifact versions must be exact")
@@ -58,6 +58,16 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         if not artifact.get("url", "").startswith(("https://developer.download.nvidia.com/", "https://download.visualstudio.microsoft.com/")):
             raise RuntimePrepError("native DLL artifacts must use approved immutable vendor URLs")
         if not SHA256_RE.fullmatch(artifact.get("sha256", "")): raise RuntimePrepError("native DLL artifact sha256 must be 64 lowercase hex characters")
+        if not SHA256_RE.fullmatch(artifact.get("extracted_sha256", "")): raise RuntimePrepError("native DLL extracted_sha256 must be 64 lowercase hex characters")
+        member = artifact.get("archive_member_path", "")
+        if not member or Path(member).is_absolute() or ".." in Path(member).parts:
+            raise RuntimePrepError("native DLL artifact archive_member_path must be exact and relative")
+        if not artifact["url"].lower().endswith(".zip"):
+            raise RuntimePrepError("native DLL artifacts must be pinned zip archives")
+        if artifact["name"].lower().startswith("cudart") and artifact.get("version") != "12.4.127":
+            raise RuntimePrepError("CUDA runtime native DLL version must be 12.4.127")
+        if artifact["name"].lower().startswith("cublas") and artifact.get("version") != "12.4.5.8":
+            raise RuntimePrepError("cuBLAS native DLL version must be 12.4.5.8")
         destination = artifact.get("destination", artifact["name"]).lower().replace("\\", "/")
         if destination in native_destinations: raise RuntimePrepError(f"duplicate native DLL destination: {destination}")
         native_destinations.add(destination)
@@ -108,6 +118,14 @@ def fetch(url: str, sha: str, dest: Path) -> Path:
         part.unlink(missing_ok=True)
         try:
             with urllib.request.urlopen(url, timeout=120) as r, part.open('wb') as f:  # nosec B310 - URL scheme/host is validated and SHA-256 pinned
+                final_url = getattr(r, "geturl", lambda: url)()
+                if not final_url.startswith((
+                    "https://github.com/",
+                    "https://files.pythonhosted.org/",
+                    "https://developer.download.nvidia.com/",
+                    "https://download.visualstudio.microsoft.com/",
+                )):
+                    raise RuntimePrepError("runtime artifact redirected to an unapproved HTTPS host")
                 shutil.copyfileobj(r, f)
             got = sha256_file(part)
             if got != sha:
@@ -442,6 +460,7 @@ def write_provenance(runtime: Path, m: dict, pe_closure: list[dict[str, object]]
         'required_packages': m['required_packages'], 'required_native_dlls': m['required_native_dlls'],
         'expected_backend': 'cuda', 'build_timestamp': provenance_timestamp(),
         'python_package_wheels': m.get('python_package_wheels', []), 'pe_dll_closure': pe_closure if pe_closure is not None else m.get('pe_dll_closure', []),
+        'native_dll_artifacts': m.get('native_dll_artifacts', []),
     }
     (runtime/PROVENANCE).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
 

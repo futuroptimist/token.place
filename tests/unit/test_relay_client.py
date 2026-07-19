@@ -7013,3 +7013,88 @@ def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mo
 
     assert observed == ['current-secret', 'current-secret']
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+
+
+def test_api_v1_control_poll_hint_clamps_and_handles_malformed():
+    assert RelayClient._api_v1_control_poll_hint(0.25) == 1.0
+    assert RelayClient._api_v1_control_poll_hint(15) == 10.0
+    assert RelayClient._api_v1_control_poll_hint('bad') == 1.0
+    assert RelayClient._api_v1_control_poll_hint(3) == 3.0
+
+
+def test_api_v1_deadline_uses_smaller_remaining_and_only_shortens(monkeypatch):
+    client = _standalone_relay_client()
+    ticks = iter([100.0, 110.0, 120.0])
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: next(ticks))
+    deadline = client._api_v1_local_deadline_from_work({
+        'request_deadline_remaining_seconds': 30,
+        'request_ttl_seconds': 20,
+    })
+    assert deadline == 120.0
+    assert client._api_v1_shorten_deadline(deadline, {'request_deadline_remaining_seconds': 50}) == deadline
+    assert client._api_v1_shorten_deadline(deadline, {'request_deadline_remaining_seconds': 5}) == deadline
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_registration_heartbeat_omitting_control_credential_does_not_erase(mock_post):
+    client = _standalone_relay_client()
+    target = 'http://localhost:5000'
+    first = MagicMock(status_code=200)
+    first.json.return_value = {'control_credential': 'secret-one'}
+    second = MagicMock(status_code=200)
+    second.json.return_value = {'next_ping_in_x_seconds': 30}
+    mock_post.side_effect = [first, second]
+
+    client.register_api_v1_compute_node(target)
+    client.register_api_v1_compute_node(target)
+
+    assert client._api_v1_control_credential_for_relay(target) == 'secret-one'
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_unregister_clears_only_matching_relay_credential(mock_post):
+    client = _standalone_relay_client()
+    relay_a = 'http://relay-a:5000'
+    relay_b = 'http://relay-b:5000'
+    client._relay_urls = [relay_a, relay_b]
+    client._api_v1_registered_relays.add(relay_a)
+    client._store_api_v1_control_credential(relay_a, 'secret-a')
+    client._store_api_v1_control_credential(relay_b, 'secret-b')
+    success = MagicMock(status_code=200)
+    mock_post.return_value = success
+
+    assert client.unregister_from_relay() is True
+
+    assert client._api_v1_control_credential_for_relay(relay_a) == ''
+    assert client._api_v1_control_credential_for_relay(relay_b) == 'secret-b'
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_api_v1_control_request_uses_matching_credential_and_token(mock_post):
+    client = _standalone_relay_client()
+    client._registration_token = 'registration-token'
+    target = 'http://localhost:5000'
+    client._store_api_v1_control_credential(target, 'owner-secret')
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'status': 'active', 'next_poll_seconds': 2}
+    mock_post.return_value = response
+
+    result = client.control_api_v1_request(request_id='req-control', relay_url=target, acknowledge=True)
+
+    assert result['status'] == 'active'
+    payload = mock_post.call_args.kwargs['json']
+    assert payload == {
+        'server_public_key': client.crypto_manager.public_key_b64,
+        'request_id': 'req-control',
+        'control_credential': 'owner-secret',
+        'acknowledge': True,
+    }
+    assert mock_post.call_args.kwargs['headers']['X-Relay-Server-Token'] == 'registration-token'
+
+
+def test_api_v1_control_request_without_credential_fails_closed_without_http():
+    client = _standalone_relay_client()
+
+    result = client.control_api_v1_request(request_id='req-control', relay_url='http://localhost:5000')
+
+    assert result == {'status': 'owner-proof-failed', 'http_status': 403}

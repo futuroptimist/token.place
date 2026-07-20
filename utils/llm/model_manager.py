@@ -5867,9 +5867,10 @@ class ModelManager:
                 return False
 
         process_stopped = True
-        if terminate_process and process is not None:
-            # Terminate the subprocess before invoking proxy close so a blocking
-            # close() implementation cannot prevent the reliable process fallback.
+        if process is not None:
+            # Subprocess-backed workers are cleaned up with process primitives before
+            # any proxy close so third-party close() cannot block cancellation or
+            # ordinary invalidation while holding up recovery.
             for attr in ('stdin', 'stdout', 'stderr'):
                 _close_or_join_resource(getattr(process, attr, None))
             if not _dead():
@@ -5901,14 +5902,14 @@ class ModelManager:
             process_stopped = _dead()
 
         close = getattr(llm, 'close', None)
-        if callable(close) and not terminate_process:
+        if callable(close) and process is None and not terminate_process:
             try:
                 close()
             except Exception:
                 self.log_warning("Failed to close old llama.cpp worker during invalidation")
         elif callable(close):
-            # Forced cancellation cleanup relies on verified subprocess death and
-            # owned pipe/reader disposal; do not call a potentially blocking proxy close.
+            # Subprocess-backed cleanup relies on verified process death and owned
+            # pipe/reader disposal; do not call a potentially blocking proxy close.
             pass
 
         for attr in (
@@ -5972,8 +5973,10 @@ class ModelManager:
 
     def _invalidate_llm_if_current(self, failed_llm: Any, error: Any = None) -> int:
         dead_worker_log_message: Optional[str] = None
+        detached_llm = None
         with self.llm_lock:
             if self.llm is failed_llm:
+                detached_llm = self.llm
                 self.last_worker_exit_code = self._worker_exit_code(failed_llm)
                 self.last_worker_error_code = _safe_worker_error_code(error) if error is not None else 'worker_dead'
                 self.worker_state = 'recovering'
@@ -5984,28 +5987,35 @@ class ModelManager:
                     f"safe_error_code={self.last_worker_error_code} worker_generation={self._llm_generation} "
                     f"worker_restart_count={self.worker_restart_count} exit_code={self.last_worker_exit_code}"
                 )
-                self._close_llm_proxy(self.llm)
                 self.llm = None
                 self._llm_generation += 1
             generation = self._llm_generation
+        if detached_llm is not None and not self._close_llm_proxy(detached_llm):
+            with self.llm_lock:
+                self.worker_state = 'failed'
         if dead_worker_log_message is not None:
             self.log_warning(dead_worker_log_message)
         return generation
 
     def _ensure_replacement_llm(self, observed_generation: int) -> Any:
         replacement_attempt_log_message: Optional[str] = None
+        detached_llm = None
         with self.llm_lock:
             if self.llm is not None and self._llm_is_usable(self.llm):
                 return self.llm
             if self.llm is not None:
-                self._close_llm_proxy(self.llm)
+                detached_llm = self.llm
                 self.llm = None
             if self._llm_generation == observed_generation:
                 self._llm_generation += 1
             self.worker_state = 'recovering'
             replacement_attempt_log_message = "desktop.llama_cpp_worker.replacement_attempt event=replacement_attempt worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count)
-            # Release llm_lock before get_llm_instance() because it initializes under
-            # the same non-reentrant lock and still serializes creation internally.
+            # Release llm_lock before cleanup/get_llm_instance() because both may
+            # call third-party code and initialization re-acquires this non-reentrant lock.
+        if detached_llm is not None and not self._close_llm_proxy(detached_llm):
+            with self.llm_lock:
+                self.worker_state = 'failed'
+            return None
         if replacement_attempt_log_message is not None:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()

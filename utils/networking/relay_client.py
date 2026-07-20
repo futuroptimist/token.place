@@ -2535,12 +2535,22 @@ class RelayClient:
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
                 quiescence_deadline = time.monotonic() + 0.5
-                cleanup_quiesced = _wait_for_future_quiescence(future, quiescence_deadline) and cleanup_quiesced
+                inference_quiesced = _wait_for_future_quiescence(future, quiescence_deadline)
+                cleanup_quiesced = inference_quiesced and cleanup_quiesced
+                control_quiesced = True
                 if control_future is not None:
-                    cleanup_quiesced = _wait_for_future_quiescence(control_future, quiescence_deadline) and cleanup_quiesced
+                    # Control transport cleanup is required to avoid request-owned
+                    # thread leaks, but routine control latency is not inference
+                    # recovery failure and must not permanently stop a reusable client.
+                    control_deadline = time.monotonic() + min(
+                        0.5,
+                        max(0.05, self._request_timeout),
+                        max(0.05, local_deadline - time.monotonic()),
+                    )
+                    control_quiesced = _wait_for_future_quiescence(control_future, control_deadline)
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
-                if not cleanup_quiesced:
+                if not inference_quiesced:
                     recovery_succeeded = False
                     self.stop_polling = True
                     self._polling_stopped_by_request = True
@@ -2550,6 +2560,8 @@ class RelayClient:
                             cleanup_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
                         except Exception:
                             cleanup_quiesced = False
+                elif not control_quiesced:
+                    log_warning('api_v1.control_cleanup_pending request_id={}', request_id)
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
@@ -2565,9 +2577,13 @@ class RelayClient:
                 future.cancel()
             if control_future is not None and not control_done:
                 control_future.cancel()
-            executor.shutdown(wait=inference_done, cancel_futures=True)
+            if not inference_done:
+                _wait_for_future_quiescence(future, time.monotonic() + 0.5)
+            if control_future is not None and not control_done:
+                _wait_for_future_quiescence(control_future, time.monotonic() + min(0.5, max(0.05, self._request_timeout)))
+            executor.shutdown(wait=True, cancel_futures=True)
             if control_executor is not None:
-                control_executor.shutdown(wait=control_done, cancel_futures=True)
+                control_executor.shutdown(wait=True, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

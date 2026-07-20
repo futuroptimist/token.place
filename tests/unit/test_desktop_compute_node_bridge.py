@@ -295,11 +295,17 @@ class WarmingTimeoutApiV1Runtime(ApiV1Runtime):
         super().__init__(_config)
         WarmingTimeoutApiV1Runtime.last_instance = self
         self.ready_started = threading.Event()
+        self.processed_event = threading.Event()
 
     def ensure_api_v1_runtime_ready(self):
         self.ready_started.set()
         time.sleep(0.2)
         return True
+
+    def process_relay_request(self, payload):
+        result = super().process_relay_request(payload)
+        self.processed_event.set()
+        return result
 
 
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
@@ -1190,11 +1196,9 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
 
-    stop_counter = {'count': 0}
-
     def fake_stop_requested():
-        stop_counter['count'] += 1
-        return stop_counter['count'] > 2
+        runtime = WarmingTimeoutApiV1Runtime.last_instance
+        return runtime is not None and runtime.processed_event.is_set()
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 

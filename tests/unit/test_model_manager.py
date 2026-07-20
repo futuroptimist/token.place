@@ -5003,7 +5003,7 @@ def test_model_manager_cancellation_active_worker_reports_recreation_outcomes(mo
     assert old_event.is_set() is True
     assert manager._llm_cancel_generation_event is not old_event
 
-    none_replacement_worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)))
+    none_replacement_worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)), is_alive=MagicMock(return_value=False))
     manager.llm = none_replacement_worker
     close_llm_proxy.reset_mock()
     get_llm_instance.reset_mock()
@@ -5100,6 +5100,54 @@ def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, 
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
     assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    poll_values = iter([None, None, None, 0])
+    process = SimpleNamespace(
+        poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still alive"), 0]),
+        kill=MagicMock(),
+    )
+    close = MagicMock(side_effect=AssertionError("subprocess close must not be called"))
+    worker = SimpleNamespace(close=close, _process=process, _queue=SimpleNamespace(close=MagicMock()))
+    manager.llm = worker
+    cleanup_observed = {}
+    real_close = manager._close_llm_proxy
+
+    def observed_close(llm, **kwargs):
+        cleanup_observed["llm_detached"] = manager.llm is None
+        cleanup_observed["lock_available"] = manager.llm_lock.acquire(blocking=False)
+        if cleanup_observed["lock_available"]:
+            manager.llm_lock.release()
+        return real_close(llm, **kwargs)
+
+    monkeypatch.setattr(manager, "_close_llm_proxy", observed_close)
+
+    generation = manager._invalidate_llm_if_current(worker, RuntimeError("dead"))
+
+    assert generation == 1
+    assert cleanup_observed == {"llm_detached": True, "lock_available": True}
+    close.assert_not_called()
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    assert worker._queue is None
+
+
+def test_ensure_replacement_fails_when_stale_worker_cleanup_unverified(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)), is_alive=MagicMock(return_value=False))
+    manager.llm = worker
+    monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock(return_value=False))
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=SimpleNamespace()))
+
+    assert manager._ensure_replacement_llm(manager._llm_generation) is None
+    manager._close_llm_proxy.assert_called_once_with(worker)
+    manager.get_llm_instance.assert_not_called()
+    assert manager.worker_state == "failed"
 
 def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
     first = _RestartableFakeWorker("first", fail="dead")

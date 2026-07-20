@@ -2594,8 +2594,6 @@ class RelayClient:
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
                 if not inference_quiesced:
-                    # Inference thread is stuck: permanently stop polling and invoke
-                    # the fatal bridge teardown to terminate the disposable process tree.
                     recovery_succeeded = False
                     self.stop_polling = True
                     self._polling_stopped_by_request = True
@@ -2605,6 +2603,8 @@ class RelayClient:
                             inference_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
                         except Exception:
                             inference_quiesced = False
+                elif not control_quiesced:
+                    log_warning('api_v1.control_cleanup_pending request_id={}', request_id)
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
@@ -2625,9 +2625,13 @@ class RelayClient:
                 future.cancel()
             if control_future is not None and not control_done:
                 control_future.cancel()
-            executor.shutdown(wait=inference_done, cancel_futures=True)
+            if not inference_done:
+                _wait_for_future_quiescence(future, time.monotonic() + 0.5)
+            if control_future is not None and not control_done:
+                _wait_for_future_quiescence(control_future, time.monotonic() + min(0.5, max(0.05, self._request_timeout)))
+            executor.shutdown(wait=True, cancel_futures=True)
             if control_executor is not None:
-                control_executor.shutdown(wait=control_done, cancel_futures=True)
+                control_executor.shutdown(wait=True, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

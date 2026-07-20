@@ -7280,7 +7280,8 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         def post(self, *args, **kwargs):
             control_entered.set()
             # Block until the supervisor closes the session (operator stop teardown).
-            self._closed.wait(5)
+            # Use a generous 30-second sentinel to avoid test flakiness under slow CI.
+            self._closed.wait(30)
             raise relay_client_module.requests.ConnectionError('session closed by supervisor')
 
         def close(self):

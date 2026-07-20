@@ -2365,8 +2365,8 @@ class RelayClient:
         if callable(close):
             try:
                 close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_warning('api_v1.worker_fallback_close_error reason={} err={}', reason, exc)
         return False
 
     def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
@@ -2628,7 +2628,9 @@ class RelayClient:
             if not inference_done:
                 inference_done = bool(_wait_for_future_quiescence(future, time.monotonic() + 0.5))
             if control_future is not None and not control_done:
-                control_done = bool(_wait_for_future_quiescence(control_future, time.monotonic() + min(0.5, max(0.05, self._request_timeout))))
+                # Control timeout: bounded between 50ms and 500ms to avoid stalling cleanup.
+                control_quiescence_timeout = min(0.5, max(0.05, self._request_timeout))
+                control_done = bool(_wait_for_future_quiescence(control_future, time.monotonic() + control_quiescence_timeout))
             executor.shutdown(wait=inference_done, cancel_futures=True)
             if control_executor is not None:
                 control_executor.shutdown(wait=control_done, cancel_futures=True)

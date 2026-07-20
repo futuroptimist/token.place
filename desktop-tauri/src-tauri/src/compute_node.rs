@@ -161,6 +161,45 @@ struct BridgeProcessAttachment {
     notify: Option<Arc<Notify>>,
 }
 
+async fn reserve_starting_bridge_process_for_session(
+    state: &ComputeNodeState,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
+    // Lifecycle transitions that must be coherent for concurrent Stop use this
+    // order: bridge_process -> legacy child/stdin -> status -> ack. Do not await
+    // child I/O or process waits while holding these mutexes.
+    let mut process = state.bridge_process.lock().await;
+    if process.as_ref().is_some_and(BridgeProcessRecord::is_active) {
+        anyhow::bail!("compute node already running; stop it before starting a new session");
+    }
+    let mut child_slot = state.child.lock().await;
+    if child_slot
+        .as_mut()
+        .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+    {
+        anyhow::bail!("compute node already running; stop it before starting a new session");
+    }
+    let mut stdin_slot = state.stdin.lock().await;
+    let mut status = state.status.lock().await;
+    let mut ack = state.stopped_event_ack_session_id.lock().await;
+    *child_slot = None;
+    *stdin_slot = None;
+    *process = Some(BridgeProcessRecord::new(session_id.to_string(), None, None));
+    status.operator_session_id = Some(session_id.to_string());
+    status.log_file_path = None;
+    status.last_error = None;
+    status.updated_at_ms = Some(current_time_ms());
+    status.stop_cleanup_required = None;
+    status.stop_cleanup_attempted = None;
+    status.stop_cleanup_outcome = None;
+    status.stop_cleanup_success_count = None;
+    status.stop_cleanup_failure_count = None;
+    status.stop_cleanup_warning = None;
+    *ack = None;
+    Ok(())
+}
+
 async fn attach_spawned_bridge_process_for_session(
     state: &ComputeNodeState,
     session_id: &str,
@@ -563,6 +602,46 @@ fn startup_failure_status(
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
+    }
+}
+
+async fn complete_no_child_startup_failure(
+    state: &ComputeNodeState,
+    request: &ComputeNodeRequest,
+    session_id: &str,
+    log_file_path: Option<String>,
+    last_error: String,
+) {
+    let mut notify = None;
+    {
+        let mut process = state.bridge_process.lock().await;
+        let mut status = state.status.lock().await;
+        if status.operator_session_id.as_deref() == Some(session_id) {
+            let mut failure_status = startup_failure_status(
+                request,
+                last_error,
+                Some(session_id.to_string()),
+                log_file_path,
+            );
+            failure_status.stop_cleanup_required = Some(false);
+            failure_status.stop_cleanup_attempted = Some(false);
+            failure_status.stop_cleanup_outcome = Some("not_required".into());
+            failure_status.stop_cleanup_success_count = Some(0);
+            failure_status.stop_cleanup_failure_count = Some(0);
+            failure_status.stop_cleanup_warning = None;
+            *status = failure_status;
+        }
+        if let Some(record) = process
+            .as_mut()
+            .filter(|record| record.session_id == session_id)
+        {
+            record.phase = BridgeProcessPhase::Completed;
+            record.stop_result = Some(Ok(()));
+            notify = Some(record.notify.clone());
+        }
+    }
+    if let Some(notify) = notify {
+        notify.notify_waiters();
     }
 }
 
@@ -1235,38 +1314,7 @@ pub async fn start_compute_node(
         next_session_id.to_string()
     };
 
-    {
-        let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        let mut process = state.bridge_process.lock().await;
-        if process.as_ref().is_some_and(BridgeProcessRecord::is_active) {
-            anyhow::bail!("compute node already running; stop it before starting a new session");
-        }
-        *process = Some(BridgeProcessRecord::new(session_id.clone(), None, None));
-        let mut child_slot = state.child.lock().await;
-        if child_slot
-            .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
-        {
-            anyhow::bail!("compute node already running; stop it before starting a new session");
-        }
-        *child_slot = None;
-        *state.stdin.lock().await = None;
-    }
-    {
-        let mut status = state.status.lock().await;
-        let mut ack = state.stopped_event_ack_session_id.lock().await;
-        status.operator_session_id = Some(session_id.clone());
-        status.log_file_path = None;
-        status.last_error = None;
-        status.updated_at_ms = Some(current_time_ms());
-        status.stop_cleanup_required = None;
-        status.stop_cleanup_attempted = None;
-        status.stop_cleanup_outcome = None;
-        status.stop_cleanup_success_count = None;
-        status.stop_cleanup_failure_count = None;
-        status.stop_cleanup_warning = None;
-        *ack = None;
-    }
+    reserve_starting_bridge_process_for_session(&state, &session_id).await?;
     state.stopped_event_ack_notify.notify_waiters();
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),
@@ -1308,15 +1356,14 @@ pub async fn start_compute_node(
     let bridge_script = match resolve_bridge_script(&app) {
         Ok(bridge_script) => bridge_script,
         Err(err) => {
-            {
-                let mut status = state.status.lock().await;
-                *status = startup_failure_status(
-                    &request,
-                    err.clone(),
-                    Some(session_id.clone()),
-                    log_file_path.clone(),
-                );
-            }
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                err.clone(),
+            )
+            .await;
             return Err(anyhow::anyhow!(err));
         }
     };
@@ -1337,29 +1384,27 @@ pub async fn start_compute_node(
             Ok(result) => match result {
                 Ok(launcher) => Some(launcher),
                 Err(err) => {
-                    {
-                        let mut status = state.status.lock().await;
-                        *status = startup_failure_status(
-                            &request,
-                            err.to_string(),
-                            Some(session_id.clone()),
-                            log_file_path.clone(),
-                        );
-                    }
+                    complete_no_child_startup_failure(
+                        &state,
+                        &request,
+                        &session_id,
+                        log_file_path.clone(),
+                        err.to_string(),
+                    )
+                    .await;
                     return Err(err.into());
                 }
             },
             Err(err) => {
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
-                {
-                    let mut status = state.status.lock().await;
-                    *status = startup_failure_status(
-                        &request,
-                        err.to_string(),
-                        Some(session_id.clone()),
-                        log_file_path.clone(),
-                    );
-                }
+                complete_no_child_startup_failure(
+                    &state,
+                    &request,
+                    &session_id,
+                    log_file_path.clone(),
+                    err.to_string(),
+                )
+                .await;
                 return Err(err.into());
             }
         }
@@ -1370,15 +1415,14 @@ pub async fn start_compute_node(
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
-            {
-                let mut status = state.status.lock().await;
-                *status = startup_failure_status(
-                    &request,
-                    err.to_string(),
-                    Some(session_id.clone()),
-                    log_file_path.clone(),
-                );
-            }
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                err.to_string(),
+            )
+            .await;
             return Err(err.into());
         }
     };
@@ -1449,25 +1493,14 @@ pub async fn start_compute_node(
     let mut child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
-            {
-                let _lifecycle_lock = state.lifecycle_lock.lock().await;
-                {
-                    let mut process = state.bridge_process.lock().await;
-                    if process
-                        .as_ref()
-                        .is_some_and(|record| record.session_id == session_id)
-                    {
-                        *process = None;
-                    }
-                }
-                let mut status = state.status.lock().await;
-                *status = startup_failure_status(
-                    &request,
-                    format!("failed to start compute-node bridge: {err}"),
-                    Some(session_id.clone()),
-                    log_file_path.clone(),
-                );
-            }
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                format!("failed to start compute-node bridge: {err}"),
+            )
+            .await;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
@@ -1702,6 +1735,7 @@ async fn stop_compute_node_with_shutdown_timeout(
     shutdown_timeout: Duration,
 ) -> anyhow::Result<()> {
     let (stop_session_id, stop_log_file_path) = {
+        let _lifecycle_lock = state.lifecycle_lock.try_lock().ok();
         let status = state.status.lock().await;
         (
             status.operator_session_id.clone(),
@@ -4200,6 +4234,172 @@ mod tests {
                 "session-1".to_string()
             )
         );
+    }
+
+    fn sample_compute_node_request() -> ComputeNodeRequest {
+        ComputeNodeRequest {
+            model_path: "model.gguf".into(),
+            relay_base_url: "https://relay.example".into(),
+            relay_base_urls: vec![],
+            mode: ComputeMode::Cpu,
+            context_tier: "64k-full".into(),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn starting_reservation_rejects_live_legacy_child_without_mutating_status() {
+        let state = ComputeNodeState::default();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn legacy child");
+        *state.child.lock().await = Some(child);
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("existing-session".into());
+            status.last_error = Some("preserve me".into());
+        }
+
+        let result = reserve_starting_bridge_process_for_session(&state, "new-session").await;
+        assert!(result.is_err());
+        assert!(state.bridge_process.lock().await.is_none());
+        let status = state.status.lock().await.clone();
+        assert_eq!(
+            status.operator_session_id.as_deref(),
+            Some("existing-session")
+        );
+        assert_eq!(status.last_error.as_deref(), Some("preserve me"));
+
+        let legacy_child = { state.child.lock().await.take() };
+        if let Some(mut child) = legacy_child {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn no_child_startup_failure_completes_reservation_and_allows_next_start() {
+        let state = ComputeNodeState::default();
+        let request = sample_compute_node_request();
+        reserve_starting_bridge_process_for_session(&state, "session-1")
+            .await
+            .expect("reserve session 1");
+
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            "session-1",
+            Some("/tmp/operator.log".into()),
+            "bridge script missing".into(),
+        )
+        .await;
+
+        let process = state.bridge_process.lock().await;
+        let record = process.as_ref().expect("completed record");
+        assert_eq!(record.phase, BridgeProcessPhase::Completed);
+        assert_eq!(record.stop_result, Some(Ok(())));
+        drop(process);
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.stop_cleanup_required, Some(false));
+        assert_eq!(status.stop_cleanup_attempted, Some(false));
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
+        assert_eq!(status.stop_cleanup_success_count, Some(0));
+        assert_eq!(status.stop_cleanup_failure_count, Some(0));
+        assert!(status.stop_cleanup_warning.is_none());
+        assert_eq!(status.last_error.as_deref(), Some("bridge script missing"));
+
+        reserve_starting_bridge_process_for_session(&state, "session-2")
+            .await
+            .expect("completed startup failure should permit next start reservation");
+        assert_eq!(
+            state.status.lock().await.operator_session_id.as_deref(),
+            Some("session-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_latched_during_no_child_startup_failure_replays_success_without_warning() {
+        let state = ComputeNodeState::default();
+        let request = sample_compute_node_request();
+        reserve_starting_bridge_process_for_session(&state, "session-1")
+            .await
+            .expect("reserve session");
+
+        let stop_state = state.clone();
+        let stop_task = tokio::spawn(async move {
+            stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
+        });
+        let phase_deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if state
+                .bridge_process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|record| record.phase == BridgeProcessPhase::Stopping)
+            {
+                break;
+            }
+            assert!(Instant::now() < phase_deadline);
+            tokio::task::yield_now().await;
+        }
+
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            "session-1",
+            None,
+            "python launcher missing".into(),
+        )
+        .await;
+        stop_task
+            .await
+            .expect("stop join")
+            .expect("no-child startup failure stop should replay cached success");
+        let status = state.status.lock().await.clone();
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("python launcher missing")
+        );
+        assert!(status.stop_cleanup_warning.is_none());
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
+    }
+
+    #[tokio::test]
+    async fn delayed_no_child_failure_from_old_session_cannot_overwrite_replacement() {
+        let state = ComputeNodeState::default();
+        let request = sample_compute_node_request();
+        reserve_starting_bridge_process_for_session(&state, "session-2")
+            .await
+            .expect("reserve replacement");
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.last_error = None;
+        }
+
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            "session-1",
+            None,
+            "old failure".into(),
+        )
+        .await;
+
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.operator_session_id.as_deref(), Some("session-2"));
+        assert!(status.running);
+        assert!(status.registered);
+        assert!(status.last_error.is_none());
+        assert!(status.stop_cleanup_outcome.is_none());
+        let process = state.bridge_process.lock().await;
+        let record = process.as_ref().expect("replacement record");
+        assert_eq!(record.session_id, "session-2");
+        assert_eq!(record.phase, BridgeProcessPhase::Starting);
     }
 
     #[test]

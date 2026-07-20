@@ -2605,8 +2605,10 @@ def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    with pytest.raises(validator.ValidationError, match='filename does not contain'):
-        validator.validate_artifact(nsis, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
+    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.2-setup.exe'
+    wrong_name.write_bytes(b'installer')
+    with pytest.raises(validator.ValidationError, match='filename does not match'):
+        validator.validate_artifact(wrong_name, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
     provenance = next(msi.rglob('embedded_python_runtime_provenance.json'))
     data = json.loads(provenance.read_text(encoding='utf-8'))
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
@@ -2923,3 +2925,96 @@ def test_prepare_load_manifest_additional_rejection_branches(tmp_path):
     path.write_text(json.dumps(bad), encoding='utf-8')
     with pytest.raises(prep.RuntimePrepError, match='python_package_wheels must be a list'):
         prep.load_manifest(path)
+
+def test_windows_validator_normalizes_and_rejects_internal_version_metadata(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    app = tmp_path / 'token.place.exe'
+    app.write_bytes(b'MZ-app')
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ-nsis')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(
+        validator,
+        '_read_pe_version_info',
+        lambda path: {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'} if path == artifact else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'},
+    )
+    validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+    monkeypatch.setattr(
+        validator,
+        '_read_pe_version_info',
+        lambda path: {'ProductVersion': '0.1.1.0', 'FileVersion': '0.1.2.0'},
+    )
+    with pytest.raises(validator.ValidationError, match='NSIS ProductVersion=0.1.1'):
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+
+def test_windows_validator_rejects_stale_msi_or_installed_app_version(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    app = tmp_path / 'token.place.exe'
+    app.write_bytes(b'MZ-app')
+    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
+    msi.write_bytes(b'MZ-msi')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.1')
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.2', 'FileVersion': '0.1.2'})
+    with pytest.raises(validator.ValidationError, match='MSI ProductVersion=0.1.1'):
+        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+
+    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.2')
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.1', 'FileVersion': '0.1.2'})
+    with pytest.raises(validator.ValidationError, match='app ProductVersion=0.1.1'):
+        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+
+def test_windows_nvidia_smoke_installer_handoff_is_one_shot(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+    calls = {'materialize': 0, 'run': [], 'cleanup': []}
+    materialized = tmp_path / 'materialized'
+    python_exe = materialized / 'python-runtime' / 'python.exe'
+    resource_root = materialized
+
+    def fake_mkdtemp(prefix):
+        materialized.mkdir(parents=True, exist_ok=True)
+        return str(materialized)
+
+    def fake_materialize(artifact, root):
+        calls['materialize'] += 1
+        assert artifact == installer
+        assert root == materialized
+        python_exe.parent.mkdir(parents=True, exist_ok=True)
+        python_exe.write_text('python', encoding='utf-8')
+        (resource_root / 'python').mkdir(exist_ok=True)
+        (resource_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+
+    def fake_run(cmd, **kwargs):
+        calls['run'].append((cmd, kwargs))
+        return type('Completed', (), {'returncode': 17})()
+
+    monkeypatch.setattr(smoke.tempfile, 'mkdtemp', fake_mkdtemp)
+    monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+    monkeypatch.setattr(smoke.shutil, 'rmtree', lambda path, ignore_errors=False: calls['cleanup'].append((Path(path), ignore_errors)))
+    args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+
+    assert smoke._launch_materialized_child(args) == 17
+    assert calls['materialize'] == 1
+    assert len(calls['run']) == 1
+    cmd = calls['run'][0][0]
+    assert cmd[0] == str(python_exe)
+    assert '--installer' not in cmd
+    assert '--artifact-root' not in cmd
+    assert cmd[cmd.index('--python-exe') + 1] == str(python_exe)
+    assert cmd[cmd.index('--resource-root') + 1] == str(resource_root)
+    assert cmd[cmd.index('--mode') + 1] == 'gpu'
+    assert cmd[cmd.index('--context-tier') + 1] == '64k-full'
+    assert calls['cleanup'] == [(materialized, True)]

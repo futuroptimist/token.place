@@ -715,8 +715,8 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
         "offloaded_layers": 0,
         "kv_cache_device": "cpu",
         "context_tier": _startup_context_tier(args),
-        "model_path": str(getattr(args, "model", "")),
-        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+        "model_path": Path(str(getattr(args, "model", ""))).name if getattr(args, "model", "") else "",
+        "log_file_path": _runtime_public_value("log_file_path", os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown"),
         "last_error": None,
         "warm_load_state": "provisioning",
         "warm_load_enabled": _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT),
@@ -738,6 +738,19 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
             "startup_elapsed_ms": elapsed_ms,
         },
     }
+
+
+def _runtime_public_value(key: str, value: Any) -> Any:
+    if key in {"interpreter"}:
+        return Path(str(value or sys.executable)).name or "python.exe"
+    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path"}:
+        text = str(value or "unknown")
+        if "python-runtime" in text.lower() or text == "bundled":
+            return "bundled"
+        return Path(text).name if text not in {"", "unknown"} else "unknown"
+    if key in {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}:
+        return "redacted" if value else None
+    return value
 
 def _structured_startup_error_payload(
     args: argparse.Namespace,
@@ -764,9 +777,9 @@ def _structured_startup_error_payload(
         "fallback_reason": None,
         "error_code": getattr(args, "startup_error_code", "desktop_compute_node_startup_failed"),
         "context_tier": _startup_context_tier(args),
-        "interpreter": sys.executable,
-        "import_root": os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "unknown") or "unknown",
-        "log_file_path": os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown",
+        "interpreter": _runtime_public_value("interpreter", sys.executable),
+        "import_root": _runtime_public_value("import_root", os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "unknown") or "unknown"),
+        "log_file_path": _runtime_public_value("log_file_path", os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown"),
         "last_error": message,
         "message": message,
         "warm_load_state": "failed",
@@ -891,8 +904,8 @@ def run(args: argparse.Namespace) -> int:
         detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
         emit_startup_error(
             "desktop runtime dependency preflight failed "
-            f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
-            f"import_root={dependency_setup.get('import_root', 'unknown')} "
+            f"(interpreter={_runtime_public_value('interpreter', dependency_setup.get('interpreter', sys.executable))} "
+            f"import_root={_runtime_public_value('import_root', dependency_setup.get('import_root', 'unknown'))} "
             f"missing={missing}): {detail}"
         )
         return 1
@@ -928,17 +941,17 @@ def run(args: argparse.Namespace) -> int:
         f"llama_cpp_python_installed_version={runtime_setup.get('llama_cpp_python_installed_version', 'unknown')} "
         f"llama_cpp_python_required_version={runtime_setup.get('llama_cpp_python_required_version', 'unknown')} "
         f"llama_cpp_python_version_match={runtime_setup.get('llama_cpp_python_version_match', 'unknown')} "
-        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"interpreter={_runtime_public_value('interpreter', runtime_setup.get('interpreter', sys.executable))} "
         f"python_version={runtime_setup.get('python_version', 'unknown')} "
-        f"prefix={runtime_setup.get('prefix', runtime_setup.get('interpreter_prefix', 'unknown'))} "
-        f"base_prefix={runtime_setup.get('base_prefix', 'unknown')} "
-        f"dependency_target={runtime_setup.get('dependency_target', 'unknown')} "
+        f"prefix={_runtime_public_value('prefix', runtime_setup.get('prefix', runtime_setup.get('interpreter_prefix', 'unknown')))} "
+        f"base_prefix={_runtime_public_value('base_prefix', runtime_setup.get('base_prefix', 'unknown'))} "
+        f"dependency_target={_runtime_public_value('dependency_target', runtime_setup.get('dependency_target', 'unknown'))} "
         f"pip={runtime_setup.get('pip_version', 'unknown')} "
-        f"install_command={runtime_setup.get('install_command_summary', 'none')} "
+        f"install_command={_runtime_public_value('install_command_summary', runtime_setup.get('install_command_summary')) or 'none'} "
         f"install_backend={runtime_setup.get('install_backend', 'none')} "
-        f"cmake_args={runtime_setup.get('cmake_args', 'none')} "
-        f"pip_stdout_tail={runtime_setup.get('pip_stdout_tail', 'none')} "
-        f"pip_stderr_tail={runtime_setup.get('pip_stderr_tail', 'none')} "
+        f"cmake_args={_runtime_public_value('cmake_args', runtime_setup.get('cmake_args')) or 'none'} "
+        f"pip_stdout_tail={_runtime_public_value('pip_stdout_tail', runtime_setup.get('pip_stdout_tail')) or 'none'} "
+        f"pip_stderr_tail={_runtime_public_value('pip_stderr_tail', runtime_setup.get('pip_stderr_tail')) or 'none'} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
@@ -1211,19 +1224,19 @@ def run(args: argparse.Namespace) -> int:
             "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
             "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
-            "interpreter": runtime_setup.get("interpreter", sys.executable),
-            "dependency_target": runtime_setup.get("dependency_target", "unknown"),
+            "interpreter": _runtime_public_value("interpreter", runtime_setup.get("interpreter", sys.executable)),
+            "dependency_target": _runtime_public_value("dependency_target", runtime_setup.get("dependency_target", "unknown")),
             "python_version": runtime_setup.get("python_version", "unknown"),
-            "prefix": runtime_setup.get("prefix", runtime_setup.get("interpreter_prefix", "unknown")),
-            "base_prefix": runtime_setup.get("base_prefix", "unknown"),
+            "prefix": _runtime_public_value("prefix", runtime_setup.get("prefix", runtime_setup.get("interpreter_prefix", "unknown"))),
+            "base_prefix": _runtime_public_value("base_prefix", runtime_setup.get("base_prefix", "unknown")),
             "pip_version": runtime_setup.get("pip_version", "unknown"),
             "runtime_action": runtime_setup.get("runtime_action", "none"),
             "runtime_selected_backend": runtime_setup.get("selected_backend", "cpu"),
-            "install_command_summary": runtime_setup.get("install_command_summary"),
+            "install_command_summary": _runtime_public_value("install_command_summary", runtime_setup.get("install_command_summary")),
             "install_backend": runtime_setup.get("install_backend"),
-            "cmake_args": runtime_setup.get("cmake_args"),
-            "pip_stdout_tail": runtime_setup.get("pip_stdout_tail"),
-            "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
+            "cmake_args": _runtime_public_value("cmake_args", runtime_setup.get("cmake_args")),
+            "pip_stdout_tail": _runtime_public_value("pip_stdout_tail", runtime_setup.get("pip_stdout_tail")),
+            "pip_stderr_tail": _runtime_public_value("pip_stderr_tail", runtime_setup.get("pip_stderr_tail")),
             "model_path_was_relative": model_path_was_relative,
             "parent_model_path_exists": parent_model_path_exists,
             "child_model_path_exists": getattr(runtime.model_manager, "child_model_path_exists", False),

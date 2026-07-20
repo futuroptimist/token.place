@@ -53,29 +53,58 @@ def _sanitize_env_for_bundled_runtime(resource_root: Path) -> dict[str, str]:
     return env
 
 
-def _extract_release_artifact(installer: Path, artifact_root: Path | None = None) -> tuple[Path, Path]:
-    base = artifact_root or installer.parent
-    extract_root = Path(tempfile.mkdtemp(prefix='token-place-win-smoke-'))
-    if installer.is_dir():
-        extract_root = installer
-    else:
-        seven_zip = shutil.which('7z') or shutil.which('7za') or shutil.which('7zz')
-        if seven_zip is None:
-            raise RuntimeError('7z/7za/7zz is required to extract the Windows release artifact')
-        subprocess.run([seven_zip, 'x', '-y', f'-o{extract_root}', str(installer)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def _find_materialized_runtime(extract_root: Path) -> tuple[Path, Path]:
     candidates = [p for p in extract_root.rglob('python.exe') if p.parent.name.lower() == 'python-runtime']
     if len(candidates) != 1:
         raise RuntimeError(f'expected exactly one bundled python-runtime/python.exe in release artifact, found {len(candidates)}')
     python_exe = candidates[0]
     resources = python_exe.parent.parent
     if not (resources / 'python' / 'compute_node_bridge.py').is_file():
-        # Some extractor layouts add extra wrapper directories; locate the bridge and
-        # use its parent as the resource root while retaining the bundled interpreter.
         bridges = list(extract_root.rglob('compute_node_bridge.py'))
         if not bridges:
             raise RuntimeError('release artifact resources are missing compute_node_bridge.py')
         resources = bridges[0].parent.parent
     return python_exe, resources
+
+
+def _materialize_release_artifact(installer: Path, extract_root: Path) -> None:
+    if installer.is_dir():
+        shutil.copytree(installer, extract_root, dirs_exist_ok=True)
+        return
+    if not sys.platform.startswith('win'):
+        raise RuntimeError('Windows installer materialization requires Windows')
+    installer_abs = installer.resolve()
+    root_abs = extract_root.resolve()
+    suffix = installer.suffix.lower()
+    if suffix == '.msi':
+        subprocess.run(['msiexec.exe', '/a', str(installer_abs), '/qn', '/norestart', f'TARGETDIR={root_abs}'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return
+    if suffix == '.exe':
+        subprocess.run([str(installer_abs), '/S', f'/D={root_abs}'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return
+    raise RuntimeError(f'unsupported Windows installer artifact: {installer.name}')
+
+
+def _canonical_child_args(args: argparse.Namespace, python_exe: Path, resource_root: Path) -> list[str]:
+    child = ['--python-exe', str(python_exe), '--resource-root', str(resource_root)]
+    if args.model:
+        child.extend(['--model', str(args.model)])
+    child.extend(['--mode', args.mode, '--context-tier', args.context_tier])
+    return child
+
+
+def _launch_materialized_child(args: argparse.Namespace) -> int:
+    install_root = Path(tempfile.mkdtemp(prefix='token-place-win-smoke-'))
+    try:
+        _materialize_release_artifact(args.installer, install_root)
+        python_exe, resource_root = _find_materialized_runtime(install_root)
+        child_args = _canonical_child_args(args, python_exe, resource_root)
+        env = _sanitize_env_for_bundled_runtime(resource_root)
+        completed = subprocess.run([str(python_exe), str(Path(__file__).resolve()), *child_args], env=env, cwd=str(resource_root), check=False)
+        return int(completed.returncode)
+    finally:
+        shutil.rmtree(install_root, ignore_errors=True)
+
 
 def _maybe_reexec_with_bundled_python(python_exe: Path | None, resource_root: Path | None, argv: list[str]) -> None:
     if python_exe is None:
@@ -201,19 +230,25 @@ def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str, resource_
     repo_root = _repo_root()
     python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     bridge_path = python_root / 'compute_node_bridge.py'
-    env = os.environ.copy()
-    existing_pythonpath = env.get('PYTHONPATH', '')
-    entries = [str(repo_root), str(python_root)]
-    if existing_pythonpath:
-        entries.append(existing_pythonpath)
-    env['PYTHONPATH'] = os.pathsep.join(entries)
+    if resource_root:
+        env = _sanitize_env_for_bundled_runtime(resource_root)
+        env['PYTHONPATH'] = str(python_root)
+        cwd = str(resource_root)
+    else:
+        env = os.environ.copy()
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        entries = [str(repo_root), str(python_root)]
+        if existing_pythonpath:
+            entries.append(existing_pythonpath)
+        env['PYTHONPATH'] = os.pathsep.join(entries)
+        cwd = str(repo_root)
 
     popen_kwargs: dict[str, Any] = {
         'stdin': subprocess.PIPE,
         'stdout': subprocess.PIPE,
         'stderr': subprocess.PIPE,
         'text': True,
-        'cwd': str(repo_root),
+        'cwd': cwd,
         'env': env,
     }
     if os.name != 'nt':
@@ -311,7 +346,7 @@ def main() -> int:
 
     try:
         if getattr(args, 'installer', None) and not getattr(args, 'python_exe', None):
-            args.python_exe, args.resource_root = _extract_release_artifact(args.installer, getattr(args, 'artifact_root', None))
+            return _launch_materialized_child(args)
         _maybe_reexec_with_bundled_python(getattr(args, 'python_exe', None), getattr(args, 'resource_root', None), sys.argv[1:])
     except Exception as exc:
         return _fail(str(exc))
@@ -328,9 +363,9 @@ def main() -> int:
     python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     if str(python_root) not in sys.path:
         sys.path.insert(0, str(python_root))
-    from path_bootstrap import ensure_runtime_import_paths
-
-    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+    if resource_root is None:
+        from path_bootstrap import ensure_runtime_import_paths
+        ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
     try:
         diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode, args.context_tier)

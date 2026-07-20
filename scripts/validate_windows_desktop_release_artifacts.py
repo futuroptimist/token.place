@@ -24,6 +24,81 @@ class ValidationError(RuntimeError):
     pass
 
 
+
+def _normalize_windows_version(value: str) -> str:
+    parts = [part for part in str(value or '').strip().split('.') if part != '']
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValidationError('Windows version metadata is missing or unparseable')
+    while len(parts) > 3 and parts[-1] == '0':
+        parts.pop()
+    return '.'.join(parts)
+
+
+def _read_pe_version_info(path: Path) -> dict[str, str]:
+    if platform.system() != 'Windows':
+        return {}
+    script = "$v=(Get-Item -LiteralPath $args[0]).VersionInfo; [Console]::WriteLine(($v.ProductVersion+'|'+$v.FileVersion))"
+    result = subprocess.run(['powershell', '-NoProfile', '-Command', script, str(path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+    if result.returncode != 0:
+        return {}
+    product, _, file_version = (result.stdout or '').strip().partition('|')
+    return {'ProductVersion': product.strip(), 'FileVersion': file_version.strip()}
+
+
+def _read_msi_product_version(path: Path) -> str | None:
+    if platform.system() != 'Windows':
+        return None
+    script = "$installer=New-Object -ComObject WindowsInstaller.Installer; $db=$installer.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$installer,@($args[0],0)); $view=$db.OpenView(\"SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'\"); $view.Execute(); $record=$view.Fetch(); if ($record) { [Console]::WriteLine($record.StringData(1)) }"
+    result = subprocess.run(['powershell', '-NoProfile', '-Command', script, str(path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+    if result.returncode != 0:
+        return None
+    return (result.stdout or '').strip() or None
+
+
+def _find_tauri_app_exe(root: Path) -> Path | None:
+    candidates = []
+    for path in root.rglob('*.exe'):
+        lower = path.name.lower()
+        if lower in {'python.exe', 'pythonw.exe'} or lower.startswith(('unins', 'uninstall')):
+            continue
+        if 'python-runtime' in {part.lower() for part in path.parts}:
+            continue
+        candidates.append(path)
+    return sorted(candidates)[0] if candidates else None
+
+
+def _validate_version_metadata(artifact: Path, dest: Path, expected: str, kind: str) -> None:
+    if artifact.is_dir():
+        return
+    values: dict[str, str | None] = {}
+    if kind.upper() == 'MSI':
+        values['MSI ProductVersion'] = _read_msi_product_version(artifact)
+    elif artifact.is_file():
+        nsis_versions = _read_pe_version_info(artifact)
+        values['NSIS ProductVersion'] = nsis_versions.get('ProductVersion')
+        values['NSIS FileVersion'] = nsis_versions.get('FileVersion')
+    app_exe = _find_tauri_app_exe(dest)
+    if app_exe is not None:
+        app_versions = _read_pe_version_info(app_exe)
+        values['app ProductVersion'] = app_versions.get('ProductVersion')
+        values['app FileVersion'] = app_versions.get('FileVersion')
+    if platform.system() != 'Windows' and artifact.is_file():
+        return
+    failed = []
+    for label, value in values.items():
+        if not value:
+            failed.append(f'{label}=missing')
+            continue
+        try:
+            normalized = _normalize_windows_version(value)
+        except ValidationError:
+            failed.append(f'{label}=unparseable')
+            continue
+        if normalized != expected:
+            failed.append(f'{label}={normalized}')
+    if failed:
+        raise ValidationError(f'{kind} version metadata mismatch for {artifact.name}: {failed}; expected {expected}')
+
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding='utf-8'))
 
@@ -179,8 +254,14 @@ def _validate_runtime_tree(runtime: Path, manifest: dict) -> None:
 
 
 def validate_artifact(artifact: Path, expected: str, kind: str, manifest: dict) -> None:
-    if expected not in artifact.name:
-        raise ValidationError(f'{kind} filename does not contain expected version {expected}: {artifact.name}')
+    if not artifact.is_dir():
+        name = artifact.name
+        if kind.upper() == 'MSI':
+            pattern = rf'.*{re.escape(expected)}.*\.msi$'
+        else:
+            pattern = rf'.*{re.escape(expected)}.*setup.*\.exe$'
+        if not re.fullmatch(pattern, name, re.IGNORECASE):
+            raise ValidationError(f'{kind} filename does not match expected version {expected}: {artifact.name}')
     with tempfile.TemporaryDirectory(prefix=f'token-place-{kind}-') as td:
         dest = Path(td) / 'extract'
         dest.mkdir()
@@ -188,6 +269,7 @@ def validate_artifact(artifact: Path, expected: str, kind: str, manifest: dict) 
         try:
             runtime = _find_runtime(dest)
             _validate_runtime_tree(runtime, manifest)
+            _validate_version_metadata(artifact, dest, expected, kind)
         finally:
             cleanup()
 

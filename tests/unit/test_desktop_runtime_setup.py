@@ -3992,3 +3992,62 @@ def test_valid_provenance_does_not_block_cuda_probe_success(monkeypatch, tmp_pat
 
     assert result['runtime_action'] == 'already_supported'
     assert result['selected_backend'] == 'cuda'
+
+def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tmp_path):
+    resources = tmp_path / 'TokenPlace' / 'resources'
+    python_root = resources / 'python'
+    bundled_site = resources / 'python-runtime' / 'Lib' / 'site-packages'
+    python_root.mkdir(parents=True)
+    bundled_site.mkdir(parents=True)
+    hostile = tmp_path / 'C' / 'Users' / 'SecretName' / '.token_place_desktop_site'
+    hostile.mkdir(parents=True)
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'executable', str(resources / 'python-runtime' / 'python.exe'))
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(hostile))
+    called = {'resolver': 0, 'popen_env': None}
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: resources)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (_ for _ in ()).throw(AssertionError('resolver must not be called')))
+
+    class FakeProcess:
+        stdout = None
+        stderr = None
+        def __init__(self):
+            self.returncode = 0
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        called['popen_env'] = kwargs['env']
+        frame = {
+            'backend': 'cuda', 'gpu_offload_supported': True, 'detected_device': 'cuda',
+            'interpreter': str(resources / 'python-runtime' / 'python.exe'), 'prefix': str(resources / 'python-runtime'),
+            'base_prefix': str(resources / 'python-runtime'), 'dependency_target': 'bundled',
+            'llama_module_path': str(bundled_site / 'llama_cpp' / '__init__.py'),
+        }
+        # Avoid thread IO complexity by forcing no result and a deterministic failure after env capture.
+        raise RuntimeError('captured')
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', fake_popen)
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=resources)
+    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    env = called['popen_env']
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert str(hostile) not in env.get('PYTHONPATH', '')
+    assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
+
+
+def test_packaged_probe_payload_redacts_secret_paths(monkeypatch, tmp_path):
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\python-runtime\python.exe'
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cuda', gpu_offload_supported=True, detected_device='cuda', interpreter=secret,
+        prefix=r'C:\Users\SecretName\prefix', base_prefix=r'C:\Users\SecretName\base',
+        dependency_target=r'C:\Users\SecretName\deps', llama_module_path=r'C:\Users\SecretName\llama_cpp\__init__.py',
+    )
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert payload['interpreter'] == 'python.exe'
+    assert payload['dependency_target'] == 'bundled'

@@ -2033,7 +2033,7 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert "model_path" not in payload
     assert payload["error_code"] == "desktop_compute_node_startup_failed"
     assert payload["context_tier"] == "8k-fast"
-    assert payload["interpreter"] == sys.executable
+    assert payload["interpreter"] == Path(sys.executable).name
     assert payload["import_root"] == "unknown"
     assert payload["log_file_path"] == "unknown"
     assert payload["last_error"] == payload["message"]
@@ -2289,9 +2289,10 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     assert payload['error_code'] == 'context_profiles_unavailable'
     assert payload['registered'] is False
     assert payload['context_tier'] == '64k-full'
-    assert payload['interpreter'] == sys.executable
-    assert payload['import_root'] == str(import_root)
-    assert payload['log_file_path'] == str(tmp_path / 'operator.log')
+    assert payload['interpreter'] == Path(sys.executable).name
+    assert payload['import_root'] == import_root.name
+    assert str(tmp_path) not in json.dumps(payload)
+    assert payload['log_file_path'] == 'operator.log'
     assert 'context profiles unavailable' in payload['message']
     assert 'model_path' not in payload
 
@@ -3819,14 +3820,9 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
     assert payload["relay_runtime_state"] == "failed"
     assert payload["last_error"] == payload["message"]
     assert "desktop runtime dependency preflight failed" in payload["last_error"]
-    assert (
-        "interpreter=/Applications/token.place.app/Contents/MacOS/python"
-        in payload["last_error"]
-    )
-    assert (
-        "import_root=/Applications/token.place.app/Contents/Resources"
-        in payload["last_error"]
-    )
+    assert "interpreter=python" in payload["last_error"]
+    assert "import_root=Resources" in payload["last_error"]
+    assert "/Applications/token.place.app" not in payload["last_error"]
     assert "missing=cryptography,requests" in payload["last_error"]
 
 
@@ -4054,31 +4050,32 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     stderr = output.err
     assert 'desktop.runtime_setup ' in stderr
     for marker in (
-        'interpreter=/Applications/TokenPlace.app/Contents/Resources/python/bin/python',
+        'interpreter=python',
         'python_version=3.12.4',
-        'prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
-        'base_prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
-        'dependency_target=/Users/alice/Library/Application Support/token.place/.token_place_desktop_site',
+        'prefix=Python3.framework',
+        'base_prefix=Python3.framework',
+        'dependency_target=.token_place_desktop_site',
         'pip=pip 24.0',
-        'install_command=python -m pip install --target /deps llama-cpp-python',
+        'install_command=redacted',
         'install_backend=metal',
-        'cmake_args=-DGGML_METAL=on -DGGML_NATIVE=off',
-        'pip_stdout_tail=building wheel',
-        'pip_stderr_tail=Metal headers missing',
+        'cmake_args=redacted',
+        'pip_stdout_tail=redacted',
+        'pip_stderr_tail=redacted',
         'fallback_reason=Metal failed; using CPU runtime',
     ):
         assert marker in stderr
+    assert '/Users/alice' not in stderr
     assert 'llama_module_path=/deps/llama_cpp/__init__.py' not in stderr
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = events[0]
     assert started['last_error'] is None
     status_event = next(event for event in events if event.get('type') == 'status')
     assert status_event['runtime_action'] == 'metal_cpu_fallback'
-    assert status_event['base_prefix'].startswith('/Library/Developer')
+    assert status_event['base_prefix'] == 'Python3.framework'
     assert status_event['pip_version'] == 'pip 24.0'
-    assert status_event['install_command_summary'].startswith('python -m pip install')
-    assert status_event['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
-    assert status_event['pip_stderr_tail'] == 'Metal headers missing'
+    assert status_event['install_command_summary'] == 'redacted'
+    assert status_event['cmake_args'] == 'redacted'
+    assert status_event['pip_stderr_tail'] == 'redacted'
     assert 'llama_module_path' not in status_event
 
 def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):

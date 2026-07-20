@@ -537,6 +537,21 @@ def _pip_version_summary() -> str:
     return output or "available"
 
 
+
+def _bundled_site_packages_dir() -> Path:
+    return _safe_resolve_path(sys.executable).parent / "Lib" / "site-packages"
+
+
+def _public_runtime_identity(value: str) -> str:
+    text = str(value or "")
+    lower = text.lower()
+    if _is_exact_packaged_runtime_layout():
+        basename = text.replace("\\", "/").rsplit("/", 1)[-1]
+        if lower.endswith("python.exe") or lower.endswith("python"):
+            return basename or "python.exe"
+        return basename if text else "bundled"
+    return text
+
 def _probe_failure(
     *,
     error: str,
@@ -561,19 +576,30 @@ def _probe_failure(
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
-    dependency_target, _dependency_target_error = _resolve_desktop_dependency_target(repo_root)
-    dependency_target_env = str(dependency_target) if dependency_target is not None else ""
-    dependency_target_text = dependency_target_env or "unknown"
-    pip_version = "bundled-runtime-probe" if _is_exact_packaged_runtime_layout() else _pip_version_summary()
+    exact_packaged = _is_exact_packaged_runtime_layout()
+    dependency_target = _bundled_site_packages_dir() if exact_packaged else _resolve_desktop_dependency_target(repo_root)[0]
+    dependency_target_env = str(dependency_target) if dependency_target is not None and not exact_packaged else ""
+    dependency_target_text = "bundled" if exact_packaged else (dependency_target_env or "unknown")
+    pip_version = "bundled-runtime-probe" if exact_packaged else _pip_version_summary()
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(python_root)]
-    if dependency_target is not None:
-        pythonpath_entries.append(str(dependency_target))
-    pythonpath_entries.append(str(repo_root))
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
+    if exact_packaged:
+        for key in list(env):
+            upper = key.upper()
+            if upper in {"PYTHONHOME", "PYTHONPATH", "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"} or upper.startswith("PIP_") or upper.startswith("CMAKE_") or upper == "FORCE_CMAKE":
+                env.pop(key, None)
+        pythonpath_entries = [str(dependency_target), str(python_root)] if dependency_target is not None else [str(python_root)]
+        probe_cwd = str(python_root)
+        env["PYTHONNOUSERSITE"] = "1"
+    else:
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        pythonpath_entries = [str(python_root)]
+        if dependency_target is not None:
+            pythonpath_entries.append(str(dependency_target))
+        pythonpath_entries.append(str(repo_root))
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        probe_cwd = str(repo_root)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))
@@ -582,13 +608,14 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     else:
         env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     env["TOKEN_PLACE_DESKTOP_PIP_VERSION"] = pip_version
-    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
+    if not exact_packaged:
+        env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
-        "cwd": str(repo_root),
+        "cwd": probe_cwd,
         "env": env,
     }
     if os.name != "nt":
@@ -1164,6 +1191,14 @@ def _runtime_probe_is_importable(probe: RuntimeProbe) -> bool:
 
 
 def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    if _is_exact_packaged_runtime_layout():
+        dependency_target = _bundled_site_packages_dir()
+        dependency_target_text = str(dependency_target)
+        active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
+        if dependency_target_text not in active_sys_path:
+            active_sys_path.insert(1 if active_sys_path else 0, dependency_target_text)
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+        return dependency_target, None
     dependency_target, dependency_target_error = _resolve_desktop_dependency_target(runtime_root)
     if dependency_target is not None:
         dependency_target_text = str(dependency_target)
@@ -1176,12 +1211,13 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     return {
         "detected_device": probe.detected_device or "cpu",
-        "interpreter": probe.interpreter,
+        "interpreter": _public_runtime_identity(probe.interpreter),
         "python_version": probe.python_version,
-        "prefix": probe.prefix,
-        "base_prefix": probe.base_prefix,
-        "interpreter_prefix": probe.prefix,
-        "dependency_target": probe.dependency_target,
+        "prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.prefix,
+        "base_prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.base_prefix,
+        "interpreter_prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.prefix,
+        "dependency_target": "bundled" if _is_exact_packaged_runtime_layout() else probe.dependency_target,
+        "runtime_origin": "bundled" if _is_exact_packaged_runtime_layout() else "development",
         "pip_version": probe.pip_version,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
         "llama_module_path_present": bool(llama_module_identity_from_path(probe.llama_module_path)),
@@ -2303,9 +2339,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
 
     missing = _module_missing(required_modules)
     if not missing:
-        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": str(target_dir) if target_dir is not None else ""}
+        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": "bundled" if _is_exact_packaged_runtime_layout() else (str(target_dir) if target_dir is not None else "")}
     if _is_exact_packaged_runtime_layout():
-        return {"ok": "false", "action": "bundled_runtime_probe_failed", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else "", "detail": "immutable packaged runtime will not run pip installers"}
+        return {"ok": "false", "action": "bundled_runtime_probe_failed", "missing": ",".join(missing), "dependency_target": "bundled", "detail": "immutable packaged runtime will not run pip installers"}
     if not mutate:
         return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else ""}
 
@@ -2314,9 +2350,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": "requirements_missing",
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
         }
 
     if target_dir is None:
@@ -2324,9 +2360,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": "install_target_unavailable",
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
             "detail": target_error or "unable to create desktop dependency install target",
         }
 
@@ -2371,9 +2407,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": action,
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
             "dependency_target": target_dir_str,
             "detail": _summarize_install_error(output),
         }

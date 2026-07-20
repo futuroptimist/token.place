@@ -4879,11 +4879,17 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
         terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
         wait=MagicMock(return_value=0),
         kill=MagicMock(),
+        stdin=SimpleNamespace(close=MagicMock()),
+        stdout=SimpleNamespace(close=MagicMock()),
+        stderr=SimpleNamespace(close=MagicMock()),
     )
     manager._close_llm_proxy(SimpleNamespace(_process=terminate_fails_process), terminate_process=True)
     terminate_fails_process.terminate.assert_called_once_with()
     terminate_fails_process.kill.assert_called_once_with()
     terminate_fails_process.wait.assert_called_once_with(timeout=1.0)
+    terminate_fails_process.stdin.close.assert_called_once_with()
+    terminate_fails_process.stdout.close.assert_called_once_with()
+    terminate_fails_process.stderr.close.assert_called_once_with()
 
     stubborn_process = SimpleNamespace(
         poll=MagicMock(return_value=None),

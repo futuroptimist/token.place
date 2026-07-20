@@ -1319,7 +1319,11 @@ class RelayClient:
         """Reset stop/unregister state before a fresh API v1 polling session.
 
         ``clear_registration`` forces the next poll to re-register with the relay, which is
-        required after an explicit Stop because the relay-side lease may have been removed.
+        required after confirmed teardown or exact session replacement because the
+        relay-side lease may have been removed. In-memory owner credentials are not
+        blanket-cleared here; each relay credential is preserved until that exact
+        relay is successfully unregistered, replaced, or otherwise confirmed torn
+        down.
         """
 
         self.stop_polling = False
@@ -1327,8 +1331,6 @@ class RelayClient:
         self._unregister_attempted = False
         self._unregister_complete = False
         if clear_registration:
-            for relay_url in tuple(self._api_v1_registered_relays):
-                self._pop_api_v1_control_credential(relay_url)
             self._api_v1_registered_relays.clear()
             self._api_v1_last_heartbeat_at.clear()
             getattr(self, "_api_v1_relay_wait_hints", {}).clear()
@@ -2291,11 +2293,7 @@ class RelayClient:
         manager = getattr(self, 'model_manager', None)
         terminate = getattr(manager, 'terminate_active_worker_for_cancellation', None)
         if callable(terminate):
-            try:
-                return bool(terminate(reason=reason, recreate=recreate))
-            except TypeError:
-                terminate(reason=reason)
-                return True
+            return bool(terminate(reason=reason, recreate=recreate))
         llm = getattr(manager, 'llm', None)
         close = getattr(llm, 'close', None)
         if callable(close):
@@ -2332,6 +2330,26 @@ class RelayClient:
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
+        cleanup_quiesced = True
+
+        def _wait_for_future_quiescence(target_future: Any, deadline: float) -> bool:
+            """Boundedly drain a request-scoped future before executor teardown."""
+
+            while not target_future.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    target_future.result(timeout=min(0.05, remaining))
+                except FutureTimeoutError:
+                    continue
+                except Exception:
+                    return True
+            try:
+                target_future.result(timeout=0)
+            except Exception:
+                pass
+            return True
 
         def _generate() -> Dict[str, Any]:
             return self._generate_api_v1_response_with_runtime_model(
@@ -2369,34 +2387,21 @@ class RelayClient:
                         terminal_reason = 'local_deadline'
                         break
                     try:
-                        control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5))
-                        control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control')
-                        control_future = control_executor.submit(
-                            self._post_api_v1_request_control,
+                        control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5, 0.25))
+                        control = self._post_api_v1_request_control(
                             relay_url=relay_url,
                             request_id=request_id,
                             acknowledge=False,
                             timeout_seconds=control_timeout,
                         )
-                        try:
-                            while not control_future.done():
-                                if getattr(self, '_polling_stopped_by_request', False):
-                                    terminal_status = 'operator_stop'
-                                    terminal_reason = 'operator_stop'
-                                    break
-                                if time.monotonic() >= local_deadline:
-                                    terminal_status = 'local_deadline'
-                                    terminal_reason = 'local_deadline'
-                                    break
-                                wakeup = getattr(self, '_api_v1_control_wakeup', None)
-                                if wakeup is not None and wakeup.wait(0.05):
-                                    wakeup.clear()
-                                    continue
-                        finally:
-                            control_executor.shutdown(wait=False, cancel_futures=True)
-                        if terminal_status is not None:
+                        if getattr(self, '_polling_stopped_by_request', False):
+                            terminal_status = 'operator_stop'
+                            terminal_reason = 'operator_stop'
                             break
-                        control = control_future.result()
+                        if time.monotonic() >= local_deadline:
+                            terminal_status = 'local_deadline'
+                            terminal_reason = 'local_deadline'
+                            break
                         backoff = 1.0
                         local_deadline = self._api_v1_deadline_after_response(local_deadline, control, now=time.monotonic())
                         status = str(control.get('status') or '').lower()
@@ -2437,34 +2442,32 @@ class RelayClient:
             if terminal_status is not None:
                 recovery_succeeded = False
                 try:
-                    try:
-                        recovery_succeeded = self._terminate_current_llama_worker(
-                            terminal_reason, recreate=terminal_status != 'operator_stop'
-                        )
-                    except TypeError:
-                        self._terminate_current_llama_worker(terminal_reason)
-                        recovery_succeeded = True
+                    recovery_succeeded = self._terminate_current_llama_worker(
+                        terminal_reason, recreate=terminal_status != 'operator_stop'
+                    )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
+                quiescence_deadline = time.monotonic() + 0.5
+                cleanup_quiesced = _wait_for_future_quiescence(future, quiescence_deadline) and cleanup_quiesced
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
+                if not cleanup_quiesced:
+                    recovery_succeeded = False
+                    self.stop_polling = True
+                    self._polling_stopped_by_request = True
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
-                    runtime_healthy=bool(recovery_succeeded),
+                    runtime_healthy=bool(recovery_succeeded and cleanup_quiesced),
                     recovery_attempted=True,
-                    recovery_succeeded=bool(recovery_succeeded),
+                    recovery_succeeded=bool(recovery_succeeded and cleanup_quiesced),
                     submission_allowed=False,
                 )
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-            if not future.done():
-                try:
-                    future.result(timeout=0.25)
-                except FutureTimeoutError:
-                    pass
-                except Exception:
-                    pass
+            if future.done():
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

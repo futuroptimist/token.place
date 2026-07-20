@@ -5823,7 +5823,8 @@ class ModelManager:
         for attr in (
             'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
             '_stdout_reader', '_stderr_reader', '_reader', '_queue',
-            'stdout_queue', 'stderr_queue',
+            'stdout_queue', 'stderr_queue', '_stderr_reader_thread',
+            '_stdout_reader_thread', '_reader_thread',
         ):
             resource = getattr(llm, attr, None)
             closer = getattr(resource, 'close', None)
@@ -5848,6 +5849,14 @@ class ModelManager:
         process = getattr(llm, '_process', None)
         if process is None:
             return True
+        for attr in ('stdin', 'stdout', 'stderr'):
+            pipe = getattr(process, attr, None)
+            closer = getattr(pipe, 'close', None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
         def _dead() -> bool:
             poll = getattr(process, 'poll', None)

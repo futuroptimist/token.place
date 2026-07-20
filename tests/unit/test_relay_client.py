@@ -6949,7 +6949,7 @@ def test_worker_diagnostic_sanitizer_allows_qwen_plain_completion_variant_fields
     assert "SECRET_PROMPT" not in json.dumps(safe)
 
 @patch('utils.networking.relay_client.requests.post')
-def test_reset_api_v1_polling_session_clear_registration_clears_control_credentials(mock_post):
+def test_reset_api_v1_polling_session_preserves_control_credentials(mock_post):
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
@@ -6959,7 +6959,7 @@ def test_reset_api_v1_polling_session_clear_registration_clears_control_credenti
 
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}
-    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == ''
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'reset-secret'
 
 
 @patch('utils.networking.relay_client.requests.post')
@@ -7102,7 +7102,7 @@ def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monk
 
     client._generate_api_v1_response_with_runtime_model = generate
     client._post_api_v1_request_control = control
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     result = client._run_api_v1_inference_with_control({
         'request_id': 'req',
@@ -7137,7 +7137,7 @@ def test_api_v1_local_deadline_stops_before_next_control_poll(monkeypatch):
 
     client._generate_api_v1_response_with_runtime_model = generate
     client._post_api_v1_request_control = control
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     started = time.monotonic()
     result = client._run_api_v1_inference_with_control({
@@ -7165,13 +7165,52 @@ def test_api_v1_control_403_fail_closed_stops_without_ack():
 
     client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
     client._post_api_v1_request_control = lambda **_kwargs: (_ for _ in ()).throw(PermissionError('api_v1_control_owner_proof_failed'))
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     assert client._run_api_v1_inference_with_control({
         'request_id': 'req', 'model': 'm', 'messages': [], 'options': {},
         'routing': {'context_tier': '8k-fast'}, 'request_ttl_seconds': 30,
     }) is None
     assert stopped == ['owner_proof_failed']
+
+
+def test_api_v1_terminal_cleanup_fails_closed_when_inference_does_not_quiesce():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    started = threading.Event()
+
+    def _hung_generate(**_kwargs):
+        started.set()
+        release.wait()
+        return {'request_id': 'late'}
+
+    client._generate_api_v1_response_with_runtime_model = _hung_generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+    client._terminate_current_llama_worker = MagicMock(return_value=True)
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-hung',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    try:
+        assert started.is_set()
+        assert outcome.response_envelope is None
+        assert outcome.terminal_code == 'cancelled'
+        assert outcome.runtime_healthy is False
+        assert outcome.recovery_succeeded is False
+        assert outcome.submission_allowed is False
+        assert client.stop_polling is True
+        client._terminate_current_llama_worker.assert_called_once_with('cancelled', recreate=True)
+    finally:
+        release.set()
 
 
 def test_api_v1_missing_control_credential_fails_closed_without_worker_termination():
@@ -7257,7 +7296,7 @@ def test_api_v1_legacy_unregistered_inference_is_supervised_for_deadline():
 
     client._generate_api_v1_response_with_runtime_model = generate
     client._post_api_v1_request_control = lambda **kwargs: control_calls.append(kwargs)
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     started = time.monotonic()
     result = client._run_api_v1_inference_with_control({
@@ -7291,7 +7330,7 @@ def test_api_v1_control_timeout_is_strictly_less_than_remaining_deadline(monkeyp
         return {'status': 'cancelled'}
 
     client._post_api_v1_request_control = control
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     assert client._run_api_v1_inference_with_control({
         'request_id': 'req-timeout',
@@ -7346,7 +7385,7 @@ def test_api_v1_control_retries_transient_statuses_and_network_errors(monkeypatc
 
     client._api_v1_control_wakeup = Wakeup()
     client._post_api_v1_request_control = control
-    client._terminate_current_llama_worker = lambda reason: (stopped.append(reason), release.set())
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
 
     assert client._run_api_v1_inference_with_control({
         'request_id': 'req-retry',

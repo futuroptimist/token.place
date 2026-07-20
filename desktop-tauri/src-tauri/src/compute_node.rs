@@ -1184,7 +1184,10 @@ async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
             &sanitize_operator_diagnostic_line(&line),
         );
         if filter.should_emit(&line) {
-            eprintln!("desktop.compute_node.stderr line={line}");
+            eprintln!(
+                "desktop.compute_node.stderr line={}",
+                sanitize_operator_diagnostic_line(&line)
+            );
         }
     }
     Ok(())
@@ -1749,6 +1752,8 @@ pub async fn start_compute_node(
     });
 
     let mut lines = BufReader::new(stdout).lines();
+    let mut saw_startup_event = false;
+    let mut saw_error_event = false;
     let stdout_terminal_reason = loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
@@ -1773,6 +1778,16 @@ pub async fn start_compute_node(
                         if !apply_compute_node_event_to_state(&state, &payload).await {
                             continue;
                         }
+                        if payload.get("operator_session_id").and_then(Value::as_str)
+                            == Some(session_id.as_str())
+                        {
+                            match payload.get("type").and_then(Value::as_str) {
+                                Some("started") => saw_startup_event = true,
+                                Some("error") => saw_error_event = true,
+                                Some("stopped") => {}
+                                _ => {}
+                            }
+                        }
                         if app.emit("compute_node_event", payload).is_err() {
                             eprintln!(
                                 "desktop.compute_node.event_emit_error operator_session_id={}",
@@ -1782,9 +1797,8 @@ pub async fn start_compute_node(
                     }
                     Err(err) => {
                         eprintln!(
-                            "desktop.compute_node.stdout_parse_error error={} summary={}",
-                            err,
-                            redact_bridge_stdout_line(&line)
+                            "desktop.compute_node.stdout_parse_error operator_session_id={} error={}",
+                            session_id, err
                         );
                     }
                 }
@@ -1805,6 +1819,8 @@ pub async fn start_compute_node(
         &session_id,
         log_file_path.clone(),
         stdout_terminal_reason,
+        saw_startup_event,
+        saw_error_event,
     )
     .await;
 
@@ -1843,8 +1859,11 @@ async fn finalize_bridge_stdout_end(
     session_id: &str,
     log_file_path: Option<String>,
     reason: &str,
+    saw_startup_event: bool,
+    saw_error_event: bool,
 ) {
-    let (notify, deadline, should_spawn) = {
+    let warning = "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".to_string();
+    let (notify, deadline, owned_child, mut stdin_handle) = {
         let mut process = state.bridge_process.lock().await;
         let Some(record) = process
             .as_mut()
@@ -1865,26 +1884,110 @@ async fn finalize_bridge_stdout_end(
         let deadline = *record
             .stop_deadline
             .get_or_insert_with(|| Instant::now() + DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT);
-        let should_spawn = !record.shutdown_worker_started;
-        if should_spawn {
-            record.shutdown_worker_started = true;
-        }
+        record.shutdown_worker_started = true;
+        let child = record.child.take();
+        let stdin = if record.cancel_sent {
+            None
+        } else {
+            let stdin = record.stdin.take();
+            record.cancel_sent = stdin.is_some();
+            stdin
+        };
         eprintln!(
             "desktop.compute_node.bridge_stdout_terminal operator_session_id={} reason={}",
             session_id, reason
         );
-        (record.notify.clone(), deadline, should_spawn)
+        (record.notify.clone(), deadline, child, stdin)
     };
 
-    if should_spawn {
-        let worker_state = state.clone();
-        let worker_session = Some(session_id.to_string());
-        tokio::spawn(async move {
-            bridge_shutdown_supervisor(worker_state, worker_session, log_file_path).await;
-        });
+    if let Some(stdin) = stdin_handle.as_mut() {
+        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+        let _ = stdin.flush().await;
+    }
+    drop(stdin_handle.take());
+
+    let had_child = owned_child.is_some();
+    let mut bridge_killed = false;
+    let mut child_exit_status = None;
+    if let Some(mut child) = owned_child {
+        child_exit_status = child.try_wait().ok().flatten();
+        while child_exit_status.is_none() && Instant::now() < deadline {
+            tokio::time::sleep(std::cmp::min(
+                Duration::from_millis(25),
+                deadline.saturating_duration_since(Instant::now()),
+            ))
+            .await;
+            child_exit_status = child.try_wait().ok().flatten();
+        }
+        if child_exit_status.is_none() {
+            bridge_killed = true;
+            let _ = child.kill().await;
+            child_exit_status = child.wait().await.ok();
+        } else if let Ok(status) = child.wait().await {
+            child_exit_status = Some(status);
+        }
     }
 
-    let _ = wait_for_cached_stop_result(state, Some(session_id), notify, deadline).await;
+    let cleanup_acknowledged = {
+        let status = state.status.lock().await;
+        let ack = state.stopped_event_ack_session_id.lock().await;
+        status.operator_session_id.as_deref() == Some(session_id)
+            && ack.as_deref() == Some(session_id)
+    };
+
+    let mut cached = Err(warning.clone());
+    let mut synthetic_payload = None;
+    if let Some(exit_status) = child_exit_status {
+        {
+            let mut status = state.status.lock().await;
+            synthetic_payload = finalize_bridge_exit(
+                &mut status,
+                exit_status,
+                saw_startup_event,
+                saw_error_event,
+                session_id,
+                log_file_path.as_deref(),
+            );
+            if (!saw_startup_event || !exit_status.success())
+                && status.operator_session_id.as_deref() == Some(session_id)
+                && status.last_error.is_some()
+            {
+                cached = Err(status.last_error.clone().unwrap_or_else(|| warning.clone()));
+            }
+        }
+        if cached.is_ok() || (saw_startup_event && exit_status.success()) {
+            let result = finalize_stop_status(
+                state,
+                Some(session_id),
+                had_child,
+                bridge_killed,
+                Some(exit_status),
+                cleanup_acknowledged,
+            )
+            .await;
+            cached = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
+        }
+    }
+
+    if let Some(payload) = synthetic_payload {
+        let _ = apply_compute_node_event_to_state(state, &payload).await;
+    }
+
+    {
+        let mut process = state.bridge_process.lock().await;
+        if let Some(record) = process
+            .as_mut()
+            .filter(|record| record.session_id == session_id)
+        {
+            record.phase = BridgeProcessPhase::Completed;
+            record.killed = bridge_killed;
+            record.exit_status = child_exit_status;
+            record.child = None;
+            record.stdin = None;
+            record.stop_result = Some(cached);
+        }
+    }
+    notify.notify_waiters();
 }
 
 async fn wait_for_stop_cleanup_ack(
@@ -1989,7 +2092,6 @@ async fn bridge_shutdown_supervisor(
     stop_log_file_path: Option<String>,
 ) {
     let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown").to_string();
-    let warning = "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".to_string();
     let (process_notify, parent_shutdown_deadline) = {
         let process = state.bridge_process.lock().await;
         let Some(record) = process.as_ref() else {
@@ -5421,5 +5523,53 @@ mod tests {
                 .and_then(|record| record.stop_result.clone()),
             Some(Ok(()))
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stdout_eof_before_startup_caches_specific_bridge_exit_error() {
+        let state = ComputeNodeState::default();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "stdout-prestart-session".into(),
+            Some(child),
+            None,
+        ));
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("stdout-prestart-session".into());
+            status.running = true;
+            status.registered = false;
+        }
+
+        finalize_bridge_stdout_end(&state, "stdout-prestart-session", None, "eof", false, false)
+            .await;
+
+        let status = state.status.lock().await;
+        let last_error = status.last_error.clone().expect("specific exit error");
+        assert!(
+            last_error.contains("before emitting a startup event"),
+            "{last_error}"
+        );
+        drop(status);
+        let record = state.bridge_process.lock().await;
+        let cached = record
+            .as_ref()
+            .and_then(|record| record.stop_result.clone())
+            .expect("cached result");
+        assert!(cached
+            .expect_err("pre-start exit is actionable")
+            .contains("before emitting a startup event"));
+        assert!(record
+            .as_ref()
+            .and_then(|record| record.child.as_ref())
+            .is_none());
     }
 }

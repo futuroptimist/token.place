@@ -1218,7 +1218,7 @@ fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line
 
 fn redact_bridge_stdout_line(line: &str) -> String {
     let Ok(payload) = serde_json::from_str::<Value>(line) else {
-        return sanitize_freeform_bridge_log_line(line);
+        return r#"{"type":"malformed_bridge_event","contents_omitted":true}"#.into();
     };
     summarize_bridge_stdout_payload(&payload)
 }
@@ -1814,7 +1814,7 @@ pub async fn start_compute_node(
         }
     };
 
-    finalize_bridge_stdout_end(
+    let stdout_end = finalize_bridge_stdout_end(
         &state,
         &session_id,
         log_file_path.clone(),
@@ -1823,6 +1823,20 @@ pub async fn start_compute_node(
         saw_error_event,
     )
     .await;
+    match stdout_end.disposition {
+        BridgeStdoutEndDisposition::UnexpectedFailure
+        | BridgeStdoutEndDisposition::Completed
+        | BridgeStdoutEndDisposition::ExplicitStopOwnsShutdown
+        | BridgeStdoutEndDisposition::StaleSession => {}
+    }
+    if let Some(payload) = stdout_end.synthetic_payload.clone() {
+        if app.emit("compute_node_event", payload).is_err() {
+            eprintln!(
+                "desktop.compute_node.event_emit_error operator_session_id={}",
+                session_id
+            );
+        }
+    }
 
     if let Err(err) = stderr_task.await {
         eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
@@ -1851,7 +1865,26 @@ pub async fn start_compute_node(
         }
     }
 
+    if let Some(err) = stdout_end.result.err() {
+        anyhow::bail!(err);
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BridgeStdoutEndDisposition {
+    ExplicitStopOwnsShutdown,
+    Completed,
+    UnexpectedFailure,
+    StaleSession,
+}
+
+#[derive(Debug, Clone)]
+struct BridgeStdoutEndResult {
+    disposition: BridgeStdoutEndDisposition,
+    result: Result<(), String>,
+    synthetic_payload: Option<Value>,
 }
 
 async fn finalize_bridge_stdout_end(
@@ -1861,7 +1894,7 @@ async fn finalize_bridge_stdout_end(
     reason: &str,
     saw_startup_event: bool,
     saw_error_event: bool,
-) {
+) -> BridgeStdoutEndResult {
     let warning = "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".to_string();
     let (notify, deadline, owned_child, mut stdin_handle) = {
         let mut process = state.bridge_process.lock().await;
@@ -1869,16 +1902,29 @@ async fn finalize_bridge_stdout_end(
             .as_mut()
             .filter(|record| record.session_id == session_id)
         else {
-            return;
+            return BridgeStdoutEndResult {
+                disposition: BridgeStdoutEndDisposition::StaleSession,
+                result: Ok(()),
+                synthetic_payload: None,
+            };
         };
         if record.phase == BridgeProcessPhase::Stopping {
             // The detached Stop supervisor owns child/stdin cleanup and result caching.
             record.notify.notify_waiters();
-            return;
+            return BridgeStdoutEndResult {
+                disposition: BridgeStdoutEndDisposition::ExplicitStopOwnsShutdown,
+                result: Ok(()),
+                synthetic_payload: None,
+            };
         }
         if record.stop_result.is_some() || record.phase == BridgeProcessPhase::Completed {
+            let result = record.stop_result.clone().unwrap_or(Ok(()));
             record.notify.notify_waiters();
-            return;
+            return BridgeStdoutEndResult {
+                disposition: BridgeStdoutEndDisposition::Completed,
+                result,
+                synthetic_payload: None,
+            };
         }
         record.phase = BridgeProcessPhase::Stopping;
         let deadline = *record
@@ -1969,10 +2015,11 @@ async fn finalize_bridge_stdout_end(
         }
     }
 
-    if let Some(payload) = synthetic_payload {
-        let _ = apply_compute_node_event_to_state(state, &payload).await;
-    }
-
+    let disposition = if cached.is_ok() {
+        BridgeStdoutEndDisposition::Completed
+    } else {
+        BridgeStdoutEndDisposition::UnexpectedFailure
+    };
     {
         let mut process = state.bridge_process.lock().await;
         if let Some(record) = process
@@ -1984,10 +2031,15 @@ async fn finalize_bridge_stdout_end(
             record.exit_status = child_exit_status;
             record.child = None;
             record.stdin = None;
-            record.stop_result = Some(cached);
+            record.stop_result = Some(cached.clone());
         }
     }
     notify.notify_waiters();
+    BridgeStdoutEndResult {
+        disposition,
+        result: cached,
+        synthetic_payload,
+    }
 }
 
 async fn wait_for_stop_cleanup_ack(
@@ -2616,6 +2668,33 @@ mod tests {
         assert!(!redacted.contains("Example User"));
         assert!(!redacted.contains("plaintext prompt"));
         assert!(!redacted.contains("token=secret"));
+    }
+
+    #[test]
+    fn malformed_bridge_stdout_omits_contents_from_operator_summary() {
+        let line =
+            r#"not json prompt=secret response=secret token=secret https://user:pass@example.test"#;
+
+        let redacted = redact_bridge_stdout_line(line);
+        let payload: Value = serde_json::from_str(&redacted).expect("summary json");
+
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("malformed_bridge_event")
+        );
+        assert_eq!(
+            payload.get("contents_omitted").and_then(Value::as_bool),
+            Some(true)
+        );
+        for secret in [
+            "prompt=secret",
+            "response=secret",
+            "token=secret",
+            "user:pass",
+            "example.test",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} leaked: {redacted}");
+        }
     }
 
     #[test]

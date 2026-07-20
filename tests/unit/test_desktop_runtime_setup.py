@@ -4051,3 +4051,42 @@ def test_packaged_probe_payload_redacts_secret_paths(monkeypatch, tmp_path):
     assert 'SecretName' not in encoded
     assert payload['interpreter'] == 'python.exe'
     assert payload['dependency_target'] == 'bundled'
+
+
+def test_windows_development_missing_dependencies_is_read_only_even_with_opt_ins(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_arch', lambda: 'x86_64')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    calls = {'pip': 0, 'source': 0, 'lock': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **kwargs: _probe(backend='missing', error='No module named llama_cpp'))
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (tmp_path / 'target', None))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *a, **k: calls.__setitem__('source', calls['source'] + 1))
+
+    class CountingLock:
+        def __init__(self, *args, **kwargs):
+            calls['lock'] += 1
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', CountingLock)
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert result['runtime_action'] in {'windows_development_runtime_missing_read_only', 'version_mismatch_failed'}
+    assert calls['source'] == 0
+    assert 'cuda_build' not in json.dumps(result)
+
+
+def test_sanitized_runtime_payload_removes_secret_paths(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    payload = desktop_runtime_setup._sanitize_public_runtime_payload({
+        'fallback_reason': r'failed at C:\Users\SecretName\deps\llama_cpp and /Users/SecretName/model.gguf',
+        'detail': r'C:\Users\SecretName\pip.log',
+        'interpreter': r'C:\Users\SecretName\Python\python.exe',
+    })
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert '<path>' in encoded

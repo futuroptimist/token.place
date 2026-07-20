@@ -743,11 +743,11 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
 def _runtime_public_value(key: str, value: Any) -> Any:
     if key in {"interpreter"}:
         return Path(str(value or sys.executable)).name or "python.exe"
-    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path"}:
+    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path", "fallback_reason", "last_error", "message", "interpreter"}:
         text = str(value or "unknown")
         if "python-runtime" in text.lower() or text == "bundled":
             return "bundled"
-        return Path(text).name if text not in {"", "unknown"} else "unknown"
+        return text.replace("\\", "/").rsplit("/", 1)[-1] if text not in {"", "unknown"} else "unknown"
     if key in {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}:
         return "redacted" if value else None
     return value
@@ -952,7 +952,7 @@ def run(args: argparse.Namespace) -> int:
         f"cmake_args={_runtime_public_value('cmake_args', runtime_setup.get('cmake_args')) or 'none'} "
         f"pip_stdout_tail={_runtime_public_value('pip_stdout_tail', runtime_setup.get('pip_stdout_tail')) or 'none'} "
         f"pip_stderr_tail={_runtime_public_value('pip_stderr_tail', runtime_setup.get('pip_stderr_tail')) or 'none'} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        f"fallback_reason={_runtime_public_value('fallback_reason', runtime_setup.get('fallback_reason')) or 'none'}",
         file=sys.stderr,
     )
     repo_llama_cpp_shim_imported = runtime_setup.get("runtime_action") == "shadowed_repo_llama_cpp"
@@ -1223,7 +1223,7 @@ def run(args: argparse.Namespace) -> int:
             "backend_used": diagnostics.get("backend_used"),
             "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
             "kv_cache_device": diagnostics.get("kv_cache_device"),
-            "fallback_reason": diagnostics.get("fallback_reason"),
+            "fallback_reason": _runtime_public_value("fallback_reason", diagnostics.get("fallback_reason")),
             "interpreter": _runtime_public_value("interpreter", runtime_setup.get("interpreter", sys.executable)),
             "dependency_target": _runtime_public_value("dependency_target", runtime_setup.get("dependency_target", "unknown")),
             "python_version": runtime_setup.get("python_version", "unknown"),

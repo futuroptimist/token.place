@@ -552,6 +552,38 @@ def _public_runtime_identity(value: str) -> str:
         return basename if text else "bundled"
     return text
 
+
+def _sanitize_public_runtime_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return text
+    text = re.sub(r"[A-Za-z]:[/\\][^;\s,)]*", "<path>", text)
+    text = re.sub(r"/(Users|home)/[^;\s,)]*", "<path>", text)
+    return text
+
+
+def _sanitize_public_runtime_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(result)
+    if not _is_exact_packaged_runtime_layout():
+        return sanitized
+    for key in (
+        "fallback_reason",
+        "detail",
+        "error",
+        "last_error",
+        "interpreter",
+        "prefix",
+        "base_prefix",
+        "interpreter_prefix",
+        "dependency_target",
+        "import_root",
+        "requirements",
+        "llama_module_path",
+    ):
+        if key in sanitized and isinstance(sanitized[key], str):
+            sanitized[key] = _sanitize_public_runtime_text(sanitized[key])
+    return sanitized
+
 def _probe_failure(
     *,
     error: str,
@@ -2128,7 +2160,7 @@ def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         os.environ.pop(RUNTIME_PROBE_ENV, None)
         return result
-    public_result = dict(result)
+    public_result = _sanitize_public_runtime_payload(result)
     for private_key in ("llama_module_path", "llama_module_identity"):
         public_result.pop(private_key, None)
     for key in (
@@ -2399,7 +2431,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         detail = "managed site mutation lock unavailable"
         if isinstance(exc, TimeoutError) and "cancelled" in str(exc).lower():
             detail = "managed site mutation lock cancelled"
-        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": detail}
+        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": Path(sys.executable).name, "import_root": root.name, "requirements": requirements_path.name, "dependency_target": "development", "detail": detail}
 
     if not ok:
         action = "install_cancelled" if "outcome=cancelled" in output else ("install_timeout" if ("outcome=timed_out" in output or "timed out" in output.lower()) else "install_failed")
@@ -2419,10 +2451,10 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         "ok": "true" if not missing_after else "false",
         "action": "installed" if not missing_after else "post_install_missing",
         "missing": ",".join(missing_after),
-        "interpreter": sys.executable,
-        "import_root": str(root),
-        "requirements": str(requirements_path),
-        "dependency_target": target_dir_str,
+        "interpreter": Path(sys.executable).name,
+        "import_root": root.name,
+        "requirements": requirements_path.name,
+        "dependency_target": "development",
     }
 
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:

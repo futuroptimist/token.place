@@ -3018,3 +3018,157 @@ def test_windows_nvidia_smoke_installer_handoff_is_one_shot(tmp_path, monkeypatc
     assert cmd[cmd.index('--mode') + 1] == 'gpu'
     assert cmd[cmd.index('--context-tier') + 1] == '64k-full'
     assert calls['cleanup'] == [(materialized, True)]
+
+
+def test_windows_metadata_readers_use_environment_path_and_structured_json(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'TokenPlace.Setup.exe'
+    artifact.write_bytes(b'MZ')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        assert '$args[0]' not in cmd[3]
+        assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+        assert str(artifact) not in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}), stderr='')
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    assert validator._read_pe_version_info(artifact) == {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}
+
+    def fake_msi_run(cmd, **kwargs):
+        assert '$args[0]' not in cmd[3]
+        assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0'}), stderr='')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_msi_run)
+    assert validator._read_msi_product_version(artifact) == '0.1.2.0'
+
+
+def test_windows_metadata_readers_fail_closed_on_empty_or_malformed(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'TokenPlace.Setup.exe'
+    artifact.write_bytes(b'MZ')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout='', stderr=''))
+    with pytest.raises(validator.ValidationError, match='empty metadata'):
+        validator._read_pe_version_info(artifact)
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout='not-json', stderr=''))
+    with pytest.raises(validator.ValidationError, match='malformed metadata'):
+        validator._read_msi_product_version(artifact)
+
+
+def test_windows_version_normalization_is_strict():
+    validator = _load_windows_release_validator()
+    assert validator._normalize_windows_version('0.1.2') == '0.1.2'
+    assert validator._normalize_windows_version('0.1.2.0') == '0.1.2'
+    for value in ['0.1', '0.1.2.1', '0.1.2.0.0', '0.1.x']:
+        with pytest.raises(validator.ValidationError):
+            validator._normalize_windows_version(value)
+
+
+def test_find_tauri_app_exe_uses_expected_name_and_rejects_ambiguous(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator, '_expected_tauri_binary_name', lambda: 'token-place-desktop-tauri.exe')
+    root = tmp_path / 'payload'
+    (root / 'helpers').mkdir(parents=True)
+    (root / 'helpers' / 'helper.exe').write_bytes(b'MZ')
+    expected = root / 'Token-Place-Desktop-Tauri.EXE'
+    expected.write_bytes(b'MZ')
+    assert validator._find_tauri_app_exe(root) == expected
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator._find_tauri_app_exe(tmp_path / 'missing')
+    dup = root / 'nested'
+    dup.mkdir()
+    (dup / 'token-place-desktop-tauri.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='found 2'):
+        validator._find_tauri_app_exe(root)
+
+
+def test_validate_version_metadata_requires_app_versions_on_windows(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ')
+    app = tmp_path / 'token-place-desktop-tauri.exe'
+    app.write_bytes(b'MZ')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda path: {'ProductVersion': '', 'FileVersion': ''} if path == app else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'})
+    with pytest.raises(validator.ValidationError, match='app ProductVersion=missing'):
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+
+def test_windows_nvidia_smoke_runs_nsis_uninstaller_after_success_and_failure(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit_cleanup', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+
+    for child_code in (0, 23):
+        root = tmp_path / f'install-{child_code}'
+        python_exe = root / 'python-runtime' / 'python.exe'
+        uninstaller = root / 'Uninstall token.place.exe'
+        calls = []
+        monkeypatch.setattr(smoke.tempfile, 'mkdtemp', lambda prefix, root=root: str(root))
+
+        def fake_materialize(_artifact, materialized_root, python_exe=python_exe, uninstaller=uninstaller):
+            python_exe.parent.mkdir(parents=True, exist_ok=True)
+            python_exe.write_text('python', encoding='utf-8')
+            (materialized_root / 'python').mkdir(exist_ok=True)
+            (materialized_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+            uninstaller.write_text('uninstall', encoding='utf-8')
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, child_code if len(calls) == 1 else 0, stdout='')
+
+        monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+        monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+        monkeypatch.setattr(smoke.shutil, 'rmtree', lambda *a, **k: None)
+        args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+        assert smoke._launch_materialized_child(args) == child_code
+        assert len(calls) == 2
+        assert calls[1] == [str(uninstaller), '/S']
+
+
+def test_windows_nvidia_smoke_cleanup_failure_overrides_child_exit(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit_cleanup_fail', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    root = tmp_path / 'install'
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+    monkeypatch.setattr(smoke.tempfile, 'mkdtemp', lambda prefix: str(root))
+
+    def fake_materialize(_artifact, materialized_root):
+        python_exe = materialized_root / 'python-runtime' / 'python.exe'
+        python_exe.parent.mkdir(parents=True, exist_ok=True)
+        python_exe.write_text('python', encoding='utf-8')
+        (materialized_root / 'python').mkdir(exist_ok=True)
+        (materialized_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+        (materialized_root / 'unins000.exe').write_text('uninstall', encoding='utf-8')
+
+    calls = []
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 2:
+            raise subprocess.CalledProcessError(7, cmd, output='cleanup failed')
+        return subprocess.CompletedProcess(cmd, 0, stdout='')
+
+    monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+    monkeypatch.setattr(smoke.shutil, 'rmtree', lambda *a, **k: None)
+    args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+    with pytest.raises(subprocess.CalledProcessError):
+        smoke._launch_materialized_child(args)
+    assert len(calls) == 2

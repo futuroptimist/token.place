@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import platform
 import shutil
+import tomllib
 import subprocess
 import sys
 import tempfile
@@ -26,45 +28,99 @@ class ValidationError(RuntimeError):
 
 
 def _normalize_windows_version(value: str) -> str:
-    parts = [part for part in str(value or '').strip().split('.') if part != '']
-    if not parts or any(not part.isdigit() for part in parts):
+    parts = str(value or '').strip().split('.')
+    if len(parts) not in {3, 4} or any(part == '' or not part.isdigit() for part in parts):
         raise ValidationError('Windows version metadata is missing or unparseable')
-    while len(parts) > 3 and parts[-1] == '0':
-        parts.pop()
+    if len(parts) == 4:
+        if parts[3] != '0':
+            raise ValidationError('Windows version metadata has unsupported fourth component')
+        parts = parts[:3]
     return '.'.join(parts)
+
+
+def _powershell_json(script: str, path: Path, *, description: str) -> dict:
+    env = {**os.environ, 'TOKEN_PLACE_ARTIFACT_PATH': str(path)}
+    result = subprocess.run(
+        ['powershell', '-NoProfile', '-Command', script],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise ValidationError(f'{description} reader failed for {path.name}')
+    text = (result.stdout or '').strip()
+    if not text:
+        raise ValidationError(f'{description} reader returned empty metadata for {path.name}')
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f'{description} reader returned malformed metadata for {path.name}') from exc
+    if not isinstance(data, dict):
+        raise ValidationError(f'{description} reader returned malformed metadata for {path.name}')
+    return data
 
 
 def _read_pe_version_info(path: Path) -> dict[str, str]:
     if platform.system() != 'Windows':
         return {}
-    script = "$v=(Get-Item -LiteralPath $args[0]).VersionInfo; [Console]::WriteLine(($v.ProductVersion+'|'+$v.FileVersion))"
-    result = subprocess.run(['powershell', '-NoProfile', '-Command', script, str(path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
-    if result.returncode != 0:
-        return {}
-    product, _, file_version = (result.stdout or '').strip().partition('|')
-    return {'ProductVersion': product.strip(), 'FileVersion': file_version.strip()}
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$p = $env:TOKEN_PLACE_ARTIFACT_PATH
+if ([string]::IsNullOrWhiteSpace($p)) { throw 'missing artifact path' }
+$v = (Get-Item -LiteralPath $p).VersionInfo
+[PSCustomObject]@{ ProductVersion = [string]$v.ProductVersion; FileVersion = [string]$v.FileVersion } | ConvertTo-Json -Compress
+'''
+    data = _powershell_json(script, path, description='PE version')
+    product = str(data.get('ProductVersion') or '').strip()
+    file_version = str(data.get('FileVersion') or '').strip()
+    if not product or not file_version:
+        raise ValidationError(f'PE version reader returned incomplete metadata for {path.name}')
+    return {'ProductVersion': product, 'FileVersion': file_version}
 
 
 def _read_msi_product_version(path: Path) -> str | None:
     if platform.system() != 'Windows':
         return None
-    script = "$installer=New-Object -ComObject WindowsInstaller.Installer; $db=$installer.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$installer,@($args[0],0)); $view=$db.OpenView(\"SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'\"); $view.Execute(); $record=$view.Fetch(); if ($record) { [Console]::WriteLine($record.StringData(1)) }"
-    result = subprocess.run(['powershell', '-NoProfile', '-Command', script, str(path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
-    if result.returncode != 0:
-        return None
-    return (result.stdout or '').strip() or None
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$p = $env:TOKEN_PLACE_ARTIFACT_PATH
+if ([string]::IsNullOrWhiteSpace($p)) { throw 'missing artifact path' }
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$db = $installer.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$installer,@($p,0))
+$view = $db.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'")
+$view.Execute()
+$record = $view.Fetch()
+$value = if ($record) { [string]$record.StringData(1) } else { '' }
+[PSCustomObject]@{ ProductVersion = $value } | ConvertTo-Json -Compress
+'''
+    data = _powershell_json(script, path, description='MSI ProductVersion')
+    value = str(data.get('ProductVersion') or '').strip()
+    if not value:
+        raise ValidationError(f'MSI ProductVersion reader returned incomplete metadata for {path.name}')
+    return value
+
+
+def _expected_tauri_binary_name() -> str:
+    tauri = _load_json(TAURI_CONFIG)
+    product = str(tauri.get('bundle', {}).get('windows', {}).get('mainBinaryName') or '').strip()
+    if not product:
+        cargo = ROOT / 'desktop-tauri' / 'src-tauri' / 'Cargo.toml'
+        data = tomllib.loads(cargo.read_text(encoding='utf-8'))
+        product = str(data.get('package', {}).get('name') or '').strip()
+    if not product:
+        raise ValidationError('unable to determine expected Tauri app executable name')
+    return product if product.lower().endswith('.exe') else f'{product}.exe'
 
 
 def _find_tauri_app_exe(root: Path) -> Path | None:
-    candidates = []
-    for path in root.rglob('*.exe'):
-        lower = path.name.lower()
-        if lower in {'python.exe', 'pythonw.exe'} or lower.startswith(('unins', 'uninstall')):
-            continue
-        if 'python-runtime' in {part.lower() for part in path.parts}:
-            continue
-        candidates.append(path)
-    return sorted(candidates)[0] if candidates else None
+    expected = _expected_tauri_binary_name().lower()
+    candidates = [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() == '.exe' and p.name.lower() == expected]
+    if len(candidates) != 1:
+        raise ValidationError(f'expected exactly one installed app executable named {expected}, found {len(candidates)}')
+    return candidates[0]
 
 
 def _validate_version_metadata(artifact: Path, dest: Path, expected: str, kind: str) -> None:
@@ -77,13 +133,12 @@ def _validate_version_metadata(artifact: Path, dest: Path, expected: str, kind: 
         nsis_versions = _read_pe_version_info(artifact)
         values['NSIS ProductVersion'] = nsis_versions.get('ProductVersion')
         values['NSIS FileVersion'] = nsis_versions.get('FileVersion')
-    app_exe = _find_tauri_app_exe(dest)
-    if app_exe is not None:
-        app_versions = _read_pe_version_info(app_exe)
-        values['app ProductVersion'] = app_versions.get('ProductVersion')
-        values['app FileVersion'] = app_versions.get('FileVersion')
     if platform.system() != 'Windows' and artifact.is_file():
         return
+    app_exe = _find_tauri_app_exe(dest)
+    app_versions = _read_pe_version_info(app_exe)
+    values['app ProductVersion'] = app_versions.get('ProductVersion')
+    values['app FileVersion'] = app_versions.get('FileVersion')
     failed = []
     for label, value in values.items():
         if not value:

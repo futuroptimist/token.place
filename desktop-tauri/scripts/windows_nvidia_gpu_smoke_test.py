@@ -93,17 +93,37 @@ def _canonical_child_args(args: argparse.Namespace, python_exe: Path, resource_r
     return child
 
 
+def _run_nsis_uninstaller_once(install_root: Path) -> None:
+    uninstallers = sorted(
+        p for p in install_root.rglob('*.exe')
+        if p.is_file() and p.name.lower().startswith(('unins', 'uninstall'))
+    )
+    if not uninstallers:
+        return
+    subprocess.run([str(uninstallers[0]), '/S'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
 def _launch_materialized_child(args: argparse.Namespace) -> int:
     install_root = Path(tempfile.mkdtemp(prefix='token-place-win-smoke-'))
+    child_returncode = 1
+    cleanup_error: Exception | None = None
     try:
         _materialize_release_artifact(args.installer, install_root)
         python_exe, resource_root = _find_materialized_runtime(install_root)
         child_args = _canonical_child_args(args, python_exe, resource_root)
         env = _sanitize_env_for_bundled_runtime(resource_root)
         completed = subprocess.run([str(python_exe), str(Path(__file__).resolve()), *child_args], env=env, cwd=str(resource_root), check=False)
-        return int(completed.returncode)
+        child_returncode = int(completed.returncode)
+        return child_returncode
     finally:
+        try:
+            if getattr(args, 'installer', None) and Path(args.installer).suffix.lower() == '.exe':
+                _run_nsis_uninstaller_once(install_root)
+        except Exception as exc:
+            cleanup_error = exc
         shutil.rmtree(install_root, ignore_errors=True)
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _maybe_reexec_with_bundled_python(python_exe: Path | None, resource_root: Path | None, argv: list[str]) -> None:

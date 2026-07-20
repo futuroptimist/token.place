@@ -5366,3 +5366,11 @@ def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, mo
         if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
     ]
     assert timeout_status_events, "expected at least one warm_load status event from the timeout path"
+
+
+def test_runtime_public_value_redacts_secret_path_diagnostics():
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\deps\pip stderr tail'
+    for key in ['fallback_reason', 'last_error', 'message', 'dependency_target', 'prefix', 'base_prefix', 'import_root', 'log_file_path']:
+        value = compute_node_bridge._runtime_public_value(key, secret)
+        assert 'SecretName' not in str(value)
+        assert 'C:\\Users' not in str(value)

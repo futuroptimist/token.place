@@ -85,6 +85,7 @@ PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
 PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
+BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS = 6.5
 
 
 
@@ -328,6 +329,37 @@ def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
         return None
     return str(raw_error)
 
+
+
+
+
+
+def _call_runtime_stop_with_shutdown_deadline(stop_runtime: Any, shutdown_deadline: float) -> None:
+    try:
+        signature = inspect.signature(stop_runtime)
+    except (TypeError, ValueError):
+        stop_runtime(shutdown_deadline=shutdown_deadline)
+        return
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD or name == "shutdown_deadline"
+        for name, param in signature.parameters.items()
+    ):
+        stop_runtime(shutdown_deadline=shutdown_deadline)
+    else:
+        stop_runtime()
+
+
+def _call_unregister_with_shutdown_deadline(unregister: Any, shutdown_deadline: float) -> bool:
+    try:
+        signature = inspect.signature(unregister)
+    except (TypeError, ValueError):
+        return bool(unregister(shutdown_deadline=shutdown_deadline))
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD or name == "shutdown_deadline"
+        for name, param in signature.parameters.items()
+    ):
+        return bool(unregister(shutdown_deadline=shutdown_deadline))
+    return bool(unregister())
 
 def _sanitize_relay_target(relay_url: Any) -> str:
     """Return a redacted relay target that never includes userinfo/query/fragment."""
@@ -1654,7 +1686,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             try:
-                unregistered = bool(unregister())
+                unregistered = _call_unregister_with_shutdown_deadline(unregister, bridge_shutdown_deadline)
             except Exception as exc:
                 print(
                     "desktop.compute_node_bridge.unregister.failed "
@@ -1726,7 +1758,7 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 try:
-                    unregistered = bool(unregister())
+                    unregistered = _call_unregister_with_shutdown_deadline(unregister, bridge_shutdown_deadline)
                 except Exception as exc:
                     print(
                         "desktop.compute_node_bridge.recovery.unregister.failed "
@@ -2267,6 +2299,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 break
 
+    bridge_shutdown_deadline = time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS
     try:
         if warm_runtime_before_registration():
             for relay_runtime in runtimes:
@@ -2307,7 +2340,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             try:
-                relay_runtime.stop()
+                _call_runtime_stop_with_shutdown_deadline(relay_runtime.stop, bridge_shutdown_deadline)
             except Exception as exc:
                 print(
                     "desktop.compute_node_bridge.runtime.stop_failed "

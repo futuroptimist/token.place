@@ -5891,25 +5891,10 @@ class ModelManager:
 
         close = getattr(llm, 'close', None)
         if callable(close) and not terminate_process:
-            close_done = threading.Event()
-
-            def _bounded_close() -> None:
-                try:
-                    close()
-                except Exception:
-                    self.log_warning("Failed to close old llama.cpp worker during invalidation")
-                finally:
-                    close_done.set()
-
-            close_thread = threading.Thread(
-                target=_bounded_close,
-                name='llama_proxy_close',
-                daemon=True,
-            )
-            close_thread.start()
-            close_thread.join(timeout=1.0)
-            if not close_done.is_set():
-                self.log_warning("Timed out closing old llama.cpp worker during invalidation")
+            try:
+                close()
+            except Exception:
+                self.log_warning("Failed to close old llama.cpp worker during invalidation")
         elif callable(close):
             # Forced cancellation cleanup relies on verified subprocess death and
             # owned pipe/reader disposal; do not call a potentially blocking proxy close.

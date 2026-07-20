@@ -2421,7 +2421,14 @@ class RelayClient:
                         break
                     try:
                         if control_future is None:
-                            control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5, 0.25))
+                            control_timeout = max(
+                                0.001,
+                                min(
+                                    self._request_timeout,
+                                    remaining * 0.8,
+                                    max(0.001, remaining - 0.001),
+                                ),
+                            )
                             control_future = control_executor.submit(
                                 self._post_api_v1_request_control,
                                 relay_url=relay_url,

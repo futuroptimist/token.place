@@ -1535,7 +1535,7 @@ class ComputeNodeRuntime:
             return False
         return bool(submit_error(request_data, code=code, message=message))
 
-    def stop(self) -> None:
+    def stop(self, *, shutdown_deadline: Optional[float] = None) -> None:
         """Stop relay polling and network activity."""
         try:
             self.relay_client.stop()
@@ -1543,8 +1543,8 @@ class ComputeNodeRuntime:
             should_unregister = isinstance(registered_relays, set) and bool(registered_relays)
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn) and should_unregister:
-                shutdown_deadline = time.monotonic() + 6.5
-                if not unregister_fn(shutdown_deadline=shutdown_deadline):
+                effective_deadline = shutdown_deadline if shutdown_deadline is not None else time.monotonic() + 6.5
+                if not unregister_fn(shutdown_deadline=effective_deadline):
                     _log_warning("Relay unregister request failed during shutdown")
             elif callable(unregister_fn):
                 _log_info("Skipping relay unregister because no API v1 registration succeeded")

@@ -7524,7 +7524,7 @@ def test_post_api_v1_response_rechecks_cancellation_after_encryption_before_http
     post = MagicMock()
     monkeypatch.setattr(relay_client_module.requests, 'post', post)
 
-    submitted = client._post_api_v1_response(
+    outcome = client._post_api_v1_response(
         {
             'protocol': 'tokenplace_api_v1_relay_e2ee',
             'version': 1,
@@ -7537,7 +7537,9 @@ def test_post_api_v1_response_rechecks_cancellation_after_encryption_before_http
         local_deadline=relay_client_module.time.monotonic() + 10,
     )
 
-    assert submitted is False
+    assert outcome.submitted is False
+    assert outcome.suppressed is True
+    assert outcome.suppressed_code == 'request_cancelled'
     post.assert_not_called()
 
 
@@ -7553,7 +7555,7 @@ def test_post_api_v1_response_rechecks_operator_stop_after_encryption_before_htt
     post = MagicMock()
     monkeypatch.setattr(relay_client_module.requests, 'post', post)
 
-    assert client._post_api_v1_response(
+    outcome = client._post_api_v1_response(
         {
             'protocol': 'tokenplace_api_v1_relay_e2ee',
             'version': 1,
@@ -7563,5 +7565,63 @@ def test_post_api_v1_response_rechecks_operator_stop_after_encryption_before_htt
         client_pub_key_b64='client-key',
         client_pub_key=b'client-key',
         local_deadline=relay_client_module.time.monotonic() + 10,
-    ) is False
+    )
+    assert outcome.submitted is False
+    assert outcome.suppressed is True
+    assert outcome.suppressed_code == 'operator_stop'
+    post.assert_not_called()
+
+
+def test_process_client_request_result_three_part_snapshot_activates_cancellation_guard(monkeypatch):
+    """Regression: cancellation_generation_snapshot() returns a 3-tuple but the old
+    len==2 guard silently dropped it, leaving cancel_snapshot=None and disabling the
+    pre-submit cancellation check.  This test proves the guard fires when a 3-part
+    snapshot is stale (epoch rotated) and that _post_api_v1_response suppression
+    propagates submission_allowed=False through process_client_request_result()."""
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    cancel_event = threading.Event()
+    # Simulate a 3-part snapshot already stale at submission time.
+    snapshot_3 = (1, cancel_event, 0)
+    cancel_event.set()  # mark the event as cancelled immediately
+
+    client.model_manager = SimpleNamespace(
+        cancellation_generation_snapshot=lambda: snapshot_3,
+        cancellation_generation_cancelled=lambda s: s[1].is_set() if isinstance(s, tuple) and len(s) >= 2 else False,
+    )
+
+    # Wire a minimal decrypted API v1 payload so the code reaches _post_api_v1_response.
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-3part-snapshot",
+        "client_public_key": TEST_VALID_RESPONSE["client_public_key"],
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {},
+            "routing": {"context_tier": "8k-fast"},
+        },
+    }
+    client.crypto_manager.decrypt_message = MagicMock(return_value=decrypted_payload)
+    client.crypto_manager.encrypt_message = MagicMock(
+        return_value={"chat_history": "cipher", "cipherkey": "k", "iv": "iv"}
+    )
+
+    # Generate succeeds so the flow reaches the post guard.
+    response_envelope = {
+        "request_id": "req-3part-snapshot",
+        "api_v1_response": {"message": {"role": "assistant", "content": "reply"}},
+    }
+    client._generate_api_v1_response_with_runtime_model = MagicMock(return_value=response_envelope)
+
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.submitted is False
+    assert result.submission_allowed is False
+    assert result.safe_error_code == 'request_cancelled'
     post.assert_not_called()

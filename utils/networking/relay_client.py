@@ -56,6 +56,22 @@ class _ApiV1SupervisorOutcome(NamedTuple):
     submission_allowed: bool = True
 
 
+class _PostApiV1Outcome(NamedTuple):
+    """Typed result from _post_api_v1_response().
+
+    ``submitted`` is True only when the relay accepted the encrypted envelope
+    with HTTP 200.  ``suppressed`` is True when a pre-submit guard (cancellation,
+    operator Stop, or local deadline) blocked transmission.  ``transport_failed``
+    is True for network/HTTP errors that are not a suppression.
+    ``suppressed_code`` carries a safe log/result code when suppressed.
+    """
+
+    submitted: bool
+    suppressed: bool = False
+    transport_failed: bool = False
+    suppressed_code: Optional[str] = None
+
+
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     """Return True for request-scoped llama.cpp inference validation failures."""
 
@@ -2601,10 +2617,22 @@ class RelayClient:
         *,
         client_pub_key_b64: str,
         client_pub_key: bytes,
-        cancel_snapshot: Optional[tuple[int, threading.Event]] = None,
+        cancel_snapshot: Optional[Tuple[Any, ...]] = None,
         local_deadline: Optional[float] = None,
-    ) -> bool:
-        """Encrypt and submit an API v1 response to the relay that supplied work."""
+    ) -> _PostApiV1Outcome:
+        """Encrypt and submit an API v1 response to the relay that supplied work.
+
+        ``cancel_snapshot`` is an opaque token produced by
+        :meth:`ModelManager.cancellation_generation_snapshot`.  Its shape is
+        ``(generation: int, cancel_event: threading.Event, epoch: int)`` but is
+        treated as opaque here and forwarded verbatim to
+        ``cancellation_generation_cancelled()``.
+
+        Returns a :class:`_PostApiV1Outcome` that distinguishes successful
+        submission, pre-submit guard suppression (cancellation / operator Stop /
+        local deadline), and transport failure.  Callers that only need a boolean
+        should read ``.submitted``.
+        """
 
         try:
             bound_response_envelope = {
@@ -2641,17 +2669,23 @@ class RelayClient:
                 and callable(cancelled_fn)
                 and cancelled_fn(cancel_snapshot) is True
             )
-            if getattr(self, '_polling_stopped_by_request', False) or (
-                local_deadline is not None and time.monotonic() >= local_deadline
-            ) or request_cancelled:
+            operator_stopped = getattr(self, '_polling_stopped_by_request', False)
+            deadline_expired = local_deadline is not None and time.monotonic() >= local_deadline
+            if operator_stopped or deadline_expired or request_cancelled:
+                suppressed_code = (
+                    'operator_stop' if operator_stopped
+                    else 'local_deadline' if deadline_expired
+                    else 'request_cancelled'
+                )
                 log_info(
-                    "API v1 E2EE response submission suppressed request_id={} protocol={} route={} relay={}",
+                    "API v1 E2EE response submission suppressed request_id={} protocol={} route={} relay={} code={}",
                     response_envelope["request_id"],
                     "tokenplace_api_v1_relay_e2ee",
                     "/api/v1/relay/responses",
                     relay_target,
+                    suppressed_code,
                 )
-                return False
+                return _PostApiV1Outcome(submitted=False, suppressed=True, suppressed_code=suppressed_code)
             source_response = requests.post(
                 response_url,
                 timeout=self._request_timeout,
@@ -2678,7 +2712,7 @@ class RelayClient:
                     relay_target,
                     source_response.status_code,
                 )
-            return submitted
+            return _PostApiV1Outcome(submitted=submitted)
         except Exception:
             log_error(
                 "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
@@ -2687,7 +2721,7 @@ class RelayClient:
                 "/api/v1/relay/responses",
                 exc_info=True,
             )
-            return False
+            return _PostApiV1Outcome(submitted=False, transport_failed=True)
 
 
     def submit_api_v1_error_response(
@@ -2728,7 +2762,7 @@ class RelayClient:
             response_envelope,
             client_pub_key_b64=client_pub_key_b64,
             client_pub_key=client_pub_key,
-        )
+        ).submitted
 
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:
@@ -4834,9 +4868,12 @@ class RelayClient:
                     snapshot_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_snapshot', None)
                     if callable(snapshot_fn):
                         candidate_snapshot = snapshot_fn()
+                        # Accept both 2-part (generation, event) legacy shapes and
+                        # the current 3-part (generation, event, epoch) shape; the
+                        # token is forwarded opaquely to cancellation_generation_cancelled().
                         if (
                             isinstance(candidate_snapshot, tuple)
-                            and len(candidate_snapshot) == 2
+                            and len(candidate_snapshot) >= 2
                             and hasattr(candidate_snapshot[1], 'is_set')
                         ):
                             cancel_snapshot = candidate_snapshot
@@ -4887,16 +4924,26 @@ class RelayClient:
                             recovery_succeeded=recovery_succeeded,
                             submission_allowed=False,
                         )
-                    submitted = self._post_api_v1_response(
+                    post_outcome = self._post_api_v1_response(
                         response_envelope,
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                         cancel_snapshot=cancel_snapshot,
                         local_deadline=outer_api_v1_deadline,
                     )
+                    if post_outcome.suppressed:
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code=post_outcome.suppressed_code or 'request_suppressed',
+                            runtime_healthy=runtime_healthy,
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
+                        )
                     return RelayProcessingResult(
-                        inference_succeeded=safe_error_code is None and submitted,
-                        submitted=submitted,
+                        inference_succeeded=safe_error_code is None and post_outcome.submitted,
+                        submitted=post_outcome.submitted,
                         safe_error_code=safe_error_code,
                         runtime_healthy=runtime_healthy,
                         recovery_attempted=recovery_attempted,

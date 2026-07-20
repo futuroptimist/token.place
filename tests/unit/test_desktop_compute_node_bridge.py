@@ -5257,7 +5257,7 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     # Use a never-completing runtime so Future.result(timeout=) always raises
     # TimeoutError, making the deadline path deterministic regardless of OS
     # scheduling.  Real timing only affects how quickly remaining_seconds drops
-    # to zero; the warm-load deadline (80 ms) is always hit before the 30-second
+    # to zero; the warm-load deadline (80 ms) is always hit before the 5-second
     # block inside NeverReadyApiV1Runtime expires.
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=NeverReadyApiV1Runtime)
@@ -5309,19 +5309,19 @@ def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, mo
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
 
     # Two-phase fake clock.
-    # Phase 0 (jumped not set): returns T0, so wait_started_at = T0,
-    #   warm_load_abs_deadline = T0 + 0.08, and elapsed_seconds = 0 on the first
+    # Phase 0 (jumped not set): returns base_time_seconds, so wait_started_at = base_time_seconds,
+    #   warm_load_abs_deadline = base_time_seconds + 0.08, and elapsed_seconds = 0 on the first
     #   loop iteration (remaining = 0.08 > 0, loop proceeds to future.result()).
-    # Phase 1 (jumped set): returns T0 + deadline + 1, triggering the post-wait
+    # Phase 1 (jumped set): returns base_time_seconds + deadline + 1, triggering the post-wait
     #   absolute-deadline check.
-    t0 = 1000.0
+    base_time_seconds = 1000.0
     deadline_s = 0.08
     jumped = threading.Event()
 
     def fake_monotonic():
         if jumped.is_set():
-            return t0 + deadline_s + 1.0
-        return t0
+            return base_time_seconds + deadline_s + 1.0
+        return base_time_seconds
 
     monkeypatch.setattr(compute_node_bridge.time, 'monotonic', fake_monotonic)
 

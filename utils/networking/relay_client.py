@@ -28,17 +28,6 @@ logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
-
-
-class _ApiV1SubmissionOutcome(NamedTuple):
-    submitted: bool
-    suppressed: bool = False
-    safe_error_code: Optional[str] = None
-
-    def __bool__(self) -> bool:
-        return self.submitted
-
-
 class _ApiV1ChatValidationResult(NamedTuple):
     valid: bool
     code: Optional[str] = None
@@ -2312,7 +2301,7 @@ class RelayClient:
         *,
         client_pub_key_b64: str,
         client_pub_key: bytes,
-    ) -> _ApiV1SubmissionOutcome:
+    ) -> bool:
         """Encrypt and submit an API v1 response to the relay that supplied work."""
 
         if not self._api_v1_begin_mutation():
@@ -2322,11 +2311,7 @@ class RelayClient:
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
             )
-            return _ApiV1SubmissionOutcome(
-                submitted=False,
-                suppressed=True,
-                safe_error_code="shutdown_requested",
-            )
+            return False
 
         try:
             bound_response_envelope = {
@@ -2383,13 +2368,7 @@ class RelayClient:
                     relay_target,
                     source_response.status_code,
                 )
-            if submitted:
-                return _ApiV1SubmissionOutcome(submitted=True)
-            return _ApiV1SubmissionOutcome(
-                submitted=False,
-                suppressed=False,
-                safe_error_code="response_submission_failed",
-            )
+            return submitted
         except Exception:
             log_error(
                 "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
@@ -2398,11 +2377,7 @@ class RelayClient:
                 "/api/v1/relay/responses",
                 exc_info=True,
             )
-            return _ApiV1SubmissionOutcome(
-                submitted=False,
-                suppressed=False,
-                safe_error_code="response_submission_failed",
-            )
+            return False
         finally:
             self._api_v1_end_mutation()
 
@@ -2441,11 +2416,11 @@ class RelayClient:
             request_data["request_id"],
             error={"code": code, "message": message},
         )
-        return bool(self._post_api_v1_response(
+        return self._post_api_v1_response(
             response_envelope,
             client_pub_key_b64=client_pub_key_b64,
             client_pub_key=client_pub_key,
-        ))
+        )
 
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:
@@ -4581,18 +4556,12 @@ class RelayClient:
                             recovery_attempted=recovery_attempted,
                             recovery_succeeded=recovery_succeeded,
                         )
-                    submission_outcome = self._post_api_v1_response(
+                    submitted = self._post_api_v1_response(
                         response_envelope,
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                     )
-                    submitted = bool(getattr(submission_outcome, "submitted", submission_outcome))
-                    suppressed = bool(getattr(submission_outcome, "suppressed", False))
-                    outcome_error_code = getattr(submission_outcome, "safe_error_code", None)
-                    if suppressed:
-                        safe_error_code = outcome_error_code or "shutdown_requested"
-                        runtime_healthy = True
-                    elif (
+                    if (
                         not submitted
                         and (
                             getattr(self, "_api_v1_mutation_latched", False)
@@ -4601,8 +4570,6 @@ class RelayClient:
                     ):
                         safe_error_code = "shutdown_requested"
                         runtime_healthy = True
-                    elif not submitted and outcome_error_code and safe_error_code is None:
-                        safe_error_code = outcome_error_code
                     return RelayProcessingResult(
                         inference_succeeded=safe_error_code is None and submitted,
                         submitted=submitted,

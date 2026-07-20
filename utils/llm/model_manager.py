@@ -6001,6 +6001,9 @@ class ModelManager:
         replacement_create = getattr(replacement, 'create_chat_completion', None)
         if not callable(replacement_create):
             raise RuntimeError('LLM replacement runtime missing create_chat_completion')
+        with self.llm_lock:
+            if self._llm_generation != observed_generation and observed_cancel_event.is_set():
+                raise RuntimeError('LLM inference request cancelled before worker retry')
         try:
             result = replacement_create(*args, **kwargs)
             with self.llm_lock:

@@ -5091,6 +5091,60 @@ def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, mo
     manager._ensure_replacement_llm.assert_not_called()
     assert created == [first]
 
+
+def test_model_manager_cancel_signal_after_replacement_acquisition_prevents_replay(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement_create = MagicMock(return_value={"choices": []})
+    replacement = SimpleNamespace(create_chat_completion=replacement_create)
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first])
+
+    observed = {}
+
+    def _ensure_replacement_llm(_observed_generation):
+        with manager.llm_lock:
+            observed["event"] = manager._llm_cancel_generation_event
+            manager._llm_generation += 1
+            manager._llm_cancel_generation_event.set()
+        return replacement
+
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", _ensure_replacement_llm)
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert created == [first]
+    assert observed["event"].is_set() is True
+    replacement_create.assert_not_called()
+
+
+def test_model_manager_cancel_signal_between_pre_retry_checks_prevents_replay(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 5
+    cancel_event = MagicMock()
+    cancel_event.is_set.side_effect = [False, True]
+    manager._llm_cancel_generation_event = cancel_event
+    first = _RestartableFakeWorker("first", fail="dead")
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=first))
+
+    def _invalidate_llm_if_current(_llm, _exc):
+        manager._llm_generation = 6
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_llm_if_current)
+    monkeypatch.setattr(
+        manager,
+        "_ensure_replacement_llm",
+        MagicMock(side_effect=AssertionError("cancelled request must not acquire replacement")),
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    assert first.calls == 1
+    manager._ensure_replacement_llm.assert_not_called()
+    assert cancel_event.is_set.call_count == 2
+
+
 def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog, capsys):
     """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
     from utils.llm import model_manager as model_manager_module

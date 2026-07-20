@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -1542,7 +1543,8 @@ class ComputeNodeRuntime:
             should_unregister = isinstance(registered_relays, set) and bool(registered_relays)
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn) and should_unregister:
-                if not unregister_fn():
+                shutdown_deadline = time.monotonic() + 6.5
+                if not unregister_fn(shutdown_deadline=shutdown_deadline):
                     _log_warning("Relay unregister request failed during shutdown")
             elif callable(unregister_fn):
                 _log_info("Skipping relay unregister because no API v1 registration succeeded")

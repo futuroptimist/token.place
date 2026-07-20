@@ -5766,6 +5766,20 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
         self._close_llm_proxy(failed_runtime)
 
+
+    def cancellation_generation_snapshot(self) -> tuple[int, threading.Event]:
+        """Return a request-scoped cancellation generation snapshot."""
+        with self.llm_lock:
+            return self._llm_generation, self._llm_cancel_generation_event
+
+    def cancellation_generation_cancelled(self, snapshot: tuple[int, threading.Event]) -> bool:
+        """Return whether the captured request generation was cancelled/replaced."""
+        generation, cancel_event = snapshot
+        if cancel_event.is_set():
+            return True
+        with self.llm_lock:
+            return self._llm_generation != generation and cancel_event.is_set()
+
     def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True) -> bool:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
         safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
@@ -5876,7 +5890,7 @@ class ModelManager:
             process_stopped = _dead()
 
         close = getattr(llm, 'close', None)
-        if callable(close):
+        if callable(close) and not terminate_process:
             close_done = threading.Event()
 
             def _bounded_close() -> None:
@@ -5893,9 +5907,13 @@ class ModelManager:
                 daemon=True,
             )
             close_thread.start()
-            close_thread.join(timeout=0.25 if terminate_process else 1.0)
-            if not close_done.is_set() and not terminate_process:
+            close_thread.join(timeout=1.0)
+            if not close_done.is_set():
                 self.log_warning("Timed out closing old llama.cpp worker during invalidation")
+        elif callable(close):
+            # Forced cancellation cleanup relies on verified subprocess death and
+            # owned pipe/reader disposal; do not call a potentially blocking proxy close.
+            pass
 
         for attr in (
             'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',

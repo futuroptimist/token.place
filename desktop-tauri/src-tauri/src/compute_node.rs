@@ -108,6 +108,8 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
@@ -135,16 +137,33 @@ fn terminate_bridge_process_tree(pid: u32) {
     unsafe {
         let pgid = pid as i32;
         let _ = kill(-pgid, SIGTERM);
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = kill(-pgid, SIGKILL);
     }
 }
 
 #[cfg(windows)]
 fn terminate_bridge_process_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
+    let Ok(mut child) = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1558,17 +1577,23 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 terminate_bridge_process_tree(pid);
             }
             let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let exited_after_kill = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some();
             eprintln!(
-                "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
-                stop_session_id.as_deref().unwrap_or("unknown")
+                "desktop.compute_node.bridge_process_exited operator_session_id={} killed={}",
+                stop_session_id.as_deref().unwrap_or("unknown"),
+                exited_after_kill
             );
             append_operator_log_path_line(
                 stop_log_file_path.as_deref(),
                 "desktop.compute_node.bridge_process_exited",
                 &format!(
-                    "operator_session_id={} killed=true",
-                    stop_session_id.as_deref().unwrap_or("unknown")
+                    "operator_session_id={} killed={}",
+                    stop_session_id.as_deref().unwrap_or("unknown"),
+                    exited_after_kill
                 ),
             );
         } else {

@@ -7347,7 +7347,7 @@ def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreate
 
     manager.terminate_active_worker_for_cancellation(reason='cancelled')
 
-    old.close.assert_called_once()
+    old.close.assert_not_called()
     manager.get_llm_instance.assert_called_once()
     assert manager.llm is None
     assert manager.last_worker_error_code == 'cancelled'

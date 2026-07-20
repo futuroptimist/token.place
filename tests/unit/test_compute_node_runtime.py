@@ -2101,12 +2101,11 @@ def test_compute_node_runtime_stop_delegates_to_relay_client():
     )
 
     runtime.stop()
-    relay_client.unregister_from_relay.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_called_once()
+    assert relay_client.unregister_from_relay.call_args.kwargs["shutdown_deadline"] > 0
     relay_client.stop.assert_called_once_with()
-    assert relay_client.method_calls[:2] == [
-        call.stop(),
-        call.unregister_from_relay(),
-    ]
+    assert relay_client.method_calls[0] == call.stop()
+    assert relay_client.method_calls[1][0] == "unregister_from_relay"
 
 
 def test_compute_node_runtime_stop_continues_when_unregister_raises():
@@ -2126,12 +2125,11 @@ def test_compute_node_runtime_stop_continues_when_unregister_raises():
 
     runtime.stop()
 
-    relay_client.unregister_from_relay.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_called_once()
+    assert relay_client.unregister_from_relay.call_args.kwargs["shutdown_deadline"] > 0
     relay_client.stop.assert_called_once_with()
-    assert relay_client.method_calls[:2] == [
-        call.stop(),
-        call.unregister_from_relay(),
-    ]
+    assert relay_client.method_calls[0] == call.stop()
+    assert relay_client.method_calls[1][0] == "unregister_from_relay"
 
 
 def test_compute_node_runtime_replaces_stale_error_on_preflight_failure():

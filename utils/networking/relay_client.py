@@ -1361,8 +1361,13 @@ class RelayClient:
             wakeup.set()
         self._api_v1_stop_heartbeat_worker()
 
-    def unregister_from_relay(self) -> bool:
-        """Best-effort unregister call for graceful compute-node shutdown."""
+    def unregister_from_relay(self, *, shutdown_deadline: Optional[float] = None) -> bool:
+        """Best-effort unregister call for graceful compute-node shutdown.
+
+        When ``shutdown_deadline`` is provided, all relay unregister attempts share
+        that absolute monotonic deadline so desktop bridge cleanup stays inside
+        Rust's bounded stop grace.
+        """
 
         self._api_v1_stop_heartbeat_worker()
 
@@ -1422,9 +1427,14 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 unregister_url = self._build_api_v1_url(candidate_url, "/relay/servers/unregister")
+                timeout = self._remaining_unregister_timeout(shutdown_deadline)
+                if timeout is None:
+                    failed_relays.add(candidate_url)
+                    last_error = "shutdown_deadline_exhausted"
+                    break
                 response = requests.post(
                     unregister_url,
-                    timeout=self._request_timeout,
+                    timeout=timeout,
                     **request_kwargs,
                 )
                 if response.status_code == 404:
@@ -1432,9 +1442,14 @@ class RelayClient:
                     if legacy_base_url.endswith('/api/v1'):
                         legacy_base_url = legacy_base_url[: -len('/api/v1')]
                     legacy_url = f"{legacy_base_url}/unregister"
+                    timeout = self._remaining_unregister_timeout(shutdown_deadline)
+                    if timeout is None:
+                        failed_relays.add(candidate_url)
+                        last_error = "shutdown_deadline_exhausted"
+                        break
                     response = requests.post(
                         legacy_url,
-                        timeout=self._request_timeout,
+                        timeout=timeout,
                         **request_kwargs,
                     )
                 if response.status_code == 200:
@@ -1494,6 +1509,14 @@ class RelayClient:
                 self._api_v1_last_heartbeat_at.pop(relay_url, None)
                 relay_wait_hints.pop(relay_url, None)
         return True
+
+    def _remaining_unregister_timeout(self, shutdown_deadline: Optional[float]) -> Optional[float]:
+        if shutdown_deadline is None:
+            return self._request_timeout
+        remaining = shutdown_deadline - time.monotonic()
+        if remaining <= 0.05:
+            return None
+        return max(0.05, min(self._request_timeout, remaining * 0.8))
 
     def ping_relay(self) -> Dict[str, Any]:
         """
@@ -2299,7 +2322,7 @@ class RelayClient:
         if callable(close):
             close()
             return True
-        return True
+        return False
 
     def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
         try:
@@ -2498,6 +2521,12 @@ class RelayClient:
                     recovery_succeeded = False
                     self.stop_polling = True
                     self._polling_stopped_by_request = True
+                    fatal = getattr(self, 'fatal_bridge_teardown', None)
+                    if callable(fatal):
+                        try:
+                            cleanup_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
+                        except Exception:
+                            cleanup_quiesced = False
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
@@ -2509,6 +2538,10 @@ class RelayClient:
         finally:
             inference_done = future.done()
             control_done = control_future is None or control_future.done()
+            if not inference_done:
+                future.cancel()
+            if control_future is not None and not control_done:
+                control_future.cancel()
             executor.shutdown(wait=inference_done, cancel_futures=True)
             if control_executor is not None:
                 control_executor.shutdown(wait=control_done, cancel_futures=True)
@@ -4771,6 +4804,16 @@ class RelayClient:
             )
             if api_v1_request_payload is not None:
                 try:
+                    cancel_snapshot = None
+                    snapshot_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_snapshot', None)
+                    if callable(snapshot_fn):
+                        candidate_snapshot = snapshot_fn()
+                        if (
+                            isinstance(candidate_snapshot, tuple)
+                            and len(candidate_snapshot) == 2
+                            and hasattr(candidate_snapshot[1], 'is_set')
+                        ):
+                            cancel_snapshot = candidate_snapshot
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
                     supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
@@ -4796,11 +4839,23 @@ class RelayClient:
                         "compute_node_process_failed",
                     }:
                         runtime_healthy = True
-                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= outer_api_v1_deadline:
+                    cancelled_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_cancelled', None)
+                    request_cancelled = bool(
+                        cancel_snapshot is not None
+                        and callable(cancelled_fn)
+                        and cancelled_fn(cancel_snapshot) is True
+                    )
+                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= outer_api_v1_deadline or request_cancelled:
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
-                            safe_error_code='operator_stop' if getattr(self, '_polling_stopped_by_request', False) else 'local_deadline',
+                            safe_error_code=(
+                                'operator_stop'
+                                if getattr(self, '_polling_stopped_by_request', False)
+                                else 'local_deadline'
+                                if time.monotonic() >= outer_api_v1_deadline
+                                else 'request_cancelled'
+                            ),
                             runtime_healthy=runtime_healthy,
                             recovery_attempted=recovery_attempted,
                             recovery_succeeded=recovery_succeeded,

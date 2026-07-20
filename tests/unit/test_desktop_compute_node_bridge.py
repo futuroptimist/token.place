@@ -275,6 +275,25 @@ class WarmingTimeoutApiV1Runtime(ApiV1Runtime):
         return True
 
 
+class NeverReadyApiV1Runtime(ApiV1Runtime):
+    """Runtime whose ensure_api_v1_runtime_ready blocks on an Event that is never
+    set, so Future.result(timeout=t) always raises TimeoutError — useful for
+    deterministic deadline/timeout tests."""
+
+    last_instance = None
+    _BLOCK_TIMEOUT = 30.0  # safety ceiling; test deadline is always shorter
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        NeverReadyApiV1Runtime.last_instance = self
+        self._block = threading.Event()
+
+    def ensure_api_v1_runtime_ready(self):
+        # Never sets self._block, so this always times out after _BLOCK_TIMEOUT.
+        self._block.wait(timeout=self._BLOCK_TIMEOUT)
+        return False
+
+
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
     last_instance = None
 
@@ -5235,19 +5254,16 @@ def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
 
 
 def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monkeypatch):
+    # Use a never-completing runtime so Future.result(timeout=) always raises
+    # TimeoutError, making the deadline path deterministic regardless of OS
+    # scheduling.  Real timing only affects how quickly remaining_seconds drops
+    # to zero; the warm-load deadline (80 ms) is always hit before the 30-second
+    # block inside NeverReadyApiV1Runtime expires.
     _reset_cancel_queue()
-    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NeverReadyApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
-
-    stop_counter = {'count': 0}
-
-    def fake_stop_requested():
-        stop_counter['count'] += 1
-        return stop_counter['count'] > 3
-
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -5266,3 +5282,73 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     ]
     assert warming_status_events
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
+
+
+def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, monkeypatch):
+    # Reproduce the race: Future.result(timeout=t) can return a completed result
+    # after the nominal timeout when the calling thread is scheduled late.
+    # Verify that the post-wait absolute-deadline check catches this and causes
+    # exit code 1 (fatal warm-load failure) rather than accepting the late result.
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
+    # Short deadline (80 ms) — the runtime will complete only after the fake
+    # clock has advanced past the deadline.
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
+
+    # Control the monotonic clock so the post-wait check fires deterministically.
+    # Layout:
+    #   call 0  — wait_started_at capture                  → T0 (well before deadline)
+    #   call 1  — first elapsed check at top of loop       → T0 + 0.001
+    #   call 2+ — post-ensure_runtime_ready deadline check → T0 + deadline + 0.05
+    #             (simulates the Future completing "after" the deadline)
+    t0 = 1000.0
+    deadline_s = 0.08
+    call_n = {'v': 0}
+
+    def fake_monotonic():
+        n = call_n['v']
+        call_n['v'] += 1
+        if n == 0:
+            return t0
+        if n == 1:
+            return t0 + 0.001
+        # All subsequent calls (including post-wait deadline check) are past deadline.
+        return t0 + deadline_s + 0.050
+
+    monkeypatch.setattr(compute_node_bridge.time, 'monotonic', fake_monotonic)
+
+    # Release the runtime from a background thread so ensure_api_v1_runtime_ready
+    # completes (returns True) and ensure_runtime_ready returns True, triggering
+    # the post-wait absolute-deadline check.
+    def _release():
+        inst = WarmingThenApiV1Runtime.last_instance
+        if inst is not None:
+            inst.ready_started.wait(timeout=5)
+            inst.ready_release.set()
+
+    release_thread = threading.Thread(target=_release, daemon=True)
+    release_thread.start()
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    result = compute_node_bridge.run(args)
+    release_thread.join(timeout=5)
+
+    assert result == 1, (
+        "expected exit 1 because the Future completed after the absolute deadline, "
+        f"got {result}"
+    )
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.registration.gate_wait_timeout' in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    timeout_status_events = [
+        e for e in events
+        if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
+    ]
+    assert timeout_status_events, "expected at least one warm_load status event from the timeout path"

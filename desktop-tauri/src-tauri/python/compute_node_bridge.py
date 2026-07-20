@@ -1466,59 +1466,80 @@ def run(args: argparse.Namespace) -> int:
             block=False,
         )
         wait_started_at = time.monotonic()
+        # Absolute deadline established once before the loop.  Checked both at
+        # the top of each iteration (elapsed-based) and immediately after any
+        # blocking Future.result() call returns a result — Future.result() can
+        # return a completed value after the nominal per-call timeout when the
+        # calling thread is scheduled late by the OS.
+        warm_load_abs_deadline = wait_started_at + warm_load_deadline_seconds
         last_progress_log_at = wait_started_at
         last_status_emit_at = wait_started_at
         progress_emit_interval_seconds = PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS
         status_emit_interval_seconds = PRE_REGISTRATION_STATUS_INTERVAL_SECONDS
+
+        def _emit_gate_wait_timeout() -> bool:
+            """Set warm-load state to failed and emit timeout diagnostics.
+
+            Always returns False so callers can ``return _emit_gate_wait_timeout()``.
+            Do not cancel the warm-load Future: the underlying daemon thread cannot
+            be forcibly stopped, and cancelling the Future can race with the worker
+            setting its result/exception.  The failed warm-load state makes the
+            bridge ignore any late completion.
+            """
+            nonlocal warm_load_state, warm_load_failed, warm_load_duration_ms, last_error
+            warm_load_state = "failed"
+            current_runtime_error = getattr(
+                runtime.model_manager, 'last_runtime_init_error', None
+            )
+            warm_load_failed = (
+                current_runtime_error
+                or "API v1 relay runtime warm-load timed out after "
+                f"{warm_load_deadline_seconds:g}s"
+            )
+            warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+            last_error = warm_load_failed
+            print(
+                "desktop.compute_node_bridge.registration.gate_wait_timeout "
+                f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+                f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
+                f"timeout_seconds={warm_load_deadline_seconds}",
+                file=sys.stderr,
+            )
+            emit_operator_event(
+                build_status_payload(
+                    event_type="status",
+                    running=True,
+                    registered=False,
+                    active_relay_url=runtime.relay_client.relay_url,
+                    current_last_error=last_error,
+                    extra={
+                        "runtime_provisioning_state": "provisioning",
+                        "startup_phase": "warm_load",
+                        "startup_elapsed_ms": warm_load_duration_ms,
+                        "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
+                    },
+                )
+            )
+            fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
+            return False
+
         while warm_load_state == "warming":
             elapsed_seconds = time.monotonic() - wait_started_at
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
-                warm_load_state = "failed"
-                current_runtime_error = getattr(
-                    runtime.model_manager, 'last_runtime_init_error', None
-                )
-                warm_load_failed = (
-                    current_runtime_error
-                    or "API v1 relay runtime warm-load timed out after "
-                    f"{warm_load_deadline_seconds:g}s"
-                )
-                warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
-                last_error = warm_load_failed
-                # Do not cancel the warm-load Future here: the underlying daemon
-                # thread cannot be forcibly stopped, and cancelling the Future can
-                # race with the worker setting its result/exception.  The failed
-                # warm-load state above makes the bridge ignore any late completion.
-                print(
-                    "desktop.compute_node_bridge.registration.gate_wait_timeout "
-                    f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
-                    f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
-                    f"timeout_seconds={warm_load_deadline_seconds}",
-                    file=sys.stderr,
-                )
-                emit_operator_event(
-                    build_status_payload(
-                        event_type="status",
-                        running=True,
-                        registered=False,
-                        active_relay_url=runtime.relay_client.relay_url,
-                        current_last_error=last_error,
-                        extra={
-                            "runtime_provisioning_state": "provisioning",
-                            "startup_phase": "warm_load",
-                            "startup_elapsed_ms": warm_load_duration_ms,
-                            "startup_deadline_ms": int(warm_load_deadline_seconds * 1000),
-                        },
-                    )
-                )
-                fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
-                return False
+                return _emit_gate_wait_timeout()
             if ensure_runtime_ready(
                 "pre_registration",
                 active_relay_url=runtime.relay_client.relay_url,
                 block=True,
                 block_timeout_seconds=min(0.1, remaining_seconds),
             ):
+                # Post-wait absolute-deadline check: Future.result() can return a
+                # completed result after the nominal per-call timeout when the
+                # calling thread is descheduled.  Re-check the absolute deadline
+                # before accepting the result as a success.
+                if time.monotonic() >= warm_load_abs_deadline:
+                    return _emit_gate_wait_timeout()
                 break
             now = time.monotonic()
             duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)

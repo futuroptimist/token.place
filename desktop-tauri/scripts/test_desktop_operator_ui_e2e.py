@@ -99,7 +99,7 @@ def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeou
             last_error = exc
             time.sleep(0.1)
             continue
-        if time.monotonic() <= deadline and last_count == expected_count:
+        if last_count == expected_count:
             return time.monotonic() - started
         time.sleep(0.1)
     raise AssertionError(

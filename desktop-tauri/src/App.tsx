@@ -802,6 +802,7 @@ export function App() {
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
+  const computeNodeStartAttemptRef = useRef(0);
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend')
@@ -1005,6 +1006,8 @@ export function App() {
   };
 
   const startComputeNode = async () => {
+    const startAttempt = computeNodeStartAttemptRef.current + 1;
+    computeNodeStartAttemptRef.current = startAttempt;
     try {
       setIsStartingComputeNode(true);
       setError('');
@@ -1055,6 +1058,9 @@ export function App() {
         },
       });
     } catch (e) {
+      if (computeNodeStartAttemptRef.current !== startAttempt) {
+        return;
+      }
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       const failedStatus = {

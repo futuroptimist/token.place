@@ -1823,19 +1823,32 @@ pub async fn start_compute_node(
         saw_error_event,
     )
     .await;
-    match stdout_end.disposition {
+    let stdout_end_session_is_current = {
+        let status = state.status.lock().await;
+        status.operator_session_id.as_deref() == Some(session_id.as_str())
+    };
+    if matches!(
+        stdout_end.disposition,
         BridgeStdoutEndDisposition::UnexpectedFailure
-        | BridgeStdoutEndDisposition::Completed
-        | BridgeStdoutEndDisposition::ExplicitStopOwnsShutdown
-        | BridgeStdoutEndDisposition::StaleSession => {}
-    }
-    if let Some(payload) = stdout_end.synthetic_payload.clone() {
-        if app.emit("compute_node_event", payload).is_err() {
-            eprintln!(
-                "desktop.compute_node.event_emit_error operator_session_id={}",
-                session_id
-            );
+    ) && stdout_end_session_is_current
+    {
+        if let Some(payload) = stdout_end.synthetic_payload.clone() {
+            if app.emit("compute_node_event", payload).is_err() {
+                eprintln!(
+                    "desktop.compute_node.event_emit_error operator_session_id={}",
+                    session_id
+                );
+            }
         }
+    } else if matches!(
+        stdout_end.disposition,
+        BridgeStdoutEndDisposition::Completed
+            | BridgeStdoutEndDisposition::ExplicitStopOwnsShutdown
+            | BridgeStdoutEndDisposition::StaleSession
+    ) {
+        // Expected terminal states do not synthesize UI errors here: explicit Stop
+        // owns its cached result, coherent completion already came from stdout,
+        // and stale sessions must not mutate a replacement session.
     }
 
     if let Err(err) = stderr_task.await {
@@ -1865,8 +1878,12 @@ pub async fn start_compute_node(
         }
     }
 
-    if let Some(err) = stdout_end.result.err() {
-        anyhow::bail!(err);
+    if stdout_end_session_is_current {
+        if let Some(err) = stdout_end.result.err() {
+            anyhow::bail!(err);
+        }
+    } else {
+        let _ = stdout_end.result;
     }
 
     Ok(())

@@ -21,8 +21,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -120,6 +118,7 @@ struct BridgeProcessRecord {
     killed: bool,
     exit_status: Option<std::process::ExitStatus>,
     stop_result: Option<Result<(), String>>,
+    shutdown_worker_started: bool,
     notify: Arc<Notify>,
 }
 
@@ -139,6 +138,7 @@ impl BridgeProcessRecord {
             killed: false,
             exit_status: None,
             stop_result: None,
+            shutdown_worker_started: false,
             notify: Arc::new(Notify::new()),
         }
     }
@@ -212,15 +212,14 @@ struct StopSessionSnapshot {
 }
 
 #[cfg(test)]
-static SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK: OnceLock<
-    std::sync::Mutex<Option<oneshot::Sender<()>>>,
-> = OnceLock::new();
-
-#[cfg(test)]
-fn install_snapshot_stop_session_process_lock_attempt_hook(sender: oneshot::Sender<()>) {
-    let hook =
-        SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK.get_or_init(|| std::sync::Mutex::new(None));
-    *hook.lock().expect("snapshot hook mutex") = Some(sender);
+async fn install_snapshot_stop_session_process_lock_attempt_hook(
+    state: &ComputeNodeState,
+    sender: oneshot::Sender<()>,
+) {
+    *state
+        .snapshot_stop_session_process_lock_attempt_hook
+        .lock()
+        .await = Some(sender);
 }
 
 async fn snapshot_stop_session(state: &ComputeNodeState) -> StopSessionSnapshot {
@@ -228,10 +227,13 @@ async fn snapshot_stop_session(state: &ComputeNodeState) -> StopSessionSnapshot 
     // Start: bridge_process -> status. This blocks on an in-progress Starting
     // reservation publication without ever waiting on lifecycle_lock.
     #[cfg(test)]
-    if let Some(hook) = SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK.get() {
-        if let Some(sender) = hook.lock().expect("snapshot hook mutex").take() {
-            let _ = sender.send(());
-        }
+    if let Some(sender) = state
+        .snapshot_stop_session_process_lock_attempt_hook
+        .lock()
+        .await
+        .take()
+    {
+        let _ = sender.send(());
     }
     let process = state.bridge_process.lock().await;
     let status = state.status.lock().await;
@@ -341,6 +343,8 @@ pub struct ComputeNodeState {
     pub next_session_id: Arc<Mutex<u64>>,
     pub stopped_event_ack_session_id: Arc<Mutex<Option<String>>>,
     pub stopped_event_ack_notify: Arc<Notify>,
+    #[cfg(test)]
+    snapshot_stop_session_process_lock_attempt_hook: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -1866,117 +1870,98 @@ async fn wait_for_stop_cleanup_ack_inner(
     }
 }
 
-async fn stop_compute_node_with_shutdown_timeout(
-    state: ComputeNodeState,
-    shutdown_timeout: Duration,
+async fn wait_for_cached_stop_result(
+    state: &ComputeNodeState,
+    session_id: Option<&str>,
+    notify: Arc<Notify>,
+    deadline: Instant,
 ) -> anyhow::Result<()> {
-    let StopSessionSnapshot {
-        session_id: stop_session_id,
-        log_file_path: stop_log_file_path,
-    } = snapshot_stop_session(&state).await;
-    let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown");
-    eprintln!(
-        "desktop.compute_node.stop_requested operator_session_id={}",
-        stop_session_display
-    );
-    append_operator_log_path_line(
-        stop_log_file_path.as_deref(),
-        "desktop.compute_node.stop_requested",
-        &format!("operator_session_id={}", stop_session_display),
-    );
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let cached = {
+            let process = state.bridge_process.lock().await;
+            process.as_ref().and_then(|record| {
+                let matches_session = session_id.is_none_or(|session| {
+                    record.session_id.is_empty() || record.session_id == session
+                });
+                matches_session
+                    .then(|| record.stop_result.clone())
+                    .flatten()
+            })
+        };
+        if let Some(result) = cached {
+            return result.map_err(anyhow::Error::msg);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+        }
+        tokio::select! {
+            _ = &mut notified => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
+        }
+    }
+}
 
-    let parent_shutdown_deadline = Instant::now() + shutdown_timeout;
-    let process_notify;
+async fn bridge_shutdown_supervisor(
+    state: ComputeNodeState,
+    stop_session_id: Option<String>,
+    stop_log_file_path: Option<String>,
+) {
+    let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown").to_string();
+    let warning = "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".to_string();
+    let (process_notify, parent_shutdown_deadline) = {
+        let process = state.bridge_process.lock().await;
+        let Some(record) = process.as_ref() else {
+            return;
+        };
+        (
+            record.notify.clone(),
+            record
+                .stop_deadline
+                .unwrap_or_else(|| Instant::now() + DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT),
+        )
+    };
+
     let mut stdin_handle = None;
     let mut owned_child = None;
-    let first_stopper;
-    let mut stop_latched_during_startup = false;
-    let child_handoff_deadline = std::cmp::min(
-        parent_shutdown_deadline,
-        Instant::now() + Duration::from_millis(500),
-    );
 
     loop {
-        let mut process = state.bridge_process.lock().await;
-        if process.as_ref().is_none_or(|record| !record.is_active()) {
-            let legacy_child = state.child.lock().await.take();
-            let legacy_stdin = state.stdin.lock().await.take();
-            if legacy_child.is_some() || legacy_stdin.is_some() {
-                *process = Some(BridgeProcessRecord::new(
-                    stop_session_id.clone().unwrap_or_default(),
-                    legacy_child,
-                    legacy_stdin,
-                ));
-            }
-        }
-
-        if let Some(record) = process.as_mut() {
+        let notified = process_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut process = state.bridge_process.lock().await;
+            let Some(record) = process.as_mut() else {
+                break;
+            };
             if stop_session_id.as_deref().is_some_and(|session| {
                 !record.session_id.is_empty() && record.session_id != session
             }) {
-                anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+                record.phase = BridgeProcessPhase::Completed;
+                record.stop_result = Some(Err(warning.clone()));
+                record.notify.notify_waiters();
+                return;
             }
-            if let Some(result) = record.stop_result.clone() {
-                return result.map_err(anyhow::Error::msg);
+            if record.stop_result.is_some() {
+                record.notify.notify_waiters();
+                return;
             }
-            process_notify = record.notify.clone();
-            if record.phase == BridgeProcessPhase::Stopping {
-                first_stopper = false;
-            } else {
-                first_stopper = true;
-                let was_starting = record.phase == BridgeProcessPhase::Starting;
-                record.phase = BridgeProcessPhase::Stopping;
-                record.stop_deadline.get_or_insert(parent_shutdown_deadline);
-                if !record.cancel_sent {
-                    stdin_handle = record.stdin.take();
-                    record.cancel_sent = stdin_handle.is_some();
-                }
+            if owned_child.is_none() {
                 owned_child = record.child.take();
-                stop_latched_during_startup = was_starting && owned_child.is_none();
             }
+            if stdin_handle.is_none() && !record.cancel_sent {
+                stdin_handle = record.stdin.take();
+                record.cancel_sent = stdin_handle.is_some();
+            }
+        }
+        if owned_child.is_some() || Instant::now() >= parent_shutdown_deadline {
             break;
         }
-
-        drop(process);
-        if Instant::now() >= child_handoff_deadline {
-            return finalize_stop_status(
-                &state,
-                stop_session_id.as_deref(),
-                false,
-                false,
-                None,
-                true,
-            )
-            .await;
-        }
-        tokio::time::sleep(std::cmp::min(
-            Duration::from_millis(25),
-            child_handoff_deadline.saturating_duration_since(Instant::now()),
-        ))
-        .await;
-    }
-
-    if !first_stopper {
-        loop {
-            let notified = process_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(result) = state
-                .bridge_process
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|record| record.stop_result.clone())
-            {
-                return result.map_err(anyhow::Error::msg);
-            }
-            if Instant::now() >= parent_shutdown_deadline {
-                anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(parent_shutdown_deadline)) => {},
-            }
+        tokio::select! {
+            _ = &mut notified => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(parent_shutdown_deadline)) => {},
         }
     }
 
@@ -1990,55 +1975,10 @@ async fn stop_compute_node_with_shutdown_timeout(
             "desktop.compute_node.cancel_requested",
             &format!("operator_session_id={}", stop_session_display),
         );
-        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
-        let _ = stdin.flush().await;
-    }
-
-    if stop_latched_during_startup && owned_child.is_none() {
-        loop {
-            let notified = process_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let mut process = state.bridge_process.lock().await;
-                if let Some(record) = process.as_mut() {
-                    if stop_session_id.as_deref().is_some_and(|session| {
-                        !record.session_id.is_empty() && record.session_id != session
-                    }) {
-                        anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
-                    }
-                    if let Some(result) = record.stop_result.clone() {
-                        return result.map_err(anyhow::Error::msg);
-                    }
-                    if owned_child.is_none() {
-                        owned_child = record.child.take();
-                        if stdin_handle.is_none() && !record.cancel_sent {
-                            stdin_handle = record.stdin.take();
-                            record.cancel_sent = stdin_handle.is_some();
-                        }
-                    }
-                }
-            }
-            if owned_child.is_some() || Instant::now() >= parent_shutdown_deadline {
-                break;
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(parent_shutdown_deadline)) => {},
-            }
-        }
-        if let Some(stdin) = stdin_handle.as_mut() {
-            eprintln!(
-                "desktop.compute_node.cancel_requested operator_session_id={}",
-                stop_session_display
-            );
-            append_operator_log_path_line(
-                stop_log_file_path.as_deref(),
-                "desktop.compute_node.cancel_requested",
-                &format!("operator_session_id={}", stop_session_display),
-            );
-            let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
-            let _ = stdin.flush().await;
+        if stdin.write_all(b"{\"type\":\"cancel\"}\n").await.is_err()
+            || stdin.flush().await.is_err()
+        {
+            // Continue to bounded wait/kill and report through existing safe result.
         }
     }
 
@@ -2046,14 +1986,14 @@ async fn stop_compute_node_with_shutdown_timeout(
     let mut bridge_killed = false;
     let mut child_exit_status = None;
     if let Some(mut child) = owned_child {
-        child_exit_status = child.try_wait()?;
+        child_exit_status = child.try_wait().ok().flatten();
         while child_exit_status.is_none() && Instant::now() < parent_shutdown_deadline {
             tokio::time::sleep(std::cmp::min(
                 Duration::from_millis(50),
                 parent_shutdown_deadline.saturating_duration_since(Instant::now()),
             ))
             .await;
-            child_exit_status = child.try_wait()?;
+            child_exit_status = child.try_wait().ok().flatten();
         }
         if child_exit_status.is_none() {
             bridge_killed = true;
@@ -2119,18 +2059,95 @@ async fn stop_compute_node_with_shutdown_timeout(
     let cached = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
     let notify = {
         let mut process = state.bridge_process.lock().await;
-        process.as_mut().map(|record| {
-            record.phase = BridgeProcessPhase::Completed;
-            record.killed = bridge_killed;
-            record.exit_status = child_exit_status;
-            record.stop_result = Some(cached.clone());
-            record.notify.clone()
+        process.as_mut().and_then(|record| {
+            let matches_session = stop_session_id
+                .as_deref()
+                .is_none_or(|session| record.session_id.is_empty() || record.session_id == session);
+            if matches_session {
+                record.phase = BridgeProcessPhase::Completed;
+                record.killed = bridge_killed;
+                record.exit_status = child_exit_status;
+                record.stop_result = Some(cached.clone());
+                record.child = None;
+                record.stdin = None;
+                Some(record.notify.clone())
+            } else {
+                None
+            }
         })
     };
     if let Some(notify) = notify {
         notify.notify_waiters();
     }
-    result
+}
+
+async fn stop_compute_node_with_shutdown_timeout(
+    state: ComputeNodeState,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<()> {
+    let StopSessionSnapshot {
+        session_id: stop_session_id,
+        log_file_path: stop_log_file_path,
+    } = snapshot_stop_session(&state).await;
+    let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown");
+    eprintln!(
+        "desktop.compute_node.stop_requested operator_session_id={}",
+        stop_session_display
+    );
+    append_operator_log_path_line(
+        stop_log_file_path.as_deref(),
+        "desktop.compute_node.stop_requested",
+        &format!("operator_session_id={}", stop_session_display),
+    );
+
+    let first_deadline = Instant::now() + shutdown_timeout;
+    let (notify, deadline, should_spawn) = loop {
+        let mut process = state.bridge_process.lock().await;
+        if process.as_ref().is_none_or(|record| !record.is_active()) {
+            let legacy_child = state.child.lock().await.take();
+            let legacy_stdin = state.stdin.lock().await.take();
+            if legacy_child.is_some() || legacy_stdin.is_some() {
+                *process = Some(BridgeProcessRecord::new(
+                    stop_session_id.clone().unwrap_or_default(),
+                    legacy_child,
+                    legacy_stdin,
+                ));
+            }
+        }
+        if let Some(record) = process.as_mut() {
+            if stop_session_id.as_deref().is_some_and(|session| {
+                !record.session_id.is_empty() && record.session_id != session
+            }) {
+                anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+            }
+            if let Some(result) = record.stop_result.clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            if record.phase != BridgeProcessPhase::Stopping {
+                record.phase = BridgeProcessPhase::Stopping;
+            }
+            let deadline = *record.stop_deadline.get_or_insert(first_deadline);
+            let should_spawn = !record.shutdown_worker_started;
+            if should_spawn {
+                record.shutdown_worker_started = true;
+            }
+            break (record.notify.clone(), deadline, should_spawn);
+        }
+        drop(process);
+        return finalize_stop_status(&state, stop_session_id.as_deref(), false, false, None, true)
+            .await;
+    };
+
+    if should_spawn {
+        let worker_state = state.clone();
+        let worker_session = stop_session_id.clone();
+        let worker_log_path = stop_log_file_path.clone();
+        tokio::spawn(async move {
+            bridge_shutdown_supervisor(worker_state, worker_session, worker_log_path).await;
+        });
+    }
+
+    wait_for_cached_stop_result(&state, stop_session_id.as_deref(), notify, deadline).await
 }
 
 async fn finalize_stop_status(
@@ -3008,7 +3025,7 @@ mod tests {
 
         let mut process_guard = state.bridge_process.lock().await;
         let (snapshot_attempt_tx, snapshot_attempt_rx) = tokio::sync::oneshot::channel();
-        install_snapshot_stop_session_process_lock_attempt_hook(snapshot_attempt_tx);
+        install_snapshot_stop_session_process_lock_attempt_hook(&state, snapshot_attempt_tx).await;
         let stop_state = state.clone();
         let stop_task = tokio::spawn(async move {
             stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
@@ -5263,6 +5280,68 @@ mod tests {
         assert_eq!(
             command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
             None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn first_stop_cancellation_detached_worker_replays_success() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("temp dir");
+        let cancel_path = temp.path().join("cancel.txt");
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; exit 0",
+                "sh",
+                cancel_path.to_str().expect("cancel path"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let stdin = child.stdin.take().expect("child stdin");
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("cancel-session".into());
+            status.stop_cleanup_required = Some(false);
+            status.stop_cleanup_attempted = Some(false);
+            status.stop_cleanup_outcome = Some("not_required".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+        acknowledge_stopped_event_for_test(&state, "cancel-session").await;
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "cancel-session".into(),
+            Some(child),
+            Some(stdin),
+        ));
+
+        let stop_state = state.clone();
+        let first_stop = tokio::spawn(async move {
+            stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !cancel_path.exists() {
+            assert!(Instant::now() < deadline, "worker did not send cancel");
+            tokio::task::yield_now().await;
+        }
+        first_stop.abort();
+
+        stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_secs(2))
+            .await
+            .expect("later Stop replays worker success");
+        assert_eq!(
+            std::fs::read_to_string(cancel_path).unwrap(),
+            "{\"type\":\"cancel\"}"
+        );
+        let record = state.bridge_process.lock().await;
+        assert_eq!(
+            record
+                .as_ref()
+                .and_then(|record| record.stop_result.clone()),
+            Some(Ok(()))
         );
     }
 }

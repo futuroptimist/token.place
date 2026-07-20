@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -98,6 +100,55 @@ pub struct ComputeNodeState {
     pub lifecycle_lock: Arc<Mutex<()>>,
     pub next_session_id: Arc<Mutex<u64>>,
 }
+
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn isolate_bridge_process_tree(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_bridge_process_tree(pid: u32) {
+    unsafe {
+        let pgid = pid as i32;
+        let _ = kill(-pgid, SIGTERM);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_bridge_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_bridge_process_tree(_pid: u32) {}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -1190,6 +1241,8 @@ pub async fn start_compute_node(
         bridge_command.env(key, value);
     }
 
+    isolate_bridge_process_tree(&mut bridge_command);
+
     let spawn_result = bridge_command
         .arg("--model")
         .arg(&request.model_path)
@@ -1501,8 +1554,11 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                     stop_session_id.as_deref().unwrap_or("unknown")
                 ),
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if let Some(pid) = child.id() {
+                terminate_bridge_process_tree(pid);
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
                 stop_session_id.as_deref().unwrap_or("unknown")

@@ -2507,9 +2507,11 @@ class RelayClient:
                     submission_allowed=False,
                 )
         finally:
-            executor.shutdown(wait=future.done(), cancel_futures=True)
+            inference_done = future.done()
+            control_done = control_future is None or control_future.done()
+            executor.shutdown(wait=inference_done, cancel_futures=True)
             if control_executor is not None:
-                control_executor.shutdown(wait=control_future is None or control_future.done(), cancel_futures=True)
+                control_executor.shutdown(wait=control_done, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

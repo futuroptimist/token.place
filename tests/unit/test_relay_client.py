@@ -7174,7 +7174,7 @@ def test_api_v1_control_403_fail_closed_stops_without_ack():
     assert stopped == ['owner_proof_failed']
 
 
-def test_api_v1_terminal_cleanup_fails_closed_when_inference_does_not_quiesce():
+def test_api_v1_terminal_cleanup_unblocks_and_drains_inference_before_return():
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
     client._api_v1_registered_relays.add('https://relay.example')
@@ -7189,7 +7189,12 @@ def test_api_v1_terminal_cleanup_fails_closed_when_inference_does_not_quiesce():
 
     client._generate_api_v1_response_with_runtime_model = _hung_generate
     client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
-    client._terminate_current_llama_worker = MagicMock(return_value=True)
+
+    def terminate_worker(reason, recreate=True):
+        release.set()
+        return True
+
+    client._terminate_current_llama_worker = MagicMock(side_effect=terminate_worker)
 
     outcome = client._supervise_api_v1_inference({
         'request_id': 'req-hung',
@@ -7204,8 +7209,8 @@ def test_api_v1_terminal_cleanup_fails_closed_when_inference_does_not_quiesce():
         assert started.is_set()
         assert outcome.response_envelope is None
         assert outcome.terminal_code == 'cancelled'
-        assert outcome.runtime_healthy is False
-        assert outcome.recovery_succeeded is False
+        assert outcome.runtime_healthy is True
+        assert outcome.recovery_succeeded is True
         assert outcome.submission_allowed is False
         assert client.stop_polling is True
         client._terminate_current_llama_worker.assert_called_once_with('cancelled', recreate=True)
@@ -7262,13 +7267,13 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
 
     def control(**_kwargs):
         control_entered.set()
-        release_control.wait(2)
+        release_control.wait()
         return {'status': 'active', 'next_poll_seconds': 1}
 
     client._generate_api_v1_response_with_runtime_model = generate
     client._post_api_v1_request_control = control
     client._terminate_current_llama_worker = lambda reason, recreate=True: (
-        release_inference.set() or True
+        release_control.set() or release_inference.set() or True
     )
 
     def supervise():
@@ -7291,6 +7296,8 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         assert outcome.response_envelope is None
         assert outcome.terminal_code == 'operator_stop'
         assert outcome.submission_allowed is False
+        assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
+        assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
     finally:
         release_control.set()
         release_inference.set()

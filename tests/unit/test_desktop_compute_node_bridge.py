@@ -1163,11 +1163,9 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
 
-    stop_counter = {'count': 0}
-
     def fake_stop_requested():
-        stop_counter['count'] += 1
-        return stop_counter['count'] > 2
+        runtime = WarmingTimeoutApiV1Runtime.last_instance
+        return bool(runtime is not None and runtime._processed)
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 

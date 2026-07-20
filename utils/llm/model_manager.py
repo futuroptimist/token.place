@@ -5814,19 +5814,9 @@ class ModelManager:
             return False
 
     def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> bool:
-        close = getattr(llm, 'close', None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                self.log_warning("Failed to close old llama.cpp worker during invalidation")
-        for attr in (
-            'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
-            '_stdout_reader', '_stderr_reader', '_reader', '_queue',
-            'stdout_queue', 'stderr_queue', '_stderr_reader_thread',
-            '_stdout_reader_thread', '_reader_thread',
-        ):
-            resource = getattr(llm, attr, None)
+        process = getattr(llm, '_process', None)
+
+        def _close_or_join_resource(resource: Any) -> None:
             closer = getattr(resource, 'close', None)
             if callable(closer):
                 try:
@@ -5839,26 +5829,10 @@ class ModelManager:
                     join(timeout=0.25)
                 except Exception:
                     pass
-            if resource is not None:
-                try:
-                    setattr(llm, attr, None)
-                except Exception:
-                    pass
-        if not terminate_process:
-            return True
-        process = getattr(llm, '_process', None)
-        if process is None:
-            return True
-        for attr in ('stdin', 'stdout', 'stderr'):
-            pipe = getattr(process, attr, None)
-            closer = getattr(pipe, 'close', None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
 
         def _dead() -> bool:
+            if process is None:
+                return True
             poll = getattr(process, 'poll', None)
             if not callable(poll):
                 return False
@@ -5867,36 +5841,76 @@ class ModelManager:
             except Exception:
                 return False
 
-        if _dead():
-            return True
-        terminate = getattr(process, 'terminate', None)
-        terminate_requested = False
-        if callable(terminate):
-            try:
-                terminate()
-                terminate_requested = True
-            except Exception:
-                pass
-        wait = getattr(process, 'wait', None)
-        if callable(wait) and terminate_requested:
-            try:
-                wait(timeout=1.0)
-            except Exception:
-                pass
-        if _dead():
-            return True
-        kill = getattr(process, 'kill', None)
-        if callable(kill):
-            try:
-                kill()
-            except Exception:
-                pass
-        if callable(wait):
-            try:
-                wait(timeout=1.0)
-            except Exception:
-                pass
-        return _dead()
+        process_stopped = True
+        if terminate_process and process is not None:
+            # Terminate the subprocess before invoking proxy close so a blocking
+            # close() implementation cannot prevent the reliable process fallback.
+            for attr in ('stdin', 'stdout', 'stderr'):
+                _close_or_join_resource(getattr(process, attr, None))
+            if not _dead():
+                terminate = getattr(process, 'terminate', None)
+                if callable(terminate):
+                    try:
+                        terminate()
+                    except Exception:
+                        pass
+                wait = getattr(process, 'wait', None)
+                if callable(wait):
+                    try:
+                        wait(timeout=1.0)
+                    except Exception:
+                        pass
+            if not _dead():
+                kill = getattr(process, 'kill', None)
+                if callable(kill):
+                    try:
+                        kill()
+                    except Exception:
+                        pass
+                wait = getattr(process, 'wait', None)
+                if callable(wait):
+                    try:
+                        wait(timeout=1.0)
+                    except Exception:
+                        pass
+            process_stopped = _dead()
+
+        close = getattr(llm, 'close', None)
+        if callable(close):
+            close_done = threading.Event()
+
+            def _bounded_close() -> None:
+                try:
+                    close()
+                except Exception:
+                    self.log_warning("Failed to close old llama.cpp worker during invalidation")
+                finally:
+                    close_done.set()
+
+            close_thread = threading.Thread(
+                target=_bounded_close,
+                name='llama_proxy_close',
+                daemon=True,
+            )
+            close_thread.start()
+            close_thread.join(timeout=0.25 if terminate_process else 1.0)
+            if not close_done.is_set() and not terminate_process:
+                self.log_warning("Timed out closing old llama.cpp worker during invalidation")
+
+        for attr in (
+            'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
+            '_stdout_reader', '_stderr_reader', '_reader', '_queue',
+            'stdout_queue', 'stderr_queue', '_stderr_reader_thread',
+            '_stdout_reader_thread', '_reader_thread',
+        ):
+            resource = getattr(llm, attr, None)
+            _close_or_join_resource(resource)
+            if resource is not None:
+                try:
+                    setattr(llm, attr, None)
+                except Exception:
+                    pass
+        return bool(process_stopped)
 
     def _llm_is_usable(self, llm: Any) -> bool:
         is_alive = getattr(llm, 'is_alive', None)

@@ -4886,7 +4886,7 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     manager._close_llm_proxy(SimpleNamespace(_process=terminate_fails_process), terminate_process=True)
     terminate_fails_process.terminate.assert_called_once_with()
     terminate_fails_process.kill.assert_called_once_with()
-    terminate_fails_process.wait.assert_called_once_with(timeout=1.0)
+    assert terminate_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
     terminate_fails_process.stdin.close.assert_called_once_with()
     terminate_fails_process.stdout.close.assert_called_once_with()
     terminate_fails_process.stderr.close.assert_called_once_with()
@@ -4962,7 +4962,7 @@ def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatc
 
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
-    process.wait.assert_called_once_with(timeout=1.0)
+    assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
 
 
 
@@ -5075,7 +5075,34 @@ def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
 
     kill_fails_process.terminate.assert_called_once_with()
     kill_fails_process.kill.assert_called_once_with()
-    kill_fails_process.wait.assert_called_once_with(timeout=1.0)
+    assert kill_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    close_entered = threading.Event()
+    close_release = threading.Event()
+    poll_values = iter([None, None, 0])
+    process = SimpleNamespace(
+        poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still alive"), 0]),
+        kill=MagicMock(),
+    )
+
+    def blocking_close():
+        close_entered.set()
+        close_release.wait()
+
+    worker = SimpleNamespace(close=blocking_close, _process=process)
+    try:
+        assert manager._close_llm_proxy(worker, terminate_process=True) is True
+        assert close_entered.wait(1)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    finally:
+        close_release.set()
 
 def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
     first = _RestartableFakeWorker("first", fail="dead")

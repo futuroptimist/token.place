@@ -2626,12 +2626,12 @@ class RelayClient:
             if control_future is not None and not control_done:
                 control_future.cancel()
             if not inference_done:
-                _wait_for_future_quiescence(future, time.monotonic() + 0.5)
+                inference_done = bool(_wait_for_future_quiescence(future, time.monotonic() + 0.5))
             if control_future is not None and not control_done:
-                _wait_for_future_quiescence(control_future, time.monotonic() + min(0.5, max(0.05, self._request_timeout)))
-            executor.shutdown(wait=True, cancel_futures=True)
+                control_done = bool(_wait_for_future_quiescence(control_future, time.monotonic() + min(0.5, max(0.05, self._request_timeout))))
+            executor.shutdown(wait=inference_done, cancel_futures=True)
             if control_executor is not None:
-                control_executor.shutdown(wait=True, cancel_futures=True)
+                control_executor.shutdown(wait=control_done, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

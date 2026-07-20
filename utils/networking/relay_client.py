@@ -1327,8 +1327,9 @@ class RelayClient:
         self._unregister_attempted = False
         self._unregister_complete = False
         if clear_registration:
+            for relay_url in tuple(self._api_v1_registered_relays):
+                self._pop_api_v1_control_credential(relay_url)
             self._api_v1_registered_relays.clear()
-            self._clear_api_v1_control_credentials()
             self._api_v1_last_heartbeat_at.clear()
             getattr(self, "_api_v1_relay_wait_hints", {}).clear()
 
@@ -1402,8 +1403,15 @@ class RelayClient:
             try:
                 payload = {'server_public_key': self.crypto_manager.public_key_b64}
                 control_credential = self._api_v1_control_credential_for_relay(candidate_url)
-                if isinstance(control_credential, str) and control_credential:
-                    payload['control_credential'] = control_credential
+                if not (isinstance(control_credential, str) and control_credential):
+                    failed_relays.add(candidate_url)
+                    last_error = "missing_api_v1_control_credential"
+                    log_error(
+                        "Refusing credentialless API v1 unregister for relay {}",
+                        candidate_url,
+                    )
+                    continue
+                payload['control_credential'] = control_credential
                 request_kwargs = {
                     'json': payload,
                 }
@@ -1478,10 +1486,11 @@ class RelayClient:
 
         self._unregister_complete = True
         if len(unregistered_relays) == len(target_urls):
-            self._api_v1_registered_relays.clear()
-            self._clear_api_v1_control_credentials()
-            self._api_v1_last_heartbeat_at.clear()
-            relay_wait_hints.clear()
+            self._api_v1_registered_relays.difference_update(unregistered_relays)
+            for relay_url in unregistered_relays:
+                self._pop_api_v1_control_credential(relay_url)
+                self._api_v1_last_heartbeat_at.pop(relay_url, None)
+                relay_wait_hints.pop(relay_url, None)
         return True
 
     def ping_relay(self) -> Dict[str, Any]:
@@ -2360,12 +2369,34 @@ class RelayClient:
                         terminal_reason = 'local_deadline'
                         break
                     try:
-                        control = self._post_api_v1_request_control(
+                        control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5))
+                        control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control')
+                        control_future = control_executor.submit(
+                            self._post_api_v1_request_control,
                             relay_url=relay_url,
                             request_id=request_id,
                             acknowledge=False,
-                            timeout_seconds=max(0.001, min(self._request_timeout, remaining * 0.5)),
+                            timeout_seconds=control_timeout,
                         )
+                        try:
+                            while not control_future.done():
+                                if getattr(self, '_polling_stopped_by_request', False):
+                                    terminal_status = 'operator_stop'
+                                    terminal_reason = 'operator_stop'
+                                    break
+                                if time.monotonic() >= local_deadline:
+                                    terminal_status = 'local_deadline'
+                                    terminal_reason = 'local_deadline'
+                                    break
+                                wakeup = getattr(self, '_api_v1_control_wakeup', None)
+                                if wakeup is not None and wakeup.wait(0.05):
+                                    wakeup.clear()
+                                    continue
+                        finally:
+                            control_executor.shutdown(wait=False, cancel_futures=True)
+                        if terminal_status is not None:
+                            break
+                        control = control_future.result()
                         backoff = 1.0
                         local_deadline = self._api_v1_deadline_after_response(local_deadline, control, now=time.monotonic())
                         status = str(control.get('status') or '').lower()
@@ -2420,13 +2451,20 @@ class RelayClient:
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
-                    runtime_healthy=terminal_status in {'completed', 'unavailable', 'completed/unavailable'},
+                    runtime_healthy=bool(recovery_succeeded),
                     recovery_attempted=True,
-                    recovery_succeeded=recovery_succeeded,
+                    recovery_succeeded=bool(recovery_succeeded),
                     submission_allowed=False,
                 )
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+            if not future.done():
+                try:
+                    future.result(timeout=0.25)
+                except FutureTimeoutError:
+                    pass
+                except Exception:
+                    pass
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}
@@ -4711,6 +4749,16 @@ class RelayClient:
                         "compute_node_process_failed",
                     }:
                         runtime_healthy = True
+                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= outer_api_v1_deadline:
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code='operator_stop' if getattr(self, '_polling_stopped_by_request', False) else 'local_deadline',
+                            runtime_healthy=runtime_healthy,
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
+                        )
                     submitted = self._post_api_v1_response(
                         response_envelope,
                         client_pub_key_b64=client_pub_key_b64,

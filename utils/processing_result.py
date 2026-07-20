@@ -38,5 +38,5 @@ class RelayProcessingResult:
             runtime_healthy=runtime_healthy,
             recovery_attempted=False,
             recovery_succeeded=False,
-            submission_allowed=False,
+            submission_allowed=True,
         )

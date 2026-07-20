@@ -510,6 +510,7 @@ class TestRelayClient:
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'owner-secret'
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -519,7 +520,7 @@ class TestRelayClient:
         assert result is True
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
             timeout=relay_client._request_timeout,
         )
 
@@ -559,6 +560,7 @@ class TestRelayClient:
         client._api_v1_registered_relays.update(client._relay_urls)
         for relay_url in client._relay_urls:
             client._api_v1_last_heartbeat_at[relay_url] = 1.0
+            client._api_v1_control_credentials_by_relay[relay_url] = f'credential-{relay_url}'
         success_response = MagicMock()
         success_response.status_code = 200
         failure_response = MagicMock()
@@ -581,6 +583,7 @@ class TestRelayClient:
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'owner-secret'
         failure_response = MagicMock()
         failure_response.status_code = 503
         success_response = MagicMock()
@@ -627,6 +630,7 @@ class TestRelayClient:
         backup = 'http://backup-relay:6000'
         client._api_v1_registered_relays.update({primary, backup})
         client._api_v1_last_heartbeat_at.update({primary: 1.0, backup: 2.0})
+        client._api_v1_control_credentials_by_relay.update({primary: 'primary-secret', backup: 'backup-secret'})
         client._api_v1_relay_wait_hints = {
             primary: {'next_ping_in_x_seconds': 30},
             backup: {'next_ping_in_x_seconds': 30},
@@ -684,6 +688,7 @@ class TestRelayClient:
 
         client._api_v1_registered_relays.add(client.relay_url)
         client._api_v1_last_heartbeat_at[client.relay_url] = 1.0
+        client._api_v1_control_credentials_by_relay[client.relay_url] = 'owner-secret'
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -866,6 +871,7 @@ class TestRelayClient:
         client._api_v1_registered_relays.update(client._relay_urls)
         for relay_url in client._relay_urls:
             client._api_v1_last_heartbeat_at[relay_url] = 1.0
+            client._api_v1_control_credentials_by_relay[relay_url] = f'credential-{relay_url}'
         success_response = MagicMock()
         success_response.status_code = 200
         success_response.json.return_value = TEST_NO_REQUEST_RESPONSE
@@ -1622,13 +1628,14 @@ class TestRelayClient:
         client._relay_urls = [prefixed_url]
         client._api_v1_registered_relays.add(prefixed_url)
         client._api_v1_last_heartbeat_at[prefixed_url] = 1.0
+        client._api_v1_control_credentials_by_relay[prefixed_url] = 'owner-secret'
         mock_post.return_value = MagicMock(status_code=200)
 
         assert client.unregister_from_relay() is True
 
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
             timeout=15,
         )
 
@@ -4161,6 +4168,7 @@ def test_unregister_from_relay_falls_back_to_legacy_unregister_on_404(mock_post)
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     api_v1_missing = MagicMock(status_code=404)
     legacy_success = MagicMock(status_code=200)
     mock_post.side_effect = [api_v1_missing, legacy_success]
@@ -4182,6 +4190,7 @@ def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregist
     client._relay_urls = [prefixed_url]
     client._api_v1_registered_relays.add(prefixed_url)
     client._api_v1_last_heartbeat_at[prefixed_url] = 123.0
+    client._api_v1_control_credentials_by_relay[prefixed_url] = 'owner-secret'
     api_v1_missing = MagicMock(status_code=404)
     legacy_success = MagicMock(status_code=200)
     mock_post.side_effect = [api_v1_missing, legacy_success]
@@ -4201,6 +4210,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
     client._api_v1_relay_wait_hints = {'http://localhost:5000': {'next_ping_in_x_seconds': 30}}
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
@@ -4208,7 +4218,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
 
     mock_post.assert_called_once_with(
         'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
@@ -4223,13 +4233,14 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
     client._unregister_complete = True
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
         'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
@@ -4241,6 +4252,7 @@ def test_unregister_from_relay_logs_control_plane_429_diagnostic(mock_post, capl
     client._registration_token = 'super-secret-token'
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
 
     response = MagicMock(status_code=429)
     response.headers = {
@@ -4323,7 +4335,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     client._unregister_complete = True
 
     register_response = MagicMock(status_code=200)
-    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0, 'control_credential': 'owner-secret'}
     unregister_response = MagicMock(status_code=200)
 
     def fake_post(url, *args, **kwargs):

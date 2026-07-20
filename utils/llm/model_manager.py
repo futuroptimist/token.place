@@ -5799,7 +5799,11 @@ class ModelManager:
             except Exception:
                 self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
                 return False
-        self._close_llm_proxy(llm, terminate_process=True)
+        old_worker_stopped = self._close_llm_proxy(llm, terminate_process=True)
+        if not old_worker_stopped:
+            with self.llm_lock:
+                self.worker_state = 'failed'
+            return False
         if not recreate:
             return True
         # Eagerly validate a clean worker for the next request when possible.
@@ -5809,39 +5813,69 @@ class ModelManager:
             self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
             return False
 
-    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> None:
+    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> bool:
         close = getattr(llm, 'close', None)
         if callable(close):
             try:
                 close()
             except Exception:
                 self.log_warning("Failed to close old llama.cpp worker during invalidation")
+        for attr in (
+            'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
+            '_stdout_reader', '_stderr_reader', '_reader', '_queue',
+            'stdout_queue', 'stderr_queue',
+        ):
+            resource = getattr(llm, attr, None)
+            closer = getattr(resource, 'close', None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+            join = getattr(resource, 'join', None)
+            if callable(join):
+                try:
+                    join(timeout=0.25)
+                except Exception:
+                    pass
+            if resource is not None:
+                try:
+                    setattr(llm, attr, None)
+                except Exception:
+                    pass
         if not terminate_process:
-            return
+            return True
         process = getattr(llm, '_process', None)
         if process is None:
-            return
-        poll = getattr(process, 'poll', None)
-        try:
-            if callable(poll) and poll() is not None:
-                return
-        except Exception:
-            pass
-        terminated = False
+            return True
+
+        def _dead() -> bool:
+            poll = getattr(process, 'poll', None)
+            if not callable(poll):
+                return False
+            try:
+                return poll() is not None
+            except Exception:
+                return False
+
+        if _dead():
+            return True
         terminate = getattr(process, 'terminate', None)
+        terminate_requested = False
         if callable(terminate):
             try:
                 terminate()
-                terminated = True
-            except Exception:
-                terminated = False
-        wait = getattr(process, 'wait', None)
-        if callable(wait) and terminated:
-            try:
-                wait(timeout=1.0)
-                return
+                terminate_requested = True
             except Exception:
                 pass
+        wait = getattr(process, 'wait', None)
+        if callable(wait) and terminate_requested:
+            try:
+                wait(timeout=1.0)
+            except Exception:
+                pass
+        if _dead():
+            return True
         kill = getattr(process, 'kill', None)
         if callable(kill):
             try:
@@ -5853,6 +5887,7 @@ class ModelManager:
                 wait(timeout=1.0)
             except Exception:
                 pass
+        return _dead()
 
     def _llm_is_usable(self, llm: Any) -> bool:
         is_alive = getattr(llm, 'is_alive', None)

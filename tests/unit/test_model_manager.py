@@ -4904,8 +4904,8 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     )
     manager._close_llm_proxy(SimpleNamespace(_process=broken_poll_process), terminate_process=True)
     broken_poll_process.terminate.assert_called_once_with()
-    broken_poll_process.wait.assert_called_once_with(timeout=1.0)
-    broken_poll_process.kill.assert_not_called()
+    assert broken_poll_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    broken_poll_process.kill.assert_called_once_with()
 
 
 def test_model_manager_cancellation_without_active_worker_recreate_false_and_failure(monkeypatch):

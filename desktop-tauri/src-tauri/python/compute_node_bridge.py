@@ -2284,6 +2284,7 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        _unregister_active_relay_clients(runtimes)
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
             print(

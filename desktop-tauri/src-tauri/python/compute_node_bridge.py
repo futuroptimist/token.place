@@ -373,7 +373,7 @@ def _relay_response_summary(
     has_heartbeat = "next_ping_in_x_seconds" in relay_response
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
-    safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
+    safe_request_id = _sanitize_public_text(request_id) if isinstance(request_id, str) and request_id else "none"
     error_kind = relay_response.get("relay_error_kind")
     http_status = relay_response.get("http_status")
 
@@ -383,30 +383,30 @@ def _relay_response_summary(
         return (
             "kind=cloudflare_pre_app_rejection "
             f"status={http_status or 'unknown'} cf_ray={headers.get('cf-ray', 'none')} "
-            f"server={headers.get('server', 'none')} wait={wait_seconds} error={relay_error or 'none'}"
+            f"server={_sanitize_public_text(headers.get('server', 'none'))} wait={wait_seconds} error={_sanitize_public_text(relay_error) or 'none'}"
         )
     if error_kind == "relay_json_error":
         return (
             "kind=relay_json_error "
             f"status={http_status or 'unknown'} request_id={safe_request_id} "
-            f"wait={wait_seconds} error={relay_response.get('relay_error') or relay_error or 'none'}"
+            f"wait={wait_seconds} error={_sanitize_public_text(relay_response.get('relay_error') or relay_error) or 'none'}"
         )
     if error_kind == "http_status_no_json_body":
         return (
             "kind=http_status_no_json_body "
             f"status={http_status or 'unknown'} request_id={safe_request_id} "
-            f"wait={wait_seconds} error={relay_error or 'none'}"
+            f"wait={wait_seconds} error={_sanitize_public_text(relay_error) or 'none'}"
         )
     if isinstance(relay_error, str) and "timed out" in relay_error.lower():
         return (
             "kind=request_timeout "
-            f"request_id={safe_request_id} wait={wait_seconds} error={relay_error}"
+            f"request_id={safe_request_id} wait={wait_seconds} error={_sanitize_public_text(relay_error)}"
         )
 
     return (
         f"keys={keys} api_v1_payload={api_v1_payload} "
         f"heartbeat={has_heartbeat} request_id={safe_request_id} "
-        f"wait={wait_seconds} error={relay_error or 'none'}"
+        f"wait={wait_seconds} error={_sanitize_public_text(relay_error) or 'none'}"
     )
 
 
@@ -1333,7 +1333,7 @@ def run(args: argparse.Namespace) -> int:
         if not callable(submit_error):
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.error_response.unavailable "
-                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
                 f"code={code}",
                 file=sys.stderr,
             )
@@ -1341,7 +1341,7 @@ def run(args: argparse.Namespace) -> int:
         submitted = bool(submit_error(relay_response, code=code, message=message))
         print(
             "desktop.compute_node_bridge.api_v1_e2ee.error_response.submitted "
-            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+            f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
             f"code={code} submitted={submitted}",
             file=sys.stderr,
         )
@@ -1375,7 +1375,7 @@ def run(args: argparse.Namespace) -> int:
             print(
                 "desktop.compute_node_bridge.model_init.start "
                 f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
-                f"request_id={request_id} state={warm_load_state}",
+                f"request_id={_sanitize_public_text(request_id)} state={warm_load_state}",
                 file=sys.stderr,
             )
         if warm_load_future is None:
@@ -1397,7 +1397,7 @@ def run(args: argparse.Namespace) -> int:
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.exception "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
                     f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
                     f"exc_type={type(exc).__name__}",
                     file=sys.stderr,
@@ -1416,7 +1416,7 @@ def run(args: argparse.Namespace) -> int:
                 print(
                     "desktop.compute_node_bridge.model_init.exception "
                     f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
-                    f"request_id={request_id} state={warm_load_state} "
+                    f"request_id={_sanitize_public_text(request_id)} state={warm_load_state} "
                     f"duration_ms={warm_load_duration_ms} exc_type={type(exc).__name__}",
                     file=sys.stderr,
                 )
@@ -1432,7 +1432,7 @@ def run(args: argparse.Namespace) -> int:
             print(
                 "desktop.compute_node_bridge.model_init.failed "
                 f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
-                f"request_id={request_id} state={warm_load_state} "
+                f"request_id={_sanitize_public_text(request_id)} state={warm_load_state} "
                 f"duration_ms={warm_load_duration_ms}",
                 file=sys.stderr,
             )
@@ -1440,7 +1440,7 @@ def run(args: argparse.Namespace) -> int:
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.failed "
                     f"relay={_sanitize_relay_target(active_relay_url)} "
-                    f"request_id={request_id} state={warm_load_state}",
+                    f"request_id={_sanitize_public_text(request_id)} state={warm_load_state}",
                     file=sys.stderr,
                 )
             return False
@@ -1448,7 +1448,7 @@ def run(args: argparse.Namespace) -> int:
         print(
             "desktop.compute_node_bridge.model_init.ready "
             f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
-            f"request_id={request_id} state={warm_load_state} "
+            f"request_id={_sanitize_public_text(request_id)} state={warm_load_state} "
             f"duration_ms={warm_load_duration_ms}",
             file=sys.stderr,
         )
@@ -1456,7 +1456,7 @@ def run(args: argparse.Namespace) -> int:
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.ready "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
-                f"request_id={request_id} state={warm_load_state}",
+                f"request_id={_sanitize_public_text(request_id)} state={warm_load_state}",
                 file=sys.stderr,
             )
         print(_runtime_diagnostics_summary(compute_mode_diagnostics(runtime.model_manager)), file=sys.stderr)
@@ -1821,7 +1821,7 @@ def run(args: argparse.Namespace) -> int:
         if not coordinator:
             print(
                 "desktop.compute_node_bridge.recovery.join_existing "
-                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                 file=sys.stderr,
             )
             while True:
@@ -1855,7 +1855,7 @@ def run(args: argparse.Namespace) -> int:
             worker_status = worker_lifecycle_status()
             print(
                 "desktop.compute_node_bridge.recovery.start "
-                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
                 f"safe_error_code={worker_status.get('last_worker_error_code') or 'runtime_recovery'} "
                 f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
                 f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')} "
@@ -1867,13 +1867,13 @@ def run(args: argparse.Namespace) -> int:
                 if stop_requested():
                     print(
                         "desktop.compute_node_bridge.recovery.cancelled "
-                        f"attempt={attempt} request_id={request_id}",
+                        f"attempt={attempt} request_id={_sanitize_public_text(request_id)}",
                         file=sys.stderr,
                     )
                     return False
                 print(
                     "desktop.compute_node_bridge.recovery.attempt "
-                    f"attempt={attempt} request_id={request_id}",
+                    f"attempt={attempt} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
                 try:
@@ -1905,7 +1905,7 @@ def run(args: argparse.Namespace) -> int:
                         worker_status = worker_lifecycle_status()
                         print(
                             "desktop.compute_node_bridge.recovery.succeeded "
-                            f"attempt={attempt} request_id={request_id} "
+                            f"attempt={attempt} request_id={_sanitize_public_text(request_id)} "
                             f"safe_error_code={worker_status.get('last_worker_error_code') or 'none'} "
                             f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
                             f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')}",
@@ -1915,14 +1915,14 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     print(
                         "desktop.compute_node_bridge.recovery.attempt_exception "
-                        f"attempt={attempt} request_id={request_id} "
+                        f"attempt={attempt} request_id={_sanitize_public_text(request_id)} "
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
                 if attempt < attempts and _sleep_with_cancel(backoff_seconds):
                     print(
                         "desktop.compute_node_bridge.recovery.cancelled_during_backoff "
-                        f"attempt={attempt} request_id={request_id}",
+                        f"attempt={attempt} request_id={_sanitize_public_text(request_id)}",
                         file=sys.stderr,
                     )
                     return False
@@ -1949,7 +1949,7 @@ def run(args: argparse.Namespace) -> int:
             worker_status = worker_lifecycle_status()
             print(
                 "desktop.compute_node_bridge.recovery.exhausted "
-                f"request_id={request_id} action=restart_desktop_compute_node "
+                f"request_id={_sanitize_public_text(request_id)} action=restart_desktop_compute_node "
                 f"safe_error_code={worker_status.get('last_worker_error_code') or 'recovery_exhausted'} "
                 f"worker_generation={worker_status.get('worker_generation', 'unknown')} "
                 f"worker_restart_count={worker_status.get('worker_restart_count', 'unknown')} "
@@ -2080,22 +2080,22 @@ def run(args: argparse.Namespace) -> int:
                 f"operator_session_id={bridge_session_id} "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
                 f"key_fingerprint={_relay_key_fingerprint(relay_runtime.relay_client)} "
-                f"request_id={request_id}"
-                + (f" error={relay_error}" if relay_error else ""),
+                f"request_id={_sanitize_public_text(request_id)}"
+                + (f" error={_sanitize_public_text(relay_error)}" if relay_error else ""),
                 file=sys.stderr,
             )
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={_sanitize_public_text(request_id)} wait={wait_seconds} summary={summary}",
                 file=sys.stderr,
             )
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={_sanitize_public_text(request_id)} wait={wait_seconds} summary={summary}",
                 file=sys.stderr,
             )
 
@@ -2120,17 +2120,17 @@ def run(args: argparse.Namespace) -> int:
                 )
                 print(
                     f"desktop.compute_node_bridge.request_route runtime_path={runtime_path} "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
                 print(
                     "desktop.compute_node_bridge.process_request "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.work_received "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
                 emit_operator_event(
@@ -2176,7 +2176,7 @@ def run(args: argparse.Namespace) -> int:
                     last_error = relay_last_error
                     print(
                         "desktop.compute_node_bridge.process_request.exception "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
                         f"exc_type={type(exc).__name__}",
                         file=sys.stderr,
                     )
@@ -2217,7 +2217,7 @@ def run(args: argparse.Namespace) -> int:
                     last_error = relay_last_error
                     print(
                         "desktop.compute_node_bridge.process_request.failed "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)} "
                         f"safe_error_code={safe_error_code or 'none'} submitted={submitted} "
                         f"runtime_healthy={runtime_healthy} "
                         f"recovery_attempted={recovery_attempted} "
@@ -2228,7 +2228,7 @@ def run(args: argparse.Namespace) -> int:
                         print(
                             "desktop.compute_node_bridge.api_v1_e2ee.error_envelope_submitted "
                             f"relay={_sanitize_relay_target(active_relay_url)} "
-                            f"request_id={request_id} safe_error_code={safe_error_code or 'unknown'}",
+                            f"request_id={_sanitize_public_text(request_id)} safe_error_code={safe_error_code or 'unknown'}",
                             file=sys.stderr,
                         )
                     elif runtime_healthy:
@@ -2244,7 +2244,7 @@ def run(args: argparse.Namespace) -> int:
                         print(
                             "desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped "
                             f"relay={_sanitize_relay_target(active_relay_url)} "
-                            f"request_id={request_id} reason=shared_runtime_recovery",
+                            f"request_id={_sanitize_public_text(request_id)} reason=shared_runtime_recovery",
                             file=sys.stderr,
                         )
                     if not runtime_healthy:
@@ -2267,13 +2267,13 @@ def run(args: argparse.Namespace) -> int:
                     print(
                         "desktop.compute_node_bridge.api_v1_e2ee.response_submitted "
                         f"relay={_sanitize_relay_target(active_relay_url)} "
-                        f"request_id={request_id}",
+                        f"request_id={_sanitize_public_text(request_id)}",
                         file=sys.stderr,
                     )
                 wait_seconds = 0.0
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.work_processed_next_poll_immediate "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
             else:
@@ -2301,7 +2301,7 @@ def run(args: argparse.Namespace) -> int:
             if _sleep_with_cancel(wait_seconds):
                 print(
                     "desktop.compute_node_bridge.stop_requested "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={_sanitize_public_text(request_id)}",
                     file=sys.stderr,
                 )
                 break

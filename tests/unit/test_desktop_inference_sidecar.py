@@ -828,3 +828,37 @@ def test_packaged_windows_bundled_runtime_probe_failure_never_invokes_installer(
     assert result['runtime_origin'] == 'bundled'
     assert calls == {'pip': 0, 'source': 0}
     assert 'cuda_build' not in str(result)
+
+
+def test_control_plane_events_and_stderr_are_sanitized_but_tokens_verbatim(capsys):
+    canary = r"C:\Users\SecretName\AppData\Local\token.place\secret.txt"
+    posix = "/private/var/SecretName/runtime/site-packages"
+    token_text = f"token keeps {canary} and https://user:pass@[2001:db8::1]:8443/path?q=secret#frag"
+
+    inference_sidecar.emit({
+        'type': 'started',
+        'fallback_reason': f"failed at {canary} and {posix}",
+        'prompt': 'do not expose prompt SecretName',
+        'relay_url': 'https://user:pass@[2001:db8::1]:8443/path?q=secret#frag',
+        'pip_stderr_tail': f"pip failed from {canary}",
+    })
+    inference_sidecar.emit({'type': 'token', 'text': token_text})
+    inference_sidecar.emit_error('bad_model', f"model missing at {posix}")
+    inference_sidecar.emit_summary('runtime', model_path=canary, fallback_reason=f"reason {posix}")
+
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[0]['prompt'] == 'redacted'
+    assert events[0]['pip_stderr_tail'] == 'redacted'
+    assert events[0]['relay_url'] == 'https://[2001:db8::1]:8443'
+    assert '<path>' in events[0]['fallback_reason']
+    assert events[1] == {'type': 'token', 'text': token_text}
+    assert events[2]['message'] == 'model missing at <path>'
+    control_public = '\n'.join(captured.out.splitlines()[0:1] + captured.out.splitlines()[2:]) + captured.err
+    assert 'SecretName' in events[1]['text']
+    assert 'SecretName' not in control_public
+    assert '/private/var' not in control_public
+    assert 'user:pass' not in control_public
+    assert '?q=secret' not in control_public
+    assert 'desktop.inference.summary' in captured.err

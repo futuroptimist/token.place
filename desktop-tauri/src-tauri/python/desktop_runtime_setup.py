@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 _PACKAGED_RESOURCES_ROOT = Path(__file__).resolve().parent.parent
 if (_PACKAGED_RESOURCES_ROOT / "utils").is_dir() and str(_PACKAGED_RESOURCES_ROOT) not in sys.path:
@@ -575,6 +576,23 @@ _PUBLIC_PATH_FIELDS = {
 _PUBLIC_TEXT_FIELDS = {"fallback_reason", "detail", "error", "last_error", "message", "pip_version"}
 
 
+
+
+def _sanitize_public_relay_target(relay_url: Any) -> str:
+    if not isinstance(relay_url, str):
+        return "unknown"
+    try:
+        parsed = urlsplit(relay_url.strip())
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
+        return "unknown"
+    if not parsed.scheme or not hostname:
+        return "unknown"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
+
 def _bound_public_diagnostic_text(text: str) -> str:
     if len(text) <= PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS:
         return text
@@ -594,6 +612,10 @@ def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
         return "redacted" if value not in (None, "") else value
     if normalized_key in _PUBLIC_COMMAND_KEYS:
         return "redacted" if value else None
+    if "relay_url" in normalized_key or normalized_key.endswith("relay") or normalized_key in {"active_relay_url"}:
+        if isinstance(value, list):
+            return [_sanitize_public_relay_target(item) for item in value]
+        return _sanitize_public_relay_target(value)
     if normalized_key in _PUBLIC_PATH_FIELDS and isinstance(value, str):
         if normalized_key == "dependency_target" and (_is_exact_packaged_runtime_layout() or "python-runtime" in value.lower()):
             return "bundled"

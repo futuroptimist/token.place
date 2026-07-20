@@ -24,6 +24,8 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path
 from desktop_runtime_setup import (
+    _sanitize_public_runtime_payload,
+    _sanitize_public_runtime_text,
     desktop_gpu_runtime_failure_message,
     ensure_desktop_llama_runtime,
     maybe_reexec_for_runtime_refresh,
@@ -51,8 +53,14 @@ def _start_stdin_reader() -> None:
         _stdin_reader_started = True
 
 
+def _sanitize_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if payload.get("type") == "token":
+        return payload
+    return _sanitize_public_runtime_payload(payload)
+
+
 def emit(payload: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.write(json.dumps(_sanitize_control_payload(payload)) + "\n")
     sys.stdout.flush()
 
 
@@ -64,6 +72,7 @@ def emit_error(code: str, message: str) -> int:
 def emit_summary(label: str, **fields: Any) -> None:
     summary_payload = {"label": label}
     summary_payload.update({key: value for key, value in fields.items() if value is not None})
+    summary_payload = _sanitize_public_runtime_payload(summary_payload)
     print(
         f"desktop.inference.summary {json.dumps(summary_payload, separators=(',', ':'))}",
         file=sys.stderr,
@@ -173,15 +182,21 @@ def run(args: argparse.Namespace) -> int:
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
+    public_runtime_setup = _sanitize_public_runtime_payload(
+        {
+            "interpreter": runtime_setup.get("interpreter", sys.executable),
+            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+        }
+    )
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
-        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        f"interpreter={public_runtime_setup['interpreter']} "
+        f"llama_module_path={public_runtime_setup['llama_module_path']} "
+        f"fallback_reason={_sanitize_public_runtime_text(runtime_setup.get('fallback_reason') or 'none')}",
         file=sys.stderr,
     )
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
@@ -200,7 +215,7 @@ def run(args: argparse.Namespace) -> int:
 
     diagnostics = compute_mode_diagnostics(manager)
     model_name = Path(args.model).name
-    model_path_for_summary = args.model if verbose_subprocess_logging_enabled() else model_name
+    model_path_for_summary = model_name
     emit_summary(
         "model_init",
         model=model_name,

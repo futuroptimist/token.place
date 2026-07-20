@@ -211,6 +211,30 @@ async fn attach_spawned_bridge_process_for_session(
     }
 }
 
+async fn publish_running_if_bridge_record_still_running(
+    state: &ComputeNodeState,
+    session_id: &str,
+    status: ComputeNodeStatus,
+) -> bool {
+    // Serialize phase validation with the public Running write. Stop uses the
+    // same bridge_process -> status order when finalizing, so a Stop transition
+    // to Stopping/Completed cannot race with a late Running publication.
+    let process = state.bridge_process.lock().await;
+    let still_running = process.as_ref().is_some_and(|record| {
+        record.session_id == session_id && record.phase == BridgeProcessPhase::Running
+    });
+    if !still_running {
+        return false;
+    }
+
+    let mut current_status = state.status.lock().await;
+    if current_status.operator_session_id.as_deref() != Some(session_id) {
+        return false;
+    }
+    *current_status = status;
+    true
+}
+
 #[derive(Clone, Default)]
 pub struct ComputeNodeState {
     // Legacy slots are retained for focused tests that install synthetic child
@@ -1427,6 +1451,15 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let _lifecycle_lock = state.lifecycle_lock.lock().await;
+                {
+                    let mut process = state.bridge_process.lock().await;
+                    if process
+                        .as_ref()
+                        .is_some_and(|record| record.session_id == session_id)
+                    {
+                        *process = None;
+                    }
+                }
                 let mut status = state.status.lock().await;
                 *status = startup_failure_status(
                     &request,
@@ -1434,13 +1467,6 @@ pub async fn start_compute_node(
                     Some(session_id.clone()),
                     log_file_path.clone(),
                 );
-                let mut process = state.bridge_process.lock().await;
-                if process
-                    .as_ref()
-                    .is_some_and(|record| record.session_id == session_id)
-                {
-                    *process = None;
-                }
             }
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
@@ -1491,67 +1517,54 @@ pub async fn start_compute_node(
         }
     }
 
-    let publish_running = if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
-        let process = state.bridge_process.lock().await;
-        process.as_ref().is_some_and(|record| {
-            record.session_id == session_id && record.phase == BridgeProcessPhase::Running
-        })
-    } else {
-        false
-    };
-
-    if publish_running {
-        let mut status = state.status.lock().await;
-        if status.operator_session_id.as_deref() == Some(session_id.as_str()) {
-            *status = ComputeNodeStatus {
-                running: true,
-                registered: false,
-                active_relay_url: primary_relay_url.clone(),
-                configured_relay_urls: relay_base_urls.clone(),
-                relay_statuses: Vec::new(),
-                registered_relay_count: 0,
-                configured_relay_count: relay_base_urls.len(),
-                registered_relay_urls: Vec::new(),
-                active_relay_urls: Vec::new(),
-                requested_mode: format!("{:?}", request.mode).to_lowercase(),
-                effective_mode: "cpu".into(),
-                backend_available: "unknown".into(),
-                backend_selected: "cpu".into(),
-                backend_used: "cpu".into(),
-                fallback_reason: None,
-                model_path: request.model_path.clone(),
-                last_error: None,
-                relay_runtime_state: Some("starting".into()),
-                warm_load_state: Some("not_started".into()),
-                warm_load_enabled: Some(true),
-                warm_load_duration_ms: None,
-                context_tier: Some(normalize_context_tier(&request.context_tier)),
-                context_window_tokens: context_profile(&normalize_context_tier(
-                    &request.context_tier,
-                ))
+    if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
+        let running_status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            active_relay_url: primary_relay_url.clone(),
+            configured_relay_urls: relay_base_urls.clone(),
+            relay_statuses: Vec::new(),
+            registered_relay_count: 0,
+            configured_relay_count: relay_base_urls.len(),
+            registered_relay_urls: Vec::new(),
+            active_relay_urls: Vec::new(),
+            requested_mode: format!("{:?}", request.mode).to_lowercase(),
+            effective_mode: "cpu".into(),
+            backend_available: "unknown".into(),
+            backend_selected: "cpu".into(),
+            backend_used: "cpu".into(),
+            fallback_reason: None,
+            model_path: request.model_path.clone(),
+            last_error: None,
+            relay_runtime_state: Some("starting".into()),
+            warm_load_state: Some("not_started".into()),
+            warm_load_enabled: Some(true),
+            warm_load_duration_ms: None,
+            context_tier: Some(normalize_context_tier(&request.context_tier)),
+            context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
                 .map(|profile| profile.total_context_tokens),
-                runtime_path: Some("bridge".into()),
-                relay_runtime_path: Some("bridge".into()),
-                worker_state: Some("starting".into()),
-                worker_generation: None,
-                worker_restart_count: None,
-                worker_alive: Some(false),
-                last_worker_error_code: None,
-                last_worker_exit_code: None,
-                last_worker_restart_at_ms: None,
-                stop_cleanup_required: None,
-                stop_cleanup_attempted: None,
-                stop_cleanup_outcome: None,
-                stop_cleanup_success_count: None,
-                stop_cleanup_failure_count: None,
-                stop_cleanup_warning: None,
-                operator_session_id: Some(session_id.clone()),
-                sequence: Some(0),
-                updated_at_ms: Some(current_time_ms()),
-                log_file_path: log_file_path.clone(),
-                readiness_diagnostics: Map::new(),
-            };
-        }
+            runtime_path: Some("bridge".into()),
+            relay_runtime_path: Some("bridge".into()),
+            worker_state: Some("starting".into()),
+            worker_generation: None,
+            worker_restart_count: None,
+            worker_alive: Some(false),
+            last_worker_error_code: None,
+            last_worker_exit_code: None,
+            last_worker_restart_at_ms: None,
+            stop_cleanup_required: None,
+            stop_cleanup_attempted: None,
+            stop_cleanup_outcome: None,
+            stop_cleanup_success_count: None,
+            stop_cleanup_failure_count: None,
+            stop_cleanup_warning: None,
+            operator_session_id: Some(session_id.clone()),
+            sequence: Some(0),
+            updated_at_ms: Some(current_time_ms()),
+            log_file_path: log_file_path.clone(),
+            readiness_diagnostics: Map::new(),
+        };
+        publish_running_if_bridge_record_still_running(&state, &session_id, running_status).await;
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -3121,7 +3134,7 @@ mod tests {
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "IFS= read -r line; printf '%s\n' \"$line\" >> \"$1\"; printf '%s\n' '{\"type\":\"stopped\",\"operator_session_id\":\"stopping-attach-session\",\"cleanup_required\":true,\"cleanup_attempted\":true,\"cleanup_outcome\":\"complete\",\"cleanup_success_count\":1,\"cleanup_failure_count\":0}'; exit 0",
+                "IFS= read -r line; printf '%s\n' \"$line\" >> \"$1\"; printf '%s\n' '{\"type\":\"stopped\",\"operator_session_id\":\"stopping-attach-session\",\"unregister_required\":true,\"unregister_attempted\":true,\"unregister_outcome\":\"complete\",\"unregister_success_count\":1,\"unregister_failure_count\":0}'; exit 0",
                 "sh",
                 cancel_path.to_str().expect("cancel path utf8"),
             ])
@@ -3173,6 +3186,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn starting_running_publication_allows_stop_after_validated_publication() {
+        let state = ComputeNodeState::default();
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "publish-first-session".into(),
+            None,
+            None,
+        ));
+        {
+            let mut process = state.bridge_process.lock().await;
+            process.as_mut().expect("process record").phase = BridgeProcessPhase::Running;
+        }
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("publish-first-session".into());
+        }
+
+        let published = publish_running_if_bridge_record_still_running(
+            &state,
+            "publish-first-session",
+            ComputeNodeStatus {
+                running: true,
+                operator_session_id: Some("publish-first-session".into()),
+                ..ComputeNodeStatus::default()
+            },
+        )
+        .await;
+        assert!(
+            published,
+            "Running should publish while phase is still Running"
+        );
+
+        {
+            let mut process = state.bridge_process.lock().await;
+            let record = process.as_mut().expect("process record");
+            record.phase = BridgeProcessPhase::Stopping;
+        }
+        {
+            let mut status = state.status.lock().await;
+            status.stop_cleanup_required = Some(false);
+            status.stop_cleanup_attempted = Some(false);
+            status.stop_cleanup_outcome = Some("not_required".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+
+        finalize_stop_status(
+            &state,
+            Some("publish-first-session"),
+            true,
+            false,
+            Some(success_exit_status()),
+            true,
+        )
+        .await
+        .expect("stop finalization after Running publication");
+        let status = state.status.lock().await.clone();
+        assert!(!status.running);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("stopped"));
+        assert!(status.last_error.is_none());
+    }
+
+    #[tokio::test]
     async fn starting_running_publication_rechecks_phase_after_stop_latch() {
         let state = ComputeNodeState::default();
         *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
@@ -3203,15 +3278,18 @@ mod tests {
             assert_eq!(record.phase, BridgeProcessPhase::Running);
             record.phase = BridgeProcessPhase::Stopping;
         }
-        let publish_running = {
-            let process = state.bridge_process.lock().await;
-            process.as_ref().is_some_and(|record| {
-                record.session_id == "publish-race-session"
-                    && record.phase == BridgeProcessPhase::Running
-            })
-        };
+        let published = publish_running_if_bridge_record_still_running(
+            &state,
+            "publish-race-session",
+            ComputeNodeStatus {
+                running: true,
+                operator_session_id: Some("publish-race-session".into()),
+                ..ComputeNodeStatus::default()
+            },
+        )
+        .await;
         assert!(
-            !publish_running,
+            !published,
             "late Running publication must be skipped after Stop latches"
         );
         let status = state.status.lock().await.clone();

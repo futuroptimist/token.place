@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import platform
 import shutil
 import subprocess
 import sys
@@ -50,15 +51,75 @@ def validate_config_versions(expected: str) -> None:
         raise ValidationError(f'Windows release version mismatch: {mismatches}; expected {expected}')
 
 
-def _run_extract(artifact: Path, dest: Path) -> None:
-    seven_zip = shutil.which('7z') or shutil.which('7za') or shutil.which('7zz')
+def _sanitize_process_output(text: str, artifact: Path, dest: Path) -> str:
+    sanitized = (text or '')[-4000:]
+    for raw, replacement in (
+        (str(artifact.resolve()), artifact.name),
+        (str(dest.resolve()), dest.name),
+        (str(artifact), artifact.name),
+        (str(dest), dest.name),
+    ):
+        sanitized = sanitized.replace(raw, replacement)
+    return sanitized[-1200:]
+
+
+def _run_native_materializer(cmd: list[str], artifact: Path, dest: Path, *, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = _sanitize_process_output(exc.stdout or '', artifact, dest)
+        raise ValidationError(f'native materialization timed out for {artifact.name}: {output}') from exc
+    except subprocess.CalledProcessError as exc:
+        output = _sanitize_process_output(exc.stdout or '', artifact, dest)
+        raise ValidationError(f'native materialization failed for {artifact.name}: exit={exc.returncode}: {output}') from exc
+
+
+def _cleanup_nsis_install(root: Path) -> None:
+    uninstallers = sorted(
+        p for p in root.rglob('*.exe')
+        if p.is_file() and p.name.lower().startswith(('unins', 'uninstall'))
+    )
+    if not uninstallers:
+        return
+    artifact = uninstallers[0]
+    try:
+        _run_native_materializer([str(artifact.resolve()), '/S'], artifact, root, timeout=120)
+    except ValidationError as exc:
+        raise ValidationError(f'failed to clean NSIS install for {root.name}: {exc}') from exc
+
+
+def _run_extract(artifact: Path, dest: Path):
     if artifact.is_dir():
+        # Directory inputs are explicitly pre-materialized fixture/inspection trees,
+        # not real MSI/NSIS installers.
         shutil.copytree(artifact, dest, dirs_exist_ok=True)
-        return
-    if seven_zip:
-        subprocess.run([seven_zip, 'x', '-y', f'-o{dest}', str(artifact)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return
-    raise ValidationError(f'cannot extract {artifact.name}: 7z/7za/7zz not available')
+        return lambda: None
+    if platform.system() != 'Windows':
+        raise ValidationError(f'native Windows installer materialization is unavailable for {artifact.name}')
+    artifact_abs = artifact.resolve()
+    dest_abs = dest.resolve()
+    suffix = artifact.suffix.lower()
+    if suffix == '.msi':
+        _run_native_materializer([
+            'msiexec.exe',
+            '/a',
+            str(artifact_abs),
+            '/qn',
+            '/norestart',
+            f'TARGETDIR={dest_abs}',
+        ], artifact, dest)
+        return lambda: None
+    if suffix == '.exe':
+        _run_native_materializer([str(artifact_abs), '/S', f'/D={dest_abs}'], artifact, dest)
+        return lambda: _cleanup_nsis_install(dest_abs)
+    raise ValidationError(f'unsupported Windows installer artifact type for {artifact.name}')
 
 
 def _find_runtime(root: Path) -> Path:
@@ -123,9 +184,12 @@ def validate_artifact(artifact: Path, expected: str, kind: str, manifest: dict) 
     with tempfile.TemporaryDirectory(prefix=f'token-place-{kind}-') as td:
         dest = Path(td) / 'extract'
         dest.mkdir()
-        _run_extract(artifact, dest)
-        runtime = _find_runtime(dest)
-        _validate_runtime_tree(runtime, manifest)
+        cleanup = _run_extract(artifact, dest)
+        try:
+            runtime = _find_runtime(dest)
+            _validate_runtime_tree(runtime, manifest)
+        finally:
+            cleanup()
 
 
 def main(argv: list[str] | None = None) -> int:

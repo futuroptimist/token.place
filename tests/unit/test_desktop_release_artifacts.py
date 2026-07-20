@@ -2629,16 +2629,101 @@ def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkey
 
     artifact = tmp_path / 'installer.exe'
     artifact.write_bytes(b'fake')
-    monkeypatch.setattr(validator.shutil, 'which', lambda _name: None)
-    with pytest.raises(validator.ValidationError, match='7z/7za/7zz not available'):
-        validator._run_extract(artifact, tmp_path / 'no-7z')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    with pytest.raises(validator.ValidationError, match='native Windows installer materialization is unavailable'):
+        validator._run_extract(artifact, tmp_path / 'no-native')
 
     calls = []
-    monkeypatch.setattr(validator.shutil, 'which', lambda _name: '/usr/bin/7z')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
     monkeypatch.setattr(validator.subprocess, 'run', lambda cmd, **kwargs: calls.append((cmd, kwargs)))
-    validator._run_extract(artifact, tmp_path / 'with-7z')
-    assert calls and calls[0][0][:3] == ['/usr/bin/7z', 'x', '-y']
+    cleanup = validator._run_extract(artifact, tmp_path / 'nsis-install-root')
+    assert calls[0][0][1] == '/S'
+    assert calls[0][0][-1].startswith('/D=')
+    assert Path(calls[0][0][-1][3:]).is_absolute()
+    cleanup()
 
+    calls.clear()
+    msi_artifact = tmp_path / 'installer.msi'
+    msi_artifact.write_bytes(b'fake')
+    validator._run_extract(msi_artifact, tmp_path / 'msi-root')
+    assert calls[0][0][0:2] == ['msiexec.exe', '/a']
+    assert '/qn' in calls[0][0]
+    assert '/norestart' in calls[0][0]
+    targetdir = next(arg for arg in calls[0][0] if arg.startswith('TARGETDIR='))
+    assert Path(targetdir.split('=', 1)[1]).is_absolute()
+
+
+def test_windows_validator_native_materialization_contracts_and_cleanup(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return type('Completed', (), {'stdout': ''})()
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
+    nsis = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    msi.write_bytes(b'msi')
+    nsis.write_bytes(b'nsis')
+
+    msi_cleanup = validator._run_extract(msi, tmp_path / 'first-root')
+    nsis_cleanup = validator._run_extract(nsis, tmp_path / 'second-root')
+    assert calls[0][0][:3] == ['msiexec.exe', '/a', str(msi.resolve())]
+    assert calls[0][0][3:5] == ['/qn', '/norestart']
+    assert calls[0][0][-1].startswith('TARGETDIR=')
+    assert Path(calls[0][0][-1].split('=', 1)[1]).is_absolute()
+    assert calls[1][0] == [str(nsis.resolve()), '/S', f'/D={(tmp_path / "second-root").resolve()}']
+    assert calls[1][0][-1].startswith('/D=')
+    assert calls[1][0][-1] == f'/D={(tmp_path / "second-root").resolve()}'
+    msi_cleanup()
+    nsis_cleanup()
+    assert len(calls) == 2
+
+    (tmp_path / 'second-root').mkdir(exist_ok=True)
+    (tmp_path / 'second-root' / 'uninstall.exe').write_bytes(b'uninstall')
+    nsis_cleanup()
+    assert calls[-1][0] == [str((tmp_path / 'second-root' / 'uninstall.exe').resolve()), '/S']
+
+
+def test_windows_validator_native_materialization_failures_are_fail_closed(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    artifact = tmp_path / 'secret-user-path-installer.exe'
+    artifact.write_bytes(b'nsis')
+
+    def timeout_run(cmd, **kwargs):
+        raise validator.subprocess.TimeoutExpired(cmd, kwargs.get('timeout', 1), output=f'raw {artifact.resolve()} {(tmp_path / "dest").resolve()}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', timeout_run)
+    with pytest.raises(validator.ValidationError) as excinfo:
+        validator._run_extract(artifact, tmp_path / 'dest')
+    message = str(excinfo.value)
+    assert 'timed out' in message
+    assert str(tmp_path) not in message
+    assert artifact.name in message
+
+    def nonzero_run(cmd, **kwargs):
+        raise validator.subprocess.CalledProcessError(7, cmd, output=f'failed {artifact.resolve()}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', nonzero_run)
+    with pytest.raises(validator.ValidationError, match='exit=7'):
+        validator._run_extract(artifact, tmp_path / 'dest2')
+
+
+def test_windows_validator_generic_archive_shape_without_runtime_cannot_pass(tmp_path):
+    validator = _load_windows_release_validator()
+    extracted_listing = tmp_path / 'token.place-desktop-0.1.2-seven-zip-listing'
+    extracted_listing.mkdir()
+    (extracted_listing / '$PLUGINSDIR').mkdir()
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator.validate_artifact(
+            extracted_listing,
+            '0.1.2',
+            'NSIS',
+            json.loads(validator.MANIFEST.read_text(encoding='utf-8')),
+        )
 
 def test_windows_validator_runtime_and_provenance_fail_closed_edges(tmp_path):
     validator = _load_windows_release_validator()

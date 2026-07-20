@@ -96,10 +96,64 @@ fn default_request_context_tier() -> String {
     DEFAULT_CONTEXT_TIER.to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeProcessPhase {
+    Starting,
+    Running,
+    Stopping,
+    Completed,
+}
+
+struct BridgeProcessRecord {
+    session_id: String,
+    phase: BridgeProcessPhase,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stop_deadline: Option<Instant>,
+    cancel_sent: bool,
+    killed: bool,
+    exit_status: Option<std::process::ExitStatus>,
+    stop_result: Option<Result<(), String>>,
+    notify: Arc<Notify>,
+}
+
+impl BridgeProcessRecord {
+    fn new(session_id: String, child: Option<Child>, stdin: Option<ChildStdin>) -> Self {
+        Self {
+            session_id,
+            phase: if child.is_some() {
+                BridgeProcessPhase::Running
+            } else {
+                BridgeProcessPhase::Starting
+            },
+            child,
+            stdin,
+            stop_deadline: None,
+            cancel_sent: false,
+            killed: false,
+            exit_status: None,
+            stop_result: None,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(
+            self.phase,
+            BridgeProcessPhase::Starting
+                | BridgeProcessPhase::Running
+                | BridgeProcessPhase::Stopping
+        ) || (self.child.is_some() && self.stop_result.is_none())
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ComputeNodeState {
+    // Legacy slots are retained for focused tests that install synthetic child
+    // handles directly. Production bridge ownership lives in bridge_process.
     pub child: Arc<Mutex<Option<Child>>>,
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
+    bridge_process: Arc<Mutex<Option<BridgeProcessRecord>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
     pub next_session_id: Arc<Mutex<u64>>,
@@ -1090,6 +1144,11 @@ pub async fn start_compute_node(
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
+        let mut process = state.bridge_process.lock().await;
+        if process.as_ref().is_some_and(BridgeProcessRecord::is_active) {
+            anyhow::bail!("compute node already running; stop it before starting a new session");
+        }
+        *process = None;
         let mut child_slot = state.child.lock().await;
         if child_slot
             .as_mut()
@@ -1314,6 +1373,7 @@ pub async fn start_compute_node(
                 );
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
+                *state.bridge_process.lock().await = None;
             }
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
@@ -1348,9 +1408,15 @@ pub async fn start_compute_node(
                 session_id,
                 sanitize_relay_target(&primary_relay_url)
             );
-            *child_slot = pending_child.take();
+            *child_slot = None;
             let mut stdin_slot = state.stdin.lock().await;
-            *stdin_slot = pending_stdin.take();
+            *stdin_slot = None;
+            let mut process = state.bridge_process.lock().await;
+            *process = Some(BridgeProcessRecord::new(
+                session_id.clone(),
+                pending_child.take(),
+                pending_stdin.take(),
+            ));
             let mut status = state.status.lock().await;
             *status = ComputeNodeStatus {
                 running: true,
@@ -1425,8 +1491,6 @@ pub async fn start_compute_node(
     });
 
     let mut lines = BufReader::new(stdout).lines();
-    let mut saw_error_event = false;
-    let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         let parsed_for_log = serde_json::from_str::<Value>(&line).ok();
         append_operator_log_line(
@@ -1442,14 +1506,6 @@ pub async fn start_compute_node(
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 let payload = with_log_file_path(payload, log_file_path.as_deref());
-                if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
-                    if event_type == "error" {
-                        saw_error_event = true;
-                    }
-                    if event_type == "started" || event_type == "status" {
-                        saw_startup_event = true;
-                    }
-                }
                 if !apply_compute_node_event_to_state(&state, &payload).await {
                     continue;
                 }
@@ -1468,51 +1524,21 @@ pub async fn start_compute_node(
         eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
     }
 
-    let running_child = {
-        let _lifecycle_lock = state.lifecycle_lock.lock().await;
+    {
         let current_session = state.status.lock().await.operator_session_id.clone();
         if current_session.as_deref() == Some(session_id.as_str()) {
-            let mut child_slot = state.child.lock().await;
-            child_slot.take()
-        } else {
-            None
-        }
-    };
-
-    if let Some(mut running_child) = running_child {
-        let exit_status = running_child.wait().await?;
-        let exit_payload = {
-            let mut status = state.status.lock().await;
-            finalize_bridge_exit(
-                &mut status,
-                exit_status,
-                saw_startup_event,
-                saw_error_event,
-                &session_id,
-                log_file_path.as_deref(),
-            )
-        };
-
-        append_operator_log_line(
-            &log_sink,
-            "desktop.compute_node.bridge_process_exited",
-            &format!(
-                "operator_session_id={} status={}",
-                session_id,
-                bridge_exit_status_label(exit_status)
-            ),
-        );
-
-        if let Some(payload) = exit_payload {
-            app.emit("compute_node_event", payload)?;
-        }
-    } else {
-        let mut status = state.status.lock().await;
-        if status.operator_session_id.as_deref() == Some(session_id.as_str()) {
-            status.running = false;
-            status.registered = false;
+            let mut process = state.bridge_process.lock().await;
+            if let Some(record) = process
+                .as_mut()
+                .filter(|record| record.session_id == session_id)
+            {
+                if record.phase != BridgeProcessPhase::Stopping {
+                    record.phase = BridgeProcessPhase::Completed;
+                }
+            }
         }
     }
+
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let current_session = state.status.lock().await.operator_session_id.clone();
@@ -1597,50 +1623,77 @@ async fn stop_compute_node_with_shutdown_timeout(
             status.log_file_path.clone(),
         )
     };
+    let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown");
     eprintln!(
         "desktop.compute_node.stop_requested operator_session_id={}",
-        stop_session_id.as_deref().unwrap_or("unknown")
+        stop_session_display
     );
     append_operator_log_path_line(
         stop_log_file_path.as_deref(),
         "desktop.compute_node.stop_requested",
-        &format!(
-            "operator_session_id={}",
-            stop_session_id.as_deref().unwrap_or("unknown")
-        ),
+        &format!("operator_session_id={}", stop_session_display),
     );
+
     let parent_shutdown_deadline = Instant::now() + shutdown_timeout;
-
-    let mut stdin_handle = {
-        let mut stdin_lock = state.stdin.lock().await;
-        stdin_lock.take()
-    };
-    if let Some(stdin) = stdin_handle.as_mut() {
-        eprintln!(
-            "desktop.compute_node.cancel_requested operator_session_id={}",
-            stop_session_id.as_deref().unwrap_or("unknown")
-        );
-        append_operator_log_path_line(
-            stop_log_file_path.as_deref(),
-            "desktop.compute_node.cancel_requested",
-            &format!(
-                "operator_session_id={}",
-                stop_session_id.as_deref().unwrap_or("unknown")
-            ),
-        );
-        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
-        let _ = stdin.flush().await;
-    }
-
+    let process_notify;
+    let mut stdin_handle = None;
+    let mut owned_child = None;
+    let first_stopper;
     let child_handoff_deadline = std::cmp::min(
         parent_shutdown_deadline,
         Instant::now() + Duration::from_millis(500),
     );
-    let mut owned_child = None;
-    while Instant::now() < child_handoff_deadline {
-        if let Some(child) = state.child.lock().await.take() {
-            owned_child = Some(child);
+
+    loop {
+        let mut process = state.bridge_process.lock().await;
+        if process.as_ref().is_none_or(|record| !record.is_active()) {
+            let legacy_child = state.child.lock().await.take();
+            let legacy_stdin = state.stdin.lock().await.take();
+            if legacy_child.is_some() || legacy_stdin.is_some() {
+                *process = Some(BridgeProcessRecord::new(
+                    stop_session_id.clone().unwrap_or_default(),
+                    legacy_child,
+                    legacy_stdin,
+                ));
+            }
+        }
+
+        if let Some(record) = process.as_mut() {
+            if stop_session_id.as_deref().is_some_and(|session| {
+                !record.session_id.is_empty() && record.session_id != session
+            }) {
+                anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+            }
+            if let Some(result) = record.stop_result.clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            process_notify = record.notify.clone();
+            if record.phase == BridgeProcessPhase::Stopping {
+                first_stopper = false;
+            } else {
+                first_stopper = true;
+                record.phase = BridgeProcessPhase::Stopping;
+                record.stop_deadline.get_or_insert(parent_shutdown_deadline);
+                if !record.cancel_sent {
+                    stdin_handle = record.stdin.take();
+                    record.cancel_sent = true;
+                }
+                owned_child = record.child.take();
+            }
             break;
+        }
+
+        drop(process);
+        if Instant::now() >= child_handoff_deadline {
+            return finalize_stop_status(
+                &state,
+                stop_session_id.as_deref(),
+                false,
+                false,
+                None,
+                true,
+            )
+            .await;
         }
         tokio::time::sleep(std::cmp::min(
             Duration::from_millis(25),
@@ -1649,8 +1702,46 @@ async fn stop_compute_node_with_shutdown_timeout(
         .await;
     }
 
-    let mut bridge_killed = false;
+    if !first_stopper {
+        loop {
+            let notified = process_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = state
+                .bridge_process
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|record| record.stop_result.clone())
+            {
+                return result.map_err(anyhow::Error::msg);
+            }
+            if Instant::now() >= parent_shutdown_deadline {
+                anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(parent_shutdown_deadline)) => {},
+            }
+        }
+    }
+
+    if let Some(stdin) = stdin_handle.as_mut() {
+        eprintln!(
+            "desktop.compute_node.cancel_requested operator_session_id={}",
+            stop_session_display
+        );
+        append_operator_log_path_line(
+            stop_log_file_path.as_deref(),
+            "desktop.compute_node.cancel_requested",
+            &format!("operator_session_id={}", stop_session_display),
+        );
+        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+        let _ = stdin.flush().await;
+    }
+
     let had_child = owned_child.is_some();
+    let mut bridge_killed = false;
     let mut child_exit_status = None;
     if let Some(mut child) = owned_child {
         child_exit_status = child.try_wait()?;
@@ -1662,34 +1753,27 @@ async fn stop_compute_node_with_shutdown_timeout(
             .await;
             child_exit_status = child.try_wait()?;
         }
-
         if child_exit_status.is_none() {
             bridge_killed = true;
             eprintln!(
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
-                stop_session_id.as_deref().unwrap_or("unknown")
+                stop_session_display
             );
             append_operator_log_path_line(
                 stop_log_file_path.as_deref(),
                 "desktop.compute_node.bridge_kill_requested",
-                &format!(
-                    "operator_session_id={}",
-                    stop_session_id.as_deref().unwrap_or("unknown")
-                ),
+                &format!("operator_session_id={}", stop_session_display),
             );
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            child_exit_status = child.wait().await.ok();
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
-                stop_session_id.as_deref().unwrap_or("unknown")
+                stop_session_display
             );
             append_operator_log_path_line(
                 stop_log_file_path.as_deref(),
                 "desktop.compute_node.bridge_process_exited",
-                &format!(
-                    "operator_session_id={} killed=true",
-                    stop_session_id.as_deref().unwrap_or("unknown")
-                ),
+                &format!("operator_session_id={} killed=true", stop_session_display),
             );
         } else {
             let status_text = child_exit_status
@@ -1698,16 +1782,14 @@ async fn stop_compute_node_with_shutdown_timeout(
                 .unwrap_or_else(|| "unknown".into());
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false exit_status={}",
-                stop_session_id.as_deref().unwrap_or("unknown"),
-                status_text
+                stop_session_display, status_text
             );
             append_operator_log_path_line(
                 stop_log_file_path.as_deref(),
                 "desktop.compute_node.bridge_process_exited",
                 &format!(
                     "operator_session_id={} killed=false exit_status={}",
-                    stop_session_id.as_deref().unwrap_or("unknown"),
-                    status_text
+                    stop_session_display, status_text
                 ),
             );
         }
@@ -1722,6 +1804,41 @@ async fn stop_compute_node_with_shutdown_timeout(
         }
     }
 
+    let result = finalize_stop_status(
+        &state,
+        stop_session_id.as_deref(),
+        had_child,
+        bridge_killed,
+        child_exit_status,
+        cleanup_acknowledged,
+    )
+    .await;
+
+    let cached = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
+    let notify = {
+        let mut process = state.bridge_process.lock().await;
+        process.as_mut().map(|record| {
+            record.phase = BridgeProcessPhase::Completed;
+            record.killed = bridge_killed;
+            record.exit_status = child_exit_status;
+            record.stop_result = Some(cached.clone());
+            record.notify.clone()
+        })
+    };
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+    result
+}
+
+async fn finalize_stop_status(
+    state: &ComputeNodeState,
+    stop_session_id: Option<&str>,
+    had_child: bool,
+    bridge_killed: bool,
+    child_exit_status: Option<std::process::ExitStatus>,
+    cleanup_acknowledged: bool,
+) -> anyhow::Result<()> {
     let stop_outcome_error = {
         let status = state.status.lock().await.clone();
         let child_exit_failed = had_child
@@ -1730,13 +1847,7 @@ async fn stop_compute_node_with_shutdown_timeout(
                 .as_ref()
                 .map(|exit_status| !exit_status.success())
                 .unwrap_or(true);
-        // Every production child is owned by an operator session. A child-backed
-        // stop without a matching session is intentionally malformed and fails
-        // closed so stale/missing cleanup acknowledgments cannot be accepted.
-        let session_matches = match (
-            stop_session_id.as_deref(),
-            status.operator_session_id.as_deref(),
-        ) {
+        let session_matches = match (stop_session_id, status.operator_session_id.as_deref()) {
             (Some(expected), Some(actual)) => expected == actual,
             _ => !had_child,
         };
@@ -1756,11 +1867,7 @@ async fn stop_compute_node_with_shutdown_timeout(
             (Some("not_required"), Some(false), Some(false), Some(0), Some(0)) => true,
             _ => false,
         };
-        if bridge_killed {
-            Some(warning)
-        } else if child_exit_failed {
-            Some(warning)
-        } else if !session_matches {
+        if bridge_killed || child_exit_failed || !session_matches {
             Some(warning)
         } else if had_child && (!cleanup_acknowledged || !coherent_success) {
             Some(warning)
@@ -1771,10 +1878,7 @@ async fn stop_compute_node_with_shutdown_timeout(
 
     {
         let mut status = state.status.lock().await;
-        let session_still_current = match (
-            stop_session_id.as_deref(),
-            status.operator_session_id.as_deref(),
-        ) {
+        let session_still_current = match (stop_session_id, status.operator_session_id.as_deref()) {
             (Some(expected), Some(actual)) => expected == actual,
             (None, None) => true,
             _ => !had_child,
@@ -2631,6 +2735,87 @@ mod tests {
         let final_status = state.status.lock().await.clone();
         assert!(!final_status.running);
         assert!(!final_status.registered);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn concurrent_stop_replays_single_bridge_process_result() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "count=0; while IFS= read -r line; do count=$((count+1)); printf '%s\\n' \"$line\" >> '{}'; break; done; exit 0",
+                observed_cancel_path.display()
+            ))
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let child_stdin = child.stdin.take().expect("child stdin");
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "concurrent-stop-session".into(),
+            Some(child),
+            Some(child_stdin),
+        ));
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("concurrent-stop-session".into());
+            status.stop_cleanup_required = Some(false);
+            status.stop_cleanup_attempted = Some(false);
+            status.stop_cleanup_outcome = Some("not_required".into());
+            status.stop_cleanup_success_count = Some(0);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+        acknowledge_stopped_event_for_test(&state, "concurrent-stop-session").await;
+
+        let (first, second) = tokio::join!(
+            stop_compute_node(state.clone()),
+            stop_compute_node(state.clone())
+        );
+        first.expect("first stop");
+        second.expect("second stop replays result");
+
+        let observed = std::fs::read_to_string(observed_cancel_path).expect("cancel command");
+        assert_eq!(observed.matches("cancel").count(), 1);
+        assert!(state
+            .bridge_process
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|record| record.stop_result.as_ref())
+            .is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn bridge_process_stdout_eof_before_stop_still_requires_cleanup_ack() {
+        let state = ComputeNodeState::default();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "bridge-process-eof-session".into(),
+            Some(child),
+            None,
+        ));
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("bridge-process-eof-session".into());
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+        acknowledge_stopped_event_for_test(&state, "bridge-process-eof-session").await;
+
+        stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_secs(2))
+            .await
+            .expect("stop validates persisted exit and ack");
     }
 
     #[cfg(not(windows))]

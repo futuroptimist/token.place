@@ -21,10 +21,14 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +41,8 @@ pub struct ComputeNodeRequest {
     #[serde(default = "default_request_context_tier")]
     pub context_tier: String,
 }
+
+const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -205,10 +211,28 @@ struct StopSessionSnapshot {
     log_file_path: Option<String>,
 }
 
+#[cfg(test)]
+static SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK: OnceLock<
+    std::sync::Mutex<Option<oneshot::Sender<()>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn install_snapshot_stop_session_process_lock_attempt_hook(sender: oneshot::Sender<()>) {
+    let hook =
+        SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *hook.lock().expect("snapshot hook mutex") = Some(sender);
+}
+
 async fn snapshot_stop_session(state: &ComputeNodeState) -> StopSessionSnapshot {
     // Stop snapshots process ownership using the same reservation order as
     // Start: bridge_process -> status. This blocks on an in-progress Starting
     // reservation publication without ever waiting on lifecycle_lock.
+    #[cfg(test)]
+    if let Some(hook) = SNAPSHOT_STOP_SESSION_PROCESS_LOCK_ATTEMPT_HOOK.get() {
+        if let Some(sender) = hook.lock().expect("snapshot hook mutex").take() {
+            let _ = sender.send(());
+        }
+    }
     let process = state.bridge_process.lock().await;
     let status = state.status.lock().await;
     if let Some(record_session) = process
@@ -674,6 +698,73 @@ async fn complete_no_child_startup_failure(
     if let Some(notify) = notify {
         notify.notify_waiters();
     }
+}
+
+async fn complete_spawned_bridge_startup_failure(
+    state: &ComputeNodeState,
+    session_id: &str,
+    mut child: Child,
+    mut stdin: Option<ChildStdin>,
+    deadline: Instant,
+    failure: String,
+) -> anyhow::Result<()> {
+    let warning = "Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.".to_string();
+    if let Some(stdin) = stdin.as_mut() {
+        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+        let _ = stdin.flush().await;
+    }
+    drop(stdin.take());
+
+    let mut exit_status = child.try_wait().ok().flatten();
+    while exit_status.is_none() && Instant::now() < deadline {
+        tokio::time::sleep(std::cmp::min(
+            Duration::from_millis(25),
+            deadline.saturating_duration_since(Instant::now()),
+        ))
+        .await;
+        exit_status = child.try_wait().ok().flatten();
+    }
+    let mut killed = false;
+    if exit_status.is_none() {
+        killed = true;
+        let _ = child.kill().await;
+        exit_status = child.wait().await.ok();
+    }
+
+    let outcome = if killed { "timed_out" } else { "partial" };
+    let mut notify = None;
+    {
+        let mut process = state.bridge_process.lock().await;
+        let mut status = state.status.lock().await;
+        if status.operator_session_id.as_deref() == Some(session_id) {
+            status.running = false;
+            status.registered = false;
+            status.registered_relay_count = 0;
+            status.registered_relay_urls.clear();
+            status.active_relay_urls.clear();
+            status.relay_runtime_state = Some("stopped".into());
+            status.last_error = Some(warning.clone());
+            status.stop_cleanup_outcome = Some(outcome.into());
+            status.stop_cleanup_warning = Some(warning.clone());
+            status.updated_at_ms = Some(current_time_ms());
+        }
+        if let Some(record) = process
+            .as_mut()
+            .filter(|record| record.session_id == session_id)
+        {
+            record.phase = BridgeProcessPhase::Completed;
+            record.killed = killed;
+            record.exit_status = exit_status;
+            record.stop_result = Some(Err(warning.clone()));
+            record.child = None;
+            record.stdin = None;
+            notify = Some(record.notify.clone());
+        }
+    }
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+    anyhow::bail!("{failure}: {warning}")
 }
 
 fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> bool {
@@ -1536,18 +1627,32 @@ pub async fn start_compute_node(
         }
     };
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stderr"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdin = child.stdin.take();
+    let (stdout, stderr, stdin) = match (stdout, stderr, stdin) {
+        (Some(stdout), Some(stderr), Some(stdin)) => (stdout, stderr, stdin),
+        (stdout, stderr, stdin) => {
+            let missing = if stdin.is_none() {
+                "missing compute-node bridge stdin"
+            } else if stdout.is_none() {
+                "missing compute-node bridge stdout"
+            } else {
+                "missing compute-node bridge stderr"
+            };
+            drop(stdout);
+            drop(stderr);
+            return complete_spawned_bridge_startup_failure(
+                &state,
+                &session_id,
+                child,
+                stdin,
+                Instant::now() + DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT,
+                missing.into(),
+            )
+            .await;
+        }
+    };
 
     let mut attachment =
         attach_spawned_bridge_process_for_session(&state, &session_id, child, stdin).await;
@@ -2100,7 +2205,7 @@ async fn finalize_stop_status(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    stop_compute_node_with_shutdown_timeout(state, Duration::from_secs(12)).await
+    stop_compute_node_with_shutdown_timeout(state, DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT).await
 }
 
 #[cfg(test)]
@@ -2902,11 +3007,15 @@ mod tests {
         let child_stdin = child.stdin.take().expect("child stdin");
 
         let mut process_guard = state.bridge_process.lock().await;
+        let (snapshot_attempt_tx, snapshot_attempt_rx) = tokio::sync::oneshot::channel();
+        install_snapshot_stop_session_process_lock_attempt_hook(snapshot_attempt_tx);
         let stop_state = state.clone();
         let stop_task = tokio::spawn(async move {
             stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
         });
-        tokio::task::yield_now().await;
+        snapshot_attempt_rx
+            .await
+            .expect("Stop reached process-lock snapshot attempt");
 
         *process_guard = Some(BridgeProcessRecord::new(
             "new-session".into(),
@@ -4344,6 +4453,189 @@ mod tests {
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
         }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn spawned_pipe_failure_cooperative_cancel_reaps_and_unblocks_start() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let cancel_path = temp.path().join("cancel.json");
+        reserve_starting_bridge_process_for_session(&state, "session-1")
+            .await
+            .expect("reserve");
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; exit 0",
+                "sh",
+                cancel_path.to_str().expect("utf8 path"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let stdin = child.stdin.take();
+
+        let result = complete_spawned_bridge_startup_failure(
+            &state,
+            "session-1",
+            child,
+            stdin,
+            Instant::now() + Duration::from_secs(2),
+            "missing compute-node bridge stdout".into(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(cancel_path).expect("cancel"),
+            r#"{"type":"cancel"}"#
+        );
+        {
+            let process = state.bridge_process.lock().await;
+            let record = process.as_ref().expect("record");
+            assert_eq!(record.phase, BridgeProcessPhase::Completed);
+            assert!(!record.killed);
+            assert!(record
+                .exit_status
+                .as_ref()
+                .is_some_and(|status| status.success()));
+            assert!(record.stop_result.as_ref().is_some_and(Result::is_err));
+        }
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("partial"));
+        assert!(status.stop_cleanup_attempted.is_none());
+        assert!(status.stop_cleanup_success_count.is_none());
+        assert!(status.stop_cleanup_failure_count.is_none());
+        reserve_starting_bridge_process_for_session(&state, "session-2")
+            .await
+            .expect("completed failure permits next start");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn spawned_pipe_failure_wedged_child_is_killed_and_reaped() {
+        let state = ComputeNodeState::default();
+        reserve_starting_bridge_process_for_session(&state, "session-1")
+            .await
+            .expect("reserve");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        let result = complete_spawned_bridge_startup_failure(
+            &state,
+            "session-1",
+            child,
+            None,
+            Instant::now() + Duration::from_millis(50),
+            "missing compute-node bridge stdin".into(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        {
+            let process = state.bridge_process.lock().await;
+            let record = process.as_ref().expect("record");
+            assert_eq!(record.phase, BridgeProcessPhase::Completed);
+            assert!(record.killed);
+            assert!(record.exit_status.is_some());
+        }
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("timed_out"));
+        assert_ne!(status.stop_cleanup_outcome.as_deref(), Some("complete"));
+        assert_ne!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn spawned_pipe_failure_latched_stop_replays_cached_warning_promptly() {
+        let state = ComputeNodeState::default();
+        reserve_starting_bridge_process_for_session(&state, "session-1")
+            .await
+            .expect("reserve");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        {
+            let mut process = state.bridge_process.lock().await;
+            let record = process.as_mut().expect("record");
+            record.phase = BridgeProcessPhase::Stopping;
+            record.stop_deadline = Some(Instant::now() + Duration::from_secs(2));
+        }
+
+        complete_spawned_bridge_startup_failure(
+            &state,
+            "session-1",
+            child,
+            None,
+            Instant::now() + Duration::from_millis(50),
+            "missing compute-node bridge stdin".into(),
+        )
+        .await
+        .expect_err("startup cleanup returns warning");
+
+        let replay = tokio::time::timeout(
+            Duration::from_millis(250),
+            stop_compute_node_with_shutdown_timeout(state.clone(), Duration::from_secs(2)),
+        )
+        .await
+        .expect("cached stop should wake promptly");
+        assert!(replay.is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn spawned_pipe_failure_stale_session_does_not_mutate_replacement() {
+        let state = ComputeNodeState::default();
+        reserve_starting_bridge_process_for_session(&state, "session-2")
+            .await
+            .expect("reserve replacement");
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.last_error = None;
+            status.stop_cleanup_outcome = Some("not_required".into());
+        }
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        complete_spawned_bridge_startup_failure(
+            &state,
+            "session-1",
+            child,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            "missing compute-node bridge stdin".into(),
+        )
+        .await
+        .expect_err("stale cleanup returns warning");
+
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.operator_session_id.as_deref(), Some("session-2"));
+        assert!(status.running);
+        assert!(status.registered);
+        assert!(status.last_error.is_none());
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("not_required"));
     }
 
     #[cfg(not(windows))]

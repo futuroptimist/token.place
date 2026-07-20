@@ -1053,16 +1053,6 @@ def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
     return fake_site
 
 
-def patch_packaged_runtime_setup_as_macos(resources_root: Path) -> None:
-    runtime_setup = resources_root / "python" / "desktop_runtime_setup.py"
-    runtime_setup.write_text(
-        runtime_setup.read_text(encoding="utf-8")
-        + "\n# Packaged e2e-only platform shim.\n"
-        + "_desktop_platform = lambda: 'darwin'\n"
-        + "_desktop_arch = lambda: 'arm64'\n",
-        encoding="utf-8",
-    )
-
 
 def run_macos_mock_metal_packaged_registration_probe(
     tmp_root: Path,
@@ -1109,7 +1099,6 @@ def run_macos_gpu_failure_blocks_registration_probe(
     relay_port: int,
     resources_root: Path,
 ) -> None:
-    patch_packaged_runtime_setup_as_macos(resources_root)
     broken_site = tmp_root / "fake broken macos llama_cpp"
     broken_pkg = broken_site / "llama_cpp"
     broken_pkg.mkdir(parents=True, exist_ok=True)
@@ -1254,7 +1243,7 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
-                if probe_resources_root == mac_resources_root:
+                if probe_resources_root == mac_resources_root and sys.platform == "darwin":
                     run_macos_mock_metal_packaged_registration_probe(
                         tmp_path,
                         probe_script,

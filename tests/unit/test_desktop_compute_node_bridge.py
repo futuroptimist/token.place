@@ -3778,7 +3778,8 @@ def test_platform_neutral_runtime_setup_failure_last_error_is_actionable(
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['last_error'] == payload['message']
     assert 'desktop model runtime setup failed' in payload['last_error']
-    assert 'interpreter=/opt/token.place/python' in payload['last_error']
+    assert 'interpreter=<path>' in payload['last_error']
+    assert '/opt/token.place/python' not in payload['last_error']
     assert 'missing=llama_cpp' in payload['last_error']
     assert 'before relay registration' in payload['last_error']
 
@@ -5387,3 +5388,38 @@ def test_structured_startup_and_status_payloads_redact_embedded_paths(monkeypatc
     assert 'stable code failed' in encoded
     assert payload['error_code'] == 'stable_code'
     assert '<path>' in encoded
+
+
+def test_public_payload_sanitizes_urls_sensitive_keys_and_long_text():
+    payload = {
+        'active_relay_url': 'https://user:pass@[::1]:8443/path?token=secret#frag',
+        'relay_statuses': [
+            {
+                'relay_url': 'https://user:pass@token.place:443/private?authorization=secret#frag',
+                'last_error': r'failed reading \\server\share\SecretName\payload.json',
+            }
+        ],
+        'relay_map': {
+            'https://user:pass@relay.example:9443/path?access_token=secret#frag': {
+                'message': '/private/var/SecretName/token.place failed',
+            }
+        },
+        'prompt': 'SECRET_PROMPT',
+        'prompt_tokens': 17,
+        'public_hash': 'abc123',
+        'pip_stderr_tail': 'CMAKE_ARGS=-DSECRET=1 ' + ('x' * 800),
+        'fallback_reason': '/opt/SecretName/bin failed with stable_code ' + ('y' * 800),
+    }
+
+    sanitized = compute_node_bridge._sanitize_public_payload(payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    for forbidden in ['SecretName', 'SECRET_PROMPT', 'user:pass', 'token=secret', 'access_token', '/private/var', '/opt/SecretName', 'CMAKE_ARGS']:
+        assert forbidden not in encoded
+    assert sanitized['active_relay_url'] == 'https://[::1]:8443'
+    assert sanitized['relay_statuses'][0]['relay_url'] == 'https://token.place:443'
+    assert 'https://relay.example:9443' in sanitized['relay_map']
+    assert sanitized['prompt'] == 'redacted'
+    assert sanitized['prompt_tokens'] == 17
+    assert sanitized['public_hash'] == 'abc123'
+    assert len(sanitized['fallback_reason']) <= compute_node_bridge.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS

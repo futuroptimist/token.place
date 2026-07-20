@@ -64,6 +64,7 @@ except ModuleNotFoundError:
     ) -> None:
         return
 
+
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     try:
         from utils.llm.model_manager import _is_repo_llama_cpp_shim as _shim_detector
@@ -483,7 +484,7 @@ def stop_requested() -> bool:
 
 
 def emit(payload: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.write(json.dumps(_sanitize_public_payload(payload)) + "\n")
     sys.stdout.flush()
 
 
@@ -740,26 +741,48 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
     }
 
 
+PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS = 512
+_PUBLIC_SENSITIVE_KEYS = {
+    "prompt", "prompts", "messages", "plaintext", "ciphertext", "decrypted",
+    "decrypted_content", "key", "private_key", "secret_key", "api_key",
+    "authorization", "auth_token", "access_token", "refresh_token", "token",
+    "environment", "env", "relay_payload", "request_payload", "response_payload",
+    "raw_payload", "raw_request", "raw_response", "payload",
+}
+_PUBLIC_COMMAND_KEYS = {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}
+_PUBLIC_PATH_FIELDS = {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path", "model_path"}
+_PUBLIC_TEXT_FIELDS = {"fallback_reason", "last_error", "message", "detail", "error", "pip_version"}
+
+
+_PUBLIC_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*)"
+)
+
+
 def _sanitize_public_text(value: Any) -> str:
-    text = str(value or "")
-    text = re.sub(r"(?<![A-Za-z])[A-Za-z]:[/\\][^;\r\n,)]*", "<path>", text)
-    text = re.sub(r"\\\\[^\s;\r\n,)]*", "<path>", text)
-    text = re.sub(r"/(Users|home|tmp)/[^;\r\n,)]*", "<path>", text)
-    return text
+    text = _PUBLIC_PATH_PATTERN.sub("<path>", str(value or ""))
+    return text[: PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS - 12].rstrip() + "...<truncated>" if len(text) > PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS else text
 
 
 def _runtime_public_value(key: str, value: Any) -> Any:
-    if key in {"interpreter"}:
+    normalized_key = str(key).lower()
+    if normalized_key in _PUBLIC_SENSITIVE_KEYS:
+        return "redacted" if value not in (None, "") else value
+    if normalized_key in {"interpreter"}:
         return Path(str(value or sys.executable)).name or "python.exe"
-    if key in {"fallback_reason", "last_error", "message", "detail", "error"}:
+    if normalized_key in _PUBLIC_TEXT_FIELDS:
         return _sanitize_public_text(value) if value else (None if value is None else "")
-    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path"}:
+    if normalized_key in _PUBLIC_PATH_FIELDS:
         text = str(value or "unknown")
         if "python-runtime" in text.lower() or text == "bundled":
             return "bundled"
         return text.replace("\\", "/").rsplit("/", 1)[-1] if text not in {"", "unknown"} else "unknown"
-    if key in {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}:
+    if normalized_key in _PUBLIC_COMMAND_KEYS:
         return "redacted" if value else None
+    if "relay_url" in normalized_key or normalized_key.endswith("relay") or normalized_key in {"active_relay_url"}:
+        if isinstance(value, list):
+            return [_sanitize_relay_target(item) for item in value]
+        return _sanitize_relay_target(value)
     if isinstance(value, str):
         return _sanitize_public_text(value)
     return value
@@ -767,7 +790,12 @@ def _runtime_public_value(key: str, value: Any) -> Any:
 
 def _sanitize_public_payload(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): _runtime_public_value(str(k), _sanitize_public_payload(v)) for k, v in value.items()}
+        sanitized: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key_text = str(raw_key)
+            safe_key = _sanitize_relay_target(key_text) if "://" in key_text else _sanitize_public_text(key_text)
+            sanitized[safe_key] = _runtime_public_value(key_text, _sanitize_public_payload(raw_value))
+        return sanitized
     if isinstance(value, list):
         return [_sanitize_public_payload(item) for item in value]
     if isinstance(value, str):

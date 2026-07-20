@@ -587,7 +587,8 @@ def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monke
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=tmp_path)
 
     assert result['runtime_action'] == 'metal_install_failed'
-    assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
+    assert '/Library/Developer/CommandLineTools/usr/bin/python3' not in result['fallback_reason']
+    assert 'interpreter=<path>' in result['fallback_reason']
     assert 'python_version=3.9.6' in result['fallback_reason']
     assert f'dependency_target={dependency_target}' not in result['fallback_reason']
     assert 'dependency_target=<path>' in result['fallback_reason']
@@ -4118,3 +4119,27 @@ def test_unbundled_windows_first_and_second_launch_fail_read_only_before_mutatio
     encoded = json.dumps(results)
     assert 'cuda_build' not in encoded
     assert '--target' not in encoded
+
+
+def test_runtime_public_payload_redacts_extended_paths_sensitive_keys_and_bounds_text(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    payload = {
+        'fallback_reason': r'failed at \\?\C:\Users\SecretName\deps and /Applications/SecretName/App.app ' + ('x' * 800),
+        'detail': '/Library/SecretName/lib and /private/var/SecretName/tmp and /var/SecretName/log',
+        'error': '/opt/SecretName/tool and /home/SecretName/.cache and /tmp/SecretName/out',
+        'plaintext': 'SECRET_TEXT',
+        'prompt_tokens': 9,
+        'pip_stderr_tail': 'compiler CMAKE_ARGS=-DSECRET=1',
+        'pip_version': 'pip 24.0 from /Users/SecretName/site-packages/pip (python 3.11)',
+    }
+
+    sanitized = desktop_runtime_setup._sanitize_public_runtime_payload(payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    for forbidden in ['SecretName', 'SECRET_TEXT', 'CMAKE_ARGS', '/Applications/SecretName', '/Library/SecretName', '/private/var', '/opt/SecretName']:
+        assert forbidden not in encoded
+    assert sanitized['plaintext'] == 'redacted'
+    assert sanitized['prompt_tokens'] == 9
+    assert sanitized['pip_stderr_tail'] == 'redacted'
+    assert 'pip 24.0 from <path>' in sanitized['pip_version']
+    assert len(sanitized['fallback_reason']) <= desktop_runtime_setup.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS

@@ -554,32 +554,69 @@ def _public_runtime_identity(value: str) -> str:
     return basename if (":" in text or text.startswith("/") or "\\" in text) else text
 
 
+PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS = 512
+_PUBLIC_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*)"
+)
+_PUBLIC_SENSITIVE_KEYS = {
+    "prompt", "prompts", "messages", "message_payload", "response", "responses",
+    "plaintext", "ciphertext", "decrypted", "decrypted_content", "key",
+    "private_key", "secret_key", "api_key", "authorization", "auth_token",
+    "access_token", "refresh_token", "token", "environment", "env",
+    "relay_payload", "request_payload", "response_payload", "raw_payload",
+    "raw_request", "raw_response", "payload",
+}
+_PUBLIC_COMMAND_KEYS = {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}
+_PUBLIC_PATH_FIELDS = {
+    "interpreter", "prefix", "base_prefix", "interpreter_prefix",
+    "dependency_target", "import_root", "requirements", "llama_module_path",
+    "log_file_path", "model_path", "runtime_path",
+}
+_PUBLIC_TEXT_FIELDS = {"fallback_reason", "detail", "error", "last_error", "message", "pip_version"}
+
+
+def _bound_public_diagnostic_text(text: str) -> str:
+    if len(text) <= PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS:
+        return text
+    return text[: PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS - 12].rstrip() + "...<truncated>"
+
+
 def _sanitize_public_runtime_text(value: Any) -> str:
     text = str(value or "")
     if not text:
         return text
-    text = re.sub(r"(?<![A-Za-z])[A-Za-z]:[/\\][^;\r\n,)]*", "<path>", text)
-    text = re.sub(r"\\\\[^\s;\r\n,)]*", "<path>", text)
-    text = re.sub(r"/(Users|home|tmp)/[^;\r\n,)]*", "<path>", text)
-    return text
+    return _bound_public_diagnostic_text(_PUBLIC_PATH_PATTERN.sub("<path>", text))
+
+
+def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
+    normalized_key = str(key).lower()
+    if normalized_key in _PUBLIC_SENSITIVE_KEYS:
+        return "redacted" if value not in (None, "") else value
+    if normalized_key in _PUBLIC_COMMAND_KEYS:
+        return "redacted" if value else None
+    if normalized_key in _PUBLIC_PATH_FIELDS and isinstance(value, str):
+        if normalized_key == "dependency_target" and (_is_exact_packaged_runtime_layout() or "python-runtime" in value.lower()):
+            return "bundled"
+        return _public_runtime_identity(value)
+    if normalized_key in _PUBLIC_TEXT_FIELDS and isinstance(value, str):
+        return _sanitize_public_runtime_text(value)
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            safe_key = _sanitize_public_runtime_text(str(raw_key))
+            sanitized[safe_key] = _sanitize_public_runtime_payload_value(str(raw_key), raw_value)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_public_runtime_payload_value(normalized_key, item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_runtime_payload_value(normalized_key, item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_public_runtime_text(value)
+    return value
 
 
 def _sanitize_public_runtime_payload(result: Dict[str, Any]) -> Dict[str, Any]:
-    sanitized = dict(result)
-    path_fields = {
-        "interpreter", "prefix", "base_prefix", "interpreter_prefix",
-        "dependency_target", "import_root", "requirements", "llama_module_path",
-    }
-    text_fields = {"fallback_reason", "detail", "error", "last_error", "message"}
-    for key in path_fields:
-        if key in sanitized and isinstance(sanitized[key], str):
-            sanitized[key] = _public_runtime_identity(sanitized[key])
-            if key == "dependency_target" and _is_exact_packaged_runtime_layout():
-                sanitized[key] = "bundled"
-    for key in text_fields:
-        if key in sanitized and isinstance(sanitized[key], str):
-            sanitized[key] = _sanitize_public_runtime_text(sanitized[key])
-    return sanitized
+    return {str(key): _sanitize_public_runtime_payload_value(str(key), value) for key, value in dict(result).items()}
 
 def _probe_failure(
     *,

@@ -7213,6 +7213,90 @@ def test_api_v1_terminal_cleanup_fails_closed_when_inference_does_not_quiesce():
         release.set()
 
 
+def test_api_v1_completed_future_at_deadline_boundary_is_consumed_once():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    # Legacy/no-control path still supervises deadline but must not recycle a
+    # quiesced worker simply because observing the completed future crosses it.
+    deadline = time.monotonic() + 0.2
+    generated = []
+    terminate = MagicMock(return_value=True)
+
+    def generate(**_kwargs):
+        generated.append(True)
+        return {
+            'request_id': 'req-boundary',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'ok'}},
+        }
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = terminate
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-boundary',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+    }, local_deadline=deadline)
+
+    assert generated == [True]
+    assert outcome.response_envelope['request_id'] == 'req-boundary'
+    assert outcome.submission_allowed is True
+    terminate.assert_not_called()
+
+
+def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_post():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    control_entered = threading.Event()
+    release_control = threading.Event()
+    release_inference = threading.Event()
+    result_holder = {}
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'late'}
+
+    def control(**_kwargs):
+        control_entered.set()
+        release_control.wait(2)
+        return {'status': 'active', 'next_poll_seconds': 1}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    def supervise():
+        result_holder['outcome'] = client._supervise_api_v1_inference({
+            'request_id': 'req-control-stop',
+            'model': 'llama-3-8b-instruct',
+            'messages': [],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+        }, local_deadline=time.monotonic() + 5)
+
+    thread = threading.Thread(target=supervise)
+    thread.start()
+    assert control_entered.wait(1)
+    client.stop()
+    thread.join(1)
+    try:
+        assert not thread.is_alive()
+        outcome = result_holder['outcome']
+        assert outcome.response_envelope is None
+        assert outcome.terminal_code == 'operator_stop'
+        assert outcome.submission_allowed is False
+    finally:
+        release_control.set()
+        release_inference.set()
+        thread.join(1)
+
+
 def test_api_v1_missing_control_credential_fails_closed_without_worker_termination():
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'

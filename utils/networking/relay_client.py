@@ -2361,6 +2361,8 @@ class RelayClient:
             )
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
+        control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control') if control_available else None
+        control_future: Any = None
         future = executor.submit(_generate)
         try:
             next_poll_at = time.monotonic() if control_available else local_deadline
@@ -2371,14 +2373,22 @@ class RelayClient:
                     terminal_status = 'operator_stop'
                     terminal_reason = 'operator_stop'
                     break
+                if future.done():
+                    # A completed inference is observed exactly once.  If Stop or the
+                    # local deadline was already terminal before this observation, the
+                    # result is discarded as a typed no-submit outcome; otherwise the
+                    # quiesced worker is not recycled merely because observation and
+                    # deadline are adjacent.  process_client_request_result() performs
+                    # a final pre-submit Stop/deadline recheck before posting.
+                    future_result = future.result()
+                    if getattr(self, '_polling_stopped_by_request', False):
+                        future_result = None
+                        terminal_status = 'operator_stop'
+                        terminal_reason = 'operator_stop'
+                    break
                 if now >= local_deadline:
                     terminal_status = 'local_deadline'
                     terminal_reason = 'local_deadline'
-                    break
-                if future.done():
-                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= local_deadline:
-                        continue
-                    future_result = future.result()
                     break
                 if control_available and now >= next_poll_at:
                     remaining = max(0.0, local_deadline - time.monotonic())
@@ -2387,13 +2397,42 @@ class RelayClient:
                         terminal_reason = 'local_deadline'
                         break
                     try:
-                        control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5, 0.25))
-                        control = self._post_api_v1_request_control(
-                            relay_url=relay_url,
-                            request_id=request_id,
-                            acknowledge=False,
-                            timeout_seconds=control_timeout,
-                        )
+                        if control_future is None:
+                            control_timeout = max(0.001, min(self._request_timeout, remaining * 0.5, 0.25))
+                            control_future = control_executor.submit(
+                                self._post_api_v1_request_control,
+                                relay_url=relay_url,
+                                request_id=request_id,
+                                acknowledge=False,
+                                timeout_seconds=control_timeout,
+                            )
+                        while not control_future.done():
+                            if getattr(self, '_polling_stopped_by_request', False):
+                                terminal_status = 'operator_stop'
+                                terminal_reason = 'operator_stop'
+                                break
+                            if time.monotonic() >= local_deadline:
+                                terminal_status = 'local_deadline'
+                                terminal_reason = 'local_deadline'
+                                break
+                            wakeup = getattr(self, '_api_v1_control_wakeup', None)
+                            wait_slice = min(0.05, max(0.0, local_deadline - time.monotonic()))
+                            # Unit tests sometimes install fake wakeups that advance a fake
+                            # clock by the requested sleep.  Use those only for supervisor
+                            # backoff sleeps below; in-flight control I/O uses the real
+                            # Future timeout so fake time cannot race past the deadline while
+                            # the owned control thread is merely waiting to be scheduled.
+                            if isinstance(wakeup, threading.Event) and wakeup.wait(wait_slice):
+                                wakeup.clear()
+                            else:
+                                try:
+                                    control_future.result(timeout=min(0.01, wait_slice))
+                                except FutureTimeoutError:
+                                    pass
+                        if terminal_status is not None:
+                            break
+                        control = control_future.result()
+                        control_future = None
                         if getattr(self, '_polling_stopped_by_request', False):
                             terminal_status = 'operator_stop'
                             terminal_reason = 'operator_stop'
@@ -2422,10 +2461,12 @@ class RelayClient:
                             break
                         next_poll_at = min(time.monotonic() + _API_V1_CONTROL_MIN_POLL_SECONDS, local_deadline)
                     except PermissionError:
+                        control_future = None
                         terminal_status = 'owner_proof_failed'
                         terminal_reason = 'owner_proof_failed'
                         break
                     except Exception:
+                        control_future = None
                         next_poll_at = min(time.monotonic() + backoff, local_deadline)
                         backoff = min(_API_V1_CONTROL_MAX_POLL_SECONDS, backoff * 2)
                 wait_until = min(next_poll_at, local_deadline)
@@ -2449,6 +2490,8 @@ class RelayClient:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
                 quiescence_deadline = time.monotonic() + 0.5
                 cleanup_quiesced = _wait_for_future_quiescence(future, quiescence_deadline) and cleanup_quiesced
+                if control_future is not None:
+                    cleanup_quiesced = _wait_for_future_quiescence(control_future, quiescence_deadline) and cleanup_quiesced
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
                 if not cleanup_quiesced:
@@ -2464,10 +2507,9 @@ class RelayClient:
                     submission_allowed=False,
                 )
         finally:
-            if future.done():
-                executor.shutdown(wait=True, cancel_futures=True)
-            else:
-                executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=future.done(), cancel_futures=True)
+            if control_executor is not None:
+                control_executor.shutdown(wait=control_future is None or control_future.done(), cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

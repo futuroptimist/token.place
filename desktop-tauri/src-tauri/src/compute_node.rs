@@ -147,6 +147,68 @@ impl BridgeProcessRecord {
     }
 }
 
+struct BridgeProcessAttachment {
+    installed: bool,
+    stopping_cancel_stdin: Option<ChildStdin>,
+    pending_child: Option<Child>,
+    pending_stdin: Option<ChildStdin>,
+    notify: Option<Arc<Notify>>,
+}
+
+async fn attach_spawned_bridge_process_for_session(
+    state: &ComputeNodeState,
+    session_id: &str,
+    child: Child,
+    stdin: ChildStdin,
+) -> BridgeProcessAttachment {
+    let mut pending_child = Some(child);
+    let mut pending_stdin = Some(stdin);
+    let mut stopping_cancel_stdin = None;
+    let notify;
+    let installed = {
+        let mut process = state.bridge_process.lock().await;
+        notify = if let Some(record) = process
+            .as_mut()
+            .filter(|record| record.session_id == session_id)
+        {
+            match record.phase {
+                BridgeProcessPhase::Starting => {
+                    record.child = pending_child.take();
+                    record.stdin = pending_stdin.take();
+                    record.phase = BridgeProcessPhase::Running;
+                    None
+                }
+                BridgeProcessPhase::Stopping => {
+                    record.child = pending_child.take();
+                    if !record.cancel_sent {
+                        stopping_cancel_stdin = pending_stdin.take();
+                        record.cancel_sent = stopping_cancel_stdin.is_some();
+                    } else {
+                        let _ = pending_stdin.take();
+                    }
+                    Some(record.notify.clone())
+                }
+                BridgeProcessPhase::Running | BridgeProcessPhase::Completed => {
+                    Some(record.notify.clone())
+                }
+            }
+        } else {
+            None
+        };
+        process.as_ref().is_some_and(|record| {
+            record.session_id == session_id && record.phase == BridgeProcessPhase::Running
+        })
+    };
+
+    BridgeProcessAttachment {
+        installed,
+        stopping_cancel_stdin,
+        pending_child,
+        pending_stdin,
+        notify,
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ComputeNodeState {
     // Legacy slots are retained for focused tests that install synthetic child
@@ -1395,63 +1457,28 @@ pub async fn start_compute_node(
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
 
-    let mut pending_child = Some(child);
-    let mut pending_stdin = Some(stdin);
-    let mut stopping_cancel_stdin = None;
-    let stopping_notify;
-    let installed = {
-        let mut process = state.bridge_process.lock().await;
-        stopping_notify = if let Some(record) = process
-            .as_mut()
-            .filter(|record| record.session_id == session_id)
-        {
-            match record.phase {
-                BridgeProcessPhase::Starting => {
-                    eprintln!(
-                        "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
-                        session_id,
-                        sanitize_relay_target(&primary_relay_url)
-                    );
-                    record.child = pending_child.take();
-                    record.stdin = pending_stdin.take();
-                    record.phase = BridgeProcessPhase::Running;
-                    None
-                }
-                BridgeProcessPhase::Stopping => {
-                    record.child = pending_child.take();
-                    if !record.cancel_sent {
-                        stopping_cancel_stdin = pending_stdin.take();
-                        record.cancel_sent = stopping_cancel_stdin.is_some();
-                    } else {
-                        let _ = pending_stdin.take();
-                    }
-                    Some(record.notify.clone())
-                }
-                BridgeProcessPhase::Running | BridgeProcessPhase::Completed => {
-                    Some(record.notify.clone())
-                }
-            }
-        } else {
-            None
-        };
-        process.as_ref().is_some_and(|record| {
-            record.session_id == session_id && record.phase == BridgeProcessPhase::Running
-        })
-    };
+    let mut attachment =
+        attach_spawned_bridge_process_for_session(&state, &session_id, child, stdin).await;
 
-    if !installed {
-        if let Some(mut stdin_to_cancel) = stopping_cancel_stdin.take() {
+    if attachment.installed {
+        eprintln!(
+            "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
+            session_id,
+            sanitize_relay_target(&primary_relay_url)
+        );
+    } else {
+        if let Some(mut stdin_to_cancel) = attachment.stopping_cancel_stdin.take() {
             let _ = stdin_to_cancel.write_all(b"{\"type\":\"cancel\"}\n").await;
             let _ = stdin_to_cancel.flush().await;
         }
-        if let Some(notify) = stopping_notify {
+        if let Some(notify) = attachment.notify.take() {
             notify.notify_waiters();
         }
-        if let Some(mut abandoned_stdin) = pending_stdin.take() {
+        if let Some(mut abandoned_stdin) = attachment.pending_stdin.take() {
             let _ = abandoned_stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
             let _ = abandoned_stdin.flush().await;
         }
-        if let Some(mut abandoned_child) = pending_child.take() {
+        if let Some(mut abandoned_child) = attachment.pending_child.take() {
             let _ = abandoned_child.kill().await;
             let _ = abandoned_child.wait().await;
         }
@@ -3030,6 +3057,101 @@ mod tests {
         let observed_cancel = std::fs::read_to_string(observed_cancel_path)
             .expect("cancel message should be recorded");
         assert_eq!(observed_cancel, "{\"type\":\"cancel\"}");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn concurrent_start_starting_reservation_rejects_second_start() {
+        let state = ComputeNodeState::default();
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "reserved-session".into(),
+            None,
+            None,
+        ));
+
+        let process = state.bridge_process.lock().await;
+        assert!(process.as_ref().is_some_and(BridgeProcessRecord::is_active));
+        assert_eq!(
+            process.as_ref().map(|record| record.phase),
+            Some(BridgeProcessPhase::Starting)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn starting_to_running_attachment_path_installs_child() {
+        let state = ComputeNodeState::default();
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "attach-session".into(),
+            None,
+            None,
+        ));
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line || true; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn attach child");
+        let stdin = child.stdin.take().expect("attach stdin");
+
+        let attachment =
+            attach_spawned_bridge_process_for_session(&state, "attach-session", child, stdin).await;
+
+        assert!(attachment.installed);
+        assert!(attachment.pending_child.is_none());
+        assert!(attachment.pending_stdin.is_none());
+        let mut child_to_reap = {
+            let mut process = state.bridge_process.lock().await;
+            let record = process.as_mut().expect("record remains installed");
+            assert_eq!(record.phase, BridgeProcessPhase::Running);
+            assert!(record.stdin.take().is_some());
+            record.child.take().expect("child stored in process record")
+        };
+        child_to_reap.kill().await.expect("kill attach child");
+        child_to_reap.wait().await.expect("reap attach child");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn starting_late_superseded_attachment_is_reaped_without_mutating_new_session() {
+        let state = ComputeNodeState::default();
+        *state.bridge_process.lock().await =
+            Some(BridgeProcessRecord::new("new-session".into(), None, None));
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.operator_session_id = Some("new-session".into());
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.last_error = Some("preserve me".into());
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line || true; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn superseded child");
+        let stdin = child.stdin.take().expect("superseded stdin");
+
+        let mut attachment =
+            attach_spawned_bridge_process_for_session(&state, "old-session", child, stdin).await;
+
+        assert!(!attachment.installed);
+        assert!(attachment.pending_stdin.take().is_some());
+        let mut late_child = attachment
+            .pending_child
+            .take()
+            .expect("late child should remain caller-owned for safe reap");
+        late_child.kill().await.expect("kill superseded child");
+        late_child.wait().await.expect("reap superseded child");
+        let status = state.status.lock().await;
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.operator_session_id.as_deref(), Some("new-session"));
+        assert_eq!(status.stop_cleanup_outcome.as_deref(), Some("complete"));
+        assert_eq!(status.last_error.as_deref(), Some("preserve me"));
     }
 
     #[cfg(not(windows))]

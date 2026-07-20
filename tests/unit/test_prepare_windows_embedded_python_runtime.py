@@ -895,6 +895,25 @@ def test_manifest_pins_native_vendor_runtime_dll_artifacts():
     assert artifacts['cublaslt64_12.dll']['version'] == '12.4.5.8'
 
 
+def test_manifest_pins_msvc_redist_exact_content_addressed_url():
+    # The VC++ 14.44.35211.0 x64 redistributable must use a content-addressed URL
+    # containing the exact GUID 7ebf5fdb-36dc-4145-b0a0-90d3d5990a61 and the
+    # pinned SHA-256 in the path to ensure deterministic, tamper-resistant downloads.
+    _EXPECTED_MSVC_URL = (
+        'https://download.visualstudio.microsoft.com/download/pr/'
+        '7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/'
+        'CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/'
+        'VC_redist.x64.exe'
+    )
+    m = prep.load_manifest()
+    artifacts = {a['name']: a for a in m['native_dll_artifacts']}
+    for dll in ('msvcp140.dll', 'vcomp140.dll'):
+        assert artifacts[dll]['url'] == _EXPECTED_MSVC_URL, (
+            f"{dll} URL must be the verified content-addressed VC++ 14.44.35211 x64 URL; "
+            f"got {artifacts[dll]['url']!r}"
+        )
+
+
 def test_manifest_rejects_native_artifact_missing_exact_member_or_hash(tmp_path):
     m = prep.load_manifest()
     del m['native_dll_artifacts'][0]['archive_member_path']

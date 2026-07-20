@@ -200,6 +200,37 @@ async fn reserve_starting_bridge_process_for_session(
     Ok(())
 }
 
+struct StopSessionSnapshot {
+    session_id: Option<String>,
+    log_file_path: Option<String>,
+}
+
+async fn snapshot_stop_session(state: &ComputeNodeState) -> StopSessionSnapshot {
+    // Stop snapshots process ownership using the same reservation order as
+    // Start: bridge_process -> status. This blocks on an in-progress Starting
+    // reservation publication without ever waiting on lifecycle_lock.
+    let process = state.bridge_process.lock().await;
+    let status = state.status.lock().await;
+    if let Some(record_session) = process
+        .as_ref()
+        .filter(|record| record.is_active())
+        .map(|record| record.session_id.as_str())
+        .filter(|session| !session.is_empty())
+    {
+        let log_file_path = (status.operator_session_id.as_deref() == Some(record_session))
+            .then(|| status.log_file_path.clone())
+            .flatten();
+        return StopSessionSnapshot {
+            session_id: Some(record_session.to_string()),
+            log_file_path,
+        };
+    }
+    StopSessionSnapshot {
+        session_id: status.operator_session_id.clone(),
+        log_file_path: status.log_file_path.clone(),
+    }
+}
+
 async fn attach_spawned_bridge_process_for_session(
     state: &ComputeNodeState,
     session_id: &str,
@@ -1734,14 +1765,10 @@ async fn stop_compute_node_with_shutdown_timeout(
     state: ComputeNodeState,
     shutdown_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let (stop_session_id, stop_log_file_path) = {
-        let _lifecycle_lock = state.lifecycle_lock.try_lock().ok();
-        let status = state.status.lock().await;
-        (
-            status.operator_session_id.clone(),
-            status.log_file_path.clone(),
-        )
-    };
+    let StopSessionSnapshot {
+        session_id: stop_session_id,
+        log_file_path: stop_log_file_path,
+    } = snapshot_stop_session(&state).await;
     let stop_session_display = stop_session_id.as_deref().unwrap_or("unknown");
     eprintln!(
         "desktop.compute_node.stop_requested operator_session_id={}",
@@ -2843,6 +2870,79 @@ mod tests {
 
         assert!(result.is_ok(), "stop should not block on lifecycle lock");
         drop(lifecycle_guard);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_snapshot_waits_for_start_reservation_publication_and_uses_new_session() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("old-session".into());
+            status.log_file_path = Some(temp.path().join("old.log").to_string_lossy().into_owned());
+            status.stop_cleanup_warning = Some("old unregister warning".into());
+        }
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; exit 0",
+                "sh",
+                observed_cancel_path
+                    .to_str()
+                    .expect("cancel path should be valid UTF-8"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn reservation child");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        let mut process_guard = state.bridge_process.lock().await;
+        let stop_state = state.clone();
+        let stop_task = tokio::spawn(async move {
+            stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
+        });
+        tokio::task::yield_now().await;
+
+        *process_guard = Some(BridgeProcessRecord::new(
+            "new-session".into(),
+            Some(child),
+            Some(child_stdin),
+        ));
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+            status.operator_session_id = Some("new-session".into());
+            status.log_file_path = Some(temp.path().join("new.log").to_string_lossy().into_owned());
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
+            status.stop_cleanup_warning = None;
+            *state.stopped_event_ack_session_id.lock().await = Some("new-session".into());
+        }
+        state.stopped_event_ack_notify.notify_waiters();
+        drop(process_guard);
+
+        stop_task
+            .await
+            .expect("stop join")
+            .expect("stop should use the newly published session snapshot");
+
+        let observed_cancel = std::fs::read_to_string(observed_cancel_path)
+            .expect("cancel message should be recorded");
+        assert_eq!(observed_cancel, r#"{"type":"cancel"}"#);
+        let status = state.status.lock().await.clone();
+        assert_eq!(status.operator_session_id.as_deref(), Some("new-session"));
+        assert!(status.last_error.is_none());
+        assert!(!status.running);
+        assert!(!status.registered);
     }
 
     #[cfg(not(windows))]

@@ -1745,36 +1745,11 @@ def _ensure_desktop_llama_runtime_impl(
             f"{type(exc).__name__}"
         )
     before_version_payload = _version_payload(before, required_version, required_package_spec)
-    if is_unbundled_windows:
-        if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
-            return {
-                "selected_backend": before.backend,
-                "fallback_reason": "",
-                "runtime_action": _already_supported_action(before.backend),
-                **_probe_result_payload(before),
-                **before_version_payload,
-            }
-        return {
-            "selected_backend": "cpu",
-            "fallback_reason": (
-                f"Windows development runtime dependency unavailable ({before.error or before.backend}); "
-                "install the pinned desktop Python dependencies in the selected development interpreter; "
-                "startup is read-only and will not run pip, compilers, source repair"
-            ),
-            "runtime_action": "windows_development_runtime_missing_read_only",
-            **_probe_result_payload(before),
-            **before_version_payload,
-        }
-
-    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
-    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
-
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                "llama_cpp import shadowed by repo-local shim "
-                f"({before.llama_module_path}); remove repo root from import precedence "
+                "llama_cpp import shadowed by repo-local shim; remove repo root from import precedence "
                 "or run via desktop sidecar bootstrap so site-packages llama-cpp-python is used"
             ),
             "runtime_action": "shadowed_repo_llama_cpp",
@@ -1790,6 +1765,45 @@ def _ensure_desktop_llama_runtime_impl(
             **_probe_result_payload(before),
             **before_version_payload,
         }
+
+    qwen_64k_version_ok = (
+        not qwen_64k_required
+        or (
+            not version_resolution_error
+            and before_version_payload.get("llama_cpp_python_version_match") == "match"
+        )
+    )
+
+    if is_unbundled_windows:
+        if before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_version_ok and (not qwen_64k_required or before.yarn_rope_supported):
+            return {
+                "selected_backend": "cuda",
+                "fallback_reason": "",
+                "runtime_action": "already_supported",
+                **_probe_result_payload(before),
+                **before_version_payload,
+            }
+        reason = before.error or before.backend or "missing runtime"
+        if before.backend == "metal":
+            reason = "Metal runtime is not supported for Windows development startup"
+        elif before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_required and not qwen_64k_version_ok:
+            reason = f"pinned llama-cpp-python version mismatch for Qwen 64K; required_version={required_version}; version_match={before_version_payload.get('llama_cpp_python_version_match')}"
+        elif before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_required and not before.yarn_rope_supported:
+            reason = "Qwen 64K requires YaRN/RoPE support in the preinstalled Windows CUDA runtime"
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"Windows development runtime dependency unavailable ({reason}); "
+                "install the pinned CUDA desktop Python dependencies in the selected development interpreter; "
+                "startup is read-only and will not run pip, compilers, source repair"
+            ),
+            "runtime_action": "windows_development_runtime_missing_read_only",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
+
+    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
+    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
 
     last_error = ""
     qwen_64k_version_ok = (

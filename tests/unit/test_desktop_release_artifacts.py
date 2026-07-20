@@ -2636,15 +2636,29 @@ def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkey
     package = tmp_path / 'package.json'
     lock = tmp_path / 'package-lock.json'
     tauri = tmp_path / 'tauri.conf.json'
+    cargo = tmp_path / 'Cargo.toml'
+    cargo_lock = tmp_path / 'Cargo.lock'
     package.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
     lock.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
     tauri.write_text(json.dumps({'version': '9.9.9'}), encoding='utf-8')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
     monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
     monkeypatch.setattr(validator, 'PACKAGE_LOCK', lock)
     monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
+    monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
+    monkeypatch.setattr(validator, 'CARGO_LOCK', cargo_lock)
     with pytest.raises(validator.ValidationError, match='Windows release version mismatch'):
         validator.validate_config_versions('0.1.2')
     tauri.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='Cargo.toml'):
+        validator.validate_config_versions('0.1.2')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='Cargo.lock'):
+        validator.validate_config_versions('0.1.2')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
     validator.validate_config_versions('0.1.2')
 
     source_dir = tmp_path / 'already-extracted'

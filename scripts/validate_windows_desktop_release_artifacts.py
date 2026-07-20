@@ -19,6 +19,8 @@ MANIFEST = ROOT / 'desktop-tauri' / 'src-tauri' / 'python' / 'embedded_python_ru
 PACKAGE_JSON = ROOT / 'desktop-tauri' / 'package.json'
 PACKAGE_LOCK = ROOT / 'desktop-tauri' / 'package-lock.json'
 TAURI_CONFIG = ROOT / 'desktop-tauri' / 'src-tauri' / 'tauri.conf.json'
+CARGO_MANIFEST = ROOT / 'desktop-tauri' / 'src-tauri' / 'Cargo.toml'
+CARGO_LOCK = ROOT / 'desktop-tauri' / 'src-tauri' / 'Cargo.lock'
 PROVENANCE = 'embedded_python_runtime_provenance.json'
 FORBIDDEN = re.compile(r'(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$', re.I)
 
@@ -107,8 +109,7 @@ def _expected_tauri_binary_name() -> str:
     tauri = _load_json(TAURI_CONFIG)
     product = str(tauri.get('bundle', {}).get('windows', {}).get('mainBinaryName') or '').strip()
     if not product:
-        cargo = ROOT / 'desktop-tauri' / 'src-tauri' / 'Cargo.toml'
-        data = tomllib.loads(cargo.read_text(encoding='utf-8'))
+        data = tomllib.loads(CARGO_MANIFEST.read_text(encoding='utf-8'))
         product = str(data.get('package', {}).get('name') or '').strip()
     if not product:
         raise ValidationError('unable to determine expected Tauri app executable name')
@@ -167,14 +168,26 @@ def expected_version_from_tag(tag: str | None, fallback: str) -> str:
     return match.group(1)
 
 
+def _root_cargo_lock_version() -> str | None:
+    data = tomllib.loads(CARGO_LOCK.read_text(encoding='utf-8'))
+    root_name = str(tomllib.loads(CARGO_MANIFEST.read_text(encoding='utf-8')).get('package', {}).get('name') or '')
+    for package in data.get('package', []):
+        if package.get('name') == root_name and 'source' not in package:
+            return package.get('version')
+    return None
+
+
 def validate_config_versions(expected: str) -> None:
     package = _load_json(PACKAGE_JSON)
     lock = _load_json(PACKAGE_LOCK)
     tauri = _load_json(TAURI_CONFIG)
+    cargo = tomllib.loads(CARGO_MANIFEST.read_text(encoding='utf-8'))
     values = {
         'package.json': package.get('version'),
         'package-lock.json': lock.get('version'),
         'tauri.conf.json': tauri.get('version'),
+        'src-tauri/Cargo.toml': cargo.get('package', {}).get('version'),
+        'src-tauri/Cargo.lock': _root_cargo_lock_version(),
     }
     mismatches = {k: v for k, v in values.items() if v != expected}
     if mismatches:

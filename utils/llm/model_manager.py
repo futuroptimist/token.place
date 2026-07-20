@@ -6040,6 +6040,12 @@ class ModelManager:
             observed_generation = self._llm_generation
             observed_cancel_event = self._llm_cancel_generation_event
             observed_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0)
+        # Invariant: _invalidate_llm_if_current() does NOT rotate the cancel event;
+        # it only increments _llm_generation.  Only terminate_active_worker_for_cancellation()
+        # sets the current event and rotates to a new one while advancing the epoch.
+        # Therefore observed_cancel_event.is_set() reliably detects a cancellation that
+        # arrived after the initial llm_instance acquisition, even when llm is None
+        # between invalidation and replacement.
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')

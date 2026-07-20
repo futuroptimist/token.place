@@ -33,6 +33,28 @@ _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
 _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
 
 
+class _ControlSession:
+    """Minimal per-request wrapper for abortable control HTTP transport.
+
+    Wraps the module-level ``requests.post`` call behind a threading.Event gate
+    so that supervisor teardown can interrupt a pending control submission
+    without touching the global requests module or the inference worker.
+    On ``close()``, any concurrent or subsequent ``post()`` call raises
+    ``requests.ConnectionError``.
+    """
+
+    def __init__(self) -> None:
+        self._closed: threading.Event = threading.Event()
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        if self._closed.is_set():
+            raise requests.ConnectionError('api_v1_control_session_closed')
+        return requests.post(*args, **kwargs)
+
+    def close(self) -> None:
+        self._closed.set()
+
+
 class _ApiV1ChatValidationResult(NamedTuple):
     valid: bool
     code: Optional[str] = None
@@ -2300,6 +2322,7 @@ class RelayClient:
         request_id: str,
         acknowledge: bool = False,
         timeout_seconds: Optional[float] = None,
+        session: Optional[Any] = None,
     ) -> Dict[str, Any]:
         credential = self._api_v1_control_credential_for_relay(relay_url)
         if not credential:
@@ -2318,7 +2341,9 @@ class RelayClient:
         if headers:
             request_kwargs['headers'] = headers
         control_url = self._build_api_v1_url(relay_url, '/relay/servers/control')
-        response = requests.post(control_url, **request_kwargs)
+        # Use the provided session for abortable transport; fall back to module-level requests.
+        poster = session if session is not None else requests
+        response = poster.post(control_url, **request_kwargs)
         if response.status_code in {401, 403}:
             raise PermissionError('api_v1_control_owner_proof_failed')
         if response.status_code == 429 or 500 <= response.status_code <= 599:
@@ -2333,11 +2358,15 @@ class RelayClient:
         terminate = getattr(manager, 'terminate_active_worker_for_cancellation', None)
         if callable(terminate):
             return bool(terminate(reason=reason, recreate=recreate))
+        # Fallback path: attempt a best-effort close but cannot verify process death.
+        # Return False so the caller knows worker state is uncertain.
         llm = getattr(manager, 'llm', None)
         close = getattr(llm, 'close', None)
         if callable(close):
-            close()
-            return True
+            try:
+                close()
+            except Exception:
+                pass
         return False
 
     def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
@@ -2369,7 +2398,6 @@ class RelayClient:
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
-        cleanup_quiesced = True
 
         def _wait_for_future_quiescence(target_future: Any, deadline: float) -> bool:
             """Boundedly drain a request-scoped future before executor teardown."""
@@ -2401,7 +2429,13 @@ class RelayClient:
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
         control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control') if control_available else None
+        # Per-request session for abortable control transport.  Closing it interrupts
+        # any in-flight HTTP request without involving inference worker teardown.
+        control_session: Any = _ControlSession() if control_available else None
         control_future: Any = None
+        # Last HTTP timeout used for the active control request; used to derive the
+        # control quiescence deadline after session close.
+        last_control_timeout: float = float(getattr(self, '_request_timeout', 10) or 10)
         future = executor.submit(_generate)
         try:
             next_poll_at = time.monotonic() if control_available else local_deadline
@@ -2445,12 +2479,14 @@ class RelayClient:
                                     max(0.001, remaining - 0.001),
                                 ),
                             )
+                            last_control_timeout = control_timeout
                             control_future = control_executor.submit(
                                 self._post_api_v1_request_control,
                                 relay_url=relay_url,
                                 request_id=request_id,
                                 acknowledge=False,
                                 timeout_seconds=control_timeout,
+                                session=control_session,
                             )
                         while not control_future.done():
                             if getattr(self, '_polling_stopped_by_request', False):
@@ -2527,6 +2563,16 @@ class RelayClient:
                 except FutureTimeoutError:
                     pass
             if terminal_status is not None:
+                # Abort in-flight control I/O by closing the transport session.
+                # This is independent of inference worker teardown: closing the session
+                # causes any blocked HTTP call to raise immediately, so control_future
+                # quiesces without waiting for the HTTP timeout to expire.
+                if control_session is not None:
+                    try:
+                        control_session.close()
+                    except Exception:
+                        pass
+                    control_session = None
                 recovery_succeeded = False
                 try:
                     recovery_succeeded = self._terminate_current_llama_worker(
@@ -2534,31 +2580,45 @@ class RelayClient:
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
-                quiescence_deadline = time.monotonic() + 0.5
-                cleanup_quiesced = _wait_for_future_quiescence(future, quiescence_deadline) and cleanup_quiesced
+                # Track inference and control quiescence separately.  Only a stuck
+                # inference thread justifies a permanent polling stop; routine control
+                # latency must not mark a healthy recreated worker as unhealthy.
+                inference_quiescence_deadline = time.monotonic() + 0.5
+                inference_quiesced = _wait_for_future_quiescence(future, inference_quiescence_deadline)
+                control_quiesced = True
                 if control_future is not None:
-                    cleanup_quiesced = _wait_for_future_quiescence(control_future, quiescence_deadline) and cleanup_quiesced
+                    # After session close the HTTP call fails quickly.  Use a deadline
+                    # that matches the last submitted HTTP timeout plus a small margin.
+                    control_quiescence_deadline = time.monotonic() + max(0.5, last_control_timeout + 0.25)
+                    control_quiesced = _wait_for_future_quiescence(control_future, control_quiescence_deadline)
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
-                if not cleanup_quiesced:
+                if not inference_quiesced:
+                    # Inference thread is stuck: permanently stop polling and invoke
+                    # the fatal bridge teardown to terminate the disposable process tree.
                     recovery_succeeded = False
                     self.stop_polling = True
                     self._polling_stopped_by_request = True
                     fatal = getattr(self, 'fatal_bridge_teardown', None)
                     if callable(fatal):
                         try:
-                            cleanup_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
+                            inference_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
                         except Exception:
-                            cleanup_quiesced = False
+                            inference_quiesced = False
                 return _ApiV1SupervisorOutcome(
                     response_envelope=None,
                     terminal_code=terminal_reason,
-                    runtime_healthy=bool(recovery_succeeded and cleanup_quiesced),
+                    runtime_healthy=bool(recovery_succeeded and inference_quiesced),
                     recovery_attempted=True,
-                    recovery_succeeded=bool(recovery_succeeded and cleanup_quiesced),
+                    recovery_succeeded=bool(recovery_succeeded and inference_quiesced),
                     submission_allowed=False,
                 )
         finally:
+            if control_session is not None:
+                try:
+                    control_session.close()
+                except Exception:
+                    pass
             inference_done = future.done()
             control_done = control_future is None or control_future.done()
             if not inference_done:

@@ -7252,12 +7252,12 @@ def test_api_v1_completed_future_at_deadline_boundary_is_consumed_once():
 
 
 def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_post():
+    """Worker termination releases inference only; session close releases control I/O."""
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
     client._api_v1_registered_relays.add('https://relay.example')
     client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
     control_entered = threading.Event()
-    release_control = threading.Event()
     release_inference = threading.Event()
     result_holder = {}
 
@@ -7265,16 +7265,28 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         release_inference.wait(2)
         return {'request_id': 'late'}
 
-    def control(**_kwargs):
-        control_entered.set()
-        release_control.wait()
-        return {'status': 'active', 'next_poll_seconds': 1}
-
     client._generate_api_v1_response_with_runtime_model = generate
-    client._post_api_v1_request_control = control
+    # Worker termination releases inference only, not control I/O.
     client._terminate_current_llama_worker = lambda reason, recreate=True: (
-        release_control.set() or release_inference.set() or True
+        release_inference.set() or True
     )
+
+    class _FakeControlSession:
+        """Fake requests.Session whose close() unblocks the in-flight post()."""
+
+        def __init__(self):
+            self._closed = threading.Event()
+
+        def post(self, *args, **kwargs):
+            control_entered.set()
+            # Block until the supervisor closes the session (operator stop teardown).
+            self._closed.wait(5)
+            raise relay_client_module.requests.ConnectionError('session closed by supervisor')
+
+        def close(self):
+            self._closed.set()
+
+    fake_session = _FakeControlSession()
 
     def supervise():
         result_holder['outcome'] = client._supervise_api_v1_inference({
@@ -7285,22 +7297,104 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
             'routing': {'context_tier': '8k-fast'},
         }, local_deadline=time.monotonic() + 5)
 
-    thread = threading.Thread(target=supervise)
-    thread.start()
-    assert control_entered.wait(1)
-    client.stop()
-    thread.join(1)
+    with patch.object(relay_client_module, '_ControlSession', return_value=fake_session):
+        thread = threading.Thread(target=supervise)
+        thread.start()
+        assert control_entered.wait(1)
+        client.stop()
+        thread.join(2)
     try:
-        assert not thread.is_alive()
+        assert not thread.is_alive(), 'supervisor did not return after operator stop'
         outcome = result_holder['outcome']
         assert outcome.response_envelope is None
         assert outcome.terminal_code == 'operator_stop'
         assert outcome.submission_allowed is False
+        # No request-scoped threads survive before emergency cleanup runs.
         assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
         assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
     finally:
-        release_control.set()
         release_inference.set()
+        thread.join(1)
+
+
+def test_api_v1_slow_control_io_does_not_permanently_stop_polling():
+    """Control I/O latency alone must not set _polling_stopped_by_request."""
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release_inference = threading.Event()
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'ok'}
+
+    # Control immediately returns a terminal status (simulating a slow-but-successful poll).
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-slow-control',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    # Terminal due to cancellation, but inference quiesced cleanly → healthy worker.
+    assert outcome.terminal_code == 'cancelled'
+    assert outcome.submission_allowed is False
+    assert outcome.runtime_healthy is True
+    # Polling must NOT be permanently disabled by routine control completion.
+    assert not client._polling_stopped_by_request
+
+
+def test_api_v1_stuck_inference_sets_polling_stopped_by_request():
+    """Only a stuck inference thread permanently sets _polling_stopped_by_request."""
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    result_holder = {}
+    # Use an unblockable event so test cleanup can release the stuck inference thread.
+    unblock_inference = threading.Event()
+
+    def generate(**_kwargs):
+        # Simulate stuck inference: blocks until explicitly unblocked by test cleanup.
+        unblock_inference.wait(30)
+        return {'request_id': 'ok'}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+    # Worker termination does NOT release the inference blocker (simulates stuck subprocess).
+    client._terminate_current_llama_worker = lambda reason, recreate=True: False
+
+    def supervise():
+        result_holder['outcome'] = client._supervise_api_v1_inference({
+            'request_id': 'req-stuck',
+            'model': 'llama-3-8b-instruct',
+            'messages': [],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+            'request_deadline_remaining_seconds': 0.15,
+        })
+
+    thread = threading.Thread(target=supervise, daemon=True)
+    thread.start()
+    try:
+        thread.join(3)
+        assert not thread.is_alive(), 'supervisor must return even when inference is stuck'
+        outcome = result_holder['outcome']
+        assert outcome.runtime_healthy is False
+        # Permanently stop polling when inference thread cannot be quiesced.
+        assert client._polling_stopped_by_request is True
+    finally:
+        # Unblock the stuck inference thread so the executor thread can exit cleanly.
+        unblock_inference.set()
         thread.join(1)
 
 
@@ -7330,6 +7424,35 @@ def test_api_v1_missing_control_credential_fails_closed_without_worker_terminati
     assert outcome.submission_allowed is False
     generate.assert_not_called()
     terminate.assert_not_called()
+
+
+def test_terminate_current_llama_worker_fallback_returns_false_without_verified_kill():
+    """_terminate_current_llama_worker fallback must not claim success without process verification."""
+    client = _standalone_relay_client()
+    close_called = []
+
+    class _FakeLlm:
+        def close(self):
+            close_called.append(True)
+
+    # Manager has no terminate_active_worker_for_cancellation but has llm.close()
+    manager = MagicMock(spec=[])  # No terminate_active_worker_for_cancellation
+    manager.llm = _FakeLlm()
+    client.model_manager = manager
+
+    result = client._terminate_current_llama_worker('cancelled')
+
+    # close() is attempted for best-effort cleanup but cannot verify process death
+    assert close_called == [True]
+    # Returns False because process termination is unverified
+    assert result is False
+
+
+def test_terminate_current_llama_worker_returns_false_with_no_manager():
+    """_terminate_current_llama_worker returns False when model_manager is absent."""
+    client = _standalone_relay_client()
+    client.model_manager = None
+    assert client._terminate_current_llama_worker('cancelled') is False
 
 
 def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreates():

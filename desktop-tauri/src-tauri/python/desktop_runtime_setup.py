@@ -545,41 +545,37 @@ def _bundled_site_packages_dir() -> Path:
 def _public_runtime_identity(value: str) -> str:
     text = str(value or "")
     lower = text.lower()
-    if _is_exact_packaged_runtime_layout():
-        basename = text.replace("\\", "/").rsplit("/", 1)[-1]
+    basename = text.replace("\\", "/").rsplit("/", 1)[-1]
+    if _is_exact_packaged_runtime_layout() or "python-runtime" in lower:
         if lower.endswith("python.exe") or lower.endswith("python"):
             return basename or "python.exe"
         return basename if text else "bundled"
-    return text
+    return basename if (":" in text or text.startswith("/") or "\\" in text) else text
 
 
 def _sanitize_public_runtime_text(value: Any) -> str:
     text = str(value or "")
     if not text:
         return text
-    text = re.sub(r"[A-Za-z]:[/\\][^;\s,)]*", "<path>", text)
-    text = re.sub(r"/(Users|home)/[^;\s,)]*", "<path>", text)
+    text = re.sub(r"(?<![A-Za-z])[A-Za-z]:[/\\][^;\r\n,)]*", "<path>", text)
+    text = re.sub(r"\\\\[^\s;\r\n,)]*", "<path>", text)
+    text = re.sub(r"/(Users|home|tmp)/[^;\r\n,)]*", "<path>", text)
     return text
 
 
 def _sanitize_public_runtime_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     sanitized = dict(result)
-    if not _is_exact_packaged_runtime_layout():
-        return sanitized
-    for key in (
-        "fallback_reason",
-        "detail",
-        "error",
-        "last_error",
-        "interpreter",
-        "prefix",
-        "base_prefix",
-        "interpreter_prefix",
-        "dependency_target",
-        "import_root",
-        "requirements",
-        "llama_module_path",
-    ):
+    path_fields = {
+        "interpreter", "prefix", "base_prefix", "interpreter_prefix",
+        "dependency_target", "import_root", "requirements", "llama_module_path",
+    }
+    text_fields = {"fallback_reason", "detail", "error", "last_error", "message"}
+    for key in path_fields:
+        if key in sanitized and isinstance(sanitized[key], str):
+            sanitized[key] = _public_runtime_identity(sanitized[key])
+            if key == "dependency_target" and _is_exact_packaged_runtime_layout():
+                sanitized[key] = "bundled"
+    for key in text_fields:
         if key in sanitized and isinstance(sanitized[key], str):
             sanitized[key] = _sanitize_public_runtime_text(sanitized[key])
     return sanitized
@@ -609,10 +605,16 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
     exact_packaged = _is_exact_packaged_runtime_layout()
-    dependency_target = _bundled_site_packages_dir() if exact_packaged else _resolve_desktop_dependency_target(repo_root)[0]
+    unbundled_windows = _desktop_platform().startswith("win") and not exact_packaged
+    if exact_packaged:
+        dependency_target = _bundled_site_packages_dir()
+    elif unbundled_windows:
+        dependency_target = None
+    else:
+        dependency_target = _resolve_desktop_dependency_target(repo_root)[0]
     dependency_target_env = str(dependency_target) if dependency_target is not None and not exact_packaged else ""
-    dependency_target_text = "bundled" if exact_packaged else (dependency_target_env or "unknown")
-    pip_version = "bundled-runtime-probe" if exact_packaged else _pip_version_summary()
+    dependency_target_text = "bundled" if exact_packaged else ("development-import-environment" if unbundled_windows else (dependency_target_env or "unknown"))
+    pip_version = "bundled-runtime-probe" if exact_packaged else ("read-only-development-probe" if unbundled_windows else _pip_version_summary())
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     if exact_packaged:
@@ -623,6 +625,10 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         pythonpath_entries = [str(dependency_target), str(python_root)] if dependency_target is not None else [str(python_root)]
         probe_cwd = str(python_root)
         env["PYTHONNOUSERSITE"] = "1"
+    elif unbundled_windows:
+        pythonpath_entries = None
+        probe_cwd = None
+        env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     else:
         existing_pythonpath = env.get("PYTHONPATH", "")
         pythonpath_entries = [str(python_root)]
@@ -632,7 +638,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         if existing_pythonpath:
             pythonpath_entries.append(existing_pythonpath)
         probe_cwd = str(repo_root)
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    if pythonpath_entries is not None:
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))
     if dependency_target_env:
@@ -647,9 +654,10 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
-        "cwd": probe_cwd,
         "env": env,
     }
+    if probe_cwd is not None:
+        popen_kwargs["cwd"] = probe_cwd
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
     try:
@@ -857,8 +865,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         error=payload.get("error"),
         python_version=str(payload.get("python_version", _python_version_text())),
         base_prefix=str(payload.get("base_prefix", getattr(sys, "base_prefix", sys.prefix))),
-        dependency_target=str(payload.get("dependency_target", dependency_target_text)),
-        pip_version=str(payload.get("pip_version", pip_version)),
+        dependency_target=dependency_target_text if unbundled_windows else str(payload.get("dependency_target", dependency_target_text)),
+        pip_version=pip_version if unbundled_windows else str(payload.get("pip_version", pip_version)),
         llama_cpp_python_version=str(payload.get("llama_cpp_python_version", "unknown")),
         yarn_rope_supported=payload.get("yarn_rope_supported") is True,
         yarn_resolver_source=str(payload.get("yarn_resolver_source", "unsupported")),
@@ -1721,8 +1729,10 @@ def _ensure_desktop_llama_runtime_impl(
             return _probe_runtime(target_root)
 
     before = _probe_with_context("runtime_probe")
-    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
-    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
+    is_unbundled_windows = _desktop_platform().startswith("win") and not _is_exact_packaged_runtime_layout()
+    dependency_target = None
+    dependency_target_error = "read-only Windows development startup" if is_unbundled_windows else ""
+    dependency_target_text = "development-import-environment" if is_unbundled_windows else "unknown"
     requirements_path = _resolve_requirements_path(target_root)
     version_resolution_error = ""
     try:
@@ -1735,6 +1745,30 @@ def _ensure_desktop_llama_runtime_impl(
             f"{type(exc).__name__}"
         )
     before_version_payload = _version_payload(before, required_version, required_package_spec)
+    if is_unbundled_windows:
+        if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
+            return {
+                "selected_backend": before.backend,
+                "fallback_reason": "",
+                "runtime_action": _already_supported_action(before.backend),
+                **_probe_result_payload(before),
+                **before_version_payload,
+            }
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"Windows development runtime dependency unavailable ({before.error or before.backend}); "
+                "install the pinned desktop Python dependencies in the selected development interpreter; "
+                "startup is read-only and will not run pip, compilers, source repair"
+            ),
+            "runtime_action": "windows_development_runtime_missing_read_only",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
+
+    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
+    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
+
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {
             "selected_backend": "cpu",
@@ -2355,8 +2389,13 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     requirements_path = _resolve_desktop_requirements_path(root)
     required_modules = ("psutil", "requests", "dotenv", "cryptography")
 
-    if _is_exact_packaged_runtime_layout():
+    exact_packaged = _is_exact_packaged_runtime_layout()
+    unbundled_windows = _desktop_platform().startswith("win") and not exact_packaged
+    if exact_packaged:
         target_dir, target_error = _safe_resolve_path(sys.executable).parent / "Lib" / "site-packages", None
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+    elif unbundled_windows:
+        target_dir, target_error = None, "read-only Windows development startup"
         os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     elif mutate:
         target_dir, target_error = _resolve_desktop_dependency_target(root)
@@ -2364,16 +2403,18 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         target_dir, target_error = _existing_desktop_dependency_target(root)
     if target_dir is not None:
         target_dir_str = str(target_dir)
-        if not _is_exact_packaged_runtime_layout():
+        if not exact_packaged:
             os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
-        if target_dir_str not in sys.path:
+        if not unbundled_windows and target_dir_str not in sys.path:
             sys.path.insert(1 if sys.path else 0, target_dir_str)
 
     missing = _module_missing(required_modules)
     if not missing:
-        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": "bundled" if _is_exact_packaged_runtime_layout() else (str(target_dir) if target_dir is not None else "")}
-    if _is_exact_packaged_runtime_layout():
+        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": "bundled" if exact_packaged else ("development-import-environment" if unbundled_windows else (str(target_dir) if target_dir is not None else ""))}
+    if exact_packaged:
         return {"ok": "false", "action": "bundled_runtime_probe_failed", "missing": ",".join(missing), "dependency_target": "bundled", "detail": "immutable packaged runtime will not run pip installers"}
+    if unbundled_windows:
+        return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": "development-import-environment", "detail": "Windows development startup is read-only; install desktop dependencies in the selected interpreter"}
     if not mutate:
         return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else ""}
 

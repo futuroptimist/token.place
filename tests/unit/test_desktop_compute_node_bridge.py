@@ -5374,3 +5374,16 @@ def test_runtime_public_value_redacts_secret_path_diagnostics():
         value = compute_node_bridge._runtime_public_value(key, secret)
         assert 'SecretName' not in str(value)
         assert 'C:\\Users' not in str(value)
+
+def test_structured_startup_and_status_payloads_redact_embedded_paths(monkeypatch, capsys):
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\runtime\python.exe'
+    args = compute_node_bridge.argparse.Namespace(
+        relay_url='https://token.place', relay_urls=None, mode='auto', startup_error_code='stable_code',
+        context_tier='64k-full', model=None,
+    )
+    payload = compute_node_bridge._structured_startup_error_payload(args, f'stable code failed at {secret}')
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert 'stable code failed' in encoded
+    assert payload['error_code'] == 'stable_code'
+    assert '<path>' in encoded

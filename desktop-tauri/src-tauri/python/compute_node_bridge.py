@@ -740,16 +740,38 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
     }
 
 
+def _sanitize_public_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?<![A-Za-z])[A-Za-z]:[/\\][^;\r\n,)]*", "<path>", text)
+    text = re.sub(r"\\\\[^\s;\r\n,)]*", "<path>", text)
+    text = re.sub(r"/(Users|home|tmp)/[^;\r\n,)]*", "<path>", text)
+    return text
+
+
 def _runtime_public_value(key: str, value: Any) -> Any:
     if key in {"interpreter"}:
         return Path(str(value or sys.executable)).name or "python.exe"
-    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path", "fallback_reason", "last_error", "message", "interpreter"}:
+    if key in {"fallback_reason", "last_error", "message", "detail", "error"}:
+        return _sanitize_public_text(value) if value else (None if value is None else "")
+    if key in {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path"}:
         text = str(value or "unknown")
         if "python-runtime" in text.lower() or text == "bundled":
             return "bundled"
         return text.replace("\\", "/").rsplit("/", 1)[-1] if text not in {"", "unknown"} else "unknown"
     if key in {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}:
         return "redacted" if value else None
+    if isinstance(value, str):
+        return _sanitize_public_text(value)
+    return value
+
+
+def _sanitize_public_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _runtime_public_value(str(k), _sanitize_public_payload(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_public_payload(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_public_text(value)
     return value
 
 def _structured_startup_error_payload(
@@ -780,8 +802,8 @@ def _structured_startup_error_payload(
         "interpreter": _runtime_public_value("interpreter", sys.executable),
         "import_root": _runtime_public_value("import_root", os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "unknown") or "unknown"),
         "log_file_path": _runtime_public_value("log_file_path", os.environ.get("TOKENPLACE_OPERATOR_LOG_FILE", "unknown") or "unknown"),
-        "last_error": message,
-        "message": message,
+        "last_error": _runtime_public_value("last_error", message),
+        "message": _runtime_public_value("message", message),
         "warm_load_state": "failed",
         "warm_load_enabled": _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT),
         "warm_load_duration_ms": None,
@@ -1242,18 +1264,18 @@ def run(args: argparse.Namespace) -> int:
             "child_model_path_exists": getattr(runtime.model_manager, "child_model_path_exists", False),
             "context_tier": context_profile.profile_id,
             "context_window_tokens": context_profile.total_context_tokens,
-            "last_error": relay_errors or current_last_error,
+            "last_error": _runtime_public_value("last_error", relay_errors or current_last_error),
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
             "warm_load_duration_ms": warm_load_duration_ms,
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
         }
-        payload.update(_safe_readiness_diagnostics(runtime.model_manager))
-        payload.update(worker_lifecycle_status())
+        payload.update(_sanitize_public_payload(_safe_readiness_diagnostics(runtime.model_manager)))
+        payload.update(_sanitize_public_payload(worker_lifecycle_status()))
         if extra:
-            payload.update(extra)
-        return payload
+            payload.update(_sanitize_public_payload(extra))
+        return _sanitize_public_payload(payload)
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
         emit_operator_event(

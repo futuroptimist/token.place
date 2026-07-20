@@ -4090,3 +4090,38 @@ def test_sanitized_runtime_payload_removes_secret_paths(monkeypatch):
     encoded = json.dumps(payload)
     assert 'SecretName' not in encoded
     assert '<path>' in encoded
+
+def test_unbundled_windows_probe_is_read_only_with_opt_ins(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    touched = []
+    for name in ['_resolve_desktop_dependency_target', '_pip_version_summary']:
+        monkeypatch.setattr(desktop_runtime_setup, name, lambda *a, _name=name, **k: (_ for _ in ()).throw(AssertionError(_name)))
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    assert probe.dependency_target == 'development-import-environment'
+    assert probe.pip_version == 'read-only-development-probe'
+    assert touched == []
+
+
+def test_unbundled_windows_first_and_second_launch_fail_read_only_before_mutation(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_arch', lambda: 'x86_64')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe(backend='missing', error='No module named llama_cpp'))
+    blocked = ['_resolve_desktop_dependency_target', '_run_pip_install', '_run_windows_cuda_source_repair']
+    for name in blocked:
+        monkeypatch.setattr(desktop_runtime_setup, name, lambda *a, _name=name, **k: (_ for _ in ()).throw(AssertionError(_name)))
+    class BlockedLock:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('_ManagedSiteMutationLock')
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', BlockedLock)
+    results = [desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full') for _ in range(2)]
+    assert results[0] == results[1]
+    assert results[0]['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    encoded = json.dumps(results)
+    assert 'cuda_build' not in encoded
+    assert '--target' not in encoded

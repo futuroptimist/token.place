@@ -5304,3 +5304,97 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     ]
     assert warming_status_events
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
+
+
+def test_unregister_active_relay_clients_removes_registered_client():
+    """_unregister_active_relay_clients removes a previously registered relay client (lines 114-118)."""
+    class _FakeRelayClient:
+        pass
+
+    class _FakeRuntime:
+        pass
+
+    client = _FakeRelayClient()
+    runtime = _FakeRuntime()
+    runtime.relay_client = client
+
+    # Pre-register
+    compute_node_bridge._active_relay_clients[id(client)] = client
+    try:
+        compute_node_bridge._unregister_active_relay_clients([runtime])
+        assert id(client) not in compute_node_bridge._active_relay_clients
+    finally:
+        compute_node_bridge._active_relay_clients.pop(id(client), None)
+
+
+def test_unregister_active_relay_clients_ignores_runtime_without_relay_client():
+    """_unregister_active_relay_clients skips runtimes that have no relay_client attribute."""
+    class _NoRelayRuntime:
+        pass
+
+    before = dict(compute_node_bridge._active_relay_clients)
+    compute_node_bridge._unregister_active_relay_clients([_NoRelayRuntime()])
+    assert dict(compute_node_bridge._active_relay_clients) == before
+
+
+def test_stdin_reader_signals_relay_clients_on_cancel_message(monkeypatch):
+    """_reader() closure inside _start_stdin_reader fires _signal_active_relay_clients on cancel (lines 491-497).
+
+    The test also verifies the JSONDecodeError branch (lines 493-494): a non-JSON line is sent first and
+    the loop must continue (not crash) before processing the following cancel payload.
+    """
+    signalled = threading.Event()
+    non_json_processed = threading.Event()
+
+    class _StopTrackingClient:
+        def stop(self):
+            signalled.set()
+
+    client = _StopTrackingClient()
+    key = id(client)
+    compute_node_bridge._active_relay_clients[key] = client
+
+    # Save and reset reader state so the thread actually starts.
+    original_started = compute_node_bridge._stdin_reader_started
+    compute_node_bridge._stdin_reader_started = False
+    compute_node_bridge._stop_requested_latched.clear()
+
+    # Track stdin line delivery so we know the non-JSON line was processed before the cancel.
+    deliver_non_json = threading.Event()
+    deliver_non_json.set()  # immediately ready
+
+    lines = [
+        'not-json-line\n',      # exercises the JSONDecodeError branch (lines 493-494)
+        '{"type": "cancel"}\n', # exercises lines 495-497
+        '',                     # EOF — stops the reader loop
+    ]
+    lines_iter = iter(lines)
+    non_json_seen = threading.Event()
+
+    original_signal = compute_node_bridge._signal_active_relay_clients
+
+    def _track_non_json_then_signal():
+        # By the time _signal_active_relay_clients is called, the non-JSON line
+        # must already have been read (put into _stdin_lines); verify that.
+        non_json_seen.set()
+        original_signal()
+
+    monkeypatch.setattr(compute_node_bridge, '_signal_active_relay_clients', _track_non_json_then_signal)
+
+    class _MockStdin:
+        def readline(self):
+            try:
+                return next(lines_iter)
+            except StopIteration:
+                return ''
+
+    monkeypatch.setattr(compute_node_bridge.sys, 'stdin', _MockStdin())
+    try:
+        compute_node_bridge._start_stdin_reader()
+        assert signalled.wait(timeout=2.0), '_stop_tracking_client.stop() was never called'
+        assert non_json_seen.wait(timeout=2.0), '_signal_active_relay_clients was not reached'
+    finally:
+        compute_node_bridge._active_relay_clients.pop(key, None)
+        # Restore original state: before this test, _reset_cancel_queue() had set it to True,
+        # so restoring to True (or the saved original) is correct cleanup.
+        compute_node_bridge._stdin_reader_started = original_started

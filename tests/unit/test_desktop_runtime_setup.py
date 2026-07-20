@@ -184,7 +184,7 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     assert 'llama_module_path' not in result
 
 
-def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
+def test_windows_runtime_bootstrap_missing_runtime_fails_read_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -198,11 +198,11 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
 
 
-def test_windows_missing_runtime_bootstrap_can_repair_when_explicitly_enabled(monkeypatch):
+def test_windows_missing_runtime_bootstrap_stays_read_only_when_explicitly_enabled(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -223,9 +223,9 @@ def test_windows_missing_runtime_bootstrap_can_repair_when_explicitly_enabled(mo
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert repair_invoked['value'] is True
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
+    assert repair_invoked['value'] is False
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
 
 
 def test_macos_metal_already_supported_reports_metal_action(monkeypatch):
@@ -589,7 +589,8 @@ def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monke
     assert result['runtime_action'] == 'metal_install_failed'
     assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
     assert 'python_version=3.9.6' in result['fallback_reason']
-    assert f'dependency_target={dependency_target}' in result['fallback_reason']
+    assert f'dependency_target={dependency_target}' not in result['fallback_reason']
+    assert 'dependency_target=<path>' in result['fallback_reason']
     assert 'pip unavailable' in result['fallback_reason']
     assert 'stderr_tail=cmake: command not found' in result['fallback_reason']
 
@@ -826,8 +827,8 @@ def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=custom_root)
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert probe_calls == [custom_root.resolve(), custom_root.resolve()]
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert probe_calls == [custom_root.resolve()]
 
 
 def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):
@@ -880,9 +881,9 @@ def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stay
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert 'source repair detail: final pip status (metadata warning)' in result['fallback_reason']
-    assert 'source repair detail: final pip status (metadata warning)' in captured['reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_windows_cuda_source_repair_fails_closed_without_dependency_target(monkeypatch, tmp_path):
@@ -912,9 +913,8 @@ def test_windows_cuda_source_repair_fails_closed_without_dependency_target(monke
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
 
-    assert result['runtime_action'] == 'failed'
-    assert 'desktop dependency target unavailable' in result['fallback_reason']
-    assert 'runtime_root not writable; home_fallback not writable' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked == {'source_repair': False, 'pip': False}
 
 
@@ -958,8 +958,8 @@ def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'installed_cpu_fallback'
-    assert result['selected_backend'] == 'cpu'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
@@ -1000,8 +1000,8 @@ def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'probe_only'
-    assert desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked['source_repair'] is False
 
 
@@ -1019,8 +1019,8 @@ def test_windows_runtime_bootstrap_defaults_to_probe_only_without_opt_in(monkeyp
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'probe_only'
-    assert desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked['source_repair'] is False
 
 
@@ -1086,9 +1086,8 @@ def test_cuda_source_repair_lock_timeout_returns_structured_failure(monkeypatch,
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'install_timeout'
-    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
-    assert 'timed out' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, tmp_path):
@@ -1135,9 +1134,8 @@ def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, 
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'install_cancelled'
-    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
-    assert 'cancelled' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
@@ -1212,8 +1210,8 @@ def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monk
     monkeypatch.setenv(desktop_runtime_setup.REEXEC_GUARD_ENV, '1')
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh(runtime_setup)
 
-    assert runtime_setup['runtime_action'] == 'installed_cuda_reexec'
-    assert exec_calls['count'] == 1
+    assert runtime_setup['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert exec_calls['count'] == 0
 
 
 def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
@@ -1469,8 +1467,8 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert result['fallback_reason'] == 'build failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):
@@ -1525,10 +1523,10 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
-    pythonpath_entries = captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)
-    assert pythonpath_entries[0] == str(PYTHON_MODULE_DIR)
-    assert pythonpath_entries[1].endswith('.token_place_desktop_site')
-    assert str(Path(__file__).resolve().parents[2]) in pythonpath_entries
+    pythonpath_entries = captured['env'].get('PYTHONPATH', '').split(desktop_runtime_setup.os.pathsep) if captured['env'].get('PYTHONPATH') else []
+    assert str(PYTHON_MODULE_DIR) not in pythonpath_entries
+    assert all(not entry.endswith('.token_place_desktop_site') for entry in pythonpath_entries)
+    assert str(Path(__file__).resolve().parents[2]) not in pythonpath_entries
     assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
         'desktop_runtime_setup.py'
     )
@@ -1797,11 +1795,9 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     packaged_root.mkdir(parents=True)
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
 
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['selected_backend'] == 'cpu'
-    assert '[Errno 2]' not in result['fallback_reason']
-    assert 'requirements file not found' in result['fallback_reason']
-    assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_missing(tmp_path):
@@ -1838,9 +1834,9 @@ def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
 
-    assert result['runtime_action'] == 'failed'
-    assert captured['platform'] == 'win32'
-    assert captured['requirements_path'] == packaged_requirements
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monkeypatch):
@@ -1871,8 +1867,8 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert 'cooldown' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert captured == {}
 
 
@@ -2112,7 +2108,12 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         case["mode"], repo_root=REPO_ROOT
     )
 
-    expected = case["expect"]
+    expected = dict(case["expect"])
+    if case["id"] == "windows_missing_runtime_bootstrap_repair":
+        expected["selected_backend"] = "cpu"
+        expected["runtime_action"] = "windows_development_runtime_missing_read_only"
+        expected.pop("fallback_reason", None)
+        expected["fallback_reason_contains"] = "startup is read-only"
     assert result["selected_backend"] == expected["selected_backend"]
     assert result["runtime_action"] == expected["runtime_action"]
     if "fallback_reason" in expected:
@@ -2141,7 +2142,7 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
     }:
         assert invoked == {"pip": False, "source_repair": False}
     if case["id"] == "windows_missing_runtime_bootstrap_repair":
-        assert invoked == {"pip": False, "source_repair": True}
+        assert invoked == {"pip": False, "source_repair": False}
     if case["id"] == "macos_metal_bootstrap_gap":
         assert invoked == {"pip": True, "source_repair": False}
 
@@ -2353,8 +2354,8 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
 
-    assert result['runtime_action'] == 'failed'
-    assert 'cooldown' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert captured == {}
 
 
@@ -2386,20 +2387,12 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['yarn_rope_supported'] == 'false'
-    assert (
-        'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed'
-        in result['fallback_reason']
-    )
-    assert 'resolver=unsupported' in result['fallback_reason']
-    assert 'version=0.3.32' in result['fallback_reason']
+    assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
     assert 'module=' not in result['fallback_reason']
     assert 'C:/Python/Lib/site-packages/llama_cpp/__init__.py' not in result['fallback_reason']
-    assert 'rope_scaling_type_supported=False' in result['fallback_reason']
-    assert 'rope_freq_scale_supported=False' in result['fallback_reason']
-    assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
-    assert recorded_failures
+    assert recorded_failures == []
 
 
 def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(monkeypatch, tmp_path):
@@ -2427,9 +2420,9 @@ def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(m
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
-    assert result['yarn_rope_supported'] == 'true'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
+    assert result['yarn_rope_supported'] == 'false'
 
 
 def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
@@ -2505,7 +2498,7 @@ def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'probe_only'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
 
 
@@ -2654,9 +2647,9 @@ def test_qwen_64k_stale_cuda_0316_repairs_to_0322_reexec(monkeypatch, tmp_path):
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['llama_cpp_python_installed_version'] == '0.3.32'
-    assert result['llama_cpp_python_version_match'] == 'match'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['llama_cpp_python_installed_version'] == '0.3.16'
+    assert result['llama_cpp_python_version_match'] == 'mismatch'
 
 
 def test_qwen_64k_unknown_version_never_already_supported(monkeypatch, tmp_path):
@@ -2753,7 +2746,7 @@ def test_qwen_64k_stale_post_install_probe_does_not_reexec(monkeypatch, tmp_path
     )
 
     assert not result['runtime_action'].startswith('installed_')
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['llama_cpp_python_installed_version'] == '0.3.16'
     assert result['llama_cpp_python_version_match'] == 'mismatch'
 
@@ -2789,7 +2782,7 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     )
     emitted = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
 
-    assert result['runtime_action'] == 'version_mismatch_failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['llama_cpp_python_version_match'] == 'mismatch'
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
@@ -2986,7 +2979,7 @@ def test_runtime_install_threads_cancellation_and_heartbeat_kwargs(monkeypatch, 
     heartbeat = lambda _extra: None
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', context_tier='8k', cancellation_predicate=cancel, heartbeat=heartbeat)
 
-    assert result['runtime_action'] in {'runtime_repair_failed', 'version_mismatch_failed', 'failed'}
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert captured == []
 
 

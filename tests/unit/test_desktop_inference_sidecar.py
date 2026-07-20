@@ -579,7 +579,7 @@ def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, cap
     assert all(event['type'] != 'error' for event in events)
 
 
-def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_work(
+def test_run_read_only_windows_startup_fails_without_bootstrap_install_work(
     tmp_path, capsys, monkeypatch
 ):
     _reset_cancel_queue()
@@ -616,6 +616,11 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
         runtime_setup_module.ensure_desktop_llama_runtime,
     )
     monkeypatch.setattr(
+        inference_sidecar,
+        'desktop_gpu_runtime_failure_message',
+        runtime_setup_module.desktop_gpu_runtime_failure_message,
+    )
+    monkeypatch.setattr(
         runtime_setup_module,
         '_windows_cuda_source_repair',
         lambda _requirements_path: (
@@ -635,13 +640,13 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
 
-    assert status == 0
+    assert status == 1
     captured = capsys.readouterr()
     events = [json.loads(line) for line in captured.out.splitlines()]
-    assert events[0]['type'] == 'started'
-    assert events[-1]['type'] == 'done'
+    assert events[0]['type'] == 'error'
+    assert events[0]['code'] == 'gpu_runtime_unavailable'
     assert 'desktop.runtime_setup' in captured.err
-    assert 'action=probe_only' in captured.err
+    assert 'action=windows_development_runtime_missing_read_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
 
 

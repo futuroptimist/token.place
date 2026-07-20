@@ -214,6 +214,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "provisioning_cancelled",
         "cuda_install_failed",
         "bundled_runtime_probe_failed",
+        "windows_development_runtime_missing_read_only",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300

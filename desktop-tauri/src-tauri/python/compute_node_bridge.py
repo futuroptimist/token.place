@@ -331,36 +331,6 @@ def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
 
 
 
-
-
-
-def _call_runtime_stop_with_shutdown_deadline(stop_runtime: Any, shutdown_deadline: float) -> None:
-    try:
-        signature = inspect.signature(stop_runtime)
-    except (TypeError, ValueError):
-        stop_runtime(shutdown_deadline=shutdown_deadline)
-        return
-    if any(
-        param.kind == inspect.Parameter.VAR_KEYWORD or name == "shutdown_deadline"
-        for name, param in signature.parameters.items()
-    ):
-        stop_runtime(shutdown_deadline=shutdown_deadline)
-    else:
-        stop_runtime()
-
-
-def _call_unregister_with_shutdown_deadline(unregister: Any, shutdown_deadline: float) -> bool:
-    try:
-        signature = inspect.signature(unregister)
-    except (TypeError, ValueError):
-        return bool(unregister(shutdown_deadline=shutdown_deadline))
-    if any(
-        param.kind == inspect.Parameter.VAR_KEYWORD or name == "shutdown_deadline"
-        for name, param in signature.parameters.items()
-    ):
-        return bool(unregister(shutdown_deadline=shutdown_deadline))
-    return bool(unregister())
-
 def _sanitize_relay_target(relay_url: Any) -> str:
     """Return a redacted relay target that never includes userinfo/query/fragment."""
 
@@ -1650,7 +1620,7 @@ def run(args: argparse.Namespace) -> int:
     recovery_done.set()
     recovery_fatal = False
 
-    def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> None:
+    def request_poll_cancel(relay_runtime: Any, active_relay_url: str, shutdown_deadline: float) -> None:
         if poll_cancel_requested_by_relay.get(active_relay_url):
             return
         poll_cancel_requested_by_relay[active_relay_url] = True
@@ -1686,7 +1656,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             try:
-                unregistered = _call_unregister_with_shutdown_deadline(unregister, bridge_shutdown_deadline)
+                unregistered = bool(unregister(shutdown_deadline=shutdown_deadline))
             except Exception as exc:
                 print(
                     "desktop.compute_node_bridge.unregister.failed "
@@ -1738,6 +1708,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
     def best_effort_unadvertise_all_relays() -> None:
+        recovery_shutdown_deadline = time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS
         for relay_runtime in runtimes:
             relay_url_value = getattr(
                 getattr(relay_runtime, "relay_client", None),
@@ -1758,7 +1729,7 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 try:
-                    unregistered = _call_unregister_with_shutdown_deadline(unregister, bridge_shutdown_deadline)
+                    unregistered = bool(unregister(shutdown_deadline=recovery_shutdown_deadline))
                 except Exception as exc:
                     print(
                         "desktop.compute_node_bridge.recovery.unregister.failed "
@@ -1990,7 +1961,11 @@ def run(args: argparse.Namespace) -> int:
                 relay_response = worker.call(
                     relay_runtime.register_and_poll_once,
                     stop_requested,
-                    on_cancel=lambda relay=active_relay_url, rt=relay_runtime: request_poll_cancel(rt, relay),
+                    on_cancel=lambda relay=active_relay_url, rt=relay_runtime: request_poll_cancel(
+                        rt,
+                        relay,
+                        time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS,
+                    ),
                 )
             except KeyboardInterrupt:
                 break
@@ -2299,7 +2274,6 @@ def run(args: argparse.Namespace) -> int:
                 )
                 break
 
-    bridge_shutdown_deadline = time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS
     try:
         if warm_runtime_before_registration():
             for relay_runtime in runtimes:
@@ -2317,6 +2291,7 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        bridge_shutdown_deadline = time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS
         _unregister_active_relay_clients(runtimes)
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)
@@ -2326,7 +2301,7 @@ def run(args: argparse.Namespace) -> int:
                 f"relay={_sanitize_relay_target(active_relay_url)}",
                 file=sys.stderr,
             )
-            request_poll_cancel(relay_runtime, active_relay_url)
+            request_poll_cancel(relay_runtime, active_relay_url, bridge_shutdown_deadline)
         for worker in relay_poll_workers.values():
             worker.shutdown()
         for thread in poll_threads:
@@ -2340,7 +2315,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             try:
-                _call_runtime_stop_with_shutdown_deadline(relay_runtime.stop, bridge_shutdown_deadline)
+                relay_runtime.stop(shutdown_deadline=bridge_shutdown_deadline)
             except Exception as exc:
                 print(
                     "desktop.compute_node_bridge.runtime.stop_failed "

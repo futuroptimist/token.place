@@ -133,18 +133,18 @@ fn isolate_bridge_process_tree(command: &mut Command) {
 }
 
 #[cfg(unix)]
-fn terminate_bridge_process_tree(pid: u32) {
+async fn terminate_bridge_process_tree(pid: u32) {
     unsafe {
         let pgid = pid as i32;
         let _ = kill(-pgid, SIGTERM);
-        std::thread::sleep(Duration::from_millis(250));
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let _ = kill(-pgid, SIGKILL);
     }
 }
 
 #[cfg(windows)]
-fn terminate_bridge_process_tree(pid: u32) {
-    let Ok(mut child) = std::process::Command::new("taskkill")
+async fn terminate_bridge_process_tree(pid: u32) {
+    let Ok(mut child) = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -152,22 +152,17 @@ fn terminate_bridge_process_tree(pid: u32) {
     else {
         return;
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_bridge_process_tree(_pid: u32) {}
+async fn terminate_bridge_process_tree(_pid: u32) {}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -1574,7 +1569,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 ),
             );
             if let Some(pid) = child.id() {
-                terminate_bridge_process_tree(pid);
+                terminate_bridge_process_tree(pid).await;
             }
             let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
             let exited_after_kill = tokio::time::timeout(Duration::from_secs(2), child.wait())

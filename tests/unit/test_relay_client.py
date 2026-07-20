@@ -7505,3 +7505,63 @@ def test_post_api_v1_request_control_retries_all_5xx_and_429(monkeypatch, status
             request_id='req-status',
             timeout_seconds=0.1,
         )
+
+
+def test_post_api_v1_response_rechecks_cancellation_after_encryption_before_http(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    cancel_event = threading.Event()
+    snapshot = (7, cancel_event)
+    client.model_manager = SimpleNamespace(
+        cancellation_generation_cancelled=lambda candidate: candidate == snapshot and cancel_event.is_set()
+    )
+
+    def encrypt_message(_payload, _client_key):
+        cancel_event.set()
+        return {'chat_history': 'ciphertext', 'cipherkey': 'key', 'iv': 'iv'}
+
+    client.crypto_manager.encrypt_message = encrypt_message
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    submitted = client._post_api_v1_response(
+        {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-cancel-window',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}},
+        },
+        client_pub_key_b64='client-key',
+        client_pub_key=b'client-key',
+        cancel_snapshot=snapshot,
+        local_deadline=relay_client_module.time.monotonic() + 10,
+    )
+
+    assert submitted is False
+    post.assert_not_called()
+
+
+def test_post_api_v1_response_rechecks_operator_stop_after_encryption_before_http(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    def encrypt_message(_payload, _client_key):
+        client._polling_stopped_by_request = True
+        return {'chat_history': 'ciphertext', 'cipherkey': 'key', 'iv': 'iv'}
+
+    client.crypto_manager.encrypt_message = encrypt_message
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    assert client._post_api_v1_response(
+        {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-stop-window',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}},
+        },
+        client_pub_key_b64='client-key',
+        client_pub_key=b'client-key',
+        local_deadline=relay_client_module.time.monotonic() + 10,
+    ) is False
+    post.assert_not_called()

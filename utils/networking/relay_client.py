@@ -2601,6 +2601,8 @@ class RelayClient:
         *,
         client_pub_key_b64: str,
         client_pub_key: bytes,
+        cancel_snapshot: Optional[tuple[int, threading.Event]] = None,
+        local_deadline: Optional[float] = None,
     ) -> bool:
         """Encrypt and submit an API v1 response to the relay that supplied work."""
 
@@ -2633,6 +2635,23 @@ class RelayClient:
                 "/relay/responses",
             )
             relay_target = _sanitize_relay_target(response_relay_url)
+            cancelled_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_cancelled', None)
+            request_cancelled = bool(
+                cancel_snapshot is not None
+                and callable(cancelled_fn)
+                and cancelled_fn(cancel_snapshot) is True
+            )
+            if getattr(self, '_polling_stopped_by_request', False) or (
+                local_deadline is not None and time.monotonic() >= local_deadline
+            ) or request_cancelled:
+                log_info(
+                    "API v1 E2EE response submission suppressed request_id={} protocol={} route={} relay={}",
+                    response_envelope["request_id"],
+                    "tokenplace_api_v1_relay_e2ee",
+                    "/api/v1/relay/responses",
+                    relay_target,
+                )
+                return False
             source_response = requests.post(
                 response_url,
                 timeout=self._request_timeout,
@@ -4872,6 +4891,8 @@ class RelayClient:
                         response_envelope,
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
+                        cancel_snapshot=cancel_snapshot,
+                        local_deadline=outer_api_v1_deadline,
                     )
                     return RelayProcessingResult(
                         inference_succeeded=safe_error_code is None and submitted,

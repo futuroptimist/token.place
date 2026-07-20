@@ -103,8 +103,6 @@ pub struct ComputeNodeState {
 
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-#[cfg(windows)]
-const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
@@ -128,7 +126,7 @@ fn isolate_bridge_process_tree(command: &mut Command) {
     }
     #[cfg(windows)]
     {
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 }
 

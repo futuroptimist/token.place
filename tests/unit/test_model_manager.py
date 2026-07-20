@@ -5122,6 +5122,31 @@ def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, mo
     assert created == [first]
 
 
+def test_model_manager_post_restart_cancellation_epoch_prevents_replay(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement = _RestartableFakeWorker("replacement")
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, replacement])
+
+    def _invalidate_and_cancel_after_restart(_llm, _exc):
+        with manager.llm_lock:
+            manager.llm = None
+            manager._llm_generation += 1
+        # Relay cancellation arrives while no worker is active. The captured
+        # generation event remains clear, so the cancellation epoch must block replay.
+        assert manager.terminate_active_worker_for_cancellation(reason="cancelled", recreate=False) is True
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_and_cancel_after_restart)
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", MagicMock(return_value=replacement))
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert first.calls == 1
+    assert replacement.calls == 0
+    manager._ensure_replacement_llm.assert_not_called()
+    assert created == [first]
+
+
 def test_model_manager_cancel_signal_after_replacement_acquisition_prevents_replay(tmp_path, monkeypatch):
     first = _RestartableFakeWorker("first", fail="dead")
     replacement_create = MagicMock(return_value={"choices": []})

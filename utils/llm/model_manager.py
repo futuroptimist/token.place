@@ -4404,6 +4404,7 @@ class ModelManager:
         self.llm_lock = Lock()
         self._llm_generation = 0
         self._llm_cancel_generation_event = threading.Event()
+        self._llm_cancellation_epoch = 0
         self.worker_restart_count = 0
         self.last_worker_error_code: Optional[str] = None
         self.last_worker_exit_code: Optional[int] = None
@@ -5767,18 +5768,26 @@ class ModelManager:
         self._close_llm_proxy(failed_runtime)
 
 
-    def cancellation_generation_snapshot(self) -> tuple[int, threading.Event]:
+    def cancellation_generation_snapshot(self) -> tuple[int, threading.Event, int]:
         """Return a request-scoped cancellation generation snapshot."""
         with self.llm_lock:
-            return self._llm_generation, self._llm_cancel_generation_event
+            return (
+                self._llm_generation,
+                self._llm_cancel_generation_event,
+                self._llm_cancellation_epoch,
+            )
 
-    def cancellation_generation_cancelled(self, snapshot: tuple[int, threading.Event]) -> bool:
+    def cancellation_generation_cancelled(self, snapshot) -> bool:
         """Return whether the captured request generation was cancelled/replaced."""
-        generation, cancel_event = snapshot
+        generation, cancel_event, *epoch_snapshot = snapshot
+        observed_epoch = epoch_snapshot[0] if epoch_snapshot else None
         if cancel_event.is_set():
             return True
         with self.llm_lock:
-            return self._llm_generation != generation and cancel_event.is_set()
+            return (
+                (observed_epoch is not None and self._llm_cancellation_epoch != observed_epoch)
+                or (self._llm_generation != generation and cancel_event.is_set())
+            )
 
     def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True) -> bool:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
@@ -5792,6 +5801,7 @@ class ModelManager:
                 self.worker_restart_count += 1
                 self.last_worker_restart_at_ms = int(time.time() * 1000)
                 self._llm_generation += 1
+                self._llm_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0) + 1
                 self._llm_cancel_generation_event.set()
                 self._llm_cancel_generation_event = threading.Event()
                 if not recreate:
@@ -5805,6 +5815,7 @@ class ModelManager:
                 self.last_worker_restart_at_ms = int(time.time() * 1000)
                 self.llm = None
                 self._llm_generation += 1
+                self._llm_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0) + 1
                 self._llm_cancel_generation_event.set()
                 self._llm_cancel_generation_event = threading.Event()
         if should_recreate_without_active_worker:
@@ -6028,6 +6039,7 @@ class ModelManager:
         with self.llm_lock:
             observed_generation = self._llm_generation
             observed_cancel_event = self._llm_cancel_generation_event
+            observed_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0)
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
@@ -6054,7 +6066,12 @@ class ModelManager:
         if observed_cancel_event.is_set():
             raise RuntimeError('LLM inference request cancelled before worker retry')
         with self.llm_lock:
-            if self._llm_generation != observed_generation and observed_cancel_event.is_set():
+            # Ordinary invalidation/replacement keeps the captured event clear.
+            # Cancellation rotates to a new event and advances this monotonic epoch,
+            # so post-restart cancellation is still visible to the original request.
+            if getattr(self, '_llm_cancellation_epoch', 0) != observed_cancellation_epoch or (
+                self._llm_generation != observed_generation and observed_cancel_event.is_set()
+            ):
                 raise RuntimeError('LLM inference request cancelled before worker retry')
         replacement = self._ensure_replacement_llm(observed_generation)
         if replacement is None:
@@ -6063,7 +6080,9 @@ class ModelManager:
         if not callable(replacement_create):
             raise RuntimeError('LLM replacement runtime missing create_chat_completion')
         with self.llm_lock:
-            if self._llm_generation != observed_generation and observed_cancel_event.is_set():
+            if getattr(self, '_llm_cancellation_epoch', 0) != observed_cancellation_epoch or (
+                self._llm_generation != observed_generation and observed_cancel_event.is_set()
+            ):
                 raise RuntimeError('LLM inference request cancelled before worker retry')
         try:
             result = replacement_create(*args, **kwargs)

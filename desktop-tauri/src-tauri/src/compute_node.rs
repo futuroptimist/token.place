@@ -1749,34 +1749,64 @@ pub async fn start_compute_node(
     });
 
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        let parsed_for_log = serde_json::from_str::<Value>(&line).ok();
-        append_operator_log_line(
-            &log_sink,
-            "desktop.compute_node.stdout",
-            &redact_bridge_stdout_line(&line),
-        );
-        if let Some(payload) = parsed_for_log.as_ref() {
-            for chunk in readiness_operator_log_chunks(payload) {
-                append_operator_log_line(&log_sink, "desktop.compute_node.readiness", &chunk);
-            }
-        }
-        match parse_compute_node_event_line(&line) {
-            Ok(payload) => {
-                let payload = with_log_file_path(payload, log_file_path.as_deref());
-                if !apply_compute_node_event_to_state(&state, &payload).await {
-                    continue;
+    let stdout_terminal_reason = loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let parsed_for_log = serde_json::from_str::<Value>(&line).ok();
+                append_operator_log_line(
+                    &log_sink,
+                    "desktop.compute_node.stdout",
+                    &redact_bridge_stdout_line(&line),
+                );
+                if let Some(payload) = parsed_for_log.as_ref() {
+                    for chunk in readiness_operator_log_chunks(payload) {
+                        append_operator_log_line(
+                            &log_sink,
+                            "desktop.compute_node.readiness",
+                            &chunk,
+                        );
+                    }
                 }
-                app.emit("compute_node_event", payload)?;
+                match parse_compute_node_event_line(&line) {
+                    Ok(payload) => {
+                        let payload = with_log_file_path(payload, log_file_path.as_deref());
+                        if !apply_compute_node_event_to_state(&state, &payload).await {
+                            continue;
+                        }
+                        if app.emit("compute_node_event", payload).is_err() {
+                            eprintln!(
+                                "desktop.compute_node.event_emit_error operator_session_id={}",
+                                session_id
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "desktop.compute_node.stdout_parse_error error={} summary={}",
+                            err,
+                            redact_bridge_stdout_line(&line)
+                        );
+                    }
+                }
             }
+            Ok(None) => break "eof",
             Err(err) => {
                 eprintln!(
-                    "desktop.compute_node.stdout_parse_error error={} line={}",
-                    err, line
+                    "desktop.compute_node.stdout_read_error operator_session_id={} error={}",
+                    session_id, err
                 );
+                break "read_error";
             }
         }
-    }
+    };
+
+    finalize_bridge_stdout_end(
+        &state,
+        &session_id,
+        log_file_path.clone(),
+        stdout_terminal_reason,
+    )
+    .await;
 
     if let Err(err) = stderr_task.await {
         eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
@@ -1806,6 +1836,55 @@ pub async fn start_compute_node(
     }
 
     Ok(())
+}
+
+async fn finalize_bridge_stdout_end(
+    state: &ComputeNodeState,
+    session_id: &str,
+    log_file_path: Option<String>,
+    reason: &str,
+) {
+    let (notify, deadline, should_spawn) = {
+        let mut process = state.bridge_process.lock().await;
+        let Some(record) = process
+            .as_mut()
+            .filter(|record| record.session_id == session_id)
+        else {
+            return;
+        };
+        if record.phase == BridgeProcessPhase::Stopping {
+            // The detached Stop supervisor owns child/stdin cleanup and result caching.
+            record.notify.notify_waiters();
+            return;
+        }
+        if record.stop_result.is_some() || record.phase == BridgeProcessPhase::Completed {
+            record.notify.notify_waiters();
+            return;
+        }
+        record.phase = BridgeProcessPhase::Stopping;
+        let deadline = *record
+            .stop_deadline
+            .get_or_insert_with(|| Instant::now() + DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT);
+        let should_spawn = !record.shutdown_worker_started;
+        if should_spawn {
+            record.shutdown_worker_started = true;
+        }
+        eprintln!(
+            "desktop.compute_node.bridge_stdout_terminal operator_session_id={} reason={}",
+            session_id, reason
+        );
+        (record.notify.clone(), deadline, should_spawn)
+    };
+
+    if should_spawn {
+        let worker_state = state.clone();
+        let worker_session = Some(session_id.to_string());
+        tokio::spawn(async move {
+            bridge_shutdown_supervisor(worker_state, worker_session, log_file_path).await;
+        });
+    }
+
+    let _ = wait_for_cached_stop_result(state, Some(session_id), notify, deadline).await;
 }
 
 async fn wait_for_stop_cleanup_ack(
@@ -1939,9 +2018,8 @@ async fn bridge_shutdown_supervisor(
             if stop_session_id.as_deref().is_some_and(|session| {
                 !record.session_id.is_empty() && record.session_id != session
             }) {
-                record.phase = BridgeProcessPhase::Completed;
-                record.stop_result = Some(Err(warning.clone()));
-                record.notify.notify_waiters();
+                // A stale shutdown worker must not mutate a replacement session's
+                // process record, cached result, or public status.
                 return;
             }
             if record.stop_result.is_some() {

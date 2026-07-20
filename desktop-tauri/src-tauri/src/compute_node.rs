@@ -1141,6 +1141,11 @@ pub async fn start_compute_node(
         .first()
         .cloned()
         .unwrap_or_else(|| request.relay_base_url.clone());
+    let session_id = {
+        let mut next_session_id = state.next_session_id.lock().await;
+        *next_session_id += 1;
+        next_session_id.to_string()
+    };
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -1148,7 +1153,7 @@ pub async fn start_compute_node(
         if process.as_ref().is_some_and(BridgeProcessRecord::is_active) {
             anyhow::bail!("compute node already running; stop it before starting a new session");
         }
-        *process = None;
+        *process = Some(BridgeProcessRecord::new(session_id.clone(), None, None));
         let mut child_slot = state.child.lock().await;
         if child_slot
             .as_mut()
@@ -1159,12 +1164,6 @@ pub async fn start_compute_node(
         *child_slot = None;
         *state.stdin.lock().await = None;
     }
-
-    let session_id = {
-        let mut next_session_id = state.next_session_id.lock().await;
-        *next_session_id += 1;
-        next_session_id.to_string()
-    };
     {
         let mut status = state.status.lock().await;
         let mut ack = state.stopped_event_ack_session_id.lock().await;
@@ -1371,9 +1370,13 @@ pub async fn start_compute_node(
                     Some(session_id.clone()),
                     log_file_path.clone(),
                 );
-                *state.child.lock().await = None;
-                *state.stdin.lock().await = None;
-                *state.bridge_process.lock().await = None;
+                let mut process = state.bridge_process.lock().await;
+                if process
+                    .as_ref()
+                    .is_some_and(|record| record.session_id == session_id)
+                {
+                    *process = None;
+                }
             }
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
@@ -1394,83 +1397,56 @@ pub async fn start_compute_node(
 
     let mut pending_child = Some(child);
     let mut pending_stdin = Some(stdin);
+    let mut stopping_cancel_stdin = None;
+    let stopping_notify;
     let installed = {
-        let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        let mut child_slot = state.child.lock().await;
-        if child_slot
+        let mut process = state.bridge_process.lock().await;
+        stopping_notify = if let Some(record) = process
             .as_mut()
-            .is_some_and(|existing| existing.try_wait().ok().flatten().is_none())
+            .filter(|record| record.session_id == session_id)
         {
-            false
+            match record.phase {
+                BridgeProcessPhase::Starting => {
+                    eprintln!(
+                        "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
+                        session_id,
+                        sanitize_relay_target(&primary_relay_url)
+                    );
+                    record.child = pending_child.take();
+                    record.stdin = pending_stdin.take();
+                    record.phase = BridgeProcessPhase::Running;
+                    None
+                }
+                BridgeProcessPhase::Stopping => {
+                    record.child = pending_child.take();
+                    if !record.cancel_sent {
+                        stopping_cancel_stdin = pending_stdin.take();
+                        record.cancel_sent = stopping_cancel_stdin.is_some();
+                    } else {
+                        let _ = pending_stdin.take();
+                    }
+                    Some(record.notify.clone())
+                }
+                BridgeProcessPhase::Running | BridgeProcessPhase::Completed => {
+                    Some(record.notify.clone())
+                }
+            }
         } else {
-            eprintln!(
-                "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
-                session_id,
-                sanitize_relay_target(&primary_relay_url)
-            );
-            *child_slot = None;
-            let mut stdin_slot = state.stdin.lock().await;
-            *stdin_slot = None;
-            let mut process = state.bridge_process.lock().await;
-            *process = Some(BridgeProcessRecord::new(
-                session_id.clone(),
-                pending_child.take(),
-                pending_stdin.take(),
-            ));
-            let mut status = state.status.lock().await;
-            *status = ComputeNodeStatus {
-                running: true,
-                registered: false,
-                active_relay_url: primary_relay_url.clone(),
-                configured_relay_urls: relay_base_urls.clone(),
-                relay_statuses: Vec::new(),
-                registered_relay_count: 0,
-                configured_relay_count: relay_base_urls.len(),
-                registered_relay_urls: Vec::new(),
-                active_relay_urls: Vec::new(),
-                requested_mode: format!("{:?}", request.mode).to_lowercase(),
-                effective_mode: "cpu".into(),
-                backend_available: "unknown".into(),
-                backend_selected: "cpu".into(),
-                backend_used: "cpu".into(),
-                fallback_reason: None,
-                model_path: request.model_path.clone(),
-                last_error: None,
-                relay_runtime_state: Some("starting".into()),
-                warm_load_state: Some("not_started".into()),
-                warm_load_enabled: Some(true),
-                warm_load_duration_ms: None,
-                context_tier: Some(normalize_context_tier(&request.context_tier)),
-                context_window_tokens: context_profile(&normalize_context_tier(
-                    &request.context_tier,
-                ))
-                .map(|profile| profile.total_context_tokens),
-                runtime_path: Some("bridge".into()),
-                relay_runtime_path: Some("bridge".into()),
-                worker_state: Some("starting".into()),
-                worker_generation: None,
-                worker_restart_count: None,
-                worker_alive: Some(false),
-                last_worker_error_code: None,
-                last_worker_exit_code: None,
-                last_worker_restart_at_ms: None,
-                stop_cleanup_required: None,
-                stop_cleanup_attempted: None,
-                stop_cleanup_outcome: None,
-                stop_cleanup_success_count: None,
-                stop_cleanup_failure_count: None,
-                stop_cleanup_warning: None,
-                operator_session_id: Some(session_id.clone()),
-                sequence: Some(0),
-                updated_at_ms: Some(current_time_ms()),
-                log_file_path: log_file_path.clone(),
-                readiness_diagnostics: Map::new(),
-            };
-            true
-        }
+            None
+        };
+        process.as_ref().is_some_and(|record| {
+            record.session_id == session_id && record.phase == BridgeProcessPhase::Running
+        })
     };
 
     if !installed {
+        if let Some(mut stdin_to_cancel) = stopping_cancel_stdin.take() {
+            let _ = stdin_to_cancel.write_all(b"{\"type\":\"cancel\"}\n").await;
+            let _ = stdin_to_cancel.flush().await;
+        }
+        if let Some(notify) = stopping_notify {
+            notify.notify_waiters();
+        }
         if let Some(mut abandoned_stdin) = pending_stdin.take() {
             let _ = abandoned_stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
             let _ = abandoned_stdin.flush().await;
@@ -1480,6 +1456,56 @@ pub async fn start_compute_node(
             let _ = abandoned_child.wait().await;
         }
         anyhow::bail!("compute node already running; stop it before starting a new session");
+    }
+
+    {
+        let mut status = state.status.lock().await;
+        *status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            active_relay_url: primary_relay_url.clone(),
+            configured_relay_urls: relay_base_urls.clone(),
+            relay_statuses: Vec::new(),
+            registered_relay_count: 0,
+            configured_relay_count: relay_base_urls.len(),
+            registered_relay_urls: Vec::new(),
+            active_relay_urls: Vec::new(),
+            requested_mode: format!("{:?}", request.mode).to_lowercase(),
+            effective_mode: "cpu".into(),
+            backend_available: "unknown".into(),
+            backend_selected: "cpu".into(),
+            backend_used: "cpu".into(),
+            fallback_reason: None,
+            model_path: request.model_path.clone(),
+            last_error: None,
+            relay_runtime_state: Some("starting".into()),
+            warm_load_state: Some("not_started".into()),
+            warm_load_enabled: Some(true),
+            warm_load_duration_ms: None,
+            context_tier: Some(normalize_context_tier(&request.context_tier)),
+            context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
+                .map(|profile| profile.total_context_tokens),
+            runtime_path: Some("bridge".into()),
+            relay_runtime_path: Some("bridge".into()),
+            worker_state: Some("starting".into()),
+            worker_generation: None,
+            worker_restart_count: None,
+            worker_alive: Some(false),
+            last_worker_error_code: None,
+            last_worker_exit_code: None,
+            last_worker_restart_at_ms: None,
+            stop_cleanup_required: None,
+            stop_cleanup_attempted: None,
+            stop_cleanup_outcome: None,
+            stop_cleanup_success_count: None,
+            stop_cleanup_failure_count: None,
+            stop_cleanup_warning: None,
+            operator_session_id: Some(session_id.clone()),
+            sequence: Some(0),
+            updated_at_ms: Some(current_time_ms()),
+            log_file_path: log_file_path.clone(),
+            readiness_diagnostics: Map::new(),
+        };
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -1639,6 +1665,7 @@ async fn stop_compute_node_with_shutdown_timeout(
     let mut stdin_handle = None;
     let mut owned_child = None;
     let first_stopper;
+    let mut stop_latched_during_startup = false;
     let child_handoff_deadline = std::cmp::min(
         parent_shutdown_deadline,
         Instant::now() + Duration::from_millis(500),
@@ -1672,13 +1699,15 @@ async fn stop_compute_node_with_shutdown_timeout(
                 first_stopper = false;
             } else {
                 first_stopper = true;
+                let was_starting = record.phase == BridgeProcessPhase::Starting;
                 record.phase = BridgeProcessPhase::Stopping;
                 record.stop_deadline.get_or_insert(parent_shutdown_deadline);
                 if !record.cancel_sent {
                     stdin_handle = record.stdin.take();
-                    record.cancel_sent = true;
+                    record.cancel_sent = stdin_handle.is_some();
                 }
                 owned_child = record.child.take();
+                stop_latched_during_startup = was_starting && owned_child.is_none();
             }
             break;
         }
@@ -1738,6 +1767,54 @@ async fn stop_compute_node_with_shutdown_timeout(
         );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
+    }
+
+    if stop_latched_during_startup && owned_child.is_none() {
+        loop {
+            let notified = process_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut process = state.bridge_process.lock().await;
+                if let Some(record) = process.as_mut() {
+                    if stop_session_id.as_deref().is_some_and(|session| {
+                        !record.session_id.is_empty() && record.session_id != session
+                    }) {
+                        anyhow::bail!("Operator stopped locally, but unregister did not complete for one relay; it may remain listed until lease expiry.");
+                    }
+                    if let Some(result) = record.stop_result.clone() {
+                        return result.map_err(anyhow::Error::msg);
+                    }
+                    if owned_child.is_none() {
+                        owned_child = record.child.take();
+                        if stdin_handle.is_none() && !record.cancel_sent {
+                            stdin_handle = record.stdin.take();
+                            record.cancel_sent = stdin_handle.is_some();
+                        }
+                    }
+                }
+            }
+            if owned_child.is_some() || Instant::now() >= parent_shutdown_deadline {
+                break;
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(parent_shutdown_deadline)) => {},
+            }
+        }
+        if let Some(stdin) = stdin_handle.as_mut() {
+            eprintln!(
+                "desktop.compute_node.cancel_requested operator_session_id={}",
+                stop_session_display
+            );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.cancel_requested",
+                &format!("operator_session_id={}", stop_session_display),
+            );
+            let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+            let _ = stdin.flush().await;
+        }
     }
 
     let had_child = owned_child.is_some();
@@ -2867,6 +2944,92 @@ mod tests {
         let final_status = state.status.lock().await.clone();
         assert!(!final_status.running);
         assert!(!final_status.registered);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_waits_for_reserved_startup_child_handoff() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+        *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
+            "startup-stop-session".into(),
+            None,
+            None,
+        ));
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("startup-stop-session".into());
+            status.stop_cleanup_required = Some(true);
+            status.stop_cleanup_attempted = Some(true);
+            status.stop_cleanup_outcome = Some("complete".into());
+            status.stop_cleanup_success_count = Some(1);
+            status.stop_cleanup_failure_count = Some(0);
+        }
+        acknowledge_stopped_event_for_test(&state, "startup-stop-session").await;
+
+        let stop_state = state.clone();
+        let stop_task = tokio::spawn(async move {
+            stop_compute_node_with_shutdown_timeout(stop_state, Duration::from_secs(2)).await
+        });
+
+        let phase_deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if state
+                .bridge_process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|record| record.phase == BridgeProcessPhase::Stopping)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < phase_deadline,
+                "stop should latch startup reservation into stopping phase"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !stop_task.is_finished(),
+            "stop should wait for startup handoff instead of returning before child attachment"
+        );
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; [ \"$line\" = '{\"type\":\"cancel\"}' ]",
+                "sh",
+                observed_cancel_path
+                    .to_str()
+                    .expect("cancel path should be valid UTF-8"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn startup handoff child");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        let notify = {
+            let mut process = state.bridge_process.lock().await;
+            let record = process
+                .as_mut()
+                .expect("startup reservation should still be present");
+            assert_eq!(record.phase, BridgeProcessPhase::Stopping);
+            record.child = Some(child);
+            record.stdin = Some(child_stdin);
+            record.notify.clone()
+        };
+        notify.notify_waiters();
+
+        stop_task
+            .await
+            .expect("stop task join")
+            .expect("stop should complete once startup child is attached");
+        let observed_cancel = std::fs::read_to_string(observed_cancel_path)
+            .expect("cancel message should be recorded");
+        assert_eq!(observed_cancel, "{\"type\":\"cancel\"}");
     }
 
     #[cfg(not(windows))]

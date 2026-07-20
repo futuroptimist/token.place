@@ -1,0 +1,14 @@
+/home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/deps/serde-8ae142044611171b.d: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/build/serde-6ca711a22f956e39/out/private.rs
+
+/home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/deps/libserde-8ae142044611171b.rlib: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/build/serde-6ca711a22f956e39/out/private.rs
+
+/home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/deps/libserde-8ae142044611171b.rmeta: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/build/serde-6ca711a22f956e39/out/private.rs
+
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/build/serde-6ca711a22f956e39/out/private.rs:
+
+# env-dep:OUT_DIR=/home/runner/work/token.place/token.place/desktop-tauri/src-tauri/target/debug/build/serde-6ca711a22f956e39/out

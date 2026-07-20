@@ -281,7 +281,7 @@ class NeverReadyApiV1Runtime(ApiV1Runtime):
     deterministic deadline/timeout tests."""
 
     last_instance = None
-    _BLOCK_TIMEOUT = 30.0  # safety ceiling; test deadline is always shorter
+    _BLOCK_TIMEOUT = 5.0  # safety ceiling; test deadline is always shorter
 
     def __init__(self, _config):
         super().__init__(_config)
@@ -5285,50 +5285,67 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
 
 
 def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, monkeypatch):
-    # Reproduce the race: Future.result(timeout=t) can return a completed result
-    # after the nominal timeout when the calling thread is scheduled late.
-    # Verify that the post-wait absolute-deadline check catches this and causes
-    # exit code 1 (fatal warm-load failure) rather than accepting the late result.
+    """Regression: Future.result() can return a completed result after the nominal
+    per-call timeout when the calling thread is descheduled by the OS.  The
+    absolute-deadline post-wait check in warm_runtime_before_registration must
+    catch this case and cause exit code 1 rather than accepting the late result.
+
+    A two-phase fake clock is used so the test is deterministic regardless of
+    OS scheduling: ``time.monotonic()`` returns T0 until a ``threading.Event``
+    (``jumped``) is set, then returns T0 + deadline + 1.  A background thread
+    waits for the Future to start (``ready_started``), sleeps a short margin so
+    the main loop has passed its per-iteration elapsed_seconds pre-check and is
+    blocking inside ``future.result()``, then atomically jumps the clock and
+    releases the Future.  ``ensure_runtime_ready`` returns True, and the
+    post-wait check immediately sees the past-deadline clock value.
+    """
+    # Ensure a fresh instance for this test (no stale class-level state).
+    WarmingThenApiV1Runtime.last_instance = None
+
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
-    # Short deadline (80 ms) — the runtime will complete only after the fake
-    # clock has advanced past the deadline.
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
 
-    # Control the monotonic clock so the post-wait check fires deterministically.
-    # Layout:
-    #   call 0  — wait_started_at capture                  → T0 (well before deadline)
-    #   call 1  — first elapsed check at top of loop       → T0 + 0.001
-    #   call 2+ — post-ensure_runtime_ready deadline check → T0 + deadline + 0.05
-    #             (simulates the Future completing "after" the deadline)
+    # Two-phase fake clock.
+    # Phase 0 (jumped not set): returns T0, so wait_started_at = T0,
+    #   warm_load_abs_deadline = T0 + 0.08, and elapsed_seconds = 0 on the first
+    #   loop iteration (remaining = 0.08 > 0, loop proceeds to future.result()).
+    # Phase 1 (jumped set): returns T0 + deadline + 1, triggering the post-wait
+    #   absolute-deadline check.
     t0 = 1000.0
     deadline_s = 0.08
-    call_n = {'v': 0}
+    jumped = threading.Event()
 
     def fake_monotonic():
-        n = call_n['v']
-        call_n['v'] += 1
-        if n == 0:
-            return t0
-        if n == 1:
-            return t0 + 0.001
-        # All subsequent calls (including post-wait deadline check) are past deadline.
-        return t0 + deadline_s + 0.050
+        if jumped.is_set():
+            return t0 + deadline_s + 1.0
+        return t0
 
     monkeypatch.setattr(compute_node_bridge.time, 'monotonic', fake_monotonic)
 
-    # Release the runtime from a background thread so ensure_api_v1_runtime_ready
-    # completes (returns True) and ensure_runtime_ready returns True, triggering
-    # the post-wait absolute-deadline check.
-    def _release():
+    def _release_after_deadline():
+        # Wait for the new WarmingThenApiV1Runtime instance to be created.
+        start_wall = time.time()
+        while WarmingThenApiV1Runtime.last_instance is None:
+            if time.time() - start_wall > 5.0:
+                return  # safety: give up to avoid blocking forever
+            time.sleep(0.001)
         inst = WarmingThenApiV1Runtime.last_instance
-        if inst is not None:
-            inst.ready_started.wait(timeout=5)
-            inst.ready_release.set()
+        # Wait for the Future thread to have started executing ensure_api_v1_runtime_ready.
+        inst.ready_started.wait(timeout=5)
+        # Sleep a small margin so the main thread's per-iteration elapsed_seconds
+        # pre-check (nanoseconds of work) is done and the main thread is blocked
+        # inside future.result().
+        time.sleep(0.020)
+        # Jump the clock past the deadline, then release the Future.
+        # The main thread is blocked in future.result(); when it returns True the
+        # post-wait check will see the jumped clock and invoke _emit_gate_wait_timeout().
+        jumped.set()
+        inst.ready_release.set()
 
-    release_thread = threading.Thread(target=_release, daemon=True)
+    release_thread = threading.Thread(target=_release_after_deadline, daemon=True)
     release_thread.start()
 
     args = SimpleNamespace(

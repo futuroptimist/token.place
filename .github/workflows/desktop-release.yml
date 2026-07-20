@@ -492,7 +492,7 @@ jobs:
           fi
           nsis_path="${nsis_paths[0]}"
           msi_path="${msi_paths[0]}"
-          validator_version_args=(--expected-version "0.1.2")
+          validator_version_args=()
           tag_name="${INPUT_TAG_NAME:-}"
           if [ -z "${tag_name}" ] && [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ]; then
             tag_name="${GITHUB_REF#refs/tags/}"

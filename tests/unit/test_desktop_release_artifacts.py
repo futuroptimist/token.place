@@ -2571,6 +2571,31 @@ def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.2') -> tup
     return nsis, msi
 
 
+def test_windows_release_workflow_version_args_are_tag_only_and_untagged_derives_package_version() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'validator_version_args=()' in text
+    assert 'validator_version_args=(--release-tag "${tag_name}")' in text
+    assert '--expected-version "0.1.2"' not in text
+    assert r'desktop-v[0-9]+\.[0-9]+\.[0-9]+' in text
+
+
+def test_windows_validator_without_version_args_derives_package_json_version(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    package = tmp_path / 'package.json'
+    package.write_text(json.dumps({'version': '7.8.9'}), encoding='utf-8')
+    monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(validator, 'validate_config_versions', lambda expected: observed.append(('version', expected)))
+    monkeypatch.setattr(validator, 'validate_artifact', lambda artifact, expected, kind, manifest: observed.append((kind, expected)))
+    monkeypatch.setattr(validator, '_load_json', lambda path: {'version': '7.8.9'} if path == package else {})
+
+    assert validator.main([
+        '--windows-nsis', str(tmp_path / 'token.place-desktop-7.8.9-setup.exe'),
+        '--windows-msi', str(tmp_path / 'token.place-desktop-7.8.9.msi'),
+    ]) == 0
+    assert observed == [('version', '7.8.9'), ('NSIS', '7.8.9'), ('MSI', '7.8.9')]
+
+
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)

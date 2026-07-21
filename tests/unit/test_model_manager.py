@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.llm.model_manager import ModelManager
+from utils.llm import model_manager as model_manager_module
 
 
 class _ToDictOnly:
@@ -11042,3 +11043,31 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+
+
+def test_processless_close_hard_exit_uses_privacy_safe_reason(monkeypatch, capsys):
+    class _ExitSentinel(Exception):
+        def __init__(self, code):
+            super().__init__("exit sentinel")
+            self.code = code
+
+    calls = []
+
+    def fake_exit(code):
+        calls.append(code)
+        raise _ExitSentinel(code)
+
+    monkeypatch.setattr(model_manager_module.os, "_exit", fake_exit)
+    secret_reason = "SECRET_CREDENTIAL prompt body model output"
+    safe_reason = "api_v1_worker_processless_close_timeout"
+
+    with pytest.raises(_ExitSentinel) as exc_info:
+        model_manager_module._processless_close_hard_exit(reason=safe_reason)
+
+    assert exc_info.value.code == 1
+    assert calls == [1]
+    captured = capsys.readouterr()
+    assert f"reason={safe_reason}" in captured.err
+    assert secret_reason not in captured.err
+    assert "SECRET_CREDENTIAL" not in captured.err
+    assert captured.out == ""

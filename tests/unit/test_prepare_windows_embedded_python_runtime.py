@@ -1112,3 +1112,94 @@ def test_fetch_success_and_final_cache_mismatch_paths(tmp_path, monkeypatch):
     with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
         prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', other_digest, dest)
     assert (tmp_path / 'runtime.zip.poisoned').exists()
+
+
+def test_load_manifest_rejects_more_native_and_wheelhouse_edge_cases(tmp_path):
+    base = manifest()
+
+    bad = json.loads(json.dumps(base))
+    bad['native_dll_artifacts'][0].pop('archive_member_path')
+    path = tmp_path / 'missing-native-member.json'
+    write_manifest(path, bad)
+    with pytest.raises(prep.RuntimePrepError, match='missing archive_member_path'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(base))
+    bad['native_dll_artifacts'][0]['archive_member_path'] = '../evil.dll'
+    path = tmp_path / 'native-traversal.json'
+    write_manifest(path, bad)
+    with pytest.raises(prep.RuntimePrepError, match='archive_member_path'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(base))
+    bad['native_dll_artifacts'][0]['url'] = 'https://example.com/cudart64_12.dll.zip'
+    path = tmp_path / 'bad-native-host.json'
+    write_manifest(path, bad)
+    with pytest.raises(prep.RuntimePrepError, match='approved immutable vendor URLs'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(base))
+    bad['python_package_wheels'] = [
+        {
+            'package': 'demo',
+            'version': '1.0',
+            'filename': 'demo-1.0.tar.gz',
+            'url': 'https://files.pythonhosted.org/packages/demo-1.0.tar.gz',
+            'sha256': '56789abcdeffedcba98765432100123456789abcdeffedcba987654321012345',
+        }
+    ]
+    path = tmp_path / 'sdist-wheelhouse.json'
+    write_manifest(path, bad)
+    with pytest.raises(prep.RuntimePrepError, match='entries must be wheels'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(base))
+    bad['required_packages']['demo'] = '1.0'
+    bad['python_package_wheels'] = [
+        {
+            'package': 'demo',
+            'version': '1.0',
+            'filename': 'demo-1.0-py3-none-any.whl',
+            'url': 'https://example.com/demo-1.0-py3-none-any.whl',
+            'sha256': '56789abcdeffedcba98765432100123456789abcdeffedcba987654321012345',
+        }
+    ]
+    path = tmp_path / 'bad-wheel-url.json'
+    write_manifest(path, bad)
+    with pytest.raises(prep.RuntimePrepError, match='immutable HTTPS artifact URLs'):
+        prep.load_manifest(path)
+
+
+def test_fetch_rejects_final_cache_mismatch_after_successful_part_promotion(tmp_path, monkeypatch):
+    payload = b'cached-payload'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+    dest = tmp_path / 'artifact.zip'
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_exc):
+            return False
+        def geturl(self):
+            return 'https://release-assets.githubusercontent.com/artifact.zip'
+        def read(self, size=-1):
+            if getattr(self, 'done', False):
+                return b''
+            self.done = True
+            return payload
+
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda *_args, **_kwargs: Response())
+    calls = {'count': 0}
+    real_sha = prep.sha256_file
+
+    def fake_sha(path):
+        if path == dest and path.exists():
+            calls['count'] += 1
+            if calls['count'] >= 1:
+                return '0' * 64
+        return real_sha(path)
+
+    monkeypatch.setattr(prep, 'sha256_file', fake_sha)
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/artifact.zip', digest, dest)
+    assert (tmp_path / 'artifact.zip.poisoned').exists()

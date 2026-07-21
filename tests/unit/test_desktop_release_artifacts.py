@@ -3186,3 +3186,45 @@ def test_windows_nvidia_smoke_cleanup_failure_overrides_child_exit(tmp_path, mon
     with pytest.raises(subprocess.CalledProcessError):
         smoke._launch_materialized_child(args)
     assert len(calls) == 2
+
+
+def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ')
+
+    def run_with(returncode=0, stdout='{}'):
+        def fake_run(cmd, **kwargs):
+            assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr='secret path C:/Users/Secret')
+        return fake_run
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(returncode=9, stdout='{}'))
+    with pytest.raises(validator.ValidationError, match=artifact.name):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=''))
+    with pytest.raises(validator.ValidationError, match='empty metadata'):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout='[]'))
+    with pytest.raises(validator.ValidationError, match='malformed metadata'):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': '', 'FileVersion': '0.1.2'})))
+    with pytest.raises(validator.ValidationError, match='incomplete metadata'):
+        validator._read_pe_version_info(artifact)
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': ''})))
+    with pytest.raises(validator.ValidationError, match='incomplete metadata'):
+        validator._read_msi_product_version(artifact)
+
+    tauri = tmp_path / 'tauri.conf.json'
+    cargo = tmp_path / 'Cargo.toml'
+    tauri.write_text(json.dumps({'bundle': {'windows': {'mainBinaryName': ''}}}), encoding='utf-8')
+    cargo.write_text('[package]\nname = ""\nversion = "0.1.2"\n', encoding='utf-8')
+    monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
+    monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
+    with pytest.raises(validator.ValidationError, match='unable to determine'):
+        validator._expected_tauri_binary_name()

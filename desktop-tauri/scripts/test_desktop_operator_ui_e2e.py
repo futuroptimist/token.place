@@ -686,28 +686,32 @@ def main() -> int:
 
         stop_clicked_at = time.monotonic()
         driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
-        stop_to_diagnostics_seconds = wait_for_relay_diagnostics_count(
+        diagnostics_helper_seconds = wait_for_relay_diagnostics_count(
             relay_url, 0, timeout_seconds=2.0
         )
+        diagnostics_zero_observed_at = time.monotonic()
+        stop_to_diagnostics_seconds = diagnostics_zero_observed_at - stop_clicked_at
         assert stop_to_diagnostics_seconds <= 2.0, (
             "expected Stop click to raw diagnostics zero within 2.0s; "
-            f"observed {stop_to_diagnostics_seconds:.3f}s"
+            f"observed {stop_to_diagnostics_seconds:.3f}s "
+            f"(helper polling duration {diagnostics_helper_seconds:.3f}s)"
         )
-        operator_log = wait_for_operator_log_stop_markers(relay_log, driver_log)
-        assert "desktop.compute_node.bridge_process_exited operator_session_id=" in operator_log
 
-        diagnostics_zero_at = stop_clicked_at + stop_to_diagnostics_seconds
         WebDriverWait(landing_driver, 2.5).until(
             lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
             .text.strip()
             == "Live compute nodes: 0"
         )
         widget_zero_at = time.monotonic()
-        diagnostics_to_widget_seconds = widget_zero_at - diagnostics_zero_at
+        diagnostics_to_widget_seconds = widget_zero_at - diagnostics_zero_observed_at
         assert diagnostics_to_widget_seconds <= 2.5, (
             "expected already-open landing widget to reach zero within 2.5s of diagnostics; "
             f"observed {diagnostics_to_widget_seconds:.3f}s"
         )
+
+        operator_log = wait_for_operator_log_stop_markers(relay_log, driver_log)
+        assert "desktop.compute_node.bridge_process_exited operator_session_id=" in operator_log
+
         print(
             "desktop_operator_stop_latency "
             f"stop_to_diagnostics_seconds={stop_to_diagnostics_seconds:.3f} "

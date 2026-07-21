@@ -2663,6 +2663,50 @@ def test_relay_key_fingerprint_uses_safe_helper_and_fallbacks():
     assert compute_node_bridge._relay_key_fingerprint(ShortKeyRelay()) == 'unknown'
 
 
+
+def test_relay_and_runtime_stderr_summaries_sanitize_all_rendered_values():
+    canary = r"C:\Users\SecretName\AppData\relay.txt"
+    url = "https://user:pass@[2001:db8::1]:8443/path?q=token#frag"
+    response = {
+        f"secret_key_{url}": "value",
+        "request_id": f"req {canary} {url}",
+        "relay_error_kind": "cloudflare_pre_app_rejection",
+        "http_status": f"500 {canary}",
+        "relay_error": f"boom {url} {canary}",
+        "relay_http_diagnostic": {"headers": {"cf-ray": f"ray {url}", "server": f"nginx {canary}"}},
+    }
+    original = json.dumps(response, sort_keys=True)
+    summary = compute_node_bridge._relay_response_summary(response)
+    assert json.dumps(response, sort_keys=True) == original
+    assert "SecretName" not in summary
+    assert "user:pass" not in summary
+    assert "/path" not in summary
+    assert "q=token" not in summary
+    assert "#frag" not in summary
+    assert "status=unknown" in summary
+    assert "https://[2001:db8::1]:8443" in summary
+
+    numeric = compute_node_bridge._relay_response_summary({"http_status": 503, "relay_error_kind": "relay_json_error"})
+    assert "status=503" in numeric
+
+    diagnostics = {
+        "requested_mode": "auto",
+        "effective_mode": "gpu",
+        "backend_selected": "cuda",
+        "backend_used": "cuda",
+        "backend_available": True,
+        "fallback_reason": f"fallback at /private/var/SecretName/runtime and {url}",
+        "offloaded_layers": 32,
+        "kv_cache_device": "cuda:0",
+    }
+    runtime_summary = compute_node_bridge._runtime_diagnostics_summary(diagnostics)
+    assert "SecretName" not in runtime_summary
+    assert "user:pass" not in runtime_summary
+    assert "https://[2001:db8::1]:8443" in runtime_summary
+    assert "backend_selected=cuda" in runtime_summary
+    assert "offloaded_layers=32" in runtime_summary
+
+
 def test_relay_response_summary_handles_non_dict_payloads():
     summary = compute_node_bridge._relay_response_summary(["unexpected"])
     assert summary == "non-dict response type=list"

@@ -64,6 +64,51 @@ except ModuleNotFoundError:
     ) -> None:
         return
 
+try:
+    from desktop_runtime_setup import (
+        _sanitize_public_relay_target,
+        _sanitize_public_runtime_payload,
+        _sanitize_public_runtime_payload_value,
+        _sanitize_public_runtime_text,
+    )
+except (ImportError, AttributeError):
+    def _sanitize_public_relay_target(relay_url: Any) -> str:
+        if not isinstance(relay_url, str):
+            return "unknown"
+        try:
+            parsed = urlsplit(relay_url.strip())
+            hostname = parsed.hostname
+            parsed_port = parsed.port
+        except ValueError:
+            return "unknown"
+        if not parsed.scheme or not hostname:
+            return "unknown"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        port = f":{parsed_port}" if parsed_port is not None else ""
+        return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
+
+    def _sanitize_public_runtime_text(value: Any) -> str:
+        text = re.sub(r"https?://[^\s)}>\"']+", lambda match: _sanitize_public_relay_target(match.group(0)), str(value or ""))
+        text = re.sub(r"[A-Za-z]:[/\\][^\s;\r\n,)]*|\\\\[^\s;\r\n,)]*|/(?:private|var|opt|Applications|Library|Users|home|tmp)[^\s;\r\n,)]*", "<path>", text)
+        return text[:500] + "...<truncated>" if len(text) > 512 else text
+
+    def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
+        normalized_key = str(key).lower()
+        if normalized_key == "interpreter" and isinstance(value, str):
+            return Path(value).name or "python.exe"
+        if normalized_key in {"import_root", "dependency_target", "prefix", "base_prefix", "log_file_path", "model_path"} and isinstance(value, str):
+            return Path(value).name or "unknown"
+        if isinstance(value, str):
+            return _sanitize_public_runtime_text(value)
+        if isinstance(value, dict):
+            return _sanitize_public_runtime_payload(value)
+        if isinstance(value, list):
+            return [_sanitize_public_runtime_payload_value(key, item) for item in value]
+        return value
+
+    def _sanitize_public_runtime_payload(value: Dict[str, Any]) -> Dict[str, Any]:
+        return {str(key): _sanitize_public_runtime_payload_value(str(key), item) for key, item in value.items()}
+
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     try:
@@ -369,32 +414,33 @@ def _relay_response_summary(
     if not isinstance(relay_response, dict):
         return f"non-dict response type={type(relay_response).__name__}"
 
-    keys = sorted(relay_response.keys())
+    keys = sorted(_sanitize_public_text(key) for key in relay_response.keys())
     has_heartbeat = "next_ping_in_x_seconds" in relay_response
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
     safe_request_id = _sanitize_public_text(request_id) if isinstance(request_id, str) and request_id else "none"
     error_kind = relay_response.get("relay_error_kind")
     http_status = relay_response.get("http_status")
+    safe_http_status = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) else "unknown"
 
     if error_kind == "cloudflare_pre_app_rejection":
         diagnostic = relay_response.get("relay_http_diagnostic")
         headers = diagnostic.get("headers", {}) if isinstance(diagnostic, dict) else {}
         return (
             "kind=cloudflare_pre_app_rejection "
-            f"status={http_status or 'unknown'} cf_ray={headers.get('cf-ray', 'none')} "
+            f"status={safe_http_status} cf_ray={_sanitize_public_text(headers.get('cf-ray', 'none')) or 'none'} "
             f"server={_sanitize_public_text(headers.get('server', 'none'))} wait={wait_seconds} error={_sanitize_public_text(relay_error) or 'none'}"
         )
     if error_kind == "relay_json_error":
         return (
             "kind=relay_json_error "
-            f"status={http_status or 'unknown'} request_id={safe_request_id} "
+            f"status={safe_http_status} request_id={safe_request_id} "
             f"wait={wait_seconds} error={_sanitize_public_text(relay_response.get('relay_error') or relay_error) or 'none'}"
         )
     if error_kind == "http_status_no_json_body":
         return (
             "kind=http_status_no_json_body "
-            f"status={http_status or 'unknown'} request_id={safe_request_id} "
+            f"status={safe_http_status} request_id={safe_request_id} "
             f"wait={wait_seconds} error={_sanitize_public_text(relay_error) or 'none'}"
         )
     if isinstance(relay_error, str) and "timed out" in relay_error.lower():
@@ -420,7 +466,7 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
         f"backend_selected={diagnostics.get('backend_selected')} "
         f"backend_used={diagnostics.get('backend_used')} "
         f"backend_available={diagnostics.get('backend_available')} "
-        f"fallback_reason={diagnostics.get('fallback_reason') or 'none'} "
+        f"fallback_reason={_sanitize_public_text(diagnostics.get('fallback_reason')) or 'none'} "
         f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
         f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
     )
@@ -742,65 +788,18 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
 
 
 PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS = 512
-_PUBLIC_SENSITIVE_KEYS = {
-    "prompt", "prompts", "messages", "plaintext", "ciphertext", "decrypted",
-    "decrypted_content", "key", "private_key", "secret_key", "api_key",
-    "authorization", "auth_token", "access_token", "refresh_token", "token",
-    "environment", "env", "relay_payload", "request_payload", "response_payload",
-    "raw_payload", "raw_request", "raw_response", "payload",
-}
-_PUBLIC_COMMAND_KEYS = {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}
-_PUBLIC_PATH_FIELDS = {"dependency_target", "prefix", "base_prefix", "import_root", "log_file_path", "runtime_path", "model_path"}
-_PUBLIC_TEXT_FIELDS = {"fallback_reason", "last_error", "message", "detail", "error", "pip_version"}
-
-
-_PUBLIC_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*)"
-)
 
 
 def _sanitize_public_text(value: Any) -> str:
-    text = _PUBLIC_PATH_PATTERN.sub("<path>", str(value or ""))
-    return text[: PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS - 12].rstrip() + "...<truncated>" if len(text) > PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS else text
+    return _sanitize_public_runtime_text(value)
 
 
 def _runtime_public_value(key: str, value: Any) -> Any:
-    normalized_key = str(key).lower()
-    if normalized_key in _PUBLIC_SENSITIVE_KEYS:
-        return "redacted" if value not in (None, "") else value
-    if normalized_key in {"interpreter"}:
-        return Path(str(value or sys.executable)).name or "python.exe"
-    if normalized_key in _PUBLIC_TEXT_FIELDS:
-        return _sanitize_public_text(value) if value else (None if value is None else "")
-    if normalized_key in _PUBLIC_PATH_FIELDS:
-        text = str(value or "unknown")
-        if "python-runtime" in text.lower() or text == "bundled":
-            return "bundled"
-        return text.replace("\\", "/").rsplit("/", 1)[-1] if text not in {"", "unknown"} else "unknown"
-    if normalized_key in _PUBLIC_COMMAND_KEYS:
-        return "redacted" if value else None
-    if "relay_url" in normalized_key or normalized_key.endswith("relay") or normalized_key in {"active_relay_url"}:
-        if isinstance(value, list):
-            return [_sanitize_relay_target(item) for item in value]
-        return _sanitize_relay_target(value)
-    if isinstance(value, str):
-        return _sanitize_public_text(value)
-    return value
+    return _sanitize_public_runtime_payload_value(key, value)
 
 
 def _sanitize_public_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        sanitized: Dict[str, Any] = {}
-        for raw_key, raw_value in value.items():
-            key_text = str(raw_key)
-            safe_key = _sanitize_relay_target(key_text) if "://" in key_text else _sanitize_public_text(key_text)
-            sanitized[safe_key] = _runtime_public_value(key_text, _sanitize_public_payload(raw_value))
-        return sanitized
-    if isinstance(value, list):
-        return [_sanitize_public_payload(item) for item in value]
-    if isinstance(value, str):
-        return _sanitize_public_text(value)
-    return value
+    return _sanitize_public_runtime_payload(value) if isinstance(value, dict) else _sanitize_public_runtime_payload_value("value", value)
 
 def _structured_startup_error_payload(
     args: argparse.Namespace,
@@ -996,7 +995,7 @@ def run(args: argparse.Namespace) -> int:
         f"prefix={_runtime_public_value('prefix', runtime_setup.get('prefix', runtime_setup.get('interpreter_prefix', 'unknown')))} "
         f"base_prefix={_runtime_public_value('base_prefix', runtime_setup.get('base_prefix', 'unknown'))} "
         f"dependency_target={_runtime_public_value('dependency_target', runtime_setup.get('dependency_target', 'unknown'))} "
-        f"pip={runtime_setup.get('pip_version', 'unknown')} "
+        f"pip={_runtime_public_value('pip_version', runtime_setup.get('pip_version', 'unknown'))} "
         f"install_command={_runtime_public_value('install_command_summary', runtime_setup.get('install_command_summary')) or 'none'} "
         f"install_backend={runtime_setup.get('install_backend', 'none')} "
         f"cmake_args={_runtime_public_value('cmake_args', runtime_setup.get('cmake_args')) or 'none'} "
@@ -1279,7 +1278,7 @@ def run(args: argparse.Namespace) -> int:
             "python_version": runtime_setup.get("python_version", "unknown"),
             "prefix": _runtime_public_value("prefix", runtime_setup.get("prefix", runtime_setup.get("interpreter_prefix", "unknown"))),
             "base_prefix": _runtime_public_value("base_prefix", runtime_setup.get("base_prefix", "unknown")),
-            "pip_version": runtime_setup.get("pip_version", "unknown"),
+            "pip_version": _runtime_public_value("pip_version", runtime_setup.get("pip_version", "unknown")),
             "runtime_action": runtime_setup.get("runtime_action", "none"),
             "runtime_selected_backend": runtime_setup.get("selected_backend", "cpu"),
             "install_command_summary": _runtime_public_value("install_command_summary", runtime_setup.get("install_command_summary")),

@@ -557,7 +557,7 @@ def _public_runtime_identity(value: str) -> str:
 
 PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS = 512
 _PUBLIC_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|\\\\(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+[A-Za-z_][A-Za-z0-9_]*=)[^;\r\n,)])*)"
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*)"
 )
 _PUBLIC_SENSITIVE_KEYS = {
     "prompt", "prompts", "messages", "message_payload", "response", "responses",
@@ -575,8 +575,16 @@ _PUBLIC_PATH_FIELDS = {
 }
 _PUBLIC_TEXT_FIELDS = {"fallback_reason", "detail", "error", "last_error", "message", "pip_version"}
 
+_PUBLIC_URL_PATTERN = re.compile(r"(?P<url>https?://[^\s)}>\"']+)")
 
 
+def _sanitize_public_runtime_urls(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        raw_url = match.group("url").rstrip(".,;:")
+        suffix = match.group("url")[len(raw_url):]
+        return f"{_sanitize_public_relay_target(raw_url)}{suffix}"
+
+    return _PUBLIC_URL_PATTERN.sub(_replace, text)
 
 def _sanitize_public_relay_target(relay_url: Any) -> str:
     if not isinstance(relay_url, str):
@@ -603,7 +611,19 @@ def _sanitize_public_runtime_text(value: Any) -> str:
     text = str(value or "")
     if not text:
         return text
-    return _bound_public_diagnostic_text(_PUBLIC_PATH_PATTERN.sub("<path>", text))
+    sanitized_urls: list[str] = []
+
+    def _stash_url(match: re.Match[str]) -> str:
+        raw_url = match.group("url").rstrip(".,;:")
+        suffix = match.group("url")[len(raw_url):]
+        sanitized_urls.append(_sanitize_public_relay_target(raw_url))
+        return f"__PUBLIC_URL_{len(sanitized_urls) - 1}__{suffix}"
+
+    text = _PUBLIC_URL_PATTERN.sub(_stash_url, text)
+    text = _PUBLIC_PATH_PATTERN.sub("<path>", text)
+    for index, sanitized_url in enumerate(sanitized_urls):
+        text = text.replace(f"__PUBLIC_URL_{index}__", sanitized_url)
+    return _bound_public_diagnostic_text(text)
 
 
 def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
@@ -625,7 +645,8 @@ def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
     if isinstance(value, dict):
         sanitized: Dict[str, Any] = {}
         for raw_key, raw_value in value.items():
-            safe_key = _sanitize_public_runtime_text(str(raw_key))
+            raw_key_text = str(raw_key)
+            safe_key = _sanitize_public_relay_target(raw_key_text) if "://" in raw_key_text else _sanitize_public_runtime_text(raw_key_text)
             sanitized[safe_key] = _sanitize_public_runtime_payload_value(str(raw_key), raw_value)
         return sanitized
     if isinstance(value, list):

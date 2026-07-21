@@ -830,6 +830,28 @@ def test_packaged_windows_bundled_runtime_probe_failure_never_invokes_installer(
     assert 'cuda_build' not in str(result)
 
 
+
+def test_token_event_preserves_text_but_sanitizes_extra_fields(capsys):
+    token_text = r"exact token C:\Users\SecretName\token https://user:pass@relay.example/path?q=secret#frag"
+    metadata = {
+        "prompt": "prompt SecretName",
+        "authorization": "Bearer secret-token",
+        "relay_url": "https://user:pass@relay.example:9443/path?q=secret#frag",
+        "metadata": {"fallback_reason": "/tmp/SecretName/private", "prompt_tokens": 7},
+    }
+    original = json.loads(json.dumps(metadata))
+    inference_sidecar.emit({"type": "token", "text": token_text, **metadata})
+    event = json.loads(capsys.readouterr().out)
+    assert event["type"] == "token"
+    assert event["text"] == token_text
+    assert event["prompt"] == "redacted"
+    assert event["authorization"] == "redacted"
+    assert event["relay_url"] == "https://relay.example:9443"
+    assert event["metadata"]["fallback_reason"] == "<path>"
+    assert event["metadata"]["prompt_tokens"] == 7
+    assert metadata == original
+
+
 def test_control_plane_events_and_stderr_are_sanitized_but_tokens_verbatim(capsys):
     canary = r"C:\Users\SecretName\AppData\Local\token.place\secret.txt"
     posix = "/private/var/SecretName/runtime/site-packages"

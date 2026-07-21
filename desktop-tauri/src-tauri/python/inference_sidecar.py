@@ -55,7 +55,10 @@ def _start_stdin_reader() -> None:
 
 def _sanitize_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if payload.get("type") == "token":
-        return payload
+        token_text = payload.get("text")
+        sanitized = _sanitize_public_runtime_payload({key: value for key, value in payload.items() if key != "text"})
+        sanitized["text"] = token_text
+        return sanitized
     return _sanitize_public_runtime_payload(payload)
 
 

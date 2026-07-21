@@ -4131,6 +4131,9 @@ def test_runtime_public_payload_redacts_extended_paths_sensitive_keys_and_bounds
         'prompt_tokens': 9,
         'pip_stderr_tail': 'compiler CMAKE_ARGS=-DSECRET=1',
         'pip_version': 'pip 24.0 from /Users/SecretName/site-packages/pip (python 3.11)',
+        'relay_url': 'https://user:pass@[2001:db8::2]:9443/path?q=secret#frag',
+        'relay_map': {'https://user:pass@relay.example:8443/source?token=secret#frag': {'relay_url': 'https://token.place/v1?api_key=secret', 'prompt_tokens': 9}},
+        'fallback_with_url': 'fallback via https://user:pass@relay.example:8443/source?token=secret#frag after path /tmp/SecretName/out',
     }
 
     sanitized = desktop_runtime_setup._sanitize_public_runtime_payload(payload)
@@ -4140,6 +4143,10 @@ def test_runtime_public_payload_redacts_extended_paths_sensitive_keys_and_bounds
         assert forbidden not in encoded
     assert sanitized['plaintext'] == 'redacted'
     assert sanitized['prompt_tokens'] == 9
+    assert sanitized['relay_url'] == 'https://[2001:db8::2]:9443'
+    assert 'https://relay.example:8443' in sanitized['relay_map']
+    assert sanitized['relay_map']['https://relay.example:8443']['relay_url'] == 'https://token.place'
+    assert 'https://relay.example:8443' in sanitized['fallback_with_url']
     assert sanitized['pip_stderr_tail'] == 'redacted'
     assert 'pip 24.0 from <path>' in sanitized['pip_version']
     assert len(sanitized['fallback_reason']) <= desktop_runtime_setup.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS

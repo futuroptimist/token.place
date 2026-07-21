@@ -5799,17 +5799,25 @@ mod tests {
         assert!(root_stopped, "root process did not stop after terminate_bridge_process_tree");
 
         // Boundedly prove the process group is gone by polling kill(-pgid, 0).
-        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no signal is delivered.
+        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no actual signal is delivered.
         let pgid = root_pid as i32;
         let pg_deadline = Instant::now() + Duration::from_millis(500);
         loop {
+            // SAFETY: sending signal 0 only checks for process group existence.
             let result = unsafe { kill(-pgid, 0) };
             if result == -1 {
-                // Process group gone (ESRCH) — descendant cleaned up.
-                break;
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                // ESRCH = 3: process group does not exist — descendant cleaned up.
+                // EPERM means the group still exists but we lack permission (same-user
+                // spawned processes should not hit this; treat it as still-alive).
+                if errno == 3 {
+                    break;
+                }
+                // Any other errno (e.g., EPERM) means the group is still present.
             }
             if Instant::now() >= pg_deadline {
                 // Force-kill any survivor before failing.
+                // SAFETY: sending SIGKILL to the process group for cleanup.
                 unsafe {
                     kill(-pgid, SIGKILL);
                 }

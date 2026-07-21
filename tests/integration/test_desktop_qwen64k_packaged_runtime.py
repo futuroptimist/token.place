@@ -921,7 +921,11 @@ def test_packaged_fake_metal_cancellation_authoritative_cancel_terminates_worker
 
     # --- Mock subprocess-backed process (simulate Metal/CUDA worker) ---
     mock_process = MagicMock()
-    # poll(): None means alive (checked twice before kill succeeds), then 1 = exited
+    # _close_llm_proxy calls _dead() (= poll() is not None) three times:
+    #   1. after closing stdio — process still alive (poll → None)
+    #   2. after terminate() + wait() — still alive (poll → None)
+    #   3. final liveness check after kill() + wait() — dead (poll → 1)
+    # This mirrors ModelManager._close_llm_proxy's subprocess-backed cleanup path.
     mock_process.poll.side_effect = [None, None, 1]
 
     class _FakeLlmWithProcess:
@@ -967,15 +971,16 @@ def test_packaged_fake_metal_cancellation_authoritative_cancel_terminates_worker
             return {'status': 'cancelled'}
         # Wait until the inference thread has started before returning cancelled
         # so the race is deterministic.
-        inference_started.wait(timeout=3.0)
-        # Unblock the inference thread so it can quiesce within the 0.5 s budget.
+        inference_started.wait(timeout=3.0)  # generous timeout for slow CI
+        # Unblock the inference thread before returning so it can quiesce within
+        # the supervisor's 0.5 s inference-quiescence budget.
         inference_release.set()
         return {'status': 'cancelled'}
 
     # --- Blocking inference (simulates Metal GPU work) ---
     def _blocking_generate(**_kwargs):
         inference_started.set()
-        inference_release.wait(timeout=5.0)
+        inference_release.wait(timeout=5.0)  # bounded wait; released by _fake_control above
         # Return stale output that must NOT reach the caller.
         return {'api_v1_response': {'choices': [{'message': {'content': 'stale-output'}}]}}
 

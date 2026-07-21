@@ -1,6 +1,10 @@
 import json
 import importlib.util
 import io
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +15,7 @@ from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeCon
 from utils.context_profiles import apply_context_profile
 from utils.llm import model_manager as model_manager_module
 from utils.llm.model_manager import LlamaCppInferenceRequestError, ModelManager
+from utils.networking.relay_client import RelayClient
 
 BRIDGE_MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -896,3 +901,103 @@ def test_qwen64k_packaged_profile_recovery_all_profiles_exhausted_fails_closed()
     assert recovery_calls[2][0] is q4_runtime
     assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
     assert manager._qwen_64k_profile_recovery_count == 3
+
+
+def test_packaged_fake_metal_cancellation_terminates_worker_and_recovers(tmp_path):
+    worker_script = tmp_path / 'fake_metal_worker.py'
+    stale_output = tmp_path / 'stale-output.txt'
+    worker_script.write_text(
+        "import pathlib, signal, sys, time\n"
+        "path = pathlib.Path(sys.argv[1])\n"
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+        "while True:\n"
+        "    time.sleep(0.1)\n"
+        "    if path.exists():\n"
+        "        path.write_text(path.read_text() + 'STALE_ASSISTANT_OUTPUT')\n",
+        encoding='utf-8',
+    )
+    stale_output.write_text('', encoding='utf-8')
+
+    crypto = MagicMock(public_key_b64='server-key')
+    manager = MagicMock()
+    worker_started = threading.Event()
+    worker_terminated = threading.Event()
+    next_inference_started = threading.Event()
+    workers: list[subprocess.Popen] = []
+    acknowledgments = []
+    generated_requests = []
+
+    class _PackagedFakeMetalManager:
+        def __init__(self):
+            self.replacements = 0
+
+        def terminate_active_worker_for_cancellation(self, *, reason='cancelled', recreate=True, fatal_callback=None):
+            assert reason == 'cancelled'
+            assert recreate is True
+            proc = workers[-1]
+            proc.terminate()
+            proc.wait(timeout=3)
+            worker_terminated.set()
+            self.replacements += 1
+            return True
+
+    packaged_manager = _PackagedFakeMetalManager()
+    client = RelayClient('https://relay.example', 443, crypto, packaged_manager)
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'owner-credential'
+
+    def generate(**kwargs):
+        generated_requests.append(kwargs['request_id'])
+        if kwargs['request_id'] == 'req-cancel':
+            proc = subprocess.Popen([sys.executable, str(worker_script), str(stale_output)])
+            workers.append(proc)
+            worker_started.set()
+            worker_terminated.wait(timeout=3)
+            return {'request_id': 'req-cancel', 'api_v1_response': {'message': {'content': 'late'}}}
+        next_inference_started.set()
+        return {'request_id': kwargs['request_id'], 'api_v1_response': {'message': {'content': 'clean'}}}
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acknowledgments.append(kwargs['request_id'])
+            return {'status': 'cancelled'}
+        assert worker_started.wait(timeout=3)
+        return {'status': 'cancelled'}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-cancel',
+        'model': 'qwen3-8b-q4-k-m',
+        'messages': [{'role': 'user', 'content': 'SECRET_PROMPT'}],
+        'options': {},
+        'routing': {'context_tier': '64k-full'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.response_envelope is None
+    assert outcome.terminal_code == 'cancelled'
+    assert outcome.submission_allowed is False
+    assert worker_terminated.is_set()
+    assert workers[-1].poll() is not None
+    assert acknowledgments == ['req-cancel']
+    assert packaged_manager.replacements == 1
+
+    followup = client._supervise_api_v1_inference({
+        'request_id': 'req-next',
+        'model': 'qwen3-8b-q4-k-m',
+        'messages': [{'role': 'user', 'content': 'next'}],
+        'options': {},
+        'routing': {'context_tier': '64k-full'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert next_inference_started.is_set()
+    assert followup.response_envelope['request_id'] == 'req-next'
+    assert generated_requests == ['req-cancel', 'req-next']
+    assert stale_output.read_text(encoding='utf-8') == ''
+    combined_logs = stale_output.read_text(encoding='utf-8')
+    for sentinel in (*UNSAFE_READINESS_SENTINELS, 'owner-credential', 'req-cancel'):
+        assert sentinel not in combined_logs

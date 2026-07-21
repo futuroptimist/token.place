@@ -5707,6 +5707,123 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn unix_process_alive(pid: u32) -> bool {
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn wait_unix_process_dead(pid: u32, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !unix_process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{label} pid {pid} still alive after process-tree termination");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_bridge_process_tree_kills_isolated_unix_descendant() {
+        let temp = TempDir::new().expect("tempdir");
+        let child_pid_path = temp.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' & echo $! > \"$1\"; wait")
+            .arg("sh")
+            .arg(&child_pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_bridge_process_tree(&mut command);
+        let mut root = command.spawn().expect("spawn isolated root");
+        let root_pid = root.id().expect("root pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_pid_path.exists() {
+            assert!(Instant::now() < deadline, "descendant pid was not written");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let child_pid: u32 = std::fs::read_to_string(&child_pid_path)
+            .expect("read child pid")
+            .trim()
+            .parse()
+            .expect("parse child pid");
+        assert!(unix_process_alive(root_pid));
+        assert!(unix_process_alive(child_pid));
+
+        terminate_bridge_process_tree(root_pid).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), root.wait())
+            .await
+            .expect("root reaped after tree termination");
+        wait_unix_process_dead(root_pid, "root").await;
+        wait_unix_process_dead(child_pid, "descendant").await;
+    }
+
+    #[cfg(windows)]
+    fn windows_process_alive(pid: u32) -> bool {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}", pid),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    async fn wait_windows_process_dead(pid: u32, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !windows_process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{label} pid {pid} still alive after taskkill tree termination");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn terminate_bridge_process_tree_kills_isolated_windows_descendant() {
+        let temp = TempDir::new().expect("tempdir");
+        let child_pid_path = temp.path().join("child.pid");
+        let script = format!(
+            "$child = Start-Process powershell -ArgumentList '-NoProfile','-Command','while ($true) {{ Start-Sleep -Seconds 1 }}' -PassThru; Set-Content -Path '{}' -Value $child.Id; while ($true) {{ Start-Sleep -Seconds 1 }}",
+            child_pid_path.display()
+        );
+        let mut command = Command::new("powershell");
+        command
+            .args(["-NoProfile", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_bridge_process_tree(&mut command);
+        let mut root = command.spawn().expect("spawn isolated windows root");
+        let root_pid = root.id().expect("root pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !child_pid_path.exists() {
+            assert!(Instant::now() < deadline, "descendant pid was not written");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let child_pid: u32 = std::fs::read_to_string(&child_pid_path)
+            .expect("read child pid")
+            .trim()
+            .parse()
+            .expect("parse child pid");
+        assert!(windows_process_alive(root_pid));
+        assert!(windows_process_alive(child_pid));
+
+        terminate_bridge_process_tree(root_pid).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), root.wait()).await;
+        wait_windows_process_dead(root_pid, "root").await;
+        wait_windows_process_dead(child_pid, "descendant").await;
+    }
+
     #[cfg(not(windows))]
     #[tokio::test]
     async fn stdout_eof_before_startup_caches_specific_bridge_exit_error() {

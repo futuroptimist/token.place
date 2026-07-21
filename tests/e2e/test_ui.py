@@ -145,10 +145,10 @@ def route_landing_relay_chat(
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"server_public_key": server_keys[selected_index]}),
+            body=json.dumps({"server_public_key": server_keys[selected_index], "selected_context_tier": "64k-full"}),
         )
 
-    page.route("**/api/v1/relay/servers/next", handle_next)
+    page.route("**/api/v1/relay/servers/next**", handle_next)
 
     def handle_request(route):
         payload = route.request.post_data_json
@@ -1291,7 +1291,7 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     base_url: str,
     setup_servers,
 ):
-    """Skipped failed keys do not exhaust the accepted replacement dispatch budget."""
+    """Failover waits for a queued diagnostics refresh when the poller is in flight."""
 
     live_server_public_key_b64 = base64.b64encode(
         b"-----BEGIN PUBLIC KEY-----\nlive-third-server\n-----END PUBLIC KEY-----"
@@ -1301,19 +1301,56 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
         assistant_content="Recovered on the live third server.",
         next_server_keys=[
             SERVER_PUBLIC_KEY_B64,
-            ALT_SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             live_server_public_key_b64,
         ],
         request_statuses=[200, 404, 404, 200],
-        diagnostics_counts=[1, 3],
     )
+    state["diagnostics_calls"] = 0
+    active_diagnostics = {"value": 0, "max": 0}
+    held_background_started = threading.Event()
+    held_background_route = {"route": None}
+    queued_followup_count = {"value": 0}
+
+    def fulfill_diagnostics(route, count: int):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": count,
+                    "total_api_v1_registered_compute_nodes": count,
+                }
+            ),
+        )
+
+    def handle_diagnostics(route):
+        state["diagnostics_calls"] += 1
+        active_diagnostics["value"] += 1
+        active_diagnostics["max"] = max(active_diagnostics["max"], active_diagnostics["value"])
+        try:
+            if state["diagnostics_calls"] == 1:
+                fulfill_diagnostics(route, 1)
+                return
+            if state["diagnostics_calls"] == 2:
+                held_background_route["route"] = route
+                held_background_started.set()
+                return
+            queued_followup_count["value"] += 1
+            fulfill_diagnostics(route, 4)
+        finally:
+            active_diagnostics["value"] -= 1
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
     navigations = []
     page.on("framenavigated", lambda frame: navigations.append(frame.url) if frame == page.main_frame else None)
 
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
     initial_navigation_count = len(navigations)
     patch_landing_crypto_for_visible_envelopes(page)
 
@@ -1322,17 +1359,31 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").last.wait_for(state="visible")
 
+    background_deadline = time.monotonic() + 5
+    while not held_background_started.is_set() and time.monotonic() < background_deadline:
+        page.wait_for_timeout(50)
+    assert held_background_started.is_set(), "expected background diagnostics request in flight"
     textarea.fill("second turn reaches an untried live server")
     wait_for_landing_send_enabled(page).click()
-    page.locator(".assistant-message").nth(1).wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => Array.from(document.querySelectorAll('.user-message'))
+            .some((node) => node.textContent.includes('second turn reaches an untried live server'))
+        """
+    )
+    assert held_background_route["route"] is not None
+    fulfill_diagnostics(held_background_route["route"], 1)
     page.wait_for_function(
         """
         () => {
             const messages = Array.from(document.querySelectorAll('.assistant-message'));
             return messages.length >= 2 && messages[messages.length - 1].textContent.includes('Recovered on the live third server.');
         }
-        """
+        """,
+        timeout=5000,
     )
+    diagnostics_calls_at_recovery = state["diagnostics_calls"]
+    queued_followups_at_recovery = queued_followup_count["value"]
 
     body_text = page.locator("body").inner_text()
     assert "first turn remains visible before live candidate" in body_text
@@ -1349,7 +1400,9 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     ]
     assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
     assert request_server_keys.count(live_server_public_key_b64) == 1
-    assert state["diagnostics_calls"] >= 2
+    assert active_diagnostics["max"] == 1
+    assert queued_followups_at_recovery == 1
+    assert diagnostics_calls_at_recovery == 3
     assert state["next_calls"] == 5
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []

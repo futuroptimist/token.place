@@ -44,6 +44,9 @@ new Vue({
         computeNodeCountRefreshInFlight: false,
         computeNodeCountPollTimeout: null,
         computeNodeCountRefreshQueued: false,
+        computeNodeCountQueuedRefreshPromise: null,
+        computeNodeCountQueuedRefreshResolve: null,
+        computeNodeCountQueuedRefreshActive: false,
         computeNodeCountFetchController: null,
         computeNodeCountDestroyed: false
     },
@@ -119,7 +122,7 @@ new Vue({
             }
             const nextDelayMs = delayMs === null ? COMPUTE_NODE_COUNT_POLL_INTERVAL_MS : delayMs;
             if (this.computeNodeCountRefreshInFlight) {
-                if (nextDelayMs === 0) {
+                if (nextDelayMs === 0 && !this.computeNodeCountQueuedRefreshActive) {
                     this.computeNodeCountRefreshQueued = true;
                 }
                 return;
@@ -152,6 +155,17 @@ new Vue({
                 return false;
             }
             if (this.computeNodeCountRefreshInFlight) {
+                if (applySupersededSuccess) {
+                    if (!this.computeNodeCountQueuedRefreshPromise) {
+                        this.computeNodeCountQueuedRefreshPromise = new Promise((resolve) => {
+                            this.computeNodeCountQueuedRefreshResolve = resolve;
+                        });
+                    }
+                    if (!this.computeNodeCountQueuedRefreshActive) {
+                        this.computeNodeCountRefreshQueued = true;
+                    }
+                    return this.computeNodeCountQueuedRefreshPromise;
+                }
                 if (options && options.queueImmediate === true) {
                     this.computeNodeCountRefreshQueued = true;
                 }
@@ -221,12 +235,23 @@ new Vue({
                 if (requestId === this.computeNodeCountRequestId || applySupersededSuccess) {
                     this.computeNodeCountRefreshInFlight = false;
                     if (this.computeNodeCountDestroyed) {
+                        this.resolveQueuedComputeNodeCountRefresh(false);
                         this.computeNodeCountRefreshQueued = false;
                         return;
                     }
                     if (this.computeNodeCountRefreshQueued) {
                         this.computeNodeCountRefreshQueued = false;
-                        this.scheduleComputeNodeCountRefresh(0);
+                        const queuedResolve = this.computeNodeCountQueuedRefreshResolve;
+                        if (queuedResolve) {
+                            this.computeNodeCountQueuedRefreshResolve = null;
+                            this.computeNodeCountQueuedRefreshActive = true;
+                            const queuedResult = await this.refreshComputeNodeCount({ applySupersededSuccess: true });
+                            this.computeNodeCountQueuedRefreshActive = false;
+                            this.computeNodeCountQueuedRefreshPromise = null;
+                            queuedResolve(queuedResult === true);
+                        } else {
+                            this.scheduleComputeNodeCountRefresh(0);
+                        }
                     } else {
                         const elapsedMs = Date.now() - requestStartedAt;
                         const nextDelayMs = Math.max(0, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS - elapsedMs);
@@ -234,6 +259,15 @@ new Vue({
                     }
                 }
             }
+        },
+
+        resolveQueuedComputeNodeCountRefresh(result) {
+            if (this.computeNodeCountQueuedRefreshResolve) {
+                this.computeNodeCountQueuedRefreshResolve(result === true);
+            }
+            this.computeNodeCountQueuedRefreshPromise = null;
+            this.computeNodeCountQueuedRefreshResolve = null;
+            this.computeNodeCountQueuedRefreshActive = false;
         },
 
         detectTouchInput() {
@@ -1418,6 +1452,7 @@ new Vue({
     },
     beforeDestroy() {
         this.computeNodeCountDestroyed = true;
+        this.resolveQueuedComputeNodeCountRefresh(false);
         this.computeNodeCountRefreshQueued = false;
         this.clearComputeNodeCountPoller();
         if (

@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.parse
 from playwright.sync_api import Page, expect
 import time
 
@@ -130,6 +131,10 @@ def route_landing_relay_chat(
 
     def handle_next(route):
         state["next_calls"] += 1
+        parsed_url = urllib.parse.urlparse(route.request.url)
+        query = urllib.parse.parse_qs(parsed_url.query)
+        requested_tier = query.get("context_tier", ["8k-fast"])[0]
+        state.setdefault("requested_context_tiers", []).append(requested_tier)
         status = next_status
         if next_statuses:
             status = next_statuses[min(state["next_calls"] - 1, len(next_statuses) - 1)]
@@ -142,13 +147,14 @@ def route_landing_relay_chat(
             return
         server_keys = next_server_keys or [SERVER_PUBLIC_KEY_B64]
         selected_index = min(state["next_calls"] - 1, len(server_keys) - 1)
+        selected_context_tier = requested_tier if requested_tier in {"8k-fast", "64k-full"} else "8k-fast"
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"server_public_key": server_keys[selected_index]}),
+            body=json.dumps({"server_public_key": server_keys[selected_index], "selected_context_tier": selected_context_tier}),
         )
 
-    page.route("**/api/v1/relay/servers/next", handle_next)
+    page.route("**/api/v1/relay/servers/next**", handle_next)
 
     def handle_request(route):
         payload = route.request.post_data_json
@@ -546,8 +552,7 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
@@ -582,6 +587,280 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
     assert "Live compute nodes: 5" in status.inner_text()
     assert "Updated" in status.inner_text()
 
+
+
+def test_compute_node_count_auto_refreshes_after_unregister(page: Page, base_url: str, setup_servers):
+    """Landing page should automatically refresh diagnostics from 1 to 0 within the SLA."""
+    counts = iter([1, 0])
+    latest_count = {"value": 0}
+    calls = {"count": 0}
+
+    def handle_diagnostics(route):
+        calls["count"] += 1
+        try:
+            latest_count["value"] = next(counts)
+        except StopIteration:
+            pass
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": latest_count["value"],
+                    "total_api_v1_registered_compute_nodes": latest_count["value"],
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
+
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=2000,
+    )
+    assert calls["count"] >= 2
+
+
+def test_compute_node_count_near_timeout_auto_refreshes_to_zero(page: Page, base_url: str, setup_servers):
+    """A near-timeout diagnostics response should still render 1, then auto-refresh to 0 within two seconds."""
+    responses = iter([(1, 0.9), (0, 0.0)])
+    latest = {"count": 0}
+    calls = {"count": 0}
+    in_flight = {"value": 0}
+    max_in_flight = {"value": 0}
+
+    def handle_diagnostics(route):
+        calls["count"] += 1
+        in_flight["value"] += 1
+        max_in_flight["value"] = max(max_in_flight["value"], in_flight["value"])
+        try:
+            try:
+                latest["count"], delay = next(responses)
+            except StopIteration:
+                delay = 0.0
+            if delay:
+                time.sleep(delay)
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": latest["count"],
+                        "total_api_v1_registered_compute_nodes": latest["count"],
+                    }
+                ),
+            )
+        finally:
+            in_flight["value"] -= 1
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')",
+        timeout=2000,
+    )
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=2000,
+    )
+
+    assert calls["count"] == 2
+    assert max_in_flight["value"] == 1
+
+
+def test_compute_node_count_stalled_fetch_is_bounded_without_overlap(page: Page, base_url: str, setup_servers):
+    """Bound stalled diagnostics requests and keep polling single-flight."""
+    call_count = {"value": 0}
+    in_flight = {"value": 0}
+    max_in_flight = {"value": 0}
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        in_flight["value"] += 1
+        max_in_flight["value"] = max(max_in_flight["value"], in_flight["value"])
+        try:
+            if call_count["value"] == 1:
+                time.sleep(0.9)
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": 0,
+                        "total_api_v1_registered_compute_nodes": 0,
+                    }
+                ),
+            )
+        except Exception:
+            return
+        finally:
+            in_flight["value"] -= 1
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 0')",
+        timeout=5000,
+    )
+    assert call_count["value"] >= 2
+    assert max_in_flight["value"] == 1
+
+
+def test_compute_node_count_destroy_does_not_reschedule_after_inflight(page: Page, base_url: str, setup_servers):
+    """Destroying the Vue app during an in-flight refresh should stop further polling."""
+    call_count = {"value": 0}
+    first_request_started = threading.Event()
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            first_request_started.set()
+            time.sleep(0.4)
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": 1,
+                        "total_api_v1_registered_compute_nodes": 1,
+                    }
+                ),
+            )
+        except Exception:
+            return
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_request_started.wait(timeout=5), "Expected first diagnostics request"
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.$destroy();
+        }
+        """
+    )
+    calls_after_destroy = call_count["value"]
+    page.wait_for_timeout(1500)
+    assert call_count["value"] == calls_after_destroy
+
+
+def test_compute_node_count_queued_failover_callers_share_followup_result(page: Page, base_url: str, setup_servers):
+    """Multiple high-priority refresh callers behind one request share one follow-up result."""
+    call_count = {"value": 0}
+    active = {"value": 0, "max": 0}
+    active_lock = threading.Lock()
+    first_started = threading.Event()
+    first_route = {"route": None}
+
+    def begin():
+        with active_lock:
+            active["value"] += 1
+            active["max"] = max(active["max"], active["value"])
+
+    def end():
+        with active_lock:
+            active["value"] -= 1
+
+    def fulfill(route, count: int):
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": count,
+                        "total_api_v1_registered_compute_nodes": count,
+                    }
+                ),
+            )
+        finally:
+            end()
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        begin()
+        if call_count["value"] == 1:
+            first_route["route"] = route
+            first_started.set()
+            return
+        fulfill(route, 2)
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_started.wait(timeout=5), "expected initial diagnostics request"
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            window.__queuedComputeNodeRefreshResults = Promise.all([
+                vm.refreshComputeNodeCount({ applySupersededSuccess: true }),
+                vm.refreshComputeNodeCount({ applySupersededSuccess: true })
+            ]);
+        }
+        """
+    )
+    assert first_route["route"] is not None
+    fulfill(first_route["route"], 1)
+    results = page.evaluate("() => window.__queuedComputeNodeRefreshResults")
+
+    assert results == [True, True]
+    assert call_count["value"] == 2
+    assert active["max"] == 1
+    assert page.locator(".compute-node-status").inner_text().strip().startswith("Live compute nodes: 2")
+
+
+def test_compute_node_count_destroy_settles_queued_failover_callers_false(page: Page, base_url: str, setup_servers):
+    """Destroying the component settles queued failover waiters as false and issues no follow-up."""
+    call_count = {"value": 0}
+    first_started = threading.Event()
+    first_route = {"route": None}
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            first_route["route"] = route
+            first_started.set()
+            return
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 9,
+                    "total_api_v1_registered_compute_nodes": 9,
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_started.wait(timeout=5), "expected initial diagnostics request"
+    results = page.evaluate(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            const p1 = vm.refreshComputeNodeCount({ applySupersededSuccess: true });
+            const p2 = vm.refreshComputeNodeCount({ applySupersededSuccess: true });
+            vm.$destroy();
+            return Promise.all([p1, p2]);
+        }
+        """
+    )
+    assert results == [False, False]
+    if first_route["route"] is not None:
+        try:
+            first_route["route"].abort()
+        except Exception:
+            pass
+    page.wait_for_timeout(200)
+    assert call_count["value"] == 1
 
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
     """Older diagnostics responses should not overwrite newer compute-node counts."""
@@ -639,8 +918,7 @@ def test_compute_node_count_rejects_null_diagnostics(page: Page, base_url: str, 
         )
 
     page.route("**/relay/diagnostics", handle_null_diagnostics)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
@@ -661,8 +939,7 @@ def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics_failure)
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
@@ -1131,7 +1408,7 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     base_url: str,
     setup_servers,
 ):
-    """Skipped failed keys do not exhaust the accepted replacement dispatch budget."""
+    """Failover waits for a queued diagnostics refresh when the poller is in flight."""
 
     live_server_public_key_b64 = base64.b64encode(
         b"-----BEGIN PUBLIC KEY-----\nlive-third-server\n-----END PUBLIC KEY-----"
@@ -1141,19 +1418,65 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
         assistant_content="Recovered on the live third server.",
         next_server_keys=[
             SERVER_PUBLIC_KEY_B64,
-            ALT_SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             live_server_public_key_b64,
         ],
         request_statuses=[200, 404, 404, 200],
-        diagnostics_counts=[1, 3],
     )
+    state["diagnostics_calls"] = 0
+    active_diagnostics = {"value": 0, "max": 0}
+    active_diagnostics_lock = threading.Lock()
+    held_background_started = threading.Event()
+    held_background_route = {"route": None}
+    queued_followup_count = {"value": 0}
+
+    def begin_diagnostics_request():
+        with active_diagnostics_lock:
+            active_diagnostics["value"] += 1
+            active_diagnostics["max"] = max(active_diagnostics["max"], active_diagnostics["value"])
+
+    def end_diagnostics_request():
+        with active_diagnostics_lock:
+            active_diagnostics["value"] -= 1
+
+    def fulfill_diagnostics(route, count: int):
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": count,
+                        "total_api_v1_registered_compute_nodes": count,
+                    }
+                ),
+            )
+        finally:
+            end_diagnostics_request()
+
+    def handle_diagnostics(route):
+        state["diagnostics_calls"] += 1
+        begin_diagnostics_request()
+        if state["diagnostics_calls"] == 1:
+            fulfill_diagnostics(route, 1)
+            return
+        if state["diagnostics_calls"] == 2:
+            held_background_route["route"] = route
+            held_background_started.set()
+            return
+        queued_followup_count["value"] += 1
+        fulfill_diagnostics(route, 4)
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
     navigations = []
     page.on("framenavigated", lambda frame: navigations.append(frame.url) if frame == page.main_frame else None)
 
-    page.goto(base_url)
-    page.wait_for_load_state("networkidle")
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 1')"
+    )
     initial_navigation_count = len(navigations)
     patch_landing_crypto_for_visible_envelopes(page)
 
@@ -1162,17 +1485,31 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").last.wait_for(state="visible")
 
+    background_deadline = time.monotonic() + 5
+    while not held_background_started.is_set() and time.monotonic() < background_deadline:
+        page.wait_for_timeout(50)
+    assert held_background_started.is_set(), "expected background diagnostics request in flight"
     textarea.fill("second turn reaches an untried live server")
     wait_for_landing_send_enabled(page).click()
-    page.locator(".assistant-message").nth(1).wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => Array.from(document.querySelectorAll('.user-message'))
+            .some((node) => node.textContent.includes('second turn reaches an untried live server'))
+        """
+    )
+    assert held_background_route["route"] is not None
+    fulfill_diagnostics(held_background_route["route"], 1)
     page.wait_for_function(
         """
         () => {
             const messages = Array.from(document.querySelectorAll('.assistant-message'));
             return messages.length >= 2 && messages[messages.length - 1].textContent.includes('Recovered on the live third server.');
         }
-        """
+        """,
+        timeout=5000,
     )
+    diagnostics_calls_at_recovery = state["diagnostics_calls"]
+    queued_followups_at_recovery = queued_followup_count["value"]
 
     body_text = page.locator("body").inner_text()
     assert "first turn remains visible before live candidate" in body_text
@@ -1189,7 +1526,9 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     ]
     assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
     assert request_server_keys.count(live_server_public_key_b64) == 1
-    assert state["diagnostics_calls"] >= 2
+    assert active_diagnostics["max"] == 1
+    assert queued_followups_at_recovery == 1
+    assert diagnostics_calls_at_recovery == 3
     assert state["next_calls"] == 5
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []

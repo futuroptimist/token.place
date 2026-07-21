@@ -1076,6 +1076,7 @@ class RelayClient:
         self._last_api_v1_work_relay_url: Optional[str] = None
         self._api_v1_registered_relays: Set[str] = set()
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
+        self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._api_v1_control_credentials_by_relay: Dict[str, str] = {}
         self._api_v1_control_credentials_lock = threading.Lock()
         self._unregister_attempted = False
@@ -1084,6 +1085,9 @@ class RelayClient:
         self._api_v1_heartbeat_stop = threading.Event()
         self._api_v1_heartbeat_thread: Optional[threading.Thread] = None
         self._api_v1_heartbeat_stopping = False
+        self._api_v1_mutation_lock = threading.Condition()
+        self._api_v1_mutation_count = 0
+        self._api_v1_mutation_latched = False
 
 
     def _api_v1_start_heartbeat_worker(self) -> None:
@@ -1107,29 +1111,87 @@ class RelayClient:
             self._api_v1_heartbeat_thread = thread
             thread.start()
 
-    def _api_v1_stop_heartbeat_worker(self) -> None:
+    def _api_v1_latch_shutdown(self) -> None:
+        """Prevent new API v1 polling/heartbeat work without waiting on workers."""
+
+        self.stop_polling = True
+        self._polling_stopped_by_request = True
+        # Stop latching is a mutation barrier: no new register/heartbeat
+        # mutations may start, in-flight mutations are counted until they
+        # quiesce, and stopped long-poll results must not change registration.
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is not None:
+            with condition:
+                self._api_v1_mutation_latched = True
+                condition.notify_all()
+        stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+
+    def _api_v1_begin_mutation(self) -> bool:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return not getattr(self, "_polling_stopped_by_request", False)
+        with condition:
+            if getattr(self, "_api_v1_mutation_latched", False):
+                return False
+            self._api_v1_mutation_count = int(getattr(self, "_api_v1_mutation_count", 0)) + 1
+            return True
+
+    def _api_v1_end_mutation(self) -> None:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return
+        with condition:
+            self._api_v1_mutation_count = max(0, int(getattr(self, "_api_v1_mutation_count", 0)) - 1)
+            condition.notify_all()
+
+    def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline: Optional[float] = None) -> bool:
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is None:
+            return True
+        with condition:
+            while int(getattr(self, "_api_v1_mutation_count", 0)) > 0:
+                if isinstance(shutdown_deadline, (int, float)):
+                    remaining = float(shutdown_deadline) - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    condition.wait(timeout=min(0.05, remaining))
+                else:
+                    condition.wait(timeout=0.05)
+            return True
+
+    def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline: Optional[float] = None) -> bool:
         """Stop the API v1 heartbeat worker without leaving shutdown heartbeats behind."""
 
+        # Per-request heartbeat teardown is safe because it only stops the
+        # temporary lease-refresh worker; explicit Stop owns the global polling latch.
         stop_event = getattr(self, "_api_v1_heartbeat_stop", None)
         if stop_event is None:
-            return
+            return True
         lock = getattr(self, "_api_v1_heartbeat_lock", None)
         if lock is None:
             stop_event.set()
-            return
+            return True
         with lock:
             self._api_v1_heartbeat_stopping = True
             stop_event.set()
             thread = getattr(self, "_api_v1_heartbeat_thread", None)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             join_timeout = max(float(getattr(self, "_request_timeout", 10) or 10) + 1.0, 2.0)
-            thread.join(timeout=join_timeout)
+            if isinstance(shutdown_deadline, (int, float)):
+                remaining = float(shutdown_deadline) - time.monotonic()
+                if remaining <= 0:
+                    return False
+                join_timeout = min(join_timeout, remaining)
+            thread.join(timeout=max(0.0, join_timeout))
         with lock:
             if getattr(self, "_api_v1_heartbeat_thread", None) is thread and (
                 thread is None or not thread.is_alive()
             ):
                 self._api_v1_heartbeat_thread = None
             self._api_v1_heartbeat_stopping = False
+        return bool(thread is None or not thread.is_alive())
 
     def _api_v1_heartbeat_worker(self) -> None:
         """Refresh relay leases independently from polling/inference work."""
@@ -1158,22 +1220,26 @@ class RelayClient:
                     log_error(
                         "server.heartbeat.background_failed relay={} error={}",
                         _sanitize_relay_target(candidate_url),
-                        str(exc),
+                        type(exc).__name__,
                     )
                     continue
                 if isinstance(response, dict) and not response.get("error"):
                     refreshed_lease = self._normalise_positive_seconds(
                         response.get("next_ping_in_x_seconds"), lease
                     )
-                    relay_wait_hints[candidate_url] = {
-                        "next_ping_in_x_seconds": refreshed_lease,
-                        "poll_wait_seconds": self._normalise_poll_wait_seconds(
-                            response.get("poll_wait_seconds", refreshed_lease)
-                        ),
-                        "server_public_key": self.crypto_manager.public_key_b64,
-                    }
-                    self._api_v1_registered_relays.add(candidate_url)
-                    self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
+                    if (
+                        not self._api_v1_heartbeat_stop.is_set()
+                        and not getattr(self, "_polling_stopped_by_request", False)
+                    ):
+                        relay_wait_hints[candidate_url] = {
+                            "next_ping_in_x_seconds": refreshed_lease,
+                            "poll_wait_seconds": self._normalise_poll_wait_seconds(
+                                response.get("poll_wait_seconds", refreshed_lease)
+                            ),
+                            "server_public_key": self.crypto_manager.public_key_b64,
+                        }
+                        self._api_v1_registered_relays.add(candidate_url)
+                        self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                     log_info(
                         "server.heartbeat.background relay={} lease_seconds={} key_fingerprint={}",
                         _sanitize_relay_target(candidate_url),
@@ -1361,6 +1427,11 @@ class RelayClient:
         self._polling_stopped_by_request = False
         self._unregister_attempted = False
         self._unregister_complete = False
+        condition = getattr(self, "_api_v1_mutation_lock", None)
+        if condition is not None:
+            with condition:
+                self._api_v1_mutation_latched = False
+                condition.notify_all()
         if clear_registration:
             self._api_v1_registered_relays.clear()
             self._api_v1_last_heartbeat_at.clear()
@@ -1385,8 +1456,7 @@ class RelayClient:
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""
         log_info("Stopping relay polling")
-        self.stop_polling = True
-        self._polling_stopped_by_request = True
+        self._api_v1_latch_shutdown()
         wakeup = getattr(self, '_api_v1_control_wakeup', None)
         if wakeup is not None:
             wakeup.set()
@@ -1400,7 +1470,21 @@ class RelayClient:
         Rust's bounded stop grace.
         """
 
-        self._api_v1_stop_heartbeat_worker()
+        self._api_v1_latch_shutdown()
+        if not self._api_v1_stop_heartbeat_worker(shutdown_deadline=shutdown_deadline):
+            self._unregister_complete = False
+            log_error(
+                "Timed out waiting for API v1 heartbeat shutdown before unregister; "
+                "registration evidence retained for retry"
+            )
+            return False
+        if not self._api_v1_wait_for_mutation_quiescence(shutdown_deadline=shutdown_deadline):
+            self._unregister_complete = False
+            log_error(
+                "Timed out waiting for API v1 mutation quiescence before unregister; "
+                "registration evidence retained for retry"
+            )
+            return False
 
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
         if not isinstance(registered_relays, set):
@@ -1438,6 +1522,14 @@ class RelayClient:
         relay_index_by_url = {url: index for index, url in enumerate(self._relay_urls)}
 
         for candidate_url in target_urls:
+            request_timeout = self._request_timeout
+            if isinstance(shutdown_deadline, (int, float)):
+                remaining = float(shutdown_deadline) - time.monotonic()
+                if remaining <= 0:
+                    failed_relays.add(candidate_url)
+                    last_error = "shutdown deadline exceeded before unregister request"
+                    continue
+                request_timeout = min(float(self._request_timeout), remaining)
             try:
                 payload = {'server_public_key': self.crypto_manager.public_key_b64}
                 control_credential = self._api_v1_control_credential_for_relay(candidate_url)
@@ -1486,7 +1578,7 @@ class RelayClient:
                 if response.status_code == 200:
                     if candidate_url in relay_index_by_url:
                         self._active_relay_index = relay_index_by_url[candidate_url]
-                    log_info("Unregistered compute node from relay {}", candidate_url)
+                    log_info("Unregistered compute node from relay {}", _sanitize_relay_target(candidate_url))
                     unregistered_relays.add(candidate_url)
                     self._api_v1_registered_relays.discard(candidate_url)
                     self._pop_api_v1_control_credential(candidate_url)
@@ -1504,26 +1596,24 @@ class RelayClient:
                 last_error = f"HTTP {diagnostic['status_code']}"
                 log_error(
                     "Failed to unregister compute node from {}: {}",
-                    candidate_url,
+                    _sanitize_relay_target(candidate_url),
                     last_error,
                 )
             except requests.RequestException as exc:
                 failed_relays.add(candidate_url)
-                last_error = str(exc)
+                last_error = type(exc).__name__
                 log_error(
-                    "Error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "Error unregistering compute node from {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
                     last_error,
-                    exc_info=True,
                 )
             except Exception as exc:  # pragma: no cover - unexpected edge cases
                 failed_relays.add(candidate_url)
-                last_error = str(exc)
+                last_error = type(exc).__name__
                 log_error(
-                    "Unexpected error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "Unexpected error unregistering compute node from {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
                     last_error,
-                    exc_info=True,
                 )
 
         if failed_relays:
@@ -1540,7 +1630,7 @@ class RelayClient:
                 self._api_v1_last_heartbeat_at.pop(relay_url, None)
                 relay_wait_hints.pop(relay_url, None)
         return True
-
+      
     def _remaining_unregister_timeout(self, shutdown_deadline: Optional[float]) -> Optional[float]:
         if shutdown_deadline is None:
             return self._request_timeout
@@ -1594,6 +1684,12 @@ class RelayClient:
                     **request_kwargs,
                 )
 
+                if getattr(self, "_polling_stopped_by_request", False):
+                    return {
+                        'error': 'Relay polling stopped',
+                        'next_ping_in_x_seconds': 0,
+                        'poll_wait_seconds': 0,
+                    }
                 if response.status_code != 200:
                     log_error(
                         "Error from relay /sink: status {} ({} bytes)",
@@ -1833,6 +1929,22 @@ class RelayClient:
 
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
+        if not self._api_v1_begin_mutation():
+            return {'error': 'Relay polling stopped', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 0}
+        try:
+            result = self._register_api_v1_compute_node_unlatched(target_url)
+            if isinstance(result, dict) and not result.get('error'):
+                self._api_v1_registered_relays.add(target_url)
+                self._api_v1_last_heartbeat_at.setdefault(target_url, 0.0)
+                relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+                self._api_v1_relay_wait_hints = relay_wait_hints
+                relay_wait_hints.setdefault(target_url, {})["server_public_key"] = self.crypto_manager.public_key_b64
+                self._unregister_complete = False
+            return result
+        finally:
+            self._api_v1_end_mutation()
+
+    def _register_api_v1_compute_node_unlatched(self, target_url: str) -> Dict[str, Any]:
         payload = {
             'server_public_key': self.crypto_manager.public_key_b64,
             'capabilities': self._api_v1_compute_node_capabilities(),
@@ -1988,12 +2100,13 @@ class RelayClient:
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
 
+        stopped_result = {
+            'error': 'Relay polling stopped',
+            'next_ping_in_x_seconds': 0,
+            'poll_wait_seconds': 0,
+        }
         if getattr(self, "_polling_stopped_by_request", False):
-            return {
-                'error': 'Relay polling stopped',
-                'next_ping_in_x_seconds': 0,
-                'poll_wait_seconds': 0,
-            }
+            return stopped_result
 
         last_error: Optional[Dict[str, Any]] = None
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
@@ -2036,19 +2149,11 @@ class RelayClient:
                         reregister_reason = "lease_expiry_risk"
 
                 if getattr(self, "_polling_stopped_by_request", False):
-                    return {
-                        'error': 'Relay polling stopped',
-                        'next_ping_in_x_seconds': 0,
-                        'poll_wait_seconds': 0,
-                    }
+                    return stopped_result
 
                 if requires_register:
                     if getattr(self, "_polling_stopped_by_request", False):
-                        return {
-                            'error': 'Relay polling stopped',
-                            'next_ping_in_x_seconds': 0,
-                            'poll_wait_seconds': 0,
-                        }
+                        return stopped_result
                     if reregister_reason and reregister_reason != "not_registered":
                         log_info(
                             "server.reregister reason={} relay={} key_fingerprint={}",
@@ -2082,12 +2187,7 @@ class RelayClient:
                     self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                     self._unregister_complete = False
                     if getattr(self, "_polling_stopped_by_request", False):
-                        self.unregister_from_relay()
-                        return {
-                            'error': 'Relay polling stopped',
-                            'next_ping_in_x_seconds': 0,
-                            'poll_wait_seconds': 0,
-                        }
+                        return stopped_result
                     next_refresh = self._api_v1_refresh_threshold_seconds(register_wait)
                     log_info(
                         "server.registered relay={} lease_seconds={} next_refresh_seconds={} key_fingerprint={}",
@@ -2115,11 +2215,7 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 if getattr(self, "_polling_stopped_by_request", False):
-                    return {
-                        'error': 'Relay polling stopped',
-                        'next_ping_in_x_seconds': 0,
-                        'poll_wait_seconds': 0,
-                    }
+                    return stopped_result
 
                 poll_timeout_seconds = float(request_kwargs.pop('timeout'))
                 poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
@@ -2145,6 +2241,11 @@ class RelayClient:
                         and float(poll_wait) > 0
                         and elapsed_seconds >= max(0.0, float(poll_wait) - 0.5)
                     )
+                    if getattr(self, "_polling_stopped_by_request", False):
+                        # Once Stop latches, poll failures are observation-only:
+                        # preserve registration evidence for the final bounded
+                        # unregister and avoid refreshing heartbeat/wait hints.
+                        return stopped_result
                     if reached_server_long_poll and candidate_url in self._api_v1_registered_relays:
                         self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                         relay_wait_hints[candidate_url] = {
@@ -2155,14 +2256,14 @@ class RelayClient:
                         next_refresh = self._api_v1_refresh_threshold_seconds(register_wait)
                         log_info(
                             "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} "
-                            "lease_seconds={} next_refresh_seconds={} key_fingerprint={} error={}",
+                            "lease_seconds={} next_refresh_seconds={} key_fingerprint={} exc_type={}",
                             candidate_url,
                             poll_wait,
                             poll_timeout_seconds,
                             register_wait,
                             round(next_refresh, 3),
                             self._api_v1_public_key_fingerprint(current_public_key),
-                            str(exc),
+                            type(exc).__name__,
                         )
                         return {
                             'message': 'No requests available',
@@ -2170,6 +2271,8 @@ class RelayClient:
                             'poll_wait_seconds': poll_wait,
                         }
                     raise
+                if getattr(self, "_polling_stopped_by_request", False):
+                    return stopped_result
                 if response.status_code != 200:
                     if response.status_code == 404:
                         self._api_v1_registered_relays.discard(candidate_url)
@@ -2234,11 +2337,21 @@ class RelayClient:
                 )
                 return payload
             except Exception as exc:
-                log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
+                if getattr(self, "_polling_stopped_by_request", False):
+                    # A post-latch poll exception must not erase registration,
+                    # heartbeat, wait-hint, or active-relay bookkeeping that
+                    # cleanup needs to perform the canonical unregister.
+                    return stopped_result
+                safe_error = type(exc).__name__
+                log_error(
+                    "API v1 relay poll failed for {}: exc_type={}",
+                    _sanitize_relay_target(candidate_url),
+                    safe_error,
+                )
                 self._api_v1_registered_relays.discard(candidate_url)
                 self._api_v1_last_heartbeat_at.pop(candidate_url, None)
                 relay_wait_hints.pop(candidate_url, None)
-                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                last_error = {'error': safe_error, 'next_ping_in_x_seconds': self._request_timeout}
 
         return last_error or {
             'error': 'No relay targets responded',
@@ -2693,6 +2806,15 @@ class RelayClient:
         should read ``.submitted``.
         """
 
+        if not self._api_v1_begin_mutation():
+            log_info(
+                "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
+                response_envelope.get("request_id"),
+                response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
+                "/api/v1/relay/responses",
+            )
+            return False
+
         try:
             bound_response_envelope = {
                 **response_envelope,
@@ -2781,6 +2903,8 @@ class RelayClient:
                 exc_info=True,
             )
             return _PostApiV1Outcome(submitted=False, transport_failed=True)
+        finally:
+            self._api_v1_end_mutation()
 
 
     def submit_api_v1_error_response(
@@ -4967,18 +5091,34 @@ class RelayClient:
                         and callable(cancelled_fn)
                         and cancelled_fn(cancel_snapshot) is True
                     )
-                    if getattr(self, '_polling_stopped_by_request', False) or time.monotonic() >= outer_api_v1_deadline or request_cancelled:
+                    shutdown_latched = getattr(self, "_api_v1_mutation_latched", False)
+                    operator_stopped = getattr(self, '_polling_stopped_by_request', False)
+                    deadline_expired = time.monotonic() >= outer_api_v1_deadline
+                    if shutdown_latched or operator_stopped or deadline_expired or request_cancelled:
+                        if shutdown_latched or operator_stopped:
+                            log_info(
+                                "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
+                                api_v1_request_payload["request_id"],
+                                "tokenplace_api_v1_relay_e2ee",
+                                "/api/v1/relay/responses",
+                            )
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
                             safe_error_code=(
-                                'operator_stop'
-                                if getattr(self, '_polling_stopped_by_request', False)
+                                'shutdown_requested'
+                                if shutdown_latched
+                                else 'operator_stop'
+                                if operator_stopped
                                 else 'local_deadline'
-                                if time.monotonic() >= outer_api_v1_deadline
+                                if deadline_expired
                                 else 'request_cancelled'
                             ),
-                            runtime_healthy=runtime_healthy,
+                            runtime_healthy=(
+                                True
+                                if shutdown_latched or operator_stopped
+                                else runtime_healthy
+                            ),
                             recovery_attempted=recovery_attempted,
                             recovery_succeeded=recovery_succeeded,
                             submission_allowed=False,
@@ -4990,12 +5130,30 @@ class RelayClient:
                         cancel_snapshot=cancel_snapshot,
                         local_deadline=outer_api_v1_deadline,
                     )
+                    if isinstance(post_outcome, bool):
+                        post_outcome = _PostApiV1Outcome(submitted=post_outcome)
                     if post_outcome.suppressed:
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
                             safe_error_code=post_outcome.suppressed_code or 'request_suppressed',
                             runtime_healthy=runtime_healthy,
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
+                        )
+                    if (
+                        not post_outcome.submitted
+                        and (
+                            getattr(self, "_api_v1_mutation_latched", False)
+                            or getattr(self, "_polling_stopped_by_request", False)
+                        )
+                    ):
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code="shutdown_requested",
+                            runtime_healthy=True,
                             recovery_attempted=recovery_attempted,
                             recovery_succeeded=recovery_succeeded,
                             submission_allowed=False,

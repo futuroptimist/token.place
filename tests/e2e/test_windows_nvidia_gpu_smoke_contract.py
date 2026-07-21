@@ -594,3 +594,196 @@ def test_main_rejects_non_windows_and_missing_model(monkeypatch, tmp_path):
 
     monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
     assert windows_gpu_smoke.main() == 1
+
+
+def test_nsis_uninstaller_noop_and_invocation(monkeypatch, tmp_path):
+    install_root = tmp_path / 'install'
+    install_root.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'run', lambda cmd, **_kwargs: calls.append(cmd))
+
+    windows_gpu_smoke._run_nsis_uninstaller_once(install_root)
+    assert calls == []
+
+    nested = install_root / 'app'
+    nested.mkdir()
+    uninstaller = nested / 'uninstall.exe'
+    uninstaller.write_text('uninstall', encoding='utf-8')
+    windows_gpu_smoke._run_nsis_uninstaller_once(install_root)
+    assert calls == [[str(uninstaller), '/S']]
+
+
+def test_launch_materialized_child_cleanup_failure_propagates(monkeypatch, tmp_path):
+    installer = tmp_path / 'Token.Place_0.1.2_x64-setup.exe'
+    installer.write_text('installer', encoding='utf-8')
+
+    def fake_materialize(_path, install_root):
+        runtime = install_root / 'resources' / 'python-runtime'
+        runtime.mkdir(parents=True)
+        (runtime / 'python.exe').write_text('python', encoding='utf-8')
+        bridge_root = install_root / 'resources' / 'python'
+        bridge_root.mkdir(parents=True)
+        (bridge_root / 'compute_node_bridge.py').write_text('# bridge', encoding='utf-8')
+
+    monkeypatch.setattr(windows_gpu_smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'run', lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        windows_gpu_smoke,
+        '_run_nsis_uninstaller_once',
+        lambda _root: (_ for _ in ()).throw(RuntimeError('cleanup failed')),
+    )
+
+    args = argparse.Namespace(installer=installer, model=tmp_path / 'model.gguf', mode='gpu', context_tier='64k-full')
+    try:
+        windows_gpu_smoke._launch_materialized_child(args)
+    except RuntimeError as exc:
+        assert 'cleanup failed' in str(exc)
+    else:
+        raise AssertionError('expected cleanup failure to propagate')
+
+
+def test_reexec_missing_interpreter_and_resolve_oserror(monkeypatch, tmp_path):
+    resource_root = tmp_path / 'resources'
+    missing_python = resource_root / 'python-runtime' / 'python.exe'
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'executable', str(tmp_path / 'host.exe'))
+    try:
+        windows_gpu_smoke._maybe_reexec_with_bundled_python(missing_python, resource_root, [])
+    except RuntimeError as exc:
+        assert 'bundled interpreter is missing' in str(exc)
+    else:
+        raise AssertionError('expected missing interpreter failure')
+
+    python_exe = resource_root / 'python-runtime' / 'python.exe'
+    python_exe.parent.mkdir(parents=True)
+    python_exe.write_text('python', encoding='utf-8')
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+
+    class BrokenPath(type(python_exe)):
+        def resolve(self):  # type: ignore[override]
+            raise OSError('bad path')
+
+    broken_python = BrokenPath(python_exe)
+    monkeypatch.setattr(windows_gpu_smoke.os, 'execve', lambda exe, argv, env: exec_calls.append((exe, argv, env)))
+    windows_gpu_smoke._maybe_reexec_with_bundled_python(broken_python, resource_root, ['--mode', 'gpu'])
+    assert exec_calls and exec_calls[0][0] == str(python_exe)
+
+
+def test_run_bridge_oneshot_timeout_exit_and_json_edges(monkeypatch, tmp_path):
+    repo_root = _make_repo_root_with_bootstrap(tmp_path)
+    monkeypatch.setattr(windows_gpu_smoke, '_repo_root', lambda: repo_root)
+    monkeypatch.setattr(windows_gpu_smoke, 'BRIDGE_TIMEOUT_SECONDS', 0.01)
+    terminated: list[object] = []
+    monkeypatch.setattr(windows_gpu_smoke, '_terminate_process_tree', lambda proc: terminated.append(proc))
+
+    class ExitedProcess(_FakeProcess):
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'Popen', lambda *_args, **_kwargs: ExitedProcess('not-json\n[]\n'))
+    try:
+        windows_gpu_smoke._run_bridge_oneshot('model.gguf', 'gpu', '64k-full')
+    except RuntimeError as exc:
+        text = str(exc)
+        assert 'exited before emitting' in text or 'bridge validation failed' in text
+    else:
+        raise AssertionError('expected exited-before-ready failure')
+    assert terminated
+
+    class IdleProcess(_FakeProcess):
+        def __init__(self):
+            super().__init__('')
+
+        def poll(self):
+            return None
+
+    terminated.clear()
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'Popen', lambda *_args, **_kwargs: IdleProcess())
+    try:
+        windows_gpu_smoke._run_bridge_oneshot('model.gguf', 'gpu', '64k-full')
+    except RuntimeError as exc:
+        assert 'bridge validation failed' in str(exc)
+    else:
+        raise AssertionError('expected timeout failure')
+    assert terminated
+
+
+def test_run_bridge_oneshot_resource_root_uses_bundled_environment(monkeypatch, tmp_path):
+    resource_root = tmp_path / 'resources'
+    python_root = resource_root / 'python'
+    python_root.mkdir(parents=True)
+    (python_root / 'compute_node_bridge.py').write_text('# bridge', encoding='utf-8')
+    popen_kwargs: dict[str, object] = {}
+    ready = {
+        'type': 'started',
+        'registered': True,
+        'warm_load_state': 'ready',
+        'backend_available': 'cuda',
+        'backend_used': 'cuda',
+        'offloaded_layers': 2,
+        'kv_cache_device': 'cuda:0',
+        'llama_repo_stub_imported': False,
+        'context_tier': '64k-full',
+    }
+
+    def fake_popen(*_args, **kwargs):
+        popen_kwargs.update(kwargs)
+        return _FakeProcess(json.dumps(ready) + '\n')
+
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'Popen', fake_popen)
+    started, _events, _stderr = windows_gpu_smoke._run_bridge_oneshot('model.gguf', 'gpu', '64k-full', resource_root)
+
+    assert started == ready
+    assert popen_kwargs['cwd'] == str(resource_root)
+    env = popen_kwargs['env']
+    assert env['PYTHONPATH'] == str(python_root)
+    assert env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] == '1'
+
+
+def test_main_installer_handoff_and_runtime_requirement_failures(monkeypatch, tmp_path):
+    installer = tmp_path / 'app-setup.exe'
+    installer.write_text('installer', encoding='utf-8')
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        'parse_args',
+        lambda _self: argparse.Namespace(
+            model=str(tmp_path / 'model.gguf'),
+            mode='gpu',
+            context_tier='64k-full',
+            resource_root=None,
+            python_exe=None,
+            artifact_root=None,
+            installer=installer,
+        ),
+    )
+    monkeypatch.setattr(windows_gpu_smoke, '_launch_materialized_child', lambda args: 23)
+    assert windows_gpu_smoke.main() == 23
+
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('model', encoding='utf-8')
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        'parse_args',
+        lambda _self: argparse.Namespace(
+            model=str(model_path),
+            mode='gpu',
+            context_tier='64k-full',
+            resource_root=None,
+            python_exe=None,
+            artifact_root=None,
+            installer=None,
+        ),
+    )
+    monkeypatch.setattr(windows_gpu_smoke.os.path, 'exists', lambda _path: True)
+    repo_root = _make_repo_root_with_bootstrap(tmp_path)
+    monkeypatch.setattr(windows_gpu_smoke, '_repo_root', lambda: repo_root)
+    monkeypatch.setattr(windows_gpu_smoke, '_run_bridge_oneshot', lambda *_args: ({}, [], ''))
+
+    for diagnostics in [
+        {'backend_available': 'cpu', 'backend_used': 'cuda', 'offloaded_layers': 1, 'kv_cache_device': 'cuda', 'runtime_setup': {'runtime_action': 'already_supported'}},
+        {'backend_available': 'cuda', 'backend_used': 'cuda', 'offloaded_layers': 0, 'kv_cache_device': 'cuda', 'runtime_setup': {'runtime_action': 'already_supported'}},
+        {'backend_available': 'cuda', 'backend_used': 'cuda', 'offloaded_layers': 1, 'kv_cache_device': 'cpu', 'runtime_setup': {'runtime_action': 'already_supported'}},
+        {'backend_available': 'cuda', 'backend_used': 'cuda', 'offloaded_layers': 1, 'kv_cache_device': 'cuda', 'runtime_setup': {'runtime_action': 'shadowed_repo_llama_cpp'}},
+    ]:
+        monkeypatch.setattr(windows_gpu_smoke, '_load_compute_runtime_diagnostics', lambda *_args, d=diagnostics: d)
+        assert windows_gpu_smoke.main() == 1

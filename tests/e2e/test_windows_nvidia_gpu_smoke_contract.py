@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import importlib.util
+import json
+import queue
 import sys
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -340,3 +342,255 @@ def test_main_forwards_context_tier_to_runtime_and_bridge(monkeypatch, tmp_path)
     assert windows_gpu_smoke.main() == 0
     assert calls['diagnostics'] == (str(model_path), 'gpu', '64k-full')
     assert calls['bridge'] == (str(model_path), 'gpu', '64k-full')
+
+
+def test_launch_materialized_child_materializes_once_reexecs_canonical_and_cleans(monkeypatch, tmp_path):
+    installer = tmp_path / 'Token.Place_0.1.2_x64-setup.exe'
+    installer.write_text('installer', encoding='utf-8')
+    materialized: list[Path] = []
+    cleaned: list[Path] = []
+    runs: list[dict[str, object]] = []
+
+    def fake_materialize(path, install_root):
+        assert path == installer
+        materialized.append(install_root)
+        runtime = install_root / 'resources' / 'python-runtime'
+        runtime.mkdir(parents=True)
+        (runtime / 'python.exe').write_text('python', encoding='utf-8')
+        bridge_root = install_root / 'resources' / 'python'
+        bridge_root.mkdir(parents=True)
+        (bridge_root / 'compute_node_bridge.py').write_text('# bridge', encoding='utf-8')
+
+    class Result:
+        returncode = 7
+
+    def fake_run(cmd, **kwargs):
+        runs.append({'cmd': cmd, **kwargs})
+        return Result()
+
+    monkeypatch.setattr(windows_gpu_smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'run', fake_run)
+    monkeypatch.setattr(windows_gpu_smoke, '_run_nsis_uninstaller_once', lambda root: cleaned.append(root))
+
+    args = argparse.Namespace(installer=installer, model=tmp_path / 'model.gguf', mode='gpu', context_tier='64k-full')
+    assert windows_gpu_smoke._launch_materialized_child(args) == 7
+
+    assert len(materialized) == 1
+    assert cleaned == materialized
+    assert len(runs) == 1
+    cmd = runs[0]['cmd']
+    assert str(cmd[0]).endswith('python.exe')
+    assert '--python-exe' in cmd and '--resource-root' in cmd
+    assert '--installer' not in cmd and '--artifact-root' not in cmd
+    assert '--mode' in cmd and cmd[cmd.index('--mode') + 1] == 'gpu'
+    assert '--context-tier' in cmd and cmd[cmd.index('--context-tier') + 1] == '64k-full'
+    assert runs[0]['cwd'].endswith('resources')
+    env = runs[0]['env']
+    assert env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] == '1'
+    assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
+
+
+def test_materialize_release_artifact_uses_format_specific_windows_commands(monkeypatch, tmp_path):
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert kwargs['check'] is True
+        assert kwargs['stdout'] is windows_gpu_smoke.subprocess.PIPE
+        assert kwargs['stderr'] is windows_gpu_smoke.subprocess.STDOUT
+        assert kwargs['text'] is True
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(windows_gpu_smoke.subprocess, 'run', fake_run)
+    msi = tmp_path / 'app.msi'
+    exe = tmp_path / 'app-setup.exe'
+    msi.write_text('msi', encoding='utf-8')
+    exe.write_text('exe', encoding='utf-8')
+
+    windows_gpu_smoke._materialize_release_artifact(msi, tmp_path / 'msi-root')
+    windows_gpu_smoke._materialize_release_artifact(exe, tmp_path / 'exe-root')
+
+    assert calls[0][0] == 'msiexec.exe'
+    assert calls[0][1:4] == ['/a', str(msi.resolve()), '/qn']
+    assert calls[0][4] == '/norestart'
+    assert calls[0][5].startswith('TARGETDIR=')
+    assert calls[1][0] == str(exe.resolve())
+    assert calls[1][1] == '/S'
+    assert calls[1][2].startswith('/D=')
+
+
+def test_reexec_with_bundled_python_sanitizes_env_and_skips_when_current(monkeypatch, tmp_path):
+    resource_root = tmp_path / 'resources'
+    python_exe = resource_root / 'python-runtime' / 'python.exe'
+    python_exe.parent.mkdir(parents=True)
+    python_exe.write_text('python', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', 'C:/Users/Secret/site')
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'executable', str(tmp_path / 'host-python.exe'))
+    monkeypatch.setattr(windows_gpu_smoke.os, 'execve', lambda exe, argv, env: exec_calls.append((exe, argv, env)))
+
+    windows_gpu_smoke._maybe_reexec_with_bundled_python(python_exe, resource_root, ['--mode', 'gpu'])
+
+    assert len(exec_calls) == 1
+    exe, argv, env = exec_calls[0]
+    assert exe == str(python_exe)
+    assert argv[0] == str(python_exe)
+    assert '--mode' in argv
+    assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
+    assert env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] == '1'
+
+    exec_calls.clear()
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'executable', str(python_exe))
+    windows_gpu_smoke._maybe_reexec_with_bundled_python(python_exe, resource_root, [])
+    assert exec_calls == []
+
+
+def test_helper_failure_and_runtime_discovery_edges(monkeypatch, tmp_path, capsys):
+    assert windows_gpu_smoke._fail('boom') == 1
+    assert 'FAIL: boom' in capsys.readouterr().err
+    try:
+        windows_gpu_smoke._require(False, 'missing')
+    except RuntimeError as exc:
+        assert str(exc) == 'missing'
+    else:
+        raise AssertionError('expected failed requirement')
+
+    root = tmp_path / 'install'
+    runtime = root / 'app' / 'python-runtime'
+    bridge = root / 'app' / 'python'
+    runtime.mkdir(parents=True)
+    bridge.mkdir(parents=True)
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    (bridge / 'compute_node_bridge.py').write_text('# bridge', encoding='utf-8')
+    assert windows_gpu_smoke._find_materialized_runtime(root) == (runtime / 'python.exe', root / 'app')
+
+    (root / 'second' / 'python-runtime').mkdir(parents=True)
+    (root / 'second' / 'python-runtime' / 'python.exe').write_text('python', encoding='utf-8')
+    try:
+        windows_gpu_smoke._find_materialized_runtime(root)
+    except RuntimeError as exc:
+        assert 'expected exactly one bundled' in str(exc)
+    else:
+        raise AssertionError('expected duplicate runtime failure')
+
+
+def test_materialize_release_artifact_directory_and_fail_closed_edges(monkeypatch, tmp_path):
+    source = tmp_path / 'prematerialized'
+    (source / 'python-runtime').mkdir(parents=True)
+    (source / 'python-runtime' / 'python.exe').write_text('python', encoding='utf-8')
+    dest = tmp_path / 'dest'
+    windows_gpu_smoke._materialize_release_artifact(source, dest)
+    assert (dest / 'python-runtime' / 'python.exe').is_file()
+
+    installer = tmp_path / 'app.pkg'
+    installer.write_text('pkg', encoding='utf-8')
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'linux')
+    try:
+        windows_gpu_smoke._materialize_release_artifact(installer, tmp_path / 'out')
+    except RuntimeError as exc:
+        assert 'requires Windows' in str(exc)
+    else:
+        raise AssertionError('expected non-Windows materialization failure')
+
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
+    try:
+        windows_gpu_smoke._materialize_release_artifact(installer, tmp_path / 'out')
+    except RuntimeError as exc:
+        assert 'unsupported Windows installer artifact' in str(exc)
+    else:
+        raise AssertionError('expected unsupported installer failure')
+
+
+def test_runtime_ready_predicate_and_layer_normalization_edges():
+    assert windows_gpu_smoke._offloaded_layer_count('all_supported_layers') == 1
+    assert windows_gpu_smoke._offloaded_layer_count(3) == 3
+    base = {
+        'type': 'started',
+        'registered': True,
+        'context_tier': '64k-full',
+        'warm_load_state': 'ready',
+        'backend_available': 'cuda',
+        'backend_used': 'cuda',
+        'llama_repo_stub_imported': False,
+        'offloaded_layers': 'all_supported_layers',
+        'kv_cache_device': 'cuda:0',
+    }
+    assert windows_gpu_smoke._is_truthy_cuda_ready(dict(base), '64k-full') is True
+    for key, value in [
+        ('type', 'status'),
+        ('worker_state', 'provisioning'),
+        ('backend_available', 'pending'),
+        ('registered', False),
+        ('context_tier', '8k-fast'),
+        ('warm_load_state', 'loading'),
+        ('backend_used', 'cpu'),
+        ('llama_repo_stub_imported', True),
+        ('offloaded_layers', 0),
+        ('kv_cache_device', 'cpu'),
+    ]:
+        event = dict(base)
+        event[key] = value
+        assert windows_gpu_smoke._is_truthy_cuda_ready(event, '64k-full') is False
+
+
+def test_terminate_process_tree_uses_posix_group_then_kill(monkeypatch):
+    calls: list[tuple[str, int]] = []
+
+    class SlowProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if timeout == 5 and len(calls) == 1:
+                raise windows_gpu_smoke.subprocess.TimeoutExpired('proc', timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def terminate(self):
+            calls.append(('terminate', self.pid))
+
+        def kill(self):
+            calls.append(('kill', self.pid))
+
+    monkeypatch.setattr(windows_gpu_smoke.os, 'name', 'posix', raising=False)
+    monkeypatch.setattr(windows_gpu_smoke.os, 'killpg', lambda pid, sig: calls.append((str(sig), pid)))
+
+    windows_gpu_smoke._terminate_process_tree(SlowProcess())
+    assert calls[0][1] == 4242
+    assert len(calls) >= 2
+
+
+def test_drain_lines_collects_tail_and_queue():
+    import io
+
+    output = queue.Queue()
+    tail: deque[str] = deque(maxlen=3)
+    windows_gpu_smoke._drain_lines(io.StringIO('one\ntwo\n'), output, tail)
+    assert list(tail) == ['one', 'two']
+    assert output.get_nowait() == 'one\n'
+    assert output.get_nowait() == 'two\n'
+
+
+def test_main_rejects_non_windows_and_missing_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'linux')
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        'parse_args',
+        lambda _self: argparse.Namespace(
+            model=str(tmp_path / 'missing.gguf'),
+            mode='gpu',
+            context_tier='64k-full',
+            resource_root=None,
+            python_exe=None,
+            artifact_root=None,
+            installer=None,
+        ),
+    )
+    assert windows_gpu_smoke.main() == 1
+
+    monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
+    assert windows_gpu_smoke.main() == 1

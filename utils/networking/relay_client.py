@@ -2564,11 +2564,11 @@ class RelayClient:
                     # quiesced worker is not recycled merely because observation and
                     # deadline are adjacent.  process_client_request_result() performs
                     # a final pre-submit Stop/deadline recheck before posting.
-                    _inference_exc: Optional[BaseException] = None
+                    inference_exc: Optional[BaseException] = None
                     try:
                         future_result = future.result()
-                    except BaseException as _exc:
-                        _inference_exc = _exc
+                    except BaseException as exc:
+                        inference_exc = exc
                         future_result = None
                     if (
                         getattr(self, '_polling_stopped_by_request', False)
@@ -2577,19 +2577,19 @@ class RelayClient:
                         future_result = None
                         terminal_status = 'operator_stop'
                         terminal_reason = 'operator_stop'
-                    elif _inference_exc is not None:
+                    elif inference_exc is not None:
                         # Inference raised.  If a concurrent control poll has
                         # already resolved with a terminal cancellation or expiry,
                         # the authoritative relay-side state wins.  Otherwise return
                         # a typed no-submit worker-failure outcome.
                         if control_future is not None and control_future.done():
                             try:
-                                _ctrl = control_future.result()
+                                ctrl_result = control_future.result()
                                 control_future = None
-                                _ctrl_status = str(_ctrl.get('status') or '').lower()
-                                if _ctrl_status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
-                                    terminal_status = _ctrl_status
-                                    terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[_ctrl_status]
+                                ctrl_status = str(ctrl_result.get('status') or '').lower()
+                                if ctrl_status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
+                                    terminal_status = ctrl_status
+                                    terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[ctrl_status]
                                 else:
                                     terminal_status = 'inference_failure'
                                     terminal_reason = 'inference_failure'

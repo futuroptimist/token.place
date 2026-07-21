@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.parse
 from playwright.sync_api import Page, expect
 import time
 
@@ -130,6 +131,10 @@ def route_landing_relay_chat(
 
     def handle_next(route):
         state["next_calls"] += 1
+        parsed_url = urllib.parse.urlparse(route.request.url)
+        query = urllib.parse.parse_qs(parsed_url.query)
+        requested_tier = query.get("context_tier", ["8k-fast"])[0]
+        state.setdefault("requested_context_tiers", []).append(requested_tier)
         status = next_status
         if next_statuses:
             status = next_statuses[min(state["next_calls"] - 1, len(next_statuses) - 1)]
@@ -142,10 +147,11 @@ def route_landing_relay_chat(
             return
         server_keys = next_server_keys or [SERVER_PUBLIC_KEY_B64]
         selected_index = min(state["next_calls"] - 1, len(server_keys) - 1)
+        selected_context_tier = requested_tier if requested_tier in {"8k-fast", "64k-full"} else "8k-fast"
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"server_public_key": server_keys[selected_index], "selected_context_tier": "64k-full"}),
+            body=json.dumps({"server_public_key": server_keys[selected_index], "selected_context_tier": selected_context_tier}),
         )
 
     page.route("**/api/v1/relay/servers/next**", handle_next)
@@ -745,6 +751,117 @@ def test_compute_node_count_destroy_does_not_reschedule_after_inflight(page: Pag
     assert call_count["value"] == calls_after_destroy
 
 
+def test_compute_node_count_queued_failover_callers_share_followup_result(page: Page, base_url: str, setup_servers):
+    """Multiple high-priority refresh callers behind one request share one follow-up result."""
+    call_count = {"value": 0}
+    active = {"value": 0, "max": 0}
+    active_lock = threading.Lock()
+    first_started = threading.Event()
+    first_route = {"route": None}
+
+    def begin():
+        with active_lock:
+            active["value"] += 1
+            active["max"] = max(active["max"], active["value"])
+
+    def end():
+        with active_lock:
+            active["value"] -= 1
+
+    def fulfill(route, count: int):
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": count,
+                        "total_api_v1_registered_compute_nodes": count,
+                    }
+                ),
+            )
+        finally:
+            end()
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        begin()
+        if call_count["value"] == 1:
+            first_route["route"] = route
+            first_started.set()
+            return
+        fulfill(route, 2)
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_started.wait(timeout=5), "expected initial diagnostics request"
+    page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            window.__queuedComputeNodeRefreshResults = Promise.all([
+                vm.refreshComputeNodeCount({ applySupersededSuccess: true }),
+                vm.refreshComputeNodeCount({ applySupersededSuccess: true })
+            ]);
+        }
+        """
+    )
+    assert first_route["route"] is not None
+    fulfill(first_route["route"], 1)
+    results = page.evaluate("() => window.__queuedComputeNodeRefreshResults")
+
+    assert results == [True, True]
+    assert call_count["value"] == 2
+    assert active["max"] == 1
+    assert page.locator(".compute-node-status").inner_text().strip().startswith("Live compute nodes: 2")
+
+
+def test_compute_node_count_destroy_settles_queued_failover_callers_false(page: Page, base_url: str, setup_servers):
+    """Destroying the component settles queued failover waiters as false and issues no follow-up."""
+    call_count = {"value": 0}
+    first_started = threading.Event()
+    first_route = {"route": None}
+
+    def handle_diagnostics(route):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            first_route["route"] = route
+            first_started.set()
+            return
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 9,
+                    "total_api_v1_registered_compute_nodes": 9,
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_started.wait(timeout=5), "expected initial diagnostics request"
+    results = page.evaluate(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            const p1 = vm.refreshComputeNodeCount({ applySupersededSuccess: true });
+            const p2 = vm.refreshComputeNodeCount({ applySupersededSuccess: true });
+            vm.$destroy();
+            return Promise.all([p1, p2]);
+        }
+        """
+    )
+    assert results == [False, False]
+    if first_route["route"] is not None:
+        try:
+            first_route["route"].abort()
+        except Exception:
+            pass
+    page.wait_for_timeout(200)
+    assert call_count["value"] == 1
+
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
     """Older diagnostics responses should not overwrite newer compute-node counts."""
     first_route = {}
@@ -1310,38 +1427,47 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     )
     state["diagnostics_calls"] = 0
     active_diagnostics = {"value": 0, "max": 0}
+    active_diagnostics_lock = threading.Lock()
     held_background_started = threading.Event()
     held_background_route = {"route": None}
     queued_followup_count = {"value": 0}
 
+    def begin_diagnostics_request():
+        with active_diagnostics_lock:
+            active_diagnostics["value"] += 1
+            active_diagnostics["max"] = max(active_diagnostics["max"], active_diagnostics["value"])
+
+    def end_diagnostics_request():
+        with active_diagnostics_lock:
+            active_diagnostics["value"] -= 1
+
     def fulfill_diagnostics(route, count: int):
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "total_registered_compute_nodes": count,
-                    "total_api_v1_registered_compute_nodes": count,
-                }
-            ),
-        )
+        try:
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "total_registered_compute_nodes": count,
+                        "total_api_v1_registered_compute_nodes": count,
+                    }
+                ),
+            )
+        finally:
+            end_diagnostics_request()
 
     def handle_diagnostics(route):
         state["diagnostics_calls"] += 1
-        active_diagnostics["value"] += 1
-        active_diagnostics["max"] = max(active_diagnostics["max"], active_diagnostics["value"])
-        try:
-            if state["diagnostics_calls"] == 1:
-                fulfill_diagnostics(route, 1)
-                return
-            if state["diagnostics_calls"] == 2:
-                held_background_route["route"] = route
-                held_background_started.set()
-                return
-            queued_followup_count["value"] += 1
-            fulfill_diagnostics(route, 4)
-        finally:
-            active_diagnostics["value"] -= 1
+        begin_diagnostics_request()
+        if state["diagnostics_calls"] == 1:
+            fulfill_diagnostics(route, 1)
+            return
+        if state["diagnostics_calls"] == 2:
+            held_background_route["route"] = route
+            held_background_started.set()
+            return
+        queued_followup_count["value"] += 1
+        fulfill_diagnostics(route, 4)
 
     page.route("**/relay/diagnostics", handle_diagnostics)
     navigations = []

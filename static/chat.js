@@ -1012,8 +1012,21 @@ new Vue({
 
             const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
             const tierResolution = options.tierResolution || this.resolveContextTierForRequest(apiV1Messages, this.selectedContextTier);
+            const selectedServerContextTierForRequest = this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier
+                ? this.selectedProfileMetadata.selected_context_tier
+                : '';
+            const selectedServerCanSatisfyAutoRequest = Boolean(
+                this.selectedServerPublicKey &&
+                this.selectedServerPublicKeyB64 &&
+                selectedServerContextTierForRequest &&
+                this.selectedContextTierCanSatisfy(selectedServerContextTierForRequest, tierResolution.requestedContextTier)
+            );
             const forceReselect = Boolean(options.forceReselect)
-                || (tierResolution.selectorMode === AUTO_CONTEXT_TIER && options.preserveSelectedServer !== true);
+                || (
+                    tierResolution.selectorMode === AUTO_CONTEXT_TIER &&
+                    options.preserveSelectedServer !== true &&
+                    !selectedServerCanSatisfyAutoRequest
+                );
             const selectedServer = await this.ensureSelectedServer({
                 requestedContextTier: tierResolution.requestedContextTier,
                 forceReselect

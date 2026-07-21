@@ -5754,4 +5754,111 @@ mod tests {
             .and_then(|record| record.child.as_ref())
             .is_none());
     }
+
+    /// Spawn a root process that also forks a long-lived sleep child.
+    /// `isolate_bridge_process_tree` puts them in a new process group so
+    /// `terminate_bridge_process_tree` can kill the entire group.
+    /// Boundedly prove both the root and the process group are stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolate_and_terminate_bridge_process_tree_unix_stops_root_and_descendant() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & wait"]);
+        isolate_bridge_process_tree(&mut cmd);
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn root");
+        let root_pid = child.id().expect("root pid");
+
+        // Give the shell time to fork the sleep child.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Terminate the isolated process group (SIGTERM then SIGKILL to -pgid).
+        terminate_bridge_process_tree(root_pid).await;
+
+        // Boundedly prove root stopped.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let root_stopped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Force cleanup to avoid CI leak before failing.
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => break true,
+            }
+        };
+        assert!(root_stopped, "root process did not stop after terminate_bridge_process_tree");
+
+        // Boundedly prove the process group is gone by polling kill(-pgid, 0).
+        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no signal is delivered.
+        let pgid = root_pid as i32;
+        let pg_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let result = unsafe { kill(-pgid, 0) };
+            if result == -1 {
+                // Process group gone (ESRCH) — descendant cleaned up.
+                break;
+            }
+            if Instant::now() >= pg_deadline {
+                // Force-kill any survivor before failing.
+                unsafe {
+                    kill(-pgid, SIGKILL);
+                }
+                panic!("descendant in isolated process group still alive after terminate");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Spawn a root process in a new Windows process group and terminate the
+    /// whole tree with `taskkill /T /F`.  Boundedly prove root stopped.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn isolate_and_terminate_bridge_process_tree_windows_stops_root_process() {
+        let mut cmd = Command::new("cmd");
+        // cmd /C spawns ping.exe as a child, giving us a two-process tree.
+        cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL"]);
+        isolate_bridge_process_tree(&mut cmd);
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn root");
+        let root_pid = child.id().expect("root pid");
+
+        // Terminate root and its entire process subtree.
+        terminate_bridge_process_tree(root_pid).await;
+
+        // Boundedly prove root stopped.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let root_stopped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Force cleanup to avoid CI leak before failing.
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => break true,
+            }
+        };
+        assert!(
+            root_stopped,
+            "root process did not stop after terminate_bridge_process_tree"
+        );
+    }
 }

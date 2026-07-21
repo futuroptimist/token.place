@@ -1,6 +1,7 @@
 import json
 import importlib.util
 import io
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeCon
 from utils.context_profiles import apply_context_profile
 from utils.llm import model_manager as model_manager_module
 from utils.llm.model_manager import LlamaCppInferenceRequestError, ModelManager
+from utils.networking.relay_client import RelayClient
 
 BRIDGE_MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -896,3 +898,126 @@ def test_qwen64k_packaged_profile_recovery_all_profiles_exhausted_fails_closed()
     assert recovery_calls[2][0] is q4_runtime
     assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
     assert manager._qwen_64k_profile_recovery_count == 3
+
+
+def test_packaged_fake_metal_cancellation_authoritative_cancel_terminates_worker_and_cleans_replacement():
+    """Deterministic fake-Metal cancellation regression.
+
+    Wires a blocking subprocess-backed fake worker through the full
+    ``_supervise_api_v1_inference`` path.  Drives an authoritative ``cancelled``
+    control result and asserts:
+
+    - ``submission_allowed`` is False (no response/error submitted)
+    - ``terminal_code`` is ``'cancelled'``
+    - ``response_envelope`` is None (no stale inference output returned)
+    - The worker is terminated (``terminate_active_worker_for_cancellation`` path)
+    - Exactly one acknowledgment is sent
+    - A clean replacement worker is initialized for the next inference
+    - The cleanup barrier is cleared on success
+    """
+    # --- Barriers for deterministic ordering ---
+    inference_started = threading.Event()
+    inference_release = threading.Event()
+
+    # --- Mock subprocess-backed process (simulate Metal/CUDA worker) ---
+    mock_process = MagicMock()
+    # poll(): None means alive (checked twice before kill succeeds), then 1 = exited
+    mock_process.poll.side_effect = [None, None, 1]
+
+    class _FakeLlmWithProcess:
+        """Fake llm proxy with a mock _process attribute (subprocess-backed)."""
+        def __init__(self):
+            self._process = mock_process
+
+    fake_llm = _FakeLlmWithProcess()
+    replacement_llm = _FakeLlmWithProcess()
+
+    # --- Minimal real ModelManager (bypass __init__ to stay focused) ---
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = fake_llm
+    manager.worker_state = 'ready'
+    manager._llm_generation = 1
+    manager._llm_cancel_generation_event = threading.Event()
+    manager._cleanup_barrier_generation = None
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+
+    get_instance_calls = []
+
+    def _fake_get_llm_instance():
+        get_instance_calls.append(True)
+        with manager.llm_lock:
+            manager.llm = replacement_llm
+        return replacement_llm
+
+    manager.get_llm_instance = _fake_get_llm_instance
+    manager._worker_exit_code = lambda _llm: None
+
+    # --- Control poll: wait for inference to start, then return 'cancelled';
+    #     unblock inference so the supervisor can quiesce it within its budget.
+    acks = []
+
+    def _fake_control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': 'cancelled'}
+        # Wait until the inference thread has started before returning cancelled
+        # so the race is deterministic.
+        inference_started.wait(timeout=3.0)
+        # Unblock the inference thread so it can quiesce within the 0.5 s budget.
+        inference_release.set()
+        return {'status': 'cancelled'}
+
+    # --- Blocking inference (simulates Metal GPU work) ---
+    def _blocking_generate(**_kwargs):
+        inference_started.set()
+        inference_release.wait(timeout=5.0)
+        # Return stale output that must NOT reach the caller.
+        return {'api_v1_response': {'choices': [{'message': {'content': 'stale-output'}}]}}
+
+    # --- RelayClient wired with the fake manager ---
+    crypto = MagicMock()
+    crypto.public_key_b64 = 'mock_public_key_b64'
+    config_mock = MagicMock()
+    config_mock.is_production = False
+    config_mock.get.side_effect = lambda key, default=None: {
+        'relay.request_timeout': 15,
+    }.get(key, default)
+
+    with patch('utils.networking.relay_client.get_config_lazy', return_value=config_mock):
+        client = RelayClient('https://token.place', None, crypto, MagicMock())
+
+    client.model_manager = manager
+    client._last_api_v1_work_relay_url = 'https://token.place'
+    client._api_v1_registered_relays.add('https://token.place')
+    client._api_v1_control_credentials_by_relay['https://token.place'] = 'test-cred'
+    client._post_api_v1_request_control = _fake_control
+    client._generate_api_v1_response_with_runtime_model = _blocking_generate
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-cancel-metal-integration',
+        'model': 'qwen3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '64k-full'},
+        'request_ttl_seconds': 30,
+    })
+
+    # No response or error submitted.
+    assert outcome.submission_allowed is False
+    # Authoritative relay-side state wins.
+    assert outcome.terminal_code == 'cancelled'
+    # No stale inference output returned.
+    assert outcome.response_envelope is None
+    # Exactly one acknowledgment for the terminal cancel.
+    assert len(acks) == 1, f"expected 1 ack, got {len(acks)}"
+    # Worker was terminated and a clean replacement was initialized.
+    assert manager.worker_state == 'recovering'
+    assert len(get_instance_calls) >= 1, "replacement worker was not initialized"
+    assert manager.llm is replacement_llm, "replacement worker not installed"
+    # Cleanup barrier cleared after successful worker swap.
+    assert manager._cleanup_barrier_generation is None

@@ -1203,3 +1203,114 @@ def test_fetch_rejects_final_cache_mismatch_after_successful_part_promotion(tmp_
     with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
         prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/artifact.zip', digest, dest)
     assert (tmp_path / 'artifact.zip.poisoned').exists()
+
+
+def test_stage_native_dll_artifacts_fail_closed_edge_cases(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    good_dll = tmp_path / 'cudart64_12.dll'
+    write_minimal_pe(good_dll)
+    good_sha = prep.sha256_file(good_dll)
+    archive = tmp_path / 'native.zip'
+    import zipfile
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.write(good_dll, 'bin/cudart64_12.dll')
+    archive_sha = prep.sha256_file(archive)
+    base_artifact = {
+        'name': 'cudart64_12.dll',
+        'version': '12.4.127',
+        'url': 'https://developer.download.nvidia.com/example/native.zip',
+        'sha256': archive_sha,
+        'architecture': 'AMD64',
+        'license': 'NVIDIA CUDA Toolkit EULA',
+        'provenance': 'test pinned runtime DLL',
+        'archive_member_path': 'bin/cudart64_12.dll',
+        'destination': 'cudart64_12.dll',
+        'extracted_sha256': good_sha,
+    }
+
+    monkeypatch.setattr(prep, 'fetch', lambda *_args: archive)
+    duplicate = {'native_dll_artifacts': [dict(base_artifact), dict(base_artifact)]}
+    with pytest.raises(prep.RuntimePrepError, match='duplicate native DLL artifact'):
+        prep.stage_native_dll_artifacts(duplicate, tmp_path / 'cache', runtime)
+
+    bad_dest = {'native_dll_artifacts': [dict(base_artifact, destination='../cudart64_12.dll')]}
+    with pytest.raises(prep.RuntimePrepError, match='destination must stay'):
+        prep.stage_native_dll_artifacts(bad_dest, tmp_path / 'cache', runtime)
+
+    missing_member = {'native_dll_artifacts': [dict(base_artifact, archive_member_path='bin/missing.dll')]}
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep.stage_native_dll_artifacts(missing_member, tmp_path / 'cache', runtime)
+
+    wrong_hash = {'native_dll_artifacts': [dict(base_artifact, extracted_sha256='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')]}
+    with pytest.raises(prep.RuntimePrepError, match='file digest mismatch'):
+        prep.stage_native_dll_artifacts(wrong_hash, tmp_path / 'cache', runtime)
+    assert not (runtime / 'cudart64_12.dll').exists()
+
+    arm_dll = tmp_path / 'arm.dll'
+    write_minimal_pe(arm_dll, machine=0xAA64)
+    arm_archive = tmp_path / 'arm.zip'
+    with zipfile.ZipFile(arm_archive, 'w') as zf:
+        zf.write(arm_dll, 'bin/cudart64_12.dll')
+    monkeypatch.setattr(prep, 'fetch', lambda *_args: arm_archive)
+    arm_artifact = {'native_dll_artifacts': [dict(base_artifact, extracted_sha256=prep.sha256_file(arm_dll))]}
+    with pytest.raises(prep.RuntimePrepError, match='ARM64 PE payload rejected'):
+        prep.stage_native_dll_artifacts(arm_artifact, tmp_path / 'cache', runtime)
+
+
+def test_stage_native_dll_artifacts_uses_microsoft_container_and_rejects_unknown_archive(tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    extracted = tmp_path / 'msvcp140.dll'
+    write_minimal_pe(extracted)
+    exe = tmp_path / 'VC_redist.x64.exe'
+    exe.write_bytes(b'MZredist')
+    artifact = {
+        'name': 'msvcp140.dll',
+        'version': '14.44.35211.0',
+        'url': 'https://download.visualstudio.microsoft.com/example/VC_redist.x64.exe',
+        'sha256': prep.sha256_file(exe),
+        'architecture': 'AMD64',
+        'license': 'Microsoft Visual C++ Redistributable',
+        'provenance': 'test pinned MSVC runtime DLL',
+        'archive_member_path': 'a12/msvcp140.dll_amd64',
+        'destination': 'msvcp140.dll',
+        'extracted_sha256': prep.sha256_file(extracted),
+    }
+    calls: list[tuple[Path, str, Path]] = []
+    monkeypatch.setattr(prep, 'fetch', lambda *_args: exe)
+
+    def fake_extract(archive, member, dest):
+        calls.append((archive, member, dest))
+        dest.write_bytes(extracted.read_bytes())
+
+    monkeypatch.setattr(prep, 'extract_microsoft_burn_member', fake_extract)
+    prep.stage_native_dll_artifacts({'native_dll_artifacts': [artifact]}, tmp_path / 'cache', runtime)
+    assert calls == [(exe, 'a12/msvcp140.dll_amd64', runtime / 'msvcp140.dll')]
+
+    tarball = tmp_path / 'native.tar'
+    tarball.write_bytes(b'not-supported')
+    monkeypatch.setattr(prep, 'fetch', lambda *_args: tarball)
+    with pytest.raises(prep.RuntimePrepError, match='supported archive'):
+        prep.stage_native_dll_artifacts({'native_dll_artifacts': [artifact]}, tmp_path / 'cache', runtime)
+
+
+def test_extract_microsoft_burn_member_fail_closed_edges(tmp_path, monkeypatch):
+    archive = tmp_path / 'VC_redist.x64.exe'
+    archive.write_bytes(b'MZ-without-cab')
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Linux')
+    with pytest.raises(prep.RuntimePrepError, match='requires Windows'):
+        prep.extract_microsoft_burn_member(archive, 'a12/msvcp140.dll_amd64', tmp_path / 'out.dll')
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Windows')
+    with pytest.raises(prep.RuntimePrepError, match='missing cabinet payload'):
+        prep.extract_microsoft_burn_member(archive, 'a12/msvcp140.dll_amd64', tmp_path / 'out.dll')
+
+    archive.write_bytes(b'MZMSCFattached')
+
+    def fail_expand(*_args):
+        raise prep.RuntimePrepError('native DLL artifact member missing or duplicate: a12')
+
+    monkeypatch.setattr(prep, '_expand_cab_member', fail_expand)
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep.extract_microsoft_burn_member(archive, 'a12/msvcp140.dll_amd64', tmp_path / 'out.dll')

@@ -144,13 +144,7 @@ fn expected_runtime_arch() -> &'static str {
 }
 
 fn bundled_runtime_id() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "bundled-cpython-3.11-win-x86_64-cu124"
-    } else if cfg!(target_os = "macos") {
-        "bundled-cpython-3.11-macos-arm64"
-    } else {
-        "bundled-cpython-3.11-unknown"
-    }
+    crate::build_identity::BUNDLED_RUNTIME_ID
 }
 
 fn basename(path: &str) -> String {

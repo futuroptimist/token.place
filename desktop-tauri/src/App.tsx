@@ -98,6 +98,12 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'startup_phase',
   'startup_elapsed_ms',
   'startup_deadline_ms',
+    'app_version',
+    'build_id',
+    'target_triple',
+    'bundled_runtime_id',
+    'launcher_source',
+    'interpreter_basename',
 ]);
 
 function isSafeReadinessDiagnosticString(value: string): boolean {
@@ -159,6 +165,12 @@ interface ComputeNodeStatus {
   startup_phase: string | null;
   startup_elapsed_ms: number | null;
   startup_deadline_ms: number | null;
+  app_version: string | null;
+  build_id: string | null;
+  target_triple: string | null;
+  bundled_runtime_id: string | null;
+  launcher_source: string | null;
+  interpreter_basename: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -221,6 +233,12 @@ const defaultComputeStatus: ComputeNodeStatus = {
   startup_phase: null,
   startup_elapsed_ms: null,
   startup_deadline_ms: null,
+  app_version: null,
+  build_id: null,
+  target_triple: null,
+  bundled_runtime_id: null,
+  launcher_source: null,
+  interpreter_basename: null,
 };
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
@@ -530,6 +548,12 @@ function mergeComputeStatusEvent(
     'startup_phase',
     'startup_elapsed_ms',
     'startup_deadline_ms',
+    'app_version',
+    'build_id',
+    'target_triple',
+    'bundled_runtime_id',
+    'launcher_source',
+    'interpreter_basename',
   ] as const;
   const eventHasProvisioningFields = provisioningFieldNames.some((field) =>
     Object.prototype.hasOwnProperty.call(payload, field)
@@ -753,6 +777,42 @@ function mergeComputeStatusEvent(
           : shouldClearOmittedProvisioningFields
             ? null
             : stoppedBase.startup_deadline_ms,
+    app_version:
+      payload.app_version === null
+        ? null
+        : typeof payload.app_version === 'string'
+          ? payload.app_version
+          : stoppedBase.app_version,
+    build_id:
+      payload.build_id === null
+        ? null
+        : typeof payload.build_id === 'string'
+          ? payload.build_id
+          : stoppedBase.build_id,
+    target_triple:
+      payload.target_triple === null
+        ? null
+        : typeof payload.target_triple === 'string'
+          ? payload.target_triple
+          : stoppedBase.target_triple,
+    bundled_runtime_id:
+      payload.bundled_runtime_id === null
+        ? null
+        : typeof payload.bundled_runtime_id === 'string'
+          ? payload.bundled_runtime_id
+          : stoppedBase.bundled_runtime_id,
+    launcher_source:
+      payload.launcher_source === null
+        ? null
+        : typeof payload.launcher_source === 'string'
+          ? payload.launcher_source
+          : stoppedBase.launcher_source,
+    interpreter_basename:
+      payload.interpreter_basename === null
+        ? null
+        : typeof payload.interpreter_basename === 'string'
+          ? payload.interpreter_basename
+          : stoppedBase.interpreter_basename,
   };
 }
 
@@ -1288,6 +1348,12 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
         <p style={{ marginBottom: 0 }}>Provisioning state: <code>{computeStatus.runtime_provisioning_state || 'idle'}</code></p>
         <p style={{ marginBottom: 0 }}>Startup phase: <code>{computeStatus.startup_phase || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>App version: <code>{displayStatusValue(computeStatus.app_version, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Build ID: <code>{displayStatusValue(computeStatus.build_id, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Target triple: <code>{displayStatusValue(computeStatus.target_triple, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Bundled runtime ID: <code>{displayStatusValue(computeStatus.bundled_runtime_id, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Launcher source: <code>{displayStatusValue(computeStatus.launcher_source, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Interpreter: <code>{displayStatusValue(computeStatus.interpreter_basename, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{Number.isFinite(computeStatus.startup_deadline_ms) && (computeStatus.startup_deadline_ms ?? 0) > 0 ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>
         <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
         <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>

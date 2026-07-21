@@ -10,7 +10,7 @@ use crate::python_runtime::{
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
-    ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,12 @@ pub struct ComputeNodeStatus {
     pub log_file_path: Option<String>,
     #[serde(default)]
     pub readiness_diagnostics: Map<String, Value>,
+    pub app_version: String,
+    pub build_id: String,
+    pub target_triple: String,
+    pub bundled_runtime_id: String,
+    pub launcher_source: Option<String>,
+    pub interpreter_basename: Option<String>,
 }
 
 fn default_request_context_tier() -> String {
@@ -670,6 +676,14 @@ fn startup_failure_status(
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
+        app_version: crate::build_identity::build_identity().app_version.into(),
+        build_id: crate::build_identity::build_identity().build_id.into(),
+        target_triple: crate::build_identity::build_identity().target_triple.into(),
+        bundled_runtime_id: crate::build_identity::build_identity()
+            .bundled_runtime_id
+            .into(),
+        launcher_source: None,
+        interpreter_basename: None,
     }
 }
 
@@ -1241,6 +1255,23 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
     for key in [
         "type",
         "operator_session_id",
+        "app_version",
+        "build_id",
+        "target_triple",
+        "bundled_runtime_id",
+        "launcher_source",
+        "interpreter_basename",
+        "runtime_id",
+        "runtime_provisioning_state",
+        "startup_phase",
+        "startup_elapsed_ms",
+        "startup_deadline_ms",
+        "worker_state",
+        "worker_generation",
+        "worker_restart_count",
+        "worker_alive",
+        "last_worker_error_code",
+        "last_worker_exit_code",
         "sequence",
         "updated_at_ms",
         "running",
@@ -1467,13 +1498,18 @@ pub async fn start_compute_node(
     let log_file_path = log_sink
         .as_ref()
         .map(|log_sink| log_sink.path().to_string_lossy().into_owned());
+    let build_identity = crate::build_identity::build_identity();
     append_operator_log_line(
         &log_sink,
         "desktop.compute_node.session.start",
         &format!(
-            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={} app_version={} build_id={} target_triple={} bundled_runtime_id={}",
             session_id,
-            format!("{:?}", request.mode).to_lowercase()
+            format!("{:?}", request.mode).to_lowercase(),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id
         ),
     );
     if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
@@ -1554,6 +1590,33 @@ pub async fn start_compute_node(
         None
     };
 
+    let launcher_metadata = launcher.as_ref().map(|launcher| {
+        let source = match launcher.source {
+            PythonLauncherSource::BundledRuntime => "bundled",
+            PythonLauncherSource::EnvironmentOverride => "environment_override",
+            PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
+        };
+        (
+            source.to_string(),
+            std::path::Path::new(&launcher.program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("python")
+                .to_string(),
+            launcher.runtime_id.clone(),
+            launcher.source.clone(),
+        )
+    });
+    if crate::python_runtime::is_packaged_execution(
+        std::env::current_exe().ok().as_deref(),
+        manifest_dir,
+    ) {
+        match launcher_metadata.as_ref().map(|(_, _, _, source)| source) {
+            Some(PythonLauncherSource::BundledRuntime) => {}
+            _ => anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"),
+        }
+    }
+
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
@@ -1597,7 +1660,7 @@ pub async fn start_compute_node(
         &log_sink,
         "desktop.compute_node.session.layout",
         &format!(
-            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} app_version={} build_id={} target_triple={} bundled_runtime_id={} launcher_source={} interpreter_basename={} runtime_id={}",
             session_id,
             sanitize_relay_target(&primary_relay_url),
             sanitize_path_for_operator_log(Path::new(&bridge_script)),
@@ -1607,12 +1670,31 @@ pub async fn start_compute_node(
             import_root
                 .as_ref()
                 .map(|path| sanitize_path_for_operator_log(path))
-                .unwrap_or_else(|| "<unresolved>".into())
+                .unwrap_or_else(|| "<unresolved>".into()),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id,
+            launcher_metadata.as_ref().map(|m| m.0.as_str()).unwrap_or("none"),
+            launcher_metadata.as_ref().map(|m| m.1.as_str()).unwrap_or("none"),
+            launcher_metadata.as_ref().map(|m| m.2.as_str()).unwrap_or("none")
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
         bridge_command.env(key, value);
+    }
+    bridge_command.env("TOKENPLACE_APP_VERSION", build_identity.app_version);
+    bridge_command.env("TOKENPLACE_BUILD_ID", build_identity.build_id);
+    bridge_command.env("TOKENPLACE_TARGET_TRIPLE", build_identity.target_triple);
+    bridge_command.env(
+        "TOKENPLACE_BUNDLED_RUNTIME_ID",
+        build_identity.bundled_runtime_id,
+    );
+    if let Some((source, basename, runtime_id, _)) = launcher_metadata.as_ref() {
+        bridge_command.env("TOKENPLACE_LAUNCHER_SOURCE", source);
+        bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
+        bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
 
     let spawn_result = bridge_command
@@ -1752,6 +1834,14 @@ pub async fn start_compute_node(
             updated_at_ms: Some(current_time_ms()),
             log_file_path: log_file_path.clone(),
             readiness_diagnostics: Map::new(),
+            app_version: crate::build_identity::build_identity().app_version.into(),
+            build_id: crate::build_identity::build_identity().build_id.into(),
+            target_triple: crate::build_identity::build_identity().target_triple.into(),
+            bundled_runtime_id: crate::build_identity::build_identity()
+                .bundled_runtime_id
+                .into(),
+            launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
+            interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };
         publish_running_if_bridge_record_still_running(&state, &session_id, running_status).await;
     }

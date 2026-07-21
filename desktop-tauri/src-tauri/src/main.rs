@@ -1,4 +1,5 @@
 mod backend;
+mod build_identity;
 mod compute_node;
 mod config;
 mod context_profiles;
@@ -465,7 +466,46 @@ fn current_operator_log_path(status: &ComputeNodeStatus) -> Result<PathBuf, Stri
 async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let status = state.compute_node.status.lock().await.clone();
     let path = current_operator_log_path(&status)?;
-    operator_logs::read_log_tail(&path, 256 * 1024).map_err(|e| e.to_string())
+    let dir = path
+        .parent()
+        .ok_or_else(|| "operator log path has no parent".to_string())?;
+    let mut logs: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("compute-node-") && name.ends_with(".log"))
+        })
+        .collect();
+    logs.sort_by_key(|candidate| fs::metadata(candidate).and_then(|m| m.modified()).ok());
+    if logs.len() > 4 {
+        logs = logs.split_off(logs.len() - 4);
+    }
+    if !logs.iter().any(|candidate| candidate == &path) {
+        logs.push(path.clone());
+    }
+    let mut combined = String::new();
+    for candidate in logs {
+        let name = candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("compute-node.log");
+        combined.push_str(&format!("\n--- operator_session_log file={} current={} session_id={} context_tier={} app_version={} build_id={} ---\n",
+            name,
+            candidate == path,
+            status.operator_session_id.as_deref().unwrap_or("unknown"),
+            status.context_tier.as_deref().unwrap_or("unknown"),
+            status.app_version,
+            status.build_id,
+        ));
+        combined.push_str(
+            &operator_logs::read_log_tail(&candidate, 64 * 1024).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(combined)
 }
 
 #[tauri::command]
@@ -480,6 +520,11 @@ async fn open_operator_debug_terminal(state: tauri::State<'_, AppState>) -> Resu
     let status = state.compute_node.status.lock().await.clone();
     let path = current_operator_log_path(&status)?;
     operator_logs::open_debug_terminal(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_build_identity() -> build_identity::BuildIdentity {
+    build_identity::build_identity()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -501,7 +546,8 @@ pub fn run() {
             download_model_artifact,
             read_operator_log,
             reveal_operator_log,
-            open_operator_debug_terminal
+            open_operator_debug_terminal,
+            get_build_identity
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

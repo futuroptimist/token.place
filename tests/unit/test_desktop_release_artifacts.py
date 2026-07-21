@@ -463,12 +463,12 @@ def test_validator_cleanup_skips_unreferenced_mountpoint(monkeypatch, tmp_path) 
 
 def test_validator_cleanup_uses_raw_hdiutil_info_for_matching_but_redacts_diagnostics(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
-    dmg_path = Path('release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg')
+    dmg_path = Path('release-artifacts/token.place-desktop-0.1.3-apple-silicon.dmg')
     mount_dir = tmp_path / 'mount'
     mount_dir.mkdir()
     calls = []
     raw_info = """
-image-path: /private/var/folders/zz/redacted-test/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg
+image-path: /private/var/folders/zz/redacted-test/release-artifacts/token.place-desktop-0.1.3-apple-silicon.dmg
 /dev/disk8           Apple_partition_scheme
 /dev/disk8s1         Apple_HFS
 image-path: /private/var/folders/zz/redacted-test/release-artifacts/other.dmg
@@ -531,7 +531,7 @@ def test_validator_attach_stops_on_non_transient_failure(monkeypatch, tmp_path) 
 
 def test_validator_hdiutil_info_helpers_preserve_raw_matching_and_redact(monkeypatch, tmp_path, capsys) -> None:
     validator = _load_release_artifact_validator()
-    raw_path = '/private/var/folders/zz/example/release-artifacts/token.place-desktop-0.1.2-apple-silicon.dmg'
+    raw_path = '/private/var/folders/zz/example/release-artifacts/token.place-desktop-0.1.3-apple-silicon.dmg'
 
     def fake_run(cmd, *, check, capture_output, text=None):
         if cmd == ['hdiutil', 'info']:
@@ -2539,7 +2539,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.2') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.3') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -2575,7 +2575,7 @@ def test_windows_release_workflow_version_args_are_tag_only_and_untagged_derives
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'validator_version_args=()' in text
     assert 'validator_version_args=(--release-tag "${tag_name}")' in text
-    assert '--expected-version "0.1.2"' not in text
+    assert '--expected-version "0.1.3"' not in text
     assert r'desktop-v[0-9]+\.[0-9]+\.[0-9]+' in text
 
 
@@ -2599,13 +2599,13 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.3']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.2-setup.exe'
+    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.3-setup.exe'
     wrong_name.write_bytes(b'installer')
     with pytest.raises(validator.ValidationError, match='filename does not match'):
         validator.validate_artifact(wrong_name, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
@@ -2614,52 +2614,53 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.3'])
 
 
-def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_gate() -> None:
+def test_release_workflow_runs_windows_validator_and_preserves_skipped_nvidia_gate() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Validate Windows MSI and NSIS artifact contents' in text
     assert 'validate_windows_desktop_release_artifacts.py' in text
     assert 'windows-nvidia-release-gate' in text
-    assert 'needs: [build, windows-nvidia-release-gate]' in text
+    assert 'needs: build' in text
+    assert 'Intentionally bypass the hardware smoke gate while no matching self-hosted runner exists.' in text
     assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text
 
 
 def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):
     validator = _load_windows_release_validator()
-    assert validator.expected_version_from_tag(None, '0.1.2') == '0.1.2'
-    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.2') == '1.2.3'
+    assert validator.expected_version_from_tag(None, '0.1.3') == '0.1.3'
+    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.3') == '1.2.3'
     with pytest.raises(validator.ValidationError, match='desktop-vX.Y.Z'):
-        validator.expected_version_from_tag('1495/merge', '0.1.2')
+        validator.expected_version_from_tag('1495/merge', '0.1.3')
 
     package = tmp_path / 'package.json'
     lock = tmp_path / 'package-lock.json'
     tauri = tmp_path / 'tauri.conf.json'
     cargo = tmp_path / 'Cargo.toml'
     cargo_lock = tmp_path / 'Cargo.lock'
-    package.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
-    lock.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    package.write_text(json.dumps({'version': '0.1.3'}), encoding='utf-8')
+    lock.write_text(json.dumps({'version': '0.1.3'}), encoding='utf-8')
     tauri.write_text(json.dumps({'version': '9.9.9'}), encoding='utf-8')
-    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
-    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
     monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
     monkeypatch.setattr(validator, 'PACKAGE_LOCK', lock)
     monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
     monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
     monkeypatch.setattr(validator, 'CARGO_LOCK', cargo_lock)
     with pytest.raises(validator.ValidationError, match='Windows release version mismatch'):
-        validator.validate_config_versions('0.1.2')
-    tauri.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+        validator.validate_config_versions('0.1.3')
+    tauri.write_text(json.dumps({'version': '0.1.3'}), encoding='utf-8')
     cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='Cargo.toml'):
-        validator.validate_config_versions('0.1.2')
-    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+        validator.validate_config_versions('0.1.3')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
     cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='Cargo.lock'):
-        validator.validate_config_versions('0.1.2')
-    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
-    validator.validate_config_versions('0.1.2')
+        validator.validate_config_versions('0.1.3')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
+    validator.validate_config_versions('0.1.3')
 
     source_dir = tmp_path / 'already-extracted'
     source_dir.mkdir()
@@ -2704,8 +2705,8 @@ def test_windows_validator_native_materialization_contracts_and_cleanup(tmp_path
         return type('Completed', (), {'stdout': ''})()
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
-    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
-    nsis = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    msi = tmp_path / 'token.place-desktop-0.1.3.msi'
+    nsis = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     msi.write_bytes(b'msi')
     nsis.write_bytes(b'nsis')
 
@@ -2755,13 +2756,13 @@ def test_windows_validator_native_materialization_failures_are_fail_closed(tmp_p
 
 def test_windows_validator_generic_archive_shape_without_runtime_cannot_pass(tmp_path):
     validator = _load_windows_release_validator()
-    extracted_listing = tmp_path / 'token.place-desktop-0.1.2-seven-zip-listing'
+    extracted_listing = tmp_path / 'token.place-desktop-0.1.3-seven-zip-listing'
     extracted_listing.mkdir()
     (extracted_listing / '$PLUGINSDIR').mkdir()
     with pytest.raises(validator.ValidationError, match='found 0'):
         validator.validate_artifact(
             extracted_listing,
-            '0.1.2',
+            '0.1.3',
             'NSIS',
             json.loads(validator.MANIFEST.read_text(encoding='utf-8')),
         )
@@ -2945,23 +2946,23 @@ def test_windows_validator_normalizes_and_rejects_internal_version_metadata(tmp_
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
     app = tmp_path / 'token.place.exe'
     app.write_bytes(b'MZ-app')
-    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     artifact.write_bytes(b'MZ-nsis')
     monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
     monkeypatch.setattr(
         validator,
         '_read_pe_version_info',
-        lambda path: {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'} if path == artifact else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'},
+        lambda path: {'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'} if path == artifact else {'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'},
     )
-    validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+    validator._validate_version_metadata(artifact, tmp_path, '0.1.3', 'NSIS')
 
     monkeypatch.setattr(
         validator,
         '_read_pe_version_info',
-        lambda path: {'ProductVersion': '0.1.1.0', 'FileVersion': '0.1.2.0'},
+        lambda path: {'ProductVersion': '0.1.1.0', 'FileVersion': '0.1.3.0'},
     )
     with pytest.raises(validator.ValidationError, match='NSIS ProductVersion=0.1.1'):
-        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.3', 'NSIS')
 
 
 def test_windows_validator_rejects_stale_msi_or_installed_app_version(tmp_path, monkeypatch):
@@ -2969,18 +2970,18 @@ def test_windows_validator_rejects_stale_msi_or_installed_app_version(tmp_path, 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
     app = tmp_path / 'token.place.exe'
     app.write_bytes(b'MZ-app')
-    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
+    msi = tmp_path / 'token.place-desktop-0.1.3.msi'
     msi.write_bytes(b'MZ-msi')
     monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
     monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.1')
-    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.2', 'FileVersion': '0.1.2'})
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.3', 'FileVersion': '0.1.3'})
     with pytest.raises(validator.ValidationError, match='MSI ProductVersion=0.1.1'):
-        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+        validator._validate_version_metadata(msi, tmp_path, '0.1.3', 'MSI')
 
-    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.2')
-    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.1', 'FileVersion': '0.1.2'})
+    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.3')
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.1', 'FileVersion': '0.1.3'})
     with pytest.raises(validator.ValidationError, match='app ProductVersion=0.1.1'):
-        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+        validator._validate_version_metadata(msi, tmp_path, '0.1.3', 'MSI')
 
 def test_windows_nvidia_smoke_installer_handoff_is_one_shot(tmp_path, monkeypatch):
     import importlib.util
@@ -2990,7 +2991,7 @@ def test_windows_nvidia_smoke_installer_handoff_is_one_shot(tmp_path, monkeypatc
     assert spec and spec.loader
     spec.loader.exec_module(smoke)
 
-    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     installer.write_bytes(b'installer')
     calls = {'materialize': 0, 'run': [], 'cleanup': []}
     materialized = tmp_path / 'materialized'
@@ -3045,19 +3046,19 @@ def test_windows_metadata_readers_use_environment_path_and_structured_json(monke
         assert '$args[0]' not in cmd[3]
         assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
         assert str(artifact) not in cmd
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}), stderr='')
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'}), stderr='')
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
     monkeypatch.setattr(validator.subprocess, 'run', fake_run)
-    assert validator._read_pe_version_info(artifact) == {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}
+    assert validator._read_pe_version_info(artifact) == {'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'}
 
     def fake_msi_run(cmd, **kwargs):
         assert '$args[0]' not in cmd[3]
         assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0'}), stderr='')
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.3.0'}), stderr='')
 
     monkeypatch.setattr(validator.subprocess, 'run', fake_msi_run)
-    assert validator._read_msi_product_version(artifact) == '0.1.2.0'
+    assert validator._read_msi_product_version(artifact) == '0.1.3.0'
 
 
 def test_windows_metadata_readers_fail_closed_on_empty_or_malformed(monkeypatch, tmp_path):
@@ -3075,9 +3076,9 @@ def test_windows_metadata_readers_fail_closed_on_empty_or_malformed(monkeypatch,
 
 def test_windows_version_normalization_is_strict():
     validator = _load_windows_release_validator()
-    assert validator._normalize_windows_version('0.1.2') == '0.1.2'
-    assert validator._normalize_windows_version('0.1.2.0') == '0.1.2'
-    for value in ['0.1', '0.1.2.1', '0.1.2.0.0', '0.1.x']:
+    assert validator._normalize_windows_version('0.1.3') == '0.1.3'
+    assert validator._normalize_windows_version('0.1.3.0') == '0.1.3'
+    for value in ['0.1', '0.1.3.1', '0.1.3.0.0', '0.1.x']:
         with pytest.raises(validator.ValidationError):
             validator._normalize_windows_version(value)
 
@@ -3102,15 +3103,15 @@ def test_find_tauri_app_exe_uses_expected_name_and_rejects_ambiguous(monkeypatch
 
 def test_validate_version_metadata_requires_app_versions_on_windows(monkeypatch, tmp_path):
     validator = _load_windows_release_validator()
-    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     artifact.write_bytes(b'MZ')
     app = tmp_path / 'token-place-desktop-tauri.exe'
     app.write_bytes(b'MZ')
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
     monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
-    monkeypatch.setattr(validator, '_read_pe_version_info', lambda path: {'ProductVersion': '', 'FileVersion': ''} if path == app else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'})
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda path: {'ProductVersion': '', 'FileVersion': ''} if path == app else {'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'})
     with pytest.raises(validator.ValidationError, match='app ProductVersion=missing'):
-        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.3', 'NSIS')
 
 
 def test_windows_nvidia_smoke_runs_nsis_uninstaller_after_success_and_failure(tmp_path, monkeypatch):
@@ -3121,7 +3122,7 @@ def test_windows_nvidia_smoke_runs_nsis_uninstaller_after_success_and_failure(tm
     assert spec and spec.loader
     spec.loader.exec_module(smoke)
 
-    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     installer.write_bytes(b'installer')
 
     for child_code in (0, 23):
@@ -3160,7 +3161,7 @@ def test_windows_nvidia_smoke_cleanup_failure_overrides_child_exit(tmp_path, mon
     spec.loader.exec_module(smoke)
 
     root = tmp_path / 'install'
-    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     installer.write_bytes(b'installer')
     monkeypatch.setattr(smoke.tempfile, 'mkdtemp', lambda prefix: str(root))
 
@@ -3190,7 +3191,7 @@ def test_windows_nvidia_smoke_cleanup_failure_overrides_child_exit(tmp_path, mon
 
 def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monkeypatch):
     validator = _load_windows_release_validator()
-    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
     artifact.write_bytes(b'MZ')
 
     def run_with(returncode=0, stdout='{}'):
@@ -3212,7 +3213,7 @@ def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monk
         validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
 
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
-    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': '', 'FileVersion': '0.1.2'})))
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': '', 'FileVersion': '0.1.3'})))
     with pytest.raises(validator.ValidationError, match='incomplete metadata'):
         validator._read_pe_version_info(artifact)
 
@@ -3223,7 +3224,7 @@ def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monk
     tauri = tmp_path / 'tauri.conf.json'
     cargo = tmp_path / 'Cargo.toml'
     tauri.write_text(json.dumps({'bundle': {'windows': {'mainBinaryName': ''}}}), encoding='utf-8')
-    cargo.write_text('[package]\nname = ""\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo.write_text('[package]\nname = ""\nversion = "0.1.3"\n', encoding='utf-8')
     monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
     monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
     with pytest.raises(validator.ValidationError, match='unable to determine'):

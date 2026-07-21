@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Existing desktop-v* tag to rebuild/re-publish (required unless dry_run=true)'
+        description: 'Immutable desktop-v* tag to build (required unless dry_run=true)'
         required: false
         type: string
       dry_run:
@@ -533,6 +533,38 @@ jobs:
                   fh.write(f"{digest}  {path.name}\n")
           PY
 
+      - name: Generate build provenance manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import json
+          print(json.load(open('package.json', encoding='utf-8'))['version'])
+          PY
+          )"
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          version = json.load(open('package.json', encoding='utf-8'))['version']
+          files = []
+          for path in sorted(Path('release-artifacts').iterdir()):
+              if path.is_file() and not path.name.endswith('.json'):
+                  files.append({'name': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+          manifest = {
+              'schema_version': 1,
+              'public_version': version,
+              'tag': os.environ.get('GITHUB_REF_NAME', ''),
+              'source_commit': os.environ['GITHUB_SHA'],
+              'target_triple': os.environ['TAURI_TARGET'],
+              'bundled_runtime_id': os.environ['BUNDLED_RUNTIME_ID'],
+              'artifacts': files,
+          }
+          Path('release-artifacts').joinpath(f'token.place-desktop-{version}-{os.environ["TAURI_TARGET"]}-build-provenance.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+        env:
+          TAURI_TARGET: ${{ matrix.tauri_target }}
+          BUNDLED_RUNTIME_ID: ${{ matrix.tauri_target == 'x86_64-pc-windows-msvc' && 'bundled-cpython-3.11-win-x86_64-cu124' || 'bundled-cpython-3.11-macos-arm64' }}
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v5
         with:
@@ -564,6 +596,7 @@ jobs:
         run: |
           $setup = Get-ChildItem release-assets/windows -Filter '*-setup.exe' | Sort-Object Name | Select-Object -First 1
           if (-not $setup) { throw 'Windows NSIS setup artifact was not downloaded.' }
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 8k-fast
           python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 64k-full
 
   publish:
@@ -594,6 +627,33 @@ jobs:
             exit 1
           fi
 
+      - name: Validate immutable release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#desktop-v}"
+          if [ "${tag}" = "${version}" ]; then
+            echo "Release tag must match desktop-vX.Y.Z" >&2
+            exit 1
+          fi
+          git fetch --force --tags origin "refs/tags/${tag}:refs/tags/${tag}"
+          tag_commit="$(git rev-list -n 1 "${tag}")"
+          if [ "${tag_commit}" != "${GITHUB_SHA}" ]; then
+            echo "Release tag ${tag} resolves to ${tag_commit}, but workflow checked out ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "GitHub Release ${tag} already exists; desktop releases are immutable." >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
+            echo "GitHub Release ${tag} already exists; refusing to update existing release." >&2
+            exit 1
+          fi
+          python scripts/validate_windows_desktop_release_artifacts.py --check-config-only --release-tag "${tag}"
+
       - name: Download macOS artifacts
         uses: actions/download-artifact@v5
         with:
@@ -606,7 +666,51 @@ jobs:
           name: windows-x64-bundles
           path: release-assets/windows
 
-      - name: Create or update GitHub Release
+      - name: Verify artifacts and generate release manifest
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#desktop-v}"
+          mkdir -p release-assets/publish
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          version = tag.removeprefix('desktop-v')
+          commit = os.environ['GITHUB_SHA']
+          runtime_id = 'bundled-cpython-3.11-win-x86_64-cu124'
+          roots = [Path('release-assets/macos'), Path('release-assets/windows')]
+          artifacts = []
+          for root in roots:
+              for path in sorted(root.iterdir()):
+                  if not path.is_file():
+                      continue
+                  if path.name.endswith('-build-provenance.json'):
+                      data = json.loads(path.read_text(encoding='utf-8'))
+                      if data.get('source_commit') != commit:
+                          raise SystemExit(f'build provenance {path.name} source_commit mismatch')
+                      continue
+                  if path.name.startswith('SHA256SUMS') or path.name.endswith('.json'):
+                      continue
+                  if version not in path.name:
+                      raise SystemExit(f'artifact filename {path.name} does not contain release version {version}')
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  target = 'x86_64-pc-windows-msvc' if path.suffix.lower() in {'.msi', '.exe'} else 'aarch64-apple-darwin'
+                  artifacts.append({'name': path.name, 'target_triple': target, 'sha256': digest, 'runtime_id': runtime_id if target.endswith('windows-msvc') else 'bundled-cpython-3.11-macos-arm64'})
+          if not artifacts:
+              raise SystemExit('no release artifacts found')
+          manifest = {'schema_version': 1, 'public_version': version, 'tag': tag, 'tagged_commit': commit, 'artifacts': artifacts}
+          out = Path('release-assets/publish') / f'token.place-desktop-{version}-build-manifest.json'
+          out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          sums = Path('release-assets/publish') / f'token.place-desktop-{version}-SHA256SUMS.txt'
+          with sums.open('w', encoding='utf-8') as fh:
+              for item in artifacts:
+                  fh.write(f"{item['sha256']}  {item['name']}\n")
+          PY
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+
+      - name: Create immutable GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           token: ${{ github.token }}
@@ -614,7 +718,7 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: ${{ github.event_name == 'push' }}
           fail_on_unmatched_files: true
-          overwrite_files: true
           files: |
             release-assets/macos/*
             release-assets/windows/*
+            release-assets/publish/*

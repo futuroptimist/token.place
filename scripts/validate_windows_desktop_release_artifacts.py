@@ -344,14 +344,20 @@ def validate_artifact(artifact: Path, expected: str, kind: str, manifest: dict) 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--windows-nsis', type=Path, required=True)
-    parser.add_argument('--windows-msi', type=Path, required=True)
+    parser.add_argument('--windows-nsis', type=Path, required=False)
+    parser.add_argument('--windows-msi', type=Path, required=False)
+    parser.add_argument('--check-config-only', action='store_true')
     parser.add_argument('--expected-version', default=None)
     parser.add_argument('--release-tag', default=None)
     args = parser.parse_args(argv)
     manifest = _load_json(MANIFEST)
     expected = expected_version_from_tag(args.release_tag, args.expected_version or _load_json(PACKAGE_JSON).get('version'))
     validate_config_versions(expected)
+    if args.check_config_only:
+        print(f'Windows desktop release config versions validated for {expected}')
+        return 0
+    if args.windows_nsis is None or args.windows_msi is None:
+        raise ValidationError('--windows-nsis and --windows-msi are required unless --check-config-only is used')
     validate_artifact(args.windows_nsis, expected, 'NSIS', manifest)
     validate_artifact(args.windows_msi, expected, 'MSI', manifest)
     print(f'Windows desktop release artifacts validated for {expected}')

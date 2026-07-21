@@ -159,6 +159,13 @@ interface ComputeNodeStatus {
   startup_phase: string | null;
   startup_elapsed_ms: number | null;
   startup_deadline_ms: number | null;
+  app_version: string | null;
+  build_id: string | null;
+  target_triple: string | null;
+  bundled_runtime_id: string | null;
+  launcher_source: string | null;
+  interpreter_basename: string | null;
+  runtime_id: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -221,6 +228,13 @@ const defaultComputeStatus: ComputeNodeStatus = {
   startup_phase: null,
   startup_elapsed_ms: null,
   startup_deadline_ms: null,
+  app_version: null,
+  build_id: null,
+  target_triple: null,
+  bundled_runtime_id: null,
+  launcher_source: null,
+  interpreter_basename: null,
+  runtime_id: null,
 };
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
@@ -721,6 +735,13 @@ function mergeComputeStatusEvent(
             : stoppedBase.last_error,
     readiness_diagnostics:
       readinessDiagnostics ?? (shouldClearReadinessDiagnostics ? {} : stoppedBase.readiness_diagnostics),
+    app_version: typeof payload.app_version === 'string' ? payload.app_version : stoppedBase.app_version,
+    build_id: typeof payload.build_id === 'string' ? payload.build_id : stoppedBase.build_id,
+    target_triple: typeof payload.target_triple === 'string' ? payload.target_triple : stoppedBase.target_triple,
+    bundled_runtime_id: typeof payload.bundled_runtime_id === 'string' ? payload.bundled_runtime_id : stoppedBase.bundled_runtime_id,
+    launcher_source: typeof payload.launcher_source === 'string' ? payload.launcher_source : stoppedBase.launcher_source,
+    interpreter_basename: typeof payload.interpreter_basename === 'string' ? payload.interpreter_basename : stoppedBase.interpreter_basename,
+    runtime_id: typeof payload.runtime_id === 'string' ? payload.runtime_id : stoppedBase.runtime_id,
     runtime_provisioning_state:
       payload.runtime_provisioning_state === null
         ? null
@@ -1289,6 +1310,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Provisioning state: <code>{computeStatus.runtime_provisioning_state || 'idle'}</code></p>
         <p style={{ marginBottom: 0 }}>Startup phase: <code>{computeStatus.startup_phase || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{Number.isFinite(computeStatus.startup_deadline_ms) && (computeStatus.startup_deadline_ms ?? 0) > 0 ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>
+        <p style={{ marginBottom: 0 }}>Build identity: <code>{displayStatusValue(computeStatus.app_version, 'unknown')}</code> / <code>{displayStatusValue(computeStatus.build_id, 'unknown')}</code> / <code>{displayStatusValue(computeStatus.target_triple, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Launcher: <code>{displayStatusValue(computeStatus.launcher_source, 'pending')}</code> <code>{displayStatusValue(computeStatus.interpreter_basename, 'pending')}</code> <code>{displayStatusValue(computeStatus.runtime_id || computeStatus.bundled_runtime_id, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Context tier: <code>{displayStatusValue(computeStatus.context_tier, config.context_tier)}</code></p>
         <p style={{ marginBottom: 0 }}>Context window: <code>{computeStatus.context_window_tokens ?? (CONTEXT_PROFILES.find((profile) => profile.id === config.context_tier)?.totalContextTokens ?? 8192)}</code> tokens</p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>

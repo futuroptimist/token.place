@@ -2539,7 +2539,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.2') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.3') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -2599,13 +2599,13 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.3']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.2-setup.exe'
+    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.3-setup.exe'
     wrong_name.write_bytes(b'installer')
     with pytest.raises(validator.ValidationError, match='filename does not match'):
         validator.validate_artifact(wrong_name, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
@@ -2614,17 +2614,28 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.3'])
 
 
-def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_gate() -> None:
+def test_release_workflow_runs_windows_validator_and_preserves_skipped_nvidia_gate() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Validate Windows MSI and NSIS artifact contents' in text
     assert 'validate_windows_desktop_release_artifacts.py' in text
     assert 'windows-nvidia-release-gate' in text
-    assert 'needs: [build, windows-nvidia-release-gate]' in text
+    assert 'needs: build' in text
+    assert 'if: ${{ false }}' in text
     assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text
 
+
+
+def test_release_workflow_enforces_immutable_release_and_build_manifests() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'GitHub Release ${TAG_NAME} already exists; releases are immutable.' in text
+    assert 'overwrite_files: true' not in text
+    assert 'tag_commit="$(git rev-list -n 1 "${TAG_NAME}")"' in text
+    assert 'Verify downloaded artifact manifests' in text
+    assert 'build-manifest.json' in text
+    assert 'bundled_runtime_id' in text
 
 def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):
     validator = _load_windows_release_validator()

@@ -159,6 +159,13 @@ interface ComputeNodeStatus {
   startup_phase: string | null;
   startup_elapsed_ms: number | null;
   startup_deadline_ms: number | null;
+  app_version: string | null;
+  build_id: string | null;
+  target_triple: string | null;
+  bundled_runtime_id: string | null;
+  launcher_source: string | null;
+  interpreter_basename: string | null;
+  runtime_id: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -221,6 +228,13 @@ const defaultComputeStatus: ComputeNodeStatus = {
   startup_phase: null,
   startup_elapsed_ms: null,
   startup_deadline_ms: null,
+  app_version: null,
+  build_id: null,
+  target_triple: null,
+  bundled_runtime_id: null,
+  launcher_source: null,
+  interpreter_basename: null,
+  runtime_id: null,
 };
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
@@ -753,6 +767,13 @@ function mergeComputeStatusEvent(
           : shouldClearOmittedProvisioningFields
             ? null
             : stoppedBase.startup_deadline_ms,
+    app_version: typeof payload.app_version === 'string' ? payload.app_version : prev.app_version,
+    build_id: typeof payload.build_id === 'string' ? payload.build_id : prev.build_id,
+    target_triple: typeof payload.target_triple === 'string' ? payload.target_triple : prev.target_triple,
+    bundled_runtime_id: typeof payload.bundled_runtime_id === 'string' ? payload.bundled_runtime_id : prev.bundled_runtime_id,
+    launcher_source: typeof payload.launcher_source === 'string' ? payload.launcher_source : prev.launcher_source,
+    interpreter_basename: typeof payload.interpreter_basename === 'string' ? payload.interpreter_basename : prev.interpreter_basename,
+    runtime_id: typeof payload.runtime_id === 'string' ? payload.runtime_id : prev.runtime_id,
   };
 }
 
@@ -1322,6 +1343,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend selected: <code>{displayStatusValue(computeStatus.backend_selected, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Build identity: <code>app_version={computeStatus.app_version || 'unknown'} build_id={computeStatus.build_id || 'unknown'} target={computeStatus.target_triple || 'unknown'} runtime={computeStatus.bundled_runtime_id || 'unknown'}</code></p>
+        <p style={{ marginBottom: 0 }}>Launcher: <code>launcher_source={computeStatus.launcher_source || 'unknown'} interpreter_basename={computeStatus.interpreter_basename || 'unknown'} runtime_id={computeStatus.runtime_id || 'unknown'}</code></p>
         <p style={{ marginBottom: 0 }}>Readiness diagnostics: <code>{formatReadinessDiagnostics(computeStatus.readiness_diagnostics)}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Operator debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>

@@ -1,4 +1,5 @@
 mod backend;
+mod build_identity;
 mod compute_node;
 mod config;
 mod context_profiles;

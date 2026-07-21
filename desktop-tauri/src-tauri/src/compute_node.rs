@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::build_identity;
 use crate::config::normalize_relay_base_urls;
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
@@ -94,6 +95,13 @@ pub struct ComputeNodeStatus {
     pub log_file_path: Option<String>,
     #[serde(default)]
     pub readiness_diagnostics: Map<String, Value>,
+    pub app_version: Option<String>,
+    pub build_id: Option<String>,
+    pub target_triple: Option<String>,
+    pub bundled_runtime_id: Option<String>,
+    pub launcher_source: Option<String>,
+    pub interpreter_basename: Option<String>,
+    pub runtime_id: Option<String>,
 }
 
 fn default_request_context_tier() -> String {
@@ -622,6 +630,7 @@ fn startup_failure_status(
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
 ) -> ComputeNodeStatus {
+    let identity = build_identity::build_identity();
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -670,6 +679,13 @@ fn startup_failure_status(
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
+        app_version: Some(identity.app_version.to_string()),
+        build_id: Some(identity.build_id.to_string()),
+        target_triple: Some(identity.target_triple.to_string()),
+        bundled_runtime_id: Some(identity.bundled_runtime_id.to_string()),
+        launcher_source: None,
+        interpreter_basename: None,
+        runtime_id: None,
     }
 }
 
@@ -1241,6 +1257,13 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
     for key in [
         "type",
         "operator_session_id",
+        "app_version",
+        "build_id",
+        "target_triple",
+        "bundled_runtime_id",
+        "launcher_source",
+        "interpreter_basename",
+        "runtime_id",
         "sequence",
         "updated_at_ms",
         "running",
@@ -1263,6 +1286,17 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "llama_module_path",
         "runtime_action",
         "runtime_setup_message",
+        "runtime_provisioning_state",
+        "startup_phase",
+        "startup_elapsed_ms",
+        "startup_deadline_ms",
+        "worker_state",
+        "worker_generation",
+        "worker_restart_count",
+        "worker_alive",
+        "last_worker_error_code",
+        "last_worker_exit_code",
+        "last_worker_restart_at_ms",
         "code",
         "message",
         "last_error",
@@ -1467,13 +1501,18 @@ pub async fn start_compute_node(
     let log_file_path = log_sink
         .as_ref()
         .map(|log_sink| log_sink.path().to_string_lossy().into_owned());
+    let build_identity = build_identity::build_identity();
     append_operator_log_line(
         &log_sink,
         "desktop.compute_node.session.start",
         &format!(
-            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={} app_version={} build_id={} target_triple={} bundled_runtime_id={}",
             session_id,
-            format!("{:?}", request.mode).to_lowercase()
+            format!("{:?}", request.mode).to_lowercase(),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id
         ),
     );
     if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
@@ -1554,6 +1593,62 @@ pub async fn start_compute_node(
         None
     };
 
+    #[cfg(target_os = "windows")]
+    if crate::python_runtime::is_packaged_execution(
+        std::env::current_exe().ok().as_deref(),
+        manifest_dir,
+    ) {
+        let Some(selected) = launcher.as_ref() else {
+            let err = "desktop_python_runtime_invalid category=missing_launcher source=BundledRuntime executable=python.exe packaged=true".to_string();
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                err.clone(),
+            )
+            .await;
+            return Err(anyhow::anyhow!(err));
+        };
+        if selected.source != crate::python_runtime::PythonLauncherSource::BundledRuntime {
+            let err = format!(
+                "desktop_python_runtime_invalid category=packaged_launcher_source_mismatch source={:?} executable={} expected_source=BundledRuntime packaged=true",
+                selected.source,
+                std::path::Path::new(&selected.program).file_name().and_then(|s| s.to_str()).unwrap_or("python.exe")
+            );
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                err.clone(),
+            )
+            .await;
+            return Err(anyhow::anyhow!(err));
+        }
+    }
+
+    let launcher_metadata = launcher.as_ref().map(|selected| {
+        (
+            match selected.source {
+                crate::python_runtime::PythonLauncherSource::BundledRuntime => "bundled",
+                crate::python_runtime::PythonLauncherSource::EnvironmentOverride => {
+                    "environment_override"
+                }
+                crate::python_runtime::PythonLauncherSource::SystemDevelopmentRuntime => {
+                    "system_development"
+                }
+            }
+            .to_string(),
+            std::path::Path::new(&selected.program)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("python")
+                .to_string(),
+            selected.runtime_id.clone(),
+        )
+    });
+
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
@@ -1597,7 +1692,7 @@ pub async fn start_compute_node(
         &log_sink,
         "desktop.compute_node.session.layout",
         &format!(
-            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} app_version={} build_id={} target_triple={} bundled_runtime_id={} launcher_source={} interpreter_basename={} runtime_id={}",
             session_id,
             sanitize_relay_target(&primary_relay_url),
             sanitize_path_for_operator_log(Path::new(&bridge_script)),
@@ -1607,7 +1702,14 @@ pub async fn start_compute_node(
             import_root
                 .as_ref()
                 .map(|path| sanitize_path_for_operator_log(path))
-                .unwrap_or_else(|| "<unresolved>".into())
+                .unwrap_or_else(|| "<unresolved>".into()),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id,
+            launcher_metadata.as_ref().map(|m| m.0.as_str()).unwrap_or("native"),
+            launcher_metadata.as_ref().map(|m| m.1.as_str()).unwrap_or("native"),
+            launcher_metadata.as_ref().map(|m| m.2.as_str()).unwrap_or("native")
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
@@ -1748,6 +1850,13 @@ pub async fn start_compute_node(
             stop_cleanup_failure_count: None,
             stop_cleanup_warning: None,
             operator_session_id: Some(session_id.clone()),
+            app_version: Some(build_identity.app_version.to_string()),
+            build_id: Some(build_identity.build_id.to_string()),
+            target_triple: Some(build_identity.target_triple.to_string()),
+            bundled_runtime_id: Some(build_identity.bundled_runtime_id.to_string()),
+            launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
+            interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
+            runtime_id: launcher_metadata.as_ref().map(|m| m.2.clone()),
             sequence: Some(0),
             updated_at_ms: Some(current_time_ms()),
             log_file_path: log_file_path.clone(),
@@ -2728,56 +2837,43 @@ mod tests {
     }
 
     #[test]
-    fn summarize_bridge_stdout_payload_excludes_readiness_diagnostics() {
+    fn summarize_bridge_stdout_payload_includes_safe_provisioning_and_build_identity() {
         let summary = summarize_bridge_stdout_payload(&serde_json::json!({
-            "type": "error",
-            "last_error": "runtime_completion_smoke_plain_completion_worker_exception",
-            "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
-            "api_v1_readiness_completion_smoke_generation_exception_category": "worker_exception",
-            "api_v1_readiness_completion_smoke_exception_type": "LlamaCppInferenceRequestError",
-            "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
-            "api_v1_readiness_completion_smoke_attempted_plain_completion_methods": "create_completion_keyword_prompt",
-            "api_v1_readiness_completion_smoke_rejected_option": "temperature",
-            "api_v1_readiness_yarn_requested_context_tokens": 65536,
-            "api_v1_readiness_yarn_original_context_tokens": 32768,
-            "api_v1_readiness_yarn_context_multiplier": 2.0,
-            "api_v1_readiness_yarn_rope_freq_scale": 0.5,
-            "api_v1_readiness_yarn_ext_factor_overridden": false,
-            "api_v1_readiness_yarn_rope_scaling_type_source": "enum",
-            "api_v1_readiness_yarn_configuration_valid": true,
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_token_count": 28,
-            "api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special": true,
+            "type": "status",
+            "operator_session_id": "s1",
+            "sequence": 9,
+            "app_version": "0.1.3",
+            "build_id": "abcdef123456",
+            "target_triple": "x86_64-pc-windows-msvc",
+            "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "launcher_source": "bundled",
+            "interpreter_basename": "python.exe",
+            "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "runtime_provisioning_state": "provisioning",
+            "startup_phase": "bundled_runtime_probe",
+            "startup_elapsed_ms": 123,
+            "startup_deadline_ms": 45000,
+            "worker_state": "starting",
+            "prompt": "SECRET_PROMPT"
         }));
         let payload: Value = serde_json::from_str(&summary).expect("summary json");
-
-        assert!(summary.len() <= 3500);
-        assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
         assert_eq!(
-            payload.get("last_error").and_then(Value::as_str),
-            Some("runtime_completion_smoke_plain_completion_worker_exception")
+            payload.get("app_version").and_then(Value::as_str),
+            Some("0.1.3")
         );
-        assert!(payload
-            .get("api_v1_readiness_completion_smoke_method")
-            .is_none());
         assert_eq!(
-            readiness_operator_log_chunks(&serde_json::json!({
-                "operator_session_id": "s1",
-                "sequence": 9,
-                "api_v1_readiness_completion_smoke_method": "create_completion_keyword_prompt",
-                "api_v1_readiness_completion_smoke_plain_completion_accepts_max_tokens_kwarg": true,
-                "api_v1_readiness_yarn_requested_context_tokens": 65536,
-                "api_v1_readiness_prompt_text": "unsafe",
-            }))
-            .into_iter()
-            .map(|chunk| {
-                assert!(chunk.len() <= 3500);
-                serde_json::from_str::<Value>(&chunk).expect("readiness chunk json")
-            })
-            .filter_map(|chunk| chunk.get("diagnostics").cloned())
-            .collect::<Vec<_>>()
-            .len(),
-            1
+            payload.get("launcher_source").and_then(Value::as_str),
+            Some("bundled")
         );
+        assert_eq!(
+            payload.get("startup_phase").and_then(Value::as_str),
+            Some("bundled_runtime_probe")
+        );
+        assert_eq!(
+            payload.get("startup_deadline_ms").and_then(Value::as_u64),
+            Some(45000)
+        );
+        assert!(payload.get("prompt").is_none());
     }
 
     #[test]

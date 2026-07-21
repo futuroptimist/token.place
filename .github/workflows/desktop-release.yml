@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Existing desktop-v* tag to rebuild/re-publish (required unless dry_run=true)'
+        description: 'Immutable desktop-v* tag to build (required unless dry_run=true)'
         required: false
         type: string
       dry_run:
-        description: 'Build only (skip GitHub Release create/update and upload)'
+        description: 'Build only (skip immutable GitHub Release create and upload)'
         required: false
         default: false
         type: boolean
@@ -256,6 +256,7 @@ jobs:
       - name: Build Tauri bundles
         shell: bash
         run: |
+          export TOKEN_PLACE_BUILD_ID="$(git rev-parse --short=12 HEAD)"
           if [ "${{ runner.os }}" = "macOS" ]; then
             CONFIGURED_APPLE_SIGNING_IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
             APPLE_CERTIFICATE_P12_BASE64="${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}"
@@ -510,27 +511,43 @@ jobs:
             --windows-msi "${msi_path}" \
             "${validator_version_args[@]}"
 
-      - name: Generate SHA256 checksums
+      - name: Generate SHA256 checksums and build manifest
         shell: bash
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import hashlib
+          import hashlib, json, os, subprocess
           from pathlib import Path
 
           artifact_root = Path('release-artifacts')
+          checksum_name = '${{ matrix.checksum_file }}'
+          manifest_name = 'token.place-desktop-${{ matrix.tauri_target }}-build-manifest.json'
           files = sorted(
               p for p in artifact_root.iterdir()
-              if p.is_file() and p.name != '${{ matrix.checksum_file }}'
+              if p.is_file() and p.name not in {checksum_name, manifest_name}
           )
           if not files:
               raise SystemExit('No staged bundle artifacts found in release-artifacts')
-
-          checksums = artifact_root / '${{ matrix.checksum_file }}'
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          tag = os.environ.get('GITHUB_REF_NAME', '') if os.environ.get('GITHUB_REF', '').startswith('refs/tags/') else os.environ.get('INPUT_TAG_NAME', '')
+          public_version = tag.removeprefix('desktop-v') if tag.startswith('desktop-v') else json.loads(Path('package.json').read_text())['version']
+          manifest = {
+              'public_version': public_version,
+              'tag': tag or None,
+              'tagged_commit': commit,
+              'target_triple': '${{ matrix.tauri_target }}',
+              'bundled_runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124' if os.environ.get('RUNNER_OS') == 'Windows' else 'bundled-cpython-3.11-macos-arm64',
+              'artifacts': [],
+          }
+          checksums = artifact_root / checksum_name
           with checksums.open('w', encoding='utf-8') as fh:
               for path in files:
                   digest = hashlib.sha256(path.read_bytes()).hexdigest()
                   fh.write(f"{digest}  {path.name}\n")
+                  manifest['artifacts'].append({'filename': path.name, 'sha256': digest})
+          (artifact_root / manifest_name).write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
 
       - name: Upload workflow artifacts
@@ -606,7 +623,42 @@ jobs:
           name: windows-x64-bundles
           path: release-assets/windows
 
-      - name: Create or update GitHub Release
+      - name: Enforce immutable tag and release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          case "${TAG_NAME}" in desktop-v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "Release tag must be desktop-vX.Y.Z" >&2; exit 1;; esac
+          version="${TAG_NAME#desktop-v}"
+          git fetch --force --tags origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          tag_commit="$(git rev-list -n 1 "${TAG_NAME}")"
+          test "${tag_commit}" = "${GITHUB_SHA}" || { echo "Tag ${TAG_NAME} resolves to ${tag_commit}, not built commit ${GITHUB_SHA}" >&2; exit 1; }
+          test "$(jq -r .version desktop-tauri/package.json)" = "${version}"
+          test "$(jq -r .version desktop-tauri/package-lock.json)" = "${version}"
+          test "$(jq -r .version desktop-tauri/src-tauri/tauri.conf.json)" = "${version}"
+          grep -q "^version = \"${version}\"$" desktop-tauri/src-tauri/Cargo.toml
+          grep -q "name = \"token-place-desktop-tauri\"" desktop-tauri/src-tauri/Cargo.lock
+          grep -q "version = \"${version}\"" desktop-tauri/src-tauri/Cargo.lock
+          find release-assets -type f | grep -E "token.place-desktop-${version}.*(dmg|msi|exe)$" >/dev/null
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG_NAME} already exists; releases are immutable." >&2
+            exit 1
+          fi
+
+      - name: Verify downloaded artifact manifests
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          expected_commit="$(git rev-parse HEAD)"
+          for manifest in release-assets/*/*-build-manifest.json; do
+            test -f "${manifest}" || { echo "Missing build manifest" >&2; exit 1; }
+            test "$(jq -r .tagged_commit "${manifest}")" = "${expected_commit}"
+            test "$(jq -r .public_version "${manifest}")" = "${TAG_NAME#desktop-v}"
+          done
+
+      - name: Create immutable GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           token: ${{ github.token }}
@@ -614,7 +666,6 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: ${{ github.event_name == 'push' }}
           fail_on_unmatched_files: true
-          overwrite_files: true
           files: |
             release-assets/macos/*
             release-assets/windows/*

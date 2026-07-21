@@ -8,8 +8,10 @@ import json
 import os
 import queue
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -32,6 +34,113 @@ def _require(condition: bool, message: str) -> None:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _sanitize_env_for_bundled_runtime(resource_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in list(env):
+        upper = key.upper()
+        if (
+            upper.startswith('PIP_')
+            or upper.startswith('CMAKE_')
+            or upper in {'PYTHONHOME', 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', 'TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD', 'TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP', 'FORCE_CMAKE'}
+        ):
+            env.pop(key, None)
+    python_root = resource_root / 'python'
+    env['PYTHONPATH'] = str(python_root)
+    env['PYTHONNOUSERSITE'] = '1'
+    env['TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP'] = '1'
+    return env
+
+
+def _find_materialized_runtime(extract_root: Path) -> tuple[Path, Path]:
+    candidates = [p for p in extract_root.rglob('python.exe') if p.parent.name.lower() == 'python-runtime']
+    if len(candidates) != 1:
+        raise RuntimeError(f'expected exactly one bundled python-runtime/python.exe in release artifact, found {len(candidates)}')
+    python_exe = candidates[0]
+    resources = python_exe.parent.parent
+    if not (resources / 'python' / 'compute_node_bridge.py').is_file():
+        bridges = list(extract_root.rglob('compute_node_bridge.py'))
+        if not bridges:
+            raise RuntimeError('release artifact resources are missing compute_node_bridge.py')
+        resources = bridges[0].parent.parent
+    return python_exe, resources
+
+
+def _materialize_release_artifact(installer: Path, extract_root: Path) -> None:
+    if installer.is_dir():
+        shutil.copytree(installer, extract_root, dirs_exist_ok=True)
+        return
+    if not sys.platform.startswith('win'):
+        raise RuntimeError('Windows installer materialization requires Windows')
+    installer_abs = installer.resolve()
+    root_abs = extract_root.resolve()
+    suffix = installer.suffix.lower()
+    if suffix == '.msi':
+        subprocess.run(['msiexec.exe', '/a', str(installer_abs), '/qn', '/norestart', f'TARGETDIR={root_abs}'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return
+    if suffix == '.exe':
+        subprocess.run([str(installer_abs), '/S', f'/D={root_abs}'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return
+    raise RuntimeError(f'unsupported Windows installer artifact: {installer.name}')
+
+
+def _canonical_child_args(args: argparse.Namespace, python_exe: Path, resource_root: Path) -> list[str]:
+    child = ['--python-exe', str(python_exe), '--resource-root', str(resource_root)]
+    if args.model:
+        child.extend(['--model', str(args.model)])
+    child.extend(['--mode', args.mode, '--context-tier', args.context_tier])
+    return child
+
+
+def _run_nsis_uninstaller_once(install_root: Path) -> None:
+    uninstallers = sorted(
+        p for p in install_root.rglob('*.exe')
+        if p.is_file() and p.name.lower().startswith(('unins', 'uninstall'))
+    )
+    if not uninstallers:
+        return
+    subprocess.run([str(uninstallers[0]), '/S'], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def _launch_materialized_child(args: argparse.Namespace) -> int:
+    install_root = Path(tempfile.mkdtemp(prefix='token-place-win-smoke-'))
+    child_returncode = 1
+    cleanup_error: Exception | None = None
+    try:
+        _materialize_release_artifact(args.installer, install_root)
+        python_exe, resource_root = _find_materialized_runtime(install_root)
+        child_args = _canonical_child_args(args, python_exe, resource_root)
+        env = _sanitize_env_for_bundled_runtime(resource_root)
+        completed = subprocess.run([str(python_exe), str(Path(__file__).resolve()), *child_args], env=env, cwd=str(resource_root), check=False)
+        child_returncode = int(completed.returncode)
+        return child_returncode
+    finally:
+        try:
+            if getattr(args, 'installer', None) and Path(args.installer).suffix.lower() == '.exe':
+                _run_nsis_uninstaller_once(install_root)
+        except Exception as exc:
+            cleanup_error = exc
+        shutil.rmtree(install_root, ignore_errors=True)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _maybe_reexec_with_bundled_python(python_exe: Path | None, resource_root: Path | None, argv: list[str]) -> None:
+    if python_exe is None:
+        return
+    try:
+        current = Path(sys.executable).resolve()
+        target = python_exe.resolve()
+    except OSError:
+        target = python_exe
+        current = Path(sys.executable)
+    if current == target:
+        return
+    if not python_exe.is_file():
+        raise RuntimeError('bundled interpreter is missing from release artifact')
+    env = _sanitize_env_for_bundled_runtime(resource_root or python_exe.parent.parent)
+    os.execve(str(python_exe), [str(python_exe), str(Path(__file__).resolve()), *argv], env)
 
 
 def _offloaded_layer_count(value: Any) -> int:
@@ -137,23 +246,29 @@ def _load_compute_runtime_diagnostics(model_path: str, mode: str, context_tier: 
     return diagnostics
 
 
-def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def _run_bridge_oneshot(model_path: str, mode: str, context_tier: str, resource_root: Path | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     repo_root = _repo_root()
-    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     bridge_path = python_root / 'compute_node_bridge.py'
-    env = os.environ.copy()
-    existing_pythonpath = env.get('PYTHONPATH', '')
-    entries = [str(repo_root), str(python_root)]
-    if existing_pythonpath:
-        entries.append(existing_pythonpath)
-    env['PYTHONPATH'] = os.pathsep.join(entries)
+    if resource_root:
+        env = _sanitize_env_for_bundled_runtime(resource_root)
+        env['PYTHONPATH'] = str(python_root)
+        cwd = str(resource_root)
+    else:
+        env = os.environ.copy()
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        entries = [str(repo_root), str(python_root)]
+        if existing_pythonpath:
+            entries.append(existing_pythonpath)
+        env['PYTHONPATH'] = os.pathsep.join(entries)
+        cwd = str(repo_root)
 
     popen_kwargs: dict[str, Any] = {
         'stdin': subprocess.PIPE,
         'stdout': subprocess.PIPE,
         'stderr': subprocess.PIPE,
         'text': True,
-        'cwd': str(repo_root),
+        'cwd': cwd,
         'env': env,
     }
     if os.name != 'nt':
@@ -240,23 +355,37 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description='Validate desktop sidecar GPU path on a Windows NVIDIA machine'
     )
-    parser.add_argument('--model', required=True, help='Path to GGUF model used by desktop sidecars')
+    parser.add_argument('--model', default=os.environ.get('TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL'), help='Path to GGUF model used by desktop sidecars')
     parser.add_argument('--mode', default='auto', choices=['auto', 'gpu', 'hybrid'])
     parser.add_argument('--context-tier', default='64k-full', choices=['8k-fast', '64k-full'])
+    parser.add_argument('--resource-root', type=Path, help='Extracted release artifact resources root')
+    parser.add_argument('--python-exe', type=Path, help='Bundled release artifact python.exe')
+    parser.add_argument('--artifact-root', type=Path, help='Directory containing the built Windows artifacts')
+    parser.add_argument('--installer', type=Path, help='Built NSIS/MSI artifact to extract for hardware smoke testing')
     args = parser.parse_args()
+
+    try:
+        if getattr(args, 'installer', None) and not getattr(args, 'python_exe', None):
+            return _launch_materialized_child(args)
+        _maybe_reexec_with_bundled_python(getattr(args, 'python_exe', None), getattr(args, 'resource_root', None), sys.argv[1:])
+    except Exception as exc:
+        return _fail(str(exc))
 
     if not sys.platform.startswith('win'):
         return _fail('this smoke test is only valid on Windows')
+    if not args.model:
+        return _fail('model path is required via --model or TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL')
     if not os.path.exists(args.model):
         return _fail(f'model path does not exist: {args.model}')
 
     repo_root = _repo_root()
-    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    resource_root = getattr(args, 'resource_root', None)
+    python_root = (resource_root / 'python') if resource_root else (repo_root / 'desktop-tauri' / 'src-tauri' / 'python')
     if str(python_root) not in sys.path:
         sys.path.insert(0, str(python_root))
-    from path_bootstrap import ensure_runtime_import_paths
-
-    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+    if resource_root is None:
+        from path_bootstrap import ensure_runtime_import_paths
+        ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
     try:
         diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode, args.context_tier)
@@ -282,7 +411,11 @@ def main() -> int:
         kv_cache = str(payload.get('kv_cache_device') or '').lower()
         _require(kv_cache not in {'', 'cpu'}, 'kv_cache_device indicates CPU-only execution')
 
-        started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier)
+        smoke_resource_root = getattr(args, 'resource_root', None)
+        if smoke_resource_root is None:
+            started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier)
+        else:
+            started, bridge_events, bridge_stderr = _run_bridge_oneshot(args.model, args.mode, args.context_tier, smoke_resource_root)
         print(
             json.dumps(
                 {

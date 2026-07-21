@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "cpython_version": "3.11.13",
+  "python_build_standalone_release": "20250818",
+  "python_build_standalone_build": "cpython-3.11.13+20250818-x86_64-pc-windows-msvc-install_only",
+  "target_triple": "x86_64-pc-windows-msvc",
+  "archive_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.11.13%2B20250818-x86_64-pc-windows-msvc-install_only.tar.gz",
+  "sha256": "008bab1b41dd88a831477af3deb3b10f056f02e3db8313f506e21b77ff2ae660",
+  "expected_archive_root": "python",
+  "expected_interpreter_path": "python.exe",
+  "expected_architecture": "AMD64",
+  "expected_packaged_runtime_path": "resources/python-runtime/python.exe",
+  "llama_cpp_cuda_wheel": {
+    "name": "llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "version": "0.3.32",
+    "flavor": "cu124",
+    "url": "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl",
+    "sha256": "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
+  },
+  "required_packages": {
+    "psutil": "7.1.0",
+    "requests": "2.32.5",
+    "python-dotenv": "1.1.1",
+    "cryptography": "46.0.1",
+    "Jinja2": "3.1.6",
+    "numpy": "2.3.3",
+    "diskcache": "5.6.3",
+    "typing-extensions": "4.15.0",
+    "llama-cpp-python": "0.3.32",
+    "charset-normalizer": "3.4.9",
+    "idna": "3.18",
+    "urllib3": "2.7.0",
+    "certifi": "2026.6.17",
+    "cffi": "2.1.0",
+    "pycparser": "3.0",
+    "MarkupSafe": "3.0.3"
+  },
+  "required_native_dlls": [
+    "python311.dll",
+    "vcruntime140.dll",
+    "llama.dll",
+    "ggml-base.dll",
+    "ggml-cpu.dll",
+    "ggml-cuda.dll",
+    "ggml.dll",
+    "llama-common.dll",
+    "mtmd.dll",
+    "cudart64_12.dll",
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "msvcp140.dll",
+    "vcomp140.dll"
+  ],
+  "runtime_notices": [
+    {
+      "name": "Python",
+      "license": "PSF-2.0",
+      "path": "LICENSE-PYTHON.txt"
+    },
+    {
+      "name": "python-build-standalone",
+      "license": "MPL-2.0",
+      "path": "LICENSE-python-build-standalone.txt"
+    },
+    {
+      "name": "llama-cpp-python",
+      "license": "MIT",
+      "path": "LICENSE-llama-cpp-python.txt"
+    }
+  ],
+  "python_package_wheels": [
+    {
+      "package": "cryptography",
+      "version": "46.0.1",
+      "filename": "cryptography-46.0.1-cp311-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/95/0f/cd29a35e0d6e78a0ee61793564c8cff0929c38391cb0de27627bdc7525aa/cryptography-46.0.1-cp311-abi3-win_amd64.whl",
+      "sha256": "92e8cfe8bd7dd86eac0a677499894862cd5cc2fd74de917daa881d00871ac8e7"
+    },
+    {
+      "package": "requests",
+      "version": "2.32.5",
+      "filename": "requests-2.32.5-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl",
+      "sha256": "2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6"
+    },
+    {
+      "package": "diskcache",
+      "version": "5.6.3",
+      "filename": "diskcache-5.6.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl",
+      "sha256": "5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19"
+    },
+    {
+      "package": "charset-normalizer",
+      "version": "3.4.9",
+      "filename": "charset_normalizer-3.4.9-cp311-cp311-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/ed/a1/e29995109e455dc8eff8d0fac6ae509be39561318a7cfeac5d33ad029213/charset_normalizer-3.4.9-cp311-cp311-win_amd64.whl",
+      "sha256": "6366a16e1a25018694d6a5d784d09b046edc9eac40ea2b54065c3052672516a1"
+    },
+    {
+      "package": "cffi",
+      "version": "2.1.0",
+      "filename": "cffi-2.1.0-cp311-cp311-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/f9/c8/6c2de1d55cf35ef8b92885d5ef280790f0fb9634d87ea1cc315176aecd61/cffi-2.1.0-cp311-cp311-win_amd64.whl",
+      "sha256": "4f26194e3d95e06501b942642855aed4f953d55e95d7d01b7c4483db3ecff458"
+    },
+    {
+      "package": "python-dotenv",
+      "version": "1.1.1",
+      "filename": "python_dotenv-1.1.1-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/5f/ed/539768cf28c661b5b068d66d96a2f155c4971a5d55684a514c1a0e0dec2f/python_dotenv-1.1.1-py3-none-any.whl",
+      "sha256": "31f23644fe2602f88ff55e1f5c79ba497e01224ee7737937930c448e4d0e24dc"
+    },
+    {
+      "package": "idna",
+      "version": "3.18",
+      "filename": "idna-3.18-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/1e/5e/d4e9f1a599fb8e573b7b87160658329fbf28d19eac2718f51fc3def3aa5a/idna-3.18-py3-none-any.whl",
+      "sha256": "7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"
+    },
+    {
+      "package": "certifi",
+      "version": "2026.6.17",
+      "filename": "certifi-2026.6.17-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ef/2f/c5464532e965badff2f4c4c1a3a83f5697f0d7c407ed0cda44aaa99bb451/certifi-2026.6.17-py3-none-any.whl",
+      "sha256": "2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"
+    },
+    {
+      "package": "MarkupSafe",
+      "version": "3.0.3",
+      "filename": "markupsafe-3.0.3-cp311-cp311-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/83/8a/4414c03d3f891739326e1783338e48fb49781cc915b2e0ee052aa490d586/markupsafe-3.0.3-cp311-cp311-win_amd64.whl",
+      "sha256": "de8a88e63464af587c950061a5e6a67d3632e36df62b986892331d4620a35c01"
+    },
+    {
+      "package": "numpy",
+      "version": "2.3.3",
+      "filename": "numpy-2.3.3-cp311-cp311-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/0a/a2/a4f78cb2241fe5664a22a10332f2be886dcdea8784c9f6a01c272da9b426/numpy-2.3.3-cp311-cp311-win_amd64.whl",
+      "sha256": "ec9d249840f6a565f58d8f913bccac2444235025bbb13e9a4681783572ee3caa"
+    },
+    {
+      "package": "urllib3",
+      "version": "2.7.0",
+      "filename": "urllib3-2.7.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl",
+      "sha256": "9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897"
+    },
+    {
+      "package": "pycparser",
+      "version": "3.0",
+      "filename": "pycparser-3.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl",
+      "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
+    },
+    {
+      "package": "psutil",
+      "version": "7.1.0",
+      "filename": "psutil-7.1.0-cp37-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/bf/e9/b44c4f697276a7a95b8e94d0e320a7bf7f3318521b23de69035540b39838/psutil-7.1.0-cp37-abi3-win_amd64.whl",
+      "sha256": "57f5e987c36d3146c0dd2528cd42151cf96cd359b9d67cfff836995cc5df9a3d"
+    },
+    {
+      "package": "Jinja2",
+      "version": "3.1.6",
+      "filename": "jinja2-3.1.6-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+    },
+    {
+      "package": "typing-extensions",
+      "version": "4.15.0",
+      "filename": "typing_extensions-4.15.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl",
+      "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"
+    }
+  ],
+  "pe_dll_closure": [
+    {
+      "name": "python311.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "vcruntime140.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "llama.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-base.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-cpu.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml-cuda.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "ggml.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "llama-common.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    },
+    {
+      "name": "mtmd.dll",
+      "machine": "IMAGE_FILE_MACHINE_AMD64"
+    }
+  ],
+  "native_dll_artifacts": [
+    {
+      "name": "cudart64_12.dll",
+      "version": "12.4.127",
+      "flavor": "cuda-12.4-runtime",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 runtime redistributable DLL; runtime payload only, not CUDA Toolkit developer tools",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
+      "sha256": "6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb",
+      "archive_member_path": "cuda_cudart-windows-x86_64-12.4.127-archive/bin/cudart64_12.dll",
+      "destination": "cudart64_12.dll",
+      "extracted_sha256": "d28e42265da7462162a54da6b7a99ea4fa2caf8139d862bb500db875d0b32dfc"
+    },
+    {
+      "name": "cublas64_12.dll",
+      "version": "12.4.5.8",
+      "flavor": "cuda-12.4-cublas",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 cuBLAS redistributable DLL; runtime payload only, not CUDA Toolkit developer tools",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+      "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5",
+      "archive_member_path": "libcublas-windows-x86_64-12.4.5.8-archive/bin/cublas64_12.dll",
+      "destination": "cublas64_12.dll",
+      "extracted_sha256": "e40202fe4223c1cd2d2dce7beec59e1ed61c7801bd827309183be9b50e358f4c"
+    },
+    {
+      "name": "cublasLt64_12.dll",
+      "version": "12.4.5.8",
+      "flavor": "cuda-12.4-cublas",
+      "architecture": "AMD64",
+      "license": "NVIDIA CUDA Toolkit EULA (runtime redistributable)",
+      "provenance": "NVIDIA CUDA 12.4 cuBLASLt redistributable DLL when imported by cuBLAS/llama CUDA closure",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+      "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5",
+      "archive_member_path": "libcublas-windows-x86_64-12.4.5.8-archive/bin/cublasLt64_12.dll",
+      "destination": "cublasLt64_12.dll",
+      "extracted_sha256": "2a896460bef60ed57ef32b0875812f355a6984e671d638bb632f5e8c1d7a831f"
+    },
+    {
+      "name": "msvcp140.dll",
+      "version": "14.44.35211.0",
+      "flavor": "msvc-app-local-redist",
+      "architecture": "AMD64",
+      "license": "Microsoft Visual C++ Redistributable EULA",
+      "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+      "destination": "msvcp140.dll",
+      "archive_member_path": "a12/msvcp140.dll_amd64",
+      "extracted_sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9"
+    },
+    {
+      "name": "vcomp140.dll",
+      "version": "14.44.35211.0",
+      "flavor": "msvc-openmp-app-local-redist",
+      "architecture": "AMD64",
+      "license": "Microsoft Visual C++ Redistributable EULA",
+      "provenance": "Microsoft Visual C++ OpenMP app-local runtime redistributable for Windows x64",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+      "destination": "vcomp140.dll",
+      "archive_member_path": "a12/vcomp140.dll_amd64",
+      "extracted_sha256": "55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164"
+    }
+  ]
+}

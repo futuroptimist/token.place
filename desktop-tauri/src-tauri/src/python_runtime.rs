@@ -1,11 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = "python-runtime/bin/python3";
+pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = if cfg!(target_os = "windows") {
+    "python-runtime/python.exe"
+} else {
+    "python-runtime/bin/python3"
+};
 pub const DESKTOP_PYTHON_RUNTIME_MISSING: &str = "desktop_python_runtime_missing";
 pub const DESKTOP_PYTHON_RUNTIME_INVALID: &str = "desktop_python_runtime_invalid";
 pub const DESKTOP_PYTHON_OVERRIDE_INVALID: &str = "desktop_python_override_invalid";
@@ -53,7 +59,7 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg("-c");
-        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:2]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
+        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
     }
 
@@ -116,12 +122,36 @@ pub struct PythonLauncherError {
 
 impl std::fmt::Display for PythonLauncherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch=arm64 packaged={}{}",
-            self.public_code, self.category.as_str(), self.source, self.executable_basename, self.packaged,
+        write!(f, "{} category={} source={:?} executable={} expected_python=3.11 expected_arch={} packaged={}{}",
+            self.public_code, self.category.as_str(), self.source, self.executable_basename, expected_runtime_arch(), self.packaged,
             self.exit_status.map(|s| format!(" exit_status={s}")).unwrap_or_default())
     }
 }
 impl std::error::Error for PythonLauncherError {}
+
+fn expected_runtime_arch() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "AMD64"
+    } else if cfg!(target_os = "macos") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "unknown"
+    }
+}
+
+fn bundled_runtime_id() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "bundled-cpython-3.11-win-x86_64-cu124"
+    } else if cfg!(target_os = "macos") {
+        "bundled-cpython-3.11-macos-arm64"
+    } else {
+        "bundled-cpython-3.11-unknown"
+    }
+}
 
 fn basename(path: &str) -> String {
     Path::new(path)
@@ -220,7 +250,8 @@ fn metadata_probe_is_valid(
     expected_machine: &str,
 ) -> Result<(), PythonLauncherCategory> {
     let payload = stdout.trim();
-    if !(payload.contains("\"version\"") && payload.contains("[3, 11]")) {
+    let compact_payload = payload.replace(char::is_whitespace, "");
+    if !(compact_payload.contains("\"version\"") && compact_payload.contains("[3,11,13]")) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
     if json_string_field(payload, "machine") != Some(expected_machine) {
@@ -240,6 +271,106 @@ fn metadata_probe_is_valid(
         }
     }
     Ok(())
+}
+
+fn bundled_windows_manifest() -> Option<serde_json::Value> {
+    serde_json::from_str(include_str!(
+        "../python/embedded_python_runtime_windows_x86_64_manifest.json"
+    ))
+    .ok()
+}
+
+// Rust validates bundled Windows provenance before launching the interpreter,
+// closing the pre-launch trust boundary without relying on mutable mtimes/sizes.
+fn bundled_windows_provenance_is_valid(runtime_root: &Path) -> bool {
+    let path = runtime_root.join("embedded_python_runtime_provenance.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(manifest) = bundled_windows_manifest() else {
+        return false;
+    };
+    let Some(required_dlls) = manifest
+        .get("required_native_dlls")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    let Some(closure) = value.get("pe_dll_closure").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if closure.is_empty() {
+        return false;
+    }
+    let required_names: std::collections::BTreeSet<String> = required_dlls
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
+        .collect();
+    let mut closure_names = std::collections::BTreeSet::new();
+    let mut closure_paths = std::collections::BTreeSet::new();
+    for entry in closure {
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let Some(rel) = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("name").and_then(|v| v.as_str()))
+        else {
+            return false;
+        };
+        if rel.is_empty()
+            || Path::new(rel).is_absolute()
+            || rel.split(&['/', '\\']).any(|p| p == "..")
+        {
+            return false;
+        }
+        let rel_key = rel.replace('\\', "/").to_ascii_lowercase();
+        if !closure_paths.insert(rel_key) {
+            return false;
+        }
+        let Some(expected_sha) = entry.get("sha256").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let file_path = runtime_root.join(rel);
+        let Ok(resolved_root) = runtime_root.canonicalize() else {
+            return false;
+        };
+        let Ok(resolved_file) = file_path.canonicalize() else {
+            return false;
+        };
+        if !resolved_file.starts_with(&resolved_root) || !resolved_file.is_file() {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(&resolved_file) else {
+            return false;
+        };
+        let actual_sha = format!("{:x}", Sha256::digest(&bytes));
+        if actual_sha != expected_sha {
+            return false;
+        }
+        if entry.get("machine").and_then(|v| v.as_str()) != Some("IMAGE_FILE_MACHINE_AMD64")
+            || !entry.get("imports").is_some_and(|v| v.is_array())
+        {
+            return false;
+        }
+        closure_names.insert(name.to_ascii_lowercase());
+    }
+    value.get("runtime_id").and_then(|v| v.as_str())
+        == Some("bundled-cpython-3.11-win-x86_64-cu124")
+        && value.get("cpython_version") == manifest.get("cpython_version")
+        && value.get("cpython_version").and_then(|v| v.as_str()) == Some("3.11.13")
+        && value.get("target_triple") == manifest.get("target_triple")
+        && value.get("target_triple").and_then(|v| v.as_str()) == Some("x86_64-pc-windows-msvc")
+        && value.get("source_archive_sha256") == manifest.get("sha256")
+        && value.get("llama_cpp_cuda_wheel") == manifest.get("llama_cpp_cuda_wheel")
+        && value.get("required_packages") == manifest.get("required_packages")
+        && value.get("python_package_wheels") == manifest.get("python_package_wheels")
+        && value.get("required_native_dlls") == manifest.get("required_native_dlls")
+        && required_names.is_subset(&closure_names)
 }
 
 fn launcher_error(
@@ -385,6 +516,49 @@ pub struct PythonLauncherResolutionOptions<'a> {
     pub packaged: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonExecutionLayout {
+    Packaged,
+    UnbundledDevelopment,
+}
+
+fn path_is_beneath(path: &Path, ancestor: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(ancestor) = ancestor.canonicalize() else {
+        return false;
+    };
+    path.starts_with(ancestor)
+}
+
+pub fn classify_python_execution_layout(
+    current_exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> PythonExecutionLayout {
+    let Some(exe_path) = current_exe_path else {
+        return PythonExecutionLayout::Packaged;
+    };
+    let source_marker = manifest_dir.join("python").join("desktop_runtime_setup.py");
+    if source_marker.is_file() && path_is_beneath(exe_path, &manifest_dir.join("target")) {
+        PythonExecutionLayout::UnbundledDevelopment
+    } else {
+        PythonExecutionLayout::Packaged
+    }
+}
+
+pub fn is_unbundled_development_execution(
+    current_exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> bool {
+    classify_python_execution_layout(current_exe_path, manifest_dir)
+        == PythonExecutionLayout::UnbundledDevelopment
+}
+
+pub fn is_packaged_execution(current_exe_path: Option<&Path>, manifest_dir: &Path) -> bool {
+    !is_unbundled_development_execution(current_exe_path, manifest_dir)
+}
+
 fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Option<PythonLauncher> {
     let root = if let Some(resource_dir) = opts.tauri_resource_dir {
         Some(resource_dir.to_path_buf())
@@ -393,7 +567,9 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .into_iter()
             .find(|c| {
                 c.layout == ResourceLayoutKind::MacOsAppResources
-                    || c.layout == ResourceLayoutKind::DevSourceTree
+                    || c.layout == ResourceLayoutKind::WindowsResources
+                    || c.layout == ResourceLayoutKind::TauriResourceDir
+                    || (c.layout == ResourceLayoutKind::DevSourceTree && !opts.packaged)
             })
             .map(|c| c.root)
     }?;
@@ -403,41 +579,46 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
             .to_string(),
         vec![],
         PythonLauncherSource::BundledRuntime,
-        "bundled-cpython-3.11-arm64",
+        bundled_runtime_id(),
     ))
+}
+
+fn has_confirmed_unbundled_dev_source_tree(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
+    if opts.packaged
+        || classify_python_execution_layout(opts.current_exe_path, opts.manifest_dir)
+            != PythonExecutionLayout::UnbundledDevelopment
+    {
+        return false;
+    }
+    opts.manifest_dir
+        .join("python")
+        .join("desktop_runtime_setup.py")
+        .is_file()
 }
 
 fn bundled_runtime_root_from_candidate(candidate: &PythonLauncher) -> Option<PathBuf> {
     Path::new(&candidate.program)
         .parent()
-        .and_then(Path::parent)
+        .and_then(|parent| {
+            if parent.file_name().and_then(|s| s.to_str()) == Some("bin") {
+                parent.parent()
+            } else {
+                Some(parent)
+            }
+        })
         .map(Path::to_path_buf)
 }
 
 pub fn resolve_python_launcher_resource_aware(
     opts: PythonLauncherResolutionOptions<'_>,
 ) -> Result<PythonLauncher, PythonLauncherError> {
-    if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
-        return match env_candidate.command_for_version_check().output() {
-            Ok(output) => {
-                validate_launcher_with_output(&env_candidate, &output, opts.packaged, false)
-                    .map(|_| env_candidate)
-            }
-            Err(_) => Err(launcher_error(
-                DESKTOP_PYTHON_OVERRIDE_INVALID,
-                PythonLauncherCategory::OverrideMissing,
-                Some(&env_candidate),
-                opts.packaged,
-                None,
-            )),
-        };
-    }
+    let is_bundled_required_platform = cfg!(target_os = "macos") || cfg!(target_os = "windows");
     let is_macos = cfg!(target_os = "macos")
         || opts
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_macos {
+    if is_bundled_required_platform || is_macos {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -489,17 +670,33 @@ pub fn resolve_python_launcher_resource_aware(
                                     output_status_code(&output),
                                 )
                             })?;
-                        metadata_probe_is_valid(&stdout, &runtime_root, "arm64")
-                            .map(|_| candidate.clone())
-                            .map_err(|category| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    category,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })
+                        match metadata_probe_is_valid(
+                            &stdout,
+                            &runtime_root,
+                            expected_runtime_arch(),
+                        ) {
+                            Ok(()) => {
+                                if cfg!(target_os = "windows")
+                                    && !bundled_windows_provenance_is_valid(&runtime_root)
+                                {
+                                    return Err(launcher_error(
+                                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                                        Some(&candidate),
+                                        opts.packaged,
+                                        output_status_code(&output),
+                                    ));
+                                }
+                                Ok(candidate.clone())
+                            }
+                            Err(category) => Err(launcher_error(
+                                DESKTOP_PYTHON_RUNTIME_INVALID,
+                                category,
+                                Some(&candidate),
+                                opts.packaged,
+                                output_status_code(&output),
+                            )),
+                        }
                     }
                     Err(_) => Err(launcher_error(
                         if opts.packaged {
@@ -533,15 +730,35 @@ pub fn resolve_python_launcher_resource_aware(
             ));
         }
     }
-    resolve_python_launcher(opts.override_var_name).map_err(|_| {
-        launcher_error(
+    if has_confirmed_unbundled_dev_source_tree(&opts) {
+        if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
+            return match env_candidate.command_for_version_check().output() {
+                Ok(output) => validate_launcher_with_output(&env_candidate, &output, false, false)
+                    .map(|_| env_candidate),
+                Err(_) => Err(launcher_error(
+                    DESKTOP_PYTHON_OVERRIDE_INVALID,
+                    PythonLauncherCategory::OverrideMissing,
+                    Some(&env_candidate),
+                    false,
+                    None,
+                )),
+            };
+        }
+        return Err(launcher_error(
             DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING,
             PythonLauncherCategory::SystemRuntimeMissing,
             None,
             false,
             None,
-        )
-    })
+        ));
+    }
+    Err(launcher_error(
+        DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING,
+        PythonLauncherCategory::SystemRuntimeMissing,
+        None,
+        false,
+        None,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,7 +919,17 @@ pub fn format_bridge_script_resolution_error(
     } else {
         root_candidates
             .iter()
-            .map(|candidate| format!("{:?}:{}", candidate.layout, candidate.root.display()))
+            .map(|candidate| {
+                format!(
+                    "{:?}:{}",
+                    candidate.layout,
+                    candidate
+                        .root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<root>")
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -711,7 +938,13 @@ pub fn format_bridge_script_resolution_error(
     } else {
         bridge_candidates
             .iter()
-            .map(|candidate| candidate.display().to_string())
+            .map(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<script>")
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -719,9 +952,11 @@ pub fn format_bridge_script_resolution_error(
         .first()
         .map(|candidate| format!("{:?}", candidate.layout))
         .unwrap_or_else(|| "<unknown>".into());
-    let interpreter = interpreter.unwrap_or("<unresolved>");
+    let interpreter = interpreter
+        .and_then(|p| Path::new(p).file_name().and_then(|s| s.to_str()))
+        .unwrap_or("<unresolved>");
     format!(
-        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_paths=[{attempted_bridge_paths}]"
+        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter_basename={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_basenames=[{attempted_bridge_paths}]"
     )
 }
 
@@ -749,13 +984,64 @@ where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONHOME"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONUSERBASE"));
 }
 
-pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
+const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
+    "TOKEN_PLACE_DESKTOP_PYTHON",
+    "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
+    "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
+    "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "FORCE_CMAKE",
+];
+
+pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    for key in PACKAGED_MUTABLE_ENV_KEYS {
+        command.remove_env(std::ffi::OsStr::new(key));
+    }
+    // std::process::Command cannot remove dynamic prefixes without enumerating
+    // the parent env; remove every currently inherited pip/CMake variable.
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if PACKAGED_MUTABLE_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+        {
+            command.remove_env(key);
+        }
+    }
+}
+
+fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
+    import_root
+        .join("python")
+        .join("desktop_runtime_setup.py")
+        .is_file()
+        && !import_root
+            .join("python-runtime")
+            .join("embedded_python_runtime_provenance.json")
+            .exists()
+}
+
+pub fn configure_python_subprocess_env_for_layout<C>(
+    command: &mut C,
+    import_root: &Path,
+    layout: ResourceLayoutKind,
+    packaged: bool,
+) where
+    C: PythonEnvCommand,
+{
     disable_python_user_site(command);
+    if packaged || layout != ResourceLayoutKind::DevSourceTree {
+        sanitize_packaged_python_subprocess_env(command);
+    }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
     let pythonpath = if python_dir.is_dir() {
@@ -767,11 +1053,26 @@ where
     command.set_env("PYTHONPATH", pythonpath);
 }
 
+pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+where
+    C: PythonEnvCommand,
+{
+    let layout = if import_root_is_confirmed_unbundled_development(import_root) {
+        ResourceLayoutKind::DevSourceTree
+    } else {
+        ResourceLayoutKind::TauriResourceDir
+    };
+    configure_python_subprocess_env_for_layout(command, import_root, layout, false);
+}
+
 pub trait PythonEnvCommand {
     fn set_env<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>;
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>;
 }
 
 impl PythonEnvCommand for Command {
@@ -782,6 +1083,13 @@ impl PythonEnvCommand for Command {
     {
         self.env(key, value);
     }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.env_remove(key);
+    }
 }
 
 impl PythonEnvCommand for tokio::process::Command {
@@ -791,6 +1099,13 @@ impl PythonEnvCommand for tokio::process::Command {
         V: AsRef<std::ffi::OsStr>,
     {
         self.env(key, value);
+    }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.env_remove(key);
     }
 }
 
@@ -896,6 +1211,62 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn bundled_windows_provenance_requires_complete_immutable_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path();
+        let provenance = runtime.join("embedded_python_runtime_provenance.json");
+        let manifest = bundled_windows_manifest().expect("manifest");
+        let required_dlls = manifest
+            .get("required_native_dlls")
+            .and_then(|v| v.as_array())
+            .expect("required dlls");
+        let mut pe_dll_closure: Vec<serde_json::Value> = required_dlls
+            .iter()
+            .filter_map(|name| name.as_str())
+            .map(|name| {
+                let file = runtime.join(name);
+                std::fs::write(&file, format!("pe:{name}")).expect("write required dll");
+                let digest = format!("{:x}", Sha256::digest(std::fs::read(&file).unwrap()));
+                serde_json::json!({
+                    "name": name,
+                    "path": name,
+                    "machine": "IMAGE_FILE_MACHINE_AMD64",
+                    "imports": [],
+                    "sha256": digest,
+                })
+            })
+            .collect();
+        std::fs::write(runtime.join("python.exe"), b"python-exe").expect("write python.exe");
+        pe_dll_closure.push(serde_json::json!({
+            "name": "python.exe",
+            "path": "python.exe",
+            "machine": "IMAGE_FILE_MACHINE_AMD64",
+            "imports": ["python311.dll"],
+            "sha256": format!("{:x}", Sha256::digest(std::fs::read(runtime.join("python.exe")).unwrap())),
+        }));
+        let mut valid = serde_json::json!({
+            "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "cpython_version": manifest.get("cpython_version").cloned().unwrap(),
+            "target_triple": manifest.get("target_triple").cloned().unwrap(),
+            "source_archive_sha256": manifest.get("sha256").cloned().unwrap(),
+            "llama_cpp_cuda_wheel": manifest.get("llama_cpp_cuda_wheel").cloned().unwrap(),
+            "required_packages": manifest.get("required_packages").cloned().unwrap(),
+            "python_package_wheels": manifest.get("python_package_wheels").cloned().unwrap(),
+            "required_native_dlls": manifest.get("required_native_dlls").cloned().unwrap(),
+            "pe_dll_closure": pe_dll_closure,
+        });
+        std::fs::write(&provenance, valid.to_string()).expect("write provenance");
+        assert!(bundled_windows_provenance_is_valid(runtime));
+
+        valid["llama_cpp_cuda_wheel"]["flavor"] = serde_json::json!("cpu");
+        std::fs::write(&provenance, valid.to_string()).expect("write stale provenance");
+        assert!(!bundled_windows_provenance_is_valid(runtime));
+
+        std::fs::write(&provenance, "{not-json").expect("write corrupt provenance");
+        assert!(!bundled_windows_provenance_is_valid(runtime));
     }
 
     #[test]
@@ -1082,20 +1453,18 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn packaged_linux_retains_system_python_fallback() {
-        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+    fn packaged_linux_fails_closed_without_confirmed_bundled_runtime() {
+        let err = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
             override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
             tauri_resource_dir: None,
             current_exe_path: None,
             manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
             packaged: true,
         })
-        .expect("packaged Linux should probe installed system Python");
+        .expect_err("packaged Linux must not fall back to system Python");
 
-        assert_eq!(
-            launcher.source,
-            PythonLauncherSource::SystemDevelopmentRuntime
-        );
+        assert_eq!(err.public_code, DESKTOP_PYTHON_RUNTIME_MISSING);
+        assert_eq!(err.category, PythonLauncherCategory::BundledRuntimeMissing);
     }
 
     #[test]
@@ -1201,6 +1570,97 @@ mod tests {
     }
 
     #[test]
+    fn debug_no_bundle_executable_under_target_is_unbundled_development() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+
+        assert_eq!(
+            classify_python_execution_layout(Some(&exe), &manifest),
+            PythonExecutionLayout::UnbundledDevelopment
+        );
+        assert!(!is_packaged_execution(Some(&exe), &manifest));
+    }
+
+    #[test]
+    fn installed_executable_python_sibling_shape_remains_packaged() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("repo/desktop-tauri/src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = temp.path().join("installed/app/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+
+        assert_eq!(
+            classify_python_execution_layout(Some(&exe), &manifest),
+            PythonExecutionLayout::Packaged
+        );
+        assert!(is_packaged_execution(Some(&exe), &manifest));
+    }
+
+    #[test]
+    fn tauri_resource_dir_equal_to_manifest_dir_does_not_hide_dev_source_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let opts = PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&manifest),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: false,
+        };
+
+        assert!(has_confirmed_unbundled_dev_source_tree(&opts));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn confirmed_development_selects_explicit_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest.join("target/debug/token-place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let override_python = temp.path().join("python-ok");
+        std::fs::write(&override_python, "#!/bin/sh\nprintf 'Python 3.11.13\\n'\n").unwrap();
+        let mut perms = std::fs::metadata(&override_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&override_python, perms).unwrap();
+        let var = "TOKEN_PLACE_TEST_CONFIRMED_DEV_PYTHON";
+        std::env::set_var(var, &override_python);
+
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: var,
+            tauri_resource_dir: Some(&manifest),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: false,
+        })
+        .expect("dev override selected");
+        std::env::remove_var(var);
+
+        assert_eq!(launcher.source, PythonLauncherSource::EnvironmentOverride);
+        assert_eq!(Path::new(&launcher.program), override_python.as_path());
+    }
+
+    #[test]
     fn bridge_script_candidates_are_generated_from_shared_resource_roots() {
         let temp = TempDir::new().expect("tempdir");
         let exe = temp
@@ -1238,6 +1698,25 @@ mod tests {
     }
 
     #[test]
+    fn bridge_resolution_error_omits_raw_paths_and_interpreter() {
+        let root = PathBuf::from("/Users/alice/secret/project/resources");
+        let bridge = root.join("python").join("compute_node_bridge.py");
+        let message = format_bridge_script_resolution_error(
+            "compute_node_bridge.py",
+            &[ResourceRootCandidate {
+                root: root.clone(),
+                layout: ResourceLayoutKind::TauriResourceDir,
+            }],
+            &[bridge],
+            Some("/Users/alice/secret/python-runtime/python.exe"),
+        );
+        assert!(!message.contains("/Users/alice/secret"));
+        assert!(message.contains("interpreter_basename=python.exe"));
+        assert!(message.contains("TauriResourceDir:resources"));
+        assert!(message.contains("compute_node_bridge.py"));
+    }
+
+    #[test]
     fn configure_python_subprocess_env_uses_deterministic_pythonpath() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("Resources");
@@ -1268,6 +1747,89 @@ mod tests {
         ))
         .collect();
         assert_eq!(pythonpath_entries, vec![root.clone(), root.join("python")]);
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_sanitizes_packaged_import_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("Resources");
+        std::fs::create_dir_all(root.join("python-runtime")).expect("create runtime dir");
+        std::fs::write(
+            root.join("python-runtime")
+                .join("embedded_python_runtime_provenance.json"),
+            "{}",
+        )
+        .expect("write provenance");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+
+        configure_python_subprocess_env(&mut command, &root);
+
+        let removed = command.get_envs().any(|(key, value)| {
+            key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD" && value.is_none()
+        });
+        assert!(
+            removed,
+            "packaged runtime must strip development repair opt-in"
+        );
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_for_layout_sanitizes_packaged_even_with_dev_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("Resources");
+        std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        std::fs::write(
+            root.join("python").join("desktop_runtime_setup.py"),
+            "# stale packaged copy",
+        )
+        .expect("write marker");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+        command.env("FORCE_CMAKE", "1");
+
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &root,
+            ResourceLayoutKind::WindowsResources,
+            true,
+        );
+
+        let removed_keys: std::collections::BTreeSet<_> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value
+                    .is_none()
+                    .then_some(key.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(removed_keys.contains("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"));
+        assert!(removed_keys.contains("FORCE_CMAKE"));
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_preserves_dev_opt_in_for_confirmed_unbundled_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("src-tauri");
+        std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        std::fs::write(
+            root.join("python").join("desktop_runtime_setup.py"),
+            "# dev",
+        )
+        .expect("write dev marker");
+        let mut command = Command::new("python");
+        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+
+        configure_python_subprocess_env(&mut command, &root);
+
+        let value = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD")
+                    .then_some(value.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .flatten();
+        assert_eq!(value.as_deref(), Some("1"));
     }
 
     #[test]
@@ -1343,7 +1905,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
             py.display(),
             runtime_root.display()
         );

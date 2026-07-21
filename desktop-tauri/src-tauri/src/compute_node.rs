@@ -6,7 +6,7 @@ use crate::operator_logs::{
     sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
-    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
+    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
@@ -491,7 +491,16 @@ fn configure_runtime_pythonpath(
     disable_python_user_site(command);
     let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        configure_python_subprocess_env(command, import_root);
+        let (_, layout) = describe_resource_layout(
+            Path::new(bridge_script),
+            std::env::current_exe().ok().as_deref(),
+            manifest_dir,
+            None,
+        );
+        let current_exe = std::env::current_exe().ok();
+        let packaged =
+            crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+        configure_python_subprocess_env_for_layout(command, import_root, layout, packaged);
     }
     import_root
 }
@@ -1563,12 +1572,16 @@ pub async fn start_compute_node(
         let resource_dir = app.path().resource_dir().ok();
         let current_exe = std::env::current_exe().ok();
         match tokio::task::spawn_blocking(move || {
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
             resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
                 override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
                 tauri_resource_dir: resource_dir.as_deref(),
                 current_exe_path: current_exe.as_deref(),
-                manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
-                packaged: !cfg!(debug_assertions),
+                manifest_dir,
+                packaged: crate::python_runtime::is_packaged_execution(
+                    current_exe.as_deref(),
+                    manifest_dir,
+                ),
             })
         })
         .await
@@ -5446,10 +5459,12 @@ mod tests {
 
         assert!(error.contains("compute_node_bridge.py"));
         assert!(error.contains("attempted_resource_roots="));
-        assert!(error.contains("attempted_bridge_paths="));
+        assert!(error.contains("attempted_bridge_basenames="));
         assert!(error.contains("MacOsAppResources"));
-        assert!(error.contains("Contents/Resources/python/compute_node_bridge.py"));
-        assert!(error.contains("interpreter=<unresolved>"));
+        assert!(error.contains("compute_node_bridge.py"));
+        assert!(error.contains("interpreter_basename=<unresolved>"));
+        assert!(!error.contains(temp.path().to_string_lossy().as_ref()));
+        assert!(!error.contains("Contents/Resources/python/compute_node_bridge.py"));
     }
 
     #[test]

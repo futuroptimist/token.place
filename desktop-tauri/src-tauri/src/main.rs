@@ -87,7 +87,20 @@ fn configure_runtime_pythonpath_for(
     let import_root =
         python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        python_runtime::configure_python_subprocess_env(command, import_root);
+        let current_exe = std::env::current_exe().ok();
+        let (_resource_root, layout) = python_runtime::describe_resource_layout(
+            bridge_script,
+            current_exe.as_deref(),
+            manifest_dir,
+            None,
+        );
+        let packaged = python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+        python_runtime::configure_python_subprocess_env_for_layout(
+            command,
+            import_root,
+            layout,
+            packaged,
+        );
     }
     import_root
 }
@@ -171,7 +184,7 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
             tauri_resource_dir: app.path().resource_dir().ok().as_deref(),
             current_exe_path: exe_path.as_deref(),
             manifest_dir,
-            packaged: !cfg!(debug_assertions),
+            packaged: python_runtime::is_packaged_execution(exe_path.as_deref(), manifest_dir),
         },
     )
     .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;

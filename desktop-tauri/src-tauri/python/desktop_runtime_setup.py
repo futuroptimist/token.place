@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 _PACKAGED_RESOURCES_ROOT = Path(__file__).resolve().parent.parent
 if (_PACKAGED_RESOURCES_ROOT / "utils").is_dir() and str(_PACKAGED_RESOURCES_ROOT) not in sys.path:
@@ -213,6 +214,8 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "install_heartbeat_failed",
         "provisioning_cancelled",
         "cuda_install_failed",
+        "bundled_runtime_probe_failed",
+        "windows_development_runtime_missing_read_only",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -244,6 +247,7 @@ PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
 PROBE_RESULT_MAX_BYTES = 1024 * 1024
 PROBE_EXIT_GRACE_SECONDS = 1.0
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
+DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV = "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"
 _PROCESS_SYS_PATH = sys.path
 _PROCESS_PYTHON_VERSION = sys.version.split()[0]
 
@@ -535,6 +539,128 @@ def _pip_version_summary() -> str:
     return output or "available"
 
 
+
+def _bundled_site_packages_dir() -> Path:
+    return _safe_resolve_path(sys.executable).parent / "Lib" / "site-packages"
+
+
+def _public_runtime_identity(value: str) -> str:
+    text = str(value or "")
+    lower = text.lower()
+    basename = text.replace("\\", "/").rsplit("/", 1)[-1]
+    if _is_exact_packaged_runtime_layout() or "python-runtime" in lower:
+        if lower.endswith("python.exe") or lower.endswith("python"):
+            return basename or "python.exe"
+        return basename if text else "bundled"
+    return basename if (":" in text or text.startswith("/") or "\\" in text) else text
+
+
+PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS = 512
+_PUBLIC_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[/\\](?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\\?\\[A-Za-z]:[/\\](?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\\?\\UNC\\(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|\\\\(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*|/(?:private|var|opt|Applications|Library|Users|home|tmp)(?:(?!\s+(?:[A-Za-z_][A-Za-z0-9_]*=|and\s+__PUBLIC_URL_))[^;\r\n,)])*)"
+)
+_PUBLIC_SENSITIVE_KEYS = {
+    "prompt", "prompts", "messages", "message_payload", "response", "responses",
+    "plaintext", "ciphertext", "decrypted", "decrypted_content", "key",
+    "private_key", "secret_key", "api_key", "authorization", "auth_token",
+    "access_token", "refresh_token", "token", "environment", "env",
+    "relay_payload", "request_payload", "response_payload", "raw_payload",
+    "raw_request", "raw_response", "payload",
+}
+_PUBLIC_COMMAND_KEYS = {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}
+_PUBLIC_PATH_FIELDS = {
+    "interpreter", "prefix", "base_prefix", "interpreter_prefix",
+    "dependency_target", "import_root", "requirements", "llama_module_path",
+    "log_file_path", "model_path", "runtime_path",
+}
+_PUBLIC_TEXT_FIELDS = {"fallback_reason", "detail", "error", "last_error", "message", "pip_version"}
+
+_PUBLIC_URL_PATTERN = re.compile(r"(?P<url>https?://[^\s)}>\"']+)")
+
+
+def _sanitize_public_relay_target(relay_url: Any) -> str:
+    if not isinstance(relay_url, str):
+        return "unknown"
+    try:
+        parsed = urlsplit(relay_url.strip())
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
+        return "unknown"
+    if not parsed.scheme or not hostname:
+        return "unknown"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
+
+def _bound_public_diagnostic_text(text: str) -> str:
+    if len(text) <= PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS:
+        return text
+    return text[: PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS - 12].rstrip() + "...<truncated>"
+
+
+def _sanitize_public_runtime_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return text
+    sanitized_urls: list[str] = []
+
+    def _stash_url(match: re.Match[str]) -> str:
+        raw_url = match.group("url").rstrip(".,;:")
+        suffix = match.group("url")[len(raw_url):]
+        sanitized_urls.append(_sanitize_public_relay_target(raw_url))
+        return f"__PUBLIC_URL_{len(sanitized_urls) - 1}__{suffix}"
+
+    text = _PUBLIC_URL_PATTERN.sub(_stash_url, text)
+    text = _PUBLIC_PATH_PATTERN.sub("<path>", text)
+    for index, sanitized_url in enumerate(sanitized_urls):
+        text = text.replace(f"__PUBLIC_URL_{index}__", sanitized_url)
+    return _bound_public_diagnostic_text(text)
+
+
+def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
+    normalized_key = str(key).lower()
+    if normalized_key in _PUBLIC_SENSITIVE_KEYS:
+        return "redacted" if value not in (None, "") else value
+    if normalized_key in _PUBLIC_COMMAND_KEYS:
+        return "redacted" if value else None
+    if "relay_url" in normalized_key or normalized_key.endswith("relay") or normalized_key in {"active_relay_url"}:
+        if isinstance(value, list):
+            return [_sanitize_public_relay_target(item) for item in value]
+        return _sanitize_public_relay_target(value)
+    if normalized_key in _PUBLIC_PATH_FIELDS and isinstance(value, str):
+        if normalized_key == "dependency_target" and (_is_exact_packaged_runtime_layout() or "python-runtime" in value.lower()):
+            return "bundled"
+        return _public_runtime_identity(value)
+    if normalized_key in _PUBLIC_TEXT_FIELDS and isinstance(value, str):
+        return _sanitize_public_runtime_text(value)
+    if isinstance(value, dict):
+        return _sanitize_public_runtime_mapping(value)
+    if isinstance(value, list):
+        return [_sanitize_public_runtime_payload_value(normalized_key, item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_runtime_payload_value(normalized_key, item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_public_runtime_text(value)
+    return value
+
+
+def _sanitize_public_runtime_mapping(value: Dict[Any, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        raw_key_text = str(raw_key)
+        safe_key = (
+            _sanitize_public_relay_target(raw_key_text)
+            if "://" in raw_key_text
+            else _sanitize_public_runtime_text(raw_key_text)
+        )
+        sanitized[safe_key] = _sanitize_public_runtime_payload_value(raw_key_text, raw_value)
+    return sanitized
+
+
+def _sanitize_public_runtime_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    return _sanitize_public_runtime_mapping(dict(result))
+
 def _probe_failure(
     *,
     error: str,
@@ -559,20 +685,42 @@ def _probe_failure(
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
-    dependency_target, _dependency_target_error = _resolve_desktop_dependency_target(repo_root)
-    dependency_target_env = str(dependency_target) if dependency_target is not None else ""
-    dependency_target_text = dependency_target_env or "unknown"
-    pip_version = _pip_version_summary()
+    exact_packaged = _is_exact_packaged_runtime_layout()
+    unbundled_windows = _desktop_platform().startswith("win") and not exact_packaged
+    if exact_packaged:
+        dependency_target = _bundled_site_packages_dir()
+    elif unbundled_windows:
+        dependency_target = None
+    else:
+        dependency_target = _resolve_desktop_dependency_target(repo_root)[0]
+    dependency_target_env = str(dependency_target) if dependency_target is not None and not exact_packaged else ""
+    dependency_target_text = "bundled" if exact_packaged else ("development-import-environment" if unbundled_windows else (dependency_target_env or "unknown"))
+    pip_version = "bundled-runtime-probe" if exact_packaged else ("read-only-development-probe" if unbundled_windows else _pip_version_summary())
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(python_root)]
-    if dependency_target is not None:
-        pythonpath_entries.append(str(dependency_target))
-    pythonpath_entries.append(str(repo_root))
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    if exact_packaged:
+        for key in list(env):
+            upper = key.upper()
+            if upper in {"PYTHONHOME", "PYTHONPATH", "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"} or upper.startswith("PIP_") or upper.startswith("CMAKE_") or upper == "FORCE_CMAKE":
+                env.pop(key, None)
+        pythonpath_entries = [str(dependency_target), str(python_root)] if dependency_target is not None else [str(python_root)]
+        probe_cwd = str(python_root)
+        env["PYTHONNOUSERSITE"] = "1"
+    elif unbundled_windows:
+        pythonpath_entries = None
+        probe_cwd = None
+        env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+    else:
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        pythonpath_entries = [str(python_root)]
+        if dependency_target is not None:
+            pythonpath_entries.append(str(dependency_target))
+        pythonpath_entries.append(str(repo_root))
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        probe_cwd = str(repo_root)
+    if pythonpath_entries is not None:
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))
     if dependency_target_env:
@@ -580,15 +728,17 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     else:
         env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     env["TOKEN_PLACE_DESKTOP_PIP_VERSION"] = pip_version
-    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
+    if not exact_packaged:
+        env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
-        "cwd": str(repo_root),
         "env": env,
     }
+    if probe_cwd is not None:
+        popen_kwargs["cwd"] = probe_cwd
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
     try:
@@ -796,8 +946,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         error=payload.get("error"),
         python_version=str(payload.get("python_version", _python_version_text())),
         base_prefix=str(payload.get("base_prefix", getattr(sys, "base_prefix", sys.prefix))),
-        dependency_target=str(payload.get("dependency_target", dependency_target_text)),
-        pip_version=str(payload.get("pip_version", pip_version)),
+        dependency_target=dependency_target_text if unbundled_windows else str(payload.get("dependency_target", dependency_target_text)),
+        pip_version=pip_version if unbundled_windows else str(payload.get("pip_version", pip_version)),
         llama_cpp_python_version=str(payload.get("llama_cpp_python_version", "unknown")),
         yarn_rope_supported=payload.get("yarn_rope_supported") is True,
         yarn_resolver_source=str(payload.get("yarn_resolver_source", "unsupported")),
@@ -1162,6 +1312,14 @@ def _runtime_probe_is_importable(probe: RuntimeProbe) -> bool:
 
 
 def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    if _is_exact_packaged_runtime_layout():
+        dependency_target = _bundled_site_packages_dir()
+        dependency_target_text = str(dependency_target)
+        active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
+        if dependency_target_text not in active_sys_path:
+            active_sys_path.insert(1 if active_sys_path else 0, dependency_target_text)
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+        return dependency_target, None
     dependency_target, dependency_target_error = _resolve_desktop_dependency_target(runtime_root)
     if dependency_target is not None:
         dependency_target_text = str(dependency_target)
@@ -1174,12 +1332,13 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     return {
         "detected_device": probe.detected_device or "cpu",
-        "interpreter": probe.interpreter,
+        "interpreter": _public_runtime_identity(probe.interpreter),
         "python_version": probe.python_version,
-        "prefix": probe.prefix,
-        "base_prefix": probe.base_prefix,
-        "interpreter_prefix": probe.prefix,
-        "dependency_target": probe.dependency_target,
+        "prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.prefix,
+        "base_prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.base_prefix,
+        "interpreter_prefix": "bundled" if _is_exact_packaged_runtime_layout() else probe.prefix,
+        "dependency_target": "bundled" if _is_exact_packaged_runtime_layout() else probe.dependency_target,
+        "runtime_origin": "bundled" if _is_exact_packaged_runtime_layout() else "development",
         "pip_version": probe.pip_version,
         "llama_cpp_python_version": probe.llama_cpp_python_version,
         "llama_module_path_present": bool(llama_module_identity_from_path(probe.llama_module_path)),
@@ -1299,16 +1458,125 @@ def _save_runtime_state(state: dict) -> None:
         return
 
 
+
+def _is_exact_packaged_runtime_layout() -> bool:
+    exe = _safe_resolve_path(sys.executable)
+    parts = {part.lower() for part in exe.parts}
+    if _desktop_platform().startswith("win"):
+        return exe.name.lower() == "python.exe" and exe.parent.name.lower() == "python-runtime"
+    return "python-runtime" in parts and "contents" in parts and "resources" in parts
+
+
+def _bundled_runtime_manifest() -> dict:
+    manifest_path = Path(__file__).with_name("embedded_python_runtime_windows_x86_64_manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def _bundled_runtime_provenance_valid() -> bool:
+    # Python revalidates provenance for direct/standalone entry, closing the
+    # post-launch mutation/TOCTOU boundary without trusting mtime/size caches.
+    exe = _safe_resolve_path(sys.executable)
+    provenance_path = exe.parent / "embedded_python_runtime_provenance.json"
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(provenance, dict):
+        return False
+    manifest = _bundled_runtime_manifest()
+    if not manifest:
+        return False
+    expected_wheel = manifest.get("llama_cpp_cuda_wheel")
+    if not isinstance(expected_wheel, dict):
+        return False
+    pe_closure = provenance.get("pe_dll_closure")
+    if not isinstance(pe_closure, list) or not pe_closure:
+        return False
+    required_dlls = manifest.get("required_native_dlls")
+    if not isinstance(required_dlls, list):
+        return False
+    seen_paths: set[str] = set()
+    closure_names: set[str] = set()
+    for entry in pe_closure:
+        if not isinstance(entry, dict):
+            return False
+        rel = entry.get("path") or entry.get("name")
+        digest = entry.get("sha256")
+        imports = entry.get("imports")
+        name = entry.get("name")
+        if not isinstance(rel, str) or not rel or Path(rel).is_absolute() or ".." in Path(rel).parts:
+            return False
+        rel_norm = rel.replace("\\", "/").lower()
+        if rel_norm in seen_paths:
+            return False
+        seen_paths.add(rel_norm)
+        if not isinstance(name, str) or not name:
+            return False
+        closure_names.add(name.lower())
+        file_path = exe.parent / rel
+        try:
+            if not file_path.resolve().is_relative_to(exe.parent.resolve()):
+                return False
+            if not file_path.is_file() or hashlib.sha256(file_path.read_bytes()).hexdigest() != digest:
+                return False
+        except OSError:
+            return False
+        if entry.get("machine") != "IMAGE_FILE_MACHINE_AMD64" or not isinstance(imports, list):
+            return False
+    return (
+        provenance.get("runtime_id") == "bundled-cpython-3.11-win-x86_64-cu124"
+        and provenance.get("cpython_version") == manifest.get("cpython_version") == "3.11.13"
+        and provenance.get("target_triple") == manifest.get("target_triple") == "x86_64-pc-windows-msvc"
+        and provenance.get("source_archive_sha256") == manifest.get("sha256")
+        and provenance.get("llama_cpp_cuda_wheel") == expected_wheel
+        and provenance.get("required_packages") == manifest.get("required_packages")
+        and provenance.get("python_package_wheels") == manifest.get("python_package_wheels", [])
+        and provenance.get("required_native_dlls") == required_dlls
+        and set(dll.lower() for dll in required_dlls).issubset(closure_names)
+    )
+
+
+def _is_bundled_packaged_runtime() -> bool:
+    if not _is_exact_packaged_runtime_layout():
+        return False
+    # Invariant: exact packaged layouts are immutable; provenance decides validity,
+    # not whether startup may fall back to mutable bootstrap or repair paths.
+    if _desktop_platform().startswith("win"):
+        return True
+    return True
+
+
+def _development_source_build_allowed() -> bool:
+    if _is_bundled_packaged_runtime():
+        return False
+    if os.getenv(DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, "").strip() != "1":
+        return False
+    target_root = _resolve_runtime_root()
+    source_tree = target_root / "desktop-tauri" / "src-tauri" / "python"
+    return (
+        (source_tree / "desktop_runtime_setup.py").is_file()
+        and (source_tree / "desktop_gpu_packaging.py").is_file()
+    )
+
 def _should_attempt_source_repair() -> tuple[bool, str]:
     state = _load_runtime_state()
     failures = state.get("source_repair_failures", {})
     entry = failures.get(sys.executable, {})
     last_failed_at = float(entry.get("last_failed_at", 0))
     now = time.time()
-    if now - last_failed_at >= SOURCE_REPAIR_COOLDOWN_SECONDS:
-        return True, ""
-    retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
-    return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+    if now - last_failed_at < SOURCE_REPAIR_COOLDOWN_SECONDS:
+        retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
+        return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+    if not _development_source_build_allowed():
+        return False, (
+            "CUDA source repair is disabled for packaged startup; "
+            f"set {DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV}=1 only in an unbundled development layout"
+        )
+    return True, ""
 
 
 def _record_source_repair_failure(reason: str) -> None:
@@ -1366,7 +1634,7 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
     if (
         current_platform == "darwin"
         and selected_mode != "gpu"
-        and runtime_action not in {"failed", "metal_install_failed"}
+        and runtime_action not in {"failed", "metal_install_failed", "bundled_runtime_probe_failed"}
     ):
         return None
 
@@ -1542,8 +1810,10 @@ def _ensure_desktop_llama_runtime_impl(
             return _probe_runtime(target_root)
 
     before = _probe_with_context("runtime_probe")
-    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
-    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
+    is_unbundled_windows = _desktop_platform().startswith("win") and not _is_exact_packaged_runtime_layout()
+    dependency_target = None
+    dependency_target_error = "read-only Windows development startup" if is_unbundled_windows else ""
+    dependency_target_text = "development-import-environment" if is_unbundled_windows else "unknown"
     requirements_path = _resolve_requirements_path(target_root)
     version_resolution_error = ""
     try:
@@ -1560,8 +1830,7 @@ def _ensure_desktop_llama_runtime_impl(
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                "llama_cpp import shadowed by repo-local shim "
-                f"({before.llama_module_path}); remove repo root from import precedence "
+                "llama_cpp import shadowed by repo-local shim; remove repo root from import precedence "
                 "or run via desktop sidecar bootstrap so site-packages llama-cpp-python is used"
             ),
             "runtime_action": "shadowed_repo_llama_cpp",
@@ -1578,6 +1847,45 @@ def _ensure_desktop_llama_runtime_impl(
             **before_version_payload,
         }
 
+    qwen_64k_version_ok = (
+        not qwen_64k_required
+        or (
+            not version_resolution_error
+            and before_version_payload.get("llama_cpp_python_version_match") == "match"
+        )
+    )
+
+    if is_unbundled_windows:
+        if before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_version_ok and (not qwen_64k_required or before.yarn_rope_supported):
+            return {
+                "selected_backend": "cuda",
+                "fallback_reason": "",
+                "runtime_action": "already_supported",
+                **_probe_result_payload(before),
+                **before_version_payload,
+            }
+        reason = before.error or before.backend or "missing runtime"
+        if before.backend == "metal":
+            reason = "Metal runtime is not supported for Windows development startup"
+        elif before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_required and not qwen_64k_version_ok:
+            reason = f"pinned llama-cpp-python version mismatch for Qwen 64K; required_version={required_version}; version_match={before_version_payload.get('llama_cpp_python_version_match')}"
+        elif before.gpu_offload_supported and before.backend == "cuda" and qwen_64k_required and not before.yarn_rope_supported:
+            reason = "Qwen 64K requires YaRN/RoPE support in the preinstalled Windows CUDA runtime"
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"Windows development runtime dependency unavailable ({reason}); "
+                "install the pinned CUDA desktop Python dependencies in the selected development interpreter; "
+                "startup is read-only and will not run pip, compilers, source repair"
+            ),
+            "runtime_action": "windows_development_runtime_missing_read_only",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
+
+    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
+    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
+
     last_error = ""
     qwen_64k_version_ok = (
         not qwen_64k_required
@@ -1586,6 +1894,21 @@ def _ensure_desktop_llama_runtime_impl(
             and before_version_payload.get("llama_cpp_python_version_match") == "match"
         )
     )
+
+    # On Windows, an exact packaged layout with invalid provenance must fail closed before a
+    # successful CUDA probe can bypass the immutability check.  Check this before accepting any
+    # GPU-success early return so stale/corrupt/missing provenance is never silently accepted.
+    is_windows_packaged = _desktop_platform().startswith("win") and _is_exact_packaged_runtime_layout()
+    provenance_invalid = is_windows_packaged and not _bundled_runtime_provenance_valid()
+    if provenance_invalid:
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": "immutable bundled GPU runtime probe failed: invalid or missing provenance; packaged startup will not run pip, compilers, or CPU/model/context fallback",
+            "runtime_action": "bundled_runtime_probe_failed",
+            "runtime_origin": "bundled",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
 
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
         if (not qwen_64k_required or before.yarn_rope_supported) and qwen_64k_version_ok:
@@ -1607,6 +1930,19 @@ def _ensure_desktop_llama_runtime_impl(
 
     policy = _runtime_bootstrap_policy()
     expected_backend = policy.expected_backend
+
+    if _is_exact_packaged_runtime_layout():
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                (f"{last_error}; " if last_error else "")
+                + "immutable bundled GPU runtime probe failed; packaged startup will not run pip, compilers, or CPU/model/context fallback"
+            ),
+            "runtime_action": "bundled_runtime_probe_failed",
+            "runtime_origin": "bundled",
+            **_probe_result_payload(before),
+            **before_version_payload,
+        }
 
     if before.backend == "missing" and not policy.bootstrap_supported:
         return {
@@ -1953,7 +2289,7 @@ def _record_desktop_runtime_probe(result: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         os.environ.pop(RUNTIME_PROBE_ENV, None)
         return result
-    public_result = dict(result)
+    public_result = _sanitize_public_runtime_payload(result)
     for private_key in ("llama_module_path", "llama_module_identity"):
         public_result.pop(private_key, None)
     for key in (
@@ -2148,19 +2484,32 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
     requirements_path = _resolve_desktop_requirements_path(root)
     required_modules = ("psutil", "requests", "dotenv", "cryptography")
 
-    if mutate:
+    exact_packaged = _is_exact_packaged_runtime_layout()
+    unbundled_windows = _desktop_platform().startswith("win") and not exact_packaged
+    if exact_packaged:
+        target_dir, target_error = _safe_resolve_path(sys.executable).parent / "Lib" / "site-packages", None
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+    elif unbundled_windows:
+        target_dir, target_error = None, "read-only Windows development startup"
+        os.environ.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
+    elif mutate:
         target_dir, target_error = _resolve_desktop_dependency_target(root)
     else:
         target_dir, target_error = _existing_desktop_dependency_target(root)
     if target_dir is not None:
         target_dir_str = str(target_dir)
-        os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
-        if target_dir_str not in sys.path:
+        if not exact_packaged:
+            os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
+        if not unbundled_windows and target_dir_str not in sys.path:
             sys.path.insert(1 if sys.path else 0, target_dir_str)
 
     missing = _module_missing(required_modules)
     if not missing:
-        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": str(target_dir) if target_dir is not None else ""}
+        return {"ok": "true", "action": "already_satisfied", "missing": "", "dependency_target": "bundled" if exact_packaged else ("development-import-environment" if unbundled_windows else (str(target_dir) if target_dir is not None else ""))}
+    if exact_packaged:
+        return {"ok": "false", "action": "bundled_runtime_probe_failed", "missing": ",".join(missing), "dependency_target": "bundled", "detail": "immutable packaged runtime will not run pip installers"}
+    if unbundled_windows:
+        return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": "development-import-environment", "detail": "Windows development startup is read-only; install desktop dependencies in the selected interpreter"}
     if not mutate:
         return {"ok": "false", "action": "missing_read_only", "missing": ",".join(missing), "dependency_target": str(target_dir) if target_dir is not None else ""}
 
@@ -2169,9 +2518,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": "requirements_missing",
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
         }
 
     if target_dir is None:
@@ -2179,9 +2528,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": "install_target_unavailable",
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
             "detail": target_error or "unable to create desktop dependency install target",
         }
 
@@ -2218,7 +2567,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         detail = "managed site mutation lock unavailable"
         if isinstance(exc, TimeoutError) and "cancelled" in str(exc).lower():
             detail = "managed site mutation lock cancelled"
-        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": sys.executable, "import_root": str(root), "requirements": str(requirements_path), "dependency_target": target_dir_str, "detail": detail}
+        return {"ok": "false", "action": "lock_unavailable", "missing": ",".join(missing), "interpreter": Path(sys.executable).name, "import_root": root.name, "requirements": requirements_path.name, "dependency_target": "development", "detail": detail}
 
     if not ok:
         action = "install_cancelled" if "outcome=cancelled" in output else ("install_timeout" if ("outcome=timed_out" in output or "timed out" in output.lower()) else "install_failed")
@@ -2226,9 +2575,9 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
             "ok": "false",
             "action": action,
             "missing": ",".join(missing),
-            "interpreter": sys.executable,
-            "import_root": str(root),
-            "requirements": str(requirements_path),
+            "interpreter": Path(sys.executable).name,
+            "import_root": root.name,
+            "requirements": requirements_path.name,
             "dependency_target": target_dir_str,
             "detail": _summarize_install_error(output),
         }
@@ -2238,10 +2587,10 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         "ok": "true" if not missing_after else "false",
         "action": "installed" if not missing_after else "post_install_missing",
         "missing": ",".join(missing_after),
-        "interpreter": sys.executable,
-        "import_root": str(root),
-        "requirements": str(requirements_path),
-        "dependency_target": target_dir_str,
+        "interpreter": Path(sys.executable).name,
+        "import_root": root.name,
+        "requirements": requirements_path.name,
+        "dependency_target": "development",
     }
 
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:

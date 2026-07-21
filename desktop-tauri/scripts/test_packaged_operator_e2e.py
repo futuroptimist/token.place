@@ -232,12 +232,25 @@ def run_managed_dependency_target_reuse_probe(tmp_root: Path, *, resources_root:
     """Assert two packaged preflight launches reuse one clean managed dependency target."""
 
     resources_root = resources_root or (tmp_root / "resources")
-    managed_target = tmp_root / "C_drive\\Users\\TokenPlace\\managed-dependencies"
     counter_path = tmp_root / "pip-call-count.txt"
+    bundled_runtime = resources_root / "python-runtime"
+    bundled_runtime.mkdir(parents=True, exist_ok=True)
+    (bundled_runtime / "python.exe").write_text("placeholder", encoding="utf-8")
+    (bundled_runtime / "embedded_python_runtime_provenance.json").write_text(
+        json.dumps({"runtime_id": "bundled-cpython-3.11-win-x86_64-cu124", "target_triple": "x86_64-pc-windows-msvc"}),
+        encoding="utf-8",
+    )
+    site_packages = bundled_runtime / "Lib" / "site-packages"
+    for name in ("psutil", "requests", "dotenv", "cryptography"):
+        package_dir = site_packages / name
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    hostile_target = tmp_root / "C_drive\\Users\\TokenPlace\\hostile-dependencies"
+    (hostile_target / "psutil").mkdir(parents=True, exist_ok=True)
     env = _packaged_env(
         tmp_root,
         resources_root,
-        extra_env={"TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(managed_target)},
+        extra_env={"TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET": str(hostile_target)},
     )
     probe = f"""
 import json
@@ -246,25 +259,22 @@ import sys
 sys.path.insert(0, {str(resources_root / 'python')!r})
 counter = pathlib.Path({str(counter_path)!r})
 import desktop_runtime_setup as mod
+mod.sys.platform = 'win32'
+mod.sys.executable = str(pathlib.Path({str(resources_root / 'python-runtime' / 'python.exe')!r}))
 
 def fake_run(cmd, env, **kwargs):
     counter.write_text(str(int(counter.read_text() or '0') + 1) if counter.exists() else '1')
-    target = pathlib.Path(env['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
-    for name in ('psutil', 'requests', 'dotenv', 'cryptography'):
-        package_dir = target / name
-        package_dir.mkdir(parents=True, exist_ok=True)
-        (package_dir / '__init__.py').write_text('')
-    return True, 'fake install ok'
+    raise AssertionError('packaged startup must not invoke pip installers')
 
 mod._run_pip_install = fake_run
 
 def fake_missing(required_modules):
     module_to_package = {{'dotenv': 'dotenv'}}
     missing = []
-    target = pathlib.Path(__import__('os').environ['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'])
+    runtime_site = pathlib.Path(mod.sys.executable).parent / 'Lib' / 'site-packages'
     for module_name in required_modules:
         package_name = module_to_package.get(module_name, module_name)
-        if not (target / package_name / '__init__.py').is_file():
+        if not (runtime_site / package_name / '__init__.py').is_file():
             missing.append(module_name)
     return missing
 
@@ -278,13 +288,14 @@ print(json.dumps({{'payload': payload, 'pip_calls': pip_calls}}, sort_keys=True)
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     first_payload = json.loads(first.stdout.strip())
     assert first_payload["payload"].get("ok") == "true", first.stdout
-    assert first_payload["pip_calls"] == 1, first.stdout
+    assert first_payload["pip_calls"] == 0, first.stdout
 
     second = subprocess.run([sys.executable, "-c", probe], cwd=tmp_root, env=env, capture_output=True, text=True, check=False)  # noqa: S603
     assert second.returncode == 0, f"{second.stdout}\n{second.stderr}"
     second_payload = json.loads(second.stdout.strip())
     assert second_payload["payload"].get("ok") == "true", second.stdout
-    assert second_payload["pip_calls"] == 1, second.stdout
+    assert second_payload["pip_calls"] == 0, second.stdout
+    assert "cuda_build" not in first.stdout + second.stdout
 
 def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
     resources_root = resources_root or (tmp_root / "resources")
@@ -1042,16 +1053,6 @@ def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
     return fake_site
 
 
-def patch_packaged_runtime_setup_as_macos(resources_root: Path) -> None:
-    runtime_setup = resources_root / "python" / "desktop_runtime_setup.py"
-    runtime_setup.write_text(
-        runtime_setup.read_text(encoding="utf-8")
-        + "\n# Packaged e2e-only platform shim.\n"
-        + "_desktop_platform = lambda: 'darwin'\n"
-        + "_desktop_arch = lambda: 'arm64'\n",
-        encoding="utf-8",
-    )
-
 
 def run_macos_mock_metal_packaged_registration_probe(
     tmp_root: Path,
@@ -1098,7 +1099,6 @@ def run_macos_gpu_failure_blocks_registration_probe(
     relay_port: int,
     resources_root: Path,
 ) -> None:
-    patch_packaged_runtime_setup_as_macos(resources_root)
     broken_site = tmp_root / "fake broken macos llama_cpp"
     broken_pkg = broken_site / "llama_cpp"
     broken_pkg.mkdir(parents=True, exist_ok=True)
@@ -1243,7 +1243,7 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
-                if probe_resources_root == mac_resources_root:
+                if probe_resources_root == mac_resources_root and sys.platform == "darwin":
                     run_macos_mock_metal_packaged_registration_probe(
                         tmp_path,
                         probe_script,

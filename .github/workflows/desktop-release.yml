@@ -36,7 +36,7 @@ jobs:
             checksum_file: SHA256SUMS-macos-arm64.txt
           - os: windows-latest
             artifact_name: windows-x64-bundles
-            tauri_target: ''
+            tauri_target: x86_64-pc-windows-msvc
             checksum_file: SHA256SUMS-windows-x64.txt
     runs-on: ${{ matrix.os }}
     defaults:
@@ -221,6 +221,14 @@ jobs:
             ~/.cache/token-place/embedded-python
           key: embedded-python-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_manifest.json', 'desktop-tauri/src-tauri/python/requirements_desktop_runtime.txt') }}
 
+      - name: Cache embedded Windows CUDA Python runtime artifacts
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            desktop-tauri/.cache/windows-python-runtime
+          key: windows-cuda-python-runtime-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json') }}
+
       - name: Prepare embedded macOS Python runtime
         if: runner.os == 'macOS'
         shell: bash
@@ -230,6 +238,15 @@ jobs:
           python scripts/prepare_embedded_python_runtime.py
           test -x src-tauri/python-runtime/bin/python3
           src-tauri/python-runtime/bin/python3 -m pip check
+
+      - name: Prepare embedded Windows CUDA Python runtime
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare_windows_embedded_python_runtime.py
+          test -f src-tauri/python-runtime/python.exe
+          src-tauri/python-runtime/python.exe -m pip check
 
       - name: Build frontend assets
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
@@ -389,8 +406,8 @@ jobs:
               exit 1
             fi
           elif [ "${{ runner.os }}" = "Windows" ]; then
-            nsis_dir="src-tauri/target/release/bundle/nsis"
-            msi_dir="src-tauri/target/release/bundle/msi"
+            nsis_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/nsis"
+            msi_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/msi"
 
             setup_files=("${nsis_dir}"/*-setup.exe)
             if [ ! -e "${setup_files[0]}" ]; then
@@ -459,6 +476,40 @@ jobs:
           cd ..
           python -m pytest --confcutdir=tests/integration tests/integration/test_macos_release_probe.py -q
 
+      - name: Validate Windows MSI and NSIS artifact contents
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t nsis_paths < <(find release-artifacts -maxdepth 1 -type f -name '*-setup.exe' | sort)
+          mapfile -t msi_paths < <(find release-artifacts -maxdepth 1 -type f -name '*.msi' | sort)
+          if [ "${#nsis_paths[@]}" -ne 1 ] || [ "${#msi_paths[@]}" -ne 1 ]; then
+            echo "Expected exactly one staged Windows NSIS and one MSI artifact before validation." >&2
+            printf 'NSIS count=%s MSI count=%s\n' "${#nsis_paths[@]}" "${#msi_paths[@]}" >&2
+            exit 1
+          fi
+          nsis_path="${nsis_paths[0]}"
+          msi_path="${msi_paths[0]}"
+          validator_version_args=()
+          tag_name="${INPUT_TAG_NAME:-}"
+          if [ -z "${tag_name}" ] && [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ]; then
+            tag_name="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -n "${tag_name}" ]; then
+            if [[ "${tag_name}" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              validator_version_args=(--release-tag "${tag_name}")
+            elif [ "${GITHUB_REF:-}" != "${GITHUB_REF#refs/tags/}" ] || [ -n "${INPUT_TAG_NAME:-}" ]; then
+              echo "Unexpected desktop release tag '${tag_name}'; expected desktop-vX.Y.Z." >&2
+              exit 1
+            fi
+          fi
+          python ../scripts/validate_windows_desktop_release_artifacts.py \
+            --windows-nsis "${nsis_path}" \
+            --windows-msi "${msi_path}" \
+            "${validator_version_args[@]}"
+
       - name: Generate SHA256 checksums
         shell: bash
         run: |
@@ -489,9 +540,33 @@ jobs:
           path: desktop-tauri/release-artifacts/*
           if-no-files-found: error
 
+  # Publication intentionally depends on this real self-hosted Windows x64 NVIDIA/RTX gate;
+  # mocked CUDA checks must not satisfy release hardware validation.
+  windows-nvidia-release-gate:
+    name: Windows x64 NVIDIA artifact smoke gate
+    needs: build
+    runs-on: [self-hosted, Windows, X64, NVIDIA, RTX]
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download Windows release artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: windows-x64-bundles
+          path: release-assets/windows
+      - name: Run artifact-backed Windows NVIDIA smoke test
+        shell: pwsh
+        env:
+          TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL: ${{ secrets.WINDOWS_NVIDIA_SMOKE_MODEL }}
+        run: |
+          $setup = Get-ChildItem release-assets/windows -Filter '*-setup.exe' | Sort-Object Name | Select-Object -First 1
+          if (-not $setup) { throw 'Windows NSIS setup artifact was not downloaded.' }
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 64k-full
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, windows-nvidia-release-gate]
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
     permissions:

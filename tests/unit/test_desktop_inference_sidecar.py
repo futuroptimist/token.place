@@ -579,7 +579,7 @@ def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, cap
     assert all(event['type'] != 'error' for event in events)
 
 
-def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_work(
+def test_run_read_only_windows_startup_fails_without_bootstrap_install_work(
     tmp_path, capsys, monkeypatch
 ):
     _reset_cancel_queue()
@@ -616,6 +616,11 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
         runtime_setup_module.ensure_desktop_llama_runtime,
     )
     monkeypatch.setattr(
+        inference_sidecar,
+        'desktop_gpu_runtime_failure_message',
+        runtime_setup_module.desktop_gpu_runtime_failure_message,
+    )
+    monkeypatch.setattr(
         runtime_setup_module,
         '_windows_cuda_source_repair',
         lambda _requirements_path: (
@@ -635,13 +640,13 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
 
-    assert status == 0
+    assert status == 1
     captured = capsys.readouterr()
     events = [json.loads(line) for line in captured.out.splitlines()]
-    assert events[0]['type'] == 'started'
-    assert events[-1]['type'] == 'done'
+    assert events[0]['type'] == 'error'
+    assert events[0]['code'] == 'gpu_runtime_unavailable'
     assert 'desktop.runtime_setup' in captured.err
-    assert 'action=probe_only' in captured.err
+    assert 'action=windows_development_runtime_missing_read_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
 
 
@@ -791,3 +796,91 @@ def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(
     assert events[0]['type'] == 'started'
     assert events[-1]['type'] == 'done'
     assert all(event['type'] != 'error' for event in events)
+
+
+def test_packaged_windows_bundled_runtime_probe_failure_never_invokes_installer(tmp_path, monkeypatch):
+    runtime_setup_module = sys.modules['desktop_runtime_setup']
+    probe = SimpleNamespace(
+        backend='missing', detected_device='none', gpu_offload_supported=False,
+        error='llama_cpp missing', interpreter=str(tmp_path / 'python-runtime' / 'python.exe'),
+        llama_module_path='missing', prefix='', python_version='3.11.13', base_prefix='',
+        dependency_target='unknown', pip_version='unknown', llama_cpp_python_version='unknown',
+        yarn_rope_supported=False, yarn_resolver_source='unsupported', rope_scaling_type_supported=False,
+        yarn_ext_factor_supported=False, rope_freq_scale_supported=False, yarn_orig_ctx_supported=False,
+        constructor_kwarg_support={}, constructor_has_var_kwargs=False, constructor_signature_inspectable=False,
+        qwen_64k_yarn_support='unsupported', yarn_enum_value=None, q8_kv_cache_type_value=None,
+        q4_kv_cache_type_value=None, f16_kv_cache_type_value=None, capability_source='test',
+    )
+    calls = {'pip': 0, 'source': 0}
+
+    runtime_dir = Path(probe.interpreter).parent
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text('{}', encoding='utf-8')
+
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': probe.interpreter})
+    monkeypatch.setattr(runtime_setup_module, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(runtime_setup_module, '_probe_runtime', lambda *a, **k: probe)
+    monkeypatch.setattr(runtime_setup_module, '_run_pip_install', lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'))
+    monkeypatch.setattr(runtime_setup_module, '_run_windows_cuda_source_repair', lambda *a, **k: calls.__setitem__('source', calls['source'] + 1) or (False, 'no'))
+    result = runtime_setup_module.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed'
+    assert result['runtime_origin'] == 'bundled'
+    assert calls == {'pip': 0, 'source': 0}
+    assert 'cuda_build' not in str(result)
+
+
+
+def test_token_event_preserves_text_but_sanitizes_extra_fields(capsys):
+    token_text = r"exact token C:\Users\SecretName\token https://user:pass@relay.example/path?q=secret#frag"
+    metadata = {
+        "prompt": "prompt SecretName",
+        "authorization": "Bearer secret-token",
+        "relay_url": "https://user:pass@relay.example:9443/path?q=secret#frag",
+        "metadata": {"fallback_reason": "/tmp/SecretName/private", "prompt_tokens": 7},
+    }
+    original = json.loads(json.dumps(metadata))
+    inference_sidecar.emit({"type": "token", "text": token_text, **metadata})
+    event = json.loads(capsys.readouterr().out)
+    assert event["type"] == "token"
+    assert event["text"] == token_text
+    assert event["prompt"] == "redacted"
+    assert event["authorization"] == "redacted"
+    assert event["relay_url"] == "https://relay.example:9443"
+    assert event["metadata"]["fallback_reason"] == "<path>"
+    assert event["metadata"]["prompt_tokens"] == 7
+    assert metadata == original
+
+
+def test_control_plane_events_and_stderr_are_sanitized_but_tokens_verbatim(capsys):
+    canary = r"C:\Users\SecretName\AppData\Local\token.place\secret.txt"
+    posix = "/private/var/SecretName/runtime/site-packages"
+    token_text = f"token keeps {canary} and https://user:pass@[2001:db8::1]:8443/path?q=secret#frag"
+
+    inference_sidecar.emit({
+        'type': 'started',
+        'fallback_reason': f"failed at {canary} and {posix}",
+        'prompt': 'do not expose prompt SecretName',
+        'relay_url': 'https://user:pass@[2001:db8::1]:8443/path?q=secret#frag',
+        'pip_stderr_tail': f"pip failed from {canary}",
+    })
+    inference_sidecar.emit({'type': 'token', 'text': token_text})
+    inference_sidecar.emit_error('bad_model', f"model missing at {posix}")
+    inference_sidecar.emit_summary('runtime', model_path=canary, fallback_reason=f"reason {posix}")
+
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[0]['prompt'] == 'redacted'
+    assert events[0]['pip_stderr_tail'] == 'redacted'
+    assert events[0]['relay_url'] == 'https://[2001:db8::1]:8443'
+    assert '<path>' in events[0]['fallback_reason']
+    assert events[1] == {'type': 'token', 'text': token_text}
+    assert events[2]['message'] == 'model missing at <path>'
+    control_public = '\n'.join(captured.out.splitlines()[0:1] + captured.out.splitlines()[2:]) + captured.err
+    assert 'SecretName' in events[1]['text']
+    assert 'SecretName' not in control_public
+    assert '/private/var' not in control_public
+    assert 'user:pass' not in control_public
+    assert '?q=secret' not in control_public
+    assert 'desktop.inference.summary' in captured.err

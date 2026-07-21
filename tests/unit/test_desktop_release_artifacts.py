@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -718,6 +719,7 @@ def test_background_probe_bootstraps_nested_tauri_resources_before_utils_import(
     (python_resources / 'desktop_runtime_setup.py').write_text(
         """
 import json
+import shutil
 import os
 from pathlib import Path
 
@@ -744,6 +746,7 @@ def ensure_desktop_llama_runtime(mode, *, repo_root=None, context_tier=None):
 
     code = """
 import json
+import shutil
 from pathlib import Path
 import desktop_runtime_setup
 from path_bootstrap import ensure_runtime_import_paths
@@ -803,6 +806,7 @@ def test_background_probe_uses_production_runtime_import_and_private_identity(tm
     (python_resources / 'desktop_runtime_setup.py').write_text(
         f"""
 import json
+import shutil
 import os
 from pathlib import Path
 
@@ -1004,6 +1008,15 @@ def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime(
     assert "- os: macos-26" in workflow
     assert "- os: macos-latest" not in workflow
     assert 'test "$(uname -m)" = "arm64"' in workflow
+
+
+def test_release_workflow_uses_explicit_windows_x86_64_target_and_bundle_paths() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert "tauri_target: x86_64-pc-windows-msvc" in workflow
+    assert "npm run tauri build -- --target ${{ matrix.tauri_target }}" in workflow
+    assert "src-tauri/target/${{ matrix.tauri_target }}/release/bundle/nsis" in workflow
+    assert "src-tauri/target/${{ matrix.tauri_target }}/release/bundle/msi" in workflow
+    assert "aarch64-pc-windows-msvc" not in workflow
 
 
 def test_release_workflow_installs_pytest_before_macos_probe() -> None:
@@ -2501,3 +2514,717 @@ def test_validate_embedded_python_runtime_requires_background_facade_probe(monke
     assert not any("gate.get('gpu_offload_supported')" in code for code in calls)
     assert not any("gate.get('constructor_kwarg_support')" in code for code in calls)
     assert not any('_import_llama_cpp_subprocess_module' in code for code in calls)
+
+
+
+
+def _load_prepare_module():
+    import importlib.util
+
+    script_path = Path('desktop-tauri/scripts/prepare_windows_embedded_python_runtime.py')
+    spec = importlib.util.spec_from_file_location('prepare_windows_embedded_python_runtime', script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_windows_release_validator():
+    import importlib.util
+    script_path = Path('scripts/validate_windows_desktop_release_artifacts.py')
+    spec = importlib.util.spec_from_file_location('validate_windows_desktop_release_artifacts', script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.2') -> tuple[Path, Path]:
+    validator = _load_windows_release_validator()
+    manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
+    runtime = root / 'resources' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    for name in manifest['required_native_dlls']:
+        (runtime / name).write_bytes(b'MZ placeholder')
+    (runtime / 'python.exe').write_bytes(b'MZ placeholder')
+    provenance = {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': '3.11.13',
+        'target_triple': 'x86_64-pc-windows-msvc',
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest['python_package_wheels'],
+        'required_native_dlls': manifest['required_native_dlls'],
+        'pe_dll_closure': [
+            {'name': name, 'path': name, 'machine': 'IMAGE_FILE_MACHINE_AMD64', 'imports': []}
+            for name in manifest['required_native_dlls']
+        ],
+    }
+    (runtime / validator.PROVENANCE).write_text(json.dumps(provenance), encoding='utf-8')
+    nsis = root / f'token.place-desktop-{version}-setup.exe'
+    msi = root / f'token.place-desktop-{version}.msi'
+    nsis.mkdir()
+    msi.mkdir()
+    shutil.copytree(root / 'resources', nsis / 'resources')
+    shutil.copytree(root / 'resources', msi / 'resources')
+    return nsis, msi
+
+
+def test_windows_release_workflow_version_args_are_tag_only_and_untagged_derives_package_version() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'validator_version_args=()' in text
+    assert 'validator_version_args=(--release-tag "${tag_name}")' in text
+    assert '--expected-version "0.1.2"' not in text
+    assert r'desktop-v[0-9]+\.[0-9]+\.[0-9]+' in text
+
+
+def test_windows_validator_without_version_args_derives_package_json_version(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    package = tmp_path / 'package.json'
+    package.write_text(json.dumps({'version': '7.8.9'}), encoding='utf-8')
+    monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(validator, 'validate_config_versions', lambda expected: observed.append(('version', expected)))
+    monkeypatch.setattr(validator, 'validate_artifact', lambda artifact, expected, kind, manifest: observed.append((kind, expected)))
+    monkeypatch.setattr(validator, '_load_json', lambda path: {'version': '7.8.9'} if path == package else {})
+
+    assert validator.main([
+        '--windows-nsis', str(tmp_path / 'token.place-desktop-7.8.9-setup.exe'),
+        '--windows-msi', str(tmp_path / 'token.place-desktop-7.8.9.msi'),
+    ]) == 0
+    assert observed == [('version', '7.8.9'), ('NSIS', '7.8.9'), ('MSI', '7.8.9')]
+
+
+def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
+    validator = _load_windows_release_validator()
+    nsis, msi = _write_windows_runtime_fixture(tmp_path)
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2']) == 0
+
+
+def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
+    validator = _load_windows_release_validator()
+    nsis, msi = _write_windows_runtime_fixture(tmp_path)
+    wrong_name = tmp_path / 'wrong-token.place-desktop-0.1.2-setup.exe'
+    wrong_name.write_bytes(b'installer')
+    with pytest.raises(validator.ValidationError, match='filename does not match'):
+        validator.validate_artifact(wrong_name, '9.9.9', 'NSIS', json.loads(validator.MANIFEST.read_text(encoding='utf-8')))
+    provenance = next(msi.rglob('embedded_python_runtime_provenance.json'))
+    data = json.loads(provenance.read_text(encoding='utf-8'))
+    data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
+    provenance.write_text(json.dumps(data), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2'])
+
+
+def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_gate() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'Validate Windows MSI and NSIS artifact contents' in text
+    assert 'validate_windows_desktop_release_artifacts.py' in text
+    assert 'windows-nvidia-release-gate' in text
+    assert 'needs: [build, windows-nvidia-release-gate]' in text
+    assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text
+
+
+def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    assert validator.expected_version_from_tag(None, '0.1.2') == '0.1.2'
+    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.2') == '1.2.3'
+    with pytest.raises(validator.ValidationError, match='desktop-vX.Y.Z'):
+        validator.expected_version_from_tag('1495/merge', '0.1.2')
+
+    package = tmp_path / 'package.json'
+    lock = tmp_path / 'package-lock.json'
+    tauri = tmp_path / 'tauri.conf.json'
+    cargo = tmp_path / 'Cargo.toml'
+    cargo_lock = tmp_path / 'Cargo.lock'
+    package.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    lock.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    tauri.write_text(json.dumps({'version': '9.9.9'}), encoding='utf-8')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    monkeypatch.setattr(validator, 'PACKAGE_JSON', package)
+    monkeypatch.setattr(validator, 'PACKAGE_LOCK', lock)
+    monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
+    monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
+    monkeypatch.setattr(validator, 'CARGO_LOCK', cargo_lock)
+    with pytest.raises(validator.ValidationError, match='Windows release version mismatch'):
+        validator.validate_config_versions('0.1.2')
+    tauri.write_text(json.dumps({'version': '0.1.2'}), encoding='utf-8')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='Cargo.toml'):
+        validator.validate_config_versions('0.1.2')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='Cargo.lock'):
+        validator.validate_config_versions('0.1.2')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.2"\n', encoding='utf-8')
+    validator.validate_config_versions('0.1.2')
+
+    source_dir = tmp_path / 'already-extracted'
+    source_dir.mkdir()
+    (source_dir / 'marker.txt').write_text('ok', encoding='utf-8')
+    dest = tmp_path / 'dest'
+    validator._run_extract(source_dir, dest)
+    assert (dest / 'marker.txt').read_text(encoding='utf-8') == 'ok'
+
+    artifact = tmp_path / 'installer.exe'
+    artifact.write_bytes(b'fake')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    with pytest.raises(validator.ValidationError, match='native Windows installer materialization is unavailable'):
+        validator._run_extract(artifact, tmp_path / 'no-native')
+
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda cmd, **kwargs: calls.append((cmd, kwargs)))
+    cleanup = validator._run_extract(artifact, tmp_path / 'nsis-install-root')
+    assert calls[0][0][1] == '/S'
+    assert calls[0][0][-1].startswith('/D=')
+    assert Path(calls[0][0][-1][3:]).is_absolute()
+    cleanup()
+
+    calls.clear()
+    msi_artifact = tmp_path / 'installer.msi'
+    msi_artifact.write_bytes(b'fake')
+    validator._run_extract(msi_artifact, tmp_path / 'msi-root')
+    assert calls[0][0][0:2] == ['msiexec.exe', '/a']
+    assert '/qn' in calls[0][0]
+    assert '/norestart' in calls[0][0]
+    targetdir = next(arg for arg in calls[0][0] if arg.startswith('TARGETDIR='))
+    assert Path(targetdir.split('=', 1)[1]).is_absolute()
+
+
+def test_windows_validator_native_materialization_contracts_and_cleanup(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return type('Completed', (), {'stdout': ''})()
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
+    nsis = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    msi.write_bytes(b'msi')
+    nsis.write_bytes(b'nsis')
+
+    msi_cleanup = validator._run_extract(msi, tmp_path / 'first-root')
+    nsis_cleanup = validator._run_extract(nsis, tmp_path / 'second-root')
+    assert calls[0][0][:3] == ['msiexec.exe', '/a', str(msi.resolve())]
+    assert calls[0][0][3:5] == ['/qn', '/norestart']
+    assert calls[0][0][-1].startswith('TARGETDIR=')
+    assert Path(calls[0][0][-1].split('=', 1)[1]).is_absolute()
+    assert calls[1][0] == [str(nsis.resolve()), '/S', f'/D={(tmp_path / "second-root").resolve()}']
+    assert calls[1][0][-1].startswith('/D=')
+    assert calls[1][0][-1] == f'/D={(tmp_path / "second-root").resolve()}'
+    msi_cleanup()
+    nsis_cleanup()
+    assert len(calls) == 2
+
+    (tmp_path / 'second-root').mkdir(exist_ok=True)
+    (tmp_path / 'second-root' / 'uninstall.exe').write_bytes(b'uninstall')
+    nsis_cleanup()
+    assert calls[-1][0] == [str((tmp_path / 'second-root' / 'uninstall.exe').resolve()), '/S']
+
+
+def test_windows_validator_native_materialization_failures_are_fail_closed(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    artifact = tmp_path / 'secret-user-path-installer.exe'
+    artifact.write_bytes(b'nsis')
+
+    def timeout_run(cmd, **kwargs):
+        raise validator.subprocess.TimeoutExpired(cmd, kwargs.get('timeout', 1), output=f'raw {artifact.resolve()} {(tmp_path / "dest").resolve()}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', timeout_run)
+    with pytest.raises(validator.ValidationError) as excinfo:
+        validator._run_extract(artifact, tmp_path / 'dest')
+    message = str(excinfo.value)
+    assert 'timed out' in message
+    assert str(tmp_path) not in message
+    assert artifact.name in message
+
+    def nonzero_run(cmd, **kwargs):
+        raise validator.subprocess.CalledProcessError(7, cmd, output=f'failed {artifact.resolve()}')
+
+    monkeypatch.setattr(validator.subprocess, 'run', nonzero_run)
+    with pytest.raises(validator.ValidationError, match='exit=7'):
+        validator._run_extract(artifact, tmp_path / 'dest2')
+
+
+def test_windows_validator_generic_archive_shape_without_runtime_cannot_pass(tmp_path):
+    validator = _load_windows_release_validator()
+    extracted_listing = tmp_path / 'token.place-desktop-0.1.2-seven-zip-listing'
+    extracted_listing.mkdir()
+    (extracted_listing / '$PLUGINSDIR').mkdir()
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator.validate_artifact(
+            extracted_listing,
+            '0.1.2',
+            'NSIS',
+            json.loads(validator.MANIFEST.read_text(encoding='utf-8')),
+        )
+
+def test_windows_validator_runtime_and_provenance_fail_closed_edges(tmp_path):
+    validator = _load_windows_release_validator()
+    manifest = json.loads(validator.MANIFEST.read_text(encoding='utf-8'))
+
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator._find_runtime(empty)
+    for idx in range(2):
+        runtime = empty / f'app{idx}' / 'python-runtime'
+        runtime.mkdir(parents=True)
+        (runtime / 'python.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='found 2'):
+        validator._find_runtime(empty)
+
+    runtime_root = tmp_path / 'runtime' / 'python-runtime'
+    runtime_root.mkdir(parents=True)
+    with pytest.raises(validator.ValidationError, match='bundled python.exe is missing'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    (runtime_root / 'python.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='missing required DLLs'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    for name in manifest['required_native_dlls']:
+        (runtime_root / name).write_bytes(b'MZ')
+    (runtime_root / 'cmake.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='forbidden compiler/toolkit'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+    (runtime_root / 'cmake.exe').unlink()
+    with pytest.raises(validator.ValidationError, match='missing or corrupt Windows runtime provenance'):
+        validator._validate_runtime_tree(runtime_root, manifest)
+
+    provenance = {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': '3.11.13',
+        'target_triple': 'x86_64-pc-windows-msvc',
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest['python_package_wheels'],
+        'required_native_dlls': manifest['required_native_dlls'],
+        'pe_dll_closure': [],
+    }
+    prov_path = runtime_root / validator.PROVENANCE
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='non-empty PE DLL closure'):
+        validator._validate_provenance(runtime_root, manifest)
+    provenance['pe_dll_closure'] = [
+        {'name': manifest['required_native_dlls'][0], 'path': manifest['required_native_dlls'][0], 'machine': 'IMAGE_FILE_MACHINE_I386', 'imports': []}
+    ]
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='missing required entries'):
+        validator._validate_provenance(runtime_root, manifest)
+    provenance['pe_dll_closure'] = [
+        {'name': name, 'path': name, 'machine': 'IMAGE_FILE_MACHINE_I386', 'imports': []}
+        for name in manifest['required_native_dlls']
+    ]
+    prov_path.write_text(json.dumps(provenance), encoding='utf-8')
+    with pytest.raises(validator.ValidationError, match='non-AMD64'):
+        validator._validate_provenance(runtime_root, manifest)
+
+
+def test_prepare_url_and_microsoft_extraction_failure_edges(tmp_path, monkeypatch):
+    prep = _load_prepare_module()
+    with pytest.raises(prep.RuntimePrepError, match='HTTPS'):
+        prep._validated_artifact_url('http://github.com/example/runtime.zip')
+    with pytest.raises(prep.RuntimePrepError, match='credentials'):
+        prep._validated_artifact_url('https://user:pass@github.com/example/runtime.zip')
+    with pytest.raises(prep.RuntimePrepError, match='default HTTPS port'):
+        prep._validated_artifact_url('https://github.com:444/example/runtime.zip')
+    original = prep._validated_artifact_url('https://github.com/futuroptimist/token.place/releases/download/a/runtime.zip')
+    for redirect in [
+        'http://release-assets.githubusercontent.com/file',
+        'https://token@release-assets.githubusercontent.com/file',
+        'https://files.pythonhosted.org/file',
+    ]:
+        with pytest.raises(prep.RuntimePrepError, match='redirected to an unapproved'):
+            prep._validate_redirect_url(original, redirect)
+
+    cabinet = tmp_path / 'payload.cab'
+    cabinet.write_bytes(b'MSCFfake')
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: type('R', (), {'returncode': 1})())
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep._expand_cab_member(cabinet, 'msvcp140.dll', tmp_path / 'out')
+    def fake_expand(*args, **kwargs):
+        out = Path(args[0][-1])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'a' / 'msvcp140.dll').parent.mkdir(parents=True, exist_ok=True)
+        (out / 'a' / 'msvcp140.dll').write_bytes(b'one')
+        (out / 'b' / 'msvcp140.dll').parent.mkdir(parents=True, exist_ok=True)
+        (out / 'b' / 'msvcp140.dll').write_bytes(b'two')
+        return type('R', (), {'returncode': 0})()
+    monkeypatch.setattr(prep.subprocess, 'run', fake_expand)
+    with pytest.raises(prep.RuntimePrepError, match='member missing or duplicate'):
+        prep._expand_cab_member(cabinet, 'msvcp140.dll', tmp_path / 'multi')
+
+    monkeypatch.setattr(prep.platform, 'system', lambda: 'Windows')
+    with pytest.raises(prep.RuntimePrepError, match="'<cab-key>/<file>'"):
+        prep.extract_microsoft_burn_member(tmp_path / 'redist.exe', '../msvcp140.dll', tmp_path / 'dll')
+    redist = tmp_path / 'redist.exe'
+    redist.write_bytes(b'not-a-cab')
+    with pytest.raises(prep.RuntimePrepError, match='missing cabinet payload'):
+        prep.extract_microsoft_burn_member(redist, 'a12/msvcp140.dll', tmp_path / 'dll')
+
+
+def test_prepare_fetch_success_redirect_digest_and_cached_digest_edges(tmp_path, monkeypatch):
+    prep = _load_prepare_module()
+    payload = b'pinned-runtime-artifact'
+    digest = prep.hashlib.sha256(payload).hexdigest()
+    dest = tmp_path / 'runtime.zip'
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_exc):
+            return False
+        def geturl(self):
+            return 'https://release-assets.githubusercontent.com/runtime.zip'
+        def read(self, size=-1):
+            if getattr(self, '_read', False):
+                return b''
+            self._read = True
+            return payload
+
+    calls = []
+    monkeypatch.setattr(prep.urllib.request, 'urlopen', lambda url, timeout: calls.append((url, timeout)) or Response())
+    assert prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', digest, dest) == dest
+    assert dest.read_bytes() == payload
+    assert calls == [('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', 120)]
+
+    # A subsequent cached mismatch is quarantined before failing closed.
+    dest.write_bytes(b'corrupt-after-cache')
+    good_digest_for_other_payload = prep.hashlib.sha256(b'other-payload').hexdigest()
+    with pytest.raises(prep.RuntimePrepError, match='digest mismatch'):
+        prep.fetch('https://github.com/futuroptimist/token.place/releases/download/x/runtime.zip', good_digest_for_other_payload, dest)
+    assert (tmp_path / 'runtime.zip.poisoned').exists()
+
+
+def test_prepare_load_manifest_additional_rejection_branches(tmp_path):
+    prep = _load_prepare_module()
+    manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
+
+    cases = [
+        ('schema_version', 2, 'schema_version'),
+        ('expected_architecture', 'ARM64', 'architecture must be AMD64'),
+    ]
+    for key, value, message in cases:
+        bad = json.loads(json.dumps(manifest))
+        bad[key] = value
+        path = tmp_path / f'{key}.json'
+        path.write_text(json.dumps(bad), encoding='utf-8')
+        with pytest.raises(prep.RuntimePrepError, match=message):
+            prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['llama_cpp_cuda_wheel']['name'] = 'llama_cpp_python-0.3.32-py3-none-win_arm64.whl'
+    path = tmp_path / 'bad-wheel-name.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='unexpected llama-cpp-python wheel name'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['native_dll_artifacts'][0]['architecture'] = 'I386'
+    path = tmp_path / 'bad-native-arch.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='native DLL artifacts must be AMD64'):
+        prep.load_manifest(path)
+
+    bad = json.loads(json.dumps(manifest))
+    bad['python_package_wheels'] = 'not-a-list'
+    path = tmp_path / 'bad-wheelhouse-shape.json'
+    path.write_text(json.dumps(bad), encoding='utf-8')
+    with pytest.raises(prep.RuntimePrepError, match='python_package_wheels must be a list'):
+        prep.load_manifest(path)
+
+def test_windows_validator_normalizes_and_rejects_internal_version_metadata(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    app = tmp_path / 'token.place.exe'
+    app.write_bytes(b'MZ-app')
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ-nsis')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(
+        validator,
+        '_read_pe_version_info',
+        lambda path: {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'} if path == artifact else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'},
+    )
+    validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+    monkeypatch.setattr(
+        validator,
+        '_read_pe_version_info',
+        lambda path: {'ProductVersion': '0.1.1.0', 'FileVersion': '0.1.2.0'},
+    )
+    with pytest.raises(validator.ValidationError, match='NSIS ProductVersion=0.1.1'):
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+
+def test_windows_validator_rejects_stale_msi_or_installed_app_version(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    app = tmp_path / 'token.place.exe'
+    app.write_bytes(b'MZ-app')
+    msi = tmp_path / 'token.place-desktop-0.1.2.msi'
+    msi.write_bytes(b'MZ-msi')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.1')
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.2', 'FileVersion': '0.1.2'})
+    with pytest.raises(validator.ValidationError, match='MSI ProductVersion=0.1.1'):
+        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+
+    monkeypatch.setattr(validator, '_read_msi_product_version', lambda _path: '0.1.2')
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda _path: {'ProductVersion': '0.1.1', 'FileVersion': '0.1.2'})
+    with pytest.raises(validator.ValidationError, match='app ProductVersion=0.1.1'):
+        validator._validate_version_metadata(msi, tmp_path, '0.1.2', 'MSI')
+
+def test_windows_nvidia_smoke_installer_handoff_is_one_shot(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+    calls = {'materialize': 0, 'run': [], 'cleanup': []}
+    materialized = tmp_path / 'materialized'
+    python_exe = materialized / 'python-runtime' / 'python.exe'
+    resource_root = materialized
+
+    def fake_mkdtemp(prefix):
+        materialized.mkdir(parents=True, exist_ok=True)
+        return str(materialized)
+
+    def fake_materialize(artifact, root):
+        calls['materialize'] += 1
+        assert artifact == installer
+        assert root == materialized
+        python_exe.parent.mkdir(parents=True, exist_ok=True)
+        python_exe.write_text('python', encoding='utf-8')
+        (resource_root / 'python').mkdir(exist_ok=True)
+        (resource_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+
+    def fake_run(cmd, **kwargs):
+        calls['run'].append((cmd, kwargs))
+        return type('Completed', (), {'returncode': 17})()
+
+    monkeypatch.setattr(smoke.tempfile, 'mkdtemp', fake_mkdtemp)
+    monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+    monkeypatch.setattr(smoke.shutil, 'rmtree', lambda path, ignore_errors=False: calls['cleanup'].append((Path(path), ignore_errors)))
+    args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+
+    assert smoke._launch_materialized_child(args) == 17
+    assert calls['materialize'] == 1
+    assert len(calls['run']) == 1
+    cmd = calls['run'][0][0]
+    assert cmd[0] == str(python_exe)
+    assert '--installer' not in cmd
+    assert '--artifact-root' not in cmd
+    assert cmd[cmd.index('--python-exe') + 1] == str(python_exe)
+    assert cmd[cmd.index('--resource-root') + 1] == str(resource_root)
+    assert cmd[cmd.index('--mode') + 1] == 'gpu'
+    assert cmd[cmd.index('--context-tier') + 1] == '64k-full'
+    assert calls['cleanup'] == [(materialized, True)]
+
+
+def test_windows_metadata_readers_use_environment_path_and_structured_json(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'TokenPlace.Setup.exe'
+    artifact.write_bytes(b'MZ')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        assert '$args[0]' not in cmd[3]
+        assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+        assert str(artifact) not in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}), stderr='')
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    assert validator._read_pe_version_info(artifact) == {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'}
+
+    def fake_msi_run(cmd, **kwargs):
+        assert '$args[0]' not in cmd[3]
+        assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.2.0'}), stderr='')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_msi_run)
+    assert validator._read_msi_product_version(artifact) == '0.1.2.0'
+
+
+def test_windows_metadata_readers_fail_closed_on_empty_or_malformed(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'TokenPlace.Setup.exe'
+    artifact.write_bytes(b'MZ')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout='', stderr=''))
+    with pytest.raises(validator.ValidationError, match='empty metadata'):
+        validator._read_pe_version_info(artifact)
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout='not-json', stderr=''))
+    with pytest.raises(validator.ValidationError, match='malformed metadata'):
+        validator._read_msi_product_version(artifact)
+
+
+def test_windows_version_normalization_is_strict():
+    validator = _load_windows_release_validator()
+    assert validator._normalize_windows_version('0.1.2') == '0.1.2'
+    assert validator._normalize_windows_version('0.1.2.0') == '0.1.2'
+    for value in ['0.1', '0.1.2.1', '0.1.2.0.0', '0.1.x']:
+        with pytest.raises(validator.ValidationError):
+            validator._normalize_windows_version(value)
+
+
+def test_find_tauri_app_exe_uses_expected_name_and_rejects_ambiguous(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    monkeypatch.setattr(validator, '_expected_tauri_binary_name', lambda: 'token-place-desktop-tauri.exe')
+    root = tmp_path / 'payload'
+    (root / 'helpers').mkdir(parents=True)
+    (root / 'helpers' / 'helper.exe').write_bytes(b'MZ')
+    expected = root / 'Token-Place-Desktop-Tauri.EXE'
+    expected.write_bytes(b'MZ')
+    assert validator._find_tauri_app_exe(root) == expected
+    with pytest.raises(validator.ValidationError, match='found 0'):
+        validator._find_tauri_app_exe(tmp_path / 'missing')
+    dup = root / 'nested'
+    dup.mkdir()
+    (dup / 'token-place-desktop-tauri.exe').write_bytes(b'MZ')
+    with pytest.raises(validator.ValidationError, match='found 2'):
+        validator._find_tauri_app_exe(root)
+
+
+def test_validate_version_metadata_requires_app_versions_on_windows(monkeypatch, tmp_path):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ')
+    app = tmp_path / 'token-place-desktop-tauri.exe'
+    app.write_bytes(b'MZ')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator, '_find_tauri_app_exe', lambda _dest: app)
+    monkeypatch.setattr(validator, '_read_pe_version_info', lambda path: {'ProductVersion': '', 'FileVersion': ''} if path == app else {'ProductVersion': '0.1.2.0', 'FileVersion': '0.1.2.0'})
+    with pytest.raises(validator.ValidationError, match='app ProductVersion=missing'):
+        validator._validate_version_metadata(artifact, tmp_path, '0.1.2', 'NSIS')
+
+
+def test_windows_nvidia_smoke_runs_nsis_uninstaller_after_success_and_failure(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit_cleanup', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+
+    for child_code in (0, 23):
+        root = tmp_path / f'install-{child_code}'
+        python_exe = root / 'python-runtime' / 'python.exe'
+        uninstaller = root / 'Uninstall token.place.exe'
+        calls = []
+        monkeypatch.setattr(smoke.tempfile, 'mkdtemp', lambda prefix, root=root: str(root))
+
+        def fake_materialize(_artifact, materialized_root, python_exe=python_exe, uninstaller=uninstaller):
+            python_exe.parent.mkdir(parents=True, exist_ok=True)
+            python_exe.write_text('python', encoding='utf-8')
+            (materialized_root / 'python').mkdir(exist_ok=True)
+            (materialized_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+            uninstaller.write_text('uninstall', encoding='utf-8')
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, child_code if len(calls) == 1 else 0, stdout='')
+
+        monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+        monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+        monkeypatch.setattr(smoke.shutil, 'rmtree', lambda *a, **k: None)
+        args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+        assert smoke._launch_materialized_child(args) == child_code
+        assert len(calls) == 2
+        assert calls[1] == [str(uninstaller), '/S']
+
+
+def test_windows_nvidia_smoke_cleanup_failure_overrides_child_exit(tmp_path, monkeypatch):
+    import importlib.util
+    script_path = Path('desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py')
+    spec = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test_unit_cleanup_fail', script_path)
+    smoke = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(smoke)
+
+    root = tmp_path / 'install'
+    installer = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    installer.write_bytes(b'installer')
+    monkeypatch.setattr(smoke.tempfile, 'mkdtemp', lambda prefix: str(root))
+
+    def fake_materialize(_artifact, materialized_root):
+        python_exe = materialized_root / 'python-runtime' / 'python.exe'
+        python_exe.parent.mkdir(parents=True, exist_ok=True)
+        python_exe.write_text('python', encoding='utf-8')
+        (materialized_root / 'python').mkdir(exist_ok=True)
+        (materialized_root / 'python' / 'compute_node_bridge.py').write_text('', encoding='utf-8')
+        (materialized_root / 'unins000.exe').write_text('uninstall', encoding='utf-8')
+
+    calls = []
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 2:
+            raise subprocess.CalledProcessError(7, cmd, output='cleanup failed')
+        return subprocess.CompletedProcess(cmd, 0, stdout='')
+
+    monkeypatch.setattr(smoke, '_materialize_release_artifact', fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, 'run', fake_run)
+    monkeypatch.setattr(smoke.shutil, 'rmtree', lambda *a, **k: None)
+    args = smoke.argparse.Namespace(installer=installer, artifact_root=None, python_exe=None, resource_root=None, model='model.gguf', mode='gpu', context_tier='64k-full')
+    with pytest.raises(subprocess.CalledProcessError):
+        smoke._launch_materialized_child(args)
+    assert len(calls) == 2
+
+
+def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.2-setup.exe'
+    artifact.write_bytes(b'MZ')
+
+    def run_with(returncode=0, stdout='{}'):
+        def fake_run(cmd, **kwargs):
+            assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr='secret path C:/Users/Secret')
+        return fake_run
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(returncode=9, stdout='{}'))
+    with pytest.raises(validator.ValidationError, match=artifact.name):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=''))
+    with pytest.raises(validator.ValidationError, match='empty metadata'):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout='[]'))
+    with pytest.raises(validator.ValidationError, match='malformed metadata'):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': '', 'FileVersion': '0.1.2'})))
+    with pytest.raises(validator.ValidationError, match='incomplete metadata'):
+        validator._read_pe_version_info(artifact)
+
+    monkeypatch.setattr(validator.subprocess, 'run', run_with(stdout=json.dumps({'ProductVersion': ''})))
+    with pytest.raises(validator.ValidationError, match='incomplete metadata'):
+        validator._read_msi_product_version(artifact)
+
+    tauri = tmp_path / 'tauri.conf.json'
+    cargo = tmp_path / 'Cargo.toml'
+    tauri.write_text(json.dumps({'bundle': {'windows': {'mainBinaryName': ''}}}), encoding='utf-8')
+    cargo.write_text('[package]\nname = ""\nversion = "0.1.2"\n', encoding='utf-8')
+    monkeypatch.setattr(validator, 'TAURI_CONFIG', tauri)
+    monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
+    with pytest.raises(validator.ValidationError, match='unable to determine'):
+        validator._expected_tauri_binary_name()

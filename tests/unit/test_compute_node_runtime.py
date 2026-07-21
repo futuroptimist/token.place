@@ -3368,3 +3368,20 @@ def test_completion_smoke_cuda_oom_classification_is_qwen64k_recoverable():
     assert reason == 'runtime_completion_smoke_cuda_memory_allocation'
     assert _qwen_64k_readiness_profile_recoverable(category) is True
     assert diagnostics['exception_type'] == 'RuntimeError'
+
+
+def test_compute_node_runtime_wire_fatal_bridge_teardown_sets_relay_client_attribute():
+    """wire_fatal_bridge_teardown attaches the callback to relay_client.fatal_bridge_teardown."""
+    relay_client = SimpleNamespace()
+    config = ComputeNodeRuntimeConfig(
+        relay_url='https://relay.example',
+        relay_port=443,
+        use_configured_relay_fallbacks=False,
+        relay_urls=('https://relay.example',),
+    )
+
+    sentinel = object()
+    runtime = ComputeNodeRuntime(config, relay_client=relay_client)
+    runtime.wire_fatal_bridge_teardown(sentinel)
+
+    assert relay_client.fatal_bridge_teardown is sentinel

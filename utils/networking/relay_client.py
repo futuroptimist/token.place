@@ -2589,21 +2589,42 @@ class RelayClient:
                     submission_allowed=False,
                 )
         finally:
-            # Shared cleanup deadline for both request-owned futures.  The control
-            # future always completes within _API_V1_MAX_CONTROL_TIMEOUT_SECONDS
-            # (strictly below _API_V1_CLEANUP_BUDGET_SECONDS) because the HTTP
-            # call is submitted with that bounded timeout.  For inference,
-            # _terminate_current_llama_worker() from the terminal path ensures
-            # the worker exits; the fatal_bridge_teardown path handles the
-            # stuck-subprocess edge case by unblocking inference so
-            # shutdown(wait=True) does not hang.  Never use wait=False: request-owned
-            # executor threads must be fully joined before returning a reusable client.
+            # Shared cleanup deadline for both request-owned futures.  Use the
+            # return values from _wait_for_future_quiescence: only call
+            # executor.shutdown(wait=True) after the corresponding future is
+            # proven done.  A requests timeout is not a strict wall-clock bound
+            # (DNS, adapters, or a misbehaving transport can outlive it), so the
+            # control future might still be alive even after
+            # _API_V1_MAX_CONTROL_TIMEOUT_SECONDS.  If either future remains
+            # alive at the cleanup deadline, invoke fatal_bridge_teardown (no-
+            # return in production; it terminates the disposable process so no
+            # executor thread is ever abandoned).  Never call shutdown(wait=True)
+            # on an executor whose future has not quiesced.
             cleanup_deadline = time.monotonic() + _API_V1_CLEANUP_BUDGET_SECONDS
-            _wait_for_future_quiescence(future, cleanup_deadline)
-            if control_future is not None:
-                _wait_for_future_quiescence(control_future, cleanup_deadline)
-            executor.shutdown(wait=True, cancel_futures=True)
-            if control_executor is not None:
+            inference_done = _wait_for_future_quiescence(future, cleanup_deadline)
+            control_done = (
+                control_future is None
+                or _wait_for_future_quiescence(control_future, cleanup_deadline)
+            )
+            if not inference_done or not control_done:
+                fatal = getattr(self, 'fatal_bridge_teardown', None)
+                if callable(fatal):
+                    fatal(reason='api_v1_executor_cleanup_timeout')
+                # Reached only when fatal_bridge_teardown returned (test / non-
+                # production environment where the callback unblocked the thread).
+                # Give the now-unblocked threads a brief moment to quiesce before
+                # calling shutdown(wait=True).  In production fatal is no-return.
+                after_fatal_deadline = time.monotonic() + 0.5
+                if not inference_done:
+                    inference_done = _wait_for_future_quiescence(future, after_fatal_deadline)
+                if not control_done:
+                    control_done = (
+                        control_future is None
+                        or _wait_for_future_quiescence(control_future, after_fatal_deadline)
+                    )
+            if inference_done:
+                executor.shutdown(wait=True, cancel_futures=True)
+            if control_executor is not None and control_done:
                 control_executor.shutdown(wait=True, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):

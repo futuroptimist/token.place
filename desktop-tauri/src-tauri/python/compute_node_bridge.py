@@ -878,6 +878,38 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 
     return normalized or ["https://token.place"]
 
+
+def _wire_fatal_teardown_for_runtime(relay_runtime: Any) -> None:
+    """Attach a no-return fatal-teardown callback to relay_runtime's relay client.
+
+    The relay client supervisor calls this when a request-owned executor thread
+    (inference or control I/O) is still alive past the shared cleanup deadline.
+    In production this function terminates the disposable bridge process via
+    ``os._exit`` so no request thread is ever abandoned.  Only a privacy-safe
+    lifecycle classification is emitted — no plaintext model payload content.
+    """
+
+    relay_client = getattr(relay_runtime, "relay_client", None)
+    if relay_client is None:
+        return
+    relay_url_value = getattr(relay_client, "relay_url", "unknown")
+
+    def _fatal_bridge_teardown(reason: str) -> None:
+        print(
+            "desktop.compute_node_bridge.fatal_teardown "
+            f"reason={reason} "
+            f"relay={_sanitize_relay_target(relay_url_value)}",
+            file=sys.stderr,
+        )
+        os._exit(1)
+
+    wire_fn = getattr(relay_runtime, "wire_fatal_bridge_teardown", None)
+    if callable(wire_fn):
+        wire_fn(_fatal_bridge_teardown)
+    else:
+        relay_client.fatal_bridge_teardown = _fatal_bridge_teardown
+
+
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
@@ -1093,6 +1125,16 @@ def run(args: argparse.Namespace) -> int:
             f"key_fingerprint={_relay_key_fingerprint(relay_runtime.relay_client)}",
             file=sys.stderr,
         )
+
+    # Wire a fatal-teardown callback onto each relay client.  The supervisor
+    # inside the relay client calls this when a request-owned executor thread
+    # (inference or control I/O) remains alive past the shared cleanup deadline.
+    # This function is no-return: it emits a privacy-safe lifecycle event and
+    # terminates the disposable bridge process via os._exit so no stuck thread
+    # is ever abandoned.  Tests substitute a fake that unblocks the stuck thread
+    # and returns; the supervisor re-checks quiescence before shutdown(wait=True).
+    for relay_runtime in runtimes:
+        _wire_fatal_teardown_for_runtime(relay_runtime)
 
     runtime.model_manager.model_path = args.model
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists

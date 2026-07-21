@@ -7414,6 +7414,77 @@ def test_api_v1_stuck_inference_sets_polling_stopped_by_request():
         thread.join(1)
 
 
+def test_api_v1_executor_cleanup_timeout_invokes_fatal_bridge_teardown():
+    """Stuck control I/O past the cleanup deadline triggers fatal_bridge_teardown.
+
+    A requests timeout is not a guaranteed wall-clock bound (DNS stalls, kernel
+    delays, or misbehaving adapters can outlive it).  If a request-owned executor
+    thread remains alive at the shared cleanup deadline in the finally block, the
+    supervisor must call fatal_bridge_teardown rather than block in
+    executor.shutdown(wait=True).
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    result_holder = {}
+    release_inference = threading.Event()
+    http_release = threading.Event()
+    fatal_calls = []
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'ok'}
+
+    def blocking_control_post(*args, **kwargs):
+        # Intentionally ignore the timeout kwarg to simulate a kernel/DNS stall
+        # that outlives requests' own timeout argument.
+        http_release.wait(5)
+        raise relay_client_module.requests.ConnectionError('stalled')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    def fatal_teardown(reason=None):
+        # Release the stuck control thread so the finally block can safely drain.
+        fatal_calls.append(reason)
+        http_release.set()
+
+    client.fatal_bridge_teardown = fatal_teardown
+
+    # Use a very short local deadline so control I/O is still in-flight when
+    # the supervisor breaks out of the poll loop.
+    local_deadline = time.monotonic() + 0.05
+
+    def supervise():
+        with patch.object(relay_client_module.requests, 'post', blocking_control_post):
+            with patch.object(relay_client_module, '_API_V1_CLEANUP_BUDGET_SECONDS', 0.1):
+                result_holder['outcome'] = client._supervise_api_v1_inference({
+                    'request_id': 'req-stuck-control',
+                    'model': 'llama-3-8b-instruct',
+                    'messages': [],
+                    'options': {},
+                    'routing': {'context_tier': '8k-fast'},
+                }, local_deadline=local_deadline)
+
+    thread = threading.Thread(target=supervise, daemon=True)
+    thread.start()
+    try:
+        thread.join(3)
+        assert not thread.is_alive(), 'supervisor must return even when control is stuck'
+        assert fatal_calls, 'fatal_bridge_teardown must be called when control future is stuck'
+        assert fatal_calls[0] == 'api_v1_executor_cleanup_timeout'
+        # No request-scoped executor threads survive after cleanup.
+        assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
+        assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
+    finally:
+        http_release.set()
+        release_inference.set()
+        thread.join(1)
+
+
 def test_api_v1_missing_control_credential_fails_closed_without_worker_termination():
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'

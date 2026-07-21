@@ -750,6 +750,18 @@ class ComputeNodeRuntime:
         else:
             self.request_adapters = list(request_adapters)
 
+    def wire_fatal_bridge_teardown(self, callback: Callable[..., Any]) -> None:
+        """Attach a fatal-teardown callback to the relay client.
+
+        The callback is invoked by ``_supervise_api_v1_inference`` when a
+        request-owned executor thread remains alive past the shared cleanup
+        deadline.  In production the callback is no-return (it terminates the
+        disposable bridge process); in tests it may unblock the stuck thread
+        and return so the supervisor can call ``shutdown(wait=True)`` safely.
+        """
+
+        self.relay_client.fatal_bridge_teardown = callback
+
     def _api_v1_readiness_cancel_requested(self) -> bool:
         try:
             return bool(self._cancellation_predicate())

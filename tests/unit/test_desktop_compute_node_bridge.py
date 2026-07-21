@@ -5490,3 +5490,65 @@ def test_run_final_cleanup_shares_one_shutdown_deadline_across_multiple_runtimes
     assert len(absolute_deadlines) >= 2
     assert len(set(absolute_deadlines)) == 1
     assert any(relay.endswith('/fail') and kind == 'unregister' for relay, kind, _deadline in deadlines)
+
+
+def test_wire_fatal_teardown_for_runtime_calls_wire_fatal_bridge_teardown():
+    """_wire_fatal_teardown_for_runtime uses wire_fatal_bridge_teardown when available."""
+    relay_client = SimpleNamespace(relay_url='https://relay.example')
+    wired_callbacks = []
+
+    class FakeRuntime:
+        def __init__(self):
+            self.relay_client = relay_client
+
+        def wire_fatal_bridge_teardown(self, callback):
+            wired_callbacks.append(callback)
+
+    runtime = FakeRuntime()
+    compute_node_bridge._wire_fatal_teardown_for_runtime(runtime)
+
+    assert len(wired_callbacks) == 1
+    callback = wired_callbacks[0]
+    assert callable(callback)
+
+
+def test_wire_fatal_teardown_for_runtime_falls_back_to_direct_attribute():
+    """_wire_fatal_teardown_for_runtime falls back to relay_client.fatal_bridge_teardown."""
+    relay_client = SimpleNamespace(relay_url='https://relay.example')
+
+    class FakeRuntime:
+        def __init__(self):
+            self.relay_client = relay_client
+        # No wire_fatal_bridge_teardown method
+
+    runtime = FakeRuntime()
+    compute_node_bridge._wire_fatal_teardown_for_runtime(runtime)
+
+    assert callable(getattr(relay_client, 'fatal_bridge_teardown', None))
+
+
+def test_wire_fatal_teardown_callback_calls_os_exit(monkeypatch):
+    """The wired callback emits a lifecycle event and calls os._exit(1)."""
+    relay_client = SimpleNamespace(relay_url='https://relay.example')
+
+    class FakeRuntime:
+        def __init__(self):
+            self.relay_client = relay_client
+
+    runtime = FakeRuntime()
+    compute_node_bridge._wire_fatal_teardown_for_runtime(runtime)
+    callback = relay_client.fatal_bridge_teardown
+
+    exit_codes = []
+    monkeypatch.setattr(os, '_exit', lambda code: exit_codes.append(code))
+
+    import io
+    from unittest.mock import patch as _patch
+    stderr_out = io.StringIO()
+    with _patch('sys.stderr', stderr_out):
+        callback(reason='api_v1_executor_cleanup_timeout')
+
+    assert exit_codes == [1]
+    stderr_content = stderr_out.getvalue()
+    assert 'fatal_teardown' in stderr_content
+    assert 'api_v1_executor_cleanup_timeout' in stderr_content

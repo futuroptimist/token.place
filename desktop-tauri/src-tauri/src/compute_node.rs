@@ -628,6 +628,7 @@ fn startup_failure_status(
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
 ) -> ComputeNodeStatus {
+    let build_identity = crate::build_identity::build_identity();
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -676,12 +677,10 @@ fn startup_failure_status(
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
-        app_version: crate::build_identity::build_identity().app_version.into(),
-        build_id: crate::build_identity::build_identity().build_id.into(),
-        target_triple: crate::build_identity::build_identity().target_triple.into(),
-        bundled_runtime_id: crate::build_identity::build_identity()
-            .bundled_runtime_id
-            .into(),
+        app_version: build_identity.app_version.into(),
+        build_id: build_identity.build_id.into(),
+        target_triple: build_identity.target_triple.into(),
+        bundled_runtime_id: build_identity.bundled_runtime_id.into(),
         launcher_source: None,
         interpreter_basename: None,
     }
@@ -1789,6 +1788,7 @@ pub async fn start_compute_node(
     }
 
     if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
+        let build_identity = crate::build_identity::build_identity();
         let running_status = ComputeNodeStatus {
             running: true,
             registered: false,
@@ -1834,12 +1834,10 @@ pub async fn start_compute_node(
             updated_at_ms: Some(current_time_ms()),
             log_file_path: log_file_path.clone(),
             readiness_diagnostics: Map::new(),
-            app_version: crate::build_identity::build_identity().app_version.into(),
-            build_id: crate::build_identity::build_identity().build_id.into(),
-            target_triple: crate::build_identity::build_identity().target_triple.into(),
-            bundled_runtime_id: crate::build_identity::build_identity()
-                .bundled_runtime_id
-                .into(),
+            app_version: build_identity.app_version.into(),
+            build_id: build_identity.build_id.into(),
+            target_triple: build_identity.target_triple.into(),
+            bundled_runtime_id: build_identity.bundled_runtime_id.into(),
             launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
             interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };

@@ -462,6 +462,14 @@ fn current_operator_log_path(status: &ComputeNodeStatus) -> Result<PathBuf, Stri
         })
 }
 
+fn operator_log_field<'a>(log_tail: &'a str, key: &str) -> Option<&'a str> {
+    log_tail
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+        .map(|value| value.trim_matches(|ch| ch == ',' || ch == ';'))
+        .filter(|value| !value.is_empty())
+}
+
 #[tauri::command]
 async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let status = state.compute_node.status.lock().await.clone();
@@ -481,10 +489,14 @@ async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, 
         })
         .collect();
     logs.sort_by_key(|candidate| fs::metadata(candidate).and_then(|m| m.modified()).ok());
-    if logs.len() > 4 {
-        logs = logs.split_off(logs.len() - 4);
+    let max_logs = 4;
+    if logs.len() > max_logs {
+        logs = logs.split_off(logs.len() - max_logs);
     }
     if !logs.iter().any(|candidate| candidate == &path) {
+        if logs.len() == max_logs {
+            logs.remove(0);
+        }
         logs.push(path.clone());
     }
     let mut combined = String::new();
@@ -493,17 +505,28 @@ async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, 
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("compute-node.log");
+        let log_tail =
+            operator_logs::read_log_tail(&candidate, 64 * 1024).map_err(|e| e.to_string())?;
+        let current = candidate == path;
+        let session_id = if current {
+            status.operator_session_id.as_deref().unwrap_or("unknown")
+        } else {
+            operator_log_field(&log_tail, "operator_session_id").unwrap_or("unknown")
+        };
+        let context_tier = if current {
+            status.context_tier.as_deref().unwrap_or("unknown")
+        } else {
+            operator_log_field(&log_tail, "context_tier").unwrap_or("unknown")
+        };
         combined.push_str(&format!("\n--- operator_session_log file={} current={} session_id={} context_tier={} app_version={} build_id={} ---\n",
             name,
-            candidate == path,
-            status.operator_session_id.as_deref().unwrap_or("unknown"),
-            status.context_tier.as_deref().unwrap_or("unknown"),
+            current,
+            session_id,
+            context_tier,
             status.app_version,
             status.build_id,
         ));
-        combined.push_str(
-            &operator_logs::read_log_tail(&candidate, 64 * 1024).map_err(|e| e.to_string())?,
-        );
+        combined.push_str(&log_tail);
     }
     Ok(combined)
 }

@@ -3,14 +3,13 @@
 
 The test intentionally validates deployment identity without claiming real CUDA
 execution. It is designed to run after MSI/NSIS artifacts are built on a hosted
-Windows runner; non-Windows hosts may use --contract-only for static checks.
+Windows runner; non-Windows hosts perform the static contract checks and skip installer execution.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,16 +65,18 @@ def _extract(installer: Path, destination: Path) -> None:
         raise AssertionError(f"unsupported installer type: {installer}")
 
 
-def validate_artifact(installer: Path, label: str) -> None:
-    if EXPECTED_VERSION not in installer.name:
-        raise AssertionError(f"{label} filename must include {EXPECTED_VERSION}: {installer.name}")
+def validate_artifact(installer: Path, label: str, expected_version: str) -> None:
+    if expected_version not in installer.name:
+        raise AssertionError(f"{label} filename must include {expected_version}: {installer.name}")
     if sys.platform != "win32":
         return
     with tempfile.TemporaryDirectory(prefix=f"token-place-{label}-") as tmp:
         root = Path(tmp)
         sentinel_log = root / "sentinel.log"
         sentinel_path = _sentinel_dir(root)
-        env = {"PATH": str(sentinel_path), "TOKENPLACE_SENTINEL_LOG": str(sentinel_log)}
+        env = os.environ.copy()
+        env["PATH"] = str(sentinel_path)
+        env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
         install_root = root / "install"
         install_root.mkdir()
         _extract(installer, install_root)
@@ -83,7 +84,7 @@ def validate_artifact(installer: Path, label: str) -> None:
         _assert_runtime(install_root)
         # Metadata probe only: do not assert real CUDA on hosted Windows.
         version = _run(["powershell", "-NoProfile", "-Command", f"(Get-Item '{exe}').VersionInfo.ProductVersion"], env=env).stdout.strip()
-        if EXPECTED_VERSION not in version:
+        if expected_version not in version:
             raise AssertionError(f"installed executable version mismatch: {version}")
         if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
             raise AssertionError("host Python sentinel was invoked during installer identity validation")
@@ -96,11 +97,9 @@ def main() -> int:
     parser.add_argument("--previous-version", default="0.1.2")
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     args = parser.parse_args()
-    if args.expected_version != EXPECTED_VERSION:
-        raise AssertionError(f"script pinned to {EXPECTED_VERSION}; got {args.expected_version}")
-    validate_artifact(args.windows_nsis, "clean-nsis")
-    validate_artifact(args.windows_msi, "clean-msi")
-    print("validated clean NSIS/MSI identity and static 0.1.2-to-0.1.3 upgrade contract")
+    validate_artifact(args.windows_nsis, "clean-nsis", args.expected_version)
+    validate_artifact(args.windows_msi, "clean-msi", args.expected_version)
+    print(f"validated clean NSIS/MSI identity and static {args.previous_version}-to-{args.expected_version} upgrade contract")
     print("cross-installation policy: competing MSI/NSIS installs must fail closed rather than leave stale shortcuts")
     return 0
 

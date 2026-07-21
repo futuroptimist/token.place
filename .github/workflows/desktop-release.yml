@@ -509,10 +509,14 @@ jobs:
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
             "${validator_version_args[@]}"
+          installer_identity_args=()
+          if [ -n "${tag_name}" ]; then
+            installer_identity_args=(--expected-version "${tag_name#desktop-v}")
+          fi
           python scripts/test_windows_installer_identity.py \
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
-            --expected-version "${tag_name#desktop-v}"
+            "${installer_identity_args[@]}"
 
       - name: Generate SHA256 checksums and build manifest
         shell: bash
@@ -629,6 +633,11 @@ jobs:
         with:
           name: windows-x64-bundles
           path: release-assets/windows
+
+      - name: Check out repository for immutable tag verification
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Verify immutable tag, release absence, and artifact provenance
         env:

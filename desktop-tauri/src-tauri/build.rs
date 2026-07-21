@@ -1,6 +1,8 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    println!("cargo:rerun-if-env-changed=TARGET");
     let git_sha = std::env::var("GITHUB_SHA").ok().or_else(|| {
         Command::new("git")
             .args(["rev-parse", "--short=12", "HEAD"])

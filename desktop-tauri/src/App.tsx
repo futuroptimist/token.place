@@ -98,12 +98,12 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'startup_phase',
   'startup_elapsed_ms',
   'startup_deadline_ms',
-    'app_version',
-    'build_id',
-    'target_triple',
-    'bundled_runtime_id',
-    'launcher_source',
-    'interpreter_basename',
+  'app_version',
+  'build_id',
+  'target_triple',
+  'bundled_runtime_id',
+  'launcher_source',
+  'interpreter_basename',
 ]);
 
 function isSafeReadinessDiagnosticString(value: string): boolean {

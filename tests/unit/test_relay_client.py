@@ -7252,13 +7252,14 @@ def test_api_v1_completed_future_at_deadline_boundary_is_consumed_once():
 
 
 def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_post():
-    """Worker termination releases inference only; session close releases control I/O."""
+    """_ControlSession.close() interrupts in-flight control I/O within its poll interval."""
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
     client._api_v1_registered_relays.add('https://relay.example')
     client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
     control_entered = threading.Event()
     release_inference = threading.Event()
+    http_release = threading.Event()
     result_holder = {}
 
     def generate(**_kwargs):
@@ -7266,28 +7267,16 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         return {'request_id': 'late'}
 
     client._generate_api_v1_response_with_runtime_model = generate
-    # Worker termination releases inference only, not control I/O.
+    # Worker termination releases inference; control I/O is released by session.close().
     client._terminate_current_llama_worker = lambda reason, recreate=True: (
         release_inference.set() or True
     )
 
-    class _FakeControlSession:
-        """Fake requests.Session whose close() unblocks the in-flight post()."""
-
-        def __init__(self):
-            self._closed = threading.Event()
-
-        def post(self, *args, **kwargs):
-            control_entered.set()
-            # Block until the supervisor closes the session (operator stop teardown).
-            # Use a generous 30-second sentinel to avoid test flakiness under slow CI.
-            self._closed.wait(30)
-            raise relay_client_module.requests.ConnectionError('session closed by supervisor')
-
-        def close(self):
-            self._closed.set()
-
-    fake_session = _FakeControlSession()
+    def blocking_requests_post(url, **kwargs):
+        # Signal that the HTTP call has started, then block until released by the test.
+        control_entered.set()
+        http_release.wait(30)
+        raise relay_client_module.requests.ConnectionError('test_interrupted')
 
     def supervise():
         result_holder['outcome'] = client._supervise_api_v1_inference({
@@ -7298,7 +7287,11 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
             'routing': {'context_tier': '8k-fast'},
         }, local_deadline=time.monotonic() + 5)
 
-    with patch.object(relay_client_module, '_ControlSession', return_value=fake_session):
+    # Patch module-level requests.post so the real _ControlSession's daemon thread
+    # uses the blocking mock.  When the supervisor calls control_session.close(),
+    # _ControlSession detects the closed flag within _POLL_INTERVAL and raises
+    # ConnectionError in the control executor thread without waiting for the HTTP call.
+    with patch.object(relay_client_module.requests, 'post', blocking_requests_post):
         thread = threading.Thread(target=supervise)
         thread.start()
         assert control_entered.wait(1)
@@ -7310,10 +7303,11 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         assert outcome.response_envelope is None
         assert outcome.terminal_code == 'operator_stop'
         assert outcome.submission_allowed is False
-        # No request-scoped threads survive before emergency cleanup runs.
+        # No request-scoped executor threads survive after shutdown(wait=True).
         assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
         assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
     finally:
+        http_release.set()  # Unblock the daemon HTTP thread spawned by _ControlSession
         release_inference.set()
         thread.join(1)
 
@@ -7374,6 +7368,14 @@ def test_api_v1_stuck_inference_sets_polling_stopped_by_request():
     # Worker termination does NOT release the inference blocker (simulates stuck subprocess).
     client._terminate_current_llama_worker = lambda reason, recreate=True: False
 
+    # fatal_bridge_teardown unblocks the stuck inference thread so that the shared
+    # cleanup deadline in the finally block can drain the executor with shutdown(wait=True).
+    def fatal_teardown(reason=None):
+        unblock_inference.set()
+        return True
+
+    client.fatal_bridge_teardown = fatal_teardown
+
     def supervise():
         result_holder['outcome'] = client._supervise_api_v1_inference({
             'request_id': 'req-stuck',
@@ -7394,7 +7396,7 @@ def test_api_v1_stuck_inference_sets_polling_stopped_by_request():
         # Permanently stop polling when inference thread cannot be quiesced.
         assert client._polling_stopped_by_request is True
     finally:
-        # Unblock the stuck inference thread so the executor thread can exit cleanly.
+        # Safety: unblock inference thread in case fatal_teardown was not called.
         unblock_inference.set()
         thread.join(1)
 

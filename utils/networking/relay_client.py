@@ -31,28 +31,74 @@ _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
 _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
+# Budget for quiescing request-owned executor threads in the finally block.
+# Should be less than BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS so cleanup fits
+# inside the bridge-level shutdown window.
+_API_V1_CLEANUP_BUDGET_SECONDS = 5.0
 
 
 class _ControlSession:
-    """Minimal per-request wrapper for abortable control HTTP transport.
+    """Per-request abortable control HTTP transport.
 
-    Wraps the module-level ``requests.post`` call behind a threading.Event gate
-    so that supervisor teardown can interrupt a pending control submission
-    without touching the global requests module or the inference worker.
+    Runs the HTTP call in a dedicated daemon thread so that ``close()`` can
+    interrupt a concurrent ``post()`` call within ``_POLL_INTERVAL`` seconds
+    by raising ``requests.ConnectionError`` in the calling (executor) thread.
+    The underlying HTTP request continues in the daemon thread until it
+    completes or times out naturally; its result is discarded after ``close()``
+    is called.
+
     On ``close()``, any concurrent or subsequent ``post()`` call raises
     ``requests.ConnectionError``.
     """
 
+    _POLL_INTERVAL: float = 0.05
+
     def __init__(self) -> None:
         self._closed: threading.Event = threading.Event()
+        self._result_ready: threading.Event = threading.Event()
+        self._result: Any = None
+        self._error: Optional[BaseException] = None
+        self._lock: threading.Lock = threading.Lock()
 
     def post(self, *args: Any, **kwargs: Any) -> Any:
         if self._closed.is_set():
             raise requests.ConnectionError('api_v1_control_session_closed')
-        return requests.post(*args, **kwargs)
+
+        self._result = None
+        self._error = None
+        self._result_ready.clear()
+
+        def _do_post() -> None:
+            try:
+                result = requests.post(*args, **kwargs)
+                with self._lock:
+                    if not self._closed.is_set():
+                        self._result = result
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    if not self._closed.is_set():
+                        self._error = exc
+            finally:
+                self._result_ready.set()
+
+        threading.Thread(target=_do_post, daemon=True).start()
+
+        while not self._result_ready.wait(self._POLL_INTERVAL):
+            if self._closed.is_set():
+                raise requests.ConnectionError('api_v1_control_session_closed')
+
+        if self._closed.is_set():
+            raise requests.ConnectionError('api_v1_control_session_closed')
+
+        error = self._error
+        if error is not None:
+            raise error
+        return self._result
 
     def close(self) -> None:
         self._closed.set()
+        # Wake any post() call that is polling so it exits within _POLL_INTERVAL.
+        self._result_ready.set()
 
 
 class _ApiV1ChatValidationResult(NamedTuple):
@@ -2619,21 +2665,20 @@ class RelayClient:
                     control_session.close()
                 except Exception:
                     pass
-            inference_done = future.done()
-            control_done = control_future is None or control_future.done()
-            if not inference_done:
-                future.cancel()
-            if control_future is not None and not control_done:
-                control_future.cancel()
-            if not inference_done:
-                inference_done = bool(_wait_for_future_quiescence(future, time.monotonic() + 0.5))
-            if control_future is not None and not control_done:
-                # Control timeout: bounded between 50ms and 500ms to avoid stalling cleanup.
-                control_quiescence_timeout = min(0.5, max(0.05, self._request_timeout))
-                control_done = bool(_wait_for_future_quiescence(control_future, time.monotonic() + control_quiescence_timeout))
-            executor.shutdown(wait=inference_done, cancel_futures=True)
+            # Shared cleanup deadline for both request-owned futures.  With
+            # _ControlSession.close() called above, the control future quiesces
+            # within _POLL_INTERVAL.  For inference, _terminate_current_llama_worker()
+            # from the terminal path ensures the worker exits; the fatal_bridge_teardown
+            # path handles the stuck-subprocess edge case by unblocking inference so
+            # shutdown(wait=True) does not hang.  Never use wait=False: request-owned
+            # executor threads must be fully joined before returning a reusable client.
+            cleanup_deadline = time.monotonic() + _API_V1_CLEANUP_BUDGET_SECONDS
+            _wait_for_future_quiescence(future, cleanup_deadline)
+            if control_future is not None:
+                _wait_for_future_quiescence(control_future, cleanup_deadline)
+            executor.shutdown(wait=True, cancel_futures=True)
             if control_executor is not None:
-                control_executor.shutdown(wait=control_done, cancel_futures=True)
+                control_executor.shutdown(wait=True, cancel_futures=True)
         runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
         if not isinstance(runtime_health, dict):
             runtime_health = {}

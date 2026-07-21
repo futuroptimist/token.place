@@ -655,23 +655,50 @@ jobs:
             exit 1
           fi
           export TOKENPLACE_TAG_COMMIT="${tag_commit}"
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+          release_lookup_status=0
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}" \
+            >/tmp/release-lookup.json 2>/tmp/release-lookup.log || release_lookup_status=$?
+          if [ "${release_lookup_status}" -eq 0 ]; then
             echo "::error::Release ${TAG_NAME} already exists; desktop releases are immutable."
+            exit 1
+          fi
+          if ! grep -qi '404' /tmp/release-lookup.log; then
+            echo "::error::Unable to confirm release ${TAG_NAME} is absent (gh api did not report HTTP 404)."
+            cat /tmp/release-lookup.log >&2
             exit 1
           fi
           version="${TAG_NAME#desktop-v}"
           python - <<'PY'
           import hashlib, json, os, pathlib, re, sys
           version = os.environ['TAG_NAME'].removeprefix('desktop-v')
+          EXPECTED_MANIFESTS = {
+              'release-assets/macos/token.place-desktop-aarch64-apple-darwin-build-manifest.json': {
+                  'target_triple': 'aarch64-apple-darwin',
+                  'bundled_runtime_id': 'bundled-cpython-3.11-macos-arm64',
+              },
+              'release-assets/windows/token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json': {
+                  'target_triple': 'x86_64-pc-windows-msvc',
+                  'bundled_runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+              },
+          }
           manifests = sorted(pathlib.Path('release-assets').glob('**/*build-manifest.json'))
-          if not manifests:
-              raise SystemExit('no per-target build manifests were downloaded')
+          found_paths = {manifest.as_posix() for manifest in manifests}
+          expected_paths = set(EXPECTED_MANIFESTS)
+          if found_paths != expected_paths:
+              missing = sorted(expected_paths - found_paths)
+              extra = sorted(found_paths - expected_paths)
+              raise SystemExit(f'expected exactly manifests {sorted(expected_paths)}; missing={missing} extra={extra}')
           manifest_names = {manifest.name for manifest in manifests}
           allowed_notice_names = {'README BEFORE OPENING.txt', 'README-macos-apple-silicon-preview.txt'}
           seen_manifested = set()
           for manifest in manifests:
+              expected = EXPECTED_MANIFESTS[manifest.as_posix()]
               data = json.loads(manifest.read_text())
               target = data.get('target_triple')
+              if target != expected['target_triple']:
+                  raise SystemExit(f'{manifest} target_triple mismatch: expected {expected["target_triple"]}, got {target}')
+              if data.get('bundled_runtime_id') != expected['bundled_runtime_id']:
+                  raise SystemExit(f'{manifest} bundled_runtime_id mismatch: expected {expected["bundled_runtime_id"]}, got {data.get("bundled_runtime_id")}')
               if data.get('tag') != os.environ['TAG_NAME'] or data.get('tagged_commit') != os.environ['TOKENPLACE_TAG_COMMIT'] or data.get('public_version') != version:
                   raise SystemExit(f'{manifest} provenance/version mismatch')
               artifact_names = [artifact.get('filename') for artifact in data.get('artifacts', [])]
@@ -694,7 +721,7 @@ jobs:
                       continue
                   if version not in filename:
                       raise SystemExit(f'artifact filename lacks {version}: {filename}')
-                  if target and target not in filename and filename.endswith('.json'):
+                  if target not in filename and filename.endswith('.json'):
                       raise SystemExit(f'manifest artifact has wrong target: {filename} for {target}')
           for asset in pathlib.Path('release-assets').glob('**/*'):
               if not asset.is_file() or asset.name in manifest_names or asset.name.startswith('SHA256SUMS-') or asset.name in allowed_notice_names:
@@ -702,21 +729,55 @@ jobs:
               if asset.name not in seen_manifested:
                   raise SystemExit(f'unmanifested release artifact: {asset}')
           PY
-          existing_assets="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}" --jq '.assets[].name' 2>/dev/null || true)"
-          if [ -n "${existing_assets}" ]; then
-            echo "::error::Release assets already exist for ${TAG_NAME}; refusing to overwrite."
-            echo "${existing_assets}"
-            exit 1
-          fi
 
       - name: Create immutable GitHub Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          token: ${{ github.token }}
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          generate_release_notes: ${{ github.event_name == 'push' }}
-          fail_on_unmatched_files: true
-          files: |
-            release-assets/macos/*
-            release-assets/windows/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          GENERATE_RELEASE_NOTES: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          # Atomic create-only publish: GitHub rejects a second release for the same
+          # tag_name, so a failed create (rather than a prior look-up) is the
+          # authoritative immutability guard here. No release ID is ever looked up.
+          create_status=0
+          gh api --method POST "/repos/${GITHUB_REPOSITORY}/releases" \
+            -f "tag_name=${TAG_NAME}" \
+            -f "name=${TAG_NAME}" \
+            -F "generate_release_notes=${GENERATE_RELEASE_NOTES}" \
+            >/tmp/release-create.json 2>/tmp/release-create.log || create_status=$?
+          if [ "${create_status}" -ne 0 ]; then
+            if grep -qi 'already_exists' /tmp/release-create.log; then
+              echo "::error::Release ${TAG_NAME} already exists; desktop releases are immutable."
+            else
+              echo "::error::Failed to create release ${TAG_NAME}."
+              cat /tmp/release-create.log >&2
+            fi
+            exit 1
+          fi
+          release_id="$(jq -r '.id' /tmp/release-create.json)"
+          upload_url="$(jq -r '.upload_url' /tmp/release-create.json)"
+          upload_url="${upload_url%\{*}"
+          if [ -z "${release_id}" ] || [ "${release_id}" = "null" ]; then
+            echo "::error::GitHub did not return a release id for ${TAG_NAME}." >&2
+            exit 1
+          fi
+          if [ -z "${upload_url}" ] || [ "${upload_url}" = "null" ]; then
+            echo "::error::GitHub did not return an upload URL for release ${TAG_NAME}." >&2
+            exit 1
+          fi
+          uploaded_count=0
+          for asset in release-assets/macos/* release-assets/windows/*; do
+            [ -f "${asset}" ] || continue
+            asset_name="$(basename "${asset}")"
+            echo "Uploading ${asset_name} to release ${release_id}..."
+            gh api --method POST \
+              -H "Content-Type: application/octet-stream" \
+              --input "${asset}" \
+              "${upload_url}?name=${asset_name}" >/dev/null
+            uploaded_count=$((uploaded_count + 1))
+          done
+          if [ "${uploaded_count}" -eq 0 ]; then
+            echo "::error::No release assets were uploaded for ${TAG_NAME}." >&2
+            exit 1
+          fi

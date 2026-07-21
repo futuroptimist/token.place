@@ -3229,3 +3229,220 @@ def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monk
     monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
     with pytest.raises(validator.ValidationError, match='unable to determine'):
         validator._expected_tauri_binary_name()
+
+
+def _load_publish_step(name: str) -> dict:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['publish']['steps']
+    return next(step for step in steps if step.get('name') == name)
+
+
+def _load_publish_manifest_provenance_source() -> str:
+    script = _load_publish_step('Verify immutable tag, release absence, and artifact provenance')['run']
+    marker = "python - <<'PY'\n"
+    start = script.index(marker) + len(marker)
+    end = script.index("\nPY", start)
+    return script[start:end]
+
+
+def test_publish_release_creation_is_create_only_with_no_overwrite_path() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'softprops/action-gh-release' not in text
+    assert 'overwrite_files' not in text
+    assert '--clobber' not in text
+    assert 'gh release view' not in text
+    assert '|| true' not in text
+    assert 'gh api --method POST "/repos/${GITHUB_REPOSITORY}/releases" \\' in text
+    assert '-f "tag_name=${TAG_NAME}"' in text
+    assert 'No release ID is ever looked up.' in text
+    assert "grep -qi 'already_exists' /tmp/release-create.log" in text
+    assert 'Release ${TAG_NAME} already exists; desktop releases are immutable.' in text
+
+
+def test_publish_release_lookup_distinguishes_absence_from_api_failure() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "grep -qi '404' /tmp/release-lookup.log" in text
+    assert 'Unable to confirm release ${TAG_NAME} is absent (gh api did not report HTTP 404).' in text
+
+
+def test_publish_uploads_assets_via_captured_upload_url_without_clobber() -> None:
+    create_step = _load_publish_step('Create immutable GitHub Release')
+    script = create_step['run']
+    assert 'upload_url="$(jq -r \'.upload_url\' /tmp/release-create.json)"' in script
+    assert 'release_id="$(jq -r \'.id\' /tmp/release-create.json)"' in script
+    assert 'GitHub did not return a release id for ${TAG_NAME}.' in script
+    assert 'GitHub did not return an upload URL for release ${TAG_NAME}.' in script
+    assert 'Content-Type: application/octet-stream' in script
+    assert 'No release assets were uploaded for ${TAG_NAME}.' in script
+    assert '--clobber' not in script
+
+
+def test_publish_manifest_provenance_requires_exact_two_target_manifests_in_source() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "'release-assets/macos/token.place-desktop-aarch64-apple-darwin-build-manifest.json': {" in text
+    assert "'release-assets/windows/token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json': {" in text
+    assert "'target_triple': 'aarch64-apple-darwin'," in text
+    assert "'bundled_runtime_id': 'bundled-cpython-3.11-macos-arm64'," in text
+    assert "'target_triple': 'x86_64-pc-windows-msvc'," in text
+    assert "'bundled_runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'," in text
+    assert 'expected exactly manifests' in text
+    assert 'target_triple mismatch' in text
+    assert 'bundled_runtime_id mismatch' in text
+
+
+def _write_manifest_and_asset(directory, manifest_filename, asset_filename, *, tag, commit, target_triple, runtime_id):
+    import hashlib
+
+    asset_path = directory / asset_filename
+    asset_path.write_bytes(f'contents-of-{asset_filename}'.encode('utf-8'))
+    manifest = {
+        'public_version': tag.removeprefix('desktop-v'),
+        'tag': tag,
+        'tagged_commit': commit,
+        'target_triple': target_triple,
+        'bundled_runtime_id': runtime_id,
+        'artifacts': [
+            {
+                'filename': asset_filename,
+                'sha256': hashlib.sha256(asset_path.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (directory / manifest_filename).write_text(json.dumps(manifest), encoding='utf-8')
+
+
+def _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag='desktop-v0.1.3', commit='a' * 40):
+    source = _load_publish_manifest_provenance_source()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('TAG_NAME', tag)
+    monkeypatch.setenv('TOKENPLACE_TAG_COMMIT', commit)
+    namespace = {'__name__': '__publish_manifest_provenance__'}
+    exec(compile(source, '<publish-manifest-provenance>', 'exec'), namespace)
+
+
+def test_publish_manifest_provenance_rejects_missing_manifests(tmp_path, monkeypatch) -> None:
+    (tmp_path / 'release-assets' / 'macos').mkdir(parents=True)
+    (tmp_path / 'release-assets' / 'windows').mkdir(parents=True)
+
+    with pytest.raises(SystemExit, match='expected exactly manifests'):
+        _run_publish_manifest_provenance_checker(tmp_path, monkeypatch)
+
+
+def test_publish_manifest_provenance_rejects_additional_target_manifest(tmp_path, monkeypatch) -> None:
+    tag = 'desktop-v0.1.3'
+    commit = 'a' * 40
+    macos_dir = tmp_path / 'release-assets' / 'macos'
+    windows_dir = tmp_path / 'release-assets' / 'windows'
+    linux_dir = tmp_path / 'release-assets' / 'linux'
+    macos_dir.mkdir(parents=True)
+    windows_dir.mkdir(parents=True)
+    linux_dir.mkdir(parents=True)
+
+    _write_manifest_and_asset(
+        macos_dir,
+        'token.place-desktop-aarch64-apple-darwin-build-manifest.json',
+        'token.place-desktop-0.1.3-apple-silicon.dmg',
+        tag=tag, commit=commit,
+        target_triple='aarch64-apple-darwin', runtime_id='bundled-cpython-3.11-macos-arm64',
+    )
+    _write_manifest_and_asset(
+        windows_dir,
+        'token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json',
+        'token.place-desktop-0.1.3-x86_64-pc-windows-msvc-setup.exe',
+        tag=tag, commit=commit,
+        target_triple='x86_64-pc-windows-msvc', runtime_id='bundled-cpython-3.11-win-x86_64-cu124',
+    )
+    _write_manifest_and_asset(
+        linux_dir,
+        'token.place-desktop-x86_64-unknown-linux-gnu-build-manifest.json',
+        'token.place-desktop-0.1.3-x86_64.AppImage',
+        tag=tag, commit=commit,
+        target_triple='x86_64-unknown-linux-gnu', runtime_id='bundled-cpython-3.11-linux-x86_64',
+    )
+
+    with pytest.raises(SystemExit, match='expected exactly manifests'):
+        _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag=tag, commit=commit)
+
+
+def test_publish_manifest_provenance_rejects_wrong_target_triple_mapping(tmp_path, monkeypatch) -> None:
+    tag = 'desktop-v0.1.3'
+    commit = 'b' * 40
+    macos_dir = tmp_path / 'release-assets' / 'macos'
+    windows_dir = tmp_path / 'release-assets' / 'windows'
+    macos_dir.mkdir(parents=True)
+    windows_dir.mkdir(parents=True)
+
+    _write_manifest_and_asset(
+        macos_dir,
+        'token.place-desktop-aarch64-apple-darwin-build-manifest.json',
+        'token.place-desktop-0.1.3-apple-silicon.dmg',
+        tag=tag, commit=commit,
+        target_triple='x86_64-pc-windows-msvc',  # wrong: macOS manifest claims the Windows target
+        runtime_id='bundled-cpython-3.11-macos-arm64',
+    )
+    _write_manifest_and_asset(
+        windows_dir,
+        'token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json',
+        'token.place-desktop-0.1.3-x86_64-pc-windows-msvc-setup.exe',
+        tag=tag, commit=commit,
+        target_triple='x86_64-pc-windows-msvc', runtime_id='bundled-cpython-3.11-win-x86_64-cu124',
+    )
+
+    with pytest.raises(SystemExit, match='target_triple mismatch'):
+        _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag=tag, commit=commit)
+
+
+def test_publish_manifest_provenance_rejects_wrong_bundled_runtime_id(tmp_path, monkeypatch) -> None:
+    tag = 'desktop-v0.1.3'
+    commit = 'c' * 40
+    macos_dir = tmp_path / 'release-assets' / 'macos'
+    windows_dir = tmp_path / 'release-assets' / 'windows'
+    macos_dir.mkdir(parents=True)
+    windows_dir.mkdir(parents=True)
+
+    _write_manifest_and_asset(
+        macos_dir,
+        'token.place-desktop-aarch64-apple-darwin-build-manifest.json',
+        'token.place-desktop-0.1.3-apple-silicon.dmg',
+        tag=tag, commit=commit,
+        target_triple='aarch64-apple-darwin',
+        runtime_id='bundled-cpython-3.11-win-x86_64-cu124',  # wrong: macOS manifest claims the Windows runtime id
+    )
+    _write_manifest_and_asset(
+        windows_dir,
+        'token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json',
+        'token.place-desktop-0.1.3-x86_64-pc-windows-msvc-setup.exe',
+        tag=tag, commit=commit,
+        target_triple='x86_64-pc-windows-msvc', runtime_id='bundled-cpython-3.11-win-x86_64-cu124',
+    )
+
+    with pytest.raises(SystemExit, match='bundled_runtime_id mismatch'):
+        _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag=tag, commit=commit)
+
+
+def test_publish_manifest_provenance_accepts_exact_expected_manifest_pair(tmp_path, monkeypatch) -> None:
+    tag = 'desktop-v0.1.3'
+    commit = 'd' * 40
+    macos_dir = tmp_path / 'release-assets' / 'macos'
+    windows_dir = tmp_path / 'release-assets' / 'windows'
+    macos_dir.mkdir(parents=True)
+    windows_dir.mkdir(parents=True)
+
+    _write_manifest_and_asset(
+        macos_dir,
+        'token.place-desktop-aarch64-apple-darwin-build-manifest.json',
+        'token.place-desktop-0.1.3-apple-silicon.dmg',
+        tag=tag, commit=commit,
+        target_triple='aarch64-apple-darwin', runtime_id='bundled-cpython-3.11-macos-arm64',
+    )
+    _write_manifest_and_asset(
+        windows_dir,
+        'token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json',
+        'token.place-desktop-0.1.3-x86_64-pc-windows-msvc-setup.exe',
+        tag=tag, commit=commit,
+        target_triple='x86_64-pc-windows-msvc', runtime_id='bundled-cpython-3.11-win-x86_64-cu124',
+    )
+
+    _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag=tag, commit=commit)

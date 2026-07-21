@@ -2347,7 +2347,8 @@ class RelayClient:
         manager = getattr(self, 'model_manager', None)
         terminate = getattr(manager, 'terminate_active_worker_for_cancellation', None)
         if callable(terminate):
-            return bool(terminate(reason=reason, recreate=recreate))
+            fatal = getattr(self, 'fatal_bridge_teardown', None)
+            return bool(terminate(reason=reason, recreate=recreate, fatal_callback=fatal))
         # Fallback path: attempt a best-effort close but cannot verify process death.
         # Return False so the caller knows worker state is uncertain.
         llm = getattr(manager, 'llm', None)

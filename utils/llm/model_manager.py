@@ -28,7 +28,8 @@ import threading
 import sysconfig
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Any, Optional, Iterable, Tuple
+from typing import Callable, Dict, List, Any, Optional, Iterable, Tuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 
 from utils.system import resource_monitor
 from utils.llm.model_profiles import get_model_profile, resolve_profile_id
@@ -84,6 +85,11 @@ _INIT_SAFE_CATEGORY_ALIASES = {
     'kv_cache_allocation': 'runtime_context_create_kv_cache_allocation',
     'rope_yarn_eval_failure': 'runtime_context_create_rope_yarn_config',
 }
+
+# Maximum wall-clock seconds allotted to processless worker close() under
+# bounded cancellation cleanup.  Must fit within the supervisor cleanup budget
+# (_API_V1_CLEANUP_BUDGET_SECONDS in relay_client) with room for fatal teardown.
+_PROCESSLESS_CLOSE_TIMEOUT_SECONDS: float = 4.0
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
     'runtime_model_path_unavailable',
@@ -5789,7 +5795,7 @@ class ModelManager:
                 or (self._llm_generation != generation and cancel_event.is_set())
             )
 
-    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True) -> bool:
+    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True, fatal_callback: Optional[Callable] = None) -> bool:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
         safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
         should_recreate_without_active_worker = False
@@ -5824,7 +5830,7 @@ class ModelManager:
             except Exception:
                 self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
                 return False
-        old_worker_stopped = self._close_llm_proxy(llm, terminate_process=True)
+        old_worker_stopped = self._close_llm_proxy(llm, terminate_process=True, fatal_callback=fatal_callback)
         if not old_worker_stopped:
             with self.llm_lock:
                 self.worker_state = 'failed'
@@ -5838,7 +5844,7 @@ class ModelManager:
             self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
             return False
 
-    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False) -> bool:
+    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False, fatal_callback: Optional[Callable] = None) -> bool:
         process = getattr(llm, '_process', None)
 
         def _close_or_join_resource(resource: Any) -> None:
@@ -5902,15 +5908,70 @@ class ModelManager:
             process_stopped = _dead()
 
         close = getattr(llm, 'close', None)
-        if callable(close) and process is None and not terminate_process:
-            try:
-                close()
-            except Exception:
-                self.log_warning("Failed to close old llama.cpp worker during invalidation")
-        elif callable(close):
-            # Subprocess-backed cleanup relies on verified process death and owned
-            # pipe/reader disposal; do not call a potentially blocking proxy close.
-            pass
+        if callable(close) and process is None:
+            if terminate_process:
+                # Cancellation path: a processless worker with a callable close()
+                # must be closed even during terminate_process=True.  Run it in an
+                # owned executor thread under a bounded cleanup budget so a
+                # potentially blocking close() cannot hold up the supervisor thread.
+                # Only call executor.shutdown after the future is proven done.
+                _close_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='worker_processless_close'
+                )
+                close_future = _close_executor.submit(close)
+                deadline = time.monotonic() + _PROCESSLESS_CLOSE_TIMEOUT_SECONDS
+                # Drain under the cleanup deadline.
+                while not close_future.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        close_future.result(timeout=min(0.05, remaining))
+                    except _FutureTimeoutError:
+                        continue
+                    except Exception:
+                        break
+                close_done = close_future.done()
+                if not close_done:
+                    # Deadline exceeded; invoke fatal teardown.  In production
+                    # fatal_callback is no-return (os._exit(1)); in tests the
+                    # callback must first unblock the close thread.
+                    if callable(fatal_callback):
+                        fatal_callback(reason='api_v1_worker_processless_close_timeout')
+                    # Post-fatal drain (test / non-production environment where
+                    # the callback returned after unblocking the close thread).
+                    after_deadline = time.monotonic() + 0.5
+                    while not close_future.done():
+                        remaining = after_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            close_future.result(timeout=min(0.05, remaining))
+                        except _FutureTimeoutError:
+                            continue
+                        except Exception:
+                            break
+                    close_done = close_future.done()
+                if close_done:
+                    try:
+                        close_future.result()
+                    except Exception:
+                        # close() raised an exception; treat as cleanup failure to
+                        # prevent replacement with a potentially tainted worker.
+                        process_stopped = False
+                    _close_executor.shutdown(wait=True, cancel_futures=True)
+                else:
+                    # Still running after fatal (fatal must be no-return in production;
+                    # a test that injects a returning fatal must unblock the thread).
+                    process_stopped = False
+            else:
+                # Non-cancellation path: call close() directly (existing behavior).
+                try:
+                    close()
+                except Exception:
+                    self.log_warning("Failed to close old llama.cpp worker during invalidation")
+        # process is not None: subprocess cleanup relies on verified process death and
+        # owned pipe/reader disposal; do not call a potentially blocking proxy close.
 
         for attr in (
             'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',

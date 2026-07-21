@@ -4991,7 +4991,7 @@ def test_model_manager_cancellation_active_worker_reports_recreation_outcomes(mo
     old_event = manager._llm_cancel_generation_event
     assert manager.terminate_active_worker_for_cancellation(reason="completed_unavailable") is True
 
-    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True)
+    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True, fatal_callback=None)
     get_llm_instance.assert_called_once_with()
     assert manager.llm is None
     assert manager.last_worker_exit_code == 17
@@ -5010,7 +5010,7 @@ def test_model_manager_cancellation_active_worker_reports_recreation_outcomes(mo
     monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=None))
 
     assert manager.terminate_active_worker_for_cancellation(reason="expired") is False
-    close_llm_proxy.assert_called_once_with(none_replacement_worker, terminate_process=True)
+    close_llm_proxy.assert_called_once_with(none_replacement_worker, terminate_process=True, fatal_callback=None)
     assert manager.last_worker_error_code == "expired"
 
     manager.llm = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)))
@@ -5043,7 +5043,7 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
     active_worker = manager.llm
     assert manager.terminate_active_worker_for_cancellation(reason="operator_stop", recreate=False) is True
 
-    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True)
+    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True, fatal_callback=None)
     get_llm_instance.assert_not_called()
     assert manager.last_worker_exit_code is None
     assert manager.last_worker_error_code == "operator_stop"
@@ -5053,7 +5053,7 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
 
     processless_worker = SimpleNamespace(close=MagicMock())
     ModelManager._close_llm_proxy(manager, processless_worker, terminate_process=True)
-    processless_worker.close.assert_not_called()
+    processless_worker.close.assert_called_once_with()
 
 
 def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
@@ -5100,6 +5100,70 @@ def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, 
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
     assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_close_llm_proxy_processless_terminate_close_exception_returns_failure(tmp_path, monkeypatch):
+    """close() exception on a processless worker with terminate_process=True prevents replacement."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    worker = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed on cancel")))
+    result = manager._close_llm_proxy(worker, terminate_process=True)
+
+    worker.close.assert_called_once_with()
+    assert result is False
+
+
+def test_close_llm_proxy_processless_close_timeout_invokes_fatal_and_joins_executor(tmp_path, monkeypatch):
+    """Blocking processless close() triggers fatal_callback after deadline and executor is joined."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_TIMEOUT_SECONDS', 0.05)
+
+    close_entered = threading.Event()
+    close_release = threading.Event()
+
+    def blocking_close():
+        close_entered.set()
+        close_release.wait()
+
+    fatal_calls = []
+
+    def fatal_callback(reason):
+        fatal_calls.append(reason)
+        # Unblock the close thread so the executor can be joined
+        close_release.set()
+
+    worker = SimpleNamespace(close=blocking_close)
+    result = manager._close_llm_proxy(worker, terminate_process=True, fatal_callback=fatal_callback)
+
+    assert fatal_calls == ['api_v1_worker_processless_close_timeout']
+    assert close_entered.is_set()
+    # After fatal unblocked the thread, post-fatal drain succeeds → result is True
+    assert result is True
+    # No worker_processless_close executor threads survive
+    surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
+    assert not surviving, f"Leaked executor threads: {surviving}"
+
+
+def test_close_llm_proxy_processless_no_fatal_callback_timeout_returns_failure(tmp_path, monkeypatch):
+    """Blocking processless close() with no fatal_callback returns False after deadline."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_TIMEOUT_SECONDS', 0.05)
+
+    close_entered = threading.Event()
+    close_release = threading.Event()
+
+    def blocking_close():
+        close_entered.set()
+        close_release.wait(timeout=5.0)
+
+    worker = SimpleNamespace(close=blocking_close)
+    result = manager._close_llm_proxy(worker, terminate_process=True)
+
+    assert result is False
+    assert close_entered.is_set()
+    # Unblock the thread to avoid test leaks
+    close_release.set()
+
 
 
 def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):

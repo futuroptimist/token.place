@@ -143,7 +143,7 @@ fn expected_runtime_arch() -> &'static str {
     }
 }
 
-fn bundled_runtime_id() -> &'static str {
+pub fn bundled_runtime_id() -> &'static str {
     if cfg!(target_os = "windows") {
         "bundled-cpython-3.11-win-x86_64-cu124"
     } else if cfg!(target_os = "macos") {

@@ -2617,13 +2617,35 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
         validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.2'])
 
 
+def _extract_workflow_job_block(text: str, job_key: str) -> str:
+    """Return the text from ``job_key:`` up to (but not including) the next sibling job."""
+    import re
+
+    start = text.index(job_key + ':')
+    rest = text[start:]
+    # Next top-level job starts with a newline, two spaces, a word-character, then a colon.
+    m = re.search(r'\n  [a-z][a-z0-9_-]*:', rest[1:])
+    return rest[: m.start() + 1] if m else rest
+
+
 def test_release_workflow_runs_windows_validator_and_blocks_publish_on_nvidia_gate() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
+    # Windows MSI/NSIS artifact validation remains required.
     assert 'Validate Windows MSI and NSIS artifact contents' in text
     assert 'validate_windows_desktop_release_artifacts.py' in text
-    assert 'windows-nvidia-release-gate' in text
-    assert 'needs: [build, windows-nvidia-release-gate]' in text
     assert 'windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows' in text
+    # windows-nvidia-release-gate job is still present but explicitly disabled until
+    # a matching self-hosted runner is available.
+    assert 'windows-nvidia-release-gate' in text
+    # Isolate the gate job block and assert the disabled condition.
+    gate_block = _extract_workflow_job_block(text, 'windows-nvidia-release-gate')
+    assert 'if: ${{ false }}' in gate_block
+    # Durable comment explaining the gate must be restored when hardware is ready.
+    assert 'windows-nvidia-release-gate back to publish.needs' in text
+    # Isolate the publish job block; publish must depend on build only (not the disabled gate).
+    publish_block = _extract_workflow_job_block(text, 'publish')
+    assert 'needs: build' in publish_block
+    assert 'windows-nvidia-release-gate' not in publish_block.split('needs:')[1].split('\n')[0]
 
 
 def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):

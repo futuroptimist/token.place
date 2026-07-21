@@ -65,4 +65,5 @@ integration_tests/*
 desktop-tauri/src-tauri/python-runtime/*
 !desktop-tauri/src-tauri/python-runtime/.gitkeep
 # Desktop runtime dependency target
+desktop-tauri/src-tauri/target/
 .token_place_desktop_site/

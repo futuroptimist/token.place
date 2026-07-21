@@ -508,25 +508,56 @@ async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, 
         let log_tail =
             operator_logs::read_log_tail(&candidate, 64 * 1024).map_err(|e| e.to_string())?;
         let current = candidate == path;
-        let session_id = if current {
-            status.operator_session_id.as_deref().unwrap_or("unknown")
+        let session_id = operator_log_field(&log_tail, "operator_session_id")
+            .or_else(|| {
+                current
+                    .then(|| status.operator_session_id.as_deref())
+                    .flatten()
+            })
+            .unwrap_or("unknown");
+        let context_tier = operator_log_field(&log_tail, "context_tier")
+            .or_else(|| current.then(|| status.context_tier.as_deref()).flatten())
+            .unwrap_or("unknown");
+        let app_version = operator_log_field(&log_tail, "app_version").unwrap_or(if current {
+            &status.app_version
         } else {
-            operator_log_field(&log_tail, "operator_session_id").unwrap_or("unknown")
-        };
-        let context_tier = if current {
-            status.context_tier.as_deref().unwrap_or("unknown")
+            "unknown"
+        });
+        let build_id = operator_log_field(&log_tail, "build_id").unwrap_or(if current {
+            &status.build_id
         } else {
-            operator_log_field(&log_tail, "context_tier").unwrap_or("unknown")
-        };
+            "unknown"
+        });
         combined.push_str(&format!("\n--- operator_session_log file={} current={} session_id={} context_tier={} app_version={} build_id={} ---\n",
             name,
             current,
             session_id,
             context_tier,
-            status.app_version,
-            status.build_id,
+            app_version,
+            build_id,
         ));
         combined.push_str(&log_tail);
+        const MAX_COMBINED_OPERATOR_LOG_BYTES: usize = 256 * 1024;
+        if combined.len() > MAX_COMBINED_OPERATOR_LOG_BYTES {
+            let keep_from = combined.len() - MAX_COMBINED_OPERATOR_LOG_BYTES;
+            let aligned = combined[keep_from..]
+                .char_indices()
+                .next()
+                .map(|(offset, _)| keep_from + offset)
+                .unwrap_or(keep_from);
+            let prefix = format!(
+                "[operator diagnostics truncated to last {} bytes]\n",
+                MAX_COMBINED_OPERATOR_LOG_BYTES
+            );
+            let budget = MAX_COMBINED_OPERATOR_LOG_BYTES.saturating_sub(prefix.len());
+            let tail = &combined[aligned..];
+            let tail = if tail.len() > budget {
+                &tail[tail.len() - budget..]
+            } else {
+                tail
+            };
+            combined = format!("{prefix}{tail}");
+        }
     }
     Ok(combined)
 }

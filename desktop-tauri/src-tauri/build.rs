@@ -1,18 +1,27 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=TOKENPLACE_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=TARGET");
-    let git_sha = std::env::var("GITHUB_SHA").ok().or_else(|| {
-        Command::new("git")
-            .args(["rev-parse", "--short=12", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|output| output.status.success().then_some(output.stdout))
-            .and_then(|stdout| String::from_utf8(stdout).ok())
-            .map(|sha| sha.trim().to_string())
-            .filter(|sha| !sha.is_empty())
-    });
+    let git_sha = std::env::var("TOKENPLACE_BUILD_COMMIT")
+        .ok()
+        .filter(|sha| !sha.trim().is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|output| output.status.success().then_some(output.stdout))
+                .and_then(|stdout| String::from_utf8(stdout).ok())
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| !sha.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("GITHUB_SHA")
+                .ok()
+                .filter(|sha| !sha.trim().is_empty())
+        });
     if let Some(git_sha) = git_sha {
         println!("cargo:rustc-env=TOKENPLACE_BUILD_COMMIT={git_sha}");
     }

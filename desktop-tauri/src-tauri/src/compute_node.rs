@@ -98,6 +98,7 @@ pub struct ComputeNodeStatus {
     pub build_id: String,
     pub target_triple: String,
     pub bundled_runtime_id: String,
+    pub runtime_id: Option<String>,
     pub launcher_source: Option<String>,
     pub interpreter_basename: Option<String>,
 }
@@ -681,6 +682,7 @@ fn startup_failure_status(
         build_id: build_identity.build_id.into(),
         target_triple: build_identity.target_triple.into(),
         bundled_runtime_id: build_identity.bundled_runtime_id.into(),
+        runtime_id: None,
         launcher_source: None,
         interpreter_basename: None,
     }
@@ -1612,7 +1614,20 @@ pub async fn start_compute_node(
     ) {
         match launcher_metadata.as_ref().map(|(_, _, _, source)| source) {
             Some(PythonLauncherSource::BundledRuntime) => {}
-            _ => anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"),
+            _ => {
+                let err = anyhow::anyhow!(
+                    "desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"
+                );
+                complete_no_child_startup_failure(
+                    &state,
+                    &request,
+                    &session_id,
+                    log_file_path.clone(),
+                    err.to_string(),
+                )
+                .await;
+                return Err(err.into());
+            }
         }
     }
 
@@ -1838,6 +1853,7 @@ pub async fn start_compute_node(
             build_id: build_identity.build_id.into(),
             target_triple: build_identity.target_triple.into(),
             bundled_runtime_id: build_identity.bundled_runtime_id.into(),
+            runtime_id: launcher_metadata.as_ref().map(|m| m.2.clone()),
             launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
             interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };

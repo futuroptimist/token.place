@@ -102,6 +102,7 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'build_id',
   'target_triple',
   'bundled_runtime_id',
+  'runtime_id',
   'launcher_source',
   'interpreter_basename',
 ]);
@@ -169,6 +170,7 @@ interface ComputeNodeStatus {
   build_id: string | null;
   target_triple: string | null;
   bundled_runtime_id: string | null;
+  runtime_id: string | null;
   launcher_source: string | null;
   interpreter_basename: string | null;
 }
@@ -237,6 +239,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   build_id: null,
   target_triple: null,
   bundled_runtime_id: null,
+  runtime_id: null,
   launcher_source: null,
   interpreter_basename: null,
 };
@@ -552,6 +555,7 @@ function mergeComputeStatusEvent(
     'build_id',
     'target_triple',
     'bundled_runtime_id',
+    'runtime_id',
     'launcher_source',
     'interpreter_basename',
   ] as const;
@@ -801,6 +805,12 @@ function mergeComputeStatusEvent(
         : typeof payload.bundled_runtime_id === 'string'
           ? payload.bundled_runtime_id
           : stoppedBase.bundled_runtime_id,
+    runtime_id:
+      payload.runtime_id === null
+        ? null
+        : typeof payload.runtime_id === 'string'
+          ? payload.runtime_id
+          : stoppedBase.runtime_id,
     launcher_source:
       payload.launcher_source === null
         ? null
@@ -1352,6 +1362,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Build ID: <code>{displayStatusValue(computeStatus.build_id, 'unknown')}</code></p>
         <p style={{ marginBottom: 0 }}>Target triple: <code>{displayStatusValue(computeStatus.target_triple, 'unknown')}</code></p>
         <p style={{ marginBottom: 0 }}>Bundled runtime ID: <code>{displayStatusValue(computeStatus.bundled_runtime_id, 'unknown')}</code></p>
+        <p style={{ marginBottom: 0 }}>Runtime ID: <code>{displayStatusValue(computeStatus.runtime_id, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Launcher source: <code>{displayStatusValue(computeStatus.launcher_source, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Interpreter: <code>{displayStatusValue(computeStatus.interpreter_basename, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Startup elapsed: <code>{computeStatus.startup_elapsed_ms ?? 0}</code> ms{Number.isFinite(computeStatus.startup_deadline_ms) && (computeStatus.startup_deadline_ms ?? 0) > 0 ? <> / <code>{computeStatus.startup_deadline_ms}</code> ms</> : null}</p>

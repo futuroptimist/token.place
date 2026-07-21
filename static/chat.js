@@ -1,6 +1,7 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
+const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
 const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -39,8 +40,15 @@ new Vue({
         computeNodeCount: null,
         computeNodeCountStatus: 'loading',
         computeNodeCountLastUpdated: '',
-        computeNodeCountPoller: null,
-        computeNodeCountRequestId: 0
+        computeNodeCountRequestId: 0,
+        computeNodeCountRefreshInFlight: false,
+        computeNodeCountPollTimeout: null,
+        computeNodeCountRefreshQueued: false,
+        computeNodeCountQueuedRefreshPromise: null,
+        computeNodeCountQueuedRefreshResolve: null,
+        computeNodeCountQueuedRefreshActive: false,
+        computeNodeCountFetchController: null,
+        computeNodeCountDestroyed: false
     },
     mounted() {
         this.detectTouchInput();
@@ -48,9 +56,9 @@ new Vue({
         this.fetchModels();
         this.generateClientKeys();
         this.refreshComputeNodeCount();
-        this.computeNodeCountPoller = setInterval(() => {
-            this.refreshComputeNodeCount();
-        }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
+        if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
+        }
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
@@ -101,17 +109,88 @@ new Vue({
         }
     },
     methods: {
+        clearComputeNodeCountPoller() {
+            if (this.computeNodeCountPollTimeout) {
+                clearTimeout(this.computeNodeCountPollTimeout);
+                this.computeNodeCountPollTimeout = null;
+            }
+        },
+
+        scheduleComputeNodeCountRefresh(delayMs = null) {
+            if (this.computeNodeCountDestroyed) {
+                return;
+            }
+            const nextDelayMs = delayMs === null ? COMPUTE_NODE_COUNT_POLL_INTERVAL_MS : delayMs;
+            if (this.computeNodeCountRefreshInFlight) {
+                if (nextDelayMs === 0 && !this.computeNodeCountQueuedRefreshActive) {
+                    this.computeNodeCountRefreshQueued = true;
+                }
+                return;
+            }
+            this.clearComputeNodeCountPoller();
+            if (typeof document !== 'undefined' && document.hidden) {
+                return;
+            }
+            this.computeNodeCountPollTimeout = setTimeout(() => {
+                this.computeNodeCountPollTimeout = null;
+                this.refreshComputeNodeCount();
+            }, Math.max(0, nextDelayMs));
+        },
+
+        handleComputeNodeCountVisibilityChange() {
+            if (typeof document !== 'undefined' && document.hidden) {
+                this.clearComputeNodeCountPoller();
+                return;
+            }
+            this.scheduleComputeNodeCountRefresh(0);
+        },
+
         async refreshComputeNodeCount(options = {}) {
             // Failover capacity refreshes must be allowed to apply their own
             // successful diagnostics result even if the background poller starts
             // another request before they finish; otherwise a stale count of one
             // can incorrectly suppress probing for a newly registered replacement.
             const applySupersededSuccess = options && options.applySupersededSuccess === true;
+            if (this.computeNodeCountDestroyed) {
+                return false;
+            }
+            if (this.computeNodeCountRefreshInFlight) {
+                if (applySupersededSuccess) {
+                    if (!this.computeNodeCountQueuedRefreshPromise) {
+                        this.computeNodeCountQueuedRefreshPromise = new Promise((resolve) => {
+                            this.computeNodeCountQueuedRefreshResolve = resolve;
+                        });
+                    }
+                    if (!this.computeNodeCountQueuedRefreshActive) {
+                        this.computeNodeCountRefreshQueued = true;
+                    }
+                    return this.computeNodeCountQueuedRefreshPromise;
+                }
+                if (options && options.queueImmediate === true) {
+                    this.computeNodeCountRefreshQueued = true;
+                }
+                return false;
+            }
+            this.computeNodeCountRefreshInFlight = true;
             const requestId = this.computeNodeCountRequestId + 1;
             this.computeNodeCountRequestId = requestId;
+            this.computeNodeCountRefreshQueued = false;
+            const controller = typeof AbortController !== 'undefined'
+                ? new AbortController()
+                : null;
+            this.computeNodeCountFetchController = controller;
+            const requestTimeoutId = setTimeout(() => {
+                if (this.computeNodeCountFetchController === controller && controller) {
+                    controller.abort();
+                }
+            }, COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS);
 
+            const requestStartedAt = Date.now();
             try {
-                const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                const response = await fetch('/relay/diagnostics', {
+                    cache: 'no-store',
+                    signal: controller ? controller.signal : undefined
+                });
                 if (requestId !== this.computeNodeCountRequestId && !applySupersededSuccess) {
                     return false;
                 }
@@ -148,7 +227,47 @@ new Vue({
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';
                 return false;
+            } finally {
+                clearTimeout(requestTimeoutId);
+                if (this.computeNodeCountFetchController === controller) {
+                    this.computeNodeCountFetchController = null;
+                }
+                if (requestId === this.computeNodeCountRequestId || applySupersededSuccess) {
+                    this.computeNodeCountRefreshInFlight = false;
+                    if (this.computeNodeCountDestroyed) {
+                        this.resolveQueuedComputeNodeCountRefresh(false);
+                        this.computeNodeCountRefreshQueued = false;
+                        return;
+                    }
+                    if (this.computeNodeCountRefreshQueued) {
+                        this.computeNodeCountRefreshQueued = false;
+                        const queuedResolve = this.computeNodeCountQueuedRefreshResolve;
+                        if (queuedResolve) {
+                            this.computeNodeCountQueuedRefreshResolve = null;
+                            this.computeNodeCountQueuedRefreshActive = true;
+                            const queuedResult = await this.refreshComputeNodeCount({ applySupersededSuccess: true });
+                            this.computeNodeCountQueuedRefreshActive = false;
+                            this.computeNodeCountQueuedRefreshPromise = null;
+                            queuedResolve(queuedResult === true);
+                        } else {
+                            this.scheduleComputeNodeCountRefresh(0);
+                        }
+                    } else {
+                        const elapsedMs = Date.now() - requestStartedAt;
+                        const nextDelayMs = Math.max(0, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS - elapsedMs);
+                        this.scheduleComputeNodeCountRefresh(nextDelayMs);
+                    }
+                }
             }
+        },
+
+        resolveQueuedComputeNodeCountRefresh(result) {
+            if (this.computeNodeCountQueuedRefreshResolve) {
+                this.computeNodeCountQueuedRefreshResolve(result === true);
+            }
+            this.computeNodeCountQueuedRefreshPromise = null;
+            this.computeNodeCountQueuedRefreshResolve = null;
+            this.computeNodeCountQueuedRefreshActive = false;
         },
 
         detectTouchInput() {
@@ -893,8 +1012,21 @@ new Vue({
 
             const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
             const tierResolution = options.tierResolution || this.resolveContextTierForRequest(apiV1Messages, this.selectedContextTier);
+            const selectedServerContextTierForRequest = this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier
+                ? this.selectedProfileMetadata.selected_context_tier
+                : '';
+            const selectedServerCanSatisfyAutoRequest = Boolean(
+                this.selectedServerPublicKey &&
+                this.selectedServerPublicKeyB64 &&
+                selectedServerContextTierForRequest &&
+                this.selectedContextTierCanSatisfy(selectedServerContextTierForRequest, tierResolution.requestedContextTier)
+            );
             const forceReselect = Boolean(options.forceReselect)
-                || (tierResolution.selectorMode === AUTO_CONTEXT_TIER && options.preserveSelectedServer !== true);
+                || (
+                    tierResolution.selectorMode === AUTO_CONTEXT_TIER &&
+                    options.preserveSelectedServer !== true &&
+                    !selectedServerCanSatisfyAutoRequest
+                );
             const selectedServer = await this.ensureSelectedServer({
                 requestedContextTier: tierResolution.requestedContextTier,
                 forceReselect
@@ -1332,9 +1464,19 @@ new Vue({
         }
     },
     beforeDestroy() {
-        if (this.computeNodeCountPoller) {
-            clearInterval(this.computeNodeCountPoller);
-            this.computeNodeCountPoller = null;
+        this.computeNodeCountDestroyed = true;
+        this.resolveQueuedComputeNodeCountRefresh(false);
+        this.computeNodeCountRefreshQueued = false;
+        this.clearComputeNodeCountPoller();
+        if (
+            this.computeNodeCountFetchController
+            && typeof this.computeNodeCountFetchController.abort === 'function'
+        ) {
+            this.computeNodeCountFetchController.abort();
+        }
+        this.computeNodeCountFetchController = null;
+        if (typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }
         if (!Array.isArray(this.chatHistory)) {
             return;

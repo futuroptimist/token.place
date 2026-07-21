@@ -58,6 +58,33 @@ def test_api_v1_recovery_attempts_negative_value_uses_default(monkeypatch):
 @pytest.mark.parametrize(
     ('raw_value', 'expected'),
     [
+        (None, 3.25),
+        ('', 3.25),
+        ('  ', 3.25),
+        ('2.5', 2.5),
+        ('not-a-float', 3.25),
+        ('nan', 3.25),
+        ('inf', 3.25),
+        ('0', 3.25),
+        ('-1', 3.25),
+    ],
+)
+def test_stop_cleanup_budget_seconds_parses_positive_finite_values(
+    monkeypatch,
+    raw_value,
+    expected,
+):
+    if raw_value is None:
+        monkeypatch.delenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', raising=False)
+    else:
+        monkeypatch.setenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', raw_value)
+
+    assert compute_node_bridge._stop_cleanup_budget_seconds(default=3.25) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw_value', 'expected'),
+    [
         (None, 4),
         ('0', 0),
         ('5', 5),
@@ -268,11 +295,17 @@ class WarmingTimeoutApiV1Runtime(ApiV1Runtime):
         super().__init__(_config)
         WarmingTimeoutApiV1Runtime.last_instance = self
         self.ready_started = threading.Event()
+        self.processed_event = threading.Event()
 
     def ensure_api_v1_runtime_ready(self):
         self.ready_started.set()
         time.sleep(0.2)
         return True
+
+    def process_relay_request(self, payload):
+        result = super().process_relay_request(payload)
+        self.processed_event.set()
+        return result
 
 
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
@@ -572,7 +605,7 @@ def test_run_start_stop_start_resets_stale_cancel_and_registers_again(capsys, mo
     assert first_events[-1]['type'] == 'stopped'
     assert RestartTrackingRuntime.instances[0].relay_session_starts == 1
     assert RestartTrackingRuntime.instances[0].register_attempts >= 1
-    assert RestartTrackingRuntime.instances[0].stopped is True
+    assert RestartTrackingRuntime.instances[0].stopped is False
 
     compute_node_bridge._stop_requested_latched.set()
     compute_node_bridge._stdin_lines.put('{"type":"cancel"}')
@@ -1163,11 +1196,9 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
 
-    stop_counter = {'count': 0}
-
     def fake_stop_requested():
-        stop_counter['count'] += 1
-        return stop_counter['count'] > 2
+        runtime = WarmingTimeoutApiV1Runtime.last_instance
+        return runtime is not None and runtime.processed_event.is_set()
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
@@ -1771,7 +1802,7 @@ def test_run_reports_relay_poll_exception_as_structured_error(capsys, monkeypatc
     assert 'desktop.compute_node_bridge.poll.exception' in output.err
     assert error_event['relay_runtime_state'] == 'failed'
     assert error_event['registered'] is False
-    assert error_event['last_error'] == 'relay poll failed: RuntimeError: network unavailable'
+    assert error_event['last_error'] == 'relay poll failed: RuntimeError; check relay connectivity'
     assert error_event['message'] == error_event['last_error']
     assert error_event['relay_statuses'][0]['last_error'] == error_event['last_error']
 
@@ -2751,8 +2782,8 @@ def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeyp
 
     try:
         assert status == 0
-        assert "stop" in events
-        assert "warm-done" not in events[: events.index("stop") + 1]
+        assert "stop" not in events
+        assert "warm-done" not in events
         # Coarse guard: the behavioral assertions above prove shutdown did not
         # wait for warmup completion. This only catches regressions that block
         # on the full 1s warmup, without making the test depend on CI host speed.
@@ -2805,7 +2836,7 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     )
     assert "poll" not in events
     assert "warm-done" not in events
-    assert "stop" in events
+    assert "stop" not in events
     captured = capsys.readouterr()
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
     error_event = next(event for event in output_events if event.get("type") == "error")
@@ -2831,6 +2862,7 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
     events = []
     poll_started = threading.Event()
     release_poll = threading.Event()
+    latch_started = threading.Event()
 
     class BlockingPollRuntime(FakeRuntime):
         def register_and_poll_once(self):
@@ -2842,6 +2874,20 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
 
         def stop(self):
             events.append("stop")
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.relay_client._api_v1_latch_shutdown = self._latch_shutdown
+            self.relay_client._api_v1_stop_heartbeat_worker = self._stop_heartbeat_worker
+
+        def _latch_shutdown(self):
+            events.append("latch")
+            latch_started.set()
+            release_poll.set()
+
+        def _stop_heartbeat_worker(self, *, shutdown_deadline=None):
+            events.append("heartbeat-joined")
+            return True
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingPollRuntime)
     stop_calls = {"count": 0}
@@ -2861,8 +2907,11 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
 
     try:
         assert status == 0
-        assert "stop" in events
-        assert "poll-done" not in events[: events.index("stop") + 1]
+        assert latch_started.is_set()
+        assert "stop" not in events
+        assert events.index("poll-start") < events.index("latch")
+        assert events.index("latch") < events.index("heartbeat-joined")
+        assert events.index("latch") < events.index("poll-done")
     finally:
         release_poll.set()
     _ = capsys.readouterr()
@@ -3382,7 +3431,6 @@ class ShutdownTrackingRuntime(FakeRuntime):
     def stop(self):
         self.stop_calls += 1
         self.relay_client.stop()
-        self.relay_client.unregister_from_relay()
 
 
 def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch):
@@ -3403,13 +3451,20 @@ def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch
     assert status == 0
     runtime = ShutdownTrackingRuntime.last_instance
     assert runtime.poll_calls == 1
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls >= 1
     assert runtime.relay_client.unregister_calls == 1
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.poll.cancel_requested' in output.err
     assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
     assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload["unregister_required"] is True
+    assert stopped_payload["unregister_attempted"] is True
+    assert stopped_payload["unregister_outcome"] == "complete"
+    assert stopped_payload["unregister_success_count"] == 1
+    assert stopped_payload["unregister_failure_count"] == 0
+    assert stopped_payload["cleanup_warning"] is None
 
 
 class StopFailureRelayClient(FakeRelayClient):
@@ -3460,14 +3515,20 @@ def test_run_continues_shutdown_when_relay_stop_raises(capsys, monkeypatch):
 
     assert status == 0
     runtime = StopFailureRuntime.last_instance
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls == 1
-    assert runtime.relay_client.unregister_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.relay.stop_failed' in output.err
     assert 'exc_type=RuntimeError' in output.err
-    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
-    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+    assert 'desktop.compute_node_bridge.unregister.succeeded' not in output.err
+    stopped = json.loads(output.out.splitlines()[-1])
+    assert stopped['type'] == 'stopped'
+    assert stopped['unregister_required'] is True
+    assert stopped['unregister_attempted'] is False
+    assert stopped['unregister_outcome'] == 'partial'
+    assert stopped['unregister_success_count'] == 0
+    assert stopped['unregister_failure_count'] == 1
 
 
 class UnregisterFailureRelayClient(FakeRelayClient):
@@ -3517,14 +3578,24 @@ def test_run_continues_shutdown_when_unregister_raises(capsys, monkeypatch):
 
     assert status == 0
     runtime = UnregisterFailureRuntime.last_instance
-    assert runtime.stop_calls == 1
+    assert runtime.stop_calls == 0
     assert runtime.relay_client.stop_calls == 1
     assert runtime.relay_client.unregister_calls == 1
     output = capsys.readouterr()
     assert 'desktop.compute_node_bridge.unregister.failed' in output.err
     assert 'exc_type=TimeoutError' in output.err
     assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
-    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['type'] == 'stopped'
+    assert stopped_payload["unregister_required"] is True
+    assert stopped_payload["unregister_attempted"] is True
+    assert stopped_payload["unregister_outcome"] in {"partial", "timed_out"}
+    assert stopped_payload["unregister_success_count"] == 0
+    assert stopped_payload["unregister_failure_count"] >= 1
+    assert "lease expiry" in (stopped_payload.get("cleanup_warning") or "")
+    assert "cipher" not in json.dumps(stopped_payload).lower()
+    assert "prompt" not in json.dumps(stopped_payload).lower()
+    assert "response" not in json.dumps(stopped_payload).lower()
 
 
 def test_cancelable_poll_worker_invokes_cancel_callback_promptly_during_long_poll():
@@ -3993,7 +4064,414 @@ def test_run_logs_unregister_skip_when_cancelled_before_registration(capsys, mon
 
     runtime = PreRegistrationCancelRuntime.last_instance
     assert runtime.relay_client.unregister_calls == 0
-    assert 'desktop.compute_node_bridge.unregister.skipped' in capsys.readouterr().err
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload["unregister_required"] is False
+    assert stopped_payload["unregister_attempted"] is False
+    assert stopped_payload["unregister_outcome"] == "not_required"
+
+
+class MultiRelayShutdownRelayClient(FakeRelayClient):
+    def __init__(self, relay_url, *, unregister_result=True, unregister_delay=0.0):
+        self.relay_url = relay_url
+        self.stop_calls = 0
+        self.unregister_calls = 0
+        self.unregister_result = unregister_result
+        self.unregister_delay = unregister_delay
+        self.shutdown_deadlines = []
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self, *, shutdown_deadline=None):
+        self.unregister_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.unregister_delay:
+            time.sleep(self.unregister_delay)
+        return self.unregister_result
+
+
+class MultiRelayShutdownRuntime(FakeRuntime):
+    instances = []
+    outcomes_by_relay = {}
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        self.model_manager = model_manager or FakeModelManager()
+        self.crypto_manager = crypto_manager or object()
+        result, delay = self.outcomes_by_relay.get(config.relay_url, (True, 0.0))
+        self.relay_client = MultiRelayShutdownRelayClient(
+            config.relay_url,
+            unregister_result=result,
+            unregister_delay=delay,
+        )
+        self.poll_calls = 0
+        self.stop_calls = 0
+        self._processed = []
+        MultiRelayShutdownRuntime.instances.append(self)
+
+    def register_and_poll_once(self):
+        self.poll_calls += 1
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+def test_run_reports_partial_cleanup_when_one_registered_relay_unregister_fails(
+    capsys,
+    monkeypatch,
+):
+    _reset_cancel_queue()
+    MultiRelayShutdownRuntime.instances = []
+    MultiRelayShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.0),
+        'https://relay-b.example': (False, 0.0),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MultiRelayShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_urls=['https://relay-b.example'],
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 1
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert all(
+        instance.relay_client.unregister_calls == 1
+        for instance in MultiRelayShutdownRuntime.instances
+    )
+    assert all(
+        instance.relay_client.shutdown_deadlines
+        for instance in MultiRelayShutdownRuntime.instances
+    )
+    assert output.err.count('desktop.compute_node_bridge.unregister.attempted') == 2
+    assert output.err.count('desktop.compute_node_bridge.unregister.succeeded') == 1
+    assert output.err.count('desktop.compute_node_bridge.unregister.failed') == 1
+
+
+def test_run_reports_timed_out_cleanup_when_registered_relay_exceeds_budget(
+    capsys,
+    monkeypatch,
+):
+    _reset_cancel_queue()
+    MultiRelayShutdownRuntime.instances = []
+    MultiRelayShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.03),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MultiRelayShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_stop_cleanup_budget_seconds',
+        lambda default=0.0: 0.001,
+    )
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is True
+    assert stopped_payload['unregister_outcome'] == 'timed_out'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert MultiRelayShutdownRuntime.instances[0].relay_client.unregister_calls == 1
+    assert 'desktop.compute_node_bridge.unregister.attempted' in output.err
+
+
+class LegacySignatureRelayClient(MultiRelayShutdownRelayClient):
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        self.shutdown_deadlines.append('legacy-signature')
+        return self.unregister_result
+
+
+class LegacySignatureShutdownRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        result, delay = self.outcomes_by_relay.get(config.relay_url, (True, 0.0))
+        self.relay_client = LegacySignatureRelayClient(
+            config.relay_url,
+            unregister_result=result,
+            unregister_delay=delay,
+        )
+        LegacySignatureShutdownRuntime.instances.append(self)
+
+
+def test_run_supports_legacy_unregister_signature_during_cleanup(capsys, monkeypatch):
+    _reset_cancel_queue()
+    LegacySignatureShutdownRuntime.instances = []
+    LegacySignatureShutdownRuntime.outcomes_by_relay = {
+        'https://relay-a.example': (True, 0.0),
+    }
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LegacySignatureShutdownRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_outcome'] == 'complete'
+    assert stopped_payload['unregister_success_count'] == 1
+    assert stopped_payload['unregister_failure_count'] == 0
+    runtime = LegacySignatureShutdownRuntime.instances[0]
+    assert runtime.relay_client.shutdown_deadlines == ['legacy-signature']
+    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
+
+
+class NoUnregisterRelayClient(FakeRelayClient):
+    def __init__(self, relay_url):
+        self.relay_url = relay_url
+        self.stop_calls = 0
+        self._api_v1_registered_relays = {relay_url}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class NoUnregisterRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = NoUnregisterRelayClient(config.relay_url)
+        NoUnregisterRuntime.instances.append(self)
+
+
+def test_run_treats_registered_relay_without_unregister_hook_as_cleanup_failure(capsys, monkeypatch):
+    _reset_cancel_queue()
+    NoUnregisterRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NoUnregisterRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is False
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'lease expiry' in stopped_payload['cleanup_warning']
+    assert 'desktop.compute_node_bridge.unregister.failed' in output.err
+    assert 'reason=missing_unregister_hook' in output.err
+
+class LatchFailureRelayClient(MultiRelayShutdownRelayClient):
+    def __init__(self, relay_url):
+        super().__init__(relay_url, unregister_result=True, unregister_delay=0.0)
+        self._api_v1_registered_relays = {relay_url}
+        self.latch_calls = 0
+
+    def _api_v1_latch_shutdown(self):
+        self.latch_calls += 1
+        raise RuntimeError('latch failed with https://secret.example?token=abc')
+
+
+class LatchFailureRuntime(MultiRelayShutdownRuntime):
+    instances = []
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = LatchFailureRelayClient(config.relay_url)
+        LatchFailureRuntime.instances.append(self)
+
+
+def test_run_reports_partial_cleanup_when_shutdown_latch_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    LatchFailureRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LatchFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example/path?token=secret',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+    runtime = LatchFailureRuntime.instances[0]
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is False
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert 'desktop.compute_node_bridge.relay.latch_failed' in output.err
+    assert 'token=secret' not in output.err
+    assert 'secret.example' not in output.err
+
+
+class QuiesceFailureRelayClient(MultiRelayShutdownRelayClient):
+    def __init__(self, relay_url, *, fail_wait=False, fail_heartbeat=False):
+        super().__init__(relay_url, unregister_result=True, unregister_delay=0.0)
+        self._api_v1_registered_relays = {relay_url}
+        self.fail_wait = fail_wait
+        self.fail_heartbeat = fail_heartbeat
+        self.latch_calls = 0
+        self.wait_calls = 0
+        self.heartbeat_stop_calls = 0
+
+    def _api_v1_latch_shutdown(self):
+        self.latch_calls += 1
+
+    def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline=None):
+        self.wait_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.fail_wait:
+            raise RuntimeError('wait failed with https://secret.example?token=abc')
+        return True
+
+    def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline=None):
+        self.heartbeat_stop_calls += 1
+        self.shutdown_deadlines.append(shutdown_deadline)
+        if self.fail_heartbeat:
+            raise RuntimeError('heartbeat failed with https://secret.example?token=abc')
+        return True
+
+
+class QuiesceFailureRuntime(MultiRelayShutdownRuntime):
+    instances = []
+    fail_wait = False
+    fail_heartbeat = False
+
+    def __init__(self, config, *_, model_manager=None, crypto_manager=None):
+        super().__init__(config, *_, model_manager=model_manager, crypto_manager=crypto_manager)
+        self.relay_client = QuiesceFailureRelayClient(
+            config.relay_url,
+            fail_wait=self.fail_wait,
+            fail_heartbeat=self.fail_heartbeat,
+        )
+        QuiesceFailureRuntime.instances.append(self)
+
+
+def _run_quiesce_failure(monkeypatch, capsys, *, fail_wait=False, fail_heartbeat=False):
+    _reset_cancel_queue()
+    QuiesceFailureRuntime.instances = []
+    QuiesceFailureRuntime.fail_wait = fail_wait
+    QuiesceFailureRuntime.fail_heartbeat = fail_heartbeat
+    _install_fake_runtime_module(monkeypatch, runtime_cls=QuiesceFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://relay-a.example/path?token=secret',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    return capsys.readouterr(), QuiesceFailureRuntime.instances[0]
+
+
+def test_run_reports_partial_cleanup_when_mutation_quiescence_raises(capsys, monkeypatch):
+    output, runtime = _run_quiesce_failure(monkeypatch, capsys, fail_wait=True)
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is False
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.wait_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert 'desktop.compute_node_bridge.relay.quiesce_failed' in output.err
+    assert 'token=secret' not in output.err
+
+
+def test_run_reports_partial_cleanup_when_heartbeat_quiescence_raises(capsys, monkeypatch):
+    output, runtime = _run_quiesce_failure(monkeypatch, capsys, fail_heartbeat=True)
+    stopped_payload = json.loads(output.out.splitlines()[-1])
+
+    assert stopped_payload['unregister_required'] is True
+    assert stopped_payload['unregister_attempted'] is False
+    assert stopped_payload['unregister_outcome'] == 'partial'
+    assert stopped_payload['unregister_success_count'] == 0
+    assert stopped_payload['unregister_failure_count'] == 1
+    assert runtime.relay_client.latch_calls == 1
+    assert runtime.relay_client.wait_calls == 1
+    assert runtime.relay_client.heartbeat_stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    assert 'desktop.compute_node_bridge.relay.quiesce_failed' in output.err
+    assert 'token=secret' not in output.err
 
 
 def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
@@ -5265,3 +5743,112 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     ]
     assert warming_status_events
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
+
+
+def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):
+    from utils.processing_result import RelayProcessingResult
+
+    _reset_cancel_queue()
+    inference_entered = threading.Event()
+    release_inference = threading.Event()
+    unregister_called = threading.Event()
+    latch_called = threading.Event()
+    heartbeat_stopped = threading.Event()
+    submitted_after_latch = []
+
+    class BlockingRelayClient(FakeRelayClient):
+        def __init__(self):
+            self.relay_url = 'https://token.place'
+            self._api_v1_registered_relays = {self.relay_url}
+            self.unregister_calls = 0
+            self.latch_calls = 0
+
+        def _api_v1_latch_shutdown(self):
+            self.latch_calls += 1
+            latch_called.set()
+
+        def _api_v1_wait_for_mutation_quiescence(self, *, shutdown_deadline=None):
+            return True
+
+        def _api_v1_stop_heartbeat_worker(self, *, shutdown_deadline=None):
+            heartbeat_stopped.set()
+            return True
+
+        def unregister_from_relay(self, *, shutdown_deadline=None):
+            self.unregister_calls += 1
+            unregister_called.set()
+            self._api_v1_registered_relays.clear()
+            return True
+
+        def submit_api_v1_error_response(self, *args, **kwargs):
+            submitted_after_latch.append(('fallback', args, kwargs))
+            return True
+
+    class BlockingInferenceRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, config):
+            BlockingInferenceRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = BlockingRelayClient()
+            self._responses = [{
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-blocked-inference',
+                'client_public_key': 'client-key',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
+                'next_ping_in_x_seconds': 0,
+            }]
+            self._processed = []
+
+        def register_and_poll_once(self):
+            if self._responses:
+                return self._responses.pop(0)
+            time.sleep(0.01)
+            return {'next_ping_in_x_seconds': 0}
+
+        def process_relay_request_result(self, payload):
+            self._processed.append(payload)
+            inference_entered.set()
+            release_inference.wait(timeout=5.0)
+            return RelayProcessingResult(
+                inference_succeeded=False,
+                submitted=False,
+                safe_error_code='compute_node_process_failed',
+                runtime_healthy=True,
+            )
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingInferenceRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_STOP_CLEANUP_BUDGET_SECONDS', '1.0')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    result_holder = {}
+    started = time.monotonic()
+    worker = threading.Thread(target=lambda: result_holder.setdefault('status', compute_node_bridge.run(args)))
+    worker.start()
+    try:
+        assert inference_entered.wait(timeout=2.0)
+        compute_node_bridge._stdin_lines.put('{"type":"cancel"}\n')
+        assert latch_called.wait(timeout=1.0)
+        assert heartbeat_stopped.wait(timeout=1.0)
+        assert unregister_called.wait(timeout=1.0)
+        worker.join(timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert not worker.is_alive()
+        assert elapsed < 2.0
+        assert result_holder['status'] == 0
+        runtime = BlockingInferenceRuntime.last_instance
+        assert runtime.relay_client.unregister_calls == 1
+        assert not submitted_after_latch
+        output = capsys.readouterr()
+        events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+        stopped = [event for event in events if event.get('type') == 'stopped'][-1]
+        assert stopped['unregister_outcome'] == 'complete'
+        assert stopped['unregister_attempted'] is True
+        assert stopped['unregister_success_count'] == 1
+        assert stopped['unregister_failure_count'] == 0
+    finally:
+        release_inference.set()
+        worker.join(timeout=2.0)

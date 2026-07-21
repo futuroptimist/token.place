@@ -1687,6 +1687,64 @@ describe('desktop app start failure handling', () => {
     resolveStart?.();
   });
 
+  it('ignores a stale start rejection after a replacement operator is healthy', async () => {
+    let rejectFirstStart: ((error: Error) => void) | undefined;
+    invokeMock.mockImplementation((command: string, args?: unknown) => {
+      if (command === 'start_compute_node') {
+        const startCalls = invokeMock.mock.calls.filter(([called]) => called === 'start_compute_node').length;
+        if (startCalls === 1) {
+          return new Promise<void>((_resolve, reject) => {
+            rejectFirstStart = reject;
+          });
+        }
+        return Promise.resolve();
+      }
+      return mockInitialCommand(command, args);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect(eventHandlers.has('compute_node_event')).toBe(true));
+    eventHandlers.get('compute_node_event')?.({
+      payload: {
+        type: 'error',
+        operator_session_id: 'session-1',
+        sequence: 1,
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        worker_state: 'failed',
+        last_error: 'first startup failed',
+      },
+    });
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+    eventHandlers.get('compute_node_event')?.({
+      payload: {
+        type: 'started',
+        operator_session_id: 'session-2',
+        sequence: 1,
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        worker_state: 'ready',
+        active_relay_url: 'https://token.place',
+        registered_relay_count: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    rejectFirstStart?.(new Error('late session-1 rejection'));
+
+    await waitFor(() => expect(screen.getByText(/Worker state:/).textContent).toContain('ready'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    expect(screen.queryByText(/late session-1 rejection/)).toBeNull();
+    expect(screen.getByText(/Last error:/).textContent).not.toContain('late session-1 rejection');
+  });
+
   it('saves normalized relay_base_urls and first-url relay_base_url compatibility', async () => {
     render(<App />);
     const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;

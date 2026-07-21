@@ -5144,35 +5144,69 @@ def test_close_llm_proxy_processless_close_timeout_invokes_fatal_and_joins_execu
     assert not surviving, f"Leaked executor threads: {surviving}"
 
 
-def test_close_llm_proxy_processless_no_fatal_callback_timeout_returns_failure(tmp_path, monkeypatch):
-    """Blocking processless close() with no fatal_callback returns False after deadline."""
-    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_TIMEOUT_SECONDS', 0.05)
+def test_close_llm_proxy_processless_no_fatal_callback_hard_exits_subprocess(tmp_path):
+    """No fatal_callback + blocking close() triggers _processless_close_hard_exit (os._exit(1)).
 
-    close_entered = threading.Event()
-    close_release = threading.Event()
+    The old behaviour released the executor without joining the thread and
+    returned False, which left an unjoinable thread alive.  The replacement
+    calls ``_processless_close_hard_exit`` (os._exit(1)), terminating the
+    disposable process so no executor thread is ever abandoned.
 
-    def blocking_close():
-        close_entered.set()
-        close_release.wait(timeout=5.0)
+    This test spawns a disposable child process so that the real os._exit is
+    exercised without affecting the test runner.  The child must exit with a
+    nonzero code, and execution must never reach the post-cleanup marker.
+    """
+    repo_root = str(Path(__file__).resolve().parents[2])
 
-    worker = SimpleNamespace(close=blocking_close)
-    result = manager._close_llm_proxy(worker, terminate_process=True)
+    child_script = tmp_path / 'child_no_fatal.py'
+    child_script.write_text(
+        f"""\
+import sys
+import threading
+sys.path.insert(0, {repo_root!r})
+import utils.llm.model_manager as mm_mod
 
-    assert result is False
-    assert close_entered.is_set()
-    # Unblock the executor thread so it can complete naturally.
-    close_release.set()
-    # Join the worker_processless_close thread to verify it was not truly
-    # abandoned: the thread must complete after being unblocked.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
-        if not surviving:
-            break
-        surviving[0].join(timeout=0.1)
-    surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
-    assert not surviving, f"worker_processless_close thread not joined after unblocking: {surviving}"
+# Use a very short deadline to keep the test fast.
+mm_mod._PROCESSLESS_CLOSE_TIMEOUT_SECONDS = 0.05
+mm_mod._POST_FATAL_DRAIN_TIMEOUT_SECONDS = 0.05
+
+manager = mm_mod.ModelManager.__new__(mm_mod.ModelManager)
+# _close_llm_proxy's terminate_process=True path never references self attributes
+# other than log_warning (which is on the non-cancellation branch).
+
+close_release = threading.Event()
+def blocking_close():
+    close_release.wait(30.0)
+
+from types import SimpleNamespace
+worker = SimpleNamespace(close=blocking_close)
+
+# No fatal_callback supplied: must trigger _processless_close_hard_exit -> os._exit(1)
+manager._close_llm_proxy(worker, terminate_process=True)
+
+# Execution must never reach here because _processless_close_hard_exit is no-return.
+print("MARKER_REACHED_AFTER_CLOSE", flush=True)
+sys.exit(0)
+"""
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(child_script)],
+        timeout=15,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected nonzero exit from _processless_close_hard_exit, "
+        f"got {result.returncode}. stdout: {result.stdout!r}"
+    )
+    assert 'MARKER_REACHED_AFTER_CLOSE' not in result.stdout, (
+        "Execution must not reach the post-cleanup marker"
+    )
+    assert 'processless_close_hard_exit' in result.stderr, (
+        f"Expected hard-exit log line in stderr: {result.stderr!r}"
+    )
 
 
 

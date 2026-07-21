@@ -28,7 +28,7 @@ import threading
 import sysconfig
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Dict, List, Any, Optional, Iterable, Tuple
+from typing import Callable, Dict, List, Any, Optional, Iterable, Tuple, NoReturn
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 
 from utils.system import resource_monitor
@@ -98,6 +98,24 @@ _PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS: float = 0.05
 # returned (test / non-production environments where the callback unblocks
 # the thread instead of terminating the process).
 _POST_FATAL_DRAIN_TIMEOUT_SECONDS: float = 0.5
+
+
+def _processless_close_hard_exit(reason: str) -> NoReturn:
+    """Private no-return fallback when processless-worker cleanup cannot complete.
+
+    Called when fatal_callback is absent or returned without quiescing the
+    close future.  Emits a privacy-safe log line then calls ``os._exit(1)``
+    so the executor thread is never abandoned.  In production this is always
+    no-return; code after this call is unreachable.
+    """
+    print(
+        f"utils.llm.model_manager.processless_close_hard_exit reason={reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(1)
+
+
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
     'runtime_model_path_unavailable',
@@ -5992,13 +6010,16 @@ class ModelManager:
                     # included for clarity and forward-compatibility.
                     _close_executor.shutdown(wait=True, cancel_futures=True)
                 else:
-                    # Deadline exceeded with no usable fatal callback (or fatal returned
-                    # without unblocking the thread).  Signal the executor to stop
-                    # accepting new work and release its internal queue; the running
-                    # close() thread will complete when it returns naturally (bounded by
-                    # its own internal timeout).  In production fatal_callback must
-                    # always be wired (os._exit(1)) so this branch should not be reached.
-                    _close_executor.shutdown(wait=False, cancel_futures=True)
+                    # fatal_callback (if any) returned without quiescing the
+                    # close future, or no callback was wired.  Private no-return
+                    # hard-exit: in production os._exit(1) terminates the
+                    # disposable process so the executor thread is never
+                    # abandoned.  Code after this call is unreachable in
+                    # production.
+                    _processless_close_hard_exit(
+                        reason='api_v1_worker_processless_close_timeout'
+                    )
+                    # Unreachable in production.  Retain failure state.
                     process_stopped = False
             else:
                 # Non-cancellation path: call close() directly (existing behavior).

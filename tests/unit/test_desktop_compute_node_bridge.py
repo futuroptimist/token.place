@@ -6298,6 +6298,117 @@ def test_wire_fatal_teardown_callback_calls_os_exit(monkeypatch):
     assert 'api_v1_executor_cleanup_timeout' in stderr_content
 
 
+def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_path):
+    """Proves that _wire_fatal_teardown_for_runtime wires real os._exit(1) that is invoked
+    when _supervise_api_v1_inference cannot quiesce a blocking inference thread.
+
+    Spawns a disposable child process that:
+      1. Creates a minimal RelayClient.
+      2. Wires fatal via compute_node_bridge._wire_fatal_teardown_for_runtime().
+      3. Runs _supervise_api_v1_inference with a blocking inference thread and a
+         past local deadline.
+      4. Terminates through the real no-return os._exit(1) path.
+
+    The child must exit with a nonzero code and must not print the post-fatal
+    marker.  'fatal_teardown' must appear in stderr (from the bridge's privacy-safe
+    lifecycle log).
+    """
+    repo_root = str(MODULE_PATH.parents[3])
+    bridge_python_dir = str(MODULE_PATH.parent)
+    bridge_path = str(MODULE_PATH)
+
+    child_script = tmp_path / 'child_bridge_fatal.py'
+    child_script.write_text(
+        f"""\
+import sys
+import os
+import time
+import threading
+import importlib.util
+# Import repo modules FIRST so they are cached in sys.modules before
+# compute_node_bridge's path_bootstrap may reorder sys.path.
+sys.path.insert(0, {repo_root!r})
+
+# Shorten cleanup budget so the test exits quickly.
+import utils.networking.relay_client as rcm
+rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
+
+# Create a minimal RelayClient.
+from unittest.mock import MagicMock, patch
+crypto = MagicMock()
+crypto.public_key_b64 = 'testkey'
+model = MagicMock()
+config = MagicMock()
+config.is_production = False
+config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
+with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
+    client = rcm.RelayClient('http://relay.example', 443, crypto, model)
+
+client._last_api_v1_work_relay_url = 'http://relay.example'
+client._polling_stopped_by_request = False
+
+# Inference blocks forever so the quiescence check always times out.
+release_inference = threading.Event()
+def blocking_generate(**_kw):
+    release_inference.wait(60.0)
+    return {{'request_id': 'ok'}}
+client._generate_api_v1_response_with_runtime_model = blocking_generate
+
+# Terminate does not unblock inference, so inference_quiesced stays False.
+client._terminate_current_llama_worker = lambda reason, recreate=True: True
+
+# Import compute_node_bridge via importlib (same as the test file) so that
+# path_bootstrap does not clobber already-imported modules.
+spec = importlib.util.spec_from_file_location('compute_node_bridge', {bridge_path!r})
+compute_node_bridge = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(compute_node_bridge)
+
+# Wire the real no-return fatal callback.
+class FakeRuntime:
+    relay_client = client
+    def wire_fatal_bridge_teardown(self, cb):
+        self.relay_client.fatal_bridge_teardown = cb
+
+compute_node_bridge._wire_fatal_teardown_for_runtime(FakeRuntime())
+
+# Use a past local deadline so the poll loop exits on the first iteration.
+local_deadline = time.monotonic() - 1.0
+
+# This call must trigger fatal_bridge_teardown (-> os._exit(1)) when the
+# inference future is still alive after the quiescence window.
+client._supervise_api_v1_inference({{
+    'request_id': 'bridge-fatal-test',
+    'model': 'llama',
+    'messages': [],
+    'options': {{}},
+    'routing': {{'context_tier': '8k-fast'}},
+}}, local_deadline=local_deadline)
+
+# Must never be reached; fatal_bridge_teardown is no-return.
+print("MARKER_REACHED_AFTER_SUPERVISE", flush=True)
+sys.exit(0)
+"""
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(child_script)],
+        timeout=20,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+        f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
+    )
+    assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
+        "Execution must not reach the post-fatal marker"
+    )
+    assert 'fatal_teardown' in result.stderr, (
+        f"Expected 'fatal_teardown' lifecycle log in stderr: {result.stderr!r}"
+    )
+
+
 def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):
     from utils.processing_result import RelayProcessingResult
 

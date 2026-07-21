@@ -5161,8 +5161,18 @@ def test_close_llm_proxy_processless_no_fatal_callback_timeout_returns_failure(t
 
     assert result is False
     assert close_entered.is_set()
-    # Unblock the thread to avoid test leaks
+    # Unblock the executor thread so it can complete naturally.
     close_release.set()
+    # Join the worker_processless_close thread to verify it was not truly
+    # abandoned: the thread must complete after being unblocked.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
+        if not surviving:
+            break
+        surviving[0].join(timeout=0.1)
+    surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
+    assert not surviving, f"worker_processless_close thread not joined after unblocking: {surviving}"
 
 
 
@@ -5212,6 +5222,88 @@ def test_ensure_replacement_fails_when_stale_worker_cleanup_unverified(tmp_path,
     manager._close_llm_proxy.assert_called_once_with(worker)
     manager.get_llm_instance.assert_not_called()
     assert manager.worker_state == "failed"
+
+
+def test_model_manager_cancellation_barrier_gates_replacement_during_cleanup(tmp_path, monkeypatch):
+    """
+    Generation barrier: get_llm_instance() must return None while stale-worker
+    cleanup is in progress.  Only after the matching generation's cleanup
+    succeeds is a replacement allowed to initialize.
+    """
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    worker = SimpleNamespace(is_alive=MagicMock(return_value=False))
+    manager.llm = worker
+    initial_gen = manager._llm_generation
+
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+    replacement = SimpleNamespace()
+    get_llm_calls = []
+
+    real_get_llm = manager.get_llm_instance
+
+    def blocking_close(llm, **kwargs):
+        cleanup_entered.set()
+        cleanup_release.wait(timeout=5.0)
+        return True
+
+    original_get_llm = manager.get_llm_instance
+
+    def intercepted_get_llm():
+        get_llm_calls.append(manager._cleanup_barrier_generation)
+        return replacement
+
+    monkeypatch.setattr(manager, "_close_llm_proxy", blocking_close)
+    monkeypatch.setattr(manager, "get_llm_instance", intercepted_get_llm)
+
+    # Start terminate in a background thread; it will block in blocking_close.
+    result_holder = []
+
+    def do_terminate():
+        result_holder.append(
+            manager.terminate_active_worker_for_cancellation(reason='cancelled', recreate=True)
+        )
+
+    t = threading.Thread(target=do_terminate)
+    t.start()
+
+    # Wait until cleanup has entered the blocking close.
+    assert cleanup_entered.wait(timeout=5.0), "cleanup did not start"
+
+    # While cleanup is in progress, the barrier must prevent replacement init.
+    with manager.llm_lock:
+        barrier_during_cleanup = manager._cleanup_barrier_generation
+
+    assert barrier_during_cleanup == initial_gen, (
+        f"Expected barrier={initial_gen}, got {barrier_during_cleanup}"
+    )
+    # get_llm_instance is not yet called because cleanup hasn't finished.
+    assert not get_llm_calls, "get_llm_instance called before cleanup finished"
+
+    # Also verify get_llm_instance() would be blocked by the barrier directly.
+    monkeypatch.setattr(manager, "get_llm_instance", intercepted_get_llm)
+
+    # Unblock cleanup so terminate_active_worker_for_cancellation can proceed.
+    cleanup_release.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "terminate thread did not finish"
+
+    # Barrier must be cleared after successful cleanup.
+    with manager.llm_lock:
+        barrier_after_cleanup = manager._cleanup_barrier_generation
+    assert barrier_after_cleanup is None, (
+        f"Barrier not cleared after cleanup: {barrier_after_cleanup}"
+    )
+
+    # get_llm_instance should have been called exactly once (for recreation),
+    # after the barrier was cleared.
+    assert len(get_llm_calls) == 1
+    assert get_llm_calls[0] is None, (
+        f"get_llm_instance called while barrier was still set: {get_llm_calls[0]}"
+    )
+
+    assert result_holder == [True]
+
 
 def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
     first = _RestartableFakeWorker("first", fail="dead")

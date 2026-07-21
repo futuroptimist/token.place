@@ -89,6 +89,8 @@ _INIT_SAFE_CATEGORY_ALIASES = {
 # Maximum wall-clock seconds allotted to processless worker close() under
 # bounded cancellation cleanup.  Must fit within the supervisor cleanup budget
 # (_API_V1_CLEANUP_BUDGET_SECONDS in relay_client) with room for fatal teardown.
+# Must exceed 1 s in production so a momentarily stressed kernel has time to
+# schedule the close() thread; tests may monkeypatch to a shorter value for speed.
 _PROCESSLESS_CLOSE_TIMEOUT_SECONDS: float = 4.0
 # Polling interval used when waiting on the processless-close future.
 _PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS: float = 0.05
@@ -4415,6 +4417,11 @@ class ModelManager:
         self.child_model_path_exists = False
         self.llm_lock = Lock()
         self._llm_generation = 0
+        # Generation whose stale-worker cleanup is currently in progress.  Set
+        # (under llm_lock) when cleanup starts; cleared only on successful
+        # completion for the matching generation.  Gates get_llm_instance() so
+        # no replacement is initialized while cleanup is pending or failed.
+        self._cleanup_barrier_generation: Optional[int] = None
         self._llm_cancel_generation_event = threading.Event()
         self._llm_cancellation_epoch = 0
         self.worker_restart_count = 0
@@ -5358,6 +5365,10 @@ class ModelManager:
             with self.llm_lock:
                 # Double-check after acquiring lock
                 if self.llm is None:
+                    # Generation barrier: stale-worker cleanup is in progress;
+                    # block replacement until that generation's cleanup succeeds.
+                    if self._cleanup_barrier_generation is not None:
+                        return None
                     if not os.path.exists(self.model_path):
                         self.log_error("Error: Model file does not exist. LLM not initialized.")
                         return None
@@ -5805,6 +5816,7 @@ class ModelManager:
         """Terminate the active subprocess-backed llama worker and require clean recreation."""
         safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
         should_recreate_without_active_worker = False
+        cleanup_gen: Optional[int] = None
         with self.llm_lock:
             llm = self.llm
             if llm is None:
@@ -5825,11 +5837,15 @@ class ModelManager:
                 self.worker_state = 'recovering'
                 self.worker_restart_count += 1
                 self.last_worker_restart_at_ms = int(time.time() * 1000)
+                cleanup_gen = self._llm_generation
                 self.llm = None
                 self._llm_generation += 1
                 self._llm_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0) + 1
                 self._llm_cancel_generation_event.set()
                 self._llm_cancel_generation_event = threading.Event()
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
         if should_recreate_without_active_worker:
             try:
                 return self.get_llm_instance() is not None
@@ -5837,9 +5853,15 @@ class ModelManager:
                 self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
                 return False
         old_worker_stopped = self._close_llm_proxy(llm, terminate_process=True, fatal_callback=fatal_callback)
+        with self.llm_lock:
+            if self._cleanup_barrier_generation == cleanup_gen:
+                if old_worker_stopped:
+                    # Cleanup succeeded: clear barrier so replacement can be initialized.
+                    self._cleanup_barrier_generation = None
+                else:
+                    # Cleanup failed: keep barrier set and mark worker failed.
+                    self.worker_state = 'failed'
         if not old_worker_stopped:
-            with self.llm_lock:
-                self.worker_state = 'failed'
             return False
         if not recreate:
             return True
@@ -5970,8 +5992,13 @@ class ModelManager:
                     # included for clarity and forward-compatibility.
                     _close_executor.shutdown(wait=True, cancel_futures=True)
                 else:
-                    # Still running after fatal (fatal must be no-return in production;
-                    # a test that injects a returning fatal must unblock the thread).
+                    # Deadline exceeded with no usable fatal callback (or fatal returned
+                    # without unblocking the thread).  Signal the executor to stop
+                    # accepting new work and release its internal queue; the running
+                    # close() thread will complete when it returns naturally (bounded by
+                    # its own internal timeout).  In production fatal_callback must
+                    # always be wired (os._exit(1)) so this branch should not be reached.
+                    _close_executor.shutdown(wait=False, cancel_futures=True)
                     process_stopped = False
             else:
                 # Non-cancellation path: call close() directly (existing behavior).
@@ -6044,6 +6071,7 @@ class ModelManager:
     def _invalidate_llm_if_current(self, failed_llm: Any, error: Any = None) -> int:
         dead_worker_log_message: Optional[str] = None
         detached_llm = None
+        cleanup_gen: Optional[int] = None
         with self.llm_lock:
             if self.llm is failed_llm:
                 detached_llm = self.llm
@@ -6057,12 +6085,25 @@ class ModelManager:
                     f"safe_error_code={self.last_worker_error_code} worker_generation={self._llm_generation} "
                     f"worker_restart_count={self.worker_restart_count} exit_code={self.last_worker_exit_code}"
                 )
+                cleanup_gen = self._llm_generation
                 self.llm = None
                 self._llm_generation += 1
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
             generation = self._llm_generation
-        if detached_llm is not None and not self._close_llm_proxy(detached_llm):
+        if detached_llm is not None:
+            close_ok = self._close_llm_proxy(detached_llm)
             with self.llm_lock:
-                self.worker_state = 'failed'
+                if self._cleanup_barrier_generation == cleanup_gen:
+                    if close_ok:
+                        # Cleanup succeeded: clear barrier so replacement can initialize.
+                        self._cleanup_barrier_generation = None
+                    else:
+                        # Cleanup failed: keep barrier set and mark worker failed.
+                        self.worker_state = 'failed'
+                # Stale cleanup (barrier has moved to a newer generation): don't
+                # override the newer generation's barrier or worker_state.
         if dead_worker_log_message is not None:
             self.log_warning(dead_worker_log_message)
         return generation
@@ -6070,22 +6111,36 @@ class ModelManager:
     def _ensure_replacement_llm(self, observed_generation: int) -> Any:
         replacement_attempt_log_message: Optional[str] = None
         detached_llm = None
+        cleanup_gen: Optional[int] = None
         with self.llm_lock:
             if self.llm is not None and self._llm_is_usable(self.llm):
                 return self.llm
             if self.llm is not None:
                 detached_llm = self.llm
+                cleanup_gen = self._llm_generation
                 self.llm = None
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
             if self._llm_generation == observed_generation:
                 self._llm_generation += 1
             self.worker_state = 'recovering'
             replacement_attempt_log_message = "desktop.llama_cpp_worker.replacement_attempt event=replacement_attempt worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count)
             # Release llm_lock before cleanup/get_llm_instance() because both may
             # call third-party code and initialization re-acquires this non-reentrant lock.
-        if detached_llm is not None and not self._close_llm_proxy(detached_llm):
+        if detached_llm is not None:
+            close_ok = self._close_llm_proxy(detached_llm)
             with self.llm_lock:
-                self.worker_state = 'failed'
-            return None
+                if self._cleanup_barrier_generation == cleanup_gen:
+                    if close_ok:
+                        # Cleanup succeeded: clear barrier so replacement can initialize.
+                        self._cleanup_barrier_generation = None
+                    else:
+                        # Cleanup failed: keep barrier set and mark worker failed.
+                        self.worker_state = 'failed'
+                # Stale cleanup: don't override newer generation's barrier or worker_state.
+            if not close_ok:
+                return None
         if replacement_attempt_log_message is not None:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()

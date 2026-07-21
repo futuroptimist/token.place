@@ -5434,6 +5434,10 @@ def test_terminate_active_worker_close_failure_sets_worker_failed(monkeypatch):
 
     assert result is False
     assert manager.worker_state == 'failed'
+    # Verify state metadata was correctly recorded before the failed close
+    assert manager.last_worker_error_code == 'cancelled'
+    assert manager.last_worker_restart_at_ms == 100000
+    assert manager.worker_restart_count == 1
     get_llm_instance.assert_not_called()
 
 
@@ -5482,9 +5486,12 @@ def test_close_llm_proxy_post_fatal_drain_exception_breaks_inner_loop(tmp_path, 
     # 2. fatal_callback releases close().
     # 3. close() raises RuntimeError — the inner post-fatal drain catches it and breaks.
     close_release = threading.Event()
+    # Timeout generous relative to the test's configured drain budget (0.15s) to
+    # prevent flakiness while still completing well within the test's wall time.
+    _CLOSE_RELEASE_TIMEOUT = 5.0
 
     def slow_raising_close():
-        close_release.wait(timeout=5.0)
+        close_release.wait(timeout=_CLOSE_RELEASE_TIMEOUT)
         raise RuntimeError("close raised after fatal")
 
     fatal_calls = []

@@ -5599,7 +5599,10 @@ mod tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
 
-        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        let expected = if cfg!(any(
+            target_os = "macos",
+            all(target_os = "windows", target_arch = "x86_64"),
+        )) {
             Some("1")
         } else {
             None

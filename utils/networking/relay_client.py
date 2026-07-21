@@ -2514,11 +2514,11 @@ class RelayClient:
                     target_future.result(timeout=min(0.05, remaining))
                 except FutureTimeoutError:
                     continue
-                except Exception:
+                except BaseException:
                     return True
             try:
                 target_future.result(timeout=0)
-            except Exception:
+            except BaseException:
                 pass
             return True
 
@@ -2554,7 +2554,12 @@ class RelayClient:
                     # quiesced worker is not recycled merely because observation and
                     # deadline are adjacent.  process_client_request_result() performs
                     # a final pre-submit Stop/deadline recheck before posting.
-                    future_result = future.result()
+                    _inference_exc: Optional[BaseException] = None
+                    try:
+                        future_result = future.result()
+                    except BaseException as _exc:
+                        _inference_exc = _exc
+                        future_result = None
                     if (
                         getattr(self, '_polling_stopped_by_request', False)
                         and not getattr(self, '_api_v1_mutation_latched', False)
@@ -2562,6 +2567,35 @@ class RelayClient:
                         future_result = None
                         terminal_status = 'operator_stop'
                         terminal_reason = 'operator_stop'
+                    elif _inference_exc is not None:
+                        # Inference raised.  If a concurrent control poll has
+                        # already resolved with a terminal cancellation or expiry,
+                        # the authoritative relay-side state wins.  Otherwise return
+                        # a typed no-submit worker-failure outcome.
+                        if control_future is not None and control_future.done():
+                            try:
+                                _ctrl = control_future.result()
+                                control_future = None
+                                _ctrl_status = str(_ctrl.get('status') or '').lower()
+                                _terminal_ctrl_map = {
+                                    'cancelled': 'cancelled',
+                                    'expired': 'expired',
+                                    'completed': 'completed',
+                                    'unavailable': 'unavailable',
+                                    'completed/unavailable': 'completed_unavailable',
+                                }
+                                if _ctrl_status in _terminal_ctrl_map:
+                                    terminal_status = _ctrl_status
+                                    terminal_reason = _terminal_ctrl_map[_ctrl_status]
+                                else:
+                                    terminal_status = 'inference_failure'
+                                    terminal_reason = 'inference_failure'
+                            except BaseException:
+                                terminal_status = 'inference_failure'
+                                terminal_reason = 'inference_failure'
+                        else:
+                            terminal_status = 'inference_failure'
+                            terminal_reason = 'inference_failure'
                     break
                 if now >= local_deadline:
                     terminal_status = 'local_deadline'
@@ -2669,6 +2703,11 @@ class RelayClient:
                     break
                 except FutureTimeoutError:
                     pass
+                except BaseException:
+                    # Inference raised with no preceding terminal control result.
+                    terminal_status = 'inference_failure'
+                    terminal_reason = 'inference_failure'
+                    break
             if terminal_status is not None:
                 recovery_succeeded = False
                 try:
@@ -2904,13 +2943,13 @@ class RelayClient:
                     source_response.status_code,
                 )
             return _PostApiV1Outcome(submitted=submitted)
-        except Exception:
+        except Exception as _exc:
             log_error(
-                "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
+                "Failed to encrypt or post API v1 response request_id={} protocol={} route={} exc_type={}",
                 response_envelope.get("request_id"),
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
-                exc_info=True,
+                type(_exc).__name__,
             )
             return _PostApiV1Outcome(submitted=False, transport_failed=True)
         finally:

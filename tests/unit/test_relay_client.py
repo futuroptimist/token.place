@@ -8423,3 +8423,281 @@ def test_submit_api_v1_error_response_after_shutdown_latch_skips_network(mock_po
     ) is False
     client.crypto_manager.encrypt_message.assert_not_called()
     mock_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Inference-exception / cancellation race regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_api_v1_inference_exception_with_no_terminal_control_returns_no_submit():
+    """An exception raised by inference with no concurrent terminal control yields
+    a typed no-submit inference_failure outcome without retrying.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    # No control registration – inference-only path
+    stopped = []
+    unblock = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        unblock.set()
+        raise InferenceError('model exploded')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-fail',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'inference_failure'
+    assert stopped == ['inference_failure']
+
+
+def test_api_v1_inference_exception_with_concurrent_cancelled_control_cancellation_wins():
+    """When inference raises concurrently with a completed ``cancelled`` control result,
+    the authoritative relay-side state wins: worker is terminated, response suppressed,
+    and exactly one acknowledgment is sent.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    # Barrier: inference waits until the control future has reported cancelled.
+    control_done = threading.Event()
+    inference_released = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        # Wait until control has responded before raising so the race is deterministic.
+        control_done.wait(timeout=2.0)
+        inference_released.set()
+        raise InferenceError('simultaneous failure')
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': 'cancelled'}
+        result = {'status': 'cancelled'}
+        control_done.set()
+        return result
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-race-cancel',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    # cancelled control state wins over inference_failure
+    assert outcome.terminal_code == 'cancelled'
+    assert stopped == ['cancelled']
+    assert len(acks) == 1
+
+
+def test_api_v1_inference_exception_with_concurrent_expired_control_expiry_wins():
+    """When inference raises concurrently with a completed ``expired`` control result,
+    the relay-side expiry state wins over inference_failure.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    control_done = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        control_done.wait(timeout=2.0)
+        raise InferenceError('expired and failed simultaneously')
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': 'expired'}
+        result = {'status': 'expired'}
+        control_done.set()
+        return result
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-race-expired',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'expired'
+    assert stopped == ['expired']
+    assert len(acks) == 1
+
+
+def test_api_v1_inference_custom_base_exception_does_not_escape_supervisor():
+    """A custom BaseException (not Exception) raised by inference must not escape
+    the supervisor; it must be absorbed and return a typed no-submit outcome.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    stopped = []
+
+    class InfraFailure(BaseException):
+        pass
+
+    def generate(**_kwargs):
+        raise InfraFailure('infra crash')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    # Must not raise – exception must be absorbed by the supervisor.
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-base-exc',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'inference_failure'
+    assert stopped == ['inference_failure']
+
+
+# ---------------------------------------------------------------------------
+# _post_api_v1_response log-safety regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, monkeypatch):
+    """Encryption failure must log exc_type only; no credentials, keys, prompts,
+    request bodies, or model output may appear in log output.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    sentinel_credential = 'owner-token-SENTINEL_CRED_12345'
+    sentinel_key = 'client-pubkey-SENTINEL_KEY_ABCDE'
+    sentinel_prompt = 'SENTINEL_PROMPT_CONTENT_XYZ'
+    sentinel_output = 'SENTINEL_MODEL_OUTPUT_789'
+
+    class EncryptionBearingError(RuntimeError):
+        pass
+
+    def bad_encrypt(_payload, _key):
+        raise EncryptionBearingError(
+            f'cred={sentinel_credential} key={sentinel_key} '
+            f'prompt={sentinel_prompt} output={sentinel_output}'
+        )
+
+    client.crypto_manager.encrypt_message = bad_encrypt
+    monkeypatch.setattr(relay_client_module.requests, 'post', MagicMock())
+
+    with caplog.at_level('ERROR', logger='relay_client'):
+        outcome = client._post_api_v1_response(
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-enc-fail',
+                'api_v1_response': {'message': {'role': 'assistant', 'content': sentinel_output}},
+            },
+            client_pub_key_b64=sentinel_key,
+            client_pub_key=b'raw-key',
+        )
+
+    assert outcome.transport_failed is True
+    assert outcome.submitted is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'exc_type=EncryptionBearingError' in log_text
+    # Sensitive values must not appear in any log record
+    assert sentinel_credential not in log_text
+    assert sentinel_key not in log_text
+    assert sentinel_prompt not in log_text
+    assert sentinel_output not in log_text
+    # Traceback frames (exc_info) must not appear
+    assert 'Traceback' not in log_text
+    assert 'EncryptionBearingError: ' not in log_text
+
+
+def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(caplog, monkeypatch):
+    """HTTP transport failure must log exc_type only; no credentials, keys, prompts,
+    request bodies, or model output may appear in log output.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    sentinel_credential = 'relay-auth-SENTINEL_CRED_TRANSPORT'
+    sentinel_prompt = 'user-prompt-SENTINEL_TRANSPORT_PROMPT'
+    sentinel_output = 'model-out-SENTINEL_TRANSPORT_OUTPUT'
+
+    import requests as requests_lib
+
+    class TransportBearingError(requests_lib.exceptions.RequestException):
+        pass
+
+    client.crypto_manager.encrypt_message.return_value = {
+        'chat_history': 'ciphertext',
+        'cipherkey': 'key',
+        'iv': 'iv',
+    }
+
+    def bad_post(url, **kwargs):
+        raise TransportBearingError(
+            f'token={sentinel_credential} prompt={sentinel_prompt} output={sentinel_output}'
+        )
+
+    monkeypatch.setattr(relay_client_module.requests, 'post', bad_post)
+
+    with caplog.at_level('ERROR', logger='relay_client'):
+        outcome = client._post_api_v1_response(
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-transport-fail',
+                'api_v1_response': {'message': {'role': 'assistant', 'content': sentinel_output}},
+            },
+            client_pub_key_b64='client-key',
+            client_pub_key=b'raw-key',
+        )
+
+    assert outcome.transport_failed is True
+    assert outcome.submitted is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'exc_type=TransportBearingError' in log_text
+    assert sentinel_credential not in log_text
+    assert sentinel_prompt not in log_text
+    assert sentinel_output not in log_text
+    assert 'Traceback' not in log_text
+    assert 'TransportBearingError: ' not in log_text

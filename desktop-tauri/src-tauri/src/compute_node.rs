@@ -5844,8 +5844,8 @@ mod tests {
         // Temp dir for the descendant PID file (PowerShell will create it).
         let tmp_dir = TempDir::new().expect("create temp dir");
         let pid_path = tmp_dir.path().join("descendant_pid.txt");
-        // Escape single quotes in path for the PowerShell string literal.
-        let pid_path_str = pid_path.to_string_lossy().replace('\'', "''");
+        // Escape single quotes so the path is safe inside a PowerShell string literal.
+        let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "''");
 
         // PowerShell root: launch a long-lived ping descendant, publish its PID
         // to the temp file, then block until the descendant exits (or 60 s).
@@ -5854,7 +5854,7 @@ mod tests {
              -ArgumentList '-n 60 127.0.0.1'; \
              [IO.File]::WriteAllText('{pid}', [string]$d.Id); \
              $d.WaitForExit(60000)",
-            pid = pid_path_str
+            pid = escaped_pid_path
         );
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_script]);
@@ -5900,6 +5900,8 @@ mod tests {
         let root_deadline = Instant::now() + Duration::from_secs(5);
         let root_stopped = loop {
             match root_child.try_wait() {
+                // `Err(_)` also means the process is gone: on Windows, `try_wait` returns
+                // an error when the child handle is no longer valid (already reaped).
                 Ok(Some(_)) | Err(_) => break true,
                 Ok(None) => {
                     if Instant::now() >= root_deadline {
@@ -5950,8 +5952,11 @@ mod tests {
         match output {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
+                // tasklist /FO CSV outputs the PID as a quoted field (e.g. "12345").
+                // Match the quoted form to avoid false positives where one PID is a
+                // substring of another (e.g. "123" matching "1234").
                 // tasklist outputs "INFO: No tasks ..." when the PID is not found.
-                !s.contains("No tasks") && s.contains(&pid.to_string())
+                !s.contains("No tasks") && s.contains(&format!("\"{}\"", pid))
             }
             Err(_) => false,
         }

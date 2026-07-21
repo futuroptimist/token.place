@@ -631,6 +631,10 @@ class TestRelayClient:
             primary: {'next_ping_in_x_seconds': 30},
             backup: {'next_ping_in_x_seconds': 30},
         }
+        client._api_v1_control_credentials_by_relay = {
+            primary: "primary-control",
+            backup: "backup-control",
+        }
         success_response = MagicMock(status_code=200)
         failure_response = MagicMock(status_code=503)
         retry_success_response = MagicMock(status_code=200)
@@ -733,6 +737,10 @@ class TestRelayClient:
             primary: {'next_ping_in_x_seconds': 30},
             backup: {'next_ping_in_x_seconds': 30},
         }
+        client._api_v1_control_credentials_by_relay = {
+            primary: "primary-control",
+            backup: "backup-control",
+        }
 
         requested = []
 
@@ -758,6 +766,9 @@ class TestRelayClient:
         assert client._api_v1_registered_relays == {backup}
         assert primary not in client._api_v1_last_heartbeat_at
         assert backup in client._api_v1_last_heartbeat_at
+        assert client._api_v1_control_credentials_by_relay == {backup: "backup-control"}
+        assert primary not in client._api_v1_relay_wait_hints
+        assert backup in client._api_v1_relay_wait_hints
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_uses_registration_token(
@@ -7440,13 +7451,9 @@ def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
         response_worker.start()
         try:
             assert response_post_entered.wait(timeout=2.0)
-            client._api_v1_latch_shutdown()
             unregister_worker = threading.Thread(
-                target=lambda: (
-                    client._api_v1_wait_for_mutation_quiescence(
-                        shutdown_deadline=time.monotonic() + 2.0
-                    ),
-                    client.unregister_from_relay(shutdown_deadline=time.monotonic() + 2.0),
+                target=lambda: client.unregister_from_relay(
+                    shutdown_deadline=time.monotonic() + 2.0
                 ),
                 daemon=True,
             )
@@ -7462,6 +7469,72 @@ def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
             response_worker.join(timeout=2.0)
 
     assert mutations == ["response", "unregister"]
+    assert client._api_v1_registered_relays == set()
+
+
+def test_blocked_register_deadline_preserves_registration_for_retry_unregister_final():
+    client = _standalone_relay_client()
+    relay_url = "http://localhost:5000"
+    register_entered = threading.Event()
+    release_register = threading.Event()
+    register_done = threading.Event()
+    unregister_started_while_blocked = threading.Event()
+    mutations = []
+    unregister_results = {}
+
+    def fake_post(url, **kwargs):
+        if url.endswith("/api/v1/relay/servers/register"):
+            mutations.append("register")
+            register_entered.set()
+            assert release_register.wait(timeout=2.0)
+            response = MagicMock(status_code=200)
+            response.json.return_value = {
+                "next_ping_in_x_seconds": 30,
+                "poll_wait_seconds": 0,
+            }
+            return response
+        if url.endswith("/api/v1/relay/servers/unregister"):
+            if not register_done.is_set():
+                unregister_started_while_blocked.set()
+            mutations.append("unregister")
+            return MagicMock(status_code=200)
+        raise AssertionError(f"unexpected POST {url}")
+
+    register_thread = threading.Thread(
+        target=lambda: (
+            client.register_api_v1_compute_node(relay_url),
+            register_done.set(),
+        ),
+        daemon=True,
+    )
+    with patch("utils.networking.relay_client.requests.post", side_effect=fake_post):
+        register_thread.start()
+        try:
+            assert register_entered.wait(timeout=2.0)
+            deadline = time.monotonic() + 0.15
+            started = time.monotonic()
+            first_result = client.unregister_from_relay(shutdown_deadline=deadline)
+            elapsed = time.monotonic() - started
+            assert first_result is False
+            assert elapsed < 0.75
+            assert unregister_started_while_blocked.wait(timeout=0.05) is False
+            assert mutations == ["register"]
+
+            release_register.set()
+            register_thread.join(timeout=2.0)
+            assert not register_thread.is_alive()
+            assert client._api_v1_registered_relays == {relay_url}
+            assert client._unregister_complete is False
+
+            unregister_results["retry"] = client.unregister_from_relay(
+                shutdown_deadline=time.monotonic() + 2.0
+            )
+        finally:
+            release_register.set()
+            register_thread.join(timeout=2.0)
+
+    assert unregister_results["retry"] is True
+    assert mutations == ["register", "unregister"]
     assert client._api_v1_registered_relays == set()
 
 

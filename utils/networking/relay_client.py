@@ -1413,8 +1413,19 @@ class RelayClient:
 
         self._api_v1_latch_shutdown()
         if not self._api_v1_stop_heartbeat_worker(shutdown_deadline=shutdown_deadline):
-            log_error("Timed out waiting for heartbeat worker before unregister")
-
+            self._unregister_complete = False
+            log_error(
+                "Timed out waiting for API v1 heartbeat shutdown before unregister; "
+                "registration evidence retained for retry"
+            )
+            return False
+        if not self._api_v1_wait_for_mutation_quiescence(shutdown_deadline=shutdown_deadline):
+            self._unregister_complete = False
+            log_error(
+                "Timed out waiting for API v1 mutation quiescence before unregister; "
+                "registration evidence retained for retry"
+            )
+            return False
 
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
         if not isinstance(registered_relays, set):

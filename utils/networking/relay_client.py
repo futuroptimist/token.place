@@ -1630,7 +1630,7 @@ class RelayClient:
                 self._api_v1_last_heartbeat_at.pop(relay_url, None)
                 relay_wait_hints.pop(relay_url, None)
         return True
-      
+
     def _remaining_unregister_timeout(self, shutdown_deadline: Optional[float]) -> Optional[float]:
         if shutdown_deadline is None:
             return self._request_timeout
@@ -2470,7 +2470,7 @@ class RelayClient:
             try:
                 close()
             except Exception as exc:
-                log_warning('api_v1.worker_fallback_close_error reason={} err={}', reason, exc)
+                log_warning('api_v1.worker_fallback_close_error code=worker_fallback_close_error reason={} exc_type={}', reason, type(exc).__name__)
         return False
 
     def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
@@ -2540,7 +2540,10 @@ class RelayClient:
             backoff = 1.0
             while True:
                 now = time.monotonic()
-                if getattr(self, '_polling_stopped_by_request', False):
+                if (
+                    getattr(self, '_polling_stopped_by_request', False)
+                    and not getattr(self, '_api_v1_mutation_latched', False)
+                ):
                     terminal_status = 'operator_stop'
                     terminal_reason = 'operator_stop'
                     break
@@ -2552,7 +2555,10 @@ class RelayClient:
                     # deadline are adjacent.  process_client_request_result() performs
                     # a final pre-submit Stop/deadline recheck before posting.
                     future_result = future.result()
-                    if getattr(self, '_polling_stopped_by_request', False):
+                    if (
+                        getattr(self, '_polling_stopped_by_request', False)
+                        and not getattr(self, '_api_v1_mutation_latched', False)
+                    ):
                         future_result = None
                         terminal_status = 'operator_stop'
                         terminal_reason = 'operator_stop'
@@ -2813,7 +2819,11 @@ class RelayClient:
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
             )
-            return False
+            return _PostApiV1Outcome(
+                submitted=False,
+                suppressed=True,
+                suppressed_code="shutdown_requested",
+            )
 
         try:
             bound_response_envelope = {

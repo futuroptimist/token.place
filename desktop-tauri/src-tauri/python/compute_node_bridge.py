@@ -1683,7 +1683,11 @@ def run(args: argparse.Namespace) -> int:
     recovery_done.set()
     recovery_fatal = False
 
-    def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> bool:
+    def request_poll_cancel(
+        relay_runtime: Any,
+        active_relay_url: str,
+        shutdown_deadline: Optional[float] = None,
+    ) -> bool:
         if poll_cancel_requested_by_relay.get(active_relay_url):
             return poll_cancel_result_by_relay.get(active_relay_url, False)
         latch_ok = True

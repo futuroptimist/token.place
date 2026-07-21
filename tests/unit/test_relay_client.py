@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
+from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):
@@ -668,6 +668,7 @@ class TestRelayClient:
         """An in-flight heartbeat must not repopulate local registration after Stop/unregister."""
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._store_api_v1_control_credential(relay_client.relay_url, 'owner-secret')
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
         relay_client._api_v1_relay_wait_hints[relay_client.relay_url] = {
             "next_ping_in_x_seconds": 1,
@@ -4484,6 +4485,7 @@ def test_poll_exception_after_shutdown_latch_preserves_registration_for_unregist
     relay_url = 'http://localhost:5000'
     client.start()
     client._api_v1_registered_relays.add(relay_url)
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
     client._api_v1_relay_wait_hints[relay_url] = {
         'next_ping_in_x_seconds': 30,
@@ -4558,6 +4560,7 @@ def test_long_poll_timeout_after_shutdown_latch_does_not_mutate_heartbeat_state(
     relay_url = 'http://localhost:5000'
     client.start()
     client._api_v1_registered_relays.add(relay_url)
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
     client._api_v1_relay_wait_hints[relay_url] = {
         'next_ping_in_x_seconds': 30,
@@ -5790,6 +5793,7 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
     client._api_v1_registered_relays.add(client.relay_url)
+    client._store_api_v1_control_credential(client.relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[client.relay_url] = time.monotonic()
     client.crypto_manager.decrypt_message.side_effect = [
         _api_v1_decrypted_payload(request_id="req-heartbeat-1"),
@@ -5800,7 +5804,7 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
         "cipherkey": "encrypted_key",
         "iv": "encrypted_iv",
     }
-    client._post_api_v1_response = MagicMock(return_value=True)
+    client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
 
     first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
 
@@ -7264,7 +7268,6 @@ def test_api_v1_shutdown_latch_waits_for_inflight_mutation_and_blocks_new_regist
 def test_process_client_request_does_not_submit_response_after_shutdown_latch():
     manager = _AdmissionManager()
     client = _api_v1_validation_client(manager)
-    client._api_v1_registered_relays.add(client.relay_url)
     client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
         request_id="req-shutdown-latched"
     )
@@ -7278,7 +7281,7 @@ def test_process_client_request_does_not_submit_response_after_shutdown_latch():
         return original_generate(*args, **kwargs)
 
     client._generate_api_v1_response_with_runtime_model = blocked_generate
-    client._post_api_v1_response = MagicMock(return_value=True)
+    client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
     result_holder = {}
 
     worker = threading.Thread(
@@ -8136,25 +8139,23 @@ def test_post_api_v1_response_rechecks_operator_stop_after_encryption_before_htt
 
 
 def test_process_client_request_result_three_part_snapshot_activates_cancellation_guard(monkeypatch):
-    """Regression: cancellation_generation_snapshot() returns a 3-tuple but the old
-    len==2 guard silently dropped it, leaving cancel_snapshot=None and disabling the
-    pre-submit cancellation check.  This test proves the guard fires when a 3-part
-    snapshot is stale (epoch rotated) and that _post_api_v1_response suppression
-    propagates submission_allowed=False through process_client_request_result()."""
+    """Cancellation after response encryption begins suppresses all submission.
+
+    Regression: cancellation_generation_snapshot() returns a 3-tuple.  The
+    request must carry that opaque token into _post_api_v1_response(), recheck it
+    after encryption/preparation, and return submission_allowed=False so the
+    desktop bridge is not eligible to submit a generic error afterward.
+    """
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
 
     cancel_event = threading.Event()
-    # Simulate a 3-part snapshot already stale at submission time.
     snapshot_3 = (1, cancel_event, 0)
-    cancel_event.set()  # mark the event as cancelled immediately
-
     client.model_manager = SimpleNamespace(
         cancellation_generation_snapshot=lambda: snapshot_3,
-        cancellation_generation_cancelled=lambda s: s[1].is_set() if isinstance(s, tuple) and len(s) >= 2 else False,
+        cancellation_generation_cancelled=lambda s: s == snapshot_3 and cancel_event.is_set(),
     )
 
-    # Wire a minimal decrypted API v1 payload so the code reaches _post_api_v1_response.
     decrypted_payload = {
         "protocol": "tokenplace_api_v1_relay_e2ee",
         "version": 1,
@@ -8168,32 +8169,73 @@ def test_process_client_request_result_three_part_snapshot_activates_cancellatio
         },
     }
     client.crypto_manager.decrypt_message = MagicMock(return_value=decrypted_payload)
-    client.crypto_manager.encrypt_message = MagicMock(
-        return_value={"chat_history": "cipher", "cipherkey": "k", "iv": "iv"}
-    )
+    encryption_started = threading.Event()
+    release_encryption = threading.Event()
 
-    # Generate succeeds so the flow reaches the post guard.
+    def encrypt_message(_payload, _client_key):
+        encryption_started.set()
+        assert release_encryption.wait(timeout=2.0)
+        return {"chat_history": "cipher", "cipherkey": "k", "iv": "iv"}
+
+    client.crypto_manager.encrypt_message = MagicMock(side_effect=encrypt_message)
     response_envelope = {
         "request_id": "req-3part-snapshot",
         "api_v1_response": {"message": {"role": "assistant", "content": "reply"}},
     }
     client._generate_api_v1_response_with_runtime_model = MagicMock(return_value=response_envelope)
-
     post = MagicMock()
     monkeypatch.setattr(relay_client_module.requests, 'post', post)
 
-    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+    result_holder = {}
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            'result', client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+        ),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert encryption_started.wait(timeout=2.0)
+        cancel_event.set()
+        release_encryption.set()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+    finally:
+        release_encryption.set()
+        worker.join(timeout=2.0)
 
+    result = result_holder['result']
     assert result.submitted is False
     assert result.submission_allowed is False
     assert result.safe_error_code == 'request_cancelled'
     post.assert_not_called()
 
 
+def test_worker_fallback_close_error_logs_only_safe_exception_type(caplog):
+    client = _standalone_relay_client()
+
+    class SecretBearingError(RuntimeError):
+        pass
+
+    secret = 'credential=owner-secret prompt=private model_output=leaked'
+    llm = SimpleNamespace(close=MagicMock(side_effect=SecretBearingError(secret)))
+    client.model_manager = SimpleNamespace(llm=llm)
+
+    with caplog.at_level('WARNING', logger='relay_client'):
+        assert client._terminate_current_llama_worker('local_deadline') is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'api_v1.worker_fallback_close_error' in log_text
+    assert 'exc_type=SecretBearingError' in log_text
+    assert secret not in log_text
+    assert 'owner-secret' not in log_text
+    assert 'private' not in log_text
+    assert 'leaked' not in log_text
+
+
 def test_process_client_request_post_race_after_generation_returns_shutdown_without_network():
     manager = _AdmissionManager()
     client = _api_v1_validation_client(manager)
-    client._api_v1_registered_relays.add(client.relay_url)
     client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
         request_id="req-post-race"
     )
@@ -8239,6 +8281,7 @@ def test_process_client_request_post_race_after_generation_returns_shutdown_with
 def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add("http://localhost:5000")
+    client._store_api_v1_control_credential("http://localhost:5000", 'owner-secret')
     client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
     client.crypto_manager.encrypt_message.return_value = {"ciphertext": "cipher", "nonce": "nonce"}
     response_envelope = client._api_v1_response_envelope(
@@ -8297,6 +8340,7 @@ def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
 def test_blocked_register_deadline_preserves_registration_for_retry_unregister_final():
     client = _standalone_relay_client()
     relay_url = "http://localhost:5000"
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     register_entered = threading.Event()
     release_register = threading.Event()
     register_done = threading.Event()

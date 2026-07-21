@@ -8611,11 +8611,11 @@ def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, 
     sentinel_prompt = 'SENTINEL_PROMPT_CONTENT_XYZ'
     sentinel_output = 'SENTINEL_MODEL_OUTPUT_789'
 
-    class EncryptionBearingError(RuntimeError):
+    class EncryptionFailureWithSensitiveData(RuntimeError):
         pass
 
     def bad_encrypt(_payload, _key):
-        raise EncryptionBearingError(
+        raise EncryptionFailureWithSensitiveData(
             f'cred={sentinel_credential} key={sentinel_key} '
             f'prompt={sentinel_prompt} output={sentinel_output}'
         )
@@ -8639,7 +8639,7 @@ def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, 
     assert outcome.submitted is False
 
     log_text = '\n'.join(record.getMessage() for record in caplog.records)
-    assert 'exc_type=EncryptionBearingError' in log_text
+    assert 'exc_type=EncryptionFailureWithSensitiveData' in log_text
     # Sensitive values must not appear in any log record
     assert sentinel_credential not in log_text
     assert sentinel_key not in log_text
@@ -8647,7 +8647,7 @@ def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, 
     assert sentinel_output not in log_text
     # Traceback frames (exc_info) must not appear
     assert 'Traceback' not in log_text
-    assert 'EncryptionBearingError: ' not in log_text
+    assert 'EncryptionFailureWithSensitiveData: ' not in log_text
 
 
 def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(caplog, monkeypatch):
@@ -8663,7 +8663,7 @@ def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(capl
 
     import requests as requests_lib
 
-    class TransportBearingError(requests_lib.exceptions.RequestException):
+    class TransportFailureWithSensitiveData(requests_lib.exceptions.RequestException):
         pass
 
     client.crypto_manager.encrypt_message.return_value = {
@@ -8673,7 +8673,7 @@ def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(capl
     }
 
     def bad_post(url, **kwargs):
-        raise TransportBearingError(
+        raise TransportFailureWithSensitiveData(
             f'token={sentinel_credential} prompt={sentinel_prompt} output={sentinel_output}'
         )
 
@@ -8695,9 +8695,9 @@ def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(capl
     assert outcome.submitted is False
 
     log_text = '\n'.join(record.getMessage() for record in caplog.records)
-    assert 'exc_type=TransportBearingError' in log_text
+    assert 'exc_type=TransportFailureWithSensitiveData' in log_text
     assert sentinel_credential not in log_text
     assert sentinel_prompt not in log_text
     assert sentinel_output not in log_text
     assert 'Traceback' not in log_text
-    assert 'TransportBearingError: ' not in log_text
+    assert 'TransportFailureWithSensitiveData: ' not in log_text

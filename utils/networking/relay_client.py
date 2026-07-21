@@ -41,6 +41,16 @@ _API_V1_CLEANUP_BUDGET_SECONDS = 5.0
 # No daemon thread or interrupt mechanism is needed: the bounded timeout ensures
 # the control executor thread completes before executor.shutdown(wait=True).
 _API_V1_MAX_CONTROL_TIMEOUT_SECONDS = _API_V1_CLEANUP_BUDGET_SECONDS - 1.0
+# Mapping from relay-side control status strings to internal terminal reason codes.
+# Used in both the normal control-result observation path and the concurrent
+# inference-failure + terminal-control race resolution.
+_API_V1_TERMINAL_CONTROL_STATUS_MAP: Dict[str, str] = {
+    'cancelled': 'cancelled',
+    'expired': 'expired',
+    'completed': 'completed',
+    'unavailable': 'unavailable',
+    'completed/unavailable': 'completed_unavailable',
+}
 
 
 class _ApiV1ChatValidationResult(NamedTuple):
@@ -2577,16 +2587,9 @@ class RelayClient:
                                 _ctrl = control_future.result()
                                 control_future = None
                                 _ctrl_status = str(_ctrl.get('status') or '').lower()
-                                _terminal_ctrl_map = {
-                                    'cancelled': 'cancelled',
-                                    'expired': 'expired',
-                                    'completed': 'completed',
-                                    'unavailable': 'unavailable',
-                                    'completed/unavailable': 'completed_unavailable',
-                                }
-                                if _ctrl_status in _terminal_ctrl_map:
+                                if _ctrl_status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
                                     terminal_status = _ctrl_status
-                                    terminal_reason = _terminal_ctrl_map[_ctrl_status]
+                                    terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[_ctrl_status]
                                 else:
                                     terminal_status = 'inference_failure'
                                     terminal_reason = 'inference_failure'
@@ -2671,16 +2674,9 @@ class RelayClient:
                             hint = self._api_v1_control_next_poll_seconds(control.get('next_poll_seconds'))
                             next_poll_at = min(time.monotonic() + hint, local_deadline)
                             continue
-                        terminal_status_by_control_status = {
-                            'cancelled': 'cancelled',
-                            'expired': 'expired',
-                            'completed': 'completed',
-                            'unavailable': 'unavailable',
-                            'completed/unavailable': 'completed_unavailable',
-                        }
-                        if status in terminal_status_by_control_status:
+                        if status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
                             terminal_status = status
-                            terminal_reason = terminal_status_by_control_status[status]
+                            terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[status]
                             break
                         next_poll_at = min(time.monotonic() + _API_V1_CONTROL_MIN_POLL_SECONDS, local_deadline)
                     except PermissionError:

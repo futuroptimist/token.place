@@ -90,6 +90,12 @@ _INIT_SAFE_CATEGORY_ALIASES = {
 # bounded cancellation cleanup.  Must fit within the supervisor cleanup budget
 # (_API_V1_CLEANUP_BUDGET_SECONDS in relay_client) with room for fatal teardown.
 _PROCESSLESS_CLOSE_TIMEOUT_SECONDS: float = 4.0
+# Polling interval used when waiting on the processless-close future.
+_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS: float = 0.05
+# Grace period given to a processless-close thread after fatal_callback has
+# returned (test / non-production environments where the callback unblocks
+# the thread instead of terminating the process).
+_POST_FATAL_DRAIN_TIMEOUT_SECONDS: float = 0.5
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
     'runtime_model_path_unavailable',
@@ -5926,7 +5932,7 @@ class ModelManager:
                     if remaining <= 0:
                         break
                     try:
-                        close_future.result(timeout=min(0.05, remaining))
+                        close_future.result(timeout=min(_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS, remaining))
                     except _FutureTimeoutError:
                         continue
                     except Exception:
@@ -5938,15 +5944,16 @@ class ModelManager:
                     # callback must first unblock the close thread.
                     if callable(fatal_callback):
                         fatal_callback(reason='api_v1_worker_processless_close_timeout')
-                    # Post-fatal drain (test / non-production environment where
-                    # the callback returned after unblocking the close thread).
-                    after_deadline = time.monotonic() + 0.5
+                    # Post-fatal drain (_POST_FATAL_DRAIN_TIMEOUT_SECONDS): test /
+                    # non-production environment where the callback returned after
+                    # unblocking the close thread.
+                    after_deadline = time.monotonic() + _POST_FATAL_DRAIN_TIMEOUT_SECONDS
                     while not close_future.done():
                         remaining = after_deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         try:
-                            close_future.result(timeout=min(0.05, remaining))
+                            close_future.result(timeout=min(_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS, remaining))
                         except _FutureTimeoutError:
                             continue
                         except Exception:
@@ -5959,6 +5966,8 @@ class ModelManager:
                         # close() raised an exception; treat as cleanup failure to
                         # prevent replacement with a potentially tainted worker.
                         process_stopped = False
+                    # cancel_futures is a no-op here since the future is already done;
+                    # included for clarity and forward-compatibility.
                     _close_executor.shutdown(wait=True, cancel_futures=True)
                 else:
                     # Still running after fatal (fatal must be no-return in production;

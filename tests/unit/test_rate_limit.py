@@ -9,6 +9,8 @@ from flask import Flask, request as flask_request
 
 from api import (
     _check_control_plane_limits,
+    _control_plane_identity_for_request,
+    _control_server_owner_identity,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -449,20 +451,96 @@ def test_control_plane_routes_keep_aggregate_ip_abuse_budget():
     assert [response.status_code for response in responses] == [200, 200, 429]
 
 
+def test_control_server_owner_identity_requires_matching_bound_credential(monkeypatch):
+    """Control buckets use the exact owner only after proof verification."""
+
+    def digest(value: str) -> str:
+        return f"digest:{value}"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(
+            known_servers={
+                "server-a": {"api_v1_control_credential_digest": digest("secret-a")},
+            },
+            _api_v1_control_credential_digest=digest,
+        ),
+    )
+
+    assert _control_server_owner_identity(None) is None
+    assert _control_server_owner_identity({"server_public_key": "server-a"}) is None
+    assert (
+        _control_server_owner_identity(
+            {"server_public_key": "server-a", "control_credential": "wrong"}
+        )
+        is None
+    )
+    valid_control_payload = {
+        "server_public_key": " server-a ",
+        "control_credential": "secret-a",
+    }
+    assert _control_server_owner_identity(valid_control_payload) == (
+        "server_public_key",
+        "server-a",
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context("/api/v1/relay/servers/control", method="POST"):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/control", valid_control_payload
+        ) == ("server_public_key", "server-a")
+
+    with app.test_request_context("/api/v1/relay/servers/unregister", method="POST"):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/unregister", valid_control_payload
+        ) == ("server_public_key", "server-a")
+
+
+def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
+    monkeypatch,
+):
+    """Invalid control credentials cannot burn another server's identity bucket."""
+
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(
+            known_servers={}, _api_v1_control_credential_digest=lambda value: value
+        ),
+    )
+    app = Flask(__name__)
+
+    with app.test_request_context(
+        "/api/v1/relay/servers/control",
+        method="POST",
+        environ_base={"REMOTE_ADDR": "203.0.113.9"},
+    ):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/control",
+            {"server_public_key": "victim", "control_credential": "wrong"},
+        ) == ("client_ip", "203.0.113.9")
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/servers/unregister",
+            {"server_public_key": "victim", "control_credential": "wrong"},
+        ) == ("client_ip", "203.0.113.9")
+
+
 @patch.dict(
     os.environ,
     {
         "API_RATE_LIMIT": "2/hour",
         "API_DAILY_QUOTA": "1000/day",
         "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT": "65/hour",
+        "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT": "65/hour",
         "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT": "65/hour",
         "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "1000/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
     },
     clear=True,
 )
-def test_poll_and_response_control_plane_routes_do_not_use_public_quota():
-    """Poll and encrypted response submissions allow healthy cadence above user quota."""
+def test_poll_control_and_response_control_plane_routes_do_not_use_public_quota():
+    """Compute control-plane routes allow healthy cadence above user quota."""
     app = Flask(__name__)
     init_app(app)
 
@@ -470,30 +548,120 @@ def test_poll_and_response_control_plane_routes_do_not_use_public_quota():
     def relay_servers_poll():
         return {"status": "polling"}
 
+    @app.post("/api/v1/relay/servers/control")
+    def relay_servers_control():
+        return {"status": "active"}
+
     @app.post("/api/v1/relay/responses")
     def relay_responses():
         return {"status": "queued"}
 
-    with app.test_client() as client:
-        poll_responses = [
-            client.post(
-                "/api/v1/relay/servers/poll",
-                json={"server_public_key": "server-a"},
-                headers={"X-Relay-Server-Token": "relay-token"},
-            )
-            for _ in range(65)
-        ]
-        response_submissions = [
-            client.post(
-                "/api/v1/relay/responses",
-                json={"client_public_key": "client-a", "request_id": f"req-{index}"},
-                headers={"X-Relay-Server-Token": "relay-token"},
-            )
-            for index in range(65)
-        ]
+    digest = lambda value: f"digest:{value}"
+    relay_module = SimpleNamespace(
+        SERVER_REGISTRATION_TOKENS=["relay-token"],
+        known_servers={
+            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
+        },
+        _api_v1_control_credential_digest=digest,
+    )
+
+    with patch.dict(sys.modules, {"relay": relay_module, "__main__": relay_module}):
+        with app.test_client() as client:
+            poll_responses = [
+                client.post(
+                    "/api/v1/relay/servers/poll",
+                    json={"server_public_key": "server-a"},
+                    headers={"X-Relay-Server-Token": "relay-token"},
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.10"},
+                )
+                for _ in range(65)
+            ]
+            control_responses = [
+                client.post(
+                    "/api/v1/relay/servers/control",
+                    json={
+                        "server_public_key": "server-a",
+                        "request_id": f"req-{index}",
+                        "control_credential": "control-secret-a",
+                    },
+                    headers={"X-Relay-Server-Token": "relay-token"},
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.11"},
+                )
+                for index in range(66)
+            ]
+            response_submissions = [
+                client.post(
+                    "/api/v1/relay/responses",
+                    json={"client_public_key": "client-a", "request_id": f"req-{index}"},
+                    headers={"X-Relay-Server-Token": "relay-token"},
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.12"},
+                )
+                for index in range(65)
+            ]
 
     assert {response.status_code for response in poll_responses} == {200}
+    assert [response.status_code for response in control_responses[:65]] == [200] * 65
+    assert control_responses[65].status_code == 429
     assert {response.status_code for response in response_submissions} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT": "65/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "200/hour",
+    },
+    clear=True,
+)
+def test_tokenless_control_route_uses_verified_owner_identity_bucket():
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/control")
+    def relay_servers_control():
+        return {"status": "active"}
+
+    digest = lambda value: f"digest:{value}"
+    relay_module = SimpleNamespace(
+        SERVER_REGISTRATION_TOKENS=[],
+        known_servers={
+            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
+            "server-b": {"api_v1_control_credential_digest": digest("control-secret-b")},
+        },
+        _api_v1_control_credential_digest=digest,
+    )
+    with patch.dict(sys.modules, {"relay": relay_module, "__main__": relay_module}):
+        with app.test_client() as client:
+            owner_a = [
+                client.post(
+                    "/api/v1/relay/servers/control",
+                    json={
+                        "server_public_key": "server-a",
+                        "request_id": f"a-{index}",
+                        "control_credential": "control-secret-a",
+                    },
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.44"},
+                )
+                for index in range(66)
+            ]
+            owner_b = [
+                client.post(
+                    "/api/v1/relay/servers/control",
+                    json={
+                        "server_public_key": "server-b",
+                        "request_id": f"b-{index}",
+                        "control_credential": "control-secret-b",
+                    },
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.44"},
+                )
+                for index in range(65)
+            ]
+
+    assert [response.status_code for response in owner_a[:65]] == [200] * 65
+    assert owner_a[65].status_code == 429
+    assert [response.status_code for response in owner_b] == [200] * 65
 
 
 @patch.dict(

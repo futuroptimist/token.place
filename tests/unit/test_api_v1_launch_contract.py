@@ -50,6 +50,7 @@ COMPUTE_NODE_CONTROL_PLANE_ROUTES = {
     ("POST", "/api/v1/relay/servers/register"),
     ("POST", "/api/v1/relay/servers/unregister"),
     ("POST", "/api/v1/relay/servers/poll"),
+    ("POST", "/api/v1/relay/servers/control"),
     ("POST", "/api/v1/relay/responses"),
 }
 

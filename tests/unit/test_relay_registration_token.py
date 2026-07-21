@@ -6,7 +6,7 @@ from typing import Iterator
 
 import pytest
 
-MODULES_TO_CLEAR = ("relay", "config", "api", "api.v1", "api.v1.routes")
+MODULES_TO_CLEAR = ("relay", "config")
 
 
 @pytest.fixture()
@@ -167,14 +167,39 @@ def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> N
     }
     assert list(relay_module.known_servers) == ["api-v1-node"]
 
-    authorised = client.post(
+    token_only = client.post(
         "/api/v1/relay/servers/unregister",
         json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert token_only.status_code == 403
+    assert token_only.get_json() == {
+        "error": {
+            "code": 403,
+            "message": "Missing or invalid relay server control credential",
+        }
+    }
+    assert list(relay_module.known_servers) == ["api-v1-node"]
+
+    authorised = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "api-v1-node",
+            "control_credential": register_response.get_json()["control_credential"],
+        },
         headers={"X-Relay-Server-Token": "unit-token"},
     )
     assert authorised.status_code == 200
     assert authorised.get_json() == {"message": "Server unregistered", "removed": True}
     assert relay_module.known_servers == {}
+
+    absent = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert absent.status_code == 200
+    assert absent.get_json() == {"message": "Server unregistered", "removed": False}
 
     diagnostics = client.get("/relay/diagnostics")
     assert diagnostics.status_code == 200
@@ -281,3 +306,51 @@ def test_evict_stale_servers_cleans_up_queue_and_stream_state(relay_module) -> N
     assert "stale-server" not in relay_module.client_inference_requests
     assert "session-stale" not in relay_module.streaming_sessions
     assert "client-stale" not in relay_module.streaming_sessions_by_client
+
+
+@pytest.mark.parametrize("route", ["/api/v1/relay/servers/unregister", "/unregister"])
+def test_api_v1_unregister_token_and_owner_credential_matrix(relay_module, route) -> None:
+    """Live API v1 unregister aliases require shared token plus exact owner proof."""
+
+    relay_module.known_servers.clear()
+    relay_module.client_inference_requests.clear()
+    client = relay_module.app.test_client()
+    headers = {"X-Relay-Server-Token": "unit-token"}
+    wrong_headers = {"X-Relay-Server-Token": "wrong-token"}
+
+    register = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": f"api-v1-node-{route}"},
+        headers=headers,
+    )
+    assert register.status_code == 200
+    server_key = f"api-v1-node-{route}"
+    credential = register.get_json()["control_credential"]
+
+    missing_shared = client.post(route, json={"server_public_key": server_key})
+    wrong_shared = client.post(route, json={"server_public_key": server_key}, headers=wrong_headers)
+    missing_owner = client.post(route, json={"server_public_key": server_key}, headers=headers)
+    wrong_owner = client.post(
+        route,
+        json={"server_public_key": server_key, "control_credential": "wrong-owner"},
+        headers=headers,
+    )
+
+    assert missing_shared.status_code == 401
+    assert wrong_shared.status_code == 401
+    assert missing_owner.status_code == 403
+    assert wrong_owner.status_code == 403
+    assert server_key in relay_module.known_servers
+
+    correct = client.post(
+        route,
+        json={"server_public_key": server_key, "control_credential": credential},
+        headers=headers,
+    )
+    absent = client.post(route, json={"server_public_key": server_key}, headers=headers)
+
+    assert correct.status_code == 200
+    assert correct.get_json()["removed"] is True
+    assert server_key not in relay_module.known_servers
+    assert absent.status_code == 200
+    assert absent.get_json()["removed"] is False

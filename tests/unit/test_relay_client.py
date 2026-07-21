@@ -7252,11 +7252,22 @@ def test_api_v1_completed_future_at_deadline_boundary_is_consumed_once():
 
 
 def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_post():
-    """_ControlSession.close() interrupts in-flight control I/O within its poll interval."""
+    """Operator stop terminates supervision even when a control HTTP call is in-flight.
+
+    The control POST runs directly in the control executor thread with a bounded
+    HTTP timeout (_API_V1_MAX_CONTROL_TIMEOUT_SECONDS, strictly below the cleanup
+    budget).  No daemon thread is spawned.  On operator stop the supervisor sets
+    the terminal flag, terminates the worker (which releases inference), and then
+    the shared cleanup deadline in the finally block drains the control future
+    before executor.shutdown(wait=True).
+    """
     client = _standalone_relay_client()
     client._last_api_v1_work_relay_url = 'https://relay.example'
     client._api_v1_registered_relays.add('https://relay.example')
     client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    # Use a short request timeout so the control HTTP timeout is also short,
+    # letting the blocking mock release quickly via its timeout argument.
+    client._request_timeout = 0.2
     control_entered = threading.Event()
     release_inference = threading.Event()
     http_release = threading.Event()
@@ -7267,15 +7278,17 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         return {'request_id': 'late'}
 
     client._generate_api_v1_response_with_runtime_model = generate
-    # Worker termination releases inference; control I/O is released by session.close().
+    # Worker termination releases inference; the control future drains on its own timeout.
     client._terminate_current_llama_worker = lambda reason, recreate=True: (
         release_inference.set() or True
     )
 
     def blocking_requests_post(*args, **kwargs):
-        # Signal that the HTTP call has started, then block until released by the test.
+        # Signal that the HTTP call has started, then block until explicitly released
+        # or until the timeout kwarg elapses (simulating a slow-but-bounded HTTP call).
+        timeout = kwargs.get('timeout', 30)
         control_entered.set()
-        http_release.wait(30)
+        http_release.wait(float(timeout) if timeout is not None else 30)
         raise relay_client_module.requests.ConnectionError('test_interrupted')
 
     def supervise():
@@ -7287,16 +7300,16 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
             'routing': {'context_tier': '8k-fast'},
         }, local_deadline=time.monotonic() + 5)
 
-    # Patch module-level requests.post so the real _ControlSession's daemon thread
-    # uses the blocking mock.  When the supervisor calls control_session.close(),
-    # _ControlSession detects the closed flag within _POLL_INTERVAL and raises
-    # ConnectionError in the control executor thread without waiting for the HTTP call.
+    # Patch module-level requests.post so the control executor thread (which runs
+    # _post_api_v1_request_control directly, with no daemon sub-thread) uses the
+    # blocking mock.  The mock respects the timeout kwarg so the control future
+    # completes naturally within the cleanup budget.
     with patch.object(relay_client_module.requests, 'post', blocking_requests_post):
         thread = threading.Thread(target=supervise)
         thread.start()
         assert control_entered.wait(1)
         client.stop()
-        thread.join(2)
+        thread.join(3)
     try:
         assert not thread.is_alive(), 'supervisor did not return after operator stop'
         outcome = result_holder['outcome']
@@ -7307,7 +7320,7 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
         assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
     finally:
-        http_release.set()  # Unblock the daemon HTTP thread spawned by _ControlSession
+        http_release.set()  # Safety: unblock the mock in case it is still waiting.
         release_inference.set()
         thread.join(1)
 

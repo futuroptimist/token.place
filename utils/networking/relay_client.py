@@ -35,73 +35,12 @@ _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
 # Should be less than BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS so cleanup fits
 # inside the bridge-level shutdown window.
 _API_V1_CLEANUP_BUDGET_SECONDS = 5.0
-
-
-class _ControlSession:
-    """Per-request abortable control HTTP transport.
-
-    Runs the HTTP call in a dedicated daemon thread so that ``close()`` can
-    interrupt a concurrent ``post()`` call within ``_POLL_INTERVAL`` seconds
-    by raising ``requests.ConnectionError`` in the calling (executor) thread.
-    The underlying HTTP request continues in the daemon thread until it
-    completes or times out naturally; its result is discarded after ``close()``
-    is called.
-
-    On ``close()``, any concurrent or subsequent ``post()`` call raises
-    ``requests.ConnectionError``.
-    """
-
-    _POLL_INTERVAL: float = 0.05
-
-    def __init__(self) -> None:
-        self._closed: threading.Event = threading.Event()
-        self._result_ready: threading.Event = threading.Event()
-        self._result: Any = None
-        self._error: Optional[BaseException] = None
-        self._lock: threading.Lock = threading.Lock()
-
-    def post(self, *args: Any, **kwargs: Any) -> Any:
-        if self._closed.is_set():
-            raise requests.ConnectionError('api_v1_control_session_closed')
-
-        self._result = None
-        self._error = None
-        self._result_ready.clear()
-
-        def _do_post() -> None:
-            try:
-                result = requests.post(*args, **kwargs)
-                with self._lock:
-                    if not self._closed.is_set():
-                        self._result = result
-            except Exception as exc:  # noqa: BLE001 – propagate to caller; daemon thread must not crash silently
-                with self._lock:
-                    if not self._closed.is_set():
-                        self._error = exc
-            finally:
-                self._result_ready.set()
-
-        threading.Thread(target=_do_post, daemon=True).start()
-
-        while not self._result_ready.wait(self._POLL_INTERVAL):
-            if self._closed.is_set():
-                raise requests.ConnectionError('api_v1_control_session_closed')
-
-        # Check closed AFTER the loop: close() sets both _closed and _result_ready so
-        # the wait() above may return due to the session being closed rather than the
-        # HTTP call completing.  Without this check we would return None as the result.
-        if self._closed.is_set():
-            raise requests.ConnectionError('api_v1_control_session_closed')
-
-        error = self._error
-        if error is not None:
-            raise error
-        return self._result
-
-    def close(self) -> None:
-        self._closed.set()
-        # Wake any post() call that is polling so it exits within _POLL_INTERVAL.
-        self._result_ready.set()
+# Upper bound on any single control-request HTTP timeout.  Must be strictly
+# below _API_V1_CLEANUP_BUDGET_SECONDS so that a running control future is
+# always fully drained within the shared cleanup deadline in the finally block.
+# No daemon thread or interrupt mechanism is needed: the bounded timeout ensures
+# the control executor thread completes before executor.shutdown(wait=True).
+_API_V1_MAX_CONTROL_TIMEOUT_SECONDS = _API_V1_CLEANUP_BUDGET_SECONDS - 1.0
 
 
 class _ApiV1ChatValidationResult(NamedTuple):
@@ -796,6 +735,11 @@ def _log(level: str, message: str, *args, exc_info: Optional[bool] = None) -> No
 def log_info(message, *args) -> None:
     """Log info only in non-production environments using consistent formatting"""
     _log("info", message, *args)
+
+
+def log_warning(message, *args) -> None:
+    """Log warnings only in non-production environments using consistent formatting"""
+    _log("warning", message, *args)
 
 
 def log_error(message, *args, exc_info: bool = False) -> None:
@@ -2371,7 +2315,6 @@ class RelayClient:
         request_id: str,
         acknowledge: bool = False,
         timeout_seconds: Optional[float] = None,
-        session: Optional[Any] = None,
     ) -> Dict[str, Any]:
         credential = self._api_v1_control_credential_for_relay(relay_url)
         if not credential:
@@ -2390,9 +2333,7 @@ class RelayClient:
         if headers:
             request_kwargs['headers'] = headers
         control_url = self._build_api_v1_url(relay_url, '/relay/servers/control')
-        # Use the provided session for abortable transport; fall back to module-level requests.
-        poster = session if session is not None else requests
-        response = poster.post(control_url, **request_kwargs)
+        response = requests.post(control_url, **request_kwargs)
         if response.status_code in {401, 403}:
             raise PermissionError('api_v1_control_owner_proof_failed')
         if response.status_code == 429 or 500 <= response.status_code <= 599:
@@ -2478,13 +2419,7 @@ class RelayClient:
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
         control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control') if control_available else None
-        # Per-request session for abortable control transport.  Closing it interrupts
-        # any in-flight HTTP request without involving inference worker teardown.
-        control_session: Any = _ControlSession() if control_available else None
         control_future: Any = None
-        # Last HTTP timeout used for the active control request; used to derive the
-        # control quiescence deadline after session close.
-        last_control_timeout: float = float(getattr(self, '_request_timeout', 10) or 10)
         future = executor.submit(_generate)
         try:
             next_poll_at = time.monotonic() if control_available else local_deadline
@@ -2520,22 +2455,25 @@ class RelayClient:
                         break
                     try:
                         if control_future is None:
+                            # Cap the control HTTP timeout strictly below the cleanup budget
+                            # so the control executor thread always completes within the shared
+                            # cleanup deadline in the finally block.  No daemon thread or
+                            # interrupt mechanism is needed; the bounded timeout is sufficient.
                             control_timeout = max(
                                 0.001,
                                 min(
-                                    self._request_timeout,
+                                    float(getattr(self, '_request_timeout', 10) or 10),
+                                    _API_V1_MAX_CONTROL_TIMEOUT_SECONDS,
                                     remaining * 0.8,
                                     max(0.001, remaining - 0.001),
                                 ),
                             )
-                            last_control_timeout = control_timeout
                             control_future = control_executor.submit(
                                 self._post_api_v1_request_control,
                                 relay_url=relay_url,
                                 request_id=request_id,
                                 acknowledge=False,
                                 timeout_seconds=control_timeout,
-                                session=control_session,
                             )
                         while not control_future.done():
                             if getattr(self, '_polling_stopped_by_request', False):
@@ -2612,16 +2550,6 @@ class RelayClient:
                 except FutureTimeoutError:
                     pass
             if terminal_status is not None:
-                # Abort in-flight control I/O by closing the transport session.
-                # This is independent of inference worker teardown: closing the session
-                # causes any blocked HTTP call to raise immediately, so control_future
-                # quiesces without waiting for the HTTP timeout to expire.
-                if control_session is not None:
-                    try:
-                        control_session.close()
-                    except Exception:
-                        pass
-                    control_session = None
                 recovery_succeeded = False
                 try:
                     recovery_succeeded = self._terminate_current_llama_worker(
@@ -2632,14 +2560,12 @@ class RelayClient:
                 # Track inference and control quiescence separately.  Only a stuck
                 # inference thread justifies a permanent polling stop; routine control
                 # latency must not mark a healthy recreated worker as unhealthy.
+                # The control future completes naturally within its bounded HTTP timeout
+                # (_API_V1_MAX_CONTROL_TIMEOUT_SECONDS), so no interrupt mechanism is
+                # needed.  The finally block drains it within the shared cleanup deadline.
                 inference_quiescence_deadline = time.monotonic() + 0.5
                 inference_quiesced = _wait_for_future_quiescence(future, inference_quiescence_deadline)
-                control_quiesced = True
-                if control_future is not None:
-                    # After session close the HTTP call fails quickly.  Use a deadline
-                    # that matches the last submitted HTTP timeout plus a small margin.
-                    control_quiescence_deadline = time.monotonic() + max(0.5, last_control_timeout + 0.25)
-                    control_quiesced = _wait_for_future_quiescence(control_future, control_quiescence_deadline)
+                control_quiesced = control_future is None or control_future.done()
                 if terminal_status in {'cancelled', 'expired'}:
                     self._acknowledge_api_v1_terminal_control(relay_url, request_id)
                 if not inference_quiesced:
@@ -2663,16 +2589,13 @@ class RelayClient:
                     submission_allowed=False,
                 )
         finally:
-            if control_session is not None:
-                try:
-                    control_session.close()
-                except Exception:
-                    pass
-            # Shared cleanup deadline for both request-owned futures.  With
-            # _ControlSession.close() called above, the control future quiesces
-            # within _POLL_INTERVAL.  For inference, _terminate_current_llama_worker()
-            # from the terminal path ensures the worker exits; the fatal_bridge_teardown
-            # path handles the stuck-subprocess edge case by unblocking inference so
+            # Shared cleanup deadline for both request-owned futures.  The control
+            # future always completes within _API_V1_MAX_CONTROL_TIMEOUT_SECONDS
+            # (strictly below _API_V1_CLEANUP_BUDGET_SECONDS) because the HTTP
+            # call is submitted with that bounded timeout.  For inference,
+            # _terminate_current_llama_worker() from the terminal path ensures
+            # the worker exits; the fatal_bridge_teardown path handles the
+            # stuck-subprocess edge case by unblocking inference so
             # shutdown(wait=True) does not hang.  Never use wait=False: request-owned
             # executor threads must be fully joined before returning a reusable client.
             cleanup_deadline = time.monotonic() + _API_V1_CLEANUP_BUDGET_SECONDS

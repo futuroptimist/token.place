@@ -2751,7 +2751,7 @@ def test_compatibility_sanitizer_fails_closed_without_runtime_helpers():
     old_module = sys.modules.get('desktop_runtime_setup')
     sys.modules['desktop_runtime_setup'] = stub
     try:
-        exec(prefix, namespace)
+        exec(compile(prefix, str(MODULE_PATH), 'exec'), namespace)
     finally:
         if old_module is None:
             sys.modules.pop('desktop_runtime_setup', None)
@@ -4986,6 +4986,16 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     _reset_cancel_queue()
     attempts = {'count': 0}
     sleep_calls = {'count': 0}
+    created_pollers = []
+    all_pollers_started = threading.Barrier(2)
+
+    real_thread = threading.Thread
+
+    def tracking_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        if str(kwargs.get('name', '')).startswith('tokenplace-relay-poller'):
+            created_pollers.append(thread)
+        return thread
 
     class BackoffRecoveryRuntime(ApiV1Runtime):
         def __init__(self, config, *_, model_manager=None, crypto_manager=None):
@@ -5001,6 +5011,10 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
             return False
 
         def process_relay_request_result(self, _payload):
+            try:
+                all_pollers_started.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
             return SimpleNamespace(
                 inference_succeeded=False,
                 submitted=True,
@@ -5019,6 +5033,7 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '1')
+    monkeypatch.setattr(threading, 'Thread', tracking_thread)
     monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', cancel_sleep)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: compute_node_bridge._stop_requested_latched.is_set())
     args = SimpleNamespace(
@@ -5036,10 +5051,8 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     assert attempts['count'] == 1
     assert sleep_calls['count'] >= 1
     assert 'desktop.compute_node_bridge.recovery.cancelled_during_backoff' in output.err
-    assert not any(
-        thread.name.startswith('tokenplace-relay-poller') and thread.is_alive()
-        for thread in threading.enumerate()
-    )
+    assert len(created_pollers) == 2
+    assert not any(thread.is_alive() for thread in created_pollers)
 
 
 def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exception(
@@ -6096,10 +6109,10 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
         output = capsys.readouterr()
         events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
         stopped = [event for event in events if event.get('type') == 'stopped'][-1]
-        assert stopped['unregister_outcome'] == 'complete'
+        assert stopped['unregister_outcome'] == 'timed_out'
         assert stopped['unregister_attempted'] is True
         assert stopped['unregister_success_count'] == 1
-        assert stopped['unregister_failure_count'] == 0
+        assert stopped['unregister_failure_count'] == 1
     finally:
         release_inference.set()
         worker.join(timeout=2.0)

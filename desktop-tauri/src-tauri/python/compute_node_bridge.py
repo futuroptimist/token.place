@@ -2565,22 +2565,36 @@ def run(args: argparse.Namespace) -> int:
                 stop_cleanup_attempted = stop_cleanup_attempted or active_relay_url in unregister_attempted_by_relay
                 stop_cleanup_failure_count += 1
 
+        poll_thread_cleanup_failed = False
+        while any(thread.is_alive() for thread in poll_threads):
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                poll_thread_cleanup_failed = True
+                break
+            for relay_runtime, active_relay_url, _latch_ok in cleanup_targets:
+                request_poll_cancel(relay_runtime, active_relay_url)
+            for thread in poll_threads:
+                if thread.is_alive():
+                    thread.join(timeout=min(0.05, max(0.0, remaining)))
+        if any(thread.is_alive() for thread in poll_threads):
+            poll_thread_cleanup_failed = True
+
+        if poll_thread_cleanup_failed and stop_cleanup_failure_count == 0:
+            stop_cleanup_failure_count += 1
+
         if stop_cleanup_required or stop_cleanup_failure_count > 0:
             if stop_cleanup_failure_count == 0:
                 stop_cleanup_outcome = "complete"
-            elif time.monotonic() >= cleanup_deadline or len(seen_cleanup_relays) < len(cleanup_targets):
+            elif time.monotonic() >= cleanup_deadline or len(seen_cleanup_relays) < len(cleanup_targets) or poll_thread_cleanup_failed:
                 stop_cleanup_outcome = "timed_out"
             else:
                 stop_cleanup_outcome = "partial"
             if stop_cleanup_outcome != "complete":
                 stop_cleanup_warning = (
-                    "Operator stopped locally, but unregister did not complete for one relay; "
+                    "Operator stopped locally, but cleanup did not complete for one relay; "
                     "it may remain listed until lease expiry."
                 )
                 last_error = last_error or stop_cleanup_warning
-        for thread in poll_threads:
-            if thread.is_alive():
-                thread.join(timeout=0.05)
 
         for relay_runtime in runtimes:
             active_relay_url = getattr(getattr(relay_runtime, "relay_client", None), "relay_url", relay_url)

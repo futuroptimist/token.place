@@ -74,7 +74,7 @@ class _ControlSession:
                 with self._lock:
                     if not self._closed.is_set():
                         self._result = result
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 – propagate to caller; daemon thread must not crash silently
                 with self._lock:
                     if not self._closed.is_set():
                         self._error = exc
@@ -87,6 +87,9 @@ class _ControlSession:
             if self._closed.is_set():
                 raise requests.ConnectionError('api_v1_control_session_closed')
 
+        # Check closed AFTER the loop: close() sets both _closed and _result_ready so
+        # the wait() above may return due to the session being closed rather than the
+        # HTTP call completing.  Without this check we would return None as the result.
         if self._closed.is_set():
             raise requests.ConnectionError('api_v1_control_session_closed')
 

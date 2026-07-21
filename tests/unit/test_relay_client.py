@@ -7272,7 +7272,7 @@ def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_po
         release_inference.set() or True
     )
 
-    def blocking_requests_post(url, **kwargs):
+    def blocking_requests_post(*args, **kwargs):
         # Signal that the HTTP call has started, then block until released by the test.
         control_entered.set()
         http_release.wait(30)

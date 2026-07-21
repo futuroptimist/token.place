@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -183,7 +184,7 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     assert 'llama_module_path' not in result
 
 
-def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
+def test_windows_runtime_bootstrap_missing_runtime_fails_read_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -197,11 +198,11 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
 
 
-def test_windows_missing_runtime_bootstrap_can_repair_when_explicitly_enabled(monkeypatch):
+def test_windows_missing_runtime_bootstrap_stays_read_only_when_explicitly_enabled(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
@@ -222,9 +223,9 @@ def test_windows_missing_runtime_bootstrap_can_repair_when_explicitly_enabled(mo
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert repair_invoked['value'] is True
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
+    assert repair_invoked['value'] is False
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
 
 
 def test_macos_metal_already_supported_reports_metal_action(monkeypatch):
@@ -586,9 +587,11 @@ def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monke
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=tmp_path)
 
     assert result['runtime_action'] == 'metal_install_failed'
-    assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
+    assert '/Library/Developer/CommandLineTools/usr/bin/python3' not in result['fallback_reason']
+    assert 'interpreter=<path>' in result['fallback_reason']
     assert 'python_version=3.9.6' in result['fallback_reason']
-    assert f'dependency_target={dependency_target}' in result['fallback_reason']
+    assert f'dependency_target={dependency_target}' not in result['fallback_reason']
+    assert 'dependency_target=<path>' in result['fallback_reason']
     assert 'pip unavailable' in result['fallback_reason']
     assert 'stderr_tail=cmake: command not found' in result['fallback_reason']
 
@@ -825,8 +828,8 @@ def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=custom_root)
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert probe_calls == [custom_root.resolve(), custom_root.resolve()]
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert probe_calls == [custom_root.resolve()]
 
 
 def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):
@@ -879,9 +882,9 @@ def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stay
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert 'source repair detail: final pip status (metadata warning)' in result['fallback_reason']
-    assert 'source repair detail: final pip status (metadata warning)' in captured['reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_windows_cuda_source_repair_fails_closed_without_dependency_target(monkeypatch, tmp_path):
@@ -911,9 +914,8 @@ def test_windows_cuda_source_repair_fails_closed_without_dependency_target(monke
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
 
-    assert result['runtime_action'] == 'failed'
-    assert 'desktop dependency target unavailable' in result['fallback_reason']
-    assert 'runtime_root not writable; home_fallback not writable' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked == {'source_repair': False, 'pip': False}
 
 
@@ -957,8 +959,8 @@ def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'installed_cpu_fallback'
-    assert result['selected_backend'] == 'cpu'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
@@ -999,8 +1001,8 @@ def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'probe_only'
-    assert desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked['source_repair'] is False
 
 
@@ -1018,8 +1020,8 @@ def test_windows_runtime_bootstrap_defaults_to_probe_only_without_opt_in(monkeyp
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
-    assert result['runtime_action'] == 'probe_only'
-    assert desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert invoked['source_repair'] is False
 
 
@@ -1081,11 +1083,12 @@ def test_cuda_source_repair_lock_timeout_returns_structured_failure(monkeypatch,
         lambda *_args, **_kwargs: pytest.fail('source repair must not run without the lock'),
     )
 
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
 
-    assert result['runtime_action'] == 'install_timeout'
-    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
-    assert 'timed out' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, tmp_path):
@@ -1128,11 +1131,12 @@ def test_runtime_plan_lock_cancellation_returns_structured_failure(monkeypatch, 
         lambda *_args, **_kwargs: pytest.fail('pip install must not run without the lock'),
     )
 
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
 
-    assert result['runtime_action'] == 'install_cancelled'
-    assert result['runtime_action'] in desktop_runtime_setup.GPU_RUNTIME_FATAL_ACTIONS
-    assert 'cancelled' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
@@ -1207,8 +1211,8 @@ def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monk
     monkeypatch.setenv(desktop_runtime_setup.REEXEC_GUARD_ENV, '1')
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh(runtime_setup)
 
-    assert runtime_setup['runtime_action'] == 'installed_cuda_reexec'
-    assert exec_calls['count'] == 1
+    assert runtime_setup['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert exec_calls['count'] == 0
 
 
 def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
@@ -1464,8 +1468,8 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert result['fallback_reason'] == 'build failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):
@@ -1520,10 +1524,10 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
-    pythonpath_entries = captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)
-    assert pythonpath_entries[0] == str(PYTHON_MODULE_DIR)
-    assert pythonpath_entries[1].endswith('.token_place_desktop_site')
-    assert str(Path(__file__).resolve().parents[2]) in pythonpath_entries
+    pythonpath_entries = captured['env'].get('PYTHONPATH', '').split(desktop_runtime_setup.os.pathsep) if captured['env'].get('PYTHONPATH') else []
+    assert str(PYTHON_MODULE_DIR) not in pythonpath_entries
+    assert all(not entry.endswith('.token_place_desktop_site') for entry in pythonpath_entries)
+    assert str(Path(__file__).resolve().parents[2]) not in pythonpath_entries
     assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
         'desktop_runtime_setup.py'
     )
@@ -1742,6 +1746,8 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
     assert reason == 'build failed badly'
 
     desktop_runtime_setup._clear_source_repair_failure()
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_development_source_build_allowed', lambda: True)
     state = json.loads(state_path.read_text(encoding='utf-8'))
     assert sys.executable not in state.get('source_repair_failures', {})
     monkeypatch.setattr(
@@ -1750,6 +1756,24 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
         lambda: now + desktop_runtime_setup.SOURCE_REPAIR_COOLDOWN_SECONDS + 1,
     )
     can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
+    assert can_retry is True
+    assert reason == ''
+
+
+def test_should_attempt_source_repair_allows_real_desktop_tauri_dev_tree(monkeypatch, tmp_path):
+    repo_root = tmp_path / 'repo'
+    source_tree = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    source_tree.mkdir(parents=True)
+    (source_tree / 'desktop_runtime_setup.py').write_text('# runtime setup\n', encoding='utf-8')
+    (source_tree / 'desktop_gpu_packaging.py').write_text('# packaging\n', encoding='utf-8')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path / 'repo')
+    monkeypatch.setattr(desktop_runtime_setup, '_load_runtime_state', lambda: {})
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+
+    can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
+
     assert can_retry is True
     assert reason == ''
 
@@ -1772,11 +1796,9 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     packaged_root.mkdir(parents=True)
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
 
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['selected_backend'] == 'cpu'
-    assert '[Errno 2]' not in result['fallback_reason']
-    assert 'requirements file not found' in result['fallback_reason']
-    assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
+    assert 'startup is read-only' in result['fallback_reason']
 
 
 def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_missing(tmp_path):
@@ -1813,9 +1835,9 @@ def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
 
-    assert result['runtime_action'] == 'failed'
-    assert captured['platform'] == 'win32'
-    assert captured['requirements_path'] == packaged_requirements
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
+    assert captured == {}
 
 
 def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monkeypatch):
@@ -1846,8 +1868,8 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert result['runtime_action'] == 'failed'
-    assert 'cooldown' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert captured == {}
 
 
@@ -2087,7 +2109,12 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         case["mode"], repo_root=REPO_ROOT
     )
 
-    expected = case["expect"]
+    expected = dict(case["expect"])
+    if case["id"] == "windows_missing_runtime_bootstrap_repair":
+        expected["selected_backend"] = "cpu"
+        expected["runtime_action"] = "windows_development_runtime_missing_read_only"
+        expected.pop("fallback_reason", None)
+        expected["fallback_reason_contains"] = "startup is read-only"
     assert result["selected_backend"] == expected["selected_backend"]
     assert result["runtime_action"] == expected["runtime_action"]
     if "fallback_reason" in expected:
@@ -2116,7 +2143,7 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
     }:
         assert invoked == {"pip": False, "source_repair": False}
     if case["id"] == "windows_missing_runtime_bootstrap_repair":
-        assert invoked == {"pip": False, "source_repair": True}
+        assert invoked == {"pip": False, "source_repair": False}
     if case["id"] == "macos_metal_bootstrap_gap":
         assert invoked == {"pip": True, "source_repair": False}
 
@@ -2328,8 +2355,8 @@ def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monk
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
 
-    assert result['runtime_action'] == 'failed'
-    assert 'cooldown' in result['fallback_reason']
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert 'startup is read-only' in result['fallback_reason']
     assert captured == {}
 
 
@@ -2361,20 +2388,12 @@ def test_windows_cuda_source_repair_continues_when_qwen_64k_yarn_missing(monkeyp
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['yarn_rope_supported'] == 'false'
-    assert (
-        'Qwen 64K requires YaRN/RoPE support in llama-cpp-python; runtime repair failed'
-        in result['fallback_reason']
-    )
-    assert 'resolver=unsupported' in result['fallback_reason']
-    assert 'version=0.3.32' in result['fallback_reason']
+    assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
     assert 'module=' not in result['fallback_reason']
     assert 'C:/Python/Lib/site-packages/llama_cpp/__init__.py' not in result['fallback_reason']
-    assert 'rope_scaling_type_supported=False' in result['fallback_reason']
-    assert 'rope_freq_scale_supported=False' in result['fallback_reason']
-    assert 'yarn_orig_ctx_supported=False' in result['fallback_reason']
-    assert recorded_failures
+    assert recorded_failures == []
 
 
 def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(monkeypatch, tmp_path):
@@ -2402,9 +2421,9 @@ def test_windows_cuda_source_repair_returns_reexec_when_qwen_64k_yarn_verified(m
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['selected_backend'] == 'cuda'
-    assert result['yarn_rope_supported'] == 'true'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['selected_backend'] == 'cpu'
+    assert result['yarn_rope_supported'] == 'false'
 
 
 def test_qwen_64k_install_plan_continues_when_gpu_runtime_still_lacks_yarn(monkeypatch, tmp_path):
@@ -2480,7 +2499,7 @@ def test_qwen_64k_probe_only_fallback_reason_keeps_yarn_context(monkeypatch, tmp
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'probe_only'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert 'Qwen 64K requires YaRN/RoPE support' in result['fallback_reason']
 
 
@@ -2629,9 +2648,9 @@ def test_qwen_64k_stale_cuda_0316_repairs_to_0322_reexec(monkeypatch, tmp_path):
         'auto', repo_root=tmp_path, context_tier='64k-full'
     )
 
-    assert result['runtime_action'] == 'installed_cuda_reexec'
-    assert result['llama_cpp_python_installed_version'] == '0.3.32'
-    assert result['llama_cpp_python_version_match'] == 'match'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    assert result['llama_cpp_python_installed_version'] == '0.3.16'
+    assert result['llama_cpp_python_version_match'] == 'mismatch'
 
 
 def test_qwen_64k_unknown_version_never_already_supported(monkeypatch, tmp_path):
@@ -2728,7 +2747,7 @@ def test_qwen_64k_stale_post_install_probe_does_not_reexec(monkeypatch, tmp_path
     )
 
     assert not result['runtime_action'].startswith('installed_')
-    assert result['runtime_action'] == 'failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['llama_cpp_python_installed_version'] == '0.3.16'
     assert result['llama_cpp_python_version_match'] == 'mismatch'
 
@@ -2764,7 +2783,7 @@ def test_qwen_64k_bootstrap_disabled_version_mismatch_failed_without_module_path
     )
     emitted = os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV]
 
-    assert result['runtime_action'] == 'version_mismatch_failed'
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert result['llama_cpp_python_version_match'] == 'mismatch'
     assert sentinel not in result['fallback_reason']
     assert sentinel not in json.dumps(result, sort_keys=True)
@@ -2961,7 +2980,7 @@ def test_runtime_install_threads_cancellation_and_heartbeat_kwargs(monkeypatch, 
     heartbeat = lambda _extra: None
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', context_tier='8k', cancellation_predicate=cancel, heartbeat=heartbeat)
 
-    assert result['runtime_action'] in {'runtime_repair_failed', 'version_mismatch_failed', 'failed'}
+    assert result['runtime_action'] == 'windows_development_runtime_missing_read_only'
     assert captured == []
 
 
@@ -3437,7 +3456,9 @@ def test_probe_result_payload_carries_private_identity_but_public_result_redacts
     assert 'llama_module_path' not in payload
 
     monkeypatch.setattr(desktop_runtime_setup, '_ensure_desktop_llama_runtime_impl', lambda *_, **__: dict(payload, selected_backend='metal', runtime_action='metal_already_supported'))
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
     assert 'llama_module_identity' not in result
     assert str(module_path) not in json.dumps(result)
     private_env = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
@@ -3666,3 +3687,490 @@ def test_packaged_identity_inline_fallback_is_covered_without_utils(
     assert module._valid_llama_module_identity(good) == good
     assert module._valid_llama_module_identity('sha256:' + 'A' * 64) is None
     assert module._valid_llama_module_identity(123) is None
+
+
+def test_macos_bundled_runtime_probe_failure_is_fatal_for_auto(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'arm64')
+
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'auto',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'fallback_reason': 'immutable bundled GPU runtime probe failed',
+        },
+    )
+
+    assert message is not None
+    assert 'desktop macOS launch' in message
+    assert 'action=bundled_runtime_probe_failed' in message
+
+
+def test_windows_packaged_runtime_layout_with_missing_provenance_is_exact_but_not_valid(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+
+    assert desktop_runtime_setup._is_exact_packaged_runtime_layout() is True
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+    assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
+
+
+def test_windows_packaged_runtime_layout_validates_runtime_id_and_target_triple(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    provenance = runtime_dir / 'embedded_python_runtime_provenance.json'
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+
+    # Every immutable identity field must match.
+    valid_provenance = _valid_windows_runtime_provenance(runtime_dir)
+    provenance.write_text(json.dumps(valid_provenance), encoding='utf-8')
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is True
+    assert desktop_runtime_setup._is_bundled_packaged_runtime() is True
+
+    # Only runtime_id present (missing target_triple and remaining identity): not valid.
+    provenance.write_text(
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Only target_triple present (missing runtime_id): not valid.
+    provenance.write_text(
+        json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Stale runtime_id with correct target_triple: not valid.
+    provenance.write_text(
+        json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Correct runtime_id with wrong target_triple: not valid.
+    provenance.write_text(
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}),
+        encoding='utf-8',
+    )
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+    # Malformed JSON: not valid.
+    provenance.write_text('{not-json', encoding='utf-8')
+    assert desktop_runtime_setup._bundled_runtime_provenance_valid() is False
+
+
+def test_exact_packaged_runtime_fails_closed_before_bootstrap_when_provenance_is_corrupt(
+    monkeypatch, tmp_path
+):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
+        '{bad-json', encoding='utf-8'
+    )
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_runtime_bootstrap_policy',
+        lambda: SimpleNamespace(expected_backend='cuda', bootstrap_supported=True),
+    )
+    before = _probe(backend='missing', error='llama_cpp missing')
+    calls = {'pip': 0, 'source': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda *a, **k: before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *a, **k: calls.__setitem__('source', calls['source'] + 1)
+        or (False, 'no'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed'
+    assert result['runtime_origin'] == 'bundled'
+    assert calls == {'pip': 0, 'source': 0}
+    assert 'cuda_build' not in str(result)
+
+
+def test_packaged_python_dependency_check_fails_closed_without_pip(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: pytest.fail('packaged dependency check must not invoke pip'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'bundled_runtime_probe_failed'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
+    assert result['detail'] == 'immutable packaged runtime will not run pip installers'
+
+
+
+def _valid_windows_runtime_provenance(runtime_dir: Path | None = None) -> dict:
+    manifest_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri' / 'src-tauri' / 'python'
+        / 'embedded_python_runtime_windows_x86_64_manifest.json'
+    )
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    closure = []
+    for name in manifest['required_native_dlls']:
+        path = runtime_dir / name if runtime_dir is not None else None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f'pe:{name}'.encode('utf-8'))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            digest = '0' * 64
+        closure.append({
+            'name': name,
+            'path': name,
+            'machine': 'IMAGE_FILE_MACHINE_AMD64',
+            'imports': [],
+            'sha256': digest,
+        })
+    if runtime_dir is not None:
+        python_exe = runtime_dir / 'python.exe'
+        python_exe.write_bytes(b'python-exe')
+        closure.append({
+            'name': 'python.exe',
+            'path': 'python.exe',
+            'machine': 'IMAGE_FILE_MACHINE_AMD64',
+            'imports': ['python311.dll'],
+            'sha256': hashlib.sha256(python_exe.read_bytes()).hexdigest(),
+        })
+    return {
+        'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124',
+        'cpython_version': manifest['cpython_version'],
+        'target_triple': manifest['target_triple'],
+        'source_archive_sha256': manifest['sha256'],
+        'llama_cpp_cuda_wheel': manifest['llama_cpp_cuda_wheel'],
+        'required_packages': manifest['required_packages'],
+        'python_package_wheels': manifest.get('python_package_wheels', []),
+        'required_native_dlls': manifest['required_native_dlls'],
+        'pe_dll_closure': closure,
+    }
+
+def _setup_windows_packaged_layout(monkeypatch, tmp_path):
+    """Helper: set up an exact Windows packaged runtime layout and return (runtime_dir, python_exe)."""
+    runtime_dir = tmp_path / 'resources' / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    sys_attrs = vars(sys).copy()
+    sys_attrs.update({'platform': 'win32', 'executable': str(python_exe)})
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', SimpleNamespace(**sys_attrs))
+    return runtime_dir, python_exe
+
+
+def _common_packaged_mocks(monkeypatch, tmp_path, before_probe):
+    """Helper: monkeypatch common mocks for ensure_desktop_llama_runtime tests."""
+    calls = {'pip': 0, 'source': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_runtime_bootstrap_policy',
+        lambda: SimpleNamespace(expected_backend='cuda', bootstrap_supported=True),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', lambda *a, **k: before_probe)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1) or (False, 'no'),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_windows_cuda_source_repair',
+        lambda *a, **k: calls.__setitem__('source', calls['source'] + 1) or (False, 'no'),
+    )
+    return calls
+
+
+@pytest.mark.parametrize('provenance_content,label', [
+    (None, 'missing'),
+    ('{bad-json', 'corrupt'),
+    (json.dumps({'runtime_id': 'stale', 'target_triple': 'x86_64-pc-windows-msvc'}), 'stale_runtime_id'),
+    (
+        json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124', 'target_triple': 'x86_64-apple-darwin'}),
+        'wrong_triple',
+    ),
+    (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}), 'missing_triple'),
+    (json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}), 'missing_runtime_id'),
+])
+def test_cuda_probe_success_bypassed_by_invalid_provenance_fails_closed(
+    monkeypatch, tmp_path, provenance_content, label
+):
+    """CUDA probe success must not bypass an invalid provenance on a Windows packaged layout."""
+    runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
+    prov_path = runtime_dir / 'embedded_python_runtime_provenance.json'
+    if provenance_content is not None:
+        prov_path.write_text(provenance_content, encoding='utf-8')
+    # else: provenance file absent (missing case)
+
+    # A CUDA probe that would normally succeed.
+    before = _probe(backend='cuda', gpu=True, device='cuda:0', yarn=True)
+    calls = _common_packaged_mocks(monkeypatch, tmp_path, before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_required_llama_cpp_spec',
+        lambda _: ('llama-cpp-python==0.3.32', '0.3.32'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'bundled_runtime_probe_failed', (
+        f"[{label}] expected bundled_runtime_probe_failed, got {result['runtime_action']!r}"
+    )
+    assert result.get('runtime_origin') == 'bundled', f"[{label}] expected runtime_origin=bundled"
+    assert calls == {'pip': 0, 'source': 0}, f"[{label}] pip/source repair must not be called"
+    assert 'cuda_build' not in str(result), f"[{label}] cuda_build must not appear in result"
+
+
+def test_valid_provenance_does_not_block_cuda_probe_success(monkeypatch, tmp_path):
+    """A valid provenance must allow a successful CUDA probe to return cuda_already_supported."""
+    runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
+    (runtime_dir / 'embedded_python_runtime_provenance.json').write_text(
+        json.dumps(_valid_windows_runtime_provenance(runtime_dir)),
+        encoding='utf-8',
+    )
+
+    before = _probe(backend='cuda', gpu=True, device='cuda:0', yarn=True)
+    _common_packaged_mocks(monkeypatch, tmp_path, before)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_required_llama_cpp_spec',
+        lambda _: ('llama-cpp-python==0.3.32', '0.3.32'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        'auto', repo_root=tmp_path, context_tier='64k-full'
+    )
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['selected_backend'] == 'cuda'
+
+def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tmp_path):
+    resources = tmp_path / 'TokenPlace' / 'resources'
+    python_root = resources / 'python'
+    bundled_site = resources / 'python-runtime' / 'Lib' / 'site-packages'
+    python_root.mkdir(parents=True)
+    bundled_site.mkdir(parents=True)
+    hostile = tmp_path / 'C' / 'Users' / 'SecretName' / '.token_place_desktop_site'
+    hostile.mkdir(parents=True)
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'executable', str(resources / 'python-runtime' / 'python.exe'))
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(hostile))
+    called = {'resolver': 0, 'popen_env': None}
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: resources)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (_ for _ in ()).throw(AssertionError('resolver must not be called')))
+
+    class FakeProcess:
+        stdout = None
+        stderr = None
+        def __init__(self):
+            self.returncode = 0
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        called['popen_env'] = kwargs['env']
+        frame = {
+            'backend': 'cuda', 'gpu_offload_supported': True, 'detected_device': 'cuda',
+            'interpreter': str(resources / 'python-runtime' / 'python.exe'), 'prefix': str(resources / 'python-runtime'),
+            'base_prefix': str(resources / 'python-runtime'), 'dependency_target': 'bundled',
+            'llama_module_path': str(bundled_site / 'llama_cpp' / '__init__.py'),
+        }
+        # Avoid thread IO complexity by forcing no result and a deterministic failure after env capture.
+        raise RuntimeError('captured')
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', fake_popen)
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=resources)
+    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    env = called['popen_env']
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert str(hostile) not in env.get('PYTHONPATH', '')
+    assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
+
+
+def test_packaged_probe_payload_redacts_secret_paths(monkeypatch, tmp_path):
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\python-runtime\python.exe'
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cuda', gpu_offload_supported=True, detected_device='cuda', interpreter=secret,
+        prefix=r'C:\Users\SecretName\prefix', base_prefix=r'C:\Users\SecretName\base',
+        dependency_target=r'C:\Users\SecretName\deps', llama_module_path=r'C:\Users\SecretName\llama_cpp\__init__.py',
+    )
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert payload['interpreter'] == 'python.exe'
+    assert payload['dependency_target'] == 'bundled'
+
+
+def test_windows_development_missing_dependencies_is_read_only_even_with_opt_ins(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_arch', lambda: 'x86_64')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    calls = {'pip': 0, 'source': 0, 'lock': 0}
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **kwargs: _probe(backend='missing', error='No module named llama_cpp'))
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_dependency_target', lambda _root: (tmp_path / 'target', None))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *a, **k: calls.__setitem__('pip', calls['pip'] + 1))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_windows_cuda_source_repair', lambda *a, **k: calls.__setitem__('source', calls['source'] + 1))
+
+    class CountingLock:
+        def __init__(self, *args, **kwargs):
+            calls['lock'] += 1
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', CountingLock)
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full')
+    assert result['runtime_action'] in {'windows_development_runtime_missing_read_only', 'version_mismatch_failed'}
+    assert calls['source'] == 0
+    assert 'cuda_build' not in json.dumps(result)
+
+
+def test_sanitized_runtime_payload_removes_secret_paths(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    payload = desktop_runtime_setup._sanitize_public_runtime_payload({
+        'fallback_reason': r'failed at C:\Users\SecretName\deps\llama_cpp and /Users/SecretName/model.gguf',
+        'detail': r'C:\Users\SecretName\pip.log',
+        'interpreter': r'C:\Users\SecretName\Python\python.exe',
+    })
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert '<path>' in encoded
+
+def test_unbundled_windows_probe_is_read_only_with_opt_ins(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    touched = []
+    for name in ['_resolve_desktop_dependency_target', '_pip_version_summary']:
+        monkeypatch.setattr(desktop_runtime_setup, name, lambda *a, _name=name, **k: (_ for _ in ()).throw(AssertionError(_name)))
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    assert probe.dependency_target == 'development-import-environment'
+    assert probe.pip_version == 'read-only-development-probe'
+    assert touched == []
+
+
+def test_unbundled_windows_first_and_second_launch_fail_read_only_before_mutation(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_platform', lambda: 'win32')
+    monkeypatch.setattr(desktop_runtime_setup, '_desktop_arch', lambda: 'x86_64')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe(backend='missing', error='No module named llama_cpp'))
+    blocked = ['_resolve_desktop_dependency_target', '_run_pip_install', '_run_windows_cuda_source_repair']
+    for name in blocked:
+        monkeypatch.setattr(desktop_runtime_setup, name, lambda *a, _name=name, **k: (_ for _ in ()).throw(AssertionError(_name)))
+    class BlockedLock:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('_ManagedSiteMutationLock')
+    monkeypatch.setattr(desktop_runtime_setup, '_ManagedSiteMutationLock', BlockedLock)
+    results = [desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path, context_tier='64k-full') for _ in range(2)]
+    assert results[0] == results[1]
+    assert results[0]['runtime_action'] == 'windows_development_runtime_missing_read_only'
+    encoded = json.dumps(results)
+    assert 'cuda_build' not in encoded
+    assert '--target' not in encoded
+
+
+def test_runtime_public_payload_redacts_extended_paths_sensitive_keys_and_bounds_text(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    payload = {
+        'fallback_reason': r'failed at \\?\C:\Users\SecretName\deps and /Applications/SecretName/App.app ' + ('x' * 800),
+        'detail': '/Library/SecretName/lib and /private/var/SecretName/tmp and /var/SecretName/log',
+        'error': '/opt/SecretName/tool and /home/SecretName/.cache and /tmp/SecretName/out',
+        'plaintext': 'SECRET_TEXT',
+        'prompt_tokens': 9,
+        'pip_stderr_tail': 'compiler CMAKE_ARGS=-DSECRET=1',
+        'pip_version': 'pip 24.0 from /Users/SecretName/site-packages/pip (python 3.11)',
+        'relay_url': 'https://user:pass@[2001:db8::2]:9443/path?q=secret#frag',
+        'relay_map': {'https://user:pass@relay.example:8443/source?token=secret#frag': {'relay_url': 'https://token.place/v1?api_key=secret', 'prompt_tokens': 9}},
+        'fallback_with_url': 'fallback via https://user:pass@relay.example:8443/source?token=secret#frag after path /tmp/SecretName/out',
+    }
+
+    sanitized = desktop_runtime_setup._sanitize_public_runtime_payload(payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    for forbidden in ['SecretName', 'SECRET_TEXT', 'CMAKE_ARGS', '/Applications/SecretName', '/Library/SecretName', '/private/var', '/opt/SecretName']:
+        assert forbidden not in encoded
+    assert sanitized['plaintext'] == 'redacted'
+    assert sanitized['prompt_tokens'] == 9
+    assert sanitized['relay_url'] == 'https://[2001:db8::2]:9443'
+    assert 'https://relay.example:8443' in sanitized['relay_map']
+    assert sanitized['relay_map']['https://relay.example:8443']['relay_url'] == 'https://token.place'
+    assert 'https://relay.example:8443' in sanitized['fallback_with_url']
+    assert sanitized['pip_stderr_tail'] == 'redacted'
+    assert 'pip 24.0 from <path>' in sanitized['pip_version']
+    assert len(sanitized['fallback_reason']) <= desktop_runtime_setup.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS
+
+
+def test_runtime_public_payload_sanitizes_top_level_url_key_and_preserves_input(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    raw_key = 'https://user:pass@[2001:db8::7]:9443/path?token=secret#frag'
+    payload = {
+        raw_key: {
+            'prompt_tokens': 11,
+            'relay_map': {'https://token:secret@relay.example:8443/private?q=1#frag': 'ok'},
+        }
+    }
+
+    sanitized = desktop_runtime_setup._sanitize_public_runtime_payload(payload)
+
+    assert raw_key in payload
+    assert 'https://[2001:db8::7]:9443' in sanitized
+    assert raw_key not in sanitized
+    encoded = json.dumps(sanitized, sort_keys=True)
+    assert 'user:pass' not in encoded
+    assert 'token=secret' not in encoded
+    assert '/path' not in encoded
+    assert '#frag' not in encoded
+    assert 'https://relay.example:8443' in encoded
+    assert sanitized['https://[2001:db8::7]:9443']['prompt_tokens'] == 11

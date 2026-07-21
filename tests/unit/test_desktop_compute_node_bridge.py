@@ -308,6 +308,25 @@ class WarmingTimeoutApiV1Runtime(ApiV1Runtime):
         return result
 
 
+class NeverReadyApiV1Runtime(ApiV1Runtime):
+    """Runtime whose ensure_api_v1_runtime_ready blocks on an Event that is never
+    set, so Future.result(timeout=t) always raises TimeoutError — useful for
+    deterministic deadline/timeout tests."""
+
+    last_instance = None
+    _BLOCK_TIMEOUT = 5.0  # safety ceiling; test deadline is always shorter
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        NeverReadyApiV1Runtime.last_instance = self
+        self._block = threading.Event()
+
+    def ensure_api_v1_runtime_ready(self):
+        # Never sets self._block, so this always times out after _BLOCK_TIMEOUT.
+        self._block.wait(timeout=self._BLOCK_TIMEOUT)
+        return False
+
+
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
     last_instance = None
 
@@ -2044,7 +2063,7 @@ def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys
     assert "model_path" not in payload
     assert payload["error_code"] == "desktop_compute_node_startup_failed"
     assert payload["context_tier"] == "8k-fast"
-    assert payload["interpreter"] == sys.executable
+    assert payload["interpreter"] == Path(sys.executable).name
     assert payload["import_root"] == "unknown"
     assert payload["log_file_path"] == "unknown"
     assert payload["last_error"] == payload["message"]
@@ -2300,9 +2319,10 @@ def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tm
     assert payload['error_code'] == 'context_profiles_unavailable'
     assert payload['registered'] is False
     assert payload['context_tier'] == '64k-full'
-    assert payload['interpreter'] == sys.executable
-    assert payload['import_root'] == str(import_root)
-    assert payload['log_file_path'] == str(tmp_path / 'operator.log')
+    assert payload['interpreter'] == Path(sys.executable).name
+    assert payload['import_root'] == import_root.name
+    assert str(tmp_path) not in json.dumps(payload)
+    assert payload['log_file_path'] == 'operator.log'
     assert 'context profiles unavailable' in payload['message']
     assert 'model_path' not in payload
 
@@ -2671,6 +2691,100 @@ def test_relay_key_fingerprint_uses_safe_helper_and_fallbacks():
         crypto_manager = SimpleNamespace(public_key_b64='short')
 
     assert compute_node_bridge._relay_key_fingerprint(ShortKeyRelay()) == 'unknown'
+
+
+
+def test_relay_and_runtime_stderr_summaries_sanitize_all_rendered_values():
+    canary = r"C:\Users\SecretName\AppData\relay.txt"
+    url = "https://user:pass@[2001:db8::1]:8443/path?q=token#frag"
+    response = {
+        f"secret_key_{url}": "value",
+        "request_id": f"req {canary} {url}",
+        "relay_error_kind": "cloudflare_pre_app_rejection",
+        "http_status": f"500 {canary}",
+        "relay_error": f"boom {url} {canary}",
+        "relay_http_diagnostic": {"headers": {"cf-ray": f"ray {url}", "server": f"nginx {canary}"}},
+    }
+    original = json.dumps(response, sort_keys=True)
+    summary = compute_node_bridge._relay_response_summary(response)
+    assert json.dumps(response, sort_keys=True) == original
+    assert "SecretName" not in summary
+    assert "user:pass" not in summary
+    assert "/path" not in summary
+    assert "q=token" not in summary
+    assert "#frag" not in summary
+    assert "status=unknown" in summary
+    assert "https://[2001:db8::1]:8443" in summary
+
+    numeric = compute_node_bridge._relay_response_summary({"http_status": 503, "relay_error_kind": "relay_json_error"})
+    assert "status=503" in numeric
+
+    diagnostics = {
+        "requested_mode": "auto",
+        "effective_mode": "gpu",
+        "backend_selected": "cuda",
+        "backend_used": "cuda",
+        "backend_available": True,
+        "fallback_reason": f"fallback at /private/var/SecretName/runtime and {url}",
+        "offloaded_layers": 32,
+        "kv_cache_device": "cuda:0",
+    }
+    runtime_summary = compute_node_bridge._runtime_diagnostics_summary(diagnostics)
+    assert "SecretName" not in runtime_summary
+    assert "user:pass" not in runtime_summary
+    assert "https://[2001:db8::1]:8443" in runtime_summary
+    assert "backend_selected=cuda" in runtime_summary
+    assert "offloaded_layers=32" in runtime_summary
+
+
+def test_compatibility_sanitizer_fails_closed_without_runtime_helpers():
+    bridge_source = MODULE_PATH.read_text()
+    split_marker = 'def _is_repo_llama_cpp_shim'
+    prefix = bridge_source.split(split_marker, 1)[0]
+    stub = ModuleType('desktop_runtime_setup')
+    stub.desktop_gpu_runtime_failure_message = lambda *args, **kwargs: None
+    stub.ensure_desktop_llama_runtime = lambda *args, **kwargs: {'runtime_action': 'stub'}
+    stub.ensure_desktop_python_dependencies = lambda *args, **kwargs: {'ok': 'true'}
+    stub.maybe_reexec_for_runtime_refresh = lambda *args, **kwargs: None
+    stub._ensure_desktop_llama_runtime_impl = lambda *args, **kwargs: {'runtime_action': 'stub'}
+    namespace = {'__name__': 'compat_bridge_test', '__file__': str(MODULE_PATH)}
+    old_module = sys.modules.get('desktop_runtime_setup')
+    sys.modules['desktop_runtime_setup'] = stub
+    try:
+        exec(compile(prefix, str(MODULE_PATH), 'exec'), namespace)
+    finally:
+        if old_module is None:
+            sys.modules.pop('desktop_runtime_setup', None)
+        else:
+            sys.modules['desktop_runtime_setup'] = old_module
+
+    raw_key = 'https://user:pass@relay.example:9443/private?token=secret#frag'
+    payload = {
+        'prompt': 'PROMPT_SECRET',
+        'authorization': 'Bearer SECRET_AUTH',
+        'pip_stdout_tail': 'compiler output SECRET_TAIL',
+        'relay_url': 'https://user:pass@[2001:db8::5]:8443/path?q=secret#frag',
+        'interpreter': r'C:\Users\SecretName\python.exe',
+        'model_path': r'\\server\share\SecretName\model.gguf',
+        raw_key: {'response': 'RESPONSE_SECRET', 'prompt_tokens': 13},
+        'nested': {'relay_urls': ['https://token:secret@relay-b.example/path?q=1#f']},
+        'safe_hash': 'abc123',
+    }
+    original = json.loads(json.dumps(payload))
+
+    sanitized = namespace['_sanitize_public_runtime_payload'](payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    assert payload == original
+    for forbidden in ['PROMPT_SECRET', 'SECRET_AUTH', 'SECRET_TAIL', 'RESPONSE_SECRET', 'SecretName', 'user:pass', 'token=secret', '?q=', '#frag', '/private']:
+        assert forbidden not in encoded
+    assert sanitized['prompt'] == 'redacted'
+    assert sanitized['authorization'] == 'redacted'
+    assert sanitized['pip_stdout_tail'] == 'redacted'
+    assert sanitized['relay_url'] == 'https://[2001:db8::5]:8443'
+    assert 'https://relay.example:9443' in sanitized
+    assert sanitized['https://relay.example:9443']['prompt_tokens'] == 13
+    assert sanitized['safe_hash'] == 'abc123'
 
 
 def test_relay_response_summary_handles_non_dict_payloads():
@@ -3828,7 +3942,8 @@ def test_platform_neutral_runtime_setup_failure_last_error_is_actionable(
     assert payload['relay_runtime_state'] == 'failed'
     assert payload['last_error'] == payload['message']
     assert 'desktop model runtime setup failed' in payload['last_error']
-    assert 'interpreter=/opt/token.place/python' in payload['last_error']
+    assert 'interpreter=<path>' in payload['last_error']
+    assert '/opt/token.place/python' not in payload['last_error']
     assert 'missing=llama_cpp' in payload['last_error']
     assert 'before relay registration' in payload['last_error']
 
@@ -3870,14 +3985,9 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
     assert payload["relay_runtime_state"] == "failed"
     assert payload["last_error"] == payload["message"]
     assert "desktop runtime dependency preflight failed" in payload["last_error"]
-    assert (
-        "interpreter=/Applications/token.place.app/Contents/MacOS/python"
-        in payload["last_error"]
-    )
-    assert (
-        "import_root=/Applications/token.place.app/Contents/Resources"
-        in payload["last_error"]
-    )
+    assert "interpreter=python" in payload["last_error"]
+    assert "import_root=Resources" in payload["last_error"]
+    assert "/Applications/token.place.app" not in payload["last_error"]
     assert "missing=cryptography,requests" in payload["last_error"]
 
 
@@ -4512,31 +4622,32 @@ def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_e
     stderr = output.err
     assert 'desktop.runtime_setup ' in stderr
     for marker in (
-        'interpreter=/Applications/TokenPlace.app/Contents/Resources/python/bin/python',
+        'interpreter=python',
         'python_version=3.12.4',
-        'prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
-        'base_prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
-        'dependency_target=/Users/alice/Library/Application Support/token.place/.token_place_desktop_site',
+        'prefix=Python3.framework',
+        'base_prefix=Python3.framework',
+        'dependency_target=.token_place_desktop_site',
         'pip=pip 24.0',
-        'install_command=python -m pip install --target /deps llama-cpp-python',
+        'install_command=redacted',
         'install_backend=metal',
-        'cmake_args=-DGGML_METAL=on -DGGML_NATIVE=off',
-        'pip_stdout_tail=building wheel',
-        'pip_stderr_tail=Metal headers missing',
+        'cmake_args=redacted',
+        'pip_stdout_tail=redacted',
+        'pip_stderr_tail=redacted',
         'fallback_reason=Metal failed; using CPU runtime',
     ):
         assert marker in stderr
+    assert '/Users/alice' not in stderr
     assert 'llama_module_path=/deps/llama_cpp/__init__.py' not in stderr
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = events[0]
     assert started['last_error'] is None
     status_event = next(event for event in events if event.get('type') == 'status')
     assert status_event['runtime_action'] == 'metal_cpu_fallback'
-    assert status_event['base_prefix'].startswith('/Library/Developer')
+    assert status_event['base_prefix'] == 'Python3.framework'
     assert status_event['pip_version'] == 'pip 24.0'
-    assert status_event['install_command_summary'].startswith('python -m pip install')
-    assert status_event['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
-    assert status_event['pip_stderr_tail'] == 'Metal headers missing'
+    assert status_event['install_command_summary'] == 'redacted'
+    assert status_event['cmake_args'] == 'redacted'
+    assert status_event['pip_stderr_tail'] == 'redacted'
     assert 'llama_module_path' not in status_event
 
 def test_run_keeps_registration_false_after_runtime_health_failure(capsys, monkeypatch):
@@ -4875,6 +4986,16 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     _reset_cancel_queue()
     attempts = {'count': 0}
     sleep_calls = {'count': 0}
+    created_pollers = []
+    all_pollers_started = threading.Barrier(2)
+
+    real_thread = threading.Thread
+
+    def tracking_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        if str(kwargs.get('name', '')).startswith('tokenplace-relay-poller'):
+            created_pollers.append(thread)
+        return thread
 
     class BackoffRecoveryRuntime(ApiV1Runtime):
         def __init__(self, config, *_, model_manager=None, crypto_manager=None):
@@ -4890,6 +5011,10 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
             return False
 
         def process_relay_request_result(self, _payload):
+            try:
+                all_pollers_started.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
             return SimpleNamespace(
                 inference_succeeded=False,
                 submitted=True,
@@ -4908,6 +5033,7 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '1')
+    monkeypatch.setattr(threading, 'Thread', tracking_thread)
     monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', cancel_sleep)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: compute_node_bridge._stop_requested_latched.is_set())
     args = SimpleNamespace(
@@ -4925,10 +5051,8 @@ def test_multi_relay_stop_during_recovery_backoff_exits_without_threads(capsys, 
     assert attempts['count'] == 1
     assert sleep_calls['count'] >= 1
     assert 'desktop.compute_node_bridge.recovery.cancelled_during_backoff' in output.err
-    assert not any(
-        thread.name.startswith('tokenplace-relay-poller') and thread.is_alive()
-        for thread in threading.enumerate()
-    )
+    assert len(created_pollers) == 2
+    assert not any(thread.is_alive() for thread in created_pollers)
 
 
 def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exception(
@@ -4937,6 +5061,7 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
 ):
     _reset_cancel_queue()
     recovery_calls = {'count': 0}
+    recovery_completed = threading.Event()
 
     class RaisingUnregisterClient(FakeRelayClient):
         def __init__(self, relay_url):
@@ -4966,6 +5091,7 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
             recovery_calls['count'] += 1
             if recovery_calls['count'] == 1:
                 raise RuntimeError('first warm-load failed')
+            recovery_completed.set()
             return True
 
         def process_relay_request_result(self, _payload):
@@ -4982,11 +5108,9 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '0')
-    stop_checks = {'count': 0}
 
     def stop_after_recovery():
-        stop_checks['count'] += 1
-        return recovery_calls['count'] >= 2 and stop_checks['count'] > 6
+        return recovery_completed.is_set()
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_recovery)
     args = SimpleNamespace(
@@ -5712,19 +5836,16 @@ def test_runtime_typeerror_unexpected_keyword_falls_back(monkeypatch, capsys):
 
 
 def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monkeypatch):
+    # Use a never-completing runtime so Future.result(timeout=) always raises
+    # TimeoutError, making the deadline path deterministic regardless of OS
+    # scheduling.  Real timing only affects how quickly remaining_seconds drops
+    # to zero; the warm-load deadline (80 ms) is always hit before the 5-second
+    # block inside NeverReadyApiV1Runtime expires.
     _reset_cancel_queue()
-    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NeverReadyApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
     monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
-
-    stop_counter = {'count': 0}
-
-    def fake_stop_requested():
-        stop_counter['count'] += 1
-        return stop_counter['count'] > 3
-
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -5743,6 +5864,149 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
     ]
     assert warming_status_events
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
+
+
+def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, monkeypatch):
+    """Regression: Future.result() can return a completed result after the nominal
+    per-call timeout when the calling thread is descheduled by the OS.  The
+    absolute-deadline post-wait check in warm_runtime_before_registration must
+    catch this case and cause exit code 1 rather than accepting the late result.
+
+    A two-phase fake clock is used so the test is deterministic regardless of
+    OS scheduling: ``time.monotonic()`` returns T0 until a ``threading.Event``
+    (``jumped``) is set, then returns T0 + deadline + 1.  A background thread
+    waits for the Future to start (``ready_started``), sleeps a short margin so
+    the main loop has passed its per-iteration elapsed_seconds pre-check and is
+    blocking inside ``future.result()``, then atomically jumps the clock and
+    releases the Future.  ``ensure_runtime_ready`` returns True, and the
+    post-wait check immediately sees the past-deadline clock value.
+    """
+    # Ensure a fresh instance for this test (no stale class-level state).
+    WarmingThenApiV1Runtime.last_instance = None
+
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.08')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_STATUS_INTERVAL_SECONDS', 0.01)
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 30.0)
+
+    # Two-phase fake clock.
+    # Phase 0 (jumped not set): returns base_time_seconds, so wait_started_at = base_time_seconds,
+    #   warm_load_abs_deadline = base_time_seconds + 0.08, and elapsed_seconds = 0 on the first
+    #   loop iteration (remaining = 0.08 > 0, loop proceeds to future.result()).
+    # Phase 1 (jumped set): returns base_time_seconds + deadline + 1, triggering the post-wait
+    #   absolute-deadline check.
+    base_time_seconds = 1000.0
+    deadline_s = 0.08
+    jumped = threading.Event()
+
+    def fake_monotonic():
+        if jumped.is_set():
+            return base_time_seconds + deadline_s + 1.0
+        return base_time_seconds
+
+    monkeypatch.setattr(compute_node_bridge.time, 'monotonic', fake_monotonic)
+
+    def _release_after_deadline():
+        # Wait for the new WarmingThenApiV1Runtime instance to be created.
+        start_wall = time.time()
+        while WarmingThenApiV1Runtime.last_instance is None:
+            if time.time() - start_wall > 5.0:
+                return  # safety: give up to avoid blocking forever
+            time.sleep(0.001)
+        inst = WarmingThenApiV1Runtime.last_instance
+        # Wait for the Future thread to have started executing ensure_api_v1_runtime_ready.
+        inst.ready_started.wait(timeout=5)
+        # Sleep a small margin so the main thread's per-iteration elapsed_seconds
+        # pre-check (nanoseconds of work) is done and the main thread is blocked
+        # inside future.result().
+        time.sleep(0.020)
+        # Jump the clock past the deadline, then release the Future.
+        # The main thread is blocked in future.result(); when it returns True the
+        # post-wait check will see the jumped clock and invoke _emit_gate_wait_timeout().
+        jumped.set()
+        inst.ready_release.set()
+
+    release_thread = threading.Thread(target=_release_after_deadline, daemon=True)
+    release_thread.start()
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    result = compute_node_bridge.run(args)
+    release_thread.join(timeout=5)
+
+    assert result == 1, (
+        "expected exit 1 because the Future completed after the absolute deadline, "
+        f"got {result}"
+    )
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.registration.gate_wait_timeout' in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    timeout_status_events = [
+        e for e in events
+        if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
+    ]
+    assert timeout_status_events, "expected at least one warm_load status event from the timeout path"
+
+
+def test_runtime_public_value_redacts_secret_path_diagnostics():
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\deps\pip stderr tail'
+    for key in ['fallback_reason', 'last_error', 'message', 'dependency_target', 'prefix', 'base_prefix', 'import_root', 'log_file_path']:
+        value = compute_node_bridge._runtime_public_value(key, secret)
+        assert 'SecretName' not in str(value)
+        assert 'C:\\Users' not in str(value)
+
+def test_structured_startup_and_status_payloads_redact_embedded_paths(monkeypatch, capsys):
+    secret = r'C:\Users\SecretName\AppData\Local\token.place\runtime\python.exe'
+    args = compute_node_bridge.argparse.Namespace(
+        relay_url='https://token.place', relay_urls=None, mode='auto', startup_error_code='stable_code',
+        context_tier='64k-full', model=None,
+    )
+    payload = compute_node_bridge._structured_startup_error_payload(args, f'stable code failed at {secret}')
+    encoded = json.dumps(payload)
+    assert 'SecretName' not in encoded
+    assert 'stable code failed' in encoded
+    assert payload['error_code'] == 'stable_code'
+    assert '<path>' in encoded
+
+
+def test_public_payload_sanitizes_urls_sensitive_keys_and_long_text():
+    payload = {
+        'active_relay_url': 'https://user:pass@[::1]:8443/path?token=secret#frag',
+        'relay_statuses': [
+            {
+                'relay_url': 'https://user:pass@token.place:443/private?authorization=secret#frag',
+                'last_error': r'failed reading \\server\share\SecretName\payload.json',
+            }
+        ],
+        'relay_map': {
+            'https://user:pass@relay.example:9443/path?access_token=secret#frag': {
+                'message': '/private/var/SecretName/token.place failed',
+            }
+        },
+        'prompt': 'SECRET_PROMPT',
+        'prompt_tokens': 17,
+        'public_hash': 'abc123',
+        'pip_stderr_tail': 'CMAKE_ARGS=-DSECRET=1 ' + ('x' * 800),
+        'fallback_reason': '/opt/SecretName/bin failed with stable_code ' + ('y' * 800),
+    }
+
+    sanitized = compute_node_bridge._sanitize_public_payload(payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    for forbidden in ['SecretName', 'SECRET_PROMPT', 'user:pass', 'token=secret', 'access_token', '/private/var', '/opt/SecretName', 'CMAKE_ARGS']:
+        assert forbidden not in encoded
+    assert sanitized['active_relay_url'] == 'https://[::1]:8443'
+    assert sanitized['relay_statuses'][0]['relay_url'] == 'https://token.place:443'
+    assert 'https://relay.example:9443' in sanitized['relay_map']
+    assert sanitized['prompt'] == 'redacted'
+    assert sanitized['prompt_tokens'] == 17
+    assert sanitized['public_hash'] == 'abc123'
+    assert len(sanitized['fallback_reason']) <= compute_node_bridge.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS
 
 
 def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):
@@ -5845,10 +6109,10 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
         output = capsys.readouterr()
         events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
         stopped = [event for event in events if event.get('type') == 'stopped'][-1]
-        assert stopped['unregister_outcome'] == 'complete'
+        assert stopped['unregister_outcome'] == 'timed_out'
         assert stopped['unregister_attempted'] is True
         assert stopped['unregister_success_count'] == 1
-        assert stopped['unregister_failure_count'] == 0
+        assert stopped['unregister_failure_count'] == 1
     finally:
         release_inference.set()
         worker.join(timeout=2.0)

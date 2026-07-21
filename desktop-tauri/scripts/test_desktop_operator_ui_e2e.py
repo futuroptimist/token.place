@@ -543,6 +543,11 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
+    # This harness is a confirmed DevSourceTree launch, so provide the explicit
+    # interpreter override required by the fail-closed launcher policy without
+    # restoring PATH probing for packaged/runtime launches.
+    env["TOKEN_PLACE_PYTHON"] = sys.executable
+    env["TOKEN_PLACE_SIDECAR_PYTHON"] = sys.executable
     env["TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"] = "120"
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (

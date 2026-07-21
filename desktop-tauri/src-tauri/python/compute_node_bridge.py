@@ -28,7 +28,7 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     from desktop_runtime_setup import (
@@ -92,22 +92,52 @@ except (ImportError, AttributeError):
         text = re.sub(r"[A-Za-z]:[/\\][^\s;\r\n,)]*|\\\\[^\s;\r\n,)]*|/(?:private|var|opt|Applications|Library|Users|home|tmp)[^\s;\r\n,)]*", "<path>", text)
         return text[:500] + "...<truncated>" if len(text) > 512 else text
 
+    _PUBLIC_SENSITIVE_KEYS = {
+        "prompt", "prompts", "messages", "message_payload", "response", "responses",
+        "plaintext", "ciphertext", "decrypted", "decrypted_content", "key",
+        "private_key", "secret_key", "api_key", "authorization", "auth_token",
+        "access_token", "refresh_token", "token", "environment", "env",
+        "relay_payload", "request_payload", "response_payload", "raw_payload",
+        "raw_request", "raw_response", "payload",
+    }
+    _PUBLIC_COMMAND_KEYS = {"pip_stdout_tail", "pip_stderr_tail", "install_command_summary", "cmake_args"}
+    _PUBLIC_PATH_FIELDS = {"interpreter", "import_root", "dependency_target", "prefix", "base_prefix", "log_file_path", "model_path", "runtime_path", "requirements"}
+
+    def _safe_basename(value: str) -> str:
+        return PureWindowsPath(value).name or Path(value).name or "unknown"
+
+    def _sanitize_public_runtime_mapping(value: Dict[Any, Any]) -> Dict[str, Any]:
+        sanitized: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            raw_key_text = str(raw_key)
+            safe_key = _sanitize_public_relay_target(raw_key_text) if "://" in raw_key_text else _sanitize_public_runtime_text(raw_key_text)
+            sanitized[safe_key] = _sanitize_public_runtime_payload_value(raw_key_text, raw_value)
+        return sanitized
+
     def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
         normalized_key = str(key).lower()
-        if normalized_key == "interpreter" and isinstance(value, str):
-            return Path(value).name or "python.exe"
-        if normalized_key in {"import_root", "dependency_target", "prefix", "base_prefix", "log_file_path", "model_path"} and isinstance(value, str):
-            return Path(value).name or "unknown"
+        if normalized_key in _PUBLIC_SENSITIVE_KEYS:
+            return "redacted" if value not in (None, "") else value
+        if normalized_key in _PUBLIC_COMMAND_KEYS:
+            return "redacted" if value else None
+        if "relay_url" in normalized_key or normalized_key.endswith("relay") or normalized_key in {"active_relay_url"}:
+            if isinstance(value, list):
+                return [_sanitize_public_relay_target(item) for item in value]
+            return _sanitize_public_relay_target(value)
+        if normalized_key in _PUBLIC_PATH_FIELDS and isinstance(value, str):
+            return "bundled" if "python-runtime" in value.lower() else _safe_basename(value)
         if isinstance(value, str):
             return _sanitize_public_runtime_text(value)
         if isinstance(value, dict):
-            return _sanitize_public_runtime_payload(value)
+            return _sanitize_public_runtime_mapping(value)
         if isinstance(value, list):
+            return [_sanitize_public_runtime_payload_value(key, item) for item in value]
+        if isinstance(value, tuple):
             return [_sanitize_public_runtime_payload_value(key, item) for item in value]
         return value
 
     def _sanitize_public_runtime_payload(value: Dict[str, Any]) -> Dict[str, Any]:
-        return {str(key): _sanitize_public_runtime_payload_value(str(key), item) for key, item in value.items()}
+        return _sanitize_public_runtime_mapping(value)
 
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
@@ -461,14 +491,14 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
 
     return (
         "desktop.compute_node_bridge.runtime_state "
-        f"requested_mode={diagnostics.get('requested_mode')} "
-        f"effective_mode={diagnostics.get('effective_mode')} "
-        f"backend_selected={diagnostics.get('backend_selected')} "
-        f"backend_used={diagnostics.get('backend_used')} "
+        f"requested_mode={_sanitize_public_text(diagnostics.get('requested_mode'))} "
+        f"effective_mode={_sanitize_public_text(diagnostics.get('effective_mode'))} "
+        f"backend_selected={_sanitize_public_text(diagnostics.get('backend_selected'))} "
+        f"backend_used={_sanitize_public_text(diagnostics.get('backend_used'))} "
         f"backend_available={diagnostics.get('backend_available')} "
         f"fallback_reason={_sanitize_public_text(diagnostics.get('fallback_reason')) or 'none'} "
         f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
-        f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
+        f"kv_cache_device={_sanitize_public_text(diagnostics.get('kv_cache_device') or 'unknown')}"
     )
 
 

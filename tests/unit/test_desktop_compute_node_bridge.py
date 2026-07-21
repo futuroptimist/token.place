@@ -2707,6 +2707,56 @@ def test_relay_and_runtime_stderr_summaries_sanitize_all_rendered_values():
     assert "offloaded_layers=32" in runtime_summary
 
 
+def test_compatibility_sanitizer_fails_closed_without_runtime_helpers():
+    bridge_source = MODULE_PATH.read_text()
+    split_marker = 'def _is_repo_llama_cpp_shim'
+    prefix = bridge_source.split(split_marker, 1)[0]
+    stub = ModuleType('desktop_runtime_setup')
+    stub.desktop_gpu_runtime_failure_message = lambda *args, **kwargs: None
+    stub.ensure_desktop_llama_runtime = lambda *args, **kwargs: {'runtime_action': 'stub'}
+    stub.ensure_desktop_python_dependencies = lambda *args, **kwargs: {'ok': 'true'}
+    stub.maybe_reexec_for_runtime_refresh = lambda *args, **kwargs: None
+    stub._ensure_desktop_llama_runtime_impl = lambda *args, **kwargs: {'runtime_action': 'stub'}
+    namespace = {'__name__': 'compat_bridge_test', '__file__': str(MODULE_PATH)}
+    old_module = sys.modules.get('desktop_runtime_setup')
+    sys.modules['desktop_runtime_setup'] = stub
+    try:
+        exec(prefix, namespace)
+    finally:
+        if old_module is None:
+            sys.modules.pop('desktop_runtime_setup', None)
+        else:
+            sys.modules['desktop_runtime_setup'] = old_module
+
+    raw_key = 'https://user:pass@relay.example:9443/private?token=secret#frag'
+    payload = {
+        'prompt': 'PROMPT_SECRET',
+        'authorization': 'Bearer SECRET_AUTH',
+        'pip_stdout_tail': 'compiler output SECRET_TAIL',
+        'relay_url': 'https://user:pass@[2001:db8::5]:8443/path?q=secret#frag',
+        'interpreter': r'C:\Users\SecretName\python.exe',
+        'model_path': r'\\server\share\SecretName\model.gguf',
+        raw_key: {'response': 'RESPONSE_SECRET', 'prompt_tokens': 13},
+        'nested': {'relay_urls': ['https://token:secret@relay-b.example/path?q=1#f']},
+        'safe_hash': 'abc123',
+    }
+    original = json.loads(json.dumps(payload))
+
+    sanitized = namespace['_sanitize_public_runtime_payload'](payload)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    assert payload == original
+    for forbidden in ['PROMPT_SECRET', 'SECRET_AUTH', 'SECRET_TAIL', 'RESPONSE_SECRET', 'SecretName', 'user:pass', 'token=secret', '?q=', '#frag', '/private']:
+        assert forbidden not in encoded
+    assert sanitized['prompt'] == 'redacted'
+    assert sanitized['authorization'] == 'redacted'
+    assert sanitized['pip_stdout_tail'] == 'redacted'
+    assert sanitized['relay_url'] == 'https://[2001:db8::5]:8443'
+    assert 'https://relay.example:9443' in sanitized
+    assert sanitized['https://relay.example:9443']['prompt_tokens'] == 13
+    assert sanitized['safe_hash'] == 'abc123'
+
+
 def test_relay_response_summary_handles_non_dict_payloads():
     summary = compute_node_bridge._relay_response_summary(["unexpected"])
     assert summary == "non-dict response type=list"
@@ -4521,6 +4571,7 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
 ):
     _reset_cancel_queue()
     recovery_calls = {'count': 0}
+    recovery_completed = threading.Event()
 
     class RaisingUnregisterClient(FakeRelayClient):
         def __init__(self, relay_url):
@@ -4550,6 +4601,7 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
             recovery_calls['count'] += 1
             if recovery_calls['count'] == 1:
                 raise RuntimeError('first warm-load failed')
+            recovery_completed.set()
             return True
 
         def process_relay_request_result(self, _payload):
@@ -4566,11 +4618,9 @@ def test_multi_relay_recovery_logs_unregister_failure_and_retries_after_exceptio
     monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_ATTEMPTS', '2')
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_RECOVERY_BACKOFF_SECONDS', '0')
-    stop_checks = {'count': 0}
 
     def stop_after_recovery():
-        stop_checks['count'] += 1
-        return recovery_calls['count'] >= 2 and stop_checks['count'] > 6
+        return recovery_completed.is_set()
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_recovery)
     args = SimpleNamespace(

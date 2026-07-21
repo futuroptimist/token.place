@@ -4150,3 +4150,27 @@ def test_runtime_public_payload_redacts_extended_paths_sensitive_keys_and_bounds
     assert sanitized['pip_stderr_tail'] == 'redacted'
     assert 'pip 24.0 from <path>' in sanitized['pip_version']
     assert len(sanitized['fallback_reason']) <= desktop_runtime_setup.PUBLIC_DIAGNOSTIC_TEXT_MAX_CHARS
+
+
+def test_runtime_public_payload_sanitizes_top_level_url_key_and_preserves_input(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: False)
+    raw_key = 'https://user:pass@[2001:db8::7]:9443/path?token=secret#frag'
+    payload = {
+        raw_key: {
+            'prompt_tokens': 11,
+            'relay_map': {'https://token:secret@relay.example:8443/private?q=1#frag': 'ok'},
+        }
+    }
+
+    sanitized = desktop_runtime_setup._sanitize_public_runtime_payload(payload)
+
+    assert raw_key in payload
+    assert 'https://[2001:db8::7]:9443' in sanitized
+    assert raw_key not in sanitized
+    encoded = json.dumps(sanitized, sort_keys=True)
+    assert 'user:pass' not in encoded
+    assert 'token=secret' not in encoded
+    assert '/path' not in encoded
+    assert '#frag' not in encoded
+    assert 'https://relay.example:8443' in encoded
+    assert sanitized['https://[2001:db8::7]:9443']['prompt_tokens'] == 11

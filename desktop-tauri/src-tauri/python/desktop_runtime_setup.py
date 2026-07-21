@@ -578,14 +578,6 @@ _PUBLIC_TEXT_FIELDS = {"fallback_reason", "detail", "error", "last_error", "mess
 _PUBLIC_URL_PATTERN = re.compile(r"(?P<url>https?://[^\s)}>\"']+)")
 
 
-def _sanitize_public_runtime_urls(text: str) -> str:
-    def _replace(match: re.Match[str]) -> str:
-        raw_url = match.group("url").rstrip(".,;:")
-        suffix = match.group("url")[len(raw_url):]
-        return f"{_sanitize_public_relay_target(raw_url)}{suffix}"
-
-    return _PUBLIC_URL_PATTERN.sub(_replace, text)
-
 def _sanitize_public_relay_target(relay_url: Any) -> str:
     if not isinstance(relay_url, str):
         return "unknown"
@@ -643,12 +635,7 @@ def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
     if normalized_key in _PUBLIC_TEXT_FIELDS and isinstance(value, str):
         return _sanitize_public_runtime_text(value)
     if isinstance(value, dict):
-        sanitized: Dict[str, Any] = {}
-        for raw_key, raw_value in value.items():
-            raw_key_text = str(raw_key)
-            safe_key = _sanitize_public_relay_target(raw_key_text) if "://" in raw_key_text else _sanitize_public_runtime_text(raw_key_text)
-            sanitized[safe_key] = _sanitize_public_runtime_payload_value(str(raw_key), raw_value)
-        return sanitized
+        return _sanitize_public_runtime_mapping(value)
     if isinstance(value, list):
         return [_sanitize_public_runtime_payload_value(normalized_key, item) for item in value]
     if isinstance(value, tuple):
@@ -658,8 +645,21 @@ def _sanitize_public_runtime_payload_value(key: str, value: Any) -> Any:
     return value
 
 
+def _sanitize_public_runtime_mapping(value: Dict[Any, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        raw_key_text = str(raw_key)
+        safe_key = (
+            _sanitize_public_relay_target(raw_key_text)
+            if "://" in raw_key_text
+            else _sanitize_public_runtime_text(raw_key_text)
+        )
+        sanitized[safe_key] = _sanitize_public_runtime_payload_value(raw_key_text, raw_value)
+    return sanitized
+
+
 def _sanitize_public_runtime_payload(result: Dict[str, Any]) -> Dict[str, Any]:
-    return {str(key): _sanitize_public_runtime_payload_value(str(key), value) for key, value in dict(result).items()}
+    return _sanitize_public_runtime_mapping(dict(result))
 
 def _probe_failure(
     *,

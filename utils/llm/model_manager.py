@@ -28,7 +28,8 @@ import threading
 import sysconfig
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Any, Optional, Iterable, Tuple
+from typing import Callable, Dict, List, Any, Optional, Iterable, Tuple, NoReturn
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 
 from utils.system import resource_monitor
 from utils.llm.model_profiles import get_model_profile, resolve_profile_id
@@ -84,6 +85,37 @@ _INIT_SAFE_CATEGORY_ALIASES = {
     'kv_cache_allocation': 'runtime_context_create_kv_cache_allocation',
     'rope_yarn_eval_failure': 'runtime_context_create_rope_yarn_config',
 }
+
+# Maximum wall-clock seconds allotted to processless worker close() under
+# bounded cancellation cleanup.  Must fit within the supervisor cleanup budget
+# (_API_V1_CLEANUP_BUDGET_SECONDS in relay_client) with room for fatal teardown.
+# Must exceed 1 s in production so a momentarily stressed kernel has time to
+# schedule the close() thread; tests may monkeypatch to a shorter value for speed.
+_PROCESSLESS_CLOSE_TIMEOUT_SECONDS: float = 4.0
+# Polling interval used when waiting on the processless-close future.
+_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS: float = 0.05
+# Grace period given to a processless-close thread after fatal_callback has
+# returned (test / non-production environments where the callback unblocks
+# the thread instead of terminating the process).
+_POST_FATAL_DRAIN_TIMEOUT_SECONDS: float = 0.5
+
+
+def _processless_close_hard_exit(reason: str) -> NoReturn:
+    """Private no-return fallback when processless-worker cleanup cannot complete.
+
+    Called when fatal_callback is absent or returned without quiescing the
+    close future.  Emits a privacy-safe log line then calls ``os._exit(1)``
+    so the executor thread is never abandoned.  In production this is always
+    no-return; code after this call is unreachable.
+    """
+    print(
+        f"utils.llm.model_manager.processless_close_hard_exit reason={reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(1)
+
+
 _INIT_SAFE_CATEGORY_ALLOWLIST = {
     'runtime_init_unclassified',
     'runtime_model_path_unavailable',
@@ -4403,6 +4435,13 @@ class ModelManager:
         self.child_model_path_exists = False
         self.llm_lock = Lock()
         self._llm_generation = 0
+        # Generation whose stale-worker cleanup is currently in progress.  Set
+        # (under llm_lock) when cleanup starts; cleared only on successful
+        # completion for the matching generation.  Gates get_llm_instance() so
+        # no replacement is initialized while cleanup is pending or failed.
+        self._cleanup_barrier_generation: Optional[int] = None
+        self._llm_cancel_generation_event = threading.Event()
+        self._llm_cancellation_epoch = 0
         self.worker_restart_count = 0
         self.last_worker_error_code: Optional[str] = None
         self.last_worker_exit_code: Optional[int] = None
@@ -5344,6 +5383,10 @@ class ModelManager:
             with self.llm_lock:
                 # Double-check after acquiring lock
                 if self.llm is None:
+                    # Generation barrier: stale-worker cleanup is in progress;
+                    # block replacement until that generation's cleanup succeeds.
+                    if self._cleanup_barrier_generation is not None:
+                        return None
                     if not os.path.exists(self.model_path):
                         self.log_error("Error: Model file does not exist. LLM not initialized.")
                         return None
@@ -5765,13 +5808,242 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
         self._close_llm_proxy(failed_runtime)
 
-    def _close_llm_proxy(self, llm: Any) -> None:
-        close = getattr(llm, 'close', None)
-        if callable(close):
+
+    def cancellation_generation_snapshot(self) -> tuple[int, threading.Event, int]:
+        """Return a request-scoped cancellation generation snapshot."""
+        with self.llm_lock:
+            return (
+                self._llm_generation,
+                self._llm_cancel_generation_event,
+                self._llm_cancellation_epoch,
+            )
+
+    def cancellation_generation_cancelled(self, snapshot) -> bool:
+        """Return whether the captured request generation was cancelled/replaced."""
+        generation, cancel_event, *epoch_snapshot = snapshot
+        observed_epoch = epoch_snapshot[0] if epoch_snapshot else None
+        if cancel_event.is_set():
+            return True
+        with self.llm_lock:
+            return (
+                (observed_epoch is not None and self._llm_cancellation_epoch != observed_epoch)
+                or (self._llm_generation != generation and cancel_event.is_set())
+            )
+
+    def terminate_active_worker_for_cancellation(self, *, reason: str = 'cancelled', recreate: bool = True, fatal_callback: Optional[Callable] = None) -> bool:
+        """Terminate the active subprocess-backed llama worker and require clean recreation."""
+        safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', reason) else 'cancelled'
+        should_recreate_without_active_worker = False
+        cleanup_gen: Optional[int] = None
+        with self.llm_lock:
+            llm = self.llm
+            if llm is None:
+                self.worker_state = 'recovering'
+                self.last_worker_error_code = safe_reason
+                self.worker_restart_count += 1
+                self.last_worker_restart_at_ms = int(time.time() * 1000)
+                self._llm_generation += 1
+                self._llm_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0) + 1
+                self._llm_cancel_generation_event.set()
+                self._llm_cancel_generation_event = threading.Event()
+                if not recreate:
+                    return True
+                should_recreate_without_active_worker = True
+            else:
+                self.last_worker_exit_code = self._worker_exit_code(llm)
+                self.last_worker_error_code = safe_reason
+                self.worker_state = 'recovering'
+                self.worker_restart_count += 1
+                self.last_worker_restart_at_ms = int(time.time() * 1000)
+                cleanup_gen = self._llm_generation
+                self.llm = None
+                self._llm_generation += 1
+                self._llm_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0) + 1
+                self._llm_cancel_generation_event.set()
+                self._llm_cancel_generation_event = threading.Event()
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
+        if should_recreate_without_active_worker:
             try:
-                close()
+                return self.get_llm_instance() is not None
             except Exception:
-                self.log_warning("Failed to close old llama.cpp worker during invalidation")
+                self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+                return False
+        old_worker_stopped = self._close_llm_proxy(llm, terminate_process=True, fatal_callback=fatal_callback)
+        with self.llm_lock:
+            if self._cleanup_barrier_generation == cleanup_gen:
+                if old_worker_stopped:
+                    # Cleanup succeeded: clear barrier so replacement can be initialized.
+                    self._cleanup_barrier_generation = None
+                else:
+                    # Cleanup failed: keep barrier set and mark worker failed.
+                    self.worker_state = 'failed'
+        if not old_worker_stopped:
+            return False
+        if not recreate:
+            return True
+        # Eagerly validate a clean worker for the next request when possible.
+        try:
+            return self.get_llm_instance() is not None
+        except Exception:
+            self.log_warning("desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=%s" % safe_reason)
+            return False
+
+    def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False, fatal_callback: Optional[Callable] = None) -> bool:
+        process = getattr(llm, '_process', None)
+
+        def _close_or_join_resource(resource: Any) -> None:
+            closer = getattr(resource, 'close', None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+            join = getattr(resource, 'join', None)
+            if callable(join):
+                try:
+                    join(timeout=0.25)
+                except Exception:
+                    pass
+
+        def _dead() -> bool:
+            if process is None:
+                return True
+            poll = getattr(process, 'poll', None)
+            if not callable(poll):
+                return False
+            try:
+                return poll() is not None
+            except Exception:
+                return False
+
+        process_stopped = True
+        if process is not None:
+            # Subprocess-backed workers are cleaned up with process primitives before
+            # any proxy close so third-party close() cannot block cancellation or
+            # ordinary invalidation while holding up recovery.
+            for attr in ('stdin', 'stdout', 'stderr'):
+                _close_or_join_resource(getattr(process, attr, None))
+            if not _dead():
+                terminate = getattr(process, 'terminate', None)
+                if callable(terminate):
+                    try:
+                        terminate()
+                    except Exception:
+                        pass
+                wait = getattr(process, 'wait', None)
+                if callable(wait):
+                    try:
+                        wait(timeout=1.0)
+                    except Exception:
+                        pass
+            if not _dead():
+                kill = getattr(process, 'kill', None)
+                if callable(kill):
+                    try:
+                        kill()
+                    except Exception:
+                        pass
+                wait = getattr(process, 'wait', None)
+                if callable(wait):
+                    try:
+                        wait(timeout=1.0)
+                    except Exception:
+                        pass
+            process_stopped = _dead()
+
+        close = getattr(llm, 'close', None)
+        if callable(close) and process is None:
+            if terminate_process:
+                # Cancellation path: a processless worker with a callable close()
+                # must be closed even during terminate_process=True.  Run it in an
+                # owned executor thread under a bounded cleanup budget so a
+                # potentially blocking close() cannot hold up the supervisor thread.
+                # Only call executor.shutdown after the future is proven done.
+                _close_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='worker_processless_close'
+                )
+                close_future = _close_executor.submit(close)
+                deadline = time.monotonic() + _PROCESSLESS_CLOSE_TIMEOUT_SECONDS
+                # Drain under the cleanup deadline.
+                while not close_future.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        close_future.result(timeout=min(_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS, remaining))
+                    except _FutureTimeoutError:
+                        continue
+                    except Exception:
+                        break
+                close_done = close_future.done()
+                if not close_done:
+                    # Deadline exceeded; invoke fatal teardown.  In production
+                    # fatal_callback is no-return (os._exit(1)); in tests the
+                    # callback must first unblock the close thread.
+                    if callable(fatal_callback):
+                        fatal_callback(reason='api_v1_worker_processless_close_timeout')
+                    # Post-fatal drain (_POST_FATAL_DRAIN_TIMEOUT_SECONDS): test /
+                    # non-production environment where the callback returned after
+                    # unblocking the close thread.
+                    after_deadline = time.monotonic() + _POST_FATAL_DRAIN_TIMEOUT_SECONDS
+                    while not close_future.done():
+                        remaining = after_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            close_future.result(timeout=min(_PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS, remaining))
+                        except _FutureTimeoutError:
+                            continue
+                        except Exception:
+                            break
+                    close_done = close_future.done()
+                if close_done:
+                    try:
+                        close_future.result()
+                    except Exception:
+                        # close() raised an exception; treat as cleanup failure to
+                        # prevent replacement with a potentially tainted worker.
+                        process_stopped = False
+                    # cancel_futures is a no-op here since the future is already done;
+                    # included for clarity and forward-compatibility.
+                    _close_executor.shutdown(wait=True, cancel_futures=True)
+                else:
+                    # fatal_callback (if any) returned without quiescing the
+                    # close future, or no callback was wired.  Private no-return
+                    # hard-exit: in production os._exit(1) terminates the
+                    # disposable process so the executor thread is never
+                    # abandoned.  Code after this call is unreachable in
+                    # production.
+                    _processless_close_hard_exit(
+                        reason='api_v1_worker_processless_close_timeout'
+                    )
+                    # Unreachable in production.  Retain failure state.
+                    process_stopped = False
+            else:
+                # Non-cancellation path: call close() directly (existing behavior).
+                try:
+                    close()
+                except Exception:
+                    self.log_warning("Failed to close old llama.cpp worker during invalidation")
+        # process is not None: subprocess cleanup relies on verified process death and
+        # owned pipe/reader disposal; do not call a potentially blocking proxy close.
+
+        for attr in (
+            'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
+            '_stdout_reader', '_stderr_reader', '_reader', '_queue',
+            'stdout_queue', 'stderr_queue', '_stderr_reader_thread',
+            '_stdout_reader_thread', '_reader_thread',
+        ):
+            resource = getattr(llm, attr, None)
+            _close_or_join_resource(resource)
+            if resource is not None:
+                try:
+                    setattr(llm, attr, None)
+                except Exception:
+                    pass
+        return bool(process_stopped)
 
     def _llm_is_usable(self, llm: Any) -> bool:
         is_alive = getattr(llm, 'is_alive', None)
@@ -5819,8 +6091,11 @@ class ModelManager:
 
     def _invalidate_llm_if_current(self, failed_llm: Any, error: Any = None) -> int:
         dead_worker_log_message: Optional[str] = None
+        detached_llm = None
+        cleanup_gen: Optional[int] = None
         with self.llm_lock:
             if self.llm is failed_llm:
+                detached_llm = self.llm
                 self.last_worker_exit_code = self._worker_exit_code(failed_llm)
                 self.last_worker_error_code = _safe_worker_error_code(error) if error is not None else 'worker_dead'
                 self.worker_state = 'recovering'
@@ -5831,28 +6106,62 @@ class ModelManager:
                     f"safe_error_code={self.last_worker_error_code} worker_generation={self._llm_generation} "
                     f"worker_restart_count={self.worker_restart_count} exit_code={self.last_worker_exit_code}"
                 )
-                self._close_llm_proxy(self.llm)
+                cleanup_gen = self._llm_generation
                 self.llm = None
                 self._llm_generation += 1
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
             generation = self._llm_generation
+        if detached_llm is not None:
+            close_ok = self._close_llm_proxy(detached_llm)
+            with self.llm_lock:
+                if self._cleanup_barrier_generation == cleanup_gen:
+                    if close_ok:
+                        # Cleanup succeeded: clear barrier so replacement can initialize.
+                        self._cleanup_barrier_generation = None
+                    else:
+                        # Cleanup failed: keep barrier set and mark worker failed.
+                        self.worker_state = 'failed'
+                # Stale cleanup (barrier has moved to a newer generation): don't
+                # override the newer generation's barrier or worker_state.
         if dead_worker_log_message is not None:
             self.log_warning(dead_worker_log_message)
         return generation
 
     def _ensure_replacement_llm(self, observed_generation: int) -> Any:
         replacement_attempt_log_message: Optional[str] = None
+        detached_llm = None
+        cleanup_gen: Optional[int] = None
         with self.llm_lock:
             if self.llm is not None and self._llm_is_usable(self.llm):
                 return self.llm
             if self.llm is not None:
-                self._close_llm_proxy(self.llm)
+                detached_llm = self.llm
+                cleanup_gen = self._llm_generation
                 self.llm = None
+                # Set barrier before releasing lock: blocks get_llm_instance()
+                # until cleanup for this generation completes successfully.
+                self._cleanup_barrier_generation = cleanup_gen
             if self._llm_generation == observed_generation:
                 self._llm_generation += 1
             self.worker_state = 'recovering'
             replacement_attempt_log_message = "desktop.llama_cpp_worker.replacement_attempt event=replacement_attempt worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count)
-            # Release llm_lock before get_llm_instance() because it initializes under
-            # the same non-reentrant lock and still serializes creation internally.
+            # Release llm_lock before cleanup/get_llm_instance() because both may
+            # call third-party code and initialization re-acquires this non-reentrant lock.
+        if detached_llm is not None:
+            close_ok = self._close_llm_proxy(detached_llm)
+            with self.llm_lock:
+                if self._cleanup_barrier_generation == cleanup_gen:
+                    if close_ok:
+                        # Cleanup succeeded: clear barrier so replacement can initialize.
+                        self._cleanup_barrier_generation = None
+                    else:
+                        # Cleanup failed: keep barrier set and mark worker failed.
+                        self.worker_state = 'failed'
+                # Stale cleanup: don't override newer generation's barrier or worker_state.
+            if not close_ok:
+                return None
         if replacement_attempt_log_message is not None:
             self.log_warning(replacement_attempt_log_message)
         return self.get_llm_instance()
@@ -5885,6 +6194,14 @@ class ModelManager:
             raise RuntimeError('LLM runtime is unavailable')
         with self.llm_lock:
             observed_generation = self._llm_generation
+            observed_cancel_event = self._llm_cancel_generation_event
+            observed_cancellation_epoch = getattr(self, '_llm_cancellation_epoch', 0)
+        # Invariant: _invalidate_llm_if_current() does NOT rotate the cancel event;
+        # it only increments _llm_generation.  Only terminate_active_worker_for_cancellation()
+        # sets the current event and rotates to a new one while advancing the epoch.
+        # Therefore observed_cancel_event.is_set() reliably detects a cancellation that
+        # arrived after the initial llm_instance acquisition, even when llm is None
+        # between invalidation and replacement.
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
@@ -5908,12 +6225,27 @@ class ModelManager:
         except LlamaCppRestartableWorkerError as exc:
             self._invalidate_llm_if_current(llm_instance, exc)
 
+        if observed_cancel_event.is_set():
+            raise RuntimeError('LLM inference request cancelled before worker retry')
+        with self.llm_lock:
+            # Ordinary invalidation/replacement keeps the captured event clear.
+            # Cancellation rotates to a new event and advances this monotonic epoch,
+            # so post-restart cancellation is still visible to the original request.
+            if getattr(self, '_llm_cancellation_epoch', 0) != observed_cancellation_epoch or (
+                self._llm_generation != observed_generation and observed_cancel_event.is_set()
+            ):
+                raise RuntimeError('LLM inference request cancelled before worker retry')
         replacement = self._ensure_replacement_llm(observed_generation)
         if replacement is None:
             raise RuntimeError('LLM runtime replacement failed')
         replacement_create = getattr(replacement, 'create_chat_completion', None)
         if not callable(replacement_create):
             raise RuntimeError('LLM replacement runtime missing create_chat_completion')
+        with self.llm_lock:
+            if getattr(self, '_llm_cancellation_epoch', 0) != observed_cancellation_epoch or (
+                self._llm_generation != observed_generation and observed_cancel_event.is_set()
+            ):
+                raise RuntimeError('LLM inference request cancelled before worker retry')
         try:
             result = replacement_create(*args, **kwargs)
             with self.llm_lock:

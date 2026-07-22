@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from utils.processing_result import RelayProcessingResult
@@ -26,6 +27,30 @@ from utils.llm.model_profiles import build_model_aliases
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
+_API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
+_API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
+_API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
+# Budget for quiescing request-owned executor threads in the finally block.
+# Should be less than BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS so cleanup fits
+# inside the bridge-level shutdown window.
+_API_V1_CLEANUP_BUDGET_SECONDS = 5.0
+# Upper bound on any single control-request HTTP timeout.  Must be strictly
+# below _API_V1_CLEANUP_BUDGET_SECONDS so that a running control future is
+# always fully drained within the shared cleanup deadline in the finally block.
+# No daemon thread or interrupt mechanism is needed: the bounded timeout ensures
+# the control executor thread completes before executor.shutdown(wait=True).
+_API_V1_MAX_CONTROL_TIMEOUT_SECONDS = _API_V1_CLEANUP_BUDGET_SECONDS - 1.0
+# Mapping from relay-side control status strings to internal terminal reason codes.
+# Used in both the normal control-result observation path and the concurrent
+# inference-failure + terminal-control race resolution.
+_API_V1_TERMINAL_CONTROL_STATUS_MAP: Dict[str, str] = {
+    'cancelled': 'cancelled',
+    'expired': 'expired',
+    'completed': 'completed',
+    'unavailable': 'unavailable',
+    'completed/unavailable': 'completed_unavailable',
+}
 
 
 class _ApiV1ChatValidationResult(NamedTuple):
@@ -38,6 +63,33 @@ class _ApiV1ChatValidationResult(NamedTuple):
     total_content_chars: int = 0
     message_content_utf8_bytes: Optional[int] = None
     total_content_utf8_bytes: int = 0
+
+
+class _ApiV1SupervisorOutcome(NamedTuple):
+    """Request-scoped, privacy-safe result from API v1 inference supervision."""
+
+    response_envelope: Optional[Dict[str, Any]]
+    terminal_code: Optional[str] = None
+    runtime_healthy: bool = True
+    recovery_attempted: bool = False
+    recovery_succeeded: bool = False
+    submission_allowed: bool = True
+
+
+class _PostApiV1Outcome(NamedTuple):
+    """Typed result from _post_api_v1_response().
+
+    ``submitted`` is True only when the relay accepted the encrypted envelope
+    with HTTP 200.  ``suppressed`` is True when a pre-submit guard (cancellation,
+    operator Stop, or local deadline) blocked transmission.  ``transport_failed``
+    is True for network/HTTP errors that are not a suppression.
+    ``suppressed_code`` carries a safe log/result code when suppressed.
+    """
+
+    submitted: bool
+    suppressed: bool = False
+    transport_failed: bool = False
+    suppressed_code: Optional[str] = None
 
 
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
@@ -695,6 +747,11 @@ def log_info(message, *args) -> None:
     _log("info", message, *args)
 
 
+def log_warning(message, *args) -> None:
+    """Log warnings only in non-production environments using consistent formatting"""
+    _log("warning", message, *args)
+
+
 def log_error(message, *args, exc_info: bool = False) -> None:
     """Log errors only in non-production environments using consistent formatting"""
     _log("error", message, *args, exc_info=exc_info)
@@ -929,6 +986,7 @@ class RelayClient:
         self._api_v1_generation_kwarg_cache: Dict[Tuple[Any, ...], Dict[str, Set[str]]] = {}
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
+        self._api_v1_control_wakeup = threading.Event()
         self._registration_token: Optional[str] = None
         configured_servers: List[Any] = []
         self._cluster_only = False
@@ -1368,7 +1426,11 @@ class RelayClient:
         """Reset stop/unregister state before a fresh API v1 polling session.
 
         ``clear_registration`` forces the next poll to re-register with the relay, which is
-        required after an explicit Stop because the relay-side lease may have been removed.
+        required after confirmed teardown or exact session replacement because the
+        relay-side lease may have been removed. In-memory owner credentials are not
+        blanket-cleared here; each relay credential is preserved until that exact
+        relay is successfully unregistered, replaced, or otherwise confirmed torn
+        down.
         """
 
         self.stop_polling = False
@@ -1382,7 +1444,6 @@ class RelayClient:
                 condition.notify_all()
         if clear_registration:
             self._api_v1_registered_relays.clear()
-            self._clear_api_v1_control_credentials()
             self._api_v1_last_heartbeat_at.clear()
             getattr(self, "_api_v1_relay_wait_hints", {}).clear()
 
@@ -1406,10 +1467,18 @@ class RelayClient:
         """Stop the polling loop by setting stop_polling to True"""
         log_info("Stopping relay polling")
         self._api_v1_latch_shutdown()
+        wakeup = getattr(self, '_api_v1_control_wakeup', None)
+        if wakeup is not None:
+            wakeup.set()
         self._api_v1_stop_heartbeat_worker()
 
     def unregister_from_relay(self, *, shutdown_deadline: Optional[float] = None) -> bool:
-        """Best-effort unregister call for graceful compute-node shutdown."""
+        """Best-effort unregister call for graceful compute-node shutdown.
+
+        When ``shutdown_deadline`` is provided, all relay unregister attempts share
+        that absolute monotonic deadline so desktop bridge cleanup stays inside
+        Rust's bounded stop grace.
+        """
 
         self._api_v1_latch_shutdown()
         if not self._api_v1_stop_heartbeat_worker(shutdown_deadline=shutdown_deadline):
@@ -1474,8 +1543,15 @@ class RelayClient:
             try:
                 payload = {'server_public_key': self.crypto_manager.public_key_b64}
                 control_credential = self._api_v1_control_credential_for_relay(candidate_url)
-                if isinstance(control_credential, str) and control_credential:
-                    payload['control_credential'] = control_credential
+                if not (isinstance(control_credential, str) and control_credential):
+                    failed_relays.add(candidate_url)
+                    last_error = "missing_api_v1_control_credential"
+                    log_error(
+                        "Refusing credentialless API v1 unregister for relay {}",
+                        candidate_url,
+                    )
+                    continue
+                payload['control_credential'] = control_credential
                 request_kwargs = {
                     'json': payload,
                 }
@@ -1484,9 +1560,14 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 unregister_url = self._build_api_v1_url(candidate_url, "/relay/servers/unregister")
+                timeout = self._remaining_unregister_timeout(shutdown_deadline)
+                if timeout is None:
+                    failed_relays.add(candidate_url)
+                    last_error = "shutdown_deadline_exhausted"
+                    break
                 response = requests.post(
                     unregister_url,
-                    timeout=request_timeout,
+                    timeout=timeout,
                     **request_kwargs,
                 )
                 if response.status_code == 404:
@@ -1494,16 +1575,14 @@ class RelayClient:
                     if legacy_base_url.endswith('/api/v1'):
                         legacy_base_url = legacy_base_url[: -len('/api/v1')]
                     legacy_url = f"{legacy_base_url}/unregister"
-                    if isinstance(shutdown_deadline, (int, float)):
-                        remaining = float(shutdown_deadline) - time.monotonic()
-                        if remaining <= 0:
-                            failed_relays.add(candidate_url)
-                            last_error = "shutdown deadline exceeded before legacy unregister request"
-                            continue
-                        request_timeout = min(float(self._request_timeout), remaining)
+                    timeout = self._remaining_unregister_timeout(shutdown_deadline)
+                    if timeout is None:
+                        failed_relays.add(candidate_url)
+                        last_error = "shutdown_deadline_exhausted"
+                        break
                     response = requests.post(
                         legacy_url,
-                        timeout=request_timeout,
+                        timeout=timeout,
                         **request_kwargs,
                     )
                 if response.status_code == 200:
@@ -1555,11 +1634,20 @@ class RelayClient:
 
         self._unregister_complete = True
         if len(unregistered_relays) == len(target_urls):
-            self._api_v1_registered_relays.clear()
-            self._clear_api_v1_control_credentials()
-            self._api_v1_last_heartbeat_at.clear()
-            relay_wait_hints.clear()
+            self._api_v1_registered_relays.difference_update(unregistered_relays)
+            for relay_url in unregistered_relays:
+                self._pop_api_v1_control_credential(relay_url)
+                self._api_v1_last_heartbeat_at.pop(relay_url, None)
+                relay_wait_hints.pop(relay_url, None)
         return True
+
+    def _remaining_unregister_timeout(self, shutdown_deadline: Optional[float]) -> Optional[float]:
+        if shutdown_deadline is None:
+            return self._request_timeout
+        remaining = shutdown_deadline - time.monotonic()
+        if remaining <= 0.05:
+            return None
+        return max(0.05, min(self._request_timeout, remaining * 0.8))
 
     def ping_relay(self) -> Dict[str, Any]:
         """
@@ -2280,6 +2368,436 @@ class RelayClient:
             'next_ping_in_x_seconds': self._request_timeout,
         }
 
+
+    @staticmethod
+    def _api_v1_valid_relative_seconds(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return seconds
+
+    @staticmethod
+    def _api_v1_initial_relative_seconds(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
+
+    @classmethod
+    def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
+        candidates = [
+            cls._api_v1_initial_relative_seconds(request_payload.get('request_deadline_remaining_seconds')),
+            cls._api_v1_initial_relative_seconds(request_payload.get('request_ttl_seconds')),
+        ]
+        valid = [value for value in candidates if value is not None]
+        # Legacy relays may omit deadline metadata; cap such requests at the
+        # documented 300-second compatibility deadline rather than running forever.
+        remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
+        return (time.monotonic() if now is None else now) + remaining
+
+    @classmethod
+    def _api_v1_deadline_after_response(cls, current_deadline: float, response_payload: Any, *, now: Optional[float] = None) -> float:
+        if not isinstance(response_payload, dict):
+            return current_deadline
+        candidates = [
+            cls._api_v1_valid_relative_seconds(response_payload.get('request_deadline_remaining_seconds')),
+            cls._api_v1_valid_relative_seconds(response_payload.get('request_ttl_seconds')),
+        ]
+        valid = [value for value in candidates if value is not None]
+        if not valid:
+            return current_deadline
+        candidate_deadline = (time.monotonic() if now is None else now) + min(valid)
+        return min(current_deadline, candidate_deadline)
+
+    @staticmethod
+    def _api_v1_control_next_poll_seconds(value: Any) -> float:
+        if isinstance(value, bool):
+            return _API_V1_CONTROL_MIN_POLL_SECONDS
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return _API_V1_CONTROL_MIN_POLL_SECONDS
+        if not math.isfinite(seconds):
+            return _API_V1_CONTROL_MIN_POLL_SECONDS
+        return min(_API_V1_CONTROL_MAX_POLL_SECONDS, max(_API_V1_CONTROL_MIN_POLL_SECONDS, seconds))
+
+    def _post_api_v1_request_control(
+        self,
+        *,
+        relay_url: str,
+        request_id: str,
+        acknowledge: bool = False,
+        timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        credential = self._api_v1_control_credential_for_relay(relay_url)
+        if not credential:
+            raise PermissionError('missing_api_v1_control_credential')
+        payload = {
+            'server_public_key': self.crypto_manager.public_key_b64,
+            'request_id': request_id,
+            'control_credential': credential,
+            'acknowledge': bool(acknowledge),
+        }
+        request_kwargs: Dict[str, Any] = {
+            'json': payload,
+            'timeout': timeout_seconds if timeout_seconds is not None else self._request_timeout,
+        }
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs['headers'] = headers
+        control_url = self._build_api_v1_url(relay_url, '/relay/servers/control')
+        response = requests.post(control_url, **request_kwargs)
+        if response.status_code in {401, 403}:
+            raise PermissionError('api_v1_control_owner_proof_failed')
+        if response.status_code == 429 or 500 <= response.status_code <= 599:
+            raise requests.RequestException(f'HTTP {response.status_code}')
+        if response.status_code != 200:
+            return {'status': 'unavailable', 'http_status': response.status_code}
+        response_payload = response.json()
+        return response_payload if isinstance(response_payload, dict) else {'status': 'unavailable'}
+
+    def _terminate_current_llama_worker(self, reason: str, *, recreate: bool = True) -> bool:
+        manager = getattr(self, 'model_manager', None)
+        terminate = getattr(manager, 'terminate_active_worker_for_cancellation', None)
+        if callable(terminate):
+            fatal = getattr(self, 'fatal_bridge_teardown', None)
+            return bool(terminate(reason=reason, recreate=recreate, fatal_callback=fatal))
+        # Fallback path: attempt a best-effort close but cannot verify process death.
+        # Return False so the caller knows worker state is uncertain.
+        llm = getattr(manager, 'llm', None)
+        close = getattr(llm, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                log_warning('api_v1.worker_fallback_close_error code=worker_fallback_close_error reason={} exc_type={}', reason, type(exc).__name__)
+        return False
+
+    def _acknowledge_api_v1_terminal_control(self, relay_url: str, request_id: str) -> None:
+        try:
+            self._post_api_v1_request_control(
+                relay_url=relay_url,
+                request_id=request_id,
+                acknowledge=True,
+                timeout_seconds=_API_V1_CONTROL_ACK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            log_info('api_v1.control_ack_failed request_id={}', request_id)
+
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+        request_id = api_v1_request_payload['request_id']
+        relay_url = self._api_v1_response_relay_url()
+        control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
+        if control_available and not self._api_v1_control_credential_for_relay(relay_url):
+            return _ApiV1SupervisorOutcome(
+                response_envelope=None,
+                terminal_code='missing_control_credential',
+                runtime_healthy=True,
+                recovery_attempted=False,
+                recovery_succeeded=False,
+                submission_allowed=False,
+            )
+        if local_deadline is None:
+            local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        terminal_status: Optional[str] = None
+        terminal_reason = 'unknown'
+        future_result: Optional[Dict[str, Any]] = None
+
+        def _wait_for_future_quiescence(target_future: Any, deadline: float) -> bool:
+            """Boundedly drain a request-scoped future before executor teardown."""
+
+            while not target_future.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    target_future.result(timeout=min(0.05, remaining))
+                except FutureTimeoutError:
+                    continue
+                except BaseException:
+                    return True
+            try:
+                target_future.result(timeout=0)
+            except BaseException:
+                pass
+            return True
+
+        def _generate() -> Dict[str, Any]:
+            return self._generate_api_v1_response_with_runtime_model(
+                request_id=request_id,
+                model_id=api_v1_request_payload['model'],
+                messages=api_v1_request_payload['messages'],
+                options=dict(api_v1_request_payload['options']),
+                requested_context_tier=api_v1_request_payload['routing']['context_tier'],
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
+        control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_control') if control_available else None
+        control_future: Any = None
+        future = executor.submit(_generate)
+        try:
+            next_poll_at = time.monotonic() if control_available else local_deadline
+            backoff = 1.0
+            while True:
+                now = time.monotonic()
+                if (
+                    getattr(self, '_polling_stopped_by_request', False)
+                    and not getattr(self, '_api_v1_mutation_latched', False)
+                ):
+                    terminal_status = 'operator_stop'
+                    terminal_reason = 'operator_stop'
+                    break
+                if future.done():
+                    # A completed inference is observed exactly once.  If Stop or the
+                    # local deadline was already terminal before this observation, the
+                    # result is discarded as a typed no-submit outcome; otherwise the
+                    # quiesced worker is not recycled merely because observation and
+                    # deadline are adjacent.  process_client_request_result() performs
+                    # a final pre-submit Stop/deadline recheck before posting.
+                    inference_exc: Optional[BaseException] = None
+                    try:
+                        future_result = future.result()
+                    except BaseException as exc:
+                        inference_exc = exc
+                        future_result = None
+                    if (
+                        getattr(self, '_polling_stopped_by_request', False)
+                        and not getattr(self, '_api_v1_mutation_latched', False)
+                    ):
+                        future_result = None
+                        terminal_status = 'operator_stop'
+                        terminal_reason = 'operator_stop'
+                    elif inference_exc is not None:
+                        # Inference raised.  If a concurrent control poll has
+                        # already resolved with a terminal cancellation or expiry,
+                        # the authoritative relay-side state wins.  Otherwise return
+                        # a typed no-submit worker-failure outcome.
+                        if control_future is not None and control_future.done():
+                            try:
+                                ctrl_result = control_future.result()
+                                control_future = None
+                                ctrl_status = str(ctrl_result.get('status') or '').lower()
+                                if ctrl_status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
+                                    terminal_status = ctrl_status
+                                    terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[ctrl_status]
+                                else:
+                                    terminal_status = 'inference_failure'
+                                    terminal_reason = 'inference_failure'
+                            except BaseException:
+                                terminal_status = 'inference_failure'
+                                terminal_reason = 'inference_failure'
+                        else:
+                            terminal_status = 'inference_failure'
+                            terminal_reason = 'inference_failure'
+                    break
+                if now >= local_deadline:
+                    terminal_status = 'local_deadline'
+                    terminal_reason = 'local_deadline'
+                    break
+                if control_available and now >= next_poll_at:
+                    remaining = max(0.0, local_deadline - time.monotonic())
+                    if remaining <= 0.002:
+                        terminal_status = 'local_deadline'
+                        terminal_reason = 'local_deadline'
+                        break
+                    try:
+                        if control_future is None:
+                            # Cap the control HTTP timeout strictly below the cleanup budget
+                            # so the control executor thread always completes within the shared
+                            # cleanup deadline in the finally block.  No daemon thread or
+                            # interrupt mechanism is needed; the bounded timeout is sufficient.
+                            control_timeout = max(
+                                0.001,
+                                min(
+                                    float(getattr(self, '_request_timeout', 10) or 10),
+                                    _API_V1_MAX_CONTROL_TIMEOUT_SECONDS,
+                                    remaining * 0.8,
+                                    max(0.001, remaining - 0.001),
+                                ),
+                            )
+                            control_future = control_executor.submit(
+                                self._post_api_v1_request_control,
+                                relay_url=relay_url,
+                                request_id=request_id,
+                                acknowledge=False,
+                                timeout_seconds=control_timeout,
+                            )
+                        while not control_future.done():
+                            if getattr(self, '_polling_stopped_by_request', False):
+                                terminal_status = 'operator_stop'
+                                terminal_reason = 'operator_stop'
+                                break
+                            if time.monotonic() >= local_deadline:
+                                terminal_status = 'local_deadline'
+                                terminal_reason = 'local_deadline'
+                                break
+                            wakeup = getattr(self, '_api_v1_control_wakeup', None)
+                            wait_slice = min(0.05, max(0.0, local_deadline - time.monotonic()))
+                            # Unit tests sometimes install fake wakeups that advance a fake
+                            # clock by the requested sleep.  Use those only for supervisor
+                            # backoff sleeps below; in-flight control I/O uses the real
+                            # Future timeout so fake time cannot race past the deadline while
+                            # the owned control thread is merely waiting to be scheduled.
+                            if isinstance(wakeup, threading.Event) and wakeup.wait(wait_slice):
+                                wakeup.clear()
+                            else:
+                                try:
+                                    control_future.result(timeout=min(0.01, wait_slice))
+                                except FutureTimeoutError:
+                                    pass
+                        if terminal_status is not None:
+                            break
+                        control = control_future.result()
+                        control_future = None
+                        if getattr(self, '_polling_stopped_by_request', False):
+                            terminal_status = 'operator_stop'
+                            terminal_reason = 'operator_stop'
+                            break
+                        if time.monotonic() >= local_deadline:
+                            terminal_status = 'local_deadline'
+                            terminal_reason = 'local_deadline'
+                            break
+                        backoff = 1.0
+                        local_deadline = self._api_v1_deadline_after_response(local_deadline, control, now=time.monotonic())
+                        status = str(control.get('status') or '').lower()
+                        if status == 'active':
+                            hint = self._api_v1_control_next_poll_seconds(control.get('next_poll_seconds'))
+                            next_poll_at = min(time.monotonic() + hint, local_deadline)
+                            continue
+                        if status in _API_V1_TERMINAL_CONTROL_STATUS_MAP:
+                            terminal_status = status
+                            terminal_reason = _API_V1_TERMINAL_CONTROL_STATUS_MAP[status]
+                            break
+                        next_poll_at = min(time.monotonic() + _API_V1_CONTROL_MIN_POLL_SECONDS, local_deadline)
+                    except PermissionError:
+                        control_future = None
+                        terminal_status = 'owner_proof_failed'
+                        terminal_reason = 'owner_proof_failed'
+                        break
+                    except Exception:
+                        control_future = None
+                        next_poll_at = min(time.monotonic() + backoff, local_deadline)
+                        backoff = min(_API_V1_CONTROL_MAX_POLL_SECONDS, backoff * 2)
+                wait_until = min(next_poll_at, local_deadline)
+                wait_seconds = max(0.0, min(0.2, wait_until - time.monotonic()))
+                wakeup = getattr(self, '_api_v1_control_wakeup', None)
+                if wakeup is not None and wakeup.wait(wait_seconds):
+                    wakeup.clear()
+                    continue
+                try:
+                    future_result = future.result(timeout=0)
+                    break
+                except FutureTimeoutError:
+                    pass
+                except BaseException:
+                    # Inference raised with no preceding terminal control result.
+                    terminal_status = 'inference_failure'
+                    terminal_reason = 'inference_failure'
+                    break
+            if terminal_status is not None:
+                recovery_succeeded = False
+                try:
+                    recovery_succeeded = self._terminate_current_llama_worker(
+                        terminal_reason, recreate=terminal_status != 'operator_stop'
+                    )
+                except Exception:
+                    log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
+                # Track inference and control quiescence separately.  Only a stuck
+                # inference thread justifies a permanent polling stop; routine control
+                # latency must not mark a healthy recreated worker as unhealthy.
+                # The control future completes naturally within its bounded HTTP timeout
+                # (_API_V1_MAX_CONTROL_TIMEOUT_SECONDS), so no interrupt mechanism is
+                # needed.  The finally block drains it within the shared cleanup deadline.
+                inference_quiescence_deadline = time.monotonic() + 0.5
+                inference_quiesced = _wait_for_future_quiescence(future, inference_quiescence_deadline)
+                control_quiesced = control_future is None or control_future.done()
+                if terminal_status in {'cancelled', 'expired'}:
+                    self._acknowledge_api_v1_terminal_control(relay_url, request_id)
+                if not inference_quiesced:
+                    recovery_succeeded = False
+                    self.stop_polling = True
+                    self._polling_stopped_by_request = True
+                    fatal = getattr(self, 'fatal_bridge_teardown', None)
+                    if callable(fatal):
+                        try:
+                            inference_quiesced = bool(fatal(reason='api_v1_inference_not_quiesced'))
+                        except Exception:
+                            inference_quiesced = False
+                elif not control_quiesced:
+                    log_warning('api_v1.control_cleanup_pending request_id={}', request_id)
+                return _ApiV1SupervisorOutcome(
+                    response_envelope=None,
+                    terminal_code=terminal_reason,
+                    runtime_healthy=bool(recovery_succeeded and inference_quiesced),
+                    recovery_attempted=True,
+                    recovery_succeeded=bool(recovery_succeeded and inference_quiesced),
+                    submission_allowed=False,
+                )
+        finally:
+            # Shared cleanup deadline for both request-owned futures.  Use the
+            # return values from _wait_for_future_quiescence: only call
+            # executor.shutdown(wait=True) after the corresponding future is
+            # proven done.  A requests timeout is not a strict wall-clock bound
+            # (DNS, adapters, or a misbehaving transport can outlive it), so the
+            # control future might still be alive even after
+            # _API_V1_MAX_CONTROL_TIMEOUT_SECONDS.  If either future remains
+            # alive at the cleanup deadline, invoke fatal_bridge_teardown (no-
+            # return in production; it terminates the disposable process so no
+            # executor thread is ever abandoned).  Never call shutdown(wait=True)
+            # on an executor whose future has not quiesced.
+            cleanup_deadline = time.monotonic() + _API_V1_CLEANUP_BUDGET_SECONDS
+            inference_done = _wait_for_future_quiescence(future, cleanup_deadline)
+            control_done = (
+                control_future is None
+                or _wait_for_future_quiescence(control_future, cleanup_deadline)
+            )
+            if not inference_done or not control_done:
+                fatal = getattr(self, 'fatal_bridge_teardown', None)
+                if callable(fatal):
+                    fatal(reason='api_v1_executor_cleanup_timeout')
+                # Reached only when fatal_bridge_teardown returned (test / non-
+                # production environment where the callback unblocked the thread).
+                # Give the now-unblocked threads a brief moment to quiesce before
+                # calling shutdown(wait=True).  In production fatal is no-return.
+                after_fatal_deadline = time.monotonic() + 0.5
+                if not inference_done:
+                    inference_done = _wait_for_future_quiescence(future, after_fatal_deadline)
+                if not control_done:
+                    control_done = (
+                        control_future is None
+                        or _wait_for_future_quiescence(control_future, after_fatal_deadline)
+                    )
+            if inference_done:
+                executor.shutdown(wait=True, cancel_futures=True)
+            if control_executor is not None and control_done:
+                control_executor.shutdown(wait=True, cancel_futures=True)
+        runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
+        if not isinstance(runtime_health, dict):
+            runtime_health = {}
+        return _ApiV1SupervisorOutcome(
+            response_envelope=future_result,
+            runtime_healthy=bool(runtime_health.get("runtime_healthy", True)),
+            recovery_attempted=bool(runtime_health.get("recovery_attempted", False)),
+            recovery_succeeded=bool(runtime_health.get("recovery_succeeded", False)),
+            submission_allowed=True,
+        )
+
+    def _run_api_v1_inference_with_control(self, api_v1_request_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper returning only the response envelope."""
+
+        outcome = self._supervise_api_v1_inference(api_v1_request_payload)
+        return outcome.response_envelope
+
     def _api_v1_response_relay_url(self) -> str:
         """Return the relay URL that supplied the current API v1 work item."""
 
@@ -2312,8 +2830,22 @@ class RelayClient:
         *,
         client_pub_key_b64: str,
         client_pub_key: bytes,
-    ) -> bool:
-        """Encrypt and submit an API v1 response to the relay that supplied work."""
+        cancel_snapshot: Optional[Tuple[Any, ...]] = None,
+        local_deadline: Optional[float] = None,
+    ) -> _PostApiV1Outcome:
+        """Encrypt and submit an API v1 response to the relay that supplied work.
+
+        ``cancel_snapshot`` is an opaque token produced by
+        :meth:`ModelManager.cancellation_generation_snapshot`.  Its shape is
+        ``(generation: int, cancel_event: threading.Event, epoch: int)`` but is
+        treated as opaque here and forwarded verbatim to
+        ``cancellation_generation_cancelled()``.
+
+        Returns a :class:`_PostApiV1Outcome` that distinguishes successful
+        submission, pre-submit guard suppression (cancellation / operator Stop /
+        local deadline), and transport failure.  Callers that only need a boolean
+        should read ``.submitted``.
+        """
 
         if not self._api_v1_begin_mutation():
             log_info(
@@ -2322,7 +2854,11 @@ class RelayClient:
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
             )
-            return False
+            return _PostApiV1Outcome(
+                submitted=False,
+                suppressed=True,
+                suppressed_code="shutdown_requested",
+            )
 
         try:
             bound_response_envelope = {
@@ -2353,6 +2889,29 @@ class RelayClient:
                 "/relay/responses",
             )
             relay_target = _sanitize_relay_target(response_relay_url)
+            cancelled_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_cancelled', None)
+            request_cancelled = bool(
+                cancel_snapshot is not None
+                and callable(cancelled_fn)
+                and cancelled_fn(cancel_snapshot) is True
+            )
+            operator_stopped = getattr(self, '_polling_stopped_by_request', False)
+            deadline_expired = local_deadline is not None and time.monotonic() >= local_deadline
+            if operator_stopped or deadline_expired or request_cancelled:
+                suppressed_code = (
+                    'operator_stop' if operator_stopped
+                    else 'local_deadline' if deadline_expired
+                    else 'request_cancelled'
+                )
+                log_info(
+                    "API v1 E2EE response submission suppressed request_id={} protocol={} route={} relay={} code={}",
+                    response_envelope["request_id"],
+                    "tokenplace_api_v1_relay_e2ee",
+                    "/api/v1/relay/responses",
+                    relay_target,
+                    suppressed_code,
+                )
+                return _PostApiV1Outcome(submitted=False, suppressed=True, suppressed_code=suppressed_code)
             source_response = requests.post(
                 response_url,
                 timeout=self._request_timeout,
@@ -2379,16 +2938,16 @@ class RelayClient:
                     relay_target,
                     source_response.status_code,
                 )
-            return submitted
-        except Exception:
+            return _PostApiV1Outcome(submitted=submitted)
+        except Exception as _exc:
             log_error(
-                "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
+                "Failed to encrypt or post API v1 response request_id={} protocol={} route={} exc_type={}",
                 response_envelope.get("request_id"),
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
-                exc_info=True,
+                type(_exc).__name__,
             )
-            return False
+            return _PostApiV1Outcome(submitted=False, transport_failed=True)
         finally:
             self._api_v1_end_mutation()
 
@@ -2431,7 +2990,7 @@ class RelayClient:
             response_envelope,
             client_pub_key_b64=client_pub_key_b64,
             client_pub_key=client_pub_key,
-        )
+        ).submitted
 
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:
@@ -4499,6 +5058,8 @@ class RelayClient:
 
     def process_client_request_result(self, request_data: Dict[str, Any]) -> RelayProcessingResult:
         """Process a client request and return a typed, privacy-safe outcome."""
+        entry_monotonic = time.monotonic()
+        outer_api_v1_deadline = self._api_v1_initial_deadline_from_metadata(request_data, now=entry_monotonic)
         try:
             try:
                 _validate_with_fallback(request_data, MESSAGE_SCHEMA)
@@ -4531,34 +5092,108 @@ class RelayClient:
             )
             if api_v1_request_payload is not None:
                 try:
+                    cancel_snapshot = None
+                    snapshot_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_snapshot', None)
+                    if callable(snapshot_fn):
+                        candidate_snapshot = snapshot_fn()
+                        # Accept both 2-part (generation, event) legacy shapes and
+                        # the current 3-part (generation, event, epoch) shape; the
+                        # token is forwarded opaquely to cancellation_generation_cancelled().
+                        if (
+                            isinstance(candidate_snapshot, tuple)
+                            and len(candidate_snapshot) >= 2
+                            and hasattr(candidate_snapshot[1], 'is_set')
+                        ):
+                            cancel_snapshot = candidate_snapshot
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    response_envelope = self._generate_api_v1_response_with_runtime_model(
-                        request_id=api_v1_request_payload["request_id"],
-                        model_id=api_v1_request_payload["model"],
-                        messages=api_v1_request_payload["messages"],
-                        options=dict(api_v1_request_payload["options"]),
-                        requested_context_tier=api_v1_request_payload["routing"]["context_tier"],
-                    )
+                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
+                    response_envelope = supervisor_outcome.response_envelope
+                    if response_envelope is None:
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code=supervisor_outcome.terminal_code or "api_v1_request_cancelled",
+                            runtime_healthy=supervisor_outcome.runtime_healthy,
+                            recovery_attempted=supervisor_outcome.recovery_attempted,
+                            recovery_succeeded=supervisor_outcome.recovery_succeeded,
+                            submission_allowed=supervisor_outcome.submission_allowed,
+                        )
                     api_v1_response = response_envelope.get("api_v1_response", {})
                     error = api_v1_response.get("error") if isinstance(api_v1_response, dict) else None
                     safe_error_code = error.get("code") if isinstance(error, dict) else None
-                    runtime_health = getattr(self, "_last_api_v1_runtime_health", {})
-                    runtime_healthy = bool(runtime_health.get("runtime_healthy", True))
-                    recovery_attempted = bool(runtime_health.get("recovery_attempted", False))
-                    recovery_succeeded = bool(runtime_health.get("recovery_succeeded", False))
+                    runtime_healthy = supervisor_outcome.runtime_healthy
+                    recovery_attempted = supervisor_outcome.recovery_attempted
+                    recovery_succeeded = supervisor_outcome.recovery_succeeded
                     if safe_error_code not in {
                         "compute_node_internal_error",
                         "compute_node_process_failed",
                     }:
                         runtime_healthy = True
-                    if getattr(self, "_api_v1_mutation_latched", False) or getattr(self, "_polling_stopped_by_request", False):
-                        log_info(
-                            "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
-                            api_v1_request_payload["request_id"],
-                            "tokenplace_api_v1_relay_e2ee",
-                            "/api/v1/relay/responses",
+                    cancelled_fn = getattr(getattr(self, 'model_manager', None), 'cancellation_generation_cancelled', None)
+                    request_cancelled = bool(
+                        cancel_snapshot is not None
+                        and callable(cancelled_fn)
+                        and cancelled_fn(cancel_snapshot) is True
+                    )
+                    shutdown_latched = getattr(self, "_api_v1_mutation_latched", False)
+                    operator_stopped = getattr(self, '_polling_stopped_by_request', False)
+                    deadline_expired = time.monotonic() >= outer_api_v1_deadline
+                    if shutdown_latched or operator_stopped or deadline_expired or request_cancelled:
+                        if shutdown_latched or operator_stopped:
+                            log_info(
+                                "API v1 response submission skipped after shutdown latch request_id={} protocol={} route={}",
+                                api_v1_request_payload["request_id"],
+                                "tokenplace_api_v1_relay_e2ee",
+                                "/api/v1/relay/responses",
+                            )
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code=(
+                                'shutdown_requested'
+                                if shutdown_latched
+                                else 'operator_stop'
+                                if operator_stopped
+                                else 'local_deadline'
+                                if deadline_expired
+                                else 'request_cancelled'
+                            ),
+                            runtime_healthy=(
+                                True
+                                if shutdown_latched or operator_stopped
+                                else runtime_healthy
+                            ),
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
                         )
+                    post_outcome = self._post_api_v1_response(
+                        response_envelope,
+                        client_pub_key_b64=client_pub_key_b64,
+                        client_pub_key=client_pub_key,
+                        cancel_snapshot=cancel_snapshot,
+                        local_deadline=outer_api_v1_deadline,
+                    )
+                    if isinstance(post_outcome, bool):
+                        post_outcome = _PostApiV1Outcome(submitted=post_outcome)
+                    if post_outcome.suppressed:
+                        return RelayProcessingResult(
+                            inference_succeeded=False,
+                            submitted=False,
+                            safe_error_code=post_outcome.suppressed_code or 'request_suppressed',
+                            runtime_healthy=runtime_healthy,
+                            recovery_attempted=recovery_attempted,
+                            recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
+                        )
+                    if (
+                        not post_outcome.submitted
+                        and (
+                            getattr(self, "_api_v1_mutation_latched", False)
+                            or getattr(self, "_polling_stopped_by_request", False)
+                        )
+                    ):
                         return RelayProcessingResult(
                             inference_succeeded=False,
                             submitted=False,
@@ -4566,24 +5201,11 @@ class RelayClient:
                             runtime_healthy=True,
                             recovery_attempted=recovery_attempted,
                             recovery_succeeded=recovery_succeeded,
+                            submission_allowed=False,
                         )
-                    submitted = self._post_api_v1_response(
-                        response_envelope,
-                        client_pub_key_b64=client_pub_key_b64,
-                        client_pub_key=client_pub_key,
-                    )
-                    if (
-                        not submitted
-                        and (
-                            getattr(self, "_api_v1_mutation_latched", False)
-                            or getattr(self, "_polling_stopped_by_request", False)
-                        )
-                    ):
-                        safe_error_code = "shutdown_requested"
-                        runtime_healthy = True
                     return RelayProcessingResult(
-                        inference_succeeded=safe_error_code is None and submitted,
-                        submitted=submitted,
+                        inference_succeeded=safe_error_code is None and post_outcome.submitted,
+                        submitted=post_outcome.submitted,
                         safe_error_code=safe_error_code,
                         runtime_healthy=runtime_healthy,
                         recovery_attempted=recovery_attempted,

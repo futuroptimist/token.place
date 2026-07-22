@@ -4796,6 +4796,850 @@ def test_model_manager_replacement_helpers_handle_unusual_workers(tmp_path, monk
     assert stale.closed is True
 
 
+def test_model_manager_cancellation_advances_generation_without_active_worker(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 3
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    monkeypatch.setattr(time, "time", lambda: 12.345)
+    replacement = object()
+    monkeypatch.setattr(manager, "get_llm_instance", lambda: replacement)
+
+    old_event = manager._llm_cancel_generation_event
+    assert manager.terminate_active_worker_for_cancellation(reason="bad reason with spaces") is True
+
+    assert manager.llm is None
+    assert manager.worker_state == "recovering"
+    assert manager.last_worker_error_code == "cancelled"
+    assert manager.worker_restart_count == 4
+    assert manager.last_worker_restart_at_ms == 12345
+    assert manager._llm_generation == 8
+    assert old_event.is_set() is True
+    assert manager._llm_cancel_generation_event is not old_event
+    assert manager._llm_cancel_generation_event.is_set() is False
+
+
+def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.Lock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 70
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    monkeypatch.setattr(time, "time", lambda: 50.0)
+
+    replacement = object()
+
+    def get_llm_instance():
+        assert manager.llm_lock.acquire(blocking=False) is True
+        manager.llm_lock.release()
+        manager.llm = replacement
+        return replacement
+
+    monkeypatch.setattr(manager, "get_llm_instance", get_llm_instance)
+
+    old_event = manager._llm_cancel_generation_event
+    assert manager.terminate_active_worker_for_cancellation(reason="cancelled") is True
+
+    assert manager.llm is replacement
+    assert manager.worker_state == "recovering"
+    assert manager.last_worker_error_code == "cancelled"
+    assert manager.worker_restart_count == 1
+    assert manager.last_worker_restart_at_ms == 50000
+    assert manager._llm_generation == 71
+    assert old_event.is_set() is True
+    manager.log_warning.assert_not_called()
+
+
+def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    already_dead = SimpleNamespace(
+        close=MagicMock(),
+        _process=SimpleNamespace(poll=MagicMock(return_value=9), terminate=MagicMock(), kill=MagicMock()),
+    )
+    manager._close_llm_proxy(already_dead, terminate_process=True)
+    already_dead.close.assert_not_called()
+    already_dead._process.terminate.assert_not_called()
+    already_dead._process.kill.assert_not_called()
+
+    terminate_fails_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(),
+        stdin=SimpleNamespace(close=MagicMock()),
+        stdout=SimpleNamespace(close=MagicMock()),
+        stderr=SimpleNamespace(close=MagicMock()),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=terminate_fails_process), terminate_process=True)
+    terminate_fails_process.terminate.assert_called_once_with()
+    terminate_fails_process.kill.assert_called_once_with()
+    assert terminate_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    terminate_fails_process.stdin.close.assert_called_once_with()
+    terminate_fails_process.stdout.close.assert_called_once_with()
+    terminate_fails_process.stderr.close.assert_called_once_with()
+
+    stubborn_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still running"), 0]),
+        kill=MagicMock(),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=stubborn_process), terminate_process=True)
+    stubborn_process.terminate.assert_called_once_with()
+    stubborn_process.kill.assert_called_once_with()
+    assert stubborn_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+    broken_poll_process = SimpleNamespace(
+        poll=MagicMock(side_effect=RuntimeError("poll failed")),
+        terminate=MagicMock(),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(),
+    )
+    manager._close_llm_proxy(SimpleNamespace(_process=broken_poll_process), terminate_process=True)
+    broken_poll_process.terminate.assert_called_once_with()
+    assert broken_poll_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    broken_poll_process.kill.assert_called_once_with()
+
+
+def test_model_manager_cancellation_without_active_worker_recreate_false_and_failure(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = None
+    manager.worker_state = "ready"
+    manager._llm_generation = 11
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    monkeypatch.setattr(time, "time", lambda: 20.0)
+    manager.log_warning = MagicMock()
+    get_llm_instance = MagicMock(side_effect=AssertionError("must not recreate during operator stop"))
+    monkeypatch.setattr(manager, "get_llm_instance", get_llm_instance)
+
+    old_event = manager._llm_cancel_generation_event
+    assert manager.terminate_active_worker_for_cancellation(reason="operator_stop", recreate=False) is True
+
+    get_llm_instance.assert_not_called()
+    assert old_event.is_set() is True
+    assert manager._llm_generation == 12
+    assert manager.worker_restart_count == 1
+    assert manager.last_worker_error_code == "operator_stop"
+    assert manager.last_worker_restart_at_ms == 20000
+
+    manager._llm_cancel_generation_event = threading.Event()
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(side_effect=RuntimeError("recreate failed")))
+
+    assert manager.terminate_active_worker_for_cancellation(reason="expired") is False
+    assert manager._llm_generation == 13
+    assert manager.worker_restart_count == 2
+    assert manager.last_worker_error_code == "expired"
+
+
+def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
+        wait=MagicMock(side_effect=RuntimeError("wait failed")),
+        kill=MagicMock(),
+    )
+
+    manager._close_llm_proxy(SimpleNamespace(_process=process), terminate_process=True)
+
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+
+def test_model_manager_cancellation_active_worker_reports_recreation_outcomes(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = "ready"
+    manager._llm_generation = 21
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 5
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    monkeypatch.setattr(time, "time", lambda: 30.0)
+
+    process = SimpleNamespace(poll=MagicMock(return_value=17))
+    active_worker = SimpleNamespace(_process=process)
+    manager.llm = active_worker
+    close_llm_proxy = MagicMock()
+    monkeypatch.setattr(manager, "_close_llm_proxy", close_llm_proxy)
+    replacement = object()
+    get_llm_instance = MagicMock(return_value=replacement)
+    monkeypatch.setattr(manager, "get_llm_instance", get_llm_instance)
+
+    old_event = manager._llm_cancel_generation_event
+    assert manager.terminate_active_worker_for_cancellation(reason="completed_unavailable") is True
+
+    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True, fatal_callback=None)
+    get_llm_instance.assert_called_once_with()
+    assert manager.llm is None
+    assert manager.last_worker_exit_code == 17
+    assert manager.last_worker_error_code == "completed_unavailable"
+    assert manager.worker_state == "recovering"
+    assert manager.worker_restart_count == 6
+    assert manager.last_worker_restart_at_ms == 30000
+    assert manager._llm_generation == 22
+    assert old_event.is_set() is True
+    assert manager._llm_cancel_generation_event is not old_event
+
+    none_replacement_worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)), is_alive=MagicMock(return_value=False))
+    manager.llm = none_replacement_worker
+    close_llm_proxy.reset_mock()
+    get_llm_instance.reset_mock()
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=None))
+
+    assert manager.terminate_active_worker_for_cancellation(reason="expired") is False
+    close_llm_proxy.assert_called_once_with(none_replacement_worker, terminate_process=True, fatal_callback=None)
+    assert manager.last_worker_error_code == "expired"
+
+    manager.llm = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)))
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(side_effect=RuntimeError("replacement failed")))
+
+    assert manager.terminate_active_worker_for_cancellation(reason="cancelled") is False
+    manager.log_warning.assert_called_with(
+        "desktop.llama_cpp_worker.recreation_after_cancellation_failed safe_error_code=cancelled"
+    )
+
+
+def test_model_manager_cancellation_active_worker_skip_recreation_and_close_without_process(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = SimpleNamespace()
+    manager.worker_state = "ready"
+    manager._llm_generation = 31
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 1
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    monkeypatch.setattr(time, "time", lambda: 40.0)
+    close_llm_proxy = MagicMock()
+    monkeypatch.setattr(manager, "_close_llm_proxy", close_llm_proxy)
+    get_llm_instance = MagicMock(side_effect=AssertionError("operator stop must not recreate"))
+    monkeypatch.setattr(manager, "get_llm_instance", get_llm_instance)
+
+    active_worker = manager.llm
+    assert manager.terminate_active_worker_for_cancellation(reason="operator_stop", recreate=False) is True
+
+    close_llm_proxy.assert_called_once_with(active_worker, terminate_process=True, fatal_callback=None)
+    get_llm_instance.assert_not_called()
+    assert manager.last_worker_exit_code is None
+    assert manager.last_worker_error_code == "operator_stop"
+    assert manager.worker_restart_count == 2
+    assert manager.last_worker_restart_at_ms == 40000
+    assert manager._llm_generation == 32
+
+    processless_worker = SimpleNamespace(close=MagicMock())
+    ModelManager._close_llm_proxy(manager, processless_worker, terminate_process=True)
+    processless_worker.close.assert_called_once_with()
+
+
+def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
+
+    manager._close_llm_proxy(close_fails, terminate_process=False)
+
+    close_fails.close.assert_called_once_with()
+
+    kill_fails_process = SimpleNamespace(
+        poll=MagicMock(return_value=None),
+        terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(side_effect=RuntimeError("kill failed")),
+    )
+
+    manager._close_llm_proxy(SimpleNamespace(_process=kill_fails_process), terminate_process=True)
+
+    kill_fails_process.terminate.assert_called_once_with()
+    kill_fails_process.kill.assert_called_once_with()
+    assert kill_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    close_entered = threading.Event()
+    close_release = threading.Event()
+    poll_values = iter([None, None, 0])
+    process = SimpleNamespace(
+        poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still alive"), 0]),
+        kill=MagicMock(),
+    )
+
+    def blocking_close():
+        close_entered.set()
+        close_release.wait()
+
+    worker = SimpleNamespace(close=blocking_close, _process=process)
+    assert manager._close_llm_proxy(worker, terminate_process=True) is True
+    assert not close_entered.is_set()
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_close_llm_proxy_processless_terminate_close_exception_returns_failure(tmp_path, monkeypatch):
+    """close() exception on a processless worker with terminate_process=True prevents replacement."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    worker = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed on cancel")))
+    result = manager._close_llm_proxy(worker, terminate_process=True)
+
+    worker.close.assert_called_once_with()
+    assert result is False
+
+
+def test_close_llm_proxy_processless_close_timeout_invokes_fatal_and_joins_executor(tmp_path, monkeypatch):
+    """Blocking processless close() triggers fatal_callback after deadline and executor is joined."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_TIMEOUT_SECONDS', 0.05)
+
+    close_entered = threading.Event()
+    close_release = threading.Event()
+
+    def blocking_close():
+        close_entered.set()
+        close_release.wait()
+
+    fatal_calls = []
+
+    def fatal_callback(reason):
+        fatal_calls.append(reason)
+        # Unblock the close thread so the executor can be joined
+        close_release.set()
+
+    worker = SimpleNamespace(close=blocking_close)
+    result = manager._close_llm_proxy(worker, terminate_process=True, fatal_callback=fatal_callback)
+
+    assert fatal_calls == ['api_v1_worker_processless_close_timeout']
+    assert close_entered.is_set()
+    # After fatal unblocked the thread, post-fatal drain succeeds → result is True
+    assert result is True
+    # No worker_processless_close executor threads survive
+    surviving = [t for t in threading.enumerate() if 'worker_processless_close' in t.name]
+    assert not surviving, f"Leaked executor threads: {surviving}"
+
+
+def test_close_llm_proxy_processless_no_fatal_callback_hard_exits_subprocess(tmp_path):
+    """No fatal_callback + blocking close() triggers _processless_close_hard_exit (os._exit(1)).
+
+    The old behaviour released the executor without joining the thread and
+    returned False, which left an unjoinable thread alive.  The replacement
+    calls ``_processless_close_hard_exit`` (os._exit(1)), terminating the
+    disposable process so no executor thread is ever abandoned.
+
+    This test spawns a disposable child process so that the real os._exit is
+    exercised without affecting the test runner.  The child must exit with a
+    nonzero code, and execution must never reach the post-cleanup marker.
+    """
+    repo_root = str(Path(__file__).resolve().parents[2])
+
+    child_script = tmp_path / 'child_no_fatal.py'
+    child_script.write_text(
+        f"""\
+import sys
+import threading
+sys.path.insert(0, {repo_root!r})
+import utils.llm.model_manager as mm_mod
+
+# Use a very short deadline to keep the test fast.
+mm_mod._PROCESSLESS_CLOSE_TIMEOUT_SECONDS = 0.05
+mm_mod._POST_FATAL_DRAIN_TIMEOUT_SECONDS = 0.05
+
+manager = mm_mod.ModelManager.__new__(mm_mod.ModelManager)
+# _close_llm_proxy's terminate_process=True path never references self attributes
+# other than log_warning (which is on the non-cancellation branch).
+
+close_release = threading.Event()
+def blocking_close():
+    close_release.wait(30.0)
+
+from types import SimpleNamespace
+worker = SimpleNamespace(close=blocking_close)
+
+# No fatal_callback supplied: must trigger _processless_close_hard_exit -> os._exit(1)
+manager._close_llm_proxy(worker, terminate_process=True)
+
+# Execution must never reach here because _processless_close_hard_exit is no-return.
+print("MARKER_REACHED_AFTER_CLOSE", flush=True)
+sys.exit(0)
+"""
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(child_script)],
+        timeout=15,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected nonzero exit from _processless_close_hard_exit, "
+        f"got {result.returncode}. stdout: {result.stdout!r}"
+    )
+    assert 'MARKER_REACHED_AFTER_CLOSE' not in result.stdout, (
+        "Execution must not reach the post-cleanup marker"
+    )
+    assert 'processless_close_hard_exit' in result.stderr, (
+        f"Expected hard-exit log line in stderr: {result.stderr!r}"
+    )
+
+
+
+def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    poll_values = iter([None, None, None, 0])
+    process = SimpleNamespace(
+        poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
+        terminate=MagicMock(),
+        wait=MagicMock(side_effect=[TimeoutError("still alive"), 0]),
+        kill=MagicMock(),
+    )
+    close = MagicMock(side_effect=AssertionError("subprocess close must not be called"))
+    worker = SimpleNamespace(close=close, _process=process, _queue=SimpleNamespace(close=MagicMock()))
+    manager.llm = worker
+    cleanup_observed = {}
+    real_close = manager._close_llm_proxy
+
+    def observed_close(llm, **kwargs):
+        cleanup_observed["llm_detached"] = manager.llm is None
+        cleanup_observed["lock_available"] = manager.llm_lock.acquire(blocking=False)
+        if cleanup_observed["lock_available"]:
+            manager.llm_lock.release()
+        return real_close(llm, **kwargs)
+
+    monkeypatch.setattr(manager, "_close_llm_proxy", observed_close)
+
+    generation = manager._invalidate_llm_if_current(worker, RuntimeError("dead"))
+
+    assert generation == 1
+    assert cleanup_observed == {"llm_detached": True, "lock_available": True}
+    close.assert_not_called()
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+    assert worker._queue is None
+
+
+def test_ensure_replacement_fails_when_stale_worker_cleanup_unverified(tmp_path, monkeypatch):
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)), is_alive=MagicMock(return_value=False))
+    manager.llm = worker
+    monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock(return_value=False))
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=SimpleNamespace()))
+
+    assert manager._ensure_replacement_llm(manager._llm_generation) is None
+    manager._close_llm_proxy.assert_called_once_with(worker)
+    manager.get_llm_instance.assert_not_called()
+    assert manager.worker_state == "failed"
+
+
+def test_model_manager_cancellation_barrier_gates_replacement_during_cleanup(tmp_path, monkeypatch):
+    """
+    Generation barrier: get_llm_instance() must return None while stale-worker
+    cleanup is in progress.  Only after the matching generation's cleanup
+    succeeds is a replacement allowed to initialize.
+    """
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    worker = SimpleNamespace(is_alive=MagicMock(return_value=False))
+    manager.llm = worker
+    initial_gen = manager._llm_generation
+
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+    replacement = SimpleNamespace()
+    get_llm_calls = []
+
+    real_get_llm = manager.get_llm_instance
+
+    def blocking_close(llm, **kwargs):
+        cleanup_entered.set()
+        cleanup_release.wait(timeout=5.0)
+        return True
+
+    original_get_llm = manager.get_llm_instance
+
+    def intercepted_get_llm():
+        get_llm_calls.append(manager._cleanup_barrier_generation)
+        return replacement
+
+    monkeypatch.setattr(manager, "_close_llm_proxy", blocking_close)
+    monkeypatch.setattr(manager, "get_llm_instance", intercepted_get_llm)
+
+    # Start terminate in a background thread; it will block in blocking_close.
+    result_holder = []
+
+    def do_terminate():
+        result_holder.append(
+            manager.terminate_active_worker_for_cancellation(reason='cancelled', recreate=True)
+        )
+
+    t = threading.Thread(target=do_terminate)
+    t.start()
+
+    # Wait until cleanup has entered the blocking close.
+    assert cleanup_entered.wait(timeout=5.0), "cleanup did not start"
+
+    # While cleanup is in progress, the barrier must prevent replacement init.
+    with manager.llm_lock:
+        barrier_during_cleanup = manager._cleanup_barrier_generation
+
+    assert barrier_during_cleanup == initial_gen, (
+        f"Expected barrier={initial_gen}, got {barrier_during_cleanup}"
+    )
+    # get_llm_instance is not yet called because cleanup hasn't finished.
+    assert not get_llm_calls, "get_llm_instance called before cleanup finished"
+
+    # Also verify get_llm_instance() would be blocked by the barrier directly.
+    monkeypatch.setattr(manager, "get_llm_instance", intercepted_get_llm)
+
+    # Unblock cleanup so terminate_active_worker_for_cancellation can proceed.
+    cleanup_release.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "terminate thread did not finish"
+
+    # Barrier must be cleared after successful cleanup.
+    with manager.llm_lock:
+        barrier_after_cleanup = manager._cleanup_barrier_generation
+    assert barrier_after_cleanup is None, (
+        f"Barrier not cleared after cleanup: {barrier_after_cleanup}"
+    )
+
+    # get_llm_instance should have been called exactly once (for recreation),
+    # after the barrier was cleared.
+    assert len(get_llm_calls) == 1
+    assert get_llm_calls[0] is None, (
+        f"get_llm_instance called while barrier was still set: {get_llm_calls[0]}"
+    )
+
+    assert result_holder == [True]
+
+
+def test_cancellation_generation_snapshot_returns_generation_event_and_epoch():
+    """cancellation_generation_snapshot() returns a 3-tuple: (generation, event, epoch)."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager._llm_cancellation_epoch = 3
+
+    snapshot = manager.cancellation_generation_snapshot()
+    gen, evt, epoch = snapshot
+    assert gen == 7
+    assert evt is manager._llm_cancel_generation_event
+    assert epoch == 3
+
+
+def test_cancellation_generation_cancelled_event_set_returns_true():
+    """cancellation_generation_cancelled() returns True immediately if the event is set."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager._llm_cancellation_epoch = 3
+
+    snapshot = manager.cancellation_generation_snapshot()
+    manager._llm_cancel_generation_event.set()
+    assert manager.cancellation_generation_cancelled(snapshot) is True
+
+
+def test_cancellation_generation_cancelled_epoch_mismatch_returns_true():
+    """cancellation_generation_cancelled() returns True when epoch has advanced."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager._llm_cancellation_epoch = 3
+
+    snapshot = manager.cancellation_generation_snapshot()
+    # Advance epoch without setting the event
+    manager._llm_cancellation_epoch = 4
+    assert manager.cancellation_generation_cancelled(snapshot) is True
+
+
+def test_cancellation_generation_cancelled_no_change_returns_false():
+    """cancellation_generation_cancelled() returns False when generation and epoch are unchanged."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 7
+    manager._llm_cancel_generation_event = threading.Event()
+    manager._llm_cancellation_epoch = 3
+
+    snapshot = manager.cancellation_generation_snapshot()
+    assert manager.cancellation_generation_cancelled(snapshot) is False
+
+
+def test_get_llm_instance_returns_none_when_cleanup_barrier_is_set(monkeypatch):
+    """get_llm_instance() returns None without attempting initialization if the cleanup barrier is active."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.llm = None
+    manager.use_mock_llm = False
+    manager._cleanup_barrier_generation = 5  # Barrier is active
+
+    result = manager.get_llm_instance()
+    assert result is None
+
+
+def test_terminate_active_worker_close_failure_sets_worker_failed(monkeypatch):
+    """When _close_llm_proxy returns False, terminate_active_worker_for_cancellation marks
+    worker_state='failed' and returns False."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = 'ready'
+    manager._llm_generation = 10
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager._llm_cancellation_epoch = 0
+    manager.log_warning = MagicMock()
+    monkeypatch.setattr(time, 'time', lambda: 100.0)
+
+    active_worker = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)))
+    manager.llm = active_worker
+    manager._cleanup_barrier_generation = None
+
+    # _close_llm_proxy returns False → cleanup failed
+    monkeypatch.setattr(manager, '_close_llm_proxy', lambda *a, **kw: False)
+    get_llm_instance = MagicMock(side_effect=AssertionError("must not be called"))
+    monkeypatch.setattr(manager, 'get_llm_instance', get_llm_instance)
+
+    result = manager.terminate_active_worker_for_cancellation(reason='cancelled', recreate=True)
+
+    assert result is False
+    assert manager.worker_state == 'failed'
+    # Verify state metadata was correctly recorded before the failed close
+    assert manager.last_worker_error_code == 'cancelled'
+    assert manager.last_worker_restart_at_ms == 100000
+    assert manager.worker_restart_count == 1
+    get_llm_instance.assert_not_called()
+
+
+def test_close_llm_proxy_resource_close_and_join_exceptions_are_ignored(tmp_path, monkeypatch):
+    """_close_or_join_resource() silently ignores exceptions from close() and join() on pipe attributes."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    class RaisingResource:
+        def close(self):
+            raise RuntimeError("close failed in resource")
+
+        def join(self, timeout=None):
+            raise RuntimeError("join failed in resource")
+
+    worker = SimpleNamespace(
+        stdin=RaisingResource(),
+    )
+    # Non-cancellation path: no exception should escape
+    manager._close_llm_proxy(worker, terminate_process=False)
+
+
+def test_close_llm_proxy_dead_check_with_noncallable_poll(tmp_path, monkeypatch):
+    """_dead() returns False when process.poll is not callable."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    # process.poll is set to a non-callable value
+    process = SimpleNamespace(
+        poll=None,
+        terminate=MagicMock(),
+        wait=MagicMock(return_value=0),
+        kill=MagicMock(),
+    )
+    # Should not raise; terminate+kill flow runs since _dead() returns False
+    manager._close_llm_proxy(SimpleNamespace(_process=process), terminate_process=True)
+
+
+def test_close_llm_proxy_post_fatal_drain_exception_breaks_inner_loop(tmp_path, monkeypatch):
+    """During post-fatal drain, an Exception from close_future.result() exits the inner loop."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_TIMEOUT_SECONDS', 0.05)
+    monkeypatch.setattr('utils.llm.model_manager._POST_FATAL_DRAIN_TIMEOUT_SECONDS', 0.15)
+    monkeypatch.setattr('utils.llm.model_manager._PROCESSLESS_CLOSE_POLL_INTERVAL_SECONDS', 0.01)
+
+    # Sequence:
+    # 1. close() blocks until fatal_callback is called.
+    # 2. fatal_callback releases close().
+    # 3. close() raises RuntimeError — the inner post-fatal drain catches it and breaks.
+    close_release = threading.Event()
+    # Timeout generous relative to the test's configured drain budget (0.15s) to
+    # prevent flakiness while still completing well within the test's wall time.
+    _CLOSE_RELEASE_TIMEOUT = 5.0
+
+    def slow_raising_close():
+        close_release.wait(timeout=_CLOSE_RELEASE_TIMEOUT)
+        raise RuntimeError("close raised after fatal")
+
+    fatal_calls = []
+
+    def fatal_callback(reason):
+        fatal_calls.append(reason)
+        close_release.set()
+
+    worker = SimpleNamespace(close=slow_raising_close)
+    result = manager._close_llm_proxy(worker, terminate_process=True, fatal_callback=fatal_callback)
+
+    assert fatal_calls == ['api_v1_worker_processless_close_timeout']
+    # close() raised → close_future done with exception → process_stopped = False
+    assert result is False
+
+
+def test_close_llm_proxy_resource_setattr_exception_is_ignored(tmp_path, monkeypatch):
+    """setattr(llm, attr, None) exceptions during pipe-resource cleanup are silently ignored."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+
+    class ReadOnlyStdinWorker:
+        """Worker with a read-only stdin property — setattr will raise AttributeError."""
+        @property
+        def stdin(self):
+            return object()  # non-None so the setattr branch executes
+
+    worker = ReadOnlyStdinWorker()
+    # Non-cancellation path; exception from setattr must not escape
+    manager._close_llm_proxy(worker, terminate_process=False)
+
+
+def test_invalidate_llm_if_current_close_failure_sets_worker_failed(tmp_path, monkeypatch):
+    """When _close_llm_proxy returns False in _invalidate_llm_if_current, worker_state is set to 'failed'."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    manager.log_warning = MagicMock()
+
+    failed_llm = SimpleNamespace(_process=SimpleNamespace(poll=MagicMock(return_value=None)))
+    manager.llm = failed_llm
+    manager._cleanup_barrier_generation = None
+
+    monkeypatch.setattr(manager, '_close_llm_proxy', lambda *a, **kw: False)
+
+    manager._invalidate_llm_if_current(failed_llm, error='test_error')
+
+    assert manager.worker_state == 'failed'
+    # Barrier must remain set since cleanup failed
+    assert manager._cleanup_barrier_generation is not None
+
+
+def test_model_manager_cancel_signal_prevents_replay_on_replacement(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement = _RestartableFakeWorker("replacement")
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, replacement])
+
+    def _invalidate_and_signal(_llm, _exc):
+        manager._llm_cancel_generation_event.set()
+        return manager._llm_generation + 1
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_and_signal)
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", MagicMock(return_value=replacement))
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert first.calls == 1
+    assert replacement.calls == 0
+    manager._ensure_replacement_llm.assert_not_called()
+    assert created == [first]
+
+
+def test_model_manager_post_restart_cancellation_epoch_prevents_replay(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement = _RestartableFakeWorker("replacement")
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first, replacement])
+
+    def _invalidate_and_cancel_after_restart(_llm, _exc):
+        with manager.llm_lock:
+            manager.llm = None
+            manager._llm_generation += 1
+        # Relay cancellation arrives while no worker is active. The captured
+        # generation event remains clear, so the cancellation epoch must block replay.
+        assert manager.terminate_active_worker_for_cancellation(reason="cancelled", recreate=False) is True
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_and_cancel_after_restart)
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", MagicMock(return_value=replacement))
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert first.calls == 1
+    assert replacement.calls == 0
+    manager._ensure_replacement_llm.assert_not_called()
+    assert created == [first]
+
+
+def test_model_manager_cancel_signal_after_replacement_acquisition_prevents_replay(tmp_path, monkeypatch):
+    first = _RestartableFakeWorker("first", fail="dead")
+    replacement_create = MagicMock(return_value={"choices": []})
+    replacement = SimpleNamespace(create_chat_completion=replacement_create)
+    manager, created = _restart_manager(tmp_path, monkeypatch, [first])
+
+    observed = {}
+
+    def _ensure_replacement_llm(_observed_generation):
+        with manager.llm_lock:
+            observed["event"] = manager._llm_cancel_generation_event
+            manager._llm_generation += 1
+            manager._llm_cancel_generation_event.set()
+        return replacement
+
+    monkeypatch.setattr(manager, "_ensure_replacement_llm", _ensure_replacement_llm)
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[{"role": "user", "content": "SECRET"}])
+
+    assert created == [first]
+    assert observed["event"].is_set() is True
+    replacement_create.assert_not_called()
+
+
+def test_model_manager_cancel_signal_between_pre_retry_checks_prevents_replay(monkeypatch):
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager._llm_generation = 5
+    cancel_event = MagicMock()
+    cancel_event.is_set.side_effect = [False, True]
+    manager._llm_cancel_generation_event = cancel_event
+    first = _RestartableFakeWorker("first", fail="dead")
+    monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=first))
+
+    def _invalidate_llm_if_current(_llm, _exc):
+        manager._llm_generation = 6
+
+    monkeypatch.setattr(manager, "_invalidate_llm_if_current", _invalidate_llm_if_current)
+    monkeypatch.setattr(
+        manager,
+        "_ensure_replacement_llm",
+        MagicMock(side_effect=AssertionError("cancelled request must not acquire replacement")),
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled before worker retry"):
+        manager.create_chat_completion_with_recovery(messages=[])
+
+    assert first.calls == 1
+    manager._ensure_replacement_llm.assert_not_called()
+    assert cancel_event.is_set.call_count == 2
+
+
 def test_long_lived_subprocess_worker_soak_and_fault_injection(tmp_path, monkeypatch, caplog, capsys):
     """Deterministic fake llama_cpp subprocess soak for zombie-node regressions."""
     from utils.llm import model_manager as model_manager_module

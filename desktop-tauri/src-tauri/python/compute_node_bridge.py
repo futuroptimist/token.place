@@ -151,6 +151,8 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 _stop_requested_latched = threading.Event()
+_active_relay_clients: Dict[int, Any] = {}
+_active_relay_clients_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -160,7 +162,38 @@ PRE_REGISTRATION_STATUS_INTERVAL_SECONDS = 5.0
 RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 STOP_CLEANUP_BUDGET_DEFAULT_SECONDS = 10.5
+BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS = 6.5
 
+
+
+def _signal_active_relay_clients() -> None:
+    with _active_relay_clients_lock:
+        clients = list(_active_relay_clients.values())
+    for relay_client in clients:
+        stop = getattr(relay_client, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception as exc:
+                print(
+                    "desktop.compute_node_bridge.active_relay_stop.failed "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+
+def _register_active_relay_clients(runtimes: List[Any]) -> None:
+    with _active_relay_clients_lock:
+        for relay_runtime in runtimes:
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            if relay_client is not None:
+                _active_relay_clients[id(relay_client)] = relay_client
+
+def _unregister_active_relay_clients(runtimes: List[Any]) -> None:
+    with _active_relay_clients_lock:
+        for relay_runtime in runtimes:
+            relay_client = getattr(relay_runtime, "relay_client", None)
+            if relay_client is not None:
+                _active_relay_clients.pop(id(relay_client), None)
 
 def _drain_stale_stdin_cancel_messages() -> int:
     """Discard queued cancel controls before a fresh operator session starts."""
@@ -379,6 +412,7 @@ def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
     return str(raw_error)
 
 
+
 def _sanitize_relay_target(relay_url: Any) -> str:
     """Return a redacted relay target that never includes userinfo/query/fragment."""
 
@@ -539,6 +573,13 @@ def _start_stdin_reader() -> None:
                 if line == "":
                     break
                 _stdin_lines.put(line)
+                try:
+                    payload = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "cancel":
+                    _stop_requested_latched.set()
+                    _signal_active_relay_clients()
 
         threading.Thread(target=_reader, daemon=True).start()
         _stdin_reader_started = True
@@ -562,6 +603,7 @@ def stop_requested() -> bool:
             continue
         if payload.get("type") == "cancel":
             _stop_requested_latched.set()
+            _signal_active_relay_clients()
             return True
 
 
@@ -961,6 +1003,38 @@ def _normalize_relay_urls(*raw_relay_url_groups: Any) -> List[str]:
 
     return normalized or ["https://token.place"]
 
+
+def _wire_fatal_teardown_for_runtime(relay_runtime: Any) -> None:
+    """Attach a no-return fatal-teardown callback to relay_runtime's relay client.
+
+    The relay client supervisor calls this when a request-owned executor thread
+    (inference or control I/O) is still alive past the shared cleanup deadline.
+    In production this function terminates the disposable bridge process via
+    ``os._exit`` so no request thread is ever abandoned.  Only a privacy-safe
+    lifecycle classification is emitted — no plaintext model payload content.
+    """
+
+    relay_client = getattr(relay_runtime, "relay_client", None)
+    if relay_client is None:
+        return
+    relay_url_value = getattr(relay_client, "relay_url", "unknown")
+
+    def _fatal_bridge_teardown(reason: str) -> None:
+        print(
+            "desktop.compute_node_bridge.fatal_teardown "
+            f"reason={reason} "
+            f"relay={_sanitize_relay_target(relay_url_value)}",
+            file=sys.stderr,
+        )
+        os._exit(1)
+
+    wire_fn = getattr(relay_runtime, "wire_fatal_bridge_teardown", None)
+    if callable(wire_fn):
+        wire_fn(_fatal_bridge_teardown)
+    else:
+        relay_client.fatal_bridge_teardown = _fatal_bridge_teardown
+
+
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
@@ -1160,6 +1234,7 @@ def run(args: argparse.Namespace) -> int:
     emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
+    _register_active_relay_clients(runtimes)
     for relay_runtime in runtimes:
         start_relay_session = getattr(relay_runtime, "start_relay_session", None)
         if callable(start_relay_session):
@@ -1175,6 +1250,16 @@ def run(args: argparse.Namespace) -> int:
             f"key_fingerprint={_relay_key_fingerprint(relay_runtime.relay_client)}",
             file=sys.stderr,
         )
+
+    # Wire a fatal-teardown callback onto each relay client.  The supervisor
+    # inside the relay client calls this when a request-owned executor thread
+    # (inference or control I/O) remains alive past the shared cleanup deadline.
+    # This function is no-return: it emits a privacy-safe lifecycle event and
+    # terminates the disposable bridge process via os._exit so no stuck thread
+    # is ever abandoned.  Tests substitute a fake that unblocks the stuck thread
+    # and returns; the supervisor re-checks quiescence before shutdown(wait=True).
+    for relay_runtime in runtimes:
+        _wire_fatal_teardown_for_runtime(relay_runtime)
 
     runtime.model_manager.model_path = args.model
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
@@ -1732,7 +1817,11 @@ def run(args: argparse.Namespace) -> int:
     recovery_done.set()
     recovery_fatal = False
 
-    def request_poll_cancel(relay_runtime: Any, active_relay_url: str) -> bool:
+    def request_poll_cancel(
+        relay_runtime: Any,
+        active_relay_url: str,
+        shutdown_deadline: Optional[float] = None,
+    ) -> bool:
         if poll_cancel_requested_by_relay.get(active_relay_url):
             return poll_cancel_result_by_relay.get(active_relay_url, False)
         latch_ok = True
@@ -1872,6 +1961,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
     def best_effort_unadvertise_all_relays() -> None:
+        recovery_shutdown_deadline = time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS
         for relay_runtime in runtimes:
             relay_url_value = getattr(
                 getattr(relay_runtime, "relay_client", None),
@@ -1892,7 +1982,7 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 try:
-                    unregistered = bool(unregister())
+                    unregistered = bool(unregister(shutdown_deadline=recovery_shutdown_deadline))
                 except Exception as exc:
                     print(
                         "desktop.compute_node_bridge.recovery.unregister.failed "
@@ -2124,7 +2214,11 @@ def run(args: argparse.Namespace) -> int:
                 relay_response = worker.call(
                     relay_runtime.register_and_poll_once,
                     stop_requested,
-                    on_cancel=lambda relay=active_relay_url, rt=relay_runtime: request_poll_cancel(rt, relay),
+                    on_cancel=lambda relay=active_relay_url, rt=relay_runtime: request_poll_cancel(
+                        rt,
+                        relay,
+                        time.monotonic() + BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS,
+                    ),
                 )
             except KeyboardInterrupt:
                 break
@@ -2352,7 +2446,11 @@ def run(args: argparse.Namespace) -> int:
                             f"request_id={_sanitize_public_text(request_id)} safe_error_code={safe_error_code or 'unknown'}",
                             file=sys.stderr,
                         )
-                    elif runtime_healthy:
+                    elif runtime_healthy and (
+                        getattr(process_result, "submission_allowed", True)
+                        if not isinstance(process_result, dict)
+                        else process_result.get("submission_allowed", True)
+                    ):
                         if stop_requested():
                             print(
                                 "desktop.compute_node_bridge.api_v1_e2ee.error_response.skipped "
@@ -2469,6 +2567,7 @@ def run(args: argparse.Namespace) -> int:
         cleanup_started = time.monotonic()
         cleanup_deadline = cleanup_started + cleanup_budget_seconds
         cleanup_targets: List[Tuple[Any, str, bool]] = []
+        _unregister_active_relay_clients(runtimes)
         for relay_runtime in runtimes:
             relay_client = getattr(relay_runtime, "relay_client", None)
             active_relay_url = getattr(relay_client, "relay_url", relay_url)

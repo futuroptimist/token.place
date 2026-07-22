@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -353,6 +355,67 @@ pub struct ComputeNodeState {
     #[cfg(test)]
     snapshot_stop_session_process_lock_attempt_hook: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
+
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn isolate_bridge_process_tree(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_bridge_process_tree(pid: u32) {
+    unsafe {
+        let pgid = pid as i32;
+        let _ = kill(-pgid, SIGTERM);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let _ = kill(-pgid, SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+async fn terminate_bridge_process_tree(pid: u32) {
+    let Ok(mut child) = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_bridge_process_tree(_pid: u32) {}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -1716,6 +1779,8 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
 
+    isolate_bridge_process_tree(&mut bridge_command);
+
     let spawn_result = bridge_command
         .arg("--model")
         .arg(&request.model_path)
@@ -2377,8 +2442,14 @@ async fn bridge_shutdown_supervisor(
                 "desktop.compute_node.bridge_kill_requested",
                 &format!("operator_session_id={}", stop_session_display),
             );
-            let _ = child.kill().await;
-            child_exit_status = child.wait().await.ok();
+            if let Some(pid) = child.id() {
+                terminate_bridge_process_tree(pid).await;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
+            child_exit_status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok);
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
                 stop_session_display
@@ -5759,7 +5830,10 @@ mod tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
 
-        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        let expected = if cfg!(any(
+            target_os = "macos",
+            all(target_os = "windows", target_arch = "x86_64"),
+        )) {
             Some("1")
         } else {
             None
@@ -5959,5 +6033,222 @@ mod tests {
             false,
             Some(&PythonLauncherSource::SystemDevelopmentRuntime)
         ));
+    }
+
+    /// Spawn a root process that also forks a long-lived sleep child.
+    /// `isolate_bridge_process_tree` puts them in a new process group so
+    /// `terminate_bridge_process_tree` can kill the entire group.
+    /// Boundedly prove both the root and the process group are stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolate_and_terminate_bridge_process_tree_unix_stops_root_and_descendant() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & wait"]);
+        isolate_bridge_process_tree(&mut cmd);
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn root");
+        let root_pid = child.id().expect("root pid");
+
+        // Give the shell time to fork the sleep child.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Terminate the isolated process group (SIGTERM then SIGKILL to -pgid).
+        terminate_bridge_process_tree(root_pid).await;
+
+        // Boundedly prove root stopped.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let root_stopped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Force cleanup to avoid CI leak before failing.
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => break true,
+            }
+        };
+        assert!(
+            root_stopped,
+            "root process did not stop after terminate_bridge_process_tree"
+        );
+
+        // Boundedly prove the process group is gone by polling kill(-pgid, 0).
+        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no actual signal is delivered.
+        let pgid = root_pid as i32;
+        let pg_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            // SAFETY: sending signal 0 only checks for process group existence.
+            let result = unsafe { kill(-pgid, 0) };
+            if result == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                // ESRCH = 3: process group does not exist — descendant cleaned up.
+                // EPERM means the group still exists but we lack permission (same-user
+                // spawned processes should not hit this; treat it as still-alive).
+                if errno == 3 {
+                    break;
+                }
+                // Any other errno (e.g., EPERM) means the group is still present.
+            }
+            if Instant::now() >= pg_deadline {
+                // Force-kill any survivor before failing.
+                // SAFETY: sending SIGKILL to the process group for cleanup.
+                unsafe {
+                    kill(-pgid, SIGKILL);
+                }
+                panic!("descendant in isolated process group still alive after terminate");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Spawn a root PowerShell process that starts a long-lived ping descendant
+    /// and writes the descendant's PID to a temporary file.  Call
+    /// `isolate_bridge_process_tree` + `terminate_bridge_process_tree` via the
+    /// real `taskkill /PID /T /F` path, then boundedly and independently prove
+    /// that both root and descendant have stopped.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn isolate_and_terminate_bridge_process_tree_windows_stops_root_and_descendant() {
+        // Temp dir for the descendant PID file (PowerShell will create it).
+        let tmp_dir = TempDir::new().expect("create temp dir");
+        let pid_path = tmp_dir.path().join("descendant_pid.txt");
+        // Escape single quotes so the path is safe inside a PowerShell string literal.
+        let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "''");
+
+        // PowerShell root: launch a long-lived ping descendant, publish its PID
+        // to the temp file, then block until the descendant exits (or 60 s).
+        let ps_script = format!(
+            "$d = Start-Process -PassThru -WindowStyle Hidden -FilePath ping \
+             -ArgumentList '-n 60 127.0.0.1'; \
+             [IO.File]::WriteAllText('{pid}', [string]$d.Id); \
+             $d.WaitForExit(60000)",
+            pid = escaped_pid_path
+        );
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_script]);
+        isolate_bridge_process_tree(&mut cmd);
+        let mut root_child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn root PowerShell");
+        let root_pid = root_child.id().expect("root pid");
+
+        // Bounded poll for PID file publication (up to 10 s).
+        let pid_deadline = Instant::now() + Duration::from_secs(10);
+        let descendant_pid: u32 = loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(content) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = content.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            if Instant::now() >= pid_deadline {
+                let _ = root_child.kill().await;
+                let _ = root_child.wait().await;
+                panic!("descendant PID not published within deadline");
+            }
+        };
+
+        // Confirm descendant is initially alive before termination.
+        if !windows_pid_alive(descendant_pid).await {
+            let _ = root_child.kill().await;
+            let _ = root_child.wait().await;
+            panic!(
+                "descendant (pid {}) unexpectedly dead before termination",
+                descendant_pid
+            );
+        }
+
+        // Terminate root and its entire subtree via real taskkill /PID /T /F.
+        terminate_bridge_process_tree(root_pid).await;
+
+        // Boundedly prove root stopped.
+        let root_deadline = Instant::now() + Duration::from_secs(5);
+        let root_stopped = loop {
+            match root_child.try_wait() {
+                // `Err(_)` also means the process is gone: on Windows, `try_wait` returns
+                // an error when the child handle is no longer valid (already reaped).
+                Ok(Some(_)) | Err(_) => break true,
+                Ok(None) => {
+                    if Instant::now() >= root_deadline {
+                        // Force cleanup to avoid CI leak before failing.
+                        let _ = root_child.kill().await;
+                        let _ = root_child.wait().await;
+                        windows_force_kill_pid(descendant_pid).await;
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        assert!(
+            root_stopped,
+            "root process did not stop after terminate_bridge_process_tree"
+        );
+
+        // Boundedly prove descendant stopped independently.
+        let desc_deadline = Instant::now() + Duration::from_secs(5);
+        let desc_stopped = loop {
+            if !windows_pid_alive(descendant_pid).await {
+                break true;
+            }
+            if Instant::now() >= desc_deadline {
+                // Force cleanup to avoid CI leak before failing.
+                windows_force_kill_pid(descendant_pid).await;
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            desc_stopped,
+            "descendant (pid {}) did not stop after terminate_bridge_process_tree",
+            descendant_pid
+        );
+    }
+
+    /// Returns `true` if a Windows process with the given PID is currently alive.
+    #[cfg(windows)]
+    async fn windows_pid_alive(pid: u32) -> bool {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await;
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                // tasklist /FO CSV outputs the PID as a quoted field (e.g. "12345").
+                // Match the quoted form to avoid false positives where one PID is a
+                // substring of another (e.g. "123" matching "1234").
+                // tasklist outputs "INFO: No tasks ..." when the PID is not found.
+                !s.contains("No tasks") && s.contains(&format!("\"{}\"", pid))
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Force-kills the given Windows PID with `taskkill /PID <pid> /F`.
+    #[cfg(windows)]
+    async fn windows_force_kill_pid(pid: u32) {
+        if let Ok(mut c) = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(2), c.wait()).await;
+        }
     }
 }

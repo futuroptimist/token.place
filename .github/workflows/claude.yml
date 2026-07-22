@@ -76,13 +76,10 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      # Bash is already omitted from --allowedTools, which the action's own
-      # docs describe as a real allow/deny list (Bash is disabled unless
-      # explicitly granted). The PreToolUse hook below is a second,
-      # independently-coded layer: it hard-denies every Bash call and
-      # confines file-editing tools to paths that resolve inside the
-      # checkout, so a permissions-schema surprise in the action can't
-      # silently widen what an untrusted comment/PR body can make Claude do.
+      # Direct Bash remains prohibited on the ordinary path. The CLI tool
+      # lists are intentionally narrow and additive, while this PreToolUse
+      # hook remains the authoritative fail-closed guard for executable tools
+      # and workspace path confinement if action or CLI semantics drift.
       - name: Create ordinary-path tool guard
         id: guard
         env:
@@ -152,7 +149,7 @@ jobs:
           settings: |
             {
               "permissions": {
-                "deny": ["Bash"]
+                "deny": ["Bash", "WebFetch", "WebSearch"]
               },
               "hooks": {
                 "PreToolUse": [
@@ -169,10 +166,17 @@ jobs:
               }
             }
 
+          # Implementation sessions checkpoint before long validation so
+          # coherent safe work is not lost to later environmental timeouts. The
+          # action-native signed GitHub commit path remains available outside
+          # Bash; direct Bash git commands stay prohibited by CLI/settings/hooks.
           claude_args: |
             --setting-sources user
             --strict-mcp-config
-            --disallowedTools "Bash"
+            --max-turns 120
+            --append-system-prompt 'When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early, after focused validation or syntax checks, before lengthy or full validation, and before the final third of the session. Use the action native signed commit and push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing and pushing, and reporting results. Before ending, inspect the working tree and either commit and push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable.'
+            --allowedTools "Read,Edit,Write,Glob,Grep"
+            --disallowedTools "Bash,WebFetch,WebSearch"
 
   claude-exec:
     if: |
@@ -541,7 +545,10 @@ jobs:
 
           # See the guard.sh generated above: it is the authoritative,
           # exact-match Bash gate. --allowedTools below is a second,
-          # documented layer using the action's own glob-based enforcement.
+          # documented additive layer using the action's own glob-based
+          # enforcement. Native signed GitHub commits are not Bash git
+          # commands, so they remain usable while direct/destructive Bash git
+          # invocations are denied defense-in-depth.
           settings: |
             {
               "hooks": {
@@ -559,7 +566,12 @@ jobs:
               }
             }
 
+          # Implementation sessions checkpoint before long validation so
+          # coherent safe work is not lost to later environmental timeouts.
           claude_args: |
             --setting-sources user
             --strict-mcp-config
-            --allowedTools "Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
+            --max-turns 120
+            --append-system-prompt 'When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early, after focused validation or syntax checks, before lengthy or full validation, and before the final third of the session. Use the action native signed commit and push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing and pushing, and reporting results. Before ending, inspect the working tree and either commit and push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable.'
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
+            --disallowedTools "WebFetch,WebSearch,Bash(git),Bash(git *),Bash(* git add *),Bash(* git commit *),Bash(* git push *),Bash(* git reset *),Bash(* git clean *),Bash(* rm -rf *)"

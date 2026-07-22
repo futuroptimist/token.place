@@ -522,7 +522,7 @@ def _load_desktop_operator_parity_matrix():
     return json.loads(matrix_path.read_text(encoding='utf-8'))
 
 
-def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
+def test_macos_packaged_operator_lifecycle_parity_uses_linux_shared_entrypoint():
     matrix = _load_desktop_operator_parity_matrix()
     assert all(
         item.get('id') != 'macos_packaged_operator_lifecycle_parity'
@@ -534,15 +534,14 @@ def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
         for item in matrix.get('lifecycle_coverage', [])
         if item.get('id') == 'macos_packaged_operator_lifecycle_parity'
     )
-    assert coverage['platform'] == 'darwin'
-    assert coverage['status'] == 'covered_by_shared_entrypoint'
-    assert (
-        coverage['shared_entrypoint']
-        == 'desktop-tauri/scripts/run_desktop_parity_checks.py'
-    )
+    assert coverage['platform'] == 'darwin-simulated-on-linux'
+    assert coverage['status'] == 'covered_by_linux_shared_entrypoint'
+    assert coverage['workflow'] == '.github/workflows/desktop-operator-e2e.yml'
     assert coverage['covered_checks'] == [
         'packaged_resource_resolution',
         'dependency_isolation',
+        'mock_metal_registration',
+        'mock_metal_failure_blocks_registration',
         'warm_load',
         'register',
         'multi_turn_api_v1_relay_chat',
@@ -557,27 +556,38 @@ def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
         / 'workflows'
         / 'desktop-operator-e2e.yml'
     )
-    workflow = yaml.load(
-        workflow_path.read_text(encoding='utf-8'),
-        Loader=yaml.BaseLoader,
-    )
-    macos_job = workflow['jobs']['desktop-operator-packaged-e2e-macos']
-    macos_run_commands = [
+    workflow = yaml.load(workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+    assert all('macos' not in str(job.get('runs-on', '')).lower() for job in workflow['jobs'].values())
+    linux_run_commands = [
         step.get('run', '')
-        for step in macos_job['steps']
+        for step in workflow['jobs']['desktop-operator-e2e']['steps']
         if isinstance(step, dict)
     ]
-    runner_path = Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']
-    runner = runner_path.read_text(encoding='utf-8')
-
-    assert macos_job['runs-on'] == 'macos-latest'
-    assert f"python {coverage['shared_entrypoint']}" in macos_run_commands
-    assert any(
-        'test_desktop_no_relay_autostart_e2e.py' in command
-        for command in macos_run_commands
-    )
+    assert 'python desktop-tauri/scripts/test_packaged_operator_e2e.py' in linux_run_commands
+    assert 'python desktop-tauri/scripts/run_desktop_parity_checks.py --skip-packaged' in linux_run_commands
+    runner = (Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']).read_text(encoding='utf-8')
     for script in coverage['required_scripts']:
         assert Path(script).name in runner
+
+
+def test_native_macos_lifecycle_parity_uses_targeted_smoke_workflow():
+    matrix = _load_desktop_operator_parity_matrix()
+    coverage = next(
+        item
+        for item in matrix.get('lifecycle_coverage', [])
+        if item.get('id') == 'macos_native_no_relay_lifecycle_smoke'
+    )
+    assert coverage['platform'] == 'darwin-native'
+    assert coverage['status'] == 'covered_by_targeted_macos_smoke'
+    workflow_path = Path(__file__).resolve().parents[2] / coverage['workflow']
+    workflow = yaml.load(workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+    job = workflow['jobs']['native-macos-no-relay-smoke']
+    commands = [step.get('run', '') for step in job['steps'] if isinstance(step, dict)]
+    assert job['runs-on'] == 'macos-26'
+    assert 'npm run tauri build -- --debug --no-bundle' in commands
+    assert any('test_desktop_no_relay_autostart_e2e.py' in command for command in commands)
+    assert not any('run_desktop_parity_checks.py' in command for command in commands)
+    assert not any('run_all_tests.sh' in command for command in commands)
 
 
 class RestartTrackingRuntime(FakeRuntime):

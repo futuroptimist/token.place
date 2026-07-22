@@ -153,15 +153,15 @@ class BridgeProcess:
                 self.process.wait(timeout=5)
 
 
-def _bridge_compute_mode() -> str:
+def _bridge_compute_mode(*, simulated_platform: str | None = None) -> str:
     """Return the packaged bridge mode for the mock parity harness."""
 
-    current_platform = platform.system()
+    current_platform = simulated_platform or platform.system()
     # Windows and macOS desktop auto/gpu modes intentionally fail closed when a
     # GPU-capable llama-cpp-python runtime is missing or CPU-only. This e2e runs
     # with USE_MOCK_LLM=1 and validates relay lifecycle parity, so hosted CI must
     # not depend on CUDA/Metal provisioning before registration can be tested.
-    if current_platform in {"Windows", "Darwin"}:
+    if current_platform in {"Windows", "Darwin", "macOS"}:
         return "cpu"
     return "auto"
 
@@ -174,6 +174,7 @@ def _start_bridge(
     *,
     layout_label: str,
     session_index: int,
+    simulated_platform: str | None = None,
 ) -> BridgeProcess:
     safe_label = layout_label.replace(" ", "-").replace("/", "-")
     session_id = f"{safe_label}-{session_index}-{int(time.time() * 1000)}"
@@ -187,7 +188,7 @@ def _start_bridge(
             "--model",
             "mock.gguf",
             "--mode",
-            _bridge_compute_mode(),
+            _bridge_compute_mode(simulated_platform=simulated_platform),
             "--relay-url",
             relay_url,
         ],
@@ -275,7 +276,7 @@ def _assert_ready_runtime_fields(event: dict[str, Any], *, layout_label: str) ->
     assert event.get("warm_load_state") == "ready", event
     assert isinstance(event.get("warm_load_duration_ms"), int), event
 
-    if platform.system() == "Darwin" and "macOS" in layout_label:
+    if "macOS" in layout_label:
         requested_mode = str(event.get("requested_mode") or "")
         backend_available = str(event.get("backend_available") or "")
         backend_used = str(event.get("backend_used") or "")
@@ -290,7 +291,12 @@ def _assert_ready_runtime_fields(event: dict[str, Any], *, layout_label: str) ->
         else:
             assert backend_used == "cpu", event
             assert fallback_reason, event
-            assert "CUDA/Metal" in str(fallback_reason) or "Metal" in str(fallback_reason), event
+            reason_text = str(fallback_reason)
+            assert (
+                "CUDA/Metal" in reason_text
+                or "Metal" in reason_text
+                or "mock LLM mode" in reason_text
+            ), event
 
 
 def _encrypt_messages(messages: list[dict[str, str]], relay_public_key: str) -> dict[str, str]:
@@ -393,6 +399,7 @@ def _run_operator_session(
     layout_label: str,
     session_index: int,
     turns: int,
+    simulated_platform: str | None = None,
 ) -> BridgeProcess:
     bridge = _start_bridge(
         tmp_root,
@@ -401,6 +408,7 @@ def _run_operator_session(
         relay_url,
         layout_label=layout_label,
         session_index=session_index,
+        simulated_platform=simulated_platform,
     )
     try:
         _wait_for_registered(bridge, relay_url, layout_label=layout_label)
@@ -423,6 +431,7 @@ def _run_layout_parity(
     relay_stdout_handle: Any,
     *,
     layout_label: str,
+    simulated_platform: str | None = None,
 ) -> None:
     public_key_response = requests.get(f"{relay_url}/api/v1/public-key", timeout=5)
     public_key_response.raise_for_status()
@@ -437,6 +446,7 @@ def _run_layout_parity(
         layout_label=layout_label,
         session_index=1,
         turns=3,
+        simulated_platform=simulated_platform,
     )
     bridge.stop()
     assert bridge.process.returncode == 0, f"bridge Stop exited {bridge.process.returncode}: {bridge.log_path}"
@@ -541,6 +551,7 @@ def main() -> int:
                 relay_stdout,
                 relay_stdout_handle,
                 layout_label="macOS Contents/Resources",
+                simulated_platform="Darwin",
             )
         finally:
             if relay.poll() is None:

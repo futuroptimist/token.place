@@ -510,26 +510,69 @@ jobs:
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
             "${validator_version_args[@]}"
-          previous_dir="${RUNNER_TEMP}/token-place-previous-desktop-v0.1.2"
+          current_version="${tag_name#desktop-v}"
+          if [ -z "${tag_name}" ]; then
+            current_version="$(python -c 'import json; print(json.load(open("package.json"))["version"])')"
+          fi
+          release_source_repo="${GITHUB_REPOSITORY}"
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+            release_source_repo="${{ github.event.pull_request.base.repo.full_name }}"
+          fi
+          releases_json="${RUNNER_TEMP}/token-place-desktop-releases.json"
+          gh release list --repo "${release_source_repo}" --limit 200 --json tagName,isDraft,isPrerelease > "${releases_json}"
+          previous_tag="$(python - "${current_version}" "${release_source_repo}" "${releases_json}" <<'PY'
+          import json
+          import re
+          import sys
+
+          current_version, release_source_repo, releases_path = sys.argv[1:]
+          semver = re.compile(r"^desktop-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+          def parse_version(value: str) -> tuple[int, int, int]:
+              match = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", value)
+              if not match:
+                  raise SystemExit(f"current desktop version {value!r} is not semantic X.Y.Z")
+              return tuple(int(part) for part in match.groups())
+
+          current = parse_version(current_version)
+          candidates = []
+          releases = json.loads(open(releases_path, encoding="utf-8").read())
+          if isinstance(releases, dict):
+              releases = [releases]
+          for release in releases:
+              tag = release.get("tag_name") or release.get("tagName") or ""
+              match = semver.fullmatch(tag)
+              if not match or release.get("draft") or release.get("prerelease"):
+                  continue
+              version = tuple(int(part) for part in match.groups())
+              if version < current:
+                  candidates.append((version, tag))
+          if not candidates:
+              raise SystemExit(
+                  f"no stable published desktop-vX.Y.Z predecessor exists for current version "
+                  f"{current_version} in {release_source_repo}"
+              )
+          print(max(candidates)[1])
+          PY
+          )"
+          previous_version="${previous_tag#desktop-v}"
+          previous_dir="${RUNNER_TEMP}/token-place-previous-${previous_tag}"
           rm -rf "${previous_dir}"
           mkdir -p "${previous_dir}"
-          gh release download desktop-v0.1.2 \
-            --repo "${GITHUB_REPOSITORY}" \
+          gh release download "${previous_tag}" \
+            --repo "${release_source_repo}" \
             --dir "${previous_dir}" \
-            --pattern '*0.1.2*.msi' \
-            --pattern '*0.1.2*-setup.exe'
-          mapfile -t previous_nsis_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name '*0.1.2*-setup.exe' | sort)
-          mapfile -t previous_msi_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name '*0.1.2*.msi' | sort)
+            --pattern "*${previous_version}*.msi" \
+            --pattern "*${previous_version}*-setup.exe"
+          mapfile -t previous_nsis_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name "*${previous_version}*-setup.exe" | sort)
+          mapfile -t previous_msi_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name "*${previous_version}*.msi" | sort)
           if [ "${#previous_nsis_paths[@]}" -ne 1 ] || [ "${#previous_msi_paths[@]}" -ne 1 ]; then
-            echo "Expected exactly one desktop-v0.1.2 NSIS installer and one MSI artifact." >&2
+            echo "Expected exactly one ${previous_tag} NSIS installer and one MSI artifact from ${release_source_repo}." >&2
             printf 'Previous NSIS count=%s MSI count=%s\n' "${#previous_nsis_paths[@]}" "${#previous_msi_paths[@]}" >&2
             find "${previous_dir}" -maxdepth 1 -type f -print >&2
             exit 1
           fi
-          installer_identity_args=(--expected-version "${tag_name#desktop-v}")
-          if [ -z "${tag_name}" ]; then
-            installer_identity_args=(--expected-version "$(python -c 'import json; print(json.load(open("package.json"))["version"])')")
-          fi
+          installer_identity_args=(--expected-version "${current_version}")
           installer_artifact_dir="${RUNNER_TEMP}/token-place-installer-identity-artifacts"
           rm -rf "${installer_artifact_dir}"
           mkdir -p "${installer_artifact_dir}"
@@ -538,7 +581,7 @@ jobs:
             --windows-msi "${msi_path}" \
             --previous-windows-nsis "${previous_nsis_paths[0]}" \
             --previous-windows-msi "${previous_msi_paths[0]}" \
-            --previous-version "0.1.2" \
+            --previous-version "${previous_version}" \
             --expected-build-id "$(git rev-parse --short=12 HEAD)" \
             --artifact-dir "${installer_artifact_dir}" \
             "${installer_identity_args[@]}"

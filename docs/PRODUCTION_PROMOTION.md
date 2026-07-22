@@ -56,7 +56,8 @@ may intentionally differ:
 
 ## Pre-promotion gates
 
-- [ ] Confirm PR CI checks are green, including the Linux and macOS `run_all_tests.sh` PR checks.
+- [ ] Confirm PR CI checks are green, including the Linux `run_all_tests.sh` PR check as the required full-suite signal.
+- [ ] For desktop releases, push a new immutable `desktop-vX.Y.Z` tag as the canonical release action; do not also manually dispatch the same release unless intentionally retrying or rebuilding that tag.
 - [ ] Confirm the staging deployment image, chart, and release artifact are exactly the ones intended
       for production promotion; prefer immutable image tags and chart versions, plus a digest where
       available.

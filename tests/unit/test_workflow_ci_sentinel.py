@@ -138,9 +138,11 @@ def test_desktop_release_workflow_has_per_tag_concurrency() -> None:
     concurrency = workflow_data.get("concurrency", {})
 
     group = concurrency.get("group")
-    assert "desktop-release-${{ github.event_name }}" in group
-    assert "inputs.dry_run && 'dry-run' || 'release'" in group
-    assert "inputs.tag_name || github.ref_name" in group
+    assert group == (
+        "desktop-release-${{ inputs.dry_run && 'dry-run' || 'release' }}-"
+        "${{ inputs.tag_name || github.ref_name }}"
+    )
+    assert "github.event_name" not in group
     assert concurrency.get("cancel-in-progress") == "true"
 
 

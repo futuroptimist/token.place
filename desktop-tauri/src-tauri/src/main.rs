@@ -14,6 +14,9 @@ mod subprocess_logging;
 use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
+use python_runtime::{
+    resolve_python_launcher_resource_aware, PythonLauncherResolutionOptions, PythonLauncherSource,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sidecar::{InferenceRequest, SidecarState};
@@ -668,18 +671,64 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+fn print_build_identity_json(include_operator_smoke: bool) -> Result<(), String> {
+    let identity = build_identity::build_identity();
+    let mut payload = serde_json::json!({
+        "app_version": identity.app_version,
+        "build_id": identity.build_id,
+        "target_triple": identity.target_triple,
+        "bundled_runtime_id": identity.bundled_runtime_id,
+    });
+    if include_operator_smoke {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let current_exe = std::env::current_exe().ok();
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
+            tauri_resource_dir: None,
+            current_exe_path: current_exe.as_deref(),
+            manifest_dir,
+            packaged: python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir),
+        })
+        .map_err(|err| err.to_string())?;
+        if !matches!(launcher.source, PythonLauncherSource::BundledRuntime) {
+            return Err(
+                "desktop_python_runtime_invalid: packaged operator smoke requires bundled runtime"
+                    .into(),
+            );
+        }
+        payload["launcher_source"] = serde_json::json!("bundled");
+        payload["interpreter_basename"] = serde_json::json!(Path::new(&launcher.program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("python.exe"));
+        payload["runtime_id"] = serde_json::json!(launcher.runtime_id);
+        println!(
+            "launcher_source=bundled interpreter_basename={} runtime_id={}",
+            payload["interpreter_basename"]
+                .as_str()
+                .unwrap_or("python.exe"),
+            payload["runtime_id"]
+                .as_str()
+                .unwrap_or(identity.bundled_runtime_id)
+        );
+    }
+    println!("{}", payload);
+    Ok(())
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--build-identity-json") {
-        let identity = build_identity::build_identity();
-        println!(
-            "{}",
-            serde_json::json!({
-                "app_version": identity.app_version,
-                "build_id": identity.build_id,
-                "target_triple": identity.target_triple,
-                "bundled_runtime_id": identity.bundled_runtime_id,
-            })
-        );
+        if let Err(err) = print_build_identity_json(false) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--operator-session-smoke") {
+        if let Err(err) = print_build_identity_json(true) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
         return;
     }
     run();

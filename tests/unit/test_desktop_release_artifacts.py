@@ -3563,10 +3563,10 @@ def test_windows_installer_identity_shortcut_authority_rejects_duplicates_and_st
 def test_windows_installer_identity_configuration_preservation(tmp_path) -> None:
     guard = _load_windows_installer_identity()
     config = tmp_path / guard.CONFIG_NAME
-    expected = {'relay_url': 'https://relay.invalid', 'model': 'qwen3', 'context_tier': '64k-full', 'n_ctx': 65536}
+    expected = guard.seeded_config_values()
     config.write_text(json.dumps(expected), encoding='utf-8')
     guard.verify_config_preserved(config, expected)
-    config.write_text(json.dumps({**expected, 'n_ctx': 8192}), encoding='utf-8')
+    config.write_text(json.dumps({**expected, 'context_tier': '8k-fast'}), encoding='utf-8')
     with pytest.raises(guard.InstallerIdentityError, match='not preserved'):
         guard.verify_config_preserved(config, expected)
 
@@ -3592,16 +3592,81 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
         path.write_text('artifact', encoding='utf-8')
     installs = []
 
-    def fake_install(installer):
+    def fake_install(installer, log_path=None):
         installs.append(installer.kind)
-        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'remove the competing installation first', '')
+        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'remove the competing token.place installation first', '')
 
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
-    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
     monkeypatch.setattr(guard, 'install', fake_install)
     monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
     monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'verify_no_authority_remains', lambda: None)
 
     guard.run_scenario(scenario, 'abcdef123456')
     assert installs == ['nsis', 'msi']
+
+
+def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
+    for path in (current.path, previous.path):
+        path.write_text('artifact', encoding='utf-8')
+
+    def fake_install(installer, log_path=None):
+        return subprocess.CompletedProcess([str(installer.path)], 55 if installer.kind == 'msi' else 0, 'random failure', '')
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
+    monkeypatch.setattr(guard, 'install', fake_install)
+    monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
+    monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    with pytest.raises(guard.InstallerIdentityError, match='current installer failed'):
+        guard.run_scenario(guard.Scenario('cross-nsis-to-msi', current, previous), 'abcdef123456')
+
+
+def test_windows_installer_identity_requires_postconditions_for_competing_rejection(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
+    for path in (current.path, previous.path):
+        path.write_text('artifact', encoding='utf-8')
+
+    def fake_install(installer, log_path=None):
+        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'remove the competing token.place installation first', '')
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
+    monkeypatch.setattr(guard, 'install', fake_install)
+    monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
+    monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'verify_no_authority_remains', lambda: (_ for _ in ()).throw(guard.InstallerIdentityError('ambiguous second shortcut')))
+    with pytest.raises(guard.InstallerIdentityError, match='ambiguous second shortcut'):
+        guard.run_scenario(guard.Scenario('cross-nsis-to-msi', current, previous), 'abcdef123456')
+
+
+def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomplete() -> None:
+    guard = _load_windows_installer_identity()
+    guard.assert_operator_record(json.dumps({
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+    }))
+    with pytest.raises(guard.InstallerIdentityError, match='operator-session record missing'):
+        guard.assert_operator_record('launcher_source=bundled interpreter_basename=python.exe')
+    with pytest.raises(guard.InstallerIdentityError, match='operator-session record missing'):
+        guard.assert_operator_record(json.dumps({'launcher_source': 'system_development', 'interpreter_basename': 'python.exe'}))
+
+
+def test_windows_installer_identity_uses_tauri_config_path_and_schema(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
+    config_path = guard.seed_config()
+    assert config_path == tmp_path / 'Roaming' / 'place.token.desktop' / 'desktop_tauri_config.json'
+    data = json.loads(config_path.read_text(encoding='utf-8'))
+    assert set(data) == {'relay_base_url', 'relay_base_urls', 'model_path', 'preferred_mode', 'context_tier'}
+    assert data['relay_base_url'] == data['relay_base_urls'][0]

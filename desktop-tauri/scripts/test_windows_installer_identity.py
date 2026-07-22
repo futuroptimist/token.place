@@ -23,6 +23,7 @@ EXPECTED_PREVIOUS_VERSION = "0.1.2"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 SENTINELS = ("py", "python", "python3", "pip", "cmake", "ninja", "msbuild", "cl.exe", "nvcc")
 CONFIG_NAME = "desktop_tauri_config.json"
+TAURI_IDENTIFIER = "place.token.desktop"
 APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 
 
@@ -41,6 +42,17 @@ class Scenario:
 
 
 @dataclass(frozen=True)
+class ScenarioArtifactDir:
+    root: Path
+
+    def path(self, scenario: str, phase: str) -> Path:
+        safe = scenario.replace("/", "-").replace("\\", "-")
+        directory = self.root / safe
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{phase}.log"
+
+
+@dataclass(frozen=True)
 class Shortcut:
     path: Path
     target: Path
@@ -50,8 +62,18 @@ class InstallerIdentityError(AssertionError):
     pass
 
 
-def _run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 180, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: int = 180,
+    check: bool = True,
+    log_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{result.stdout}", encoding="utf-8")
     if check and result.returncode != 0:
         raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{result.stdout[-4000:]}")
     return result
@@ -166,12 +188,30 @@ $items | ConvertTo-Json -Depth 3
     return shortcuts[0]
 
 
-def seed_config(values: dict[str, object]) -> Path:
-    config_dir = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "token.place"
+def app_config_dir() -> Path:
+    return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / TAURI_IDENTIFIER
+
+
+def seed_config(values: dict[str, object] | None = None) -> Path:
+    config_dir = app_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / CONFIG_NAME
-    config_path.write_text(json.dumps(values, indent=2, sort_keys=True), encoding="utf-8")
+    payload = values or seeded_config_values()
+    config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return config_path
+
+
+def seeded_config_values() -> dict[str, object]:
+    return {
+        "relay_base_url": "https://upgrade-preserve-primary.invalid",
+        "relay_base_urls": [
+            "https://upgrade-preserve-primary.invalid",
+            "https://upgrade-preserve-backup.invalid",
+        ],
+        "model_path": r"C:\\token-place-upgrade\\distinctive-qwen3-8b-q4.gguf",
+        "preferred_mode": "gpu",
+        "context_tier": "64k-full",
+    }
 
 
 def verify_config_preserved(config_path: Path, expected: dict[str, object]) -> None:
@@ -181,22 +221,35 @@ def verify_config_preserved(config_path: Path, expected: dict[str, object]) -> N
             raise InstallerIdentityError(f"configuration value {key!r} was not preserved across upgrade")
 
 
-def install(installer: Installer) -> subprocess.CompletedProcess[str]:
+def install(installer: Installer, log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
-        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart"], timeout=300, check=False)
-    return _run([str(installer.path), "/S"], timeout=300, check=False)
+        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart"], timeout=300, check=False, log_path=log_path)
+    return _run([str(installer.path), "/S"], timeout=300, check=False, log_path=log_path)
 
 
-def uninstall_best_effort() -> None:
+def uninstall_best_effort(log_path: Path | None = None) -> None:
     if sys.platform != "win32":
         return
     script = r'''
-$products = Get-CimInstance Win32_Product | Where-Object { $_.Name -match 'token\.place|tokenplace|token-place' }
-foreach ($p in $products) { $p.Uninstall() | Out-Null }
-$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('CommonPrograms'), [Environment]::GetFolderPath('CommonDesktopDirectory'))
-foreach ($root in $roots) { if ($root -and (Test-Path $root)) { Get-ChildItem $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'token\.place|tokenplace|token-place' } | Remove-Item -Force -ErrorAction SilentlyContinue } }
+$roots = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall")
+foreach ($root in $roots) {
+  if (Test-Path $root) {
+    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+      if ($p.DisplayName -match "token\.place|tokenplace|token-place") {
+        if ($p.WindowsInstaller -eq 1 -and $p.PSChildName) { Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @("/x", $p.PSChildName, "/qn", "/norestart") -Wait }
+        elseif ($p.UninstallString) {
+          $cmd = $p.UninstallString.Trim('"')
+          Start-Process -FilePath $cmd -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+        }
+      }
+    }
+  }
+}
+$shortcutRoots = @([Environment]::GetFolderPath("Programs"), [Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("CommonPrograms"), [Environment]::GetFolderPath("CommonDesktopDirectory"))
+foreach ($root in $shortcutRoots) { if ($root -and (Test-Path $root)) { Get-ChildItem $root -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "token\.place|tokenplace|token-place" } | Remove-Item -Force -ErrorAction SilentlyContinue } }
 '''
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=120, check=False)
+    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=180, check=False, log_path=log_path)
 
 
 def _assert_runtime(exe: Path) -> None:
@@ -233,14 +286,22 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
     raise InstallerIdentityError(f"installed executable did not report expected version/build identity through an automation-safe probe: {last[-1000:]}")
 
 
-def launch_for_operator_record(exe: Path, env: dict[str, str]) -> str:
-    result = _run([str(exe), "--operator-session-smoke"], env=env, timeout=90, check=False)
+def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
+    result = _run([str(exe), "--operator-session-smoke"], env=env, timeout=90, check=False, log_path=log_path)
     if result.returncode not in (0, 124):
         raise InstallerIdentityError(f"operator-session smoke launch failed: {result.stdout[-1000:]}")
     return result.stdout
 
 
 def assert_operator_record(text: str) -> None:
+    if "launcher_source=bundled" in text and "interpreter_basename=python.exe" in text and f"runtime_id={EXPECTED_RUNTIME_ID}" in text:
+        return
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        text = "\n".join(f"{key}={value}" for key, value in data.items())
     required = [
         "launcher_source=bundled",
         "interpreter_basename=python.exe",
@@ -251,45 +312,54 @@ def assert_operator_record(text: str) -> None:
         raise InstallerIdentityError(f"operator-session record missing {missing}")
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str) -> None:
+def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
+    text = result.stdout.lower()
+    return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
+
+
+def verify_no_authority_remains() -> None:
+    try:
+        resolve_authoritative_shortcut()
+    except InstallerIdentityError:
+        return
+    raise InstallerIdentityError("competing-installer rejection left an authoritative shortcut/executable behind")
+
+
+def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
-    seeded = {
-        "relay_url": "https://upgrade-preserve.invalid/relay",
-        "model": "distinctive-upgrade-model-qwen3-8b-q4",
-        "context_tier": "64k-full",
-        "n_ctx": 65536,
-    }
+    seeded = seeded_config_values()
     with tempfile.TemporaryDirectory(prefix=f"token-place-{scenario.name}-") as tmp:
         root = Path(tmp)
         sentinel_log = root / "sentinel.log"
         env = _safe_env(_sentinel_dir(root), sentinel_log)
         try:
             if scenario.previous is not None:
-                previous = install(scenario.previous)
+                previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None)
                 if previous.returncode != 0:
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
                 config_path = seed_config(seeded)
-            current = install(scenario.current)
+            current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None)
             if current.returncode != 0:
-                if scenario.previous and scenario.previous.kind != scenario.current.kind:
+                if scenario.previous and scenario.previous.kind != scenario.current.kind and is_actionable_competing_installer_rejection(current):
                     _terminate_processes()
-                    uninstall_best_effort()
+                    uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
+                    verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
             shortcut = resolve_authoritative_shortcut()
             _assert_runtime(shortcut.target)
+            probe_identity(shortcut.target, env, EXPECTED_VERSION, expected_build_id)
+            assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
             if config_path is not None:
                 verify_config_preserved(config_path, seeded)
-            probe_identity(shortcut.target, env, EXPECTED_VERSION, expected_build_id)
-            assert_operator_record(launch_for_operator_record(shortcut.target, env))
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:
             _terminate_processes()
-            uninstall_best_effort()
+            uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall") if artifact_dir else None)
             if config_path:
                 try:
                     config_path.unlink(missing_ok=True)
@@ -297,9 +367,18 @@ def run_scenario(scenario: Scenario, expected_build_id: str) -> None:
                     pass
 
 
-def run_all_scenarios(scenarios: Iterable[Scenario], expected_build_id: str, runner: Callable[[Scenario, str], None] = run_scenario) -> None:
+def run_all_scenarios(
+    scenarios: Iterable[Scenario],
+    expected_build_id: str,
+    runner: Callable[..., None] = run_scenario,
+    artifact_root: Path | None = None,
+) -> None:
+    artifacts = ScenarioArtifactDir(artifact_root) if artifact_root else None
     for scenario in scenarios:
-        runner(scenario, expected_build_id)
+        if runner is run_scenario:
+            runner(scenario, expected_build_id, artifacts)
+        else:
+            runner(scenario, expected_build_id)
 
 
 def main() -> int:
@@ -311,6 +390,7 @@ def main() -> int:
     parser.add_argument("--previous-version", default=EXPECTED_PREVIOUS_VERSION)
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
+    parser.add_argument("--artifact-dir", type=Path, default=None)
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
@@ -319,7 +399,7 @@ def main() -> int:
     if sys.platform != "win32":
         print("validated Windows installer scenario contract; real installs run only on hosted Windows")
         return 0
-    run_all_scenarios(scenarios, args.expected_build_id)
+    run_all_scenarios(scenarios, args.expected_build_id, artifact_root=args.artifact_dir)
     print(f"validated {len(scenarios)} clean/upgrade Windows installer scenarios for {args.expected_version} build {args.expected_build_id}")
     print("CUDA/GPU execution was not validated by this installer identity guard")
     return 0

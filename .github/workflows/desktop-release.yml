@@ -530,6 +530,9 @@ jobs:
           if [ -z "${tag_name}" ]; then
             installer_identity_args=(--expected-version "$(python -c 'import json; print(json.load(open("package.json"))["version"])')")
           fi
+          installer_artifact_dir="${RUNNER_TEMP}/token-place-installer-identity-artifacts"
+          rm -rf "${installer_artifact_dir}"
+          mkdir -p "${installer_artifact_dir}"
           python scripts/test_windows_installer_identity.py \
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
@@ -537,7 +540,16 @@ jobs:
             --previous-windows-msi "${previous_msi_paths[0]}" \
             --previous-version "0.1.2" \
             --expected-build-id "$(git rev-parse --short=12 HEAD)" \
+            --artifact-dir "${installer_artifact_dir}" \
             "${installer_identity_args[@]}"
+
+      - name: Upload Windows installer identity logs
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-identity-logs
+          path: ${{ runner.temp }}/token-place-installer-identity-artifacts
+          if-no-files-found: ignore
 
       - name: Generate SHA256 checksums and build manifest
         shell: bash

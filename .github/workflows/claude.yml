@@ -264,12 +264,41 @@ jobs:
           sudo apt-get install -y --no-install-recommends bubblewrap
           bwrap --version
 
-          # Prove the sandbox can actually isolate a process on this runner
-          # image rather than trusting a single sysctl as a proxy signal
-          # (Ubuntu's AppArmor unprivileged-userns restriction can block
-          # bwrap even when kernel.unprivileged_userns_clone reads 1).
-          if ! bwrap --die-with-parent --unshare-all --unshare-net -- true; then
+          if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            userns_clone="$(cat /proc/sys/kernel/unprivileged_userns_clone)"
+            if [[ "${userns_clone}" != "1" ]]; then
+              echo "::error::kernel.unprivileged_userns_clone=${userns_clone}; Bubblewrap requires unprivileged user namespaces."
+              exit 1
+            fi
+          else
+            userns_clone="missing"
+          fi
+
+          apparmor_userns="missing"
+          if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            apparmor_userns="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            if [[ "${apparmor_userns}" == "1" ]]; then
+              # GitHub's Ubuntu 24.04 runners can enable AppArmor's
+              # unprivileged-userns restriction, which blocks Bubblewrap even
+              # when kernel.unprivileged_userns_clone is available. Match the
+              # official Claude action's ephemeral compatibility setup before
+              # probing bwrap; do not persist this sysctl change.
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              apparmor_userns="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            fi
+          fi
+
+          echo "kernel.unprivileged_userns_clone=${userns_clone}"
+          echo "kernel.apparmor_restrict_unprivileged_userns=${apparmor_userns}"
+
+          # Prove the sandbox can actually run a binary that exists inside the
+          # temporary namespace. A read-only root bind makes /bin/true available
+          # without weakening the later wrapper sandbox, and failure remains
+          # fail-closed with useful diagnostics.
+          if ! bwrap --die-with-parent --unshare-all --unshare-net --ro-bind / / -- /bin/true; then
             echo "::error::Bubblewrap cannot establish an isolated sandbox on this runner; refusing to fall back to unsandboxed validation commands."
+            echo "kernel.unprivileged_userns_clone=${userns_clone}"
+            echo "kernel.apparmor_restrict_unprivileged_userns=${apparmor_userns}"
             exit 1
           fi
 
@@ -317,7 +346,7 @@ jobs:
               # 3 = 1 pre-flight smoke test run by the trusted workflow step
               # plus up to 2 uses by Claude.
               cap=3
-              fixed_command=(bash -c 'env | grep -E "(TOKEN|SECRET|OIDC|ACTIONS_ID_TOKEN|GITHUB_TOKEN|CLAUDE_CODE_OAUTH_TOKEN)" && exit 1 || true; python -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(1 if s.connect_ex((\"1.1.1.1\",443)) == 0 else 0)"')
+              fixed_command=(/usr/bin/python3 -c 'import os,socket,sys; bad=[k for k in os.environ if any(m in k.upper() for m in ("TOKEN","SECRET","OIDC","ACTIONS_ID_TOKEN","GITHUB_TOKEN","CLAUDE_CODE_OAUTH_TOKEN"))]; print("secret-bearing environment variables visible: "+",".join(bad), file=sys.stderr) if bad else None; sys.exit(1) if bad else None; s=socket.socket(); s.settimeout(2); sys.exit(1 if s.connect_ex(("1.1.1.1",443)) == 0 else 0)')
               ;;
             *)
               echo "unknown fixed validation command" >&2
@@ -325,11 +354,10 @@ jobs:
               ;;
           esac
 
-          # CLAUDE_CODE_SCRIPT_CAPS is not a documented input of
-          # anthropics/claude-code-action; relying on it would be a no-op
-          # that looks like a control. Enforce per-wrapper call caps
-          # ourselves with a locked counter file outside the workspace so
-          # the limit is authoritative regardless of the action's behavior.
+          # The Claude action documents CLAUDE_CODE_SCRIPT_CAPS as a JSON
+          # environment control, so never use the former invalid newline
+          # path:count shape. Keep these immutable local flock counters as
+          # the authoritative, version-independent enforcement layer.
           counter_dir="${wrapper_dir}/.counters"
           install -d -m 0700 "${counter_dir}"
           counter_file="${counter_dir}/${command_name}.count"

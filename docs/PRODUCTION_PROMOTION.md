@@ -56,7 +56,7 @@ may intentionally differ:
 
 ## Pre-promotion gates
 
-- [ ] Confirm PR CI checks are green, including the Linux and macOS `run_all_tests.sh` PR checks.
+- [ ] Confirm PR CI checks are green, including the Linux `run_all_tests.sh` PR check. macOS and Windows desktop release packaging are validated by the `Desktop Tauri Release` workflow only when an immutable `desktop-vX.Y.Z` tag is pushed or when an operator intentionally uses `workflow_dispatch` for a dry run, retry, or rebuild of an existing tag.
 - [ ] Confirm the staging deployment image, chart, and release artifact are exactly the ones intended
       for production promotion; prefer immutable image tags and chart versions, plus a digest where
       available.
@@ -113,6 +113,15 @@ Expected result after each Cloudflare skip: the response is not a Cloudflare `40
 Any relay-owned app response is acceptable, including `401 Missing or invalid relay server token`
 when `SERVER_REGISTRATION_TOKENS` are configured or a `400` response because the `{}` payload is
 intentionally invalid.
+
+
+## Desktop release workflow policy
+
+Pushing a new immutable `desktop-vX.Y.Z` tag is the canonical desktop release action. The
+`Desktop Tauri Release` workflow builds, validates, checksums, signs, and publishes the macOS Apple
+Silicon and Windows release artifacts from that tag. Operators must not also manually dispatch the
+same release unless they are intentionally retrying a failed run or rebuilding an existing tag; do
+not force-move or reuse release tags as part of promotion.
 
 ## Tag verification
 

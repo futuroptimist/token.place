@@ -4,10 +4,6 @@ on:
   push:
     tags:
       - 'desktop-v*'
-  pull_request:
-    paths:
-      - '.github/workflows/desktop-release.yml'
-      - 'desktop-tauri/**'
   workflow_dispatch:
     inputs:
       tag_name:
@@ -19,6 +15,10 @@ on:
         required: false
         default: false
         type: boolean
+
+concurrency:
+  group: desktop-release-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -539,6 +539,7 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: desktop-tauri/release-artifacts/*
           if-no-files-found: error
+          retention-days: 7
 
   # Temporarily disabled until a matching self-hosted Windows x64 NVIDIA/RTX
   # runner is configured. GitHub cannot fall through after a short queue wait.

@@ -10,7 +10,10 @@ TESTING_DOC = Path("docs/TESTING.md")
 def test_production_promotion_checklist_captures_0_1_0_smoke_risks() -> None:
     text = PROMOTION_DOC.read_text(encoding="utf-8")
     required = (
-        "Linux and macOS `run_all_tests.sh` PR checks",
+        "Linux `run_all_tests.sh` PR check",
+        "Desktop Tauri Release` workflow only when an immutable `desktop-vX.Y.Z` tag is pushed",
+        "workflow_dispatch` for a dry run, retry, or rebuild",
+        "Operators must not also manually dispatch the\nsame release unless they are intentionally retrying",
         "staging deployment image, chart, and release artifact",
         "desktop releases for Windows and macOS install successfully and register",
         "`GET /livez` returns healthy JSON (`status: alive`)",

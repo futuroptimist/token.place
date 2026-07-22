@@ -1557,7 +1557,8 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         manifest_dir,
         None,
         Some(&launcher.program),
-    )?;
+    )
+    .map_err(anyhow::Error::msg)?;
     let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
     let import_root =
         configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);

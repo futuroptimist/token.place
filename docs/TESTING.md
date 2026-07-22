@@ -266,7 +266,8 @@ Desktop operator Windows/macOS parity is covered by the shared checklist in [Des
 - `tests/platform_tests/test_path_handling.py` - Tests path handling across platforms
 - `tests/platform_tests/test_config.py` - Tests configuration loading on different platforms
 - `desktop-tauri/scripts/run_desktop_parity_checks.py` - Local shared entry point for packaged resource and API v1 E2EE relay lifecycle parity checks
-- `.github/workflows/desktop-operator-e2e.yml` - CI-only Windows/macOS packaged parity jobs
+- `.github/workflows/desktop-operator-e2e.yml` - CI-only Linux/Windows packaged parity jobs, including Linux-simulated macOS packaged layout and fake Metal coverage
+- `.github/workflows/desktop-macos-smoke.yml` - targeted native macOS push/scheduled/manual no-relay lifecycle smoke
 
 **Key Scenarios Tested**:
 - Correct path resolution across Windows, macOS, and Linux

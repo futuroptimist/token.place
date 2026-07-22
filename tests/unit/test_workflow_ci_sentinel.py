@@ -539,3 +539,47 @@ def test_run_all_tests_pr_tiny_gguf_path_is_absolute_workspace_path() -> None:
         assert "scripts/provision-ci-tiny-gguf.sh" in _step_runs(
             job
         ), f"{job_name} must provision the tiny real GGUF before run_all_tests.sh."
+
+
+def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_inspect() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    jobs = workflow_data.get("jobs", {})
+    assert "desktop-operator-packaged-e2e-macos" not in jobs
+    assert "desktop-operator-packaged-inspect-python39-macos" not in jobs
+    assert all(str(job.get("runs-on")) != "macos-latest" and str(job.get("runs-on")) != "macos-26" for job in jobs.values())
+
+    inspect_job = jobs["desktop-operator-packaged-inspect-python39-linux"]
+    assert inspect_job["runs-on"] == "ubuntu-latest"
+    assert "python-version: '3.9'" in yaml.dump(inspect_job, sort_keys=True)
+    assert "TOKEN_PLACE_INSPECT_ONLY" in yaml.dump(inspect_job, sort_keys=True)
+
+
+def test_desktop_operator_workflow_has_cancellation_concurrency_and_no_duplicate_packaged_e2e() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    concurrency = workflow_data.get("concurrency", {})
+    assert concurrency.get("cancel-in-progress") == "true"
+    assert "github.event.pull_request.number || github.ref" in str(concurrency.get("group", ""))
+    linux_runs = _step_runs(workflow_data["jobs"]["desktop-operator-e2e"])
+    assert linux_runs.count("test_packaged_operator_e2e.py") == 1
+    assert "run_desktop_parity_checks.py --skip-packaged" in linux_runs
+    assert "TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM" in yaml.dump(workflow_data["jobs"]["desktop-operator-e2e"], sort_keys=True)
+
+
+def test_desktop_macos_smoke_is_targeted_and_not_pr_or_release_suite() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-macos-smoke.yml")
+    on_block = _workflow_on_block(workflow_data, "desktop-macos-smoke.yml")
+    assert set(on_block) == {"push", "schedule", "workflow_dispatch"}
+    assert "pull_request" not in on_block
+    assert on_block["push"]["branches"] == ["main"]
+    assert on_block["schedule"][0]["cron"] == "37 3 * * *"
+    assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
+
+    job = workflow_data["jobs"]["native-macos-smoke"]
+    assert job["runs-on"] == "macos-26"
+    assert int(job["timeout-minutes"]) <= 12
+    job_runs = _step_runs(job)
+    assert "npm run tauri build -- --debug --no-bundle" in job_runs
+    assert "test_desktop_no_relay_autostart_e2e.py" in job_runs
+    forbidden = ("./run_all_tests.sh", "run_desktop_parity_checks.py", "test_packaged_operator_e2e.py", "--bundles", "dmg", "prepare_embedded_python_runtime.py")
+    for fragment in forbidden:
+        assert fragment not in job_runs

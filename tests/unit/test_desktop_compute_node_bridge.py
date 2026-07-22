@@ -26,6 +26,11 @@ compute_node_bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
 
+
+def _step_runs(job: dict) -> str:
+    steps = job.get('steps', [])
+    return '\n'.join(str(step.get('run', '')) for step in steps if isinstance(step, dict))
+
 @pytest.fixture(autouse=True)
 def _default_desktop_runtime_arch(monkeypatch):
     """Keep win32 platform simulations independent from the host CPU architecture."""
@@ -522,62 +527,51 @@ def _load_desktop_operator_parity_matrix():
     return json.loads(matrix_path.read_text(encoding='utf-8'))
 
 
-def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
+def test_macos_packaged_operator_lifecycle_parity_uses_linux_simulation_and_native_smoke():
     matrix = _load_desktop_operator_parity_matrix()
     assert all(
         item.get('id') != 'macos_packaged_operator_lifecycle_parity'
         for item in matrix.get('known_gaps', [])
     )
 
-    coverage = next(
+    simulated = next(
         item
         for item in matrix.get('lifecycle_coverage', [])
-        if item.get('id') == 'macos_packaged_operator_lifecycle_parity'
+        if item.get('id') == 'macos_packaged_operator_lifecycle_parity_linux_simulated'
     )
-    assert coverage['platform'] == 'darwin'
-    assert coverage['status'] == 'covered_by_shared_entrypoint'
-    assert (
-        coverage['shared_entrypoint']
-        == 'desktop-tauri/scripts/run_desktop_parity_checks.py'
+    native = next(
+        item
+        for item in matrix.get('lifecycle_coverage', [])
+        if item.get('id') == 'macos_native_no_relay_lifecycle_smoke'
     )
-    assert coverage['covered_checks'] == [
-        'packaged_resource_resolution',
-        'dependency_isolation',
-        'warm_load',
-        'register',
-        'multi_turn_api_v1_relay_chat',
-        'stop',
-        'start_after_stop',
-        'diagnostics',
-    ]
+    assert simulated['platform'] == 'linux'
+    assert simulated['simulated_platform'] == 'darwin'
+    assert simulated['status'] == 'covered_by_shared_entrypoint'
+    assert simulated['workflow'] == '.github/workflows/desktop-operator-e2e.yml'
+    assert native['platform'] == 'darwin'
+    assert native['status'] == 'covered_by_targeted_native_smoke'
+    assert native['workflow'] == '.github/workflows/desktop-macos-smoke.yml'
 
-    workflow_path = (
-        Path(__file__).resolve().parents[2]
-        / '.github'
-        / 'workflows'
-        / 'desktop-operator-e2e.yml'
-    )
-    workflow = yaml.load(
-        workflow_path.read_text(encoding='utf-8'),
+    operator_workflow = yaml.load(
+        (Path(__file__).resolve().parents[2] / simulated['workflow']).read_text(encoding='utf-8'),
         Loader=yaml.BaseLoader,
     )
-    macos_job = workflow['jobs']['desktop-operator-packaged-e2e-macos']
-    macos_run_commands = [
-        step.get('run', '')
-        for step in macos_job['steps']
-        if isinstance(step, dict)
-    ]
-    runner_path = Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']
-    runner = runner_path.read_text(encoding='utf-8')
+    linux_job = operator_workflow['jobs']['desktop-operator-e2e']
+    linux_commands = _step_runs(linux_job)
+    assert linux_job['runs-on'] == 'ubuntu-latest'
+    assert f"python {simulated['shared_entrypoint']} --skip-packaged" in linux_commands
+    assert 'TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM' in str(linux_job)
+    assert 'test_desktop_no_relay_autostart_e2e.py' not in linux_commands
 
-    assert macos_job['runs-on'] == 'macos-latest'
-    assert f"python {coverage['shared_entrypoint']}" in macos_run_commands
-    assert any(
-        'test_desktop_no_relay_autostart_e2e.py' in command
-        for command in macos_run_commands
+    smoke_workflow = yaml.load(
+        (Path(__file__).resolve().parents[2] / native['workflow']).read_text(encoding='utf-8'),
+        Loader=yaml.BaseLoader,
     )
-    for script in coverage['required_scripts']:
-        assert Path(script).name in runner
+    smoke_commands = _step_runs(smoke_workflow['jobs']['native-macos-smoke'])
+    assert smoke_workflow['jobs']['native-macos-smoke']['runs-on'] == 'macos-26'
+    assert 'test_desktop_no_relay_autostart_e2e.py' in smoke_commands
+    for script in simulated['required_scripts']:
+        assert Path(script).name in Path(simulated['shared_entrypoint']).read_text(encoding='utf-8')
 
 
 class RestartTrackingRuntime(FakeRuntime):

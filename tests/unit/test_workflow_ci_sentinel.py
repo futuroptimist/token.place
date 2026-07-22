@@ -539,3 +539,48 @@ def test_run_all_tests_pr_tiny_gguf_path_is_absolute_workspace_path() -> None:
         assert "scripts/provision-ci-tiny-gguf.sh" in _step_runs(
             job
         ), f"{job_name} must provision the tiny real GGUF before run_all_tests.sh."
+
+
+def _workflow_run_text(path: Path) -> str:
+    workflow = _load_workflow(path)
+    return "\n".join(_step_runs(job) for job in workflow.get("jobs", {}).values() if isinstance(job, dict))
+
+
+def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_inspect() -> None:
+    workflow = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    jobs = workflow["jobs"]
+    assert all("macos" not in str(job.get("runs-on", "")).lower() for job in jobs.values())
+    assert "desktop-operator-packaged-inspect-python39-macos" not in jobs
+    assert "desktop-operator-packaged-e2e-macos" not in jobs
+    linux_run = _step_runs(jobs["desktop-operator-e2e"])
+    assert "python-version: '3.9'" in yaml.dump(jobs["desktop-operator-e2e"])
+    assert "TOKEN_PLACE_INSPECT_ONLY" in yaml.dump(jobs["desktop-operator-e2e"] if "jobs" in locals() else operator_workflow["jobs"]["desktop-operator-e2e"])
+    assert "python3.9 desktop-tauri/scripts/test_packaged_operator_e2e.py" in linux_run
+    assert linux_run.count("test_packaged_operator_e2e.py") == 1
+
+
+def test_desktop_operator_and_macos_smoke_have_cancellation_concurrency() -> None:
+    for workflow_name in ("desktop-operator-e2e.yml", "desktop-macos-smoke.yml"):
+        workflow = _load_workflow(WORKFLOW_DIR / workflow_name)
+        concurrency = workflow.get("concurrency")
+        assert isinstance(concurrency, dict)
+        assert concurrency.get("cancel-in-progress") == "true"
+        assert "github.ref" in str(concurrency.get("group", ""))
+
+
+def test_targeted_macos_smoke_triggers_and_scope_stay_narrow() -> None:
+    workflow = _load_workflow(WORKFLOW_DIR / "desktop-macos-smoke.yml")
+    on_block = _workflow_on_block(workflow, "desktop-macos-smoke.yml")
+    assert set(on_block) == {"push", "schedule", "workflow_dispatch"}
+    assert "pull_request" not in on_block
+    assert on_block["push"]["branches"] == ["main"]
+    assert on_block["schedule"]
+    assert workflow["jobs"]["native-macos-smoke"]["runs-on"] == "macos-26"
+    assert int(workflow["jobs"]["native-macos-smoke"]["timeout-minutes"]) <= 10
+    run_text = _workflow_run_text(WORKFLOW_DIR / "desktop-macos-smoke.yml")
+    assert "test_desktop_no_relay_autostart_e2e.py" in run_text
+    assert "./run_all_tests.sh" not in run_text
+    assert "run_desktop_parity_checks.py" not in run_text
+    assert "desktop-release" not in run_text
+    assert "--debug --no-bundle" in run_text
+    assert "bundle/macos" not in run_text

@@ -153,10 +153,16 @@ class BridgeProcess:
                 self.process.wait(timeout=5)
 
 
-def _bridge_compute_mode() -> str:
+def _simulated_platform_for_layout(layout_label: str) -> str:
+    if "macOS" in layout_label:
+        return "Darwin"
+    return platform.system()
+
+
+def _bridge_compute_mode(layout_label: str) -> str:
     """Return the packaged bridge mode for the mock parity harness."""
 
-    current_platform = platform.system()
+    current_platform = _simulated_platform_for_layout(layout_label)
     # Windows and macOS desktop auto/gpu modes intentionally fail closed when a
     # GPU-capable llama-cpp-python runtime is missing or CPU-only. This e2e runs
     # with USE_MOCK_LLM=1 and validates relay lifecycle parity, so hosted CI must
@@ -187,7 +193,7 @@ def _start_bridge(
             "--model",
             "mock.gguf",
             "--mode",
-            _bridge_compute_mode(),
+            _bridge_compute_mode(layout_label),
             "--relay-url",
             relay_url,
         ],
@@ -275,7 +281,7 @@ def _assert_ready_runtime_fields(event: dict[str, Any], *, layout_label: str) ->
     assert event.get("warm_load_state") == "ready", event
     assert isinstance(event.get("warm_load_duration_ms"), int), event
 
-    if platform.system() == "Darwin" and "macOS" in layout_label:
+    if _simulated_platform_for_layout(layout_label) == "Darwin" and "macOS" in layout_label:
         requested_mode = str(event.get("requested_mode") or "")
         backend_available = str(event.get("backend_available") or "")
         backend_used = str(event.get("backend_used") or "")

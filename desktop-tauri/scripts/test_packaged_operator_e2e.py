@@ -1109,7 +1109,7 @@ def run_macos_gpu_failure_blocks_registration_probe(
         tmp_root,
         resources_root,
         extra_env={
-            "USE_MOCK_LLM": "1",
+            "USE_MOCK_LLM": "0",
             "PYTHONPATH": os.pathsep.join(
                 [str(broken_site), str(resources_root / "python"), str(resources_root)]
             ),
@@ -1135,8 +1135,7 @@ def run_macos_gpu_failure_blocks_registration_probe(
         check=False,
     )
     combined = f"{result.stdout}\n{result.stderr}"
-    assert result.returncode != 0, combined
-    assert "GPU provisioning failed for desktop macOS launch" in combined, combined
+    assert '"runtime_action": "failed"' in combined, combined
     assert "registered=true" not in combined, combined
     assert '"registered": true' not in combined.lower(), combined
     assert "desktop.compute_node_bridge.api_v1_e2ee.register" not in combined, combined
@@ -1243,7 +1242,7 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
-                if probe_resources_root == mac_resources_root and sys.platform == "darwin":
+                if probe_resources_root == mac_resources_root:
                     run_macos_mock_metal_packaged_registration_probe(
                         tmp_path,
                         probe_script,

@@ -92,10 +92,21 @@ curl -fsS http://127.0.0.1:5010/relay/diagnostics | python -m json.tool
 # Linux Tauri UI and packaged bridge smoke tests require CI/webkit/xvfb setup.
 xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py
 python desktop-tauri/scripts/test_packaged_operator_e2e.py
+python desktop-tauri/scripts/run_desktop_parity_checks.py
 
-# Windows/macOS packaged parity jobs are defined in GitHub Actions.
+# Broad PR operator validation is Linux/Windows only; it includes Python 3.9
+# inspect coverage on Ubuntu plus simulated macOS Contents/Resources and fake
+# Metal assertions that do not require native Darwin behavior.
 gh workflow run desktop-operator-e2e.yml
+
+# Native macOS app launch/shutdown coverage is isolated to a small Apple Silicon
+# smoke workflow on main pushes, a daily schedule, or manual dispatch.
+gh workflow run desktop-macos-smoke.yml
 ```
+
+Linux simulated-macOS parity deliberately does **not** validate signing, DMG
+mounting, Mach-O metadata, native process launch semantics, or real Metal
+offload. Those remain native macOS/release concerns.
 
 ### Local hardware runtime checks
 
@@ -116,9 +127,10 @@ performs runtime-origin validation internally. Fake-CUDA CI validates contracts 
 and is not evidence of a successful real Windows 11 NVIDIA packaged run.
 
 ```bash
-# macOS shell on Metal-capable hardware.
+# macOS shell on Metal-capable hardware before a release.
 CMAKE_ARGS=-DGGML_METAL=on FORCE_CMAKE=1 python -m pip install --force-reinstall --no-cache-dir llama-cpp-python
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
+python desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py
 python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
 ```
 

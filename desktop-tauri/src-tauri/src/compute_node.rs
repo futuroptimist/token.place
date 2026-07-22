@@ -1467,6 +1467,13 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
     payload
 }
 
+fn packaged_launcher_source_is_valid(
+    is_packaged_execution: bool,
+    launcher_source: Option<&PythonLauncherSource>,
+) -> bool {
+    !is_packaged_execution || matches!(launcher_source, Some(PythonLauncherSource::BundledRuntime))
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -1608,27 +1615,25 @@ pub async fn start_compute_node(
             launcher.source.clone(),
         )
     });
-    if crate::python_runtime::is_packaged_execution(
-        std::env::current_exe().ok().as_deref(),
-        manifest_dir,
+    if !packaged_launcher_source_is_valid(
+        crate::python_runtime::is_packaged_execution(
+            std::env::current_exe().ok().as_deref(),
+            manifest_dir,
+        ),
+        launcher_metadata.as_ref().map(|(_, _, _, source)| source),
     ) {
-        match launcher_metadata.as_ref().map(|(_, _, _, source)| source) {
-            Some(PythonLauncherSource::BundledRuntime) => {}
-            _ => {
-                let err = anyhow::anyhow!(
-                    "desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"
-                );
-                complete_no_child_startup_failure(
-                    &state,
-                    &request,
-                    &session_id,
-                    log_file_path.clone(),
-                    err.to_string(),
-                )
-                .await;
-                return Err(err.into());
-            }
-        }
+        let err = anyhow::anyhow!(
+            "desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"
+        );
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            &session_id,
+            log_file_path.clone(),
+            err.to_string(),
+        )
+        .await;
+        return Err(err.into());
     }
 
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
@@ -2925,6 +2930,128 @@ mod tests {
         assert!(payload
             .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
             .is_none());
+    }
+
+    #[test]
+    fn summarize_bridge_stdout_payload_allows_build_and_launcher_diagnostics_and_drops_unsafe_decoys(
+    ) {
+        let summary = summarize_bridge_stdout_payload(&serde_json::json!({
+            "type": "status",
+            "app_version": "0.1.3",
+            "build_id": "abcdef012345",
+            "target_triple": "x86_64-pc-windows-msvc",
+            "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "launcher_source": "bundled",
+            "interpreter_basename": "python.exe",
+            "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "runtime_provisioning_state": "ready",
+            "startup_phase": "starting_worker",
+            "startup_elapsed_ms": 1500,
+            "startup_deadline_ms": 60000,
+            "worker_state": "ready",
+            "worker_generation": 2,
+            "worker_restart_count": 1,
+            "worker_alive": true,
+            "last_worker_error_code": "worker_exit_nonzero",
+            "last_worker_exit_code": 1,
+            "model_path": "/Users/Example User/models/model.gguf",
+            "relay_url": "https://relay.internal.example/path?token=secret",
+            "prompt": "plaintext prompt",
+            "response": "plaintext response",
+            "api_key": "sk-super-secret",
+            "env": {"PATH": "/usr/bin", "SECRET_TOKEN": "hunter2"},
+            "interpreter_path": "/Users/Example User/AppData/Local/token.place/python-runtime/python.exe",
+        }));
+        let payload: Value = serde_json::from_str(&summary).expect("summary json");
+
+        assert!(summary.len() <= 3500);
+        assert_eq!(
+            payload.get("app_version").and_then(Value::as_str),
+            Some("0.1.3")
+        );
+        assert_eq!(
+            payload.get("build_id").and_then(Value::as_str),
+            Some("abcdef012345")
+        );
+        assert_eq!(
+            payload.get("target_triple").and_then(Value::as_str),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            payload.get("bundled_runtime_id").and_then(Value::as_str),
+            Some("bundled-cpython-3.11-win-x86_64-cu124")
+        );
+        assert_eq!(
+            payload.get("launcher_source").and_then(Value::as_str),
+            Some("bundled")
+        );
+        assert_eq!(
+            payload.get("interpreter_basename").and_then(Value::as_str),
+            Some("python.exe")
+        );
+        assert_eq!(
+            payload.get("runtime_id").and_then(Value::as_str),
+            Some("bundled-cpython-3.11-win-x86_64-cu124")
+        );
+        assert_eq!(
+            payload
+                .get("runtime_provisioning_state")
+                .and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            payload.get("startup_phase").and_then(Value::as_str),
+            Some("starting_worker")
+        );
+        assert_eq!(
+            payload.get("startup_elapsed_ms").and_then(Value::as_u64),
+            Some(1500)
+        );
+        assert_eq!(
+            payload.get("startup_deadline_ms").and_then(Value::as_u64),
+            Some(60000)
+        );
+        assert_eq!(
+            payload.get("worker_state").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            payload.get("worker_generation").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            payload.get("worker_restart_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload.get("worker_alive").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("last_worker_error_code")
+                .and_then(Value::as_str),
+            Some("worker_exit_nonzero")
+        );
+        assert_eq!(
+            payload.get("last_worker_exit_code").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        assert!(payload.get("model_path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("response").is_none());
+        assert!(payload.get("api_key").is_none());
+        assert!(payload.get("env").is_none());
+        assert!(payload.get("interpreter_path").is_none());
+        assert!(!summary.contains("Example User"));
+        assert!(!summary.contains("token=secret"));
+        assert!(!summary.contains("plaintext prompt"));
+        assert!(!summary.contains("plaintext response"));
+        assert!(!summary.contains("sk-super-secret"));
+        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("/Users/Example User"));
+        assert!(!summary.contains("python-runtime/python.exe"));
     }
 
     #[test]
@@ -5786,5 +5913,51 @@ mod tests {
             .as_ref()
             .and_then(|record| record.child.as_ref())
             .is_none());
+    }
+
+    #[test]
+    fn packaged_execution_accepts_only_bundled_runtime_launcher() {
+        assert!(packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::BundledRuntime)
+        ));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_missing_launcher() {
+        assert!(!packaged_launcher_source_is_valid(true, None));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_environment_override_launcher() {
+        assert!(!packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::EnvironmentOverride)
+        ));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_system_development_launcher() {
+        assert!(!packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::SystemDevelopmentRuntime)
+        ));
+    }
+
+    #[test]
+    fn non_packaged_execution_retains_existing_launcher_behavior_for_every_source() {
+        assert!(packaged_launcher_source_is_valid(false, None));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::BundledRuntime)
+        ));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::EnvironmentOverride)
+        ));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::SystemDevelopmentRuntime)
+        ));
     }
 }

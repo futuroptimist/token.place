@@ -3796,6 +3796,86 @@ def test_windows_installer_identity_verify_authority_removed_detects_residuals(m
         guard.verify_authority_removed(snapshot_with_target)
 
 
+def _process_completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(['powershell'], returncode, stdout, '')
+
+
+def test_windows_installer_identity_process_inventory_valid_empty_array(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    captured = tmp_path / 'token.place.exe'
+    captured.write_text('exe', encoding='utf-8')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed('[]'))
+
+    assert guard._processes_running_targets([captured]) == []
+
+
+def test_windows_installer_identity_process_inventory_matches_captured_path_despite_name(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    captured = tmp_path / 'token.place.exe'
+    captured.write_text('exe', encoding='utf-8')
+    payload = [
+        {'Name': 'unexpected-renamed.exe', 'ExecutablePath': str(captured)},
+        {'Name': 'token.place.exe', 'ExecutablePath': str(tmp_path / 'unrelated.exe')},
+    ]
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(json.dumps(payload)))
+
+    assert guard._processes_running_targets([captured]) == [str(captured)]
+
+
+def test_windows_installer_identity_process_inventory_ignores_unrelated_paths(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    captured = tmp_path / 'token.place.exe'
+    payload = [{'Name': 'token.place.exe', 'ExecutablePath': str(tmp_path / 'other' / 'token.place.exe')}]
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(json.dumps(payload)))
+
+    assert guard._processes_running_targets([captured]) == []
+
+
+@pytest.mark.parametrize(
+    ('stdout', 'returncode', 'match'),
+    [
+        ('[]', 7, 'process inventory command failed'),
+        ('', 0, 'emitted no JSON'),
+        ('not-json', 0, 'invalid JSON'),
+        (json.dumps({'Name': 'token.place.exe', 'ExecutablePath': 'C:/token.place.exe'}), 0, 'must be an array'),
+        (json.dumps([{'Name': 'token.place.exe'}]), 0, 'string Name and ExecutablePath'),
+        (json.dumps([{'Name': 42, 'ExecutablePath': 'C:/token.place.exe'}]), 0, 'string Name and ExecutablePath'),
+        (json.dumps(['C:/token.place.exe']), 0, 'entries must be objects'),
+    ],
+)
+def test_windows_installer_identity_process_inventory_fail_closed(monkeypatch, tmp_path, stdout, returncode, match) -> None:
+    guard = _load_windows_installer_identity()
+    captured = tmp_path / 'token.place.exe'
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(stdout, returncode))
+
+    with pytest.raises(guard.InstallerIdentityError, match=match):
+        guard._processes_running_targets([captured])
+
+
+def test_windows_installer_identity_cleanup_polling_propagates_process_inventory_failure(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    snapshot = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(Path('a.lnk'), Path('C:/installed/token.place.exe'))],
+            existing_targets=[Path('C:/installed/token.place.exe')],
+            missing_targets=[],
+        ),
+        registry=[],
+    )
+    monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
+    monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [])
+
+    def fail_process_inventory(targets):
+        raise guard.InstallerIdentityError('process inventory command failed')
+
+    monkeypatch.setattr(guard, '_processes_running_targets', fail_process_inventory)
+    with pytest.raises(guard.InstallerIdentityError, match='process inventory command failed'):
+        guard.wait_for_cleanup_convergence(snapshot, deadline_seconds=1, sleeper=lambda _: None)
+
 def test_windows_installer_identity_cleanup_polling_converges_without_sleeping_real_time(monkeypatch) -> None:
     guard = _load_windows_installer_identity()
     snapshot = _empty_snapshot(guard)

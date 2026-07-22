@@ -464,30 +464,45 @@ def uninstall_best_effort(log_path: Path | None = None) -> None:
     wait_for_cleanup_convergence(snapshot)
 
 
+def _parse_process_inventory(raw: str) -> list[dict[str, str]]:
+    if not raw.strip():
+        raise InstallerIdentityError("process inventory command emitted no JSON")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InstallerIdentityError("process inventory command emitted invalid JSON") from exc
+    if not isinstance(data, list):
+        raise InstallerIdentityError("process inventory JSON must be an array")
+    entries: list[dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise InstallerIdentityError("process inventory entries must be objects")
+        name = item.get("Name")
+        executable_path = item.get("ExecutablePath")
+        if not isinstance(name, str) or not isinstance(executable_path, str):
+            raise InstallerIdentityError("process inventory entries must include string Name and ExecutablePath fields")
+        entries.append({"Name": name, "ExecutablePath": executable_path})
+    return entries
+
+
 def _processes_running_targets(targets: Iterable[Path]) -> list[str]:
     wanted = {_canonical_path(target) for target in targets}
     if not wanted:
         return []
     script = r'''
-$items = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-  Where-Object { $_.ExecutablePath -and ($_.Name -match 'token\.place|tokenplace|token-place') } |
-  Select-Object Name,ExecutablePath
-$items | ConvertTo-Json -Depth 3
+$items = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+  Where-Object { $_.ExecutablePath } |
+  Select-Object Name,ExecutablePath)
+ConvertTo-Json -InputObject $items -Depth 3
 '''
     result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
-    raw = result.stdout.strip()
-    if result.returncode != 0 or not raw:
-        return []
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, dict):
-        data = [data]
+    if result.returncode != 0:
+        raise InstallerIdentityError("process inventory command failed")
+    entries = _parse_process_inventory(result.stdout)
     return [
-        str(item.get("ExecutablePath") or "")
-        for item in data
-        if _canonical_path(Path(str(item.get("ExecutablePath") or ""))) in wanted
+        entry["ExecutablePath"]
+        for entry in entries
+        if _canonical_path(Path(entry["ExecutablePath"])) in wanted
     ]
 
 

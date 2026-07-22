@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
+from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):
@@ -510,6 +510,7 @@ class TestRelayClient:
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'owner-secret'
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -519,7 +520,7 @@ class TestRelayClient:
         assert result is True
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
             timeout=relay_client._request_timeout,
         )
 
@@ -559,6 +560,7 @@ class TestRelayClient:
         client._api_v1_registered_relays.update(client._relay_urls)
         for relay_url in client._relay_urls:
             client._api_v1_last_heartbeat_at[relay_url] = 1.0
+            client._api_v1_control_credentials_by_relay[relay_url] = f'credential-{relay_url}'
         success_response = MagicMock()
         success_response.status_code = 200
         failure_response = MagicMock()
@@ -581,6 +583,7 @@ class TestRelayClient:
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
+        relay_client._api_v1_control_credentials_by_relay[relay_client.relay_url] = 'owner-secret'
         failure_response = MagicMock()
         failure_response.status_code = 503
         success_response = MagicMock()
@@ -627,6 +630,7 @@ class TestRelayClient:
         backup = 'http://backup-relay:6000'
         client._api_v1_registered_relays.update({primary, backup})
         client._api_v1_last_heartbeat_at.update({primary: 1.0, backup: 2.0})
+        client._api_v1_control_credentials_by_relay.update({primary: 'primary-secret', backup: 'backup-secret'})
         client._api_v1_relay_wait_hints = {
             primary: {'next_ping_in_x_seconds': 30},
             backup: {'next_ping_in_x_seconds': 30},
@@ -664,6 +668,7 @@ class TestRelayClient:
         """An in-flight heartbeat must not repopulate local registration after Stop/unregister."""
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._store_api_v1_control_credential(relay_client.relay_url, 'owner-secret')
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 0.0
         relay_client._api_v1_relay_wait_hints[relay_client.relay_url] = {
             "next_ping_in_x_seconds": 1,
@@ -799,6 +804,7 @@ class TestRelayClient:
 
         client._api_v1_registered_relays.add(client.relay_url)
         client._api_v1_last_heartbeat_at[client.relay_url] = 1.0
+        client._api_v1_control_credentials_by_relay[client.relay_url] = 'owner-secret'
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -981,6 +987,7 @@ class TestRelayClient:
         client._api_v1_registered_relays.update(client._relay_urls)
         for relay_url in client._relay_urls:
             client._api_v1_last_heartbeat_at[relay_url] = 1.0
+            client._api_v1_control_credentials_by_relay[relay_url] = f'credential-{relay_url}'
         success_response = MagicMock()
         success_response.status_code = 200
         success_response.json.return_value = TEST_NO_REQUEST_RESPONSE
@@ -1737,13 +1744,14 @@ class TestRelayClient:
         client._relay_urls = [prefixed_url]
         client._api_v1_registered_relays.add(prefixed_url)
         client._api_v1_last_heartbeat_at[prefixed_url] = 1.0
+        client._api_v1_control_credentials_by_relay[prefixed_url] = 'owner-secret'
         mock_post.return_value = MagicMock(status_code=200)
 
         assert client.unregister_from_relay() is True
 
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/servers/unregister',
-            json={'server_public_key': 'mock_public_key_b64'},
+            json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
             timeout=15,
         )
 
@@ -4276,6 +4284,7 @@ def test_unregister_from_relay_falls_back_to_legacy_unregister_on_404(mock_post)
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     api_v1_missing = MagicMock(status_code=404)
     legacy_success = MagicMock(status_code=200)
     mock_post.side_effect = [api_v1_missing, legacy_success]
@@ -4297,6 +4306,7 @@ def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregist
     client._relay_urls = [prefixed_url]
     client._api_v1_registered_relays.add(prefixed_url)
     client._api_v1_last_heartbeat_at[prefixed_url] = 123.0
+    client._api_v1_control_credentials_by_relay[prefixed_url] = 'owner-secret'
     api_v1_missing = MagicMock(status_code=404)
     legacy_success = MagicMock(status_code=200)
     mock_post.side_effect = [api_v1_missing, legacy_success]
@@ -4316,6 +4326,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
     client._api_v1_relay_wait_hints = {'http://localhost:5000': {'next_ping_in_x_seconds': 30}}
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
@@ -4323,7 +4334,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
 
     mock_post.assert_called_once_with(
         'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
@@ -4338,13 +4349,14 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
     client._unregister_complete = True
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
     mock_post.return_value = MagicMock(status_code=200)
 
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
         'http://localhost:5000/api/v1/relay/servers/unregister',
-        json={'server_public_key': 'mock_public_key_b64'},
+        json={'server_public_key': 'mock_public_key_b64', 'control_credential': 'owner-secret'},
         timeout=15,
     )
     assert client._api_v1_registered_relays == set()
@@ -4356,6 +4368,7 @@ def test_unregister_from_relay_logs_control_plane_429_diagnostic(mock_post, capl
     client._registration_token = 'super-secret-token'
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'
 
     response = MagicMock(status_code=429)
     response.headers = {
@@ -4438,7 +4451,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     client._unregister_complete = True
 
     register_response = MagicMock(status_code=200)
-    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0, 'control_credential': 'owner-secret'}
     unregister_response = MagicMock(status_code=200)
 
     def fake_post(url, *args, **kwargs):
@@ -4472,6 +4485,7 @@ def test_poll_exception_after_shutdown_latch_preserves_registration_for_unregist
     relay_url = 'http://localhost:5000'
     client.start()
     client._api_v1_registered_relays.add(relay_url)
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
     client._api_v1_relay_wait_hints[relay_url] = {
         'next_ping_in_x_seconds': 30,
@@ -4546,6 +4560,7 @@ def test_long_poll_timeout_after_shutdown_latch_does_not_mutate_heartbeat_state(
     relay_url = 'http://localhost:5000'
     client.start()
     client._api_v1_registered_relays.add(relay_url)
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
     client._api_v1_relay_wait_hints[relay_url] = {
         'next_ping_in_x_seconds': 30,
@@ -5778,6 +5793,7 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
     client._api_v1_registered_relays.add(client.relay_url)
+    client._store_api_v1_control_credential(client.relay_url, 'owner-secret')
     client._api_v1_last_heartbeat_at[client.relay_url] = time.monotonic()
     client.crypto_manager.decrypt_message.side_effect = [
         _api_v1_decrypted_payload(request_id="req-heartbeat-1"),
@@ -5788,7 +5804,7 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
         "cipherkey": "encrypted_key",
         "iv": "encrypted_iv",
     }
-    client._post_api_v1_response = MagicMock(return_value=True)
+    client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
 
     first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
 
@@ -7252,7 +7268,6 @@ def test_api_v1_shutdown_latch_waits_for_inflight_mutation_and_blocks_new_regist
 def test_process_client_request_does_not_submit_response_after_shutdown_latch():
     manager = _AdmissionManager()
     client = _api_v1_validation_client(manager)
-    client._api_v1_registered_relays.add(client.relay_url)
     client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
         request_id="req-shutdown-latched"
     )
@@ -7266,7 +7281,7 @@ def test_process_client_request_does_not_submit_response_after_shutdown_latch():
         return original_generate(*args, **kwargs)
 
     client._generate_api_v1_response_with_runtime_model = blocked_generate
-    client._post_api_v1_response = MagicMock(return_value=True)
+    client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
     result_holder = {}
 
     worker = threading.Thread(
@@ -7290,7 +7305,7 @@ def test_process_client_request_does_not_submit_response_after_shutdown_latch():
 
 
 @patch('utils.networking.relay_client.requests.post')
-def test_reset_api_v1_polling_session_clear_registration_clears_control_credentials(mock_post):
+def test_reset_api_v1_polling_session_preserves_control_credentials(mock_post):
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
@@ -7300,7 +7315,7 @@ def test_reset_api_v1_polling_session_clear_registration_clears_control_credenti
 
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}
-    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == ''
+    assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'reset-secret'
 
 
 @patch('utils.networking.relay_client.requests.post')
@@ -7368,10 +7383,859 @@ def test_api_v1_background_heartbeat_preserves_and_rotates_control_credential(mo
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
 
 
+def test_api_v1_deadline_metadata_uses_smaller_and_never_extends(monkeypatch):
+    client = _standalone_relay_client()
+    now = {'value': 1000.0}
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+
+    deadline = client._api_v1_initial_deadline_from_metadata({
+        'request_deadline_remaining_seconds': 10,
+        'request_ttl_seconds': 30,
+    })
+    assert deadline == 1010.0
+    shortened = client._api_v1_deadline_after_response(deadline, {'request_ttl_seconds': 3})
+    assert shortened == 1003.0
+    extended = client._api_v1_deadline_after_response(shortened, {'request_deadline_remaining_seconds': 300})
+    assert extended == shortened
+    assert client._api_v1_initial_deadline_from_metadata({'request_ttl_seconds': True}) == 1300.0
+
+
+@pytest.mark.parametrize('raw,expected', [(0, 1.0), (0.25, 1.0), (11, 10.0), ('bad', 1.0), (3, 3.0)])
+def test_api_v1_control_next_poll_seconds_clamped(raw, expected):
+    assert RelayClient._api_v1_control_next_poll_seconds(raw) == expected
+
+
+def test_api_v1_registration_heartbeat_omission_preserves_independent_credentials(monkeypatch):
+    client = _standalone_relay_client()
+    responses = [
+        {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-a'},
+        {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-b'},
+        {'next_ping_in_x_seconds': 30},
+    ]
+
+    def fake_post(*_args, **_kwargs):
+        response = MagicMock(status_code=200)
+        response.json.return_value = responses.pop(0)
+        return response
+
+    monkeypatch.setattr(relay_client_module.requests, 'post', fake_post)
+    assert client.register_api_v1_compute_node('https://relay-a.example') == {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-a'}
+    assert client.register_api_v1_compute_node('https://relay-b.example') == {'next_ping_in_x_seconds': 30, 'control_credential': 'cred-b'}
+    assert client.register_api_v1_compute_node('https://relay-a.example') == {'next_ping_in_x_seconds': 30}
+    assert client._api_v1_control_credential_for_relay('https://relay-a.example') == 'cred-a'
+    assert client._api_v1_control_credential_for_relay('https://relay-b.example') == 'cred-b'
+
+
+@pytest.mark.parametrize(
+    'status,expected_reason,ack_count',
+    [
+        ('cancelled', 'cancelled', 1),
+        ('expired', 'expired', 1),
+        ('completed/unavailable', 'completed_unavailable', 0),
+    ],
+)
+def test_api_v1_control_terminal_state_stops_work_and_suppresses_submission(monkeypatch, status, expected_reason, ack_count):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def generate(**_kwargs):
+        started.set()
+        release.wait(2)
+        return {'request_id': 'late', 'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}}}
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': status}
+        started.wait(1)
+        return {'status': status, 'next_poll_seconds': 1}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert result is None
+    assert stopped == [expected_reason]
+    assert len(acks) == ack_count
+
+
+def test_api_v1_local_deadline_stops_before_next_control_poll(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    control_calls = []
+    stopped = []
+
+    def generate(**_kwargs):
+        release.wait(2)
+        return {'request_id': 'late'}
+
+    def control(**_kwargs):
+        control_calls.append(time.monotonic())
+        return {'status': 'active', 'next_poll_seconds': 10}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    started = time.monotonic()
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.2,
+    })
+
+    assert result is None
+    assert stopped == ['local_deadline']
+    assert control_calls
+    assert time.monotonic() - started < 1.0
+
+
+def test_api_v1_control_403_fail_closed_stops_without_ack():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    stopped = []
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+    client._post_api_v1_request_control = lambda **_kwargs: (_ for _ in ()).throw(PermissionError('api_v1_control_owner_proof_failed'))
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req', 'model': 'm', 'messages': [], 'options': {},
+        'routing': {'context_tier': '8k-fast'}, 'request_ttl_seconds': 30,
+    }) is None
+    assert stopped == ['owner_proof_failed']
+
+
+def test_api_v1_terminal_cleanup_unblocks_and_drains_inference_before_return():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    started = threading.Event()
+
+    def _hung_generate(**_kwargs):
+        started.set()
+        release.wait()
+        return {'request_id': 'late'}
+
+    client._generate_api_v1_response_with_runtime_model = _hung_generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+
+    def terminate_worker(reason, recreate=True):
+        release.set()
+        return True
+
+    client._terminate_current_llama_worker = MagicMock(side_effect=terminate_worker)
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-hung',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    try:
+        assert started.is_set()
+        assert outcome.response_envelope is None
+        assert outcome.terminal_code == 'cancelled'
+        assert outcome.runtime_healthy is True
+        assert outcome.recovery_succeeded is True
+        assert outcome.submission_allowed is False
+        assert client.stop_polling is True
+        client._terminate_current_llama_worker.assert_called_once_with('cancelled', recreate=True)
+    finally:
+        release.set()
+
+
+def test_api_v1_completed_future_at_deadline_boundary_is_consumed_once():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    # Legacy/no-control path still supervises deadline but must not recycle a
+    # quiesced worker simply because observing the completed future crosses it.
+    deadline = time.monotonic() + 0.2
+    generated = []
+    terminate = MagicMock(return_value=True)
+
+    def generate(**_kwargs):
+        generated.append(True)
+        return {
+            'request_id': 'req-boundary',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'ok'}},
+        }
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = terminate
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-boundary',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+    }, local_deadline=deadline)
+
+    assert generated == [True]
+    assert outcome.response_envelope['request_id'] == 'req-boundary'
+    assert outcome.submission_allowed is True
+    terminate.assert_not_called()
+
+
+def test_api_v1_blocked_control_io_observes_operator_stop_without_waiting_for_post():
+    """Operator stop terminates supervision even when a control HTTP call is in-flight.
+
+    The control POST runs directly in the control executor thread with a bounded
+    HTTP timeout (_API_V1_MAX_CONTROL_TIMEOUT_SECONDS, strictly below the cleanup
+    budget).  No daemon thread is spawned.  On operator stop the supervisor sets
+    the terminal flag, terminates the worker (which releases inference), and then
+    the shared cleanup deadline in the finally block drains the control future
+    before executor.shutdown(wait=True).
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    # Use a short request timeout so the control HTTP timeout is also short,
+    # letting the blocking mock release quickly via its timeout argument.
+    client._request_timeout = 0.2
+    control_entered = threading.Event()
+    release_inference = threading.Event()
+    http_release = threading.Event()
+    result_holder = {}
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'late'}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    # Worker termination releases inference; the control future drains on its own timeout.
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    def blocking_requests_post(*args, **kwargs):
+        # Signal that the HTTP call has started, then block until explicitly released
+        # or until the timeout kwarg elapses (simulating a slow-but-bounded HTTP call).
+        timeout = kwargs.get('timeout', 30)
+        control_entered.set()
+        http_release.wait(float(timeout) if timeout is not None else 30)
+        raise relay_client_module.requests.ConnectionError('test_interrupted')
+
+    def supervise():
+        result_holder['outcome'] = client._supervise_api_v1_inference({
+            'request_id': 'req-control-stop',
+            'model': 'llama-3-8b-instruct',
+            'messages': [],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+        }, local_deadline=time.monotonic() + 5)
+
+    # Patch module-level requests.post so the control executor thread (which runs
+    # _post_api_v1_request_control directly, with no daemon sub-thread) uses the
+    # blocking mock.  The mock respects the timeout kwarg so the control future
+    # completes naturally within the cleanup budget.
+    with patch.object(relay_client_module.requests, 'post', blocking_requests_post):
+        thread = threading.Thread(target=supervise)
+        thread.start()
+        assert control_entered.wait(1)
+        client.stop()
+        thread.join(3)
+    try:
+        assert not thread.is_alive(), 'supervisor did not return after operator stop'
+        outcome = result_holder['outcome']
+        assert outcome.response_envelope is None
+        assert outcome.terminal_code == 'operator_stop'
+        assert outcome.submission_allowed is False
+        # No request-scoped executor threads survive after shutdown(wait=True).
+        assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
+        assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
+    finally:
+        http_release.set()  # Safety: unblock the mock in case it is still waiting.
+        release_inference.set()
+        thread.join(1)
+
+
+def test_api_v1_slow_control_io_does_not_permanently_stop_polling():
+    """Control I/O latency alone must not set _polling_stopped_by_request."""
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release_inference = threading.Event()
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'ok'}
+
+    # Control immediately returns a terminal status (simulating a slow-but-successful poll).
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-slow-control',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    # Terminal due to cancellation, but inference quiesced cleanly → healthy worker.
+    assert outcome.terminal_code == 'cancelled'
+    assert outcome.submission_allowed is False
+    assert outcome.runtime_healthy is True
+    # Polling must NOT be permanently disabled by routine control completion.
+    assert not client._polling_stopped_by_request
+
+
+def test_api_v1_stuck_inference_sets_polling_stopped_by_request():
+    """Only a stuck inference thread permanently sets _polling_stopped_by_request."""
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    result_holder = {}
+    # Use an unblockable event so test cleanup can release the stuck inference thread.
+    unblock_inference = threading.Event()
+
+    def generate(**_kwargs):
+        # Simulate stuck inference: blocks until explicitly unblocked by test cleanup.
+        unblock_inference.wait(30)
+        return {'request_id': 'ok'}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **_kwargs: {'status': 'cancelled'}
+    # Worker termination does NOT release the inference blocker (simulates stuck subprocess).
+    client._terminate_current_llama_worker = lambda reason, recreate=True: False
+
+    # fatal_bridge_teardown unblocks the stuck inference thread so that the shared
+    # cleanup deadline in the finally block can drain the executor with shutdown(wait=True).
+    def fatal_teardown(reason=None):
+        unblock_inference.set()
+        return True
+
+    client.fatal_bridge_teardown = fatal_teardown
+
+    def supervise():
+        result_holder['outcome'] = client._supervise_api_v1_inference({
+            'request_id': 'req-stuck',
+            'model': 'llama-3-8b-instruct',
+            'messages': [],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+            'request_deadline_remaining_seconds': 0.15,
+        })
+
+    thread = threading.Thread(target=supervise, daemon=True)
+    thread.start()
+    try:
+        thread.join(3)
+        assert not thread.is_alive(), 'supervisor must return even when inference is stuck'
+        outcome = result_holder['outcome']
+        assert outcome.runtime_healthy is False
+        # Permanently stop polling when inference thread cannot be quiesced.
+        assert client._polling_stopped_by_request is True
+    finally:
+        # Safety: unblock inference thread in case fatal_teardown was not called.
+        unblock_inference.set()
+        thread.join(1)
+
+
+def test_api_v1_executor_cleanup_timeout_invokes_fatal_bridge_teardown():
+    """Stuck control I/O past the cleanup deadline triggers fatal_bridge_teardown.
+
+    A requests timeout is not a guaranteed wall-clock bound (DNS stalls, kernel
+    delays, or misbehaving adapters can outlive it).  If a request-owned executor
+    thread remains alive at the shared cleanup deadline in the finally block, the
+    supervisor must call fatal_bridge_teardown rather than block in
+    executor.shutdown(wait=True).
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    result_holder = {}
+    release_inference = threading.Event()
+    http_release = threading.Event()
+    fatal_calls = []
+
+    def generate(**_kwargs):
+        release_inference.wait(2)
+        return {'request_id': 'ok'}
+
+    def blocking_control_post(*args, **kwargs):
+        # Intentionally ignore the timeout kwarg to simulate a kernel/DNS stall
+        # that outlives requests' own timeout argument.
+        http_release.wait(5)
+        raise relay_client_module.requests.ConnectionError('stalled')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (
+        release_inference.set() or True
+    )
+
+    def fatal_teardown(reason=None):
+        # Release the stuck control thread so the finally block can safely drain.
+        fatal_calls.append(reason)
+        http_release.set()
+
+    client.fatal_bridge_teardown = fatal_teardown
+
+    # Use a very short local deadline so control I/O is still in-flight when
+    # the supervisor breaks out of the poll loop.
+    local_deadline = time.monotonic() + 0.05
+
+    def supervise():
+        with patch.object(relay_client_module.requests, 'post', blocking_control_post):
+            with patch.object(relay_client_module, '_API_V1_CLEANUP_BUDGET_SECONDS', 0.1):
+                result_holder['outcome'] = client._supervise_api_v1_inference({
+                    'request_id': 'req-stuck-control',
+                    'model': 'llama-3-8b-instruct',
+                    'messages': [],
+                    'options': {},
+                    'routing': {'context_tier': '8k-fast'},
+                }, local_deadline=local_deadline)
+
+    thread = threading.Thread(target=supervise, daemon=True)
+    thread.start()
+    try:
+        thread.join(3)
+        assert not thread.is_alive(), 'supervisor must return even when control is stuck'
+        assert fatal_calls, 'fatal_bridge_teardown must be called when control future is stuck'
+        assert fatal_calls[0] == 'api_v1_executor_cleanup_timeout'
+        # No request-scoped executor threads survive after cleanup.
+        assert not any(t.name.startswith('api_v1_control') for t in threading.enumerate())
+        assert not any(t.name.startswith('api_v1_inference') for t in threading.enumerate())
+    finally:
+        http_release.set()
+        release_inference.set()
+        thread.join(1)
+
+
+def test_api_v1_missing_control_credential_fails_closed_without_worker_termination():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    generate = MagicMock(return_value={'request_id': 'unexpected'})
+    terminate = MagicMock()
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = terminate
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-missing-credential',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.response_envelope is None
+    assert outcome.terminal_code == 'missing_control_credential'
+    assert outcome.runtime_healthy is True
+    assert outcome.recovery_attempted is False
+    assert outcome.submission_allowed is False
+    generate.assert_not_called()
+    terminate.assert_not_called()
+
+
+def test_terminate_current_llama_worker_fallback_returns_false_without_verified_kill():
+    """_terminate_current_llama_worker fallback must not claim success without process verification."""
+    client = _standalone_relay_client()
+    close_called = []
+
+    class _FakeLlm:
+        def close(self):
+            close_called.append(True)
+
+    # Manager has no terminate_active_worker_for_cancellation but has llm.close()
+    manager = MagicMock(spec=[])  # No terminate_active_worker_for_cancellation
+    manager.llm = _FakeLlm()
+    client.model_manager = manager
+
+    result = client._terminate_current_llama_worker('cancelled')
+
+    # close() is attempted for best-effort cleanup but cannot verify process death
+    assert close_called == [True]
+    # Returns False because process termination is unverified
+    assert result is False
+
+
+def test_terminate_current_llama_worker_returns_false_with_no_manager():
+    """_terminate_current_llama_worker returns False when model_manager is absent."""
+    client = _standalone_relay_client()
+    client.model_manager = None
+    assert client._terminate_current_llama_worker('cancelled') is False
+
+
+def test_terminate_active_worker_for_cancellation_closes_old_worker_and_recreates():
+    from utils.llm.model_manager import ModelManager
+
+    config = MagicMock()
+    config.get.side_effect = lambda key, default=None: {'model.use_mock': True, 'paths.models_dir': '/tmp'}.get(key, default)
+    manager = ModelManager(config)
+    old = MagicMock()
+    old.is_alive.return_value = True
+    manager.llm = old
+    manager.worker_state = 'ready'
+    created = MagicMock()
+    manager.get_llm_instance = MagicMock(return_value=created)
+
+    manager.terminate_active_worker_for_cancellation(reason='cancelled')
+
+    old.close.assert_not_called()
+    manager.get_llm_instance.assert_called_once()
+    assert manager.llm is None
+    assert manager.last_worker_error_code == 'cancelled'
+    assert manager.worker_restart_count == 1
+
+
+def test_extract_api_v1_request_payload_ignores_plaintext_deadline_metadata():
+    payload = relay_client_module._extract_api_v1_request_payload({
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'request_id': 'req-plaintext-deadline',
+        'client_public_key': 'client-key',
+        'api_v1_request': {
+            'model': 'llama-3-8b-instruct',
+            'messages': [{'role': 'user', 'content': 'hello'}],
+            'options': {},
+            'routing': {'context_tier': '8k-fast'},
+        },
+        'request_deadline_remaining_seconds': 9999,
+        'request_ttl_seconds': 9999,
+    }, 'client-key')
+
+    assert payload is not None
+    assert 'request_deadline_remaining_seconds' not in payload
+    assert 'request_ttl_seconds' not in payload
+
+
+def test_api_v1_legacy_unregistered_inference_is_supervised_for_deadline():
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://legacy-relay.example'
+    release = threading.Event()
+    stopped = []
+    control_calls = []
+
+    def generate(**_kwargs):
+        release.wait(2)
+        return {'request_id': 'late', 'api_v1_response': {'message': {'content': 'late'}}}
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = lambda **kwargs: control_calls.append(kwargs)
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    started = time.monotonic()
+    result = client._run_api_v1_inference_with_control({
+        'request_id': 'req-legacy-deadline',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.05,
+    })
+
+    assert result is None
+    assert stopped == ['local_deadline']
+    assert control_calls == []
+    assert time.monotonic() - started < 1.0
+
+
+def test_api_v1_control_timeout_is_strictly_less_than_remaining_deadline(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    timeouts = []
+    stopped = []
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+
+    def control(**kwargs):
+        timeouts.append(kwargs['timeout_seconds'])
+        return {'status': 'cancelled'}
+
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req-timeout',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 0.1,
+    }) is None
+
+    assert stopped == ['cancelled']
+    assert timeouts
+    assert all(0 < timeout < 0.1 for timeout in timeouts if timeout != relay_client_module._API_V1_CONTROL_ACK_TIMEOUT_SECONDS)
+
+
+def test_api_v1_control_retries_transient_statuses_and_network_errors(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    release = threading.Event()
+    stopped = []
+    sleeps = []
+    now = {'value': 1000.0}
+    monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+    responses = [
+        requests.RequestException('network'),
+        requests.RequestException('HTTP 429'),
+        requests.RequestException('HTTP 500'),
+        requests.RequestException('HTTP 502'),
+        requests.RequestException('HTTP 503'),
+        requests.RequestException('HTTP 504'),
+        {'status': 'cancelled'},
+    ]
+
+    client._generate_api_v1_response_with_runtime_model = lambda **_kwargs: (release.wait(2) or {'request_id': 'late'})
+
+    def control(**_kwargs):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    class Wakeup:
+        def wait(self, seconds):
+            sleeps.append(seconds)
+            now['value'] += max(seconds, 1.0)
+            return False
+
+        def clear(self):
+            pass
+
+    client._api_v1_control_wakeup = Wakeup()
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: (stopped.append(reason), release.set())
+
+    assert client._run_api_v1_inference_with_control({
+        'request_id': 'req-retry',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_deadline_remaining_seconds': 120,
+    }) is None
+
+    assert stopped == ['cancelled']
+    assert responses == []
+    assert sleeps
+
+
+@pytest.mark.parametrize('status_code', [429, 500, 501, 502, 503, 504, 599])
+def test_post_api_v1_request_control_retries_all_5xx_and_429(monkeypatch, status_code):
+    client = _standalone_relay_client()
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    response = MagicMock(status_code=status_code)
+    monkeypatch.setattr(relay_client_module.requests, 'post', MagicMock(return_value=response))
+
+    with pytest.raises(relay_client_module.requests.RequestException):
+        client._post_api_v1_request_control(
+            relay_url='https://relay.example',
+            request_id='req-status',
+            timeout_seconds=0.1,
+        )
+
+
+def test_post_api_v1_response_rechecks_cancellation_after_encryption_before_http(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    cancel_event = threading.Event()
+    snapshot = (7, cancel_event)
+    client.model_manager = SimpleNamespace(
+        cancellation_generation_cancelled=lambda candidate: candidate == snapshot and cancel_event.is_set()
+    )
+
+    def encrypt_message(_payload, _client_key):
+        cancel_event.set()
+        return {'chat_history': 'ciphertext', 'cipherkey': 'key', 'iv': 'iv'}
+
+    client.crypto_manager.encrypt_message = encrypt_message
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    outcome = client._post_api_v1_response(
+        {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-cancel-window',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}},
+        },
+        client_pub_key_b64='client-key',
+        client_pub_key=b'client-key',
+        cancel_snapshot=snapshot,
+        local_deadline=relay_client_module.time.monotonic() + 10,
+    )
+
+    assert outcome.submitted is False
+    assert outcome.suppressed is True
+    assert outcome.suppressed_code == 'request_cancelled'
+    post.assert_not_called()
+
+
+def test_post_api_v1_response_rechecks_operator_stop_after_encryption_before_http(monkeypatch):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    def encrypt_message(_payload, _client_key):
+        client._polling_stopped_by_request = True
+        return {'chat_history': 'ciphertext', 'cipherkey': 'key', 'iv': 'iv'}
+
+    client.crypto_manager.encrypt_message = encrypt_message
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    outcome = client._post_api_v1_response(
+        {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-stop-window',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'late'}},
+        },
+        client_pub_key_b64='client-key',
+        client_pub_key=b'client-key',
+        local_deadline=relay_client_module.time.monotonic() + 10,
+    )
+    assert outcome.submitted is False
+    assert outcome.suppressed is True
+    assert outcome.suppressed_code == 'operator_stop'
+    post.assert_not_called()
+
+
+def test_process_client_request_result_three_part_snapshot_activates_cancellation_guard(monkeypatch):
+    """Cancellation after response encryption begins suppresses all submission.
+
+    Regression: cancellation_generation_snapshot() returns a 3-tuple.  The
+    request must carry that opaque token into _post_api_v1_response(), recheck it
+    after encryption/preparation, and return submission_allowed=False so the
+    desktop bridge is not eligible to submit a generic error afterward.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    cancel_event = threading.Event()
+    snapshot_3 = (1, cancel_event, 0)
+    client.model_manager = SimpleNamespace(
+        cancellation_generation_snapshot=lambda: snapshot_3,
+        cancellation_generation_cancelled=lambda s: s == snapshot_3 and cancel_event.is_set(),
+    )
+
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-3part-snapshot",
+        "client_public_key": TEST_VALID_RESPONSE["client_public_key"],
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {},
+            "routing": {"context_tier": "8k-fast"},
+        },
+    }
+    client.crypto_manager.decrypt_message = MagicMock(return_value=decrypted_payload)
+    encryption_started = threading.Event()
+    release_encryption = threading.Event()
+
+    def encrypt_message(_payload, _client_key):
+        encryption_started.set()
+        assert release_encryption.wait(timeout=2.0)
+        return {"chat_history": "cipher", "cipherkey": "k", "iv": "iv"}
+
+    client.crypto_manager.encrypt_message = MagicMock(side_effect=encrypt_message)
+    response_envelope = {
+        "request_id": "req-3part-snapshot",
+        "api_v1_response": {"message": {"role": "assistant", "content": "reply"}},
+    }
+    client._generate_api_v1_response_with_runtime_model = MagicMock(return_value=response_envelope)
+    post = MagicMock()
+    monkeypatch.setattr(relay_client_module.requests, 'post', post)
+
+    result_holder = {}
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            'result', client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+        ),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert encryption_started.wait(timeout=2.0)
+        cancel_event.set()
+        release_encryption.set()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+    finally:
+        release_encryption.set()
+        worker.join(timeout=2.0)
+
+    result = result_holder['result']
+    assert result.submitted is False
+    assert result.submission_allowed is False
+    assert result.safe_error_code == 'request_cancelled'
+    post.assert_not_called()
+
+
+def test_worker_fallback_close_error_logs_only_safe_exception_type(caplog):
+    client = _standalone_relay_client()
+
+    class SecretBearingError(RuntimeError):
+        pass
+
+    secret = 'credential=owner-secret prompt=private model_output=leaked'
+    llm = SimpleNamespace(close=MagicMock(side_effect=SecretBearingError(secret)))
+    client.model_manager = SimpleNamespace(llm=llm)
+
+    with caplog.at_level('WARNING', logger='relay_client'):
+        assert client._terminate_current_llama_worker('local_deadline') is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'api_v1.worker_fallback_close_error' in log_text
+    assert 'exc_type=SecretBearingError' in log_text
+    assert secret not in log_text
+    assert 'owner-secret' not in log_text
+    assert 'private' not in log_text
+    assert 'leaked' not in log_text
+
+
 def test_process_client_request_post_race_after_generation_returns_shutdown_without_network():
     manager = _AdmissionManager()
     client = _api_v1_validation_client(manager)
-    client._api_v1_registered_relays.add(client.relay_url)
     client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
         request_id="req-post-race"
     )
@@ -7417,6 +8281,7 @@ def test_process_client_request_post_race_after_generation_returns_shutdown_with
 def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add("http://localhost:5000")
+    client._store_api_v1_control_credential("http://localhost:5000", 'owner-secret')
     client._api_v1_last_heartbeat_at["http://localhost:5000"] = 123.0
     client.crypto_manager.encrypt_message.return_value = {"ciphertext": "cipher", "nonce": "nonce"}
     response_envelope = client._api_v1_response_envelope(
@@ -7475,6 +8340,7 @@ def test_admitted_response_blocks_unregister_until_response_mutation_finishes():
 def test_blocked_register_deadline_preserves_registration_for_retry_unregister_final():
     client = _standalone_relay_client()
     relay_url = "http://localhost:5000"
+    client._store_api_v1_control_credential(relay_url, 'owner-secret')
     register_entered = threading.Event()
     release_register = threading.Event()
     register_done = threading.Event()
@@ -7557,3 +8423,281 @@ def test_submit_api_v1_error_response_after_shutdown_latch_skips_network(mock_po
     ) is False
     client.crypto_manager.encrypt_message.assert_not_called()
     mock_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Inference-exception / cancellation race regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_api_v1_inference_exception_with_no_terminal_control_returns_no_submit():
+    """An exception raised by inference with no concurrent terminal control yields
+    a typed no-submit inference_failure outcome without retrying.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    # No control registration – inference-only path
+    stopped = []
+    unblock = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        unblock.set()
+        raise InferenceError('model exploded')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-fail',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'inference_failure'
+    assert stopped == ['inference_failure']
+
+
+def test_api_v1_inference_exception_with_concurrent_cancelled_control_cancellation_wins():
+    """When inference raises concurrently with a completed ``cancelled`` control result,
+    the authoritative relay-side state wins: worker is terminated, response suppressed,
+    and exactly one acknowledgment is sent.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    # Barrier: inference waits until the control future has reported cancelled.
+    control_done = threading.Event()
+    inference_released = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        # Wait until control has responded before raising so the race is deterministic.
+        control_done.wait(timeout=2.0)
+        inference_released.set()
+        raise InferenceError('simultaneous failure')
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': 'cancelled'}
+        result = {'status': 'cancelled'}
+        control_done.set()
+        return result
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-race-cancel',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    # cancelled control state wins over inference_failure
+    assert outcome.terminal_code == 'cancelled'
+    assert stopped == ['cancelled']
+    assert len(acks) == 1
+
+
+def test_api_v1_inference_exception_with_concurrent_expired_control_expiry_wins():
+    """When inference raises concurrently with a completed ``expired`` control result,
+    the relay-side expiry state wins over inference_failure.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    client._api_v1_registered_relays.add('https://relay.example')
+    client._api_v1_control_credentials_by_relay['https://relay.example'] = 'cred'
+    stopped = []
+    acks = []
+    control_done = threading.Event()
+
+    class InferenceError(RuntimeError):
+        pass
+
+    def generate(**_kwargs):
+        control_done.wait(timeout=2.0)
+        raise InferenceError('expired and failed simultaneously')
+
+    def control(**kwargs):
+        if kwargs.get('acknowledge'):
+            acks.append(True)
+            return {'status': 'expired'}
+        result = {'status': 'expired'}
+        control_done.set()
+        return result
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._post_api_v1_request_control = control
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-race-expired',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'expired'
+    assert stopped == ['expired']
+    assert len(acks) == 1
+
+
+def test_api_v1_inference_custom_base_exception_does_not_escape_supervisor():
+    """A custom BaseException (not Exception) raised by inference must not escape
+    the supervisor; it must be absorbed and return a typed no-submit outcome.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+    stopped = []
+
+    class InfraFailure(BaseException):
+        pass
+
+    def generate(**_kwargs):
+        raise InfraFailure('infra crash')
+
+    client._generate_api_v1_response_with_runtime_model = generate
+    client._terminate_current_llama_worker = lambda reason, recreate=True: stopped.append(reason) or True
+
+    # Must not raise – exception must be absorbed by the supervisor.
+    outcome = client._supervise_api_v1_inference({
+        'request_id': 'req-base-exc',
+        'model': 'llama-3-8b-instruct',
+        'messages': [],
+        'options': {},
+        'routing': {'context_tier': '8k-fast'},
+        'request_ttl_seconds': 30,
+    })
+
+    assert outcome.submission_allowed is False
+    assert outcome.terminal_code == 'inference_failure'
+    assert stopped == ['inference_failure']
+
+
+# ---------------------------------------------------------------------------
+# _post_api_v1_response log-safety regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, monkeypatch):
+    """Encryption failure must log exc_type only; no credentials, keys, prompts,
+    request bodies, or model output may appear in log output.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    sentinel_credential = 'owner-token-SENTINEL_CRED_12345'
+    sentinel_key = 'client-pubkey-SENTINEL_KEY_ABCDE'
+    sentinel_prompt = 'SENTINEL_PROMPT_CONTENT_XYZ'
+    sentinel_output = 'SENTINEL_MODEL_OUTPUT_789'
+
+    class EncryptionFailureWithSensitiveData(RuntimeError):
+        pass
+
+    def bad_encrypt(_payload, _key):
+        raise EncryptionFailureWithSensitiveData(
+            f'cred={sentinel_credential} key={sentinel_key} '
+            f'prompt={sentinel_prompt} output={sentinel_output}'
+        )
+
+    client.crypto_manager.encrypt_message = bad_encrypt
+    monkeypatch.setattr(relay_client_module.requests, 'post', MagicMock())
+
+    with caplog.at_level('ERROR', logger='relay_client'):
+        outcome = client._post_api_v1_response(
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-enc-fail',
+                'api_v1_response': {'message': {'role': 'assistant', 'content': sentinel_output}},
+            },
+            client_pub_key_b64=sentinel_key,
+            client_pub_key=b'raw-key',
+        )
+
+    assert outcome.transport_failed is True
+    assert outcome.submitted is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'exc_type=EncryptionFailureWithSensitiveData' in log_text
+    # Sensitive values must not appear in any log record
+    assert sentinel_credential not in log_text
+    assert sentinel_key not in log_text
+    assert sentinel_prompt not in log_text
+    assert sentinel_output not in log_text
+    # Traceback frames (exc_info) must not appear
+    assert 'Traceback' not in log_text
+    assert 'EncryptionFailureWithSensitiveData: ' not in log_text
+
+
+def test_post_api_v1_response_http_transport_failure_logs_no_sensitive_data(caplog, monkeypatch):
+    """HTTP transport failure must log exc_type only; no credentials, keys, prompts,
+    request bodies, or model output may appear in log output.
+    """
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = 'https://relay.example'
+
+    sentinel_credential = 'relay-auth-SENTINEL_CRED_TRANSPORT'
+    sentinel_prompt = 'user-prompt-SENTINEL_TRANSPORT_PROMPT'
+    sentinel_output = 'model-out-SENTINEL_TRANSPORT_OUTPUT'
+
+    import requests as requests_lib
+
+    class TransportFailureWithSensitiveData(requests_lib.exceptions.RequestException):
+        pass
+
+    client.crypto_manager.encrypt_message.return_value = {
+        'chat_history': 'ciphertext',
+        'cipherkey': 'key',
+        'iv': 'iv',
+    }
+
+    def bad_post(url, **kwargs):
+        raise TransportFailureWithSensitiveData(
+            f'token={sentinel_credential} prompt={sentinel_prompt} output={sentinel_output}'
+        )
+
+    monkeypatch.setattr(relay_client_module.requests, 'post', bad_post)
+
+    with caplog.at_level('ERROR', logger='relay_client'):
+        outcome = client._post_api_v1_response(
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-transport-fail',
+                'api_v1_response': {'message': {'role': 'assistant', 'content': sentinel_output}},
+            },
+            client_pub_key_b64='client-key',
+            client_pub_key=b'raw-key',
+        )
+
+    assert outcome.transport_failed is True
+    assert outcome.submitted is False
+
+    log_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'exc_type=TransportFailureWithSensitiveData' in log_text
+    assert sentinel_credential not in log_text
+    assert sentinel_prompt not in log_text
+    assert sentinel_output not in log_text
+    assert 'Traceback' not in log_text
+    assert 'TransportFailureWithSensitiveData: ' not in log_text

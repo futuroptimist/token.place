@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -748,6 +749,18 @@ class ComputeNodeRuntime:
             ]
         else:
             self.request_adapters = list(request_adapters)
+
+    def wire_fatal_bridge_teardown(self, callback: Callable[..., Any]) -> None:
+        """Attach a fatal-teardown callback to the relay client.
+
+        The callback is invoked by ``_supervise_api_v1_inference`` when a
+        request-owned executor thread remains alive past the shared cleanup
+        deadline.  In production the callback is no-return (it terminates the
+        disposable bridge process); in tests it may unblock the stuck thread
+        and return so the supervisor can call ``shutdown(wait=True)`` safely.
+        """
+
+        self.relay_client.fatal_bridge_teardown = callback
 
     def _api_v1_readiness_cancel_requested(self) -> bool:
         try:
@@ -1534,7 +1547,7 @@ class ComputeNodeRuntime:
             return False
         return bool(submit_error(request_data, code=code, message=message))
 
-    def stop(self) -> None:
+    def stop(self, *, shutdown_deadline: Optional[float] = None) -> None:
         """Stop relay polling and network activity."""
         try:
             self.relay_client.stop()
@@ -1542,7 +1555,8 @@ class ComputeNodeRuntime:
             should_unregister = isinstance(registered_relays, set) and bool(registered_relays)
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn) and should_unregister:
-                if not unregister_fn():
+                effective_deadline = shutdown_deadline if shutdown_deadline is not None else time.monotonic() + 6.5
+                if not unregister_fn(shutdown_deadline=effective_deadline):
                     _log_warning("Relay unregister request failed during shutdown")
             elif callable(unregister_fn):
                 _log_info("Skipping relay unregister because no API v1 registration succeeded")

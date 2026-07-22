@@ -13,7 +13,6 @@ PR_REQUIRED_WORKFLOWS = {
     "ci.yml",
     "ci-image.yml",
     "desktop-operator-e2e.yml",
-    "desktop-release.yml",
     "run-all-tests-pr.yml",
 }
 RUN_ALL_TESTS_PR_WORKFLOW = WORKFLOW_DIR / "run-all-tests-pr.yml"
@@ -119,6 +118,46 @@ def test_required_workflows_trigger_on_pull_requests() -> None:
         "Critical workflows must trigger on pull_request so CI checks always run. "
         f"Missing pull_request trigger in: {', '.join(missing)}"
     )
+
+
+def test_desktop_release_workflow_is_tag_or_manual_only() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
+    on_block = _workflow_on_block(workflow_data, "desktop-release.yml")
+
+    assert "pull_request" not in on_block, (
+        "desktop-release.yml must not run the full release packaging matrix on ordinary PRs"
+    )
+    assert on_block["push"]["tags"] == ["desktop-v*"]
+    assert "workflow_dispatch" in on_block
+    assert "tag_name" in on_block["workflow_dispatch"]["inputs"]
+    assert "dry_run" in on_block["workflow_dispatch"]["inputs"]
+
+
+def test_desktop_release_workflow_has_per_tag_concurrency() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
+    concurrency = workflow_data.get("concurrency", {})
+
+    assert concurrency.get("group") == (
+        "desktop-release-${{ inputs.tag_name || github.ref_name }}"
+    )
+    assert concurrency.get("cancel-in-progress") == "true"
+
+
+def test_desktop_release_temporary_artifacts_expire_after_seven_days() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
+    build_steps = _job_steps(workflow_data["jobs"]["build"])
+    upload_steps = [
+        step
+        for step in build_steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+
+    assert upload_steps, "desktop-release.yml must upload temporary workflow artifacts"
+    for step in upload_steps:
+        assert step.get("with", {}).get("retention-days") == "7", (
+            "Temporary desktop release workflow artifacts should expire after seven days; "
+            "published GitHub Release assets are managed by the release upload step."
+        )
 
 
 def test_image_workflow_keeps_pull_request_validate_only() -> None:
@@ -404,77 +443,35 @@ def test_run_all_tests_pr_workflow_exists_and_triggers_on_prs() -> None:
     ), "run-all-tests-pr.yml should support manual reruns when diagnosing PR CI."
 
 
-def test_run_all_tests_pr_workflow_has_visible_linux_and_macos_jobs() -> None:
+def test_run_all_tests_pr_workflow_has_visible_linux_job_only() -> None:
     jobs = _run_all_tests_jobs()
 
     assert (
         "linux-run-all-tests" in jobs
     ), "run_all_tests PR workflow must have a Linux job"
     assert (
-        "macos-run-all-tests" in jobs
-    ), "run_all_tests PR workflow must have a macOS job"
+        "macos-run-all-tests" not in jobs
+    ), "run_all_tests PR workflow must not duplicate the full suite on macOS"
     assert jobs["linux-run-all-tests"]["name"] == "Linux run_all_tests.sh"
-    assert jobs["macos-run-all-tests"]["name"] == "macOS run_all_tests.sh"
     assert jobs["linux-run-all-tests"]["runs-on"] == "ubuntu-latest"
-    assert jobs["macos-run-all-tests"]["runs-on"] == "macos-latest"
+    assert len(jobs) == 1, (
+        "The PR workflow should expose one Linux full-suite job, not a replacement "
+        "full-suite matrix on non-Linux runners."
+    )
 
 
-def test_run_all_tests_pr_jobs_invoke_the_full_suite() -> None:
+def test_linux_run_all_tests_pr_job_invokes_the_full_suite() -> None:
     jobs = _run_all_tests_jobs()
+    job_run = _step_runs(jobs["linux-run-all-tests"])
 
-    for job_name in ("linux-run-all-tests", "macos-run-all-tests"):
-        job_run = _step_runs(jobs[job_name])
-        assert "./run_all_tests.sh" in job_run, (
-            f"{job_name} must invoke ./run_all_tests.sh directly so green "
-            "means the suite actually ran."
-        )
-        assert "GITHUB_STEP_SUMMARY" in job_run, (
-            f"{job_name} must append run_all_tests pass/fail context to the "
-            "job summary for PR diagnosis."
-        )
-
-
-def test_macos_run_all_tests_pr_job_uses_python_312_and_node_20() -> None:
-    macos_job = _run_all_tests_jobs()["macos-run-all-tests"]
-    steps = _job_steps(macos_job)
-
-    python_steps = [
-        step for step in steps if step.get("uses") == "actions/setup-python@v5"
-    ]
-    node_steps = [step for step in steps if step.get("uses") == "actions/setup-node@v4"]
-
-    assert python_steps, "macOS run_all_tests job must set up Python explicitly"
-    assert node_steps, "macOS run_all_tests job must set up Node.js explicitly"
-    assert any(
-        step.get("with", {}).get("python-version") == "3.12" for step in python_steps
+    assert "./run_all_tests.sh" in job_run, (
+        "linux-run-all-tests must invoke ./run_all_tests.sh directly so green "
+        "means the suite actually ran."
     )
-    assert any(step.get("with", {}).get("node-version") == "20" for step in node_steps)
-
-
-def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None:
-    macos_job = _run_all_tests_jobs()["macos-run-all-tests"]
-    env = macos_job.get("env", {})
-    step_runs = _step_runs(macos_job)
-
-    assert env.get("FORCE_CMAKE") == "1"
-    assert "CMAKE_ARGS" not in env, (
-        "macos-latest may run on Intel or Apple Silicon; CMAKE_ARGS must be "
-        "derived from uname -m instead of hard-coding an arm64 cross-build."
+    assert "GITHUB_STEP_SUMMARY" in job_run, (
+        "linux-run-all-tests must append run_all_tests pass/fail context to the "
+        "job summary for PR diagnosis."
     )
-    assert "Configure macOS Metal llama-cpp build" in str(macos_job), (
-        "macOS CI must configure llama_cpp_python before installing Python dependencies."
-    )
-    assert "-DGGML_METAL=on" in step_runs, (
-        "macOS CI must build llama_cpp_python with Metal enabled so "
-        "GPU-capable desktop modes do not silently fall back to CPU."
-    )
-    assert "-DGGML_NATIVE=off" in step_runs, (
-        "macos-latest runners must disable fragile native CPU feature probing "
-        "so dependency validation does not fail before run_all_tests.sh."
-    )
-    assert "-DCMAKE_OSX_ARCHITECTURES=${arch}" in step_runs
-    assert "uname -m" in step_runs
-    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in step_runs
 
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:

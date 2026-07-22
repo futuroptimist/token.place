@@ -10,7 +10,7 @@ TESTING_DOC = Path("docs/TESTING.md")
 def test_production_promotion_checklist_captures_0_1_0_smoke_risks() -> None:
     text = PROMOTION_DOC.read_text(encoding="utf-8")
     required = (
-        "Linux and macOS `run_all_tests.sh` PR checks",
+        "Linux `run_all_tests.sh` full-suite PR check",
         "staging deployment image, chart, and release artifact",
         "desktop releases for Windows and macOS install successfully and register",
         "`GET /livez` returns healthy JSON (`status: alive`)",
@@ -28,6 +28,25 @@ def test_production_promotion_checklist_captures_0_1_0_smoke_risks() -> None:
         "production secrets and relay registration tokens",
         "rate-limit storage and production environment settings",
         "rollback path",
+        "Ordinary PRs intentionally do not run the duplicate macOS full-suite copy",
+        "Desktop Tauri Release packaging matrix",
+        "immutable `desktop-v*` tag pushes",
+    )
+    missing = [item for item in required if item not in text]
+    assert not missing
+
+
+def test_promotion_docs_describe_optimized_desktop_release_policy() -> None:
+    text = PROMOTION_DOC.read_text(encoding="utf-8")
+    required = (
+        "Pushing a new immutable `desktop-vX.Y.Z` tag is the canonical desktop release action.",
+        "Operators must not also\nmanually dispatch the same release unless",
+        "Manual dispatch remains available for dry runs, retries, and intentional rebuilds",
+        "must not force-move or reuse tags",
+        "cancels older in-progress runs for the same effective tag/ref",
+        "temporary workflow artifacts for seven days",
+        "Published GitHub Release assets are unaffected",
+        "macOS Apple Silicon and Windows artifacts",
     )
     missing = [item for item in required if item not in text]
     assert not missing

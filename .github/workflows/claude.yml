@@ -15,17 +15,22 @@ jobs:
     if: |
       (github.event_name == 'issue_comment' &&
         contains(github.event.comment.body, '@claude') &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        !contains(github.event.comment.body, '@claude-exec') &&
+        github.event.comment.author_association == 'OWNER') ||
       (github.event_name == 'pull_request_review_comment' &&
         contains(github.event.comment.body, '@claude') &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        !contains(github.event.comment.body, '@claude-exec') &&
+        github.event.comment.author_association == 'OWNER') ||
       (github.event_name == 'pull_request_review' &&
         contains(github.event.review.body, '@claude') &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+        !contains(github.event.review.body, '@claude-exec') &&
+        github.event.review.author_association == 'OWNER') ||
       (github.event_name == 'issues' &&
         (contains(github.event.issue.body, '@claude') ||
          contains(github.event.issue.title, '@claude')) &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+        !contains(github.event.issue.body, '@claude-exec') &&
+        !contains(github.event.issue.title, '@claude-exec') &&
+        github.event.issue.author_association == 'OWNER')
 
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -38,8 +43,8 @@ jobs:
       id-token: write
 
     steps:
-      # Bash permissions below allow execution of repository code. Restrict them
-      # to same-repository PR branches even when a trusted user invokes Claude.
+      # Claude receives untrusted repository and PR/comment content. Keep the
+      # normal path default-deny for executable tools and fail closed for forks.
       - name: Reject fork pull requests
         if: |
           (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
@@ -51,6 +56,8 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
+          set -euo pipefail
+
           head_repository="$(
             gh api \
               "repos/${EXPECTED_REPOSITORY}/pulls/${PR_NUMBER}" \
@@ -67,20 +74,492 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
+
+      # Bash is already omitted from --allowedTools, which the action's own
+      # docs describe as a real allow/deny list (Bash is disabled unless
+      # explicitly granted). The PreToolUse hook below is a second,
+      # independently-coded layer: it hard-denies every Bash call and
+      # confines file-editing tools to paths that resolve inside the
+      # checkout, so a permissions-schema surprise in the action can't
+      # silently widen what an untrusted comment/PR body can make Claude do.
+      - name: Create ordinary-path tool guard
+        id: guard
+        env:
+          GUARD_DIR: ${{ runner.temp }}/claude-guard
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install -d -m 0700 "${GUARD_DIR}"
+
+          cat >"${GUARD_DIR}/guard.sh" <<'GUARD'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          payload="$(cat)"
+          tool_name="$(printf '%s' "${payload}" | jq -r '.tool_name // empty')"
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+          workspace_real="$(realpath -e -- "${workspace}")"
+
+          deny() {
+            echo "$1" >&2
+            exit 2
+          }
+
+          case "${tool_name}" in
+            Bash)
+              deny "Bash is disabled for the ordinary @claude path. Ask for @claude-exec if a validation command is required."
+              ;;
+            Read|Edit|Write|NotebookEdit|Glob|Grep)
+              candidate="$(printf '%s' "${payload}" | jq -r '.tool_input.file_path // .tool_input.path // .tool_input.notebook_path // empty')"
+              if [[ -n "${candidate}" ]]; then
+                if ! resolved="$(realpath -m -- "${candidate}" 2>/dev/null)"; then
+                  deny "Unable to resolve path: ${candidate}"
+                fi
+                case "${resolved}" in
+                  "${workspace_real}"|"${workspace_real}"/*) ;;
+                  *) deny "Path ${resolved} resolves outside the repository workspace." ;;
+                esac
+              fi
+              ;;
+          esac
+
+          exit 0
+          GUARD
+
+          chmod 0500 "${GUARD_DIR}/guard.sh"
+          echo "dir=${GUARD_DIR}" >> "${GITHUB_OUTPUT}"
 
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_commit_signing: true
+          include_comments_by_actor: "futuroptimist"
 
-          # These scope Claude's OIDC-issued GitHub App token. workflows: write
-          # is what permits commits that change .github/workflows/**.
+          # Scope Claude's OIDC-issued GitHub App token. The normal @claude path
+          # can edit ordinary repository files through GitHub MCP/API commits,
+          # but cannot request workflows: write or run general Bash.
+          additional_permissions: |
+            actions: read
+
+          # Belt-and-suspenders: settings.permissions.deny + the PreToolUse
+          # hook are an independent, code-level Bash ban and workspace file
+          # boundary (see the guard script above), layered underneath the
+          # documented --disallowedTools grant below.
+          settings: |
+            {
+              "permissions": {
+                "deny": ["Bash"]
+              },
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "*",
+                    "hooks": [
+                      {
+                        "type": "command",
+                        "command": "${{ steps.guard.outputs.dir }}/guard.sh"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+
+          claude_args: |
+            --setting-sources user
+            --strict-mcp-config
+            --disallowedTools "Bash"
+
+  claude-exec:
+    if: |
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude-exec') &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.comment.user.login == 'futuroptimist') ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude-exec') &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.comment.user.login == 'futuroptimist') ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude-exec') &&
+        github.event.review.author_association == 'OWNER' &&
+        github.event.review.user.login == 'futuroptimist') ||
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude-exec') ||
+         contains(github.event.issue.title, '@claude-exec')) &&
+        github.event.issue.author_association == 'OWNER' &&
+        github.event.issue.user.login == 'futuroptimist')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: claude-exec
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Reject fork pull requests
+        if: |
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+          github.event_name == 'pull_request_review_comment' ||
+          github.event_name == 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          head_repository="$(
+            gh api \
+              "repos/${EXPECTED_REPOSITORY}/pulls/${PR_NUMBER}" \
+              --jq '.head.repo.full_name'
+          )"
+
+          if [[ "${head_repository}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "::error::Claude executable tools are disabled for fork PRs."
+            exit 1
+          fi
+
+      - name: Verify claude-exec environment protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          environment_json="$(gh api "repos/${REPOSITORY}/environments/claude-exec")"
+          required_reviewers_count="$(
+            jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length' \
+              <<<"${environment_json}"
+          )"
+
+          if [[ "${required_reviewers_count}" -lt 1 ]]; then
+            echo "::error::The claude-exec environment must exist and have at least one required reviewer."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install Bubblewrap sandbox runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          bwrap --version
+
+          if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            userns_clone="$(cat /proc/sys/kernel/unprivileged_userns_clone)"
+            if [[ "${userns_clone}" != "1" ]]; then
+              echo "::error::kernel.unprivileged_userns_clone=${userns_clone}; Bubblewrap requires unprivileged user namespaces."
+              exit 1
+            fi
+          else
+            userns_clone="missing"
+          fi
+
+          apparmor_userns="missing"
+          if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            apparmor_userns="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            if [[ "${apparmor_userns}" == "1" ]]; then
+              # GitHub's Ubuntu 24.04 runners can enable AppArmor's
+              # unprivileged-userns restriction, which blocks Bubblewrap even
+              # when kernel.unprivileged_userns_clone is available. Match the
+              # official Claude action's ephemeral compatibility setup before
+              # probing bwrap; do not persist this sysctl change.
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              apparmor_userns="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            fi
+          fi
+
+          echo "kernel.unprivileged_userns_clone=${userns_clone}"
+          echo "kernel.apparmor_restrict_unprivileged_userns=${apparmor_userns}"
+
+          # Prove the sandbox can actually run a binary that exists inside the
+          # temporary namespace. A read-only root bind makes /bin/true available
+          # without weakening the later wrapper sandbox, and failure remains
+          # fail-closed with useful diagnostics.
+          if ! bwrap --die-with-parent --unshare-all --unshare-net --ro-bind / / -- /bin/true; then
+            echo "::error::Bubblewrap cannot establish an isolated sandbox on this runner; refusing to fall back to unsandboxed validation commands."
+            echo "kernel.unprivileged_userns_clone=${userns_clone}"
+            echo "kernel.apparmor_restrict_unprivileged_userns=${apparmor_userns}"
+            exit 1
+          fi
+
+      - name: Create immutable isolated validation wrappers
+        id: wrappers
+        env:
+          WRAPPER_DIR: ${{ runner.temp }}/claude-validation-wrappers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install -d -m 0700 "${WRAPPER_DIR}"
+
+          cat >"${WRAPPER_DIR}/_sandbox" <<'SANDBOX'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ "$#" -ne 1 ]]; then
+            echo "usage: _sandbox <command-name>" >&2
+            exit 64
+          fi
+
+          wrapper_dir="$(cd "$(dirname "$0")" && pwd)"
+          workspace="${GITHUB_WORKSPACE:?}"
+          command_name="$1"
+
+          case "${command_name}" in
+            python-dependency-compatibility)
+              cap=2
+              fixed_command=(python scripts/validate_dependencies.py)
+              ;;
+            python-tests)
+              cap=2
+              fixed_command=(python -m pytest -q tests)
+              ;;
+            frontend-lint)
+              cap=2
+              fixed_command=(npm run lint -- --quiet)
+              ;;
+            repository-tests)
+              cap=1
+              fixed_command=(./run_all_tests.sh)
+              ;;
+            env-network-check)
+              # 3 = 1 pre-flight smoke test run by the trusted workflow step
+              # plus up to 2 uses by Claude.
+              cap=3
+              fixed_command=(/usr/bin/python3 -c 'import os,socket,sys; bad=[k for k in os.environ if any(m in k.upper() for m in ("TOKEN","SECRET","OIDC","ACTIONS_ID_TOKEN","GITHUB_TOKEN","CLAUDE_CODE_OAUTH_TOKEN"))]; print("secret-bearing environment variables visible: "+",".join(bad), file=sys.stderr) if bad else None; sys.exit(1) if bad else None; s=socket.socket(); s.settimeout(2); sys.exit(1 if s.connect_ex(("1.1.1.1",443)) == 0 else 0)')
+              ;;
+            *)
+              echo "unknown fixed validation command" >&2
+              exit 64
+              ;;
+          esac
+
+          # The Claude action documents CLAUDE_CODE_SCRIPT_CAPS as a JSON
+          # environment control, so never use the former invalid newline
+          # path:count shape. Keep these immutable local flock counters as
+          # the authoritative, version-independent enforcement layer.
+          counter_dir="${wrapper_dir}/.counters"
+          install -d -m 0700 "${counter_dir}"
+          counter_file="${counter_dir}/${command_name}.count"
+          lock_file="${counter_dir}/${command_name}.lock"
+          exec {lock_fd}>"${lock_file}"
+          flock "${lock_fd}"
+          current=0
+          if [[ -f "${counter_file}" ]]; then
+            current="$(cat "${counter_file}")"
+          fi
+          if (( current >= cap )); then
+            flock -u "${lock_fd}"
+            echo "::error::Call cap (${cap}) exceeded for ${command_name}." >&2
+            exit 75
+          fi
+          echo "$((current + 1))" >"${counter_file}"
+          flock -u "${lock_fd}"
+
+          sandbox_home="$(mktemp -d)"
+          sandbox_tmp="$(mktemp -d)"
+          cleanup() {
+            rm -rf "${sandbox_home}" "${sandbox_tmp}"
+          }
+          trap cleanup EXIT
+
+          exec timeout --kill-after=30s 20m \
+            bwrap \
+              --die-with-parent \
+              --unshare-all \
+              --unshare-net \
+              --new-session \
+              --proc /proc \
+              --dev /dev \
+              --ro-bind /usr /usr \
+              --ro-bind /bin /bin \
+              --ro-bind-try /lib /lib \
+              --ro-bind-try /lib64 /lib64 \
+              --ro-bind-try /etc/ssl /etc/ssl \
+              --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+              --bind "${workspace}" "${workspace}" \
+              --bind "${sandbox_home}" /home/claude-validation \
+              --bind "${sandbox_tmp}" /tmp \
+              --chdir "${workspace}" \
+              --clearenv \
+              --setenv HOME /home/claude-validation \
+              --setenv TMPDIR /tmp \
+              --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              --setenv CI true \
+              --setenv GITHUB_WORKSPACE "${workspace}" \
+              --setenv PYTHONNOUSERSITE 1 \
+              -- "${fixed_command[@]}"
+          SANDBOX
+
+          cat >"${WRAPPER_DIR}/python-dependency-compatibility" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" python-dependency-compatibility
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/python-tests" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" python-tests
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/frontend-lint" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" frontend-lint
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/repository-tests" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" repository-tests
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/env-network-check" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" env-network-check
+          WRAPPER
+
+          # PreToolUse hook backing Bash for this job: allow only an exact,
+          # zero-argument match against one of the five wrapper paths above.
+          # This is deliberately stricter than glob-based --allowedTools
+          # matching -- it rejects shell indirection ("bash -c ..."),
+          # environment-variable prefixes, pipelines/chains, and appended
+          # arguments, because it compares the literal command string.
+          cat >"${WRAPPER_DIR}/guard.sh" <<'GUARD'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          payload="$(cat)"
+          tool_name="$(printf '%s' "${payload}" | jq -r '.tool_name // empty')"
+          self_dir="$(cd "$(dirname "$0")" && pwd)"
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+          workspace_real="$(realpath -e -- "${workspace}")"
+
+          deny() {
+            echo "$1" >&2
+            exit 2
+          }
+
+          case "${tool_name}" in
+            Bash)
+              command="$(printf '%s' "${payload}" | jq -r '.tool_input.command // empty')"
+              case "${command}" in
+                "${self_dir}/python-dependency-compatibility"|"${self_dir}/python-tests"|"${self_dir}/frontend-lint"|"${self_dir}/repository-tests"|"${self_dir}/env-network-check")
+                  ;;
+                *)
+                  deny "Only the fixed validation wrappers may run via Bash; rejected: ${command}"
+                  ;;
+              esac
+              ;;
+            Read|Edit|Write|NotebookEdit|Glob|Grep)
+              candidate="$(printf '%s' "${payload}" | jq -r '.tool_input.file_path // .tool_input.path // .tool_input.notebook_path // empty')"
+              if [[ -n "${candidate}" ]]; then
+                if ! resolved="$(realpath -m -- "${candidate}" 2>/dev/null)"; then
+                  deny "Unable to resolve path: ${candidate}"
+                fi
+                case "${resolved}" in
+                  "${workspace_real}"|"${workspace_real}"/*) ;;
+                  *) deny "Path ${resolved} resolves outside the repository workspace." ;;
+                esac
+              fi
+              ;;
+          esac
+
+          exit 0
+          GUARD
+
+          chmod 0500 "${WRAPPER_DIR}"/*
+          echo "dir=${WRAPPER_DIR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify sandbox isolation before invoking Claude
+        env:
+          WRAPPER_DIR: ${{ steps.wrappers.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! "${WRAPPER_DIR}/env-network-check"; then
+            echo "::error::Sandbox isolation smoke test failed (secret-bearing env var visible or outbound network reachable); refusing to invoke Claude with validation wrappers."
+            exit 1
+          fi
+
+      - name: Run Claude Code with isolated validation wrappers
+        id: claude-exec
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_EXEC }}
+          use_commit_signing: true
+          include_comments_by_actor: "futuroptimist"
+          trigger_phrase: "@claude-exec"
+
+          # workflows: write is available only after the protected environment
+          # gate has approved this privileged path.
           additional_permissions: |
             actions: read
             workflows: write
 
-          # Trusted, same-repository invocations may run the normal test/build
-          # tools used by this Python, TypeScript, and Rust repository.
+          # See the guard.sh generated above: it is the authoritative,
+          # exact-match Bash gate. --allowedTools below is a second,
+          # documented layer using the action's own glob-based enforcement.
+          settings: |
+            {
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "*",
+                    "hooks": [
+                      {
+                        "type": "command",
+                        "command": "${{ steps.wrappers.outputs.dir }}/guard.sh"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+
           claude_args: |
-            --allowedTools "Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pre-commit:*),Bash(npm:*),Bash(npx:*),Bash(cargo:*),Bash(git diff:*)"
+            --setting-sources user
+            --strict-mcp-config
+            --allowedTools "Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"

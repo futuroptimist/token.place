@@ -56,7 +56,10 @@ may intentionally differ:
 
 ## Pre-promotion gates
 
-- [ ] Confirm PR CI checks are green, including the Linux and macOS `run_all_tests.sh` PR checks.
+- [ ] Confirm PR CI checks are green, including the Linux `run_all_tests.sh` full-suite PR check.
+  Ordinary PRs intentionally do not run the duplicate macOS full-suite copy or the full
+  Desktop Tauri Release packaging matrix; those expensive macOS/Windows release artifact
+  builds are reserved for immutable `desktop-v*` tag pushes and explicit manual dispatches.
 - [ ] Confirm the staging deployment image, chart, and release artifact are exactly the ones intended
       for production promotion; prefer immutable image tags and chart versions, plus a digest where
       available.
@@ -113,6 +116,21 @@ Expected result after each Cloudflare skip: the response is not a Cloudflare `40
 Any relay-owned app response is acceptable, including `401 Missing or invalid relay server token`
 when `SERVER_REGISTRATION_TOKENS` are configured or a `400` response because the `{}` payload is
 intentionally invalid.
+
+
+## Desktop release workflow policy
+
+Pushing a new immutable `desktop-vX.Y.Z` tag is the canonical desktop release action. That tag
+launches the Desktop Tauri Release workflow to build, validate, checksum, sign when credentials are
+available, and publish the macOS Apple Silicon and Windows artifacts. Operators must not also
+manually dispatch the same release unless they are intentionally retrying a failed run or rebuilding
+an existing tag. Manual dispatch remains available for dry runs, retries, and intentional rebuilds,
+but the release process must not force-move or reuse tags to change what a published release means.
+
+The release workflow cancels older in-progress release runs for the same effective tag/ref and keeps
+dry-run validations in a separate concurrency group so build-only checks cannot cancel an in-flight
+publishing run. Temporary workflow artifacts are kept for seven days. Published GitHub Release
+assets are unaffected by that temporary artifact retention window.
 
 ## Tag verification
 

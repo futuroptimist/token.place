@@ -4,10 +4,6 @@ on:
   push:
     tags:
       - 'desktop-v*'
-  pull_request:
-    paths:
-      - '.github/workflows/desktop-release.yml'
-      - 'desktop-tauri/**'
   workflow_dispatch:
     inputs:
       tag_name:
@@ -22,6 +18,12 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  # Tag pushes and non-dry manual retries for the same tag intentionally share
+  # a release group; dry-run validations stay isolated from publishing runs.
+  group: desktop-release-${{ inputs.dry_run && 'dry-run' || 'release' }}-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -539,6 +541,7 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: desktop-tauri/release-artifacts/*
           if-no-files-found: error
+          retention-days: 7
 
   # Temporarily disabled until a matching self-hosted Windows x64 NVIDIA/RTX
   # runner is configured. GitHub cannot fall through after a short queue wait.

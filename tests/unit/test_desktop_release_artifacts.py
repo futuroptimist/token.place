@@ -4389,6 +4389,56 @@ def test_windows_installer_identity_second_launch_requires_observed_zero_counter
     }), expected_tier='8k-fast', launch_number=2)
 
 
+def test_installed_context_smoke_fails_when_get_llm_instance_returns_none(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_none', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', lambda self: None)
+
+    with pytest.raises(RuntimeError, match='installed_context_get_llm_instance_returned_none'):
+        module.installed_context_smoke_payload('8k-fast', '1')
+
+def test_installed_context_smoke_fails_when_constructor_is_skipped(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_skip_constructor', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', lambda self: object())
+
+    with pytest.raises(RuntimeError, match='installed_context_constructor_not_called_exactly_once'):
+        module.installed_context_smoke_payload('8k-fast', '1')
+
+
+def test_installed_context_smoke_fails_on_forbidden_model_download_attempt(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_forbidden_download', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def get_llm_instance_with_download(self):
+        self.download_model_if_needed()
+        return object()
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', get_llm_instance_with_download)
+
+    with pytest.raises(RuntimeError, match='installed_context_forbidden_model_download_attempted'):
+        module.installed_context_smoke_payload('8k-fast', '1')
+
 def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
     source = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py').read_text(encoding='utf-8')
     function = source[source.index('def installed_context_smoke_payload'):source.index('\ndef main() -> int:', source.index('def installed_context_smoke_payload'))]

@@ -1612,7 +1612,7 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
         "else:\n"
         "    gpu_supported = backend in {'cuda', 'metal'}\n"
         "if gpu_supported and backend == 'cpu':\n"
-        "    backend = 'metal' if sys.platform == 'darwin' else 'cuda'\n"
+        "    backend = 'metal' if os.environ.get('TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM', sys.platform) == 'darwin' else 'cuda'\n"
         "print(json.dumps({\n"
         "    'backend': backend,\n"
         "    'gpu_offload_supported': gpu_supported,\n"
@@ -4255,7 +4255,7 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     # without exposing GGML_USE_* backend markers. Preserve prior Linux behavior
     # by inferring CUDA when offload is available and backend markers are absent.
     if gpu_offload_supported and backend == 'cpu':
-        backend = 'metal' if sys.platform == 'darwin' else 'cuda'
+        backend = 'metal' if os.environ.get('TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM', sys.platform) == 'darwin' else 'cuda'
 
     return {
         'backend': backend,

@@ -160,10 +160,11 @@
     "known_gaps": [],
     "lifecycle_coverage": [
         {
-            "id": "macos_packaged_operator_lifecycle_parity",
-            "tracking_context": "macOS packaged operator lifecycle parity is validated through the shared desktop parity runner used by the macOS packaged CI job.",
-            "platform": "darwin",
-            "scope": "packaged_operator_lifecycle_e2e",
+            "id": "macos_packaged_operator_lifecycle_parity_linux_simulated",
+            "tracking_context": "macOS packaged layout and fake Metal/package parity are validated on Linux through deterministic simulated-darwin harnesses; this is not native signing, Mach-O launch, DMG, or real Metal coverage.",
+            "platform": "linux",
+            "simulated_platform": "darwin",
+            "scope": "platform_neutral_packaged_operator_lifecycle_e2e",
             "status": "covered_by_shared_entrypoint",
             "shared_entrypoint": "desktop-tauri/scripts/run_desktop_parity_checks.py",
             "workflow": ".github/workflows/desktop-operator-e2e.yml",
@@ -175,11 +176,33 @@
                 "multi_turn_api_v1_relay_chat",
                 "stop",
                 "start_after_stop",
-                "diagnostics"
+                "diagnostics",
+                "mock_metal_success",
+                "mock_metal_fail_closed"
             ],
             "required_scripts": [
                 "desktop-tauri/scripts/test_packaged_operator_e2e.py",
                 "desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py"
+            ]
+        },
+        {
+            "id": "macos_native_no_relay_lifecycle_smoke",
+            "tracking_context": "Native macOS launch/shutdown and no-relay lifecycle behavior stays in a narrow macos-26 push/scheduled/manual smoke workflow.",
+            "platform": "darwin",
+            "scope": "native_tauri_no_relay_lifecycle_smoke",
+            "status": "covered_by_targeted_native_smoke",
+            "workflow": ".github/workflows/desktop-macos-smoke.yml",
+            "covered_checks": [
+                "debug_tauri_app_build_no_bundle",
+                "native_no_relay_launch_shutdown"
+            ],
+            "excluded_checks": [
+                "run_all_tests.sh",
+                "shared_parity_suite",
+                "python39_inspection",
+                "release_packaging",
+                "dmg_generation",
+                "embedded_release_runtime_reconstruction"
             ]
         }
     ]

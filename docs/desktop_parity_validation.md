@@ -57,7 +57,7 @@ Do not make production two-node or round-robin claims until both Windows and mac
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
 - Packaged Apple Silicon releases use the bundled Python runtime; Command Line Tools are development-only and not an end-user prerequisite.
 - Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
-- Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
+- Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The Linux packaged e2e covers a fake `.app/Contents/Resources` layout with simulated Darwin platform selection, mock Metal registration, and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
 - Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. Public runtime setup/status payloads should show safe fields such as `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `runtime_action`, safe origin booleans/categories, and any bounded pip/CMake tails from provisioning. The internal runtime handoff serializes the versioned SHA-256 `llama_module_identity`, never the raw absolute `llama_module_path`; raw paths must not be copied into bridge events or public diagnostics.
 - If the bundled runtime is missing or invalid in a packaged app, reinstall token.place desktop or use a newer release; do not ask end users to install Python or Xcode Command Line Tools.
 
@@ -76,6 +76,9 @@ Use these commands as copy-paste starting points. Replace URLs, tokens, model pa
 
 ```bash
 # Run the single shared desktop parity entry point against a local relay with mock LLM.
+# Linux CI also sets TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM=darwin so
+# deterministic .app/Contents/Resources and fake Metal assertions run without
+# claiming native signing, Mach-O launch, DMG, process-launch, or real Metal coverage.
 python desktop-tauri/scripts/run_desktop_parity_checks.py
 
 # Or run the underlying local relay parity test directly.
@@ -93,8 +96,11 @@ curl -fsS http://127.0.0.1:5010/relay/diagnostics | python -m json.tool
 xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py
 python desktop-tauri/scripts/test_packaged_operator_e2e.py
 
-# Windows/macOS packaged parity jobs are defined in GitHub Actions.
+# Broad desktop operator PR validation is Linux + Windows only. It includes
+# Linux Python 3.9 dependency-isolation inspection plus simulated macOS packaged
+# layout/fake Metal parity. Native macOS launch is a targeted push/scheduled/manual smoke.
 gh workflow run desktop-operator-e2e.yml
+gh workflow run desktop-macos-smoke.yml
 ```
 
 ### Local hardware runtime checks

@@ -185,6 +185,7 @@ def _packaged_env(
     resources_root: Path | None = None,
     *,
     extra_env: dict[str, str] | None = None,
+    simulated_platform: str | None = None,
 ) -> dict[str, str]:
     resources_root = resources_root or (tmp_root / "resources")
     home_dir = tmp_root / "home"
@@ -194,6 +195,9 @@ def _packaged_env(
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
     env["PYTHONPATH"] = os.pathsep.join([str(resources_root / "python"), str(resources_root)])
+    simulated_platform = simulated_platform or os.environ.get("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM")
+    if simulated_platform:
+        env["TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM"] = simulated_platform
     if extra_env:
         env.update(extra_env)
     return env
@@ -1243,19 +1247,28 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
-                if probe_resources_root == mac_resources_root and sys.platform == "darwin":
-                    run_macos_mock_metal_packaged_registration_probe(
-                        tmp_path,
-                        probe_script,
-                        relay_port=relay_port,
-                        resources_root=mac_resources_root,
-                    )
-                    run_macos_gpu_failure_blocks_registration_probe(
-                        tmp_path,
-                        probe_script,
-                        relay_port=relay_port,
-                        resources_root=mac_resources_root,
-                    )
+                simulated_platform = os.environ.get("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM")
+                if probe_resources_root == mac_resources_root and (sys.platform == "darwin" or simulated_platform in (None, "darwin")):
+                    previous_simulated_platform = os.environ.get("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM")
+                    os.environ["TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM"] = "darwin"
+                    try:
+                        run_macos_mock_metal_packaged_registration_probe(
+                            tmp_path,
+                            probe_script,
+                            relay_port=relay_port,
+                            resources_root=mac_resources_root,
+                        )
+                        run_macos_gpu_failure_blocks_registration_probe(
+                            tmp_path,
+                            probe_script,
+                            relay_port=relay_port,
+                            resources_root=mac_resources_root,
+                        )
+                    finally:
+                        if previous_simulated_platform is None:
+                            os.environ.pop("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM", None)
+                        else:
+                            os.environ["TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM"] = previous_simulated_platform
             finally:
                 if relay.poll() is None:
                     relay.terminate()

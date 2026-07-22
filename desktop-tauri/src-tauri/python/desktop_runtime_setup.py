@@ -354,7 +354,8 @@ try:
         gpu_offload_supported = backend in {"cuda", "metal"}
 
     if gpu_offload_supported and backend == "cpu":
-        backend = "metal" if sys.platform == "darwin" else "cuda"
+        platform_hint = os.environ.get("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM", sys.platform)
+        backend = "metal" if platform_hint == "darwin" else "cuda"
 
     Llama = getattr(llama_cpp, "Llama", None)
     constructor_signature_inspectable = False
@@ -1659,7 +1660,7 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
 
 
 def _desktop_platform() -> str:
-    return str(getattr(sys, "platform", sys.platform)).lower()
+    return str(os.environ.get("TOKENPLACE_PACKAGED_E2E_SIMULATED_PLATFORM") or getattr(sys, "platform", sys.platform)).lower()
 
 
 def _desktop_arch() -> str:

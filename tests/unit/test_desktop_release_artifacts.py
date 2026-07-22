@@ -3568,7 +3568,7 @@ def test_windows_installer_identity_shortcut_authority_rejects_duplicates_and_st
     stale_target.write_text('exe', encoding='utf-8')
     monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: completed({'Shortcut': str(tmp_path / 'app.lnk'), 'Target': str(stale_target)}))
     with pytest.raises(guard.InstallerIdentityError, match='stale'):
-        guard.resolve_authoritative_shortcut()
+        guard.resolve_authoritative_shortcut('0.1.2')
 
     current_target = tmp_path / 'token.place.exe'
     current_target.write_text('exe', encoding='utf-8')
@@ -3640,6 +3640,46 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
 
     guard.run_scenario(scenario, 'abcdef123456')
     assert installs == ['nsis', 'msi']
+
+
+def test_windows_installer_identity_probes_scenario_current_version(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe', 'nsis', '0.1.4')
+    previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
+    for path in (current.path, previous.path):
+        path.write_text('artifact', encoding='utf-8')
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    probed_versions = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
+    monkeypatch.setattr(guard, 'install', lambda installer, log_path=None: subprocess.CompletedProcess([str(installer.path)], 0, '', ''))
+    monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
+    monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'seed_config', lambda seeded: tmp_path / guard.CONFIG_NAME)
+    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda rejected_version=None: guard.Shortcut(tmp_path / 'app.lnk', exe))
+    monkeypatch.setattr(guard, '_assert_runtime', lambda target: None)
+    monkeypatch.setattr(guard, 'launch_for_operator_record', lambda target, env, log_path=None: json.dumps({
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'context_tier': guard.seeded_config_values()['context_tier'],
+        'preferred_mode': guard.seeded_config_values()['preferred_mode'],
+    }))
+    monkeypatch.setattr(guard, 'verify_config_preserved', lambda config_path, seeded: None)
+
+    def fake_probe(target, env, expected_version, expected_build_id):
+        probed_versions.append(expected_version)
+        return {'app_version': expected_version, 'build_id': expected_build_id}
+
+    monkeypatch.setattr(guard, 'probe_identity', fake_probe)
+    guard.run_scenario(guard.Scenario('upgrade-nsis-to-nsis', current, previous), 'abcdef123456')
+    assert probed_versions == ['0.1.4']
 
 
 def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(monkeypatch, tmp_path) -> None:
@@ -3735,24 +3775,66 @@ def test_windows_installer_identity_verify_authority_removed_detects_residuals(m
         registry=[],
     )
 
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
     monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [guard.RegistryEntry('key', 'token.place desktop', '', '', False, '')])
     monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
-    with pytest.raises(guard.InstallerIdentityError, match='registry entries are not empty'):
+    with pytest.raises(guard.InstallerIdentityError, match='registry'):
         guard.verify_authority_removed(snapshot)
 
     monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [])
     monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([guard.Shortcut(tmp_path / 'a.lnk', lingering_exe)], [], []))
-    with pytest.raises(guard.InstallerIdentityError, match='shortcut/executable inventory is not empty'):
+    with pytest.raises(guard.InstallerIdentityError, match='shortcuts'):
         guard.verify_authority_removed(snapshot)
 
     monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
-    with pytest.raises(guard.InstallerIdentityError, match='still present after uninstall'):
+    with pytest.raises(guard.InstallerIdentityError, match='executables'):
         guard.verify_authority_removed(snapshot_with_target)
 
     lingering_exe.unlink()
-    monkeypatch.setattr(guard, '_verify_no_authority_processes', lambda: (_ for _ in ()).throw(guard.InstallerIdentityError('process authority remains after uninstall: token.place')))
-    with pytest.raises(guard.InstallerIdentityError, match='process authority remains'):
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: ['C:/Program Files/token.place/token.place.exe'])
+    with pytest.raises(guard.InstallerIdentityError, match='processes'):
         guard.verify_authority_removed(snapshot_with_target)
+
+
+def test_windows_installer_identity_cleanup_polling_converges_without_sleeping_real_time(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    snapshot = _empty_snapshot(guard)
+    categories = iter([['shortcuts'], ['shortcuts', 'registry'], []])
+    sleeps = []
+    now = {'value': 0.0}
+
+    def fake_residual(before):
+        return next(categories)
+
+    def fake_monotonic():
+        now['value'] += 0.1
+        return now['value']
+
+    monkeypatch.setattr(guard, 'residual_authority_categories', fake_residual)
+    guard.wait_for_cleanup_convergence(
+        snapshot,
+        deadline_seconds=2,
+        poll_seconds=0.25,
+        monotonic=fake_monotonic,
+        sleeper=sleeps.append,
+    )
+    assert sleeps == [0.25, 0.25]
+
+
+def test_windows_installer_identity_cleanup_polling_reports_residual_categories(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    snapshot = _empty_snapshot(guard)
+    times = iter([0.0, 0.2, 0.4, 0.6])
+    monkeypatch.setattr(guard, 'residual_authority_categories', lambda before: ['registry', 'processes'])
+
+    with pytest.raises(guard.InstallerIdentityError, match='registry, processes'):
+        guard.wait_for_cleanup_convergence(
+            snapshot,
+            deadline_seconds=0.5,
+            poll_seconds=0.1,
+            monotonic=lambda: next(times),
+            sleeper=lambda _: None,
+        )
 
 
 def test_split_uninstall_command_handles_quoted_and_unquoted_forms() -> None:
@@ -3830,11 +3912,13 @@ def test_assert_runtime_requires_valid_matching_provenance(tmp_path) -> None:
     exe.write_text('exe', encoding='utf-8')
     python_exe = runtime_dir / 'python.exe'
     python_exe.write_text('python', encoding='utf-8')
-    provenance = runtime_dir / 'tokenplace-runtime-provenance.json'
+    obsolete = runtime_dir / guard.OBSOLETE_RUNTIME_PROVENANCE_NAME
+    obsolete.write_text(json.dumps({'runtime_id': guard.EXPECTED_RUNTIME_ID}), encoding='utf-8')
 
     with pytest.raises(guard.InstallerIdentityError, match='missing'):
         guard._assert_runtime(exe)
 
+    provenance = runtime_dir / guard.RUNTIME_PROVENANCE_NAME
     provenance.write_text('{not valid json', encoding='utf-8')
     with pytest.raises(guard.InstallerIdentityError, match='not valid JSON'):
         guard._assert_runtime(exe)

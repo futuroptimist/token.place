@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 EXPECTED_VERSION = "0.1.3"
-EXPECTED_PREVIOUS_VERSION = "0.1.2"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
+RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
+OBSOLETE_RUNTIME_PROVENANCE_NAME = "tokenplace-runtime-" + "provenance.json"
 SENTINELS = ("py", "python", "python3", "pip", "cmake", "ninja", "msbuild", "cl.exe", "nvcc")
 CONFIG_NAME = "desktop_tauri_config.json"
 TAURI_IDENTIFIER = "place.token.desktop"
@@ -137,8 +138,8 @@ def build_scenarios(current_nsis: Path, current_msi: Path, previous_nsis: Path, 
     previous_n = classify_installer(previous_nsis, previous_version)
     previous_m = classify_installer(previous_msi, previous_version)
     return [
-        Scenario("clean-nsis-0.1.3", current_n),
-        Scenario("clean-msi-0.1.3", current_m),
+        Scenario(f"clean-nsis-{expected_version}", current_n),
+        Scenario(f"clean-msi-{expected_version}", current_m),
         Scenario("upgrade-nsis-to-nsis", current_n, previous_n),
         Scenario("upgrade-msi-to-msi", current_m, previous_m),
         Scenario("cross-nsis-to-msi", current_m, previous_n),
@@ -206,9 +207,16 @@ def _terminate_processes() -> None:
         return
     script = ";".join(f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force" for name in APP_PROCESS_NAMES)
     _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
-    time.sleep(1)
+    time.sleep(0.5)
     verify = ";".join(f"if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ exit 9 }}" for name in APP_PROCESS_NAMES)
     _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify], timeout=30)
+
+
+def _canonical_path(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path).casefold()
 
 
 def inventory_shortcuts() -> ShortcutInventory:
@@ -308,9 +316,32 @@ def capture_authority_snapshot() -> AuthoritySnapshot:
 
 
 def _authority_signature(snapshot: AuthoritySnapshot) -> tuple:
-    targets = tuple(sorted(str(target).lower() for target in snapshot.canonical_targets))
-    registry = tuple(sorted((entry.display_name, entry.product_code) for entry in snapshot.registry))
-    return targets, registry
+    shortcuts = tuple(
+        sorted(
+            (
+                _canonical_path(shortcut.path),
+                _canonical_path(shortcut.target),
+                shortcut.target.exists(),
+            )
+            for shortcut in snapshot.shortcuts.shortcuts
+        )
+    )
+    missing = tuple(sorted(_canonical_path(target) for target in snapshot.shortcuts.missing_targets))
+    targets = tuple(sorted(_canonical_path(target) for target in snapshot.canonical_targets))
+    registry = tuple(
+        sorted(
+            (
+                entry.key_path.casefold(),
+                entry.display_name.casefold(),
+                entry.uninstall_string.casefold(),
+                entry.quiet_uninstall_string.casefold(),
+                entry.windows_installer,
+                entry.product_code.casefold(),
+            )
+            for entry in snapshot.registry
+        )
+    )
+    return shortcuts, missing, targets, registry
 
 
 def verify_authority_unchanged(before: AuthoritySnapshot, after: AuthoritySnapshot) -> None:
@@ -321,7 +352,7 @@ def verify_authority_unchanged(before: AuthoritySnapshot, after: AuthoritySnapsh
         )
 
 
-def resolve_authoritative_shortcut() -> Shortcut:
+def resolve_authoritative_shortcut(rejected_version: str | None = None) -> Shortcut:
     inventory = inventory_shortcuts()
     if not inventory.shortcuts:
         raise InstallerIdentityError("expected at least one authoritative token.place shortcut, found 0")
@@ -333,7 +364,7 @@ def resolve_authoritative_shortcut() -> Shortcut:
     if len(targets) != 1:
         raise InstallerIdentityError(f"expected one distinct authoritative executable target, found {len(targets)}")
     target = targets[0]
-    if EXPECTED_PREVIOUS_VERSION in str(target):
+    if rejected_version and rejected_version in str(target):
         raise InstallerIdentityError("authoritative shortcut targets a stale previous-version executable")
     return next(shortcut for shortcut in inventory.shortcuts if str(shortcut.target).lower() == str(target).lower())
 
@@ -430,44 +461,87 @@ def uninstall_best_effort(log_path: Path | None = None) -> None:
             raise InstallerIdentityError(
                 f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
             )
-    time.sleep(1)
-    verify_authority_removed(snapshot)
+    wait_for_cleanup_convergence(snapshot)
 
 
-def _verify_no_authority_processes() -> None:
-    for name in APP_PROCESS_NAMES:
-        result = _run(
-            [
-                _powershell(),
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                f"if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ exit 9 }}",
-            ],
-            timeout=30,
-            check=False,
-        )
-        if result.returncode == 9:
-            raise InstallerIdentityError(f"process authority remains after uninstall: {name}")
+def _processes_running_targets(targets: Iterable[Path]) -> list[str]:
+    wanted = {_canonical_path(target) for target in targets}
+    if not wanted:
+        return []
+    script = r'''
+$items = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.ExecutablePath -and ($_.Name -match 'token\.place|tokenplace|token-place') } |
+  Select-Object Name,ExecutablePath
+$items | ConvertTo-Json -Depth 3
+'''
+    result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
+    raw = result.stdout.strip()
+    if result.returncode != 0 or not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return [
+        str(item.get("ExecutablePath") or "")
+        for item in data
+        if _canonical_path(Path(str(item.get("ExecutablePath") or ""))) in wanted
+    ]
+
+
+def _verify_no_authority_processes(targets: Iterable[Path]) -> None:
+    running = _processes_running_targets(targets)
+    if running:
+        raise InstallerIdentityError(f"process authority remains after uninstall: {len(running)} process(es)")
+
+
+def residual_authority_categories(before: AuthoritySnapshot | None = None) -> list[str]:
+    categories: list[str] = []
+    inventory = inventory_shortcuts()
+    if inventory.shortcuts or inventory.existing_targets or inventory.missing_targets:
+        categories.append("shortcuts")
+    registry = inventory_registry_entries()
+    if registry:
+        categories.append("registry")
+    targets = before.canonical_targets if before else []
+    if any(target.exists() for target in targets):
+        categories.append("executables")
+    if _processes_running_targets(targets):
+        categories.append("processes")
+    return categories
 
 
 def verify_no_authority_remains() -> None:
-    inventory = inventory_shortcuts()
-    if inventory.shortcuts or inventory.existing_targets or inventory.missing_targets:
-        raise InstallerIdentityError("authority remains: shortcut/executable inventory is not empty")
-    registry = inventory_registry_entries()
-    if registry:
-        names = ", ".join(entry.display_name for entry in registry)
-        raise InstallerIdentityError(f"authority remains: registry entries are not empty ({names})")
+    categories = residual_authority_categories()
+    if categories:
+        raise InstallerIdentityError(f"authority remains: {', '.join(categories)}")
 
 
 def verify_authority_removed(before: AuthoritySnapshot) -> None:
-    verify_no_authority_remains()
-    for target in before.canonical_targets:
-        if target.exists():
-            raise InstallerIdentityError(f"installed executable still present after uninstall: {target.name}")
-    _verify_no_authority_processes()
+    categories = residual_authority_categories(before)
+    if categories:
+        raise InstallerIdentityError(f"authority remains after uninstall: {', '.join(categories)}")
+
+
+def wait_for_cleanup_convergence(
+    before: AuthoritySnapshot,
+    *,
+    deadline_seconds: float = 20.0,
+    poll_seconds: float = 0.5,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    deadline = monotonic() + deadline_seconds
+    last_categories: list[str] = []
+    while True:
+        last_categories = residual_authority_categories(before)
+        if not last_categories:
+            return
+        if monotonic() >= deadline:
+            raise InstallerIdentityError(f"cleanup did not converge; residual authority: {', '.join(last_categories)}")
+        sleeper(poll_seconds)
 
 
 def _assert_runtime(exe: Path) -> None:
@@ -479,7 +553,7 @@ def _assert_runtime(exe: Path) -> None:
         if not found:
             raise InstallerIdentityError("expected installed resources to contain python-runtime/python.exe")
         python_exe = found[0]
-    provenance = python_exe.parent / "tokenplace-runtime-provenance.json"
+    provenance = python_exe.parent / RUNTIME_PROVENANCE_NAME
     if not provenance.exists():
         raise InstallerIdentityError(f"expected runtime provenance file at {provenance.name}, but it is missing")
     try:
@@ -571,9 +645,9 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
-            shortcut = resolve_authoritative_shortcut()
+            shortcut = resolve_authoritative_shortcut(scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)
-            probe_identity(shortcut.target, env, EXPECTED_VERSION, expected_build_id)
+            probe_identity(shortcut.target, env, scenario.current.version, expected_build_id)
             record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
             if config_path is not None:
                 verify_config_preserved(config_path, seeded)

@@ -4550,3 +4550,176 @@ def test_installed_context_smoke_probe_source_has_fail_closed_constructor_checks
     assert 'installed_context_forbidden_attempts' in function
     assert 'unexpected_compute_fallback' in function
     assert 'installed_context_64k_yarn_rope_capability_bypassed_or_unsupported' in function
+
+
+def test_windows_installer_identity_safe_env_restricts_path_and_preserves_required_vars(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    sentinel = tmp_path / 'sentinel'
+    sentinel.mkdir()
+    log = tmp_path / 'sentinel.log'
+    monkeypatch.setenv('SystemRoot', r'C:\Windows')
+    monkeypatch.setenv('ComSpec', r'C:\Windows\System32\cmd.exe')
+    monkeypatch.setenv('APPDATA', r'C:\Users\runner\AppData\Roaming')
+    monkeypatch.setenv('PATH', r'C:\Windows\System32')
+
+    env = guard._safe_env(sentinel, log, {'TOKENPLACE_EXTRA': 'ok'})
+
+    assert env['PATH'] == str(sentinel)
+    assert env['TOKENPLACE_SENTINEL_LOG'] == str(log)
+    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert env['SystemRoot'] == r'C:\Windows'
+    assert env['ComSpec'] == r'C:\Windows\System32\cmd.exe'
+    assert env['APPDATA'] == r'C:\Users\runner\AppData\Roaming'
+    assert env['TOKENPLACE_EXTRA'] == 'ok'
+
+
+def test_windows_installer_identity_sentinel_dir_creates_every_host_tool_guard(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+
+    directory = guard._sentinel_dir(tmp_path)
+
+    assert directory == tmp_path / 'sentinel-path'
+    for name in guard.SENTINELS:
+        sentinel = directory / f'{name}.cmd'
+        text = sentinel.read_text(encoding='utf-8')
+        assert f'SENTINEL {name} invoked' in text
+        assert '%TOKENPLACE_SENTINEL_LOG%' in text
+        assert 'exit /b 42' in text
+
+
+def test_windows_installer_identity_probe_attempt_counters_fail_closed() -> None:
+    guard = _load_windows_installer_identity()
+    guard.assert_no_probe_attempt_counters({
+        'runtime_installation_attempted_count': 0,
+        'runtime_repair_attempted_count': '0',
+        'dependency_provisioning_attempted_count': None,
+        'provisioning_attempted_count': 0,
+        'network_attempted_count': 0,
+        'model_download_attempted_count': 0,
+    })
+
+    with pytest.raises(guard.InstallerIdentityError, match='forbidden provisioning/network work'):
+        guard.assert_no_probe_attempt_counters({'network_attempted_count': 1})
+
+
+def test_windows_installer_identity_operator_record_accepts_64k_ready_contract() -> None:
+    guard = _load_windows_installer_identity()
+    record = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'context_tier': '64k-full',
+        'effective_n_ctx': 65536,
+        'n_ctx': 65536,
+        'selected_model_profile': 'qwen3-8b-q4',
+        'startup_phase': 'ready',
+        'startup_deadline_ms': 15000,
+        'startup_result': 'ready',
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+        'api_v1_readiness_yarn_requested_context_tokens': 65536,
+        'api_v1_readiness_yarn_rope_supported': True,
+        'runtime_installation_attempted_count': 0,
+        'runtime_repair_attempted_count': 0,
+        'dependency_provisioning_attempted_count': 0,
+        'provisioning_attempted_count': 0,
+        'network_attempted_count': 0,
+        'model_download_attempted_count': 0,
+        'runtime_action': 'installed_artifact_context_probe_no_provisioning',
+    }
+
+    parsed = guard.assert_operator_record(json.dumps(record), expected_tier='64k-full', launch_number=2)
+
+    assert parsed['effective_n_ctx'] == 65536
+
+
+def test_windows_installer_identity_operator_record_rejects_multiline_or_fallback() -> None:
+    guard = _load_windows_installer_identity()
+    valid = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+    }
+
+    with pytest.raises(guard.InstallerIdentityError, match='exactly one'):
+        guard.assert_operator_record(json.dumps(valid) + '\n' + json.dumps(valid))
+
+    invalid = dict(valid, context_tier='8k-fast', effective_n_ctx=8192, n_ctx=8192,
+                   selected_model_profile='qwen3-8b-q4', startup_phase='ready', startup_deadline_ms=1000,
+                   startup_result='ready', backend_fallback=True)
+    with pytest.raises(guard.InstallerIdentityError, match='fallback'):
+        guard.assert_operator_record(json.dumps(invalid), expected_tier='8k-fast')
+
+
+def test_installed_context_smoke_fails_on_observed_compute_fallback(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_fallback_guard', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original_get = ModelManager.get_llm_instance
+
+    def get_llm_instance_with_fallback(self):
+        result = original_get(self)
+        self.last_compute_diagnostics = {'fallback_reason': 'forced-test-fallback'}
+        return result
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', get_llm_instance_with_fallback)
+
+    with pytest.raises(RuntimeError, match='unexpected_compute_fallback'):
+        module.installed_context_smoke_payload('8k-fast', '1')
+
+
+def test_installed_context_smoke_fails_when_64k_capability_is_not_supported(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_yarn_guard', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original_get = ModelManager.get_llm_instance
+
+    def get_llm_instance_without_yarn_support(self):
+        result = original_get(self)
+        self.last_yarn_rope_diagnostics = {'supported': False}
+        return result
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', get_llm_instance_without_yarn_support)
+
+    with pytest.raises(RuntimeError, match='64k_yarn_rope_capability'):
+        module.installed_context_smoke_payload('64k-full', '1')
+
+
+def test_installed_context_smoke_fails_on_wrong_constructor_n_ctx(monkeypatch) -> None:
+    import importlib.util
+    from utils.llm.model_manager import ModelManager
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_wrong_n_ctx', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original_get = ModelManager.get_llm_instance
+
+    def get_llm_instance_with_tampered_context_size(self):
+        result = original_get(self)
+        self.config['model.context_size'] = 1234
+        return result
+
+    monkeypatch.setattr(ModelManager, 'get_llm_instance', get_llm_instance_with_tampered_context_size)
+
+    with pytest.raises(RuntimeError, match='constructor_n_ctx_mismatch'):
+        module.installed_context_smoke_payload('8k-fast', '1')

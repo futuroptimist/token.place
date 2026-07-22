@@ -96,6 +96,20 @@ class AuthoritySnapshot:
         return self.shortcuts.distinct_existing_targets
 
 
+@dataclass(frozen=True)
+class InstalledResourceManifest:
+    files: tuple[tuple[str, int, int], ...]
+
+    def diff(self, other: "InstalledResourceManifest") -> dict[str, list[str]]:
+        before = {path: (size, mtime_ns) for path, size, mtime_ns in self.files}
+        after = {path: (size, mtime_ns) for path, size, mtime_ns in other.files}
+        return {
+            "added": sorted(set(after) - set(before)),
+            "removed": sorted(set(before) - set(after)),
+            "modified": sorted(path for path in set(before) & set(after) if before[path] != after[path]),
+        }
+
+
 class InstallerIdentityError(AssertionError):
     pass
 
@@ -188,6 +202,7 @@ def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | N
             env[key] = os.environ[key]
     env["PATH"] = str(sentinel_path)
     env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     if extra:
         env.update(extra)
     return env
@@ -559,6 +574,40 @@ def wait_for_cleanup_convergence(
         sleeper(poll_seconds)
 
 
+def capture_installed_resource_manifest(exe: Path) -> InstalledResourceManifest:
+    """Capture deterministic state for bundled runtime/resource roots only."""
+    roots = [exe.parent / "python-runtime", exe.parent / "resources"]
+    files: list[tuple[str, int, int]] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            stat = path.stat()
+            files.append((f"{root.name}/{path.relative_to(root).as_posix()}", int(stat.st_size), int(stat.st_mtime_ns)))
+    return InstalledResourceManifest(tuple(files))
+
+
+def assert_manifest_unchanged(before: InstalledResourceManifest, after: InstalledResourceManifest, *, phase: str) -> None:
+    diff = before.diff(after)
+    residual = {key: value[:5] for key, value in diff.items() if value}
+    if residual:
+        raise InstallerIdentityError(f"installed runtime/resource mutation after {phase}: {residual}")
+
+
+def assert_no_probe_attempt_counters(data: dict[str, object]) -> None:
+    counter_keys = (
+        "runtime_installation_attempted_count",
+        "runtime_repair_attempted_count",
+        "dependency_provisioning_attempted_count",
+        "provisioning_attempted_count",
+        "network_attempted_count",
+        "model_download_attempted_count",
+    )
+    nonzero = {key: data.get(key) for key in counter_keys if int(data.get(key) or 0) != 0}
+    if nonzero:
+        raise InstallerIdentityError(f"installed-context smoke attempted forbidden provisioning/network work: {nonzero}")
+
+
 def _assert_runtime(exe: Path) -> None:
     roots = [exe.parent, exe.parent.parent]
     candidates = [root / "python-runtime" / "python.exe" for root in roots]
@@ -640,19 +689,21 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
         if expected_tier == "64k-full":
             if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
                 raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
-    if launch_number == 2:
-        mutation_keys = ("runtime_installation_attempted", "runtime_repair_attempted", "dependency_provisioning_attempted", "runtime_mutation")
-        if any(data.get(key) is True for key in mutation_keys):
-            raise InstallerIdentityError("second operator-session smoke launch attempted runtime installation/repair/provisioning")
-        if data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
-            raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
+    assert_no_probe_attempt_counters(data)
+    if launch_number == 2 and data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
+        raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
     return data
 
 
 def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_dir: ScenarioArtifactDir | None, scenario_name: str) -> None:
+    initial_manifest = capture_installed_resource_manifest(exe)
+    expected_runtime_id: str | None = None
+    expected_profile: str | None = None
     for tier in ("8k-fast", "64k-full"):
         config_path = seed_config(seeded_config_values(tier))
         for launch in (1, 2):
+            before = capture_installed_resource_manifest(exe)
+            assert_manifest_unchanged(initial_manifest, before, phase=f"{tier}-launch-{launch}-preflight")
             launch_env = dict(env)
             launch_env["TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER"] = str(launch)
             text = launch_for_operator_record(
@@ -660,9 +711,21 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
                 launch_env,
                 artifact_dir.path(scenario_name, f"operator-smoke-{tier}-launch-{launch}") if artifact_dir else None,
             )
+            after = capture_installed_resource_manifest(exe)
+            assert_manifest_unchanged(before, after, phase=f"{tier}-launch-{launch}")
             record = assert_operator_record(text, expected_tier=tier, launch_number=launch)
-            if record.get("interpreter_basename") != "python.exe" or record.get("launcher_source") != "bundled" or record.get("runtime_id") != EXPECTED_RUNTIME_ID:
+            runtime_id = str(record.get("runtime_id") or "")
+            profile_id = str(record.get("model_profile_identifier") or record.get("active_model_profile_id") or "")
+            if record.get("interpreter_basename") != "python.exe" or record.get("launcher_source") != "bundled" or runtime_id != EXPECTED_RUNTIME_ID:
                 raise InstallerIdentityError("tier smoke did not use the installed bundled runtime")
+            if expected_runtime_id is None:
+                expected_runtime_id = runtime_id
+            elif runtime_id != expected_runtime_id:
+                raise InstallerIdentityError("tier smoke changed bundled runtime identity between launches")
+            if expected_profile is None:
+                expected_profile = profile_id
+            elif profile_id != expected_profile:
+                raise InstallerIdentityError("tier smoke changed canonical model profile between launches")
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 

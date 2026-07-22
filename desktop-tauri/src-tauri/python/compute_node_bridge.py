@@ -13,6 +13,7 @@ import queue
 import re
 import sys
 import threading
+import tempfile
 import time
 import types
 import uuid
@@ -2761,14 +2762,16 @@ def run(args: argparse.Namespace) -> int:
 def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Dict[str, Any]:
     """Return a bounded installed-artifact context probe record.
 
-    This runs inside the resolved packaged interpreter and exercises the same
-    profile-to-model-constructor startup boundary used by normal startup. The
-    model/GPU dependency is an explicitly labelled deterministic fake so hosted
-    CI can capture constructor options without starting inference, networking,
-    dependency provisioning, or real CUDA work.
+    This runs inside the resolved packaged interpreter and exercises the normal
+    ModelManager.get_llm_instance() initialization entry point. Heavyweight
+    external runtime/model dependencies are replaced only at the llama.cpp import
+    and fake model-artifact boundary so the record is derived from production
+    profile selection, model existence checks, compute-plan/runtime-kwarg
+    construction, constructor invocation, diagnostics, and startup propagation.
     """
     apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
     from utils.compute_node_runtime import apply_compute_mode
+    import utils.llm.model_manager as model_manager_module
     from utils.llm.model_manager import ModelManager
 
     class _Config(dict):
@@ -2806,6 +2809,8 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
             n_ubatch: Any = None,
             **kwargs: Any,
         ) -> None:
+            self.child_model_path_exists = False
+
             captured_constructor_calls.append(
                 {
                     "args": list(args),
@@ -2826,80 +2831,114 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
                 }
             )
 
-    normalized_tier = normalize_context_tier(context_tier)
-    config = _Config(
-        {
-            "model.profile_id": "qwen3-8b-q4-k-m",
-            "model.api_model_id": "qwen3-8b-instruct",
-            "model.download_chunk_size_mb": 10,
-            "model.download_timeout": 30,
-            "model.use_mock": False,
-            "model.n_gpu_layers": -1,
-            "model.hybrid_n_gpu_layers": 24,
-            "model.gpu_memory_headroom_percent": 0.1,
-            "model.enforce_gpu_memory_headroom": True,
-            "model.chat_format": "llama-3",
-            "paths.models_dir": "<installed-artifact-model-dir>",
-        }
-    )
-    manager = ModelManager(config)
-    profile = apply_context_profile(manager, normalized_tier)
-    apply_compute_mode(manager, "auto")
+        def apply_chat_template(self, messages: Any, tokenize: bool = False, add_generation_prompt: bool = True, **kwargs: Any) -> Any:
+            rendered = "<|assistant|>"
+            return [1, 2, 3] if tokenize else rendered
+
+        def tokenize(self, content: Any, add_bos: bool = True) -> List[int]:
+            return [1, 2, 3] if add_bos else [2, 3]
+
     fake_module = _FakeLlamaModule(Llama=_FakeLlama)
-    manager.desktop_runtime_probe = {
-        "backend": "cuda",
-        "gpu_offload_supported": True,
-        "detected_device": "cuda",
-        "runtime_action": "installed_artifact_context_probe_no_provisioning",
-        "fallback_reason": None,
-        "llama_module_path": "mocked_hosted_windows_llama_cpp.py",
-        "qwen_64k_yarn_support": "supported",
-        "yarn_resolver_source": "top_level_enum",
-        "yarn_enum_value": 2,
-        "constructor_signature_inspectable": True,
-        "constructor_has_var_kwargs": False,
-        "constructor_kwarg_support": {
-            name: True
-            for name in (
-                "type_k",
-                "type_v",
-                "flash_attn",
-                "offload_kqv",
-                "n_batch",
-                "n_ubatch",
-                "rope_scaling_type",
-                "yarn_ext_factor",
-                "yarn_attn_factor",
-                "yarn_beta_fast",
-                "yarn_beta_slow",
-                "yarn_orig_ctx",
-                "rope_freq_base",
-                "rope_freq_scale",
-            )
-        },
-        "capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+    normalized_tier = normalize_context_tier(context_tier)
+    attempt_counts = {
+        "runtime_installation_attempted": 0,
+        "runtime_repair_attempted": 0,
+        "dependency_provisioning_attempted": 0,
+        "network_attempted": 0,
+        "model_download_attempted": 0,
     }
+
+    def _guard_attempt(name: str):
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            attempt_counts[name] += 1
+            raise RuntimeError(f"installed_context_forbidden_{name}")
+
+        return _raise
+
+    original_import = model_manager_module._import_llama_cpp_runtime
+    original_requests_get = getattr(model_manager_module.requests, "get", None)
+    original_can_allocate = model_manager_module.resource_monitor.can_allocate_gpu_memory
     startup_started_at = time.monotonic()
     startup_deadline_ms = 15000
-    startup_phase = "model_constructor_preflight"
+    startup_phase = "model_manager_get_llm_instance"
     startup_result = "unknown"
-    try:
-        compute_plan = manager._resolve_compute_plan()
-        fallback_reason = compute_plan.get("fallback_reason")
-        if fallback_reason:
-            raise RuntimeError(f"unexpected_compute_fallback: {fallback_reason}")
-        init_kwargs = manager._runtime_init_kwargs(
-            _FakeLlama,
-            int(compute_plan.get("n_gpu_layers", -1)),
-            llama_cpp_module=fake_module,
+    runtime_action = "installed_artifact_context_probe_no_provisioning"
+
+    with tempfile.TemporaryDirectory(prefix="tokenplace-installed-context-") as tmpdir:
+        models_dir = Path(tmpdir) / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        config = _Config(
+            {
+                "model.profile_id": "qwen3-8b-q4-k-m",
+                "model.api_model_id": "qwen3-8b-instruct",
+                "model.download_chunk_size_mb": 10,
+                "model.download_timeout": 30,
+                "model.use_mock": False,
+                "model.n_gpu_layers": -1,
+                "model.hybrid_n_gpu_layers": 24,
+                "model.gpu_memory_headroom_percent": 0.1,
+                "model.enforce_gpu_memory_headroom": False,
+                "model.chat_format": "llama-3",
+                "paths.models_dir": str(models_dir),
+            }
         )
-        startup_phase = "model_constructor"
-        _FakeLlama(**init_kwargs)
-        startup_result = "ready"
-        startup_phase = "ready"
-    except Exception:
-        startup_result = "terminal_actionable_error"
-        raise
+        manager = ModelManager(config)
+        profile = apply_context_profile(manager, normalized_tier)
+        apply_compute_mode(manager, "auto")
+        Path(manager.model_path).write_bytes(b"deterministic fake installed model artifact")
+        manager.desktop_runtime_probe = {
+            "backend": "cuda",
+            "gpu_offload_supported": True,
+            "detected_device": "cuda",
+            "runtime_action": runtime_action,
+            "fallback_reason": None,
+            "llama_module_path": "mocked_hosted_windows_llama_cpp.py",
+            "qwen_64k_yarn_support": "supported",
+            "yarn_resolver_source": "top_level_enum",
+            "yarn_enum_value": 2,
+            "constructor_signature_inspectable": True,
+            "constructor_has_var_kwargs": False,
+            "constructor_kwarg_support": {
+                name: True
+                for name in (
+                    "type_k",
+                    "type_v",
+                    "flash_attn",
+                    "offload_kqv",
+                    "n_batch",
+                    "n_ubatch",
+                    "rope_scaling_type",
+                    "yarn_ext_factor",
+                    "yarn_attn_factor",
+                    "yarn_beta_fast",
+                    "yarn_beta_slow",
+                    "yarn_orig_ctx",
+                    "rope_freq_base",
+                    "rope_freq_scale",
+                )
+            },
+            "capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+        }
+        manager.download_model_if_needed = _guard_attempt("model_download_attempted")  # type: ignore[method-assign]
+        manager.download_file_in_chunks = _guard_attempt("network_attempted")  # type: ignore[method-assign]
+        model_manager_module._import_llama_cpp_runtime = lambda *args, **kwargs: fake_module
+        model_manager_module.resource_monitor.can_allocate_gpu_memory = lambda *args, **kwargs: True
+        if original_requests_get is not None:
+            model_manager_module.requests.get = _guard_attempt("network_attempted")
+        try:
+            llm_instance = manager.get_llm_instance()
+            if llm_instance is None:
+                raise RuntimeError("installed_context_get_llm_instance_returned_none")
+            startup_result = "ready"
+            startup_phase = "ready"
+        except Exception:
+            startup_result = "terminal_actionable_error"
+            raise
+        finally:
+            model_manager_module._import_llama_cpp_runtime = original_import
+            model_manager_module.resource_monitor.can_allocate_gpu_memory = original_can_allocate
+            if original_requests_get is not None:
+                model_manager_module.requests.get = original_requests_get
 
     expected_n_ctx = int(manager.config["model.context_size"])
     if len(captured_constructor_calls) != 1:
@@ -2908,21 +2947,30 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
     constructed_n_ctx = int(constructor_call.get("n_ctx", -1))
     if constructed_n_ctx != expected_n_ctx:
         raise RuntimeError(f"installed_context_constructor_n_ctx_mismatch:{constructed_n_ctx}!={expected_n_ctx}")
+    if any(attempt_counts.values()):
+        raise RuntimeError(f"installed_context_forbidden_attempts:{attempt_counts}")
+    diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+    fallback_reason = diagnostics.get("fallback_reason")
+    if fallback_reason:
+        raise RuntimeError(f"unexpected_compute_fallback: {fallback_reason}")
     yarn_diagnostics = getattr(manager, "last_yarn_rope_diagnostics", {}) or {}
     if normalized_tier == "64k-full" and yarn_diagnostics.get("supported") is not True:
         raise RuntimeError("installed_context_64k_yarn_rope_capability_bypassed_or_unsupported")
 
     elapsed_ms = max(0, int((time.monotonic() - startup_started_at) * 1000))
     active_profile_id = getattr(manager, "profile_id", "unknown")
-    selected_model_profile = "qwen3-8b-q4"
-    runtime_action = "installed_artifact_context_probe_no_provisioning"
     payload: Dict[str, Any] = {
         "installed_context_probe": True,
         "gpu_capability": "mocked_hosted_windows_contract_no_real_cuda",
         "context_tier": getattr(profile, "profile_id", normalized_tier),
-        "selected_model_profile": selected_model_profile,
+        "selected_model_profile": (
+            active_profile_id.removesuffix("-k-m")
+            if isinstance(active_profile_id, str) and active_profile_id.endswith("-k-m")
+            else active_profile_id
+        ),
         "model_profile_identifier": active_profile_id,
         "active_model_profile_id": active_profile_id,
+        "api_model_identifier": getattr(manager, "api_model_id", "unknown"),
         "effective_n_ctx": constructed_n_ctx,
         "n_ctx": constructed_n_ctx,
         "constructor_call_count": len(captured_constructor_calls),
@@ -2931,20 +2979,19 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         "startup_result": startup_result,
         "startup_deadline_ms": startup_deadline_ms,
         "startup_elapsed_ms": elapsed_ms,
-        "runtime_action": runtime_action,
-        "fallback_reason": None,
-        "backend_fallback": False,
+        "runtime_action": diagnostics.get("runtime_action") or runtime_action,
+        "fallback_reason": fallback_reason,
+        "backend_fallback": bool(fallback_reason),
         "model_fallback": False,
-        "context_fallback": False,
-        "provisioning_attempted": False,
-        "runtime_installation_attempted": False,
-        "runtime_repair_attempted": False,
-        "dependency_provisioning_attempted": False,
-        "runtime_mutation": False,
+        "context_fallback": getattr(profile, "profile_id", normalized_tier) != normalized_tier,
+        "provisioning_attempted_count": attempt_counts["dependency_provisioning_attempted"],
+        "runtime_installation_attempted_count": attempt_counts["runtime_installation_attempted"],
+        "runtime_repair_attempted_count": attempt_counts["runtime_repair_attempted"],
+        "dependency_provisioning_attempted_count": attempt_counts["dependency_provisioning_attempted"],
+        "model_download_attempted_count": attempt_counts["model_download_attempted"],
+        "network_attempted_count": attempt_counts["network_attempted"],
         "launch_number": launch_number,
-        "second_launch_no_repair": launch_number == "2",
-        "network_attempted": False,
-        "model_constructor_boundary": "utils.llm.model_manager.ModelManager._runtime_init_kwargs",
+        "model_constructor_boundary": "utils.llm.model_manager.ModelManager.get_llm_instance",
     }
     if normalized_tier == "64k-full":
         payload.update(

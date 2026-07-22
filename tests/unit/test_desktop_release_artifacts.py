@@ -4198,9 +4198,9 @@ def test_windows_installer_identity_second_launch_rejects_repair_or_provisioning
         'backend_fallback': False,
         'model_fallback': False,
         'context_fallback': False,
-        'runtime_installation_attempted': True,
+        'runtime_installation_attempted_count': 1,
     }
-    with pytest.raises(guard.InstallerIdentityError, match='second operator-session'):
+    with pytest.raises(guard.InstallerIdentityError, match='forbidden provisioning'):
         guard.assert_operator_record(json.dumps(record), expected_tier='8k-fast', launch_number=2)
 
 
@@ -4235,9 +4235,9 @@ def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(m
             'backend_fallback': False,
             'model_fallback': False,
             'context_fallback': False,
-            'runtime_installation_attempted': False,
-            'runtime_repair_attempted': False,
-            'dependency_provisioning_attempted': False,
+            'runtime_installation_attempted_count': 0,
+            'runtime_repair_attempted_count': 0,
+            'dependency_provisioning_attempted_count': 0,
             'runtime_mutation': False,
             'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
             'api_v1_readiness_yarn_rope_supported': True,
@@ -4287,7 +4287,8 @@ def test_installed_context_smoke_cli_inherits_launch_number_from_environment(mon
     assert module.main() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload['launch_number'] == '2'
-    assert payload['second_launch_no_repair'] is True
+    assert payload['runtime_installation_attempted_count'] == 0
+    assert payload['runtime_repair_attempted_count'] == 0
 
 
 def test_installed_context_smoke_cli_rejects_unknown_rust_supplied_arguments(monkeypatch) -> None:
@@ -4323,3 +4324,76 @@ def test_installed_context_smoke_probe_constructs_model_once_and_reports_observe
     assert full['api_v1_readiness_yarn_rope_enabled'] is True
     assert full['api_v1_readiness_yarn_configuration_valid'] is True
     assert full['gpu_capability'] == 'mocked_hosted_windows_contract_no_real_cuda'
+
+
+
+def test_windows_installer_identity_manifest_detects_added_removed_modified(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    runtime = tmp_path / 'python-runtime'
+    resources = tmp_path / 'resources'
+    runtime.mkdir()
+    resources.mkdir()
+    tracked = runtime / 'python.exe'
+    tracked.write_text('runtime', encoding='utf-8')
+    before = guard.capture_installed_resource_manifest(exe)
+    (resources / 'added.txt').write_text('new', encoding='utf-8')
+    after_added = guard.capture_installed_resource_manifest(exe)
+    with pytest.raises(guard.InstallerIdentityError, match='added'):
+        guard.assert_manifest_unchanged(before, after_added, phase='added')
+    (resources / 'added.txt').unlink()
+    tracked.write_text('runtime changed', encoding='utf-8')
+    after_modified = guard.capture_installed_resource_manifest(exe)
+    with pytest.raises(guard.InstallerIdentityError, match='modified'):
+        guard.assert_manifest_unchanged(before, after_modified, phase='modified')
+    tracked.unlink()
+    after_removed = guard.capture_installed_resource_manifest(exe)
+    with pytest.raises(guard.InstallerIdentityError, match='removed'):
+        guard.assert_manifest_unchanged(before, after_removed, phase='removed')
+
+
+def test_windows_installer_identity_second_launch_requires_observed_zero_counters() -> None:
+    guard = _load_windows_installer_identity()
+    base = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'selected_model_profile': 'qwen3-8b-q4',
+        'model_profile_identifier': 'qwen3-8b-q4-k-m',
+        'context_tier': '8k-fast',
+        'effective_n_ctx': 8192,
+        'n_ctx': 8192,
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 15000,
+        'runtime_action': 'installed_artifact_context_probe_no_provisioning',
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+    }
+    with pytest.raises(guard.InstallerIdentityError, match='forbidden provisioning'):
+        guard.assert_operator_record(json.dumps({**base, 'network_attempted_count': 1}), expected_tier='8k-fast', launch_number=2)
+    guard.assert_operator_record(json.dumps({
+        **base,
+        'network_attempted_count': 0,
+        'runtime_installation_attempted_count': 0,
+        'runtime_repair_attempted_count': 0,
+        'dependency_provisioning_attempted_count': 0,
+        'provisioning_attempted_count': 0,
+        'model_download_attempted_count': 0,
+    }), expected_tier='8k-fast', launch_number=2)
+
+
+def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
+    source = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py').read_text(encoding='utf-8')
+    function = source[source.index('def installed_context_smoke_payload'):source.index('\ndef main() -> int:', source.index('def installed_context_smoke_payload'))]
+    assert '.get_llm_instance()' in function
+    assert 'manager._resolve_compute_plan()' not in function
+    assert 'manager._runtime_init_kwargs(' not in function
+    assert '"runtime_installation_attempted": False' not in function
+    assert 'second_launch_no_repair' not in function

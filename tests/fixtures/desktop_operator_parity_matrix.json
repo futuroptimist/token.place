@@ -160,16 +160,18 @@
     "known_gaps": [],
     "lifecycle_coverage": [
         {
-            "id": "macos_packaged_operator_lifecycle_parity",
-            "tracking_context": "macOS packaged operator lifecycle parity is validated through the shared desktop parity runner used by the macOS packaged CI job.",
-            "platform": "darwin",
+            "id": "simulated_macos_packaged_operator_lifecycle_parity",
+            "tracking_context": "Platform-neutral macOS Contents/Resources packaged layout, dependency isolation, fake Metal, and API v1 relay lifecycle parity run on Linux through the shared desktop parity runner.",
+            "platform": "linux-simulated-darwin",
             "scope": "packaged_operator_lifecycle_e2e",
-            "status": "covered_by_shared_entrypoint",
+            "status": "covered_by_linux_shared_entrypoint",
             "shared_entrypoint": "desktop-tauri/scripts/run_desktop_parity_checks.py",
             "workflow": ".github/workflows/desktop-operator-e2e.yml",
             "covered_checks": [
                 "packaged_resource_resolution",
                 "dependency_isolation",
+                "mock_metal_registration",
+                "mock_metal_gpu_failure_fail_closed",
                 "warm_load",
                 "register",
                 "multi_turn_api_v1_relay_chat",
@@ -180,6 +182,23 @@
             "required_scripts": [
                 "desktop-tauri/scripts/test_packaged_operator_e2e.py",
                 "desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py"
+            ]
+        },
+        {
+            "id": "native_macos_no_relay_lifecycle_smoke",
+            "tracking_context": "Genuinely native Darwin process-launch and no-relay application lifecycle coverage is isolated to a targeted macOS Apple Silicon smoke workflow on main, schedule, and manual dispatch.",
+            "platform": "darwin",
+            "scope": "native_tauri_no_relay_lifecycle_smoke",
+            "status": "covered_by_targeted_native_smoke",
+            "workflow": ".github/workflows/desktop-macos-smoke.yml",
+            "covered_checks": [
+                "debug_tauri_application_build_no_bundle",
+                "native_process_launch",
+                "native_no_relay_autostart",
+                "native_shutdown"
+            ],
+            "required_scripts": [
+                "desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py"
             ]
         }
     ]

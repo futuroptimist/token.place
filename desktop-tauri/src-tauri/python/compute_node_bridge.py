@@ -2761,35 +2761,177 @@ def run(args: argparse.Namespace) -> int:
 def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Dict[str, Any]:
     """Return a bounded installed-artifact context probe record.
 
-    This runs inside the resolved packaged interpreter and applies the production
-    context profile helper, but intentionally does not start inference, network
-    calls, or dependency provisioning. Hosted CI may mock GPU capability; this
-    record must not be interpreted as real CUDA validation.
+    This runs inside the resolved packaged interpreter and exercises the same
+    profile-to-model-constructor startup boundary used by normal startup. The
+    model/GPU dependency is an explicitly labelled deterministic fake so hosted
+    CI can capture constructor options without starting inference, networking,
+    dependency provisioning, or real CUDA work.
     """
     apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+    from utils.compute_node_runtime import apply_compute_mode
+    from utils.llm.model_manager import ModelManager
 
     class _Config(dict):
+        is_production = True
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+            return super().get(key, default)
+
         def set(self, key: str, value: Any) -> None:
             self[key] = value
 
+    class _FakeLlamaModule(types.SimpleNamespace):
+        LLAMA_ROPE_SCALING_TYPE_YARN = 2
+        __version__ = "mocked-hosted-windows-contract"
+        __file__ = "mocked_hosted_windows_llama_cpp.py"
+
+    captured_constructor_calls: List[Dict[str, Any]] = []
+
+    class _FakeLlama:
+        def __init__(
+            self,
+            *args: Any,
+            model_path: str,
+            n_gpu_layers: int,
+            n_ctx: int,
+            verbose: bool = False,
+            rope_scaling_type: Optional[int] = None,
+            rope_freq_scale: Optional[float] = None,
+            yarn_orig_ctx: Optional[int] = None,
+            type_k: Any = None,
+            type_v: Any = None,
+            flash_attn: Any = None,
+            offload_kqv: Any = None,
+            n_batch: Any = None,
+            n_ubatch: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            captured_constructor_calls.append(
+                {
+                    "args": list(args),
+                    "model_path": model_path,
+                    "n_gpu_layers": n_gpu_layers,
+                    "n_ctx": n_ctx,
+                    "verbose": verbose,
+                    "rope_scaling_type": rope_scaling_type,
+                    "rope_freq_scale": rope_freq_scale,
+                    "yarn_orig_ctx": yarn_orig_ctx,
+                    "type_k": type_k,
+                    "type_v": type_v,
+                    "flash_attn": flash_attn,
+                    "offload_kqv": offload_kqv,
+                    "n_batch": n_batch,
+                    "n_ubatch": n_ubatch,
+                    "extra_kwargs": dict(kwargs),
+                }
+            )
+
     normalized_tier = normalize_context_tier(context_tier)
-    manager = types.SimpleNamespace(config=_Config())
+    config = _Config(
+        {
+            "model.profile_id": "qwen3-8b-q4-k-m",
+            "model.api_model_id": "qwen3-8b-instruct",
+            "model.download_chunk_size_mb": 10,
+            "model.download_timeout": 30,
+            "model.use_mock": False,
+            "model.n_gpu_layers": -1,
+            "model.hybrid_n_gpu_layers": 24,
+            "model.gpu_memory_headroom_percent": 0.1,
+            "model.enforce_gpu_memory_headroom": True,
+            "model.chat_format": "llama-3",
+            "paths.models_dir": "<installed-artifact-model-dir>",
+        }
+    )
+    manager = ModelManager(config)
     profile = apply_context_profile(manager, normalized_tier)
-    effective_n_ctx = int(manager.config["model.context_size"])
+    apply_compute_mode(manager, "auto")
+    fake_module = _FakeLlamaModule(Llama=_FakeLlama)
+    manager.desktop_runtime_probe = {
+        "backend": "cuda",
+        "gpu_offload_supported": True,
+        "detected_device": "cuda",
+        "runtime_action": "installed_artifact_context_probe_no_provisioning",
+        "fallback_reason": None,
+        "llama_module_path": "mocked_hosted_windows_llama_cpp.py",
+        "qwen_64k_yarn_support": "supported",
+        "yarn_resolver_source": "top_level_enum",
+        "yarn_enum_value": 2,
+        "constructor_signature_inspectable": True,
+        "constructor_has_var_kwargs": False,
+        "constructor_kwarg_support": {
+            name: True
+            for name in (
+                "type_k",
+                "type_v",
+                "flash_attn",
+                "offload_kqv",
+                "n_batch",
+                "n_ubatch",
+                "rope_scaling_type",
+                "yarn_ext_factor",
+                "yarn_attn_factor",
+                "yarn_beta_fast",
+                "yarn_beta_slow",
+                "yarn_orig_ctx",
+                "rope_freq_base",
+                "rope_freq_scale",
+            )
+        },
+        "capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+    }
+    startup_started_at = time.monotonic()
+    startup_deadline_ms = 15000
+    startup_phase = "model_constructor_preflight"
+    startup_result = "unknown"
+    try:
+        compute_plan = manager._resolve_compute_plan()
+        fallback_reason = compute_plan.get("fallback_reason")
+        if fallback_reason:
+            raise RuntimeError(f"unexpected_compute_fallback: {fallback_reason}")
+        init_kwargs = manager._runtime_init_kwargs(
+            _FakeLlama,
+            int(compute_plan.get("n_gpu_layers", -1)),
+            llama_cpp_module=fake_module,
+        )
+        startup_phase = "model_constructor"
+        _FakeLlama(**init_kwargs)
+        startup_result = "ready"
+        startup_phase = "ready"
+    except Exception:
+        startup_result = "terminal_actionable_error"
+        raise
+
+    expected_n_ctx = int(manager.config["model.context_size"])
+    if len(captured_constructor_calls) != 1:
+        raise RuntimeError("installed_context_constructor_not_called_exactly_once")
+    constructor_call = captured_constructor_calls[0]
+    constructed_n_ctx = int(constructor_call.get("n_ctx", -1))
+    if constructed_n_ctx != expected_n_ctx:
+        raise RuntimeError(f"installed_context_constructor_n_ctx_mismatch:{constructed_n_ctx}!={expected_n_ctx}")
+    yarn_diagnostics = getattr(manager, "last_yarn_rope_diagnostics", {}) or {}
+    if normalized_tier == "64k-full" and yarn_diagnostics.get("supported") is not True:
+        raise RuntimeError("installed_context_64k_yarn_rope_capability_bypassed_or_unsupported")
+
+    elapsed_ms = max(0, int((time.monotonic() - startup_started_at) * 1000))
+    active_profile_id = getattr(manager, "profile_id", "unknown")
     selected_model_profile = "qwen3-8b-q4"
+    runtime_action = "installed_artifact_context_probe_no_provisioning"
     payload: Dict[str, Any] = {
         "installed_context_probe": True,
         "gpu_capability": "mocked_hosted_windows_contract_no_real_cuda",
         "context_tier": getattr(profile, "profile_id", normalized_tier),
         "selected_model_profile": selected_model_profile,
-        "model_profile_identifier": selected_model_profile,
-        "effective_n_ctx": effective_n_ctx,
-        "n_ctx": effective_n_ctx,
-        "startup_phase": "ready",
-        "startup_result": "ready",
-        "startup_deadline_ms": 15000,
-        "startup_elapsed_ms": 0,
-        "runtime_action": "installed_artifact_context_probe",
+        "model_profile_identifier": active_profile_id,
+        "active_model_profile_id": active_profile_id,
+        "effective_n_ctx": constructed_n_ctx,
+        "n_ctx": constructed_n_ctx,
+        "constructor_call_count": len(captured_constructor_calls),
+        "constructor_observed_n_ctx": constructed_n_ctx,
+        "startup_phase": startup_phase,
+        "startup_result": startup_result,
+        "startup_deadline_ms": startup_deadline_ms,
+        "startup_elapsed_ms": elapsed_ms,
+        "runtime_action": runtime_action,
         "fallback_reason": None,
         "backend_fallback": False,
         "model_fallback": False,
@@ -2802,15 +2944,21 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         "launch_number": launch_number,
         "second_launch_no_repair": launch_number == "2",
         "network_attempted": False,
+        "model_constructor_boundary": "utils.llm.model_manager.ModelManager._runtime_init_kwargs",
     }
     if normalized_tier == "64k-full":
         payload.update(
             {
-                "api_v1_readiness_yarn_requested_context_tokens": effective_n_ctx,
-                "api_v1_readiness_yarn_rope_supported": True,
-                "api_v1_readiness_yarn_rope_enabled": True,
-                "api_v1_readiness_yarn_configuration_valid": True,
-                "llama_cpp_capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+                "api_v1_readiness_yarn_requested_context_tokens": int(yarn_diagnostics.get("qwen_yarn_requested_context_tokens") or constructed_n_ctx),
+                "api_v1_readiness_yarn_original_context_tokens": int(yarn_diagnostics.get("qwen_yarn_original_context_tokens") or 32768),
+                "api_v1_readiness_yarn_context_multiplier": yarn_diagnostics.get("qwen_yarn_context_multiplier"),
+                "api_v1_readiness_yarn_rope_freq_scale": yarn_diagnostics.get("qwen_yarn_rope_freq_scale"),
+                "api_v1_readiness_yarn_ext_factor_overridden": yarn_diagnostics.get("qwen_yarn_ext_factor_overridden"),
+                "api_v1_readiness_yarn_rope_scaling_type_source": yarn_diagnostics.get("qwen_yarn_rope_scaling_type_source"),
+                "api_v1_readiness_yarn_rope_supported": yarn_diagnostics.get("supported") is True,
+                "api_v1_readiness_yarn_rope_enabled": constructor_call.get("rope_scaling_type") is not None,
+                "api_v1_readiness_yarn_configuration_valid": yarn_diagnostics.get("qwen_yarn_configuration_valid") is True,
+                "llama_cpp_capability_source": yarn_diagnostics.get("capability_source") or "mocked_hosted_windows_contract_no_real_cuda",
             }
         )
     return payload

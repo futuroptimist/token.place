@@ -1579,12 +1579,7 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
-        .arg(normalize_context_tier(&config.context_tier))
-        .arg("--launch-number")
-        .arg(
-            std::env::var("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER")
-                .unwrap_or_else(|_| "1".into()),
-        );
+        .arg(normalize_context_tier(&config.context_tier));
     let context_probe_output = context_probe_command.output()?;
     if !context_probe_output.status.success() {
         anyhow::bail!(

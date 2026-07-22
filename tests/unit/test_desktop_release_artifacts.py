@@ -4263,3 +4263,63 @@ def test_installed_context_smoke_probe_uses_context_profile_helper() -> None:
     assert full['effective_n_ctx'] == 65536
     assert full['api_v1_readiness_yarn_requested_context_tokens'] == 65536
     assert full['gpu_capability'] == 'mocked_hosted_windows_contract_no_real_cuda'
+
+
+def test_operator_session_smoke_rust_invocation_does_not_pass_launch_number_cli_arg() -> None:
+    source = Path('desktop-tauri/src-tauri/src/compute_node.rs').read_text(encoding='utf-8')
+    function = source[source.index('pub(crate) fn operator_session_smoke_record'):source.index('\npub async fn start_compute_node', source.index('pub(crate) fn operator_session_smoke_record'))]
+    assert '.arg("--installed-context-smoke")' in function
+    assert '.arg("--context-tier")' in function
+    assert '--launch-number' not in function
+    assert 'TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER' not in function
+
+
+def test_installed_context_smoke_cli_inherits_launch_number_from_environment(monkeypatch, capsys) -> None:
+    import importlib.util
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_cli_env', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--installed-context-smoke', '--context-tier', '8k-fast'])
+    monkeypatch.setenv('TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER', '2')
+    assert module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['launch_number'] == '2'
+    assert payload['second_launch_no_repair'] is True
+
+
+def test_installed_context_smoke_cli_rejects_unknown_rust_supplied_arguments(monkeypatch) -> None:
+    import importlib.util
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_cli_unknown', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--installed-context-smoke', '--context-tier', '8k-fast', '--launch-number', '1'])
+    with pytest.raises(SystemExit):
+        module.main()
+
+
+def test_installed_context_smoke_probe_constructs_model_once_and_reports_observed_state() -> None:
+    import importlib.util
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_observed', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    eight = module.installed_context_smoke_payload('8k-fast', '1')
+    full = module.installed_context_smoke_payload('64k-full', '2')
+    assert eight['constructor_call_count'] == 1
+    assert full['constructor_call_count'] == 1
+    assert eight['constructor_observed_n_ctx'] == eight['effective_n_ctx'] == 8192
+    assert full['constructor_observed_n_ctx'] == full['effective_n_ctx'] == 65536
+    assert eight['startup_result'] == full['startup_result'] == 'ready'
+    assert eight['fallback_reason'] is None
+    assert full['api_v1_readiness_yarn_rope_supported'] is True
+    assert full['api_v1_readiness_yarn_rope_enabled'] is True
+    assert full['api_v1_readiness_yarn_configuration_valid'] is True
+    assert full['gpu_capability'] == 'mocked_hosted_windows_contract_no_real_cuda'

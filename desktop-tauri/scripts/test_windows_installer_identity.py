@@ -382,7 +382,7 @@ def seed_config(values: dict[str, object] | None = None) -> Path:
     return config_path
 
 
-def seeded_config_values() -> dict[str, object]:
+def seeded_config_values(context_tier: str = "64k-full") -> dict[str, object]:
     return {
         "relay_base_url": "https://upgrade-preserve-primary.invalid",
         "relay_base_urls": [
@@ -391,7 +391,7 @@ def seeded_config_values() -> dict[str, object]:
         ],
         "model_path": r"C:\\token-place-upgrade\\distinctive-qwen3-8b-q4.gguf",
         "preferred_mode": "gpu",
-        "context_tier": "64k-full",
+        "context_tier": context_tier,
     }
 
 
@@ -604,7 +604,7 @@ def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | 
     return result.stdout
 
 
-def assert_operator_record(text: str) -> dict[str, object]:
+def assert_operator_record(text: str, expected_tier: str | None = None, launch_number: int | None = None) -> dict[str, object]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) != 1:
         raise InstallerIdentityError("operator-session smoke must emit exactly one machine-parseable JSON record")
@@ -624,7 +624,46 @@ def assert_operator_record(text: str) -> dict[str, object]:
         raise InstallerIdentityError(f"operator-session record missing or mismatched {missing}")
     if data.get("bridge_preflight") != "ok":
         raise InstallerIdentityError("operator-session smoke did not run bridge-command preflight")
+    if expected_tier is not None:
+        expected_n_ctx = {"8k-fast": 8192, "64k-full": 65536}.get(expected_tier)
+        if data.get("context_tier") != expected_tier or data.get("effective_n_ctx") != expected_n_ctx or data.get("n_ctx") != expected_n_ctx:
+            raise InstallerIdentityError(f"operator-session smoke reported mismatched context tier/n_ctx for {expected_tier}")
+        if data.get("selected_model_profile") != "qwen3-8b-q4":
+            raise InstallerIdentityError("operator-session smoke did not select the Qwen3 8B Q4 profile")
+        if data.get("startup_phase") == "provisioning" or data.get("startup_deadline_ms") is None:
+            raise InstallerIdentityError("operator-session smoke did not report a bounded ready/terminal startup phase")
+        if data.get("startup_result") not in ("ready", "terminal_actionable_error"):
+            raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
+        fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
+        if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
+            raise InstallerIdentityError("operator-session smoke reported a fallback")
+        if expected_tier == "64k-full":
+            if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
+                raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
+    if launch_number == 2:
+        mutation_keys = ("runtime_installation_attempted", "runtime_repair_attempted", "dependency_provisioning_attempted", "runtime_mutation")
+        if any(data.get(key) is True for key in mutation_keys):
+            raise InstallerIdentityError("second operator-session smoke launch attempted runtime installation/repair/provisioning")
+        if data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
+            raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
     return data
+
+
+def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_dir: ScenarioArtifactDir | None, scenario_name: str) -> None:
+    for tier in ("8k-fast", "64k-full"):
+        config_path = seed_config(seeded_config_values(tier))
+        for launch in (1, 2):
+            launch_env = dict(env)
+            launch_env["TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER"] = str(launch)
+            text = launch_for_operator_record(
+                exe,
+                launch_env,
+                artifact_dir.path(scenario_name, f"operator-smoke-{tier}-launch-{launch}") if artifact_dir else None,
+            )
+            record = assert_operator_record(text, expected_tier=tier, launch_number=launch)
+            if record.get("interpreter_basename") != "python.exe" or record.get("launcher_source") != "bundled" or record.get("runtime_id") != EXPECTED_RUNTIME_ID:
+                raise InstallerIdentityError("tier smoke did not use the installed bundled runtime")
+        verify_config_preserved(config_path, seeded_config_values(tier))
 
 
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
@@ -669,6 +708,7 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                 for key in ("context_tier", "preferred_mode"):
                     if str(record.get(key)) != str(seeded[key]):
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
+            validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:

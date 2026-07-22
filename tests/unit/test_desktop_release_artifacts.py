@@ -3672,6 +3672,7 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
         'preferred_mode': guard.seeded_config_values()['preferred_mode'],
     }))
     monkeypatch.setattr(guard, 'verify_config_preserved', lambda config_path, seeded: None)
+    monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda exe, env, artifact_dir, scenario_name: None)
 
     def fake_probe(target, env, expected_version, expected_build_id):
         probed_versions.append(expected_version)
@@ -4141,3 +4142,124 @@ def test_publish_flow_absent_overwrite_reuse_and_existing_draft_paths() -> None:
     assert 'gh release delete' not in text
     assert 'gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases"' in text
     assert 'already exists (including draft); desktop releases are immutable' in text
+
+
+def test_windows_installer_identity_operator_record_requires_exact_context_tier_contract() -> None:
+    guard = _load_windows_installer_identity()
+    base = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'selected_model_profile': 'qwen3-8b-q4',
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 15000,
+        'runtime_action': 'installed_artifact_context_probe',
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+    }
+    guard.assert_operator_record(json.dumps({**base, 'context_tier': '8k-fast', 'effective_n_ctx': 8192, 'n_ctx': 8192}), expected_tier='8k-fast')
+    guard.assert_operator_record(json.dumps({
+        **base,
+        'context_tier': '64k-full',
+        'effective_n_ctx': 65536,
+        'n_ctx': 65536,
+        'api_v1_readiness_yarn_requested_context_tokens': 65536,
+        'api_v1_readiness_yarn_rope_supported': True,
+    }), expected_tier='64k-full')
+    with pytest.raises(guard.InstallerIdentityError, match='mismatched context tier'):
+        guard.assert_operator_record(json.dumps({**base, 'context_tier': '8k-fast', 'effective_n_ctx': 65536, 'n_ctx': 65536}), expected_tier='8k-fast')
+    with pytest.raises(guard.InstallerIdentityError, match='fallback'):
+        guard.assert_operator_record(json.dumps({**base, 'context_tier': '8k-fast', 'effective_n_ctx': 8192, 'n_ctx': 8192, 'fallback_reason': 'cpu'}), expected_tier='8k-fast')
+
+
+def test_windows_installer_identity_second_launch_rejects_repair_or_provisioning() -> None:
+    guard = _load_windows_installer_identity()
+    record = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'selected_model_profile': 'qwen3-8b-q4',
+        'context_tier': '8k-fast',
+        'effective_n_ctx': 8192,
+        'n_ctx': 8192,
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 15000,
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+        'runtime_installation_attempted': True,
+    }
+    with pytest.raises(guard.InstallerIdentityError, match='second operator-session'):
+        guard.assert_operator_record(json.dumps(record), expected_tier='8k-fast', launch_number=2)
+
+
+def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    launched: list[tuple[str, str]] = []
+    monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
+
+    def fake_launch(path, env, log_path=None):
+        tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
+        launch = env['TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER']
+        launched.append((tier, launch))
+        n_ctx = 65536 if tier == '64k-full' else 8192
+        payload = {
+            'record': 'desktop.compute_node.session.layout',
+            'launcher_source': 'bundled',
+            'interpreter_basename': 'python.exe',
+            'runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'bridge_preflight': 'ok',
+            'selected_model_profile': 'qwen3-8b-q4',
+            'context_tier': tier,
+            'effective_n_ctx': n_ctx,
+            'n_ctx': n_ctx,
+            'startup_phase': 'ready',
+            'startup_result': 'ready',
+            'startup_deadline_ms': 15000,
+            'runtime_action': 'installed_artifact_context_probe',
+            'fallback_reason': None,
+            'backend_fallback': False,
+            'model_fallback': False,
+            'context_fallback': False,
+            'runtime_installation_attempted': False,
+            'runtime_repair_attempted': False,
+            'dependency_provisioning_attempted': False,
+            'runtime_mutation': False,
+            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
+            'api_v1_readiness_yarn_rope_supported': True,
+        }
+        return json.dumps(payload)
+
+    monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch)
+    guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+    assert launched == [('8k-fast', '1'), ('8k-fast', '2'), ('64k-full', '1'), ('64k-full', '2')]
+
+
+def test_installed_context_smoke_probe_uses_context_profile_helper() -> None:
+    import importlib.util
+
+    probe_path = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py')
+    spec = importlib.util.spec_from_file_location('compute_node_bridge', probe_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    eight = module.installed_context_smoke_payload('8k-fast', '1')
+    full = module.installed_context_smoke_payload('64k-full', '2')
+    assert eight['effective_n_ctx'] == 8192
+    assert full['effective_n_ctx'] == 65536
+    assert full['api_v1_readiness_yarn_requested_context_tokens'] == 65536
+    assert full['gpu_capability'] == 'mocked_hosted_windows_contract_no_real_cuda'

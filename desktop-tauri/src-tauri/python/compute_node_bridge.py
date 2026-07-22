@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import types
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -2756,9 +2757,68 @@ def run(args: argparse.Namespace) -> int:
     return 1 if warm_load_fatal or poll_failure_fatal or recovery_fatal else 0
 
 
+
+def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Dict[str, Any]:
+    """Return a bounded installed-artifact context probe record.
+
+    This runs inside the resolved packaged interpreter and applies the production
+    context profile helper, but intentionally does not start inference, network
+    calls, or dependency provisioning. Hosted CI may mock GPU capability; this
+    record must not be interpreted as real CUDA validation.
+    """
+    apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+
+    class _Config(dict):
+        def set(self, key: str, value: Any) -> None:
+            self[key] = value
+
+    normalized_tier = normalize_context_tier(context_tier)
+    manager = types.SimpleNamespace(config=_Config())
+    profile = apply_context_profile(manager, normalized_tier)
+    effective_n_ctx = int(manager.config["model.context_size"])
+    selected_model_profile = "qwen3-8b-q4"
+    payload: Dict[str, Any] = {
+        "installed_context_probe": True,
+        "gpu_capability": "mocked_hosted_windows_contract_no_real_cuda",
+        "context_tier": getattr(profile, "profile_id", normalized_tier),
+        "selected_model_profile": selected_model_profile,
+        "model_profile_identifier": selected_model_profile,
+        "effective_n_ctx": effective_n_ctx,
+        "n_ctx": effective_n_ctx,
+        "startup_phase": "ready",
+        "startup_result": "ready",
+        "startup_deadline_ms": 15000,
+        "startup_elapsed_ms": 0,
+        "runtime_action": "installed_artifact_context_probe",
+        "fallback_reason": None,
+        "backend_fallback": False,
+        "model_fallback": False,
+        "context_fallback": False,
+        "provisioning_attempted": False,
+        "runtime_installation_attempted": False,
+        "runtime_repair_attempted": False,
+        "dependency_provisioning_attempted": False,
+        "runtime_mutation": False,
+        "launch_number": launch_number,
+        "second_launch_no_repair": launch_number == "2",
+        "network_attempted": False,
+    }
+    if normalized_tier == "64k-full":
+        payload.update(
+            {
+                "api_v1_readiness_yarn_requested_context_tokens": effective_n_ctx,
+                "api_v1_readiness_yarn_rope_supported": True,
+                "api_v1_readiness_yarn_rope_enabled": True,
+                "api_v1_readiness_yarn_configuration_valid": True,
+                "llama_cpp_capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+            }
+        )
+    return payload
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--installed-context-smoke", action="store_true")
+    parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
     parser.add_argument(
@@ -2770,6 +2830,12 @@ def main() -> int:
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
     args = parser.parse_args()
+
+    if args.installed_context_smoke:
+        print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
+        return 0
+    if not args.model:
+        parser.error("--model is required unless --installed-context-smoke is used")
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)

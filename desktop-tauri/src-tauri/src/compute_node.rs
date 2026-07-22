@@ -1575,7 +1575,25 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
-    Ok(serde_json::json!({
+    let mut context_probe_command = launcher.command_for_script_blocking(&bridge_script);
+    context_probe_command.arg("--installed-context-smoke");
+    context_probe_command
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier))
+        .arg("--launch-number")
+        .arg(
+            std::env::var("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER")
+                .unwrap_or_else(|_| "1".into()),
+        );
+    let context_probe_output = context_probe_command.output()?;
+    if !context_probe_output.status.success() {
+        anyhow::bail!(
+            "installed_context_probe_failed: bundled interpreter context probe exited unsuccessfully"
+        );
+    }
+    let context_probe_stdout = String::from_utf8_lossy(&context_probe_output.stdout);
+    let context_probe: Value = serde_json::from_str(context_probe_stdout.trim())?;
+    let mut payload = serde_json::json!({
         "record": "desktop.compute_node.session.layout",
         "app_version": identity.app_version,
         "build_id": identity.build_id,
@@ -1590,7 +1608,13 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "context_tier": config.context_tier.as_str(),
         "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
         "bridge_preflight": "ok",
-    }))
+    });
+    if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
+        for (key, value) in probe_map {
+            payload_map.insert(key, value);
+        }
+    }
+    Ok(payload)
 }
 
 pub async fn start_compute_node(

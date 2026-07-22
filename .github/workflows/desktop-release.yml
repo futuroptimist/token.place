@@ -595,6 +595,7 @@ jobs:
           name: windows-installer-identity-logs
           path: ${{ runner.temp }}/token-place-installer-identity-artifacts
           if-no-files-found: ignore
+          retention-days: 7
 
       - name: Generate SHA256 checksums and build manifest
         shell: bash

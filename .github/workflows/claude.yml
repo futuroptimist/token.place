@@ -38,8 +38,9 @@ jobs:
       id-token: write
 
     steps:
-      # Bash permissions below allow execution of repository code. Restrict them
-      # to same-repository PR branches even when a trusted user invokes Claude.
+      # Claude may execute repository code, so only permit PR tasks whose head
+      # branch belongs to this repository. Trusted users may still review fork
+      # PRs normally, but @claude executable tasks on those PRs fail closed.
       - name: Reject fork pull requests
         if: |
           (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
@@ -51,6 +52,8 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
+          set -euo pipefail
+
           head_repository="$(
             gh api \
               "repos/${EXPECTED_REPOSITORY}/pulls/${PR_NUMBER}" \
@@ -74,13 +77,15 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # These scope Claude's OIDC-issued GitHub App token. workflows: write
-          # is what permits commits that change .github/workflows/**.
+          # Scope Claude's OIDC-issued GitHub App token. workflows: write
+          # permits commits that modify .github/workflows/**.
           additional_permissions: |
             actions: read
             workflows: write
 
-          # Trusted, same-repository invocations may run the normal test/build
-          # tools used by this Python, TypeScript, and Rust repository.
+          # Trusted same-repository tasks may use Bash for tests, builds, and
+          # validation. Block raw pushes so Claude must use the action's guarded
+          # push helper, and block destructive working-tree operations.
           claude_args: |
-            --allowedTools "Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pre-commit:*),Bash(npm:*),Bash(npx:*),Bash(cargo:*),Bash(git diff:*)"
+            --allowedTools "Bash"
+            --disallowedTools "Bash(git push:*),Bash(git reset --hard:*),Bash(git clean:*)"

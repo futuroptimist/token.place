@@ -4397,3 +4397,106 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
     assert 'manager._runtime_init_kwargs(' not in function
     assert '"runtime_installation_attempted": False' not in function
     assert 'second_launch_no_repair' not in function
+
+
+def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.2-x64.msi'
+    for path in (current_nsis, current_msi, previous_nsis, previous_msi):
+        path.write_text('artifact', encoding='utf-8')
+    monkeypatch.setattr(guard.sys, 'platform', 'linux')
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--windows-nsis', str(current_nsis),
+        '--windows-msi', str(current_msi),
+        '--previous-windows-nsis', str(previous_nsis),
+        '--previous-windows-msi', str(previous_msi),
+        '--expected-build-id', 'abcdef123456',
+    ])
+
+    assert guard.main() == 0
+
+    output = capsys.readouterr().out
+    assert 'validated Windows installer scenario contract' in output
+
+
+def test_windows_installer_identity_run_all_scenarios_uses_custom_runner_contract(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    scenario = guard.Scenario(
+        'clean/nsis',
+        guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3'),
+    )
+    calls: list[tuple[object, str]] = []
+
+    def fake_runner(scenario_arg, expected_build_id):
+        calls.append((scenario_arg, expected_build_id))
+
+    guard.run_all_scenarios([scenario], 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
+
+    assert calls == [(scenario, 'abcdef123456')]
+
+
+def test_windows_installer_identity_probe_identity_accepts_json_and_raw_fallback(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        stdout = 'not json but includes 0.1.3 and abcdef123456' if '--build-identity' in cmd else '{}'
+        return subprocess.CompletedProcess(cmd, 0, stdout)
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+
+    assert guard.probe_identity(exe, {}, '0.1.3', 'abcdef123456') == {'raw': 'not json but includes 0.1.3 and abcdef123456'}
+    assert calls == [[str(exe), '--build-identity-json'], [str(exe), '--build-identity']]
+
+
+def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
+    current.path.write_text('installer', encoding='utf-8')
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
+    monkeypatch.setattr(guard, 'install', lambda installer, log_path=None: subprocess.CompletedProcess([str(installer.path)], 0, 'ok'))
+    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda rejected_version=None: guard.Shortcut(tmp_path / 'token.place.lnk', exe))
+    monkeypatch.setattr(guard, '_assert_runtime', lambda path: None)
+    monkeypatch.setattr(guard, 'probe_identity', lambda *args, **kwargs: {})
+    monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda *args, **kwargs: None)
+    monkeypatch.setattr(guard, 'launch_for_operator_record', lambda *args, **kwargs: json.dumps({
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+    }))
+    real_sentinel_dir = guard._sentinel_dir
+
+    def sentinel_dir_with_activity(root):
+        directory = real_sentinel_dir(root)
+        (root / 'sentinel.log').write_text('SENTINEL python invoked\n', encoding='utf-8')
+        return directory
+
+    monkeypatch.setattr(guard, '_sentinel_dir', sentinel_dir_with_activity)
+
+    with pytest.raises(guard.InstallerIdentityError, match='sentinel was invoked'):
+        guard.run_scenario(guard.Scenario('clean-nsis-0.1.3', current), 'abcdef123456')
+
+
+
+def test_installed_context_smoke_probe_source_has_fail_closed_constructor_checks() -> None:
+    source = Path('desktop-tauri/src-tauri/python/compute_node_bridge.py').read_text(encoding='utf-8')
+    function = source[source.index('def installed_context_smoke_payload'):source.index('\ndef main() -> int:', source.index('def installed_context_smoke_payload'))]
+    assert 'installed_context_get_llm_instance_returned_none' in function
+    assert 'installed_context_constructor_not_called_exactly_once' in function
+    assert 'installed_context_constructor_n_ctx_mismatch' in function
+    assert 'installed_context_forbidden_attempts' in function
+    assert 'unexpected_compute_fallback' in function
+    assert 'installed_context_64k_yarn_rope_capability_bypassed_or_unsupported' in function

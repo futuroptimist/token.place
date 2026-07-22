@@ -10,6 +10,10 @@ on:
   pull_request_review:
     types: [submitted]
 
+env:
+  CLAUDE_CHECKPOINT_SYSTEM_PROMPT: >-
+    When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable.
+
 jobs:
   claude:
     if: |
@@ -123,6 +127,12 @@ jobs:
                 esac
               fi
               ;;
+            "")
+              deny "Tool name is required."
+              ;;
+            *)
+              deny "Tool ${tool_name} is not allowed by this workflow guard."
+              ;;
           esac
 
           exit 0
@@ -182,8 +192,8 @@ jobs:
             --setting-sources user
             --strict-mcp-config
             --max-turns 120
-            --append-system-prompt 'When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable.'
-            --allowedTools "Read,Edit,Write,Glob,Grep"
+            --append-system-prompt "${{ env.CLAUDE_CHECKPOINT_SYSTEM_PROMPT }}"
+            --allowedTools "Read,Edit,Write,NotebookEdit,Glob,Grep"
             --disallowedTools "Bash,WebFetch,WebSearch"
 
   claude-exec:
@@ -517,6 +527,12 @@ jobs:
                 esac
               fi
               ;;
+            "")
+              deny "Tool name is required."
+              ;;
+            *)
+              deny "Tool ${tool_name} is not allowed by this workflow guard."
+              ;;
           esac
 
           exit 0
@@ -582,6 +598,6 @@ jobs:
             --setting-sources user
             --strict-mcp-config
             --max-turns 120
-            --append-system-prompt 'When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable.'
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
+            --append-system-prompt "${{ env.CLAUDE_CHECKPOINT_SYSTEM_PROMPT }}"
+            --allowedTools "Read,Edit,Write,NotebookEdit,Glob,Grep,Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
             --disallowedTools "WebFetch,WebSearch,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git rm:*),Bash(gh:*)"

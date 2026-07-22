@@ -3265,8 +3265,8 @@ def _load_publish_step(name: str) -> dict:
 
 def _load_publish_manifest_provenance_source() -> str:
     script = _load_publish_step('Verify immutable tag, release absence, and artifact provenance')['run']
-    marker = "python - <<'PY'\n"
-    start = script.index(marker) + len(marker)
+    marker = "import hashlib, json, os, pathlib, re, sys\n"
+    start = script.index(marker)
     end = script.index("\nPY", start)
     return script[start:end]
 
@@ -3877,3 +3877,103 @@ def test_windows_installer_identity_uses_tauri_config_path_and_schema(monkeypatc
     data = json.loads(config_path.read_text(encoding='utf-8'))
     assert set(data) == {'relay_base_url', 'relay_base_urls', 'model_path', 'preferred_mode', 'context_tier'}
     assert data['relay_base_url'] == data['relay_base_urls'][0]
+
+
+def _load_previous_release_selector_source() -> str:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['build']['steps']
+    script = next(step for step in steps if step.get('name') == 'Validate Windows MSI and NSIS artifact contents')['run']
+    marker = 'previous_tag="$(python - "${current_version}" "${release_source_repo}" "${releases_json}" <<\'PY\'\n'
+    start = script.index(marker) + len(marker)
+    end = script.index('\nPY\n)"', start)
+    return script[start:end]
+
+
+def _run_previous_release_selector(current_version: str, releases: list[dict], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    releases_path = tmp_path / 'releases.json'
+    releases_path.write_text(json.dumps(releases), encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['selector', current_version, 'owner/repo', str(releases_path)])
+    from io import StringIO
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
+    try:
+        exec(compile(_load_previous_release_selector_source(), '<previous-release-selector>', 'exec'), {'__name__': '__selector__'})
+        return sys.stdout.getvalue().strip()
+    finally:
+        sys.stdout = old_stdout
+
+
+def test_previous_release_selector_uses_camel_case_publication_fields(tmp_path, monkeypatch) -> None:
+    releases = [
+        {'tagName': 'desktop-v0.1.1', 'isDraft': False, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.2', 'isDraft': False, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.3', 'isDraft': False, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.4', 'isDraft': False, 'isPrerelease': False},
+    ]
+    assert _run_previous_release_selector('0.1.3', releases, tmp_path, monkeypatch) == 'desktop-v0.1.2'
+    assert _run_previous_release_selector('0.1.4', releases, tmp_path, monkeypatch) == 'desktop-v0.1.3'
+
+
+def test_previous_release_selector_rejects_drafts_prereleases_and_malformed_records(tmp_path, monkeypatch) -> None:
+    releases = [
+        {'tagName': 'desktop-v0.1.3', 'isDraft': True, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.2', 'isDraft': False, 'isPrerelease': True},
+        {'tagName': 'desktop-v0.1.1', 'isDraft': False},
+        {'tagName': 'desktop-v0.1.0', 'isPrerelease': False},
+        {'tagName': 'desktop-v0.0.9', 'draft': False, 'prerelease': False},
+        {'tagName': 'desktop-v0.0.8', 'isDraft': 'false', 'isPrerelease': False},
+        {'tagName': 'desktop-v0.0.7', 'isDraft': False, 'isPrerelease': None},
+        {'tagName': 'desktop-vnot-semver', 'isDraft': False, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.0.6', 'isDraft': False, 'isPrerelease': False},
+    ]
+    assert _run_previous_release_selector('0.1.4', releases, tmp_path, monkeypatch) == 'desktop-v0.0.6'
+
+
+def test_previous_release_selector_reports_documented_error_when_no_valid_predecessor(tmp_path, monkeypatch) -> None:
+    releases = [
+        {'tagName': 'desktop-v0.1.2', 'isDraft': True, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.1', 'isDraft': False, 'isPrerelease': True},
+        {'tagName': 'desktop-v0.1.0', 'draft': False, 'prerelease': False},
+    ]
+    with pytest.raises(SystemExit, match='no stable published desktop-vX.Y.Z predecessor exists for current version 0.1.3 in owner/repo'):
+        _run_previous_release_selector('0.1.3', releases, tmp_path, monkeypatch)
+
+
+def test_publish_transaction_orders_draft_create_cleanup_upload_promotion_disarm() -> None:
+    script = _load_publish_step('Create immutable GitHub Release')['run']
+    create = script.index('-F "draft=true"')
+    capture = script.index('created_release_id="$(jq -r')
+    arm = script.index('cleanup_armed=1')
+    upload = script.index('Content-Type: application/octet-stream')
+    promote = script.index('gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"')
+    disarm = script.index('cleanup_armed=0', promote)
+    assert create < capture < arm < upload < promote < disarm
+    assert '-F "draft=false"' in script[promote:disarm]
+    assert 'trap cleanup_created_draft EXIT' in script[:create]
+    assert 'trap - EXIT' in script[disarm:]
+
+
+def test_publish_failure_cleanup_targets_only_created_draft_release_id() -> None:
+    script = _load_publish_step('Create immutable GitHub Release')['run']
+    cleanup_block = script[script.index('cleanup_created_draft() {'):script.index('trap cleanup_created_draft EXIT')]
+    assert 'created_release_id' in cleanup_block
+    assert 'releases/${created_release_id}' in cleanup_block
+    assert 'refs/tags' not in cleanup_block
+    assert 'git tag' not in cleanup_block
+    assert 'gh release delete' not in cleanup_block
+    assert 'release-lookup' not in cleanup_block
+    assert 'assets' not in cleanup_block
+    assert 'Failed to delete draft release ${created_release_id}' in cleanup_block
+
+
+def test_publish_flow_absent_overwrite_reuse_and_existing_draft_paths() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert '--clobber' not in text
+    assert 'overwrite_files' not in text
+    assert 'softprops/action-gh-release' not in text
+    assert 'gh release view' not in text
+    assert 'gh release delete' not in text
+    assert 'gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases"' in text
+    assert 'already exists (including draft); desktop releases are immutable' in text

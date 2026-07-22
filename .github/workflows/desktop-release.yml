@@ -542,7 +542,9 @@ jobs:
           for release in releases:
               tag = release.get("tag_name") or release.get("tagName") or ""
               match = semver.fullmatch(tag)
-              if not match or release.get("draft") or release.get("prerelease"):
+              if not match:
+                  continue
+              if release.get("isDraft") is not False or release.get("isPrerelease") is not False:
                   continue
               version = tuple(int(part) for part in match.groups())
               if version < current:
@@ -743,6 +745,14 @@ jobs:
             cat /tmp/release-lookup.log >&2
             exit 1
           fi
+          gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases" > /tmp/release-list.json
+          python - <<'PY'
+          import json, os
+          pages = json.loads(open('/tmp/release-list.json', encoding='utf-8').read() or '[]')
+          releases = [release for page in pages for release in (page if isinstance(page, list) else [page])]
+          if any(release.get('tag_name') == os.environ['TAG_NAME'] for release in releases):
+              raise SystemExit(f"Release {os.environ['TAG_NAME']} already exists (including draft); desktop releases are immutable.")
+          PY
           version="${TAG_NAME#desktop-v}"
           python - <<'PY'
           import hashlib, json, os, pathlib, re, sys
@@ -813,31 +823,49 @@ jobs:
           GENERATE_RELEASE_NOTES: ${{ github.event_name == 'push' }}
         run: |
           set -euo pipefail
-          # Atomic create-only publish: GitHub rejects a second release for the same
-          # tag_name, so a failed create (rather than a prior look-up) is the
-          # authoritative immutability guard here. No release ID is ever looked up.
+          # Create an unpublished draft first. Only this invocation's returned
+          # release ID is ever mutated or cleaned up. No release ID is ever looked up.
+          # No existing release/tag/asset is reused, overwritten, or deleted.
+          created_release_id=""
+          cleanup_armed=0
+          cleanup_created_draft() {
+            status=$?
+            if [ "${cleanup_armed}" -eq 1 ] && [ -n "${created_release_id}" ]; then
+              echo "Cleaning up draft release ${created_release_id} for ${TAG_NAME} after failed publish." >&2
+              if ! gh api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/${created_release_id}" >/tmp/release-cleanup.log 2>&1; then
+                echo "::error::Failed to delete draft release ${created_release_id}; manual cleanup may be required." >&2
+                cat /tmp/release-cleanup.log >&2
+              fi
+            fi
+            exit "${status}"
+          }
+          trap cleanup_created_draft EXIT
+
           create_status=0
           gh api --method POST "/repos/${GITHUB_REPOSITORY}/releases" \
             -f "tag_name=${TAG_NAME}" \
             -f "name=${TAG_NAME}" \
+            -F "draft=true" \
             -F "generate_release_notes=${GENERATE_RELEASE_NOTES}" \
             >/tmp/release-create.json 2>/tmp/release-create.log || create_status=$?
           if [ "${create_status}" -ne 0 ]; then
             if grep -qi 'already_exists' /tmp/release-create.log; then
               echo "::error::Release ${TAG_NAME} already exists; desktop releases are immutable."
             else
-              echo "::error::Failed to create release ${TAG_NAME}."
+              echo "::error::Failed to create draft release ${TAG_NAME}."
               cat /tmp/release-create.log >&2
             fi
             exit 1
           fi
-          release_id="$(jq -r '.id' /tmp/release-create.json)"
+          created_release_id="$(jq -r '.id' /tmp/release-create.json)"
+          release_id="${created_release_id}"
           upload_url="$(jq -r '.upload_url' /tmp/release-create.json)"
           upload_url="${upload_url%\{*}"
           if [ -z "${release_id}" ] || [ "${release_id}" = "null" ]; then
             echo "::error::GitHub did not return a release id for ${TAG_NAME}." >&2
             exit 1
           fi
+          cleanup_armed=1
           if [ -z "${upload_url}" ] || [ "${upload_url}" = "null" ]; then
             echo "::error::GitHub did not return an upload URL for release ${TAG_NAME}." >&2
             exit 1
@@ -846,7 +874,7 @@ jobs:
           for asset in release-assets/macos/* release-assets/windows/*; do
             [ -f "${asset}" ] || continue
             asset_name="$(basename "${asset}")"
-            echo "Uploading ${asset_name} to release ${release_id}..."
+            echo "Uploading ${asset_name} to draft release ${release_id}..."
             gh api --method POST \
               -H "Content-Type: application/octet-stream" \
               --input "${asset}" \
@@ -857,3 +885,7 @@ jobs:
             echo "::error::No release assets were uploaded for ${TAG_NAME}." >&2
             exit 1
           fi
+          gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F "draft=false" >/dev/null
+          cleanup_armed=0
+          trap - EXIT

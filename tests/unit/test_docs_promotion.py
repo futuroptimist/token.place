@@ -38,17 +38,19 @@ def test_production_promotion_checklist_captures_0_1_0_smoke_risks() -> None:
 
 def test_promotion_docs_describe_optimized_desktop_release_policy() -> None:
     text = PROMOTION_DOC.read_text(encoding="utf-8")
+    normalized_text = " ".join(text.split())
     required = (
         "Pushing a new immutable `desktop-vX.Y.Z` tag is the canonical desktop release action.",
-        "Operators must not also\nmanually dispatch the same release unless",
+        "Operators must not also manually dispatch the same release unless",
         "Manual dispatch remains available for dry runs, retries, and intentional rebuilds",
         "must not force-move or reuse tags",
-        "cancels older in-progress runs for the same effective tag/ref",
-        "temporary workflow artifacts for seven days",
+        "cancels older in-progress release runs for the same effective tag/ref",
+        "dry-run validations in a separate concurrency group",
+        "Temporary workflow artifacts are kept for seven days",
         "Published GitHub Release assets are unaffected",
         "macOS Apple Silicon and Windows artifacts",
     )
-    missing = [item for item in required if item not in text]
+    missing = [item for item in required if item not in normalized_text]
     assert not missing
 
 

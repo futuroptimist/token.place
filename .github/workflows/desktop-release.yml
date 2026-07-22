@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-release-${{ inputs.tag_name || github.ref_name }}
+  group: desktop-release-${{ github.event_name }}-${{ inputs.dry_run && 'dry-run' || 'release' }}-${{ inputs.tag_name || github.ref_name }}
   cancel-in-progress: true
 
 jobs:

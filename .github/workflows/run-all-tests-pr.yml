@@ -96,3 +96,59 @@ jobs:
           name: linux-run-all-tests-log
           path: run_all_tests.log
           if-no-files-found: error
+
+
+  macos-metal-runtime-bootstrap:
+    name: macOS Metal desktop runtime bootstrap
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect desktop runtime or packaging changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            changed_files="$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)"
+          else
+            changed_files="desktop-tauri/src-tauri/python/manual-dispatch"
+          fi
+          printf '%s\n' "$changed_files"
+          if printf '%s\n' "$changed_files" | grep -Eq '^(desktop-tauri/src-tauri/python/|desktop-tauri/scripts/prepare_.*python_runtime|requirements\.txt$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.11
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Prepare and verify Metal-capable embedded Python runtime
+        if: steps.changes.outputs.run == 'true'
+        working-directory: desktop-tauri
+        env:
+          CMAKE_ARGS: -DGGML_METAL=on
+          FORCE_CMAKE: '1'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          python -m pip install --upgrade pip
+          python scripts/prepare_embedded_python_runtime.py
+          test -x src-tauri/python-runtime/bin/python3
+          src-tauri/python-runtime/bin/python3 -m pip check
+
+      - name: Summarize skipped Metal bootstrap
+        if: steps.changes.outputs.run != 'true'
+        run: echo "No desktop Python runtime, packaging bootstrap, or requirements.txt changes detected; skipping focused macOS Metal bootstrap." >> "$GITHUB_STEP_SUMMARY"

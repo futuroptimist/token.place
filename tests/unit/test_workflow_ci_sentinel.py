@@ -137,9 +137,10 @@ def test_desktop_release_workflow_has_per_tag_concurrency() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
     concurrency = workflow_data.get("concurrency", {})
 
-    assert concurrency.get("group") == (
-        "desktop-release-${{ inputs.tag_name || github.ref_name }}"
-    )
+    group = concurrency.get("group")
+    assert "desktop-release-${{ github.event_name }}" in group
+    assert "inputs.dry_run && 'dry-run' || 'release'" in group
+    assert "inputs.tag_name || github.ref_name" in group
     assert concurrency.get("cancel-in-progress") == "true"
 
 
@@ -473,6 +474,24 @@ def test_linux_run_all_tests_pr_job_invokes_the_full_suite() -> None:
         "job summary for PR diagnosis."
     )
 
+
+def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
+    workflow_data = _run_all_tests_workflow()
+    job = workflow_data["jobs"].get("macos-metal-runtime-bootstrap")
+
+    assert job, (
+        "Desktop Python runtime or packaging changes need a focused macOS Metal "
+        "bootstrap guardrail now that the duplicate macOS full-suite job is removed."
+    )
+    assert job["runs-on"] == "macos-26"
+    job_text = yaml.dump(job, sort_keys=True)
+    assert "desktop-tauri/src-tauri/python/" in job_text
+    assert "requirements.txt" in job_text
+    assert "CMAKE_ARGS" in job_text
+    assert "-DGGML_METAL=on" in job_text
+    assert "FORCE_CMAKE" in job_text
+    assert "scripts/prepare_embedded_python_runtime.py" in job_text
+    assert "steps.changes.outputs.run == 'true'" in job_text
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():

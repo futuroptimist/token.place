@@ -669,6 +669,19 @@ pub fn run() {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--build-identity-json") {
+        let identity = build_identity::build_identity();
+        println!(
+            "{}",
+            serde_json::json!({
+                "app_version": identity.app_version,
+                "build_id": identity.build_id,
+                "target_triple": identity.target_triple,
+                "bundled_runtime_id": identity.bundled_runtime_id,
+            })
+        );
+        return;
+    }
     run();
 }
 

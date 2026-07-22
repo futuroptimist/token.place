@@ -481,6 +481,7 @@ jobs:
         shell: bash
         env:
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mapfile -t nsis_paths < <(find release-artifacts -maxdepth 1 -type f -name '*-setup.exe' | sort)
@@ -509,13 +510,33 @@ jobs:
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
             "${validator_version_args[@]}"
-          installer_identity_args=()
-          if [ -n "${tag_name}" ]; then
-            installer_identity_args=(--expected-version "${tag_name#desktop-v}")
+          previous_dir="${RUNNER_TEMP}/token-place-previous-desktop-v0.1.2"
+          rm -rf "${previous_dir}"
+          mkdir -p "${previous_dir}"
+          gh release download desktop-v0.1.2 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${previous_dir}" \
+            --pattern '*0.1.2*.msi' \
+            --pattern '*0.1.2*-setup.exe'
+          mapfile -t previous_nsis_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name '*0.1.2*-setup.exe' | sort)
+          mapfile -t previous_msi_paths < <(find "${previous_dir}" -maxdepth 1 -type f -name '*0.1.2*.msi' | sort)
+          if [ "${#previous_nsis_paths[@]}" -ne 1 ] || [ "${#previous_msi_paths[@]}" -ne 1 ]; then
+            echo "Expected exactly one desktop-v0.1.2 NSIS installer and one MSI artifact." >&2
+            printf 'Previous NSIS count=%s MSI count=%s\n' "${#previous_nsis_paths[@]}" "${#previous_msi_paths[@]}" >&2
+            find "${previous_dir}" -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          installer_identity_args=(--expected-version "${tag_name#desktop-v}")
+          if [ -z "${tag_name}" ]; then
+            installer_identity_args=(--expected-version "$(python -c 'import json; print(json.load(open("package.json"))["version"])')")
           fi
           python scripts/test_windows_installer_identity.py \
             --windows-nsis "${nsis_path}" \
             --windows-msi "${msi_path}" \
+            --previous-windows-nsis "${previous_nsis_paths[0]}" \
+            --previous-windows-msi "${previous_msi_paths[0]}" \
+            --previous-version "0.1.2" \
+            --expected-build-id "$(git rev-parse --short=12 HEAD)" \
             "${installer_identity_args[@]}"
 
       - name: Generate SHA256 checksums and build manifest

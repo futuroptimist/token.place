@@ -3556,7 +3556,15 @@ def test_windows_installer_identity_shortcut_authority_rejects_duplicates_and_st
         {'Shortcut': str(tmp_path / 'a.lnk'), 'Target': str(current_target)},
         {'Shortcut': str(tmp_path / 'b.lnk'), 'Target': str(current_target)},
     ]))
-    with pytest.raises(guard.InstallerIdentityError, match='expected one authoritative'):
+    assert guard.resolve_authoritative_shortcut().target == current_target.resolve()
+
+    other_target = tmp_path / 'token.place-other.exe'
+    other_target.write_text('exe', encoding='utf-8')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: completed([
+        {'Shortcut': str(tmp_path / 'a.lnk'), 'Target': str(current_target)},
+        {'Shortcut': str(tmp_path / 'b.lnk'), 'Target': str(other_target)},
+    ]))
+    with pytest.raises(guard.InstallerIdentityError, match='distinct authoritative executable target'):
         guard.resolve_authoritative_shortcut()
 
 
@@ -3652,12 +3660,21 @@ def test_windows_installer_identity_requires_postconditions_for_competing_reject
 def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomplete() -> None:
     guard = _load_windows_installer_identity()
     guard.assert_operator_record(json.dumps({
+        'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
     }))
-    with pytest.raises(guard.InstallerIdentityError, match='operator-session record missing'):
+    with pytest.raises(guard.InstallerIdentityError, match='did not emit JSON'):
         guard.assert_operator_record('launcher_source=bundled interpreter_basename=python.exe')
+    with pytest.raises(guard.InstallerIdentityError, match='operator-session record missing'):
+        guard.assert_operator_record(json.dumps({
+            'launcher_source': 'bundled',
+            'interpreter_basename': 'python.exe',
+            'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        }))
     with pytest.raises(guard.InstallerIdentityError, match='operator-session record missing'):
         guard.assert_operator_record(json.dumps({'launcher_source': 'system_development', 'interpreter_basename': 'python.exe'}))
 

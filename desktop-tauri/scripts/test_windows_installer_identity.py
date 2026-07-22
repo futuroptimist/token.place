@@ -58,6 +58,20 @@ class Shortcut:
     target: Path
 
 
+@dataclass(frozen=True)
+class ShortcutInventory:
+    shortcuts: list[Shortcut]
+    existing_targets: list[Path]
+    missing_targets: list[Path]
+
+    @property
+    def distinct_existing_targets(self) -> list[Path]:
+        distinct: dict[str, Path] = {}
+        for target in self.existing_targets:
+            distinct[str(target).lower()] = target
+        return list(distinct.values())
+
+
 class InstallerIdentityError(AssertionError):
     pass
 
@@ -157,7 +171,7 @@ def _terminate_processes() -> None:
     _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify], timeout=30)
 
 
-def resolve_authoritative_shortcut() -> Shortcut:
+def inventory_shortcuts() -> ShortcutInventory:
     script = r'''
 $roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('CommonPrograms'), [Environment]::GetFolderPath('CommonDesktopDirectory'))
 $shell = New-Object -ComObject WScript.Shell
@@ -167,7 +181,14 @@ foreach ($root in $roots) {
     Get-ChildItem -Path $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
       if ($_.Name -match 'token\.place|tokenplace|token-place') {
         $sc = $shell.CreateShortcut($_.FullName)
-        $items += [pscustomobject]@{ Shortcut=$_.FullName; Target=$sc.TargetPath }
+        $target = $sc.TargetPath
+        $exists = $false
+        $resolved = $target
+        if ($target -and (Test-Path -LiteralPath $target -PathType Leaf)) {
+          $exists = $true
+          $resolved = (Resolve-Path -LiteralPath $target).Path
+        }
+        $items += [pscustomobject]@{ Shortcut=$_.FullName; Target=$target; ResolvedTarget=$resolved; Exists=$exists }
       }
     }
   }
@@ -179,13 +200,38 @@ $items | ConvertTo-Json -Depth 3
     data = json.loads(raw) if raw else []
     if isinstance(data, dict):
         data = [data]
-    shortcuts = [Shortcut(Path(item["Shortcut"]), Path(item["Target"])) for item in data if item.get("Target")]
-    if len(shortcuts) != 1:
-        raise InstallerIdentityError(f"expected one authoritative token.place shortcut, found {len(shortcuts)}")
-    target = shortcuts[0].target
-    if EXPECTED_PREVIOUS_VERSION in str(target) or not target.exists():
-        raise InstallerIdentityError("authoritative shortcut targets a stale or missing executable")
-    return shortcuts[0]
+    shortcuts: list[Shortcut] = []
+    existing: list[Path] = []
+    missing: list[Path] = []
+    for item in data:
+        if not item.get("Target"):
+            continue
+        target = Path(item.get("ResolvedTarget") or item["Target"])
+        shortcut = Shortcut(Path(item["Shortcut"]), target)
+        shortcuts.append(shortcut)
+        exists = bool(item.get("Exists")) or target.exists()
+        if exists:
+            existing.append(target.resolve() if target.exists() else target)
+        else:
+            missing.append(target)
+    return ShortcutInventory(shortcuts, existing, missing)
+
+
+def resolve_authoritative_shortcut() -> Shortcut:
+    inventory = inventory_shortcuts()
+    if not inventory.shortcuts:
+        raise InstallerIdentityError("expected at least one authoritative token.place shortcut, found 0")
+    if inventory.missing_targets:
+        raise InstallerIdentityError("token.place shortcut inventory contains missing/stale executable targets")
+    targets = inventory.distinct_existing_targets
+    if not targets:
+        raise InstallerIdentityError("token.place shortcut inventory contains zero existing executable targets")
+    if len(targets) != 1:
+        raise InstallerIdentityError(f"expected one distinct authoritative executable target, found {len(targets)}")
+    target = targets[0]
+    if EXPECTED_PREVIOUS_VERSION in str(target):
+        raise InstallerIdentityError("authoritative shortcut targets a stale previous-version executable")
+    return next(shortcut for shortcut in inventory.shortcuts if str(shortcut.target).lower() == str(target).lower())
 
 
 def app_config_dir() -> Path:
@@ -231,25 +277,58 @@ def uninstall_best_effort(log_path: Path | None = None) -> None:
     if sys.platform != "win32":
         return
     script = r'''
-$roots = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall")
+function Split-UninstallCommand([string]$command) {
+  $command = $command.Trim()
+  if ($command.StartsWith('"')) {
+    $end = $command.IndexOf('"', 1)
+    if ($end -lt 0) { throw "unparsable quoted uninstall command" }
+    return @($command.Substring(1, $end - 1), $command.Substring($end + 1).Trim())
+  }
+  $parts = $command -split '\\s+', 2
+  if ($parts.Count -eq 1) { return @($parts[0], '') }
+  return @($parts[0], $parts[1])
+}
+$errors = @()
+$roots = @("HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
 foreach ($root in $roots) {
   if (Test-Path $root) {
     Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
       $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
-      if ($p.DisplayName -match "token\.place|tokenplace|token-place") {
-        if ($p.WindowsInstaller -eq 1 -and $p.PSChildName) { Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @("/x", $p.PSChildName, "/qn", "/norestart") -Wait }
-        elseif ($p.UninstallString) {
-          $cmd = $p.UninstallString.Trim('"')
-          Start-Process -FilePath $cmd -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+      if ($p.DisplayName -match "token\\.place|tokenplace|token-place") {
+        if ($p.WindowsInstaller -eq 1 -and $p.PSChildName) {
+          $proc = Start-Process -FilePath "$env:SystemRoot\\System32\\msiexec.exe" -ArgumentList @("/x", $p.PSChildName, "/qn", "/norestart") -Wait -PassThru
+        } else {
+          $uninstall = $p.QuietUninstallString
+          if (-not $uninstall) { $uninstall = $p.UninstallString }
+          if (-not $uninstall) { $errors += "missing uninstall command"; return }
+          $split = Split-UninstallCommand $uninstall
+          $exe = $split[0]
+          $args = $split[1]
+          if ($exe -match 'msiexec(\\.exe)?$' -and $args -notmatch '(/x|/uninstall)') { $args = "/x " + $args }
+          if ($exe -notmatch 'msiexec(\\.exe)?$' -and $args -notmatch '(/S|/quiet|/qn)') { $args = ($args + " /S").Trim() }
+          $proc = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
         }
+        if ($proc.ExitCode -notin @(0, 1605, 1614, 3010)) { $errors += "uninstaller exit $($proc.ExitCode)" }
       }
     }
   }
 }
+Start-Sleep -Seconds 1
+foreach ($root in $roots) {
+  if (Test-Path $root) {
+    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+      if ($p.DisplayName -match "token\\.place|tokenplace|token-place") { $errors += "registry authority remains" }
+    }
+  }
+}
 $shortcutRoots = @([Environment]::GetFolderPath("Programs"), [Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("CommonPrograms"), [Environment]::GetFolderPath("CommonDesktopDirectory"))
-foreach ($root in $shortcutRoots) { if ($root -and (Test-Path $root)) { Get-ChildItem $root -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "token\.place|tokenplace|token-place" } | Remove-Item -Force -ErrorAction SilentlyContinue } }
+foreach ($root in $shortcutRoots) { if ($root -and (Test-Path $root)) { Get-ChildItem $root -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "token\\.place|tokenplace|token-place" } | Remove-Item -Force -ErrorAction SilentlyContinue } }
+foreach ($name in @("token.place", "tokenplace", "token-place")) { if (Get-Process -Name $name -ErrorAction SilentlyContinue) { $errors += "process remains" } }
+if ($errors.Count -gt 0) { Write-Output ($errors -join "; "); exit 20 }
 '''
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=180, check=False, log_path=log_path)
+    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=180, check=True, log_path=log_path)
+    verify_no_authority_remains()
 
 
 def _assert_runtime(exe: Path) -> None:
@@ -293,23 +372,27 @@ def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | 
     return result.stdout
 
 
-def assert_operator_record(text: str) -> None:
-    if "launcher_source=bundled" in text and "interpreter_basename=python.exe" in text and f"runtime_id={EXPECTED_RUNTIME_ID}" in text:
-        return
+def assert_operator_record(text: str) -> dict[str, object]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise InstallerIdentityError("operator-session smoke must emit exactly one machine-parseable JSON record")
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        text = "\n".join(f"{key}={value}" for key, value in data.items())
-    required = [
-        "launcher_source=bundled",
-        "interpreter_basename=python.exe",
-        f"runtime_id={EXPECTED_RUNTIME_ID}",
-    ]
-    missing = [item for item in required if item not in text]
+        data = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise InstallerIdentityError("operator-session smoke did not emit JSON") from exc
+    expected = {
+        "record": "desktop.compute_node.session.layout",
+        "launcher_source": "bundled",
+        "interpreter_basename": "python.exe",
+        "runtime_id": EXPECTED_RUNTIME_ID,
+        "bundled_runtime_id": EXPECTED_RUNTIME_ID,
+    }
+    missing = [key for key, value in expected.items() if data.get(key) != value]
     if missing:
-        raise InstallerIdentityError(f"operator-session record missing {missing}")
+        raise InstallerIdentityError(f"operator-session record missing or mismatched {missing}")
+    if data.get("bridge_preflight") != "ok":
+        raise InstallerIdentityError("operator-session smoke did not run bridge-command preflight")
+    return data
 
 
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
@@ -318,11 +401,9 @@ def is_actionable_competing_installer_rejection(result: subprocess.CompletedProc
 
 
 def verify_no_authority_remains() -> None:
-    try:
-        resolve_authoritative_shortcut()
-    except InstallerIdentityError:
-        return
-    raise InstallerIdentityError("competing-installer rejection left an authoritative shortcut/executable behind")
+    inventory = inventory_shortcuts()
+    if inventory.shortcuts or inventory.existing_targets or inventory.missing_targets:
+        raise InstallerIdentityError("competing-installer rejection left shortcut/executable authority behind")
 
 
 def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
@@ -343,18 +424,21 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
             current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None)
             if current.returncode != 0:
                 if scenario.previous and scenario.previous.kind != scenario.current.kind and is_actionable_competing_installer_rejection(current):
+                    verify_no_authority_remains()
                     _terminate_processes()
                     uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
-                    verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
             shortcut = resolve_authoritative_shortcut()
             _assert_runtime(shortcut.target)
             probe_identity(shortcut.target, env, EXPECTED_VERSION, expected_build_id)
-            assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
+            record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
             if config_path is not None:
                 verify_config_preserved(config_path, seeded)
+                for key in ("context_tier", "preferred_mode"):
+                    if str(record.get(key)) != str(seeded[key]):
+                        raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:

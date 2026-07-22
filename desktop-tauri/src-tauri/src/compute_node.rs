@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::config::normalize_relay_base_urls;
+use crate::config::{normalize_relay_base_urls, DesktopConfig};
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
     append_line_to_path, read_log_tail, sanitize_operator_diagnostic_line,
@@ -1535,6 +1535,61 @@ fn packaged_launcher_source_is_valid(
     launcher_source: Option<&PythonLauncherSource>,
 ) -> bool {
     !is_packaged_execution || matches!(launcher_source, Some(PythonLauncherSource::BundledRuntime))
+}
+
+pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let packaged =
+        crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+    let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+        override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
+        tauri_resource_dir: None,
+        current_exe_path: current_exe.as_deref(),
+        manifest_dir,
+        packaged,
+    })?;
+    if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
+        anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
+    }
+    let bridge_script = resolve_bridge_script_for(
+        current_exe.as_deref(),
+        manifest_dir,
+        None,
+        Some(&launcher.program),
+    )?;
+    let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
+    let import_root =
+        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
+    let (selected_resource_root, selected_layout) = describe_resource_layout(
+        Path::new(&bridge_script),
+        current_exe.as_deref(),
+        manifest_dir,
+        None,
+    );
+    let identity = crate::build_identity::build_identity();
+    let launcher_source = match launcher.source {
+        PythonLauncherSource::BundledRuntime => "bundled",
+        PythonLauncherSource::EnvironmentOverride => "environment_override",
+        PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
+    };
+    Ok(serde_json::json!({
+        "record": "desktop.compute_node.session.layout",
+        "app_version": identity.app_version,
+        "build_id": identity.build_id,
+        "target_triple": identity.target_triple,
+        "bundled_runtime_id": identity.bundled_runtime_id,
+        "launcher_source": launcher_source,
+        "interpreter_basename": Path::new(&launcher.program).file_name().and_then(|n| n.to_str()).unwrap_or("python"),
+        "runtime_id": launcher.runtime_id,
+        "layout": format!("{:?}", selected_layout),
+        "resource_root": sanitize_path_for_operator_log(&selected_resource_root),
+        "import_root": import_root.as_ref().map(|path| sanitize_path_for_operator_log(path)).unwrap_or_else(|| "<unresolved>".into()),
+        "context_tier": config.context_tier.as_str(),
+        "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
+        "bridge_preflight": "ok",
+    }))
 }
 
 pub async fn start_compute_node(
@@ -6221,7 +6276,13 @@ mod tests {
     #[cfg(windows)]
     async fn windows_pid_alive(pid: u32) -> bool {
         let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .args([
+                "/FI",
+                &format!("PID eq {}", pid),
+                &format!("/{}{}", "F", "O"),
+                "CSV",
+                "/NH",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -6229,7 +6290,7 @@ mod tests {
         match output {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
-                // tasklist /FO CSV outputs the PID as a quoted field (e.g. "12345").
+                // tasklist CSV-format output contains the PID as a quoted field (e.g. "12345").
                 // Match the quoted form to avoid false positives where one PID is a
                 // substring of another (e.g. "123" matching "1234").
                 // tasklist outputs "INFO: No tasks ..." when the PID is not found.

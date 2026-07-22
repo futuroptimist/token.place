@@ -3509,6 +3509,26 @@ def test_windows_installer_identity_requires_previous_artifacts(tmp_path) -> Non
         guard.validate_previous_artifacts(previous_nsis, current_msi, '0.1.2')
 
 
+def test_windows_installer_identity_rejects_duplicate_previous_artifact(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe'
+    previous_nsis.write_text('artifact', encoding='utf-8')
+
+    with pytest.raises(guard.InstallerIdentityError, match='exactly one previous NSIS and one distinct previous MSI'):
+        guard.validate_previous_artifacts(previous_nsis, previous_nsis, '0.1.2')
+
+
+def test_immediate_prior_version_is_semver_aware() -> None:
+    guard = _load_windows_installer_identity()
+    assert guard.immediate_prior_version('0.1.3') == '0.1.2'
+    assert guard.immediate_prior_version('0.1.4') == '0.1.3'
+    assert guard.immediate_prior_version('1.0.1') == '1.0.0'
+    with pytest.raises(guard.InstallerIdentityError, match='no immediate prior patch release'):
+        guard.immediate_prior_version('1.0.0')
+    with pytest.raises(guard.InstallerIdentityError, match='expected a semantic version'):
+        guard.immediate_prior_version('not-a-version')
+
+
 def test_windows_installer_identity_main_requires_exact_build_id(tmp_path) -> None:
     guard = _load_windows_installer_identity()
     artifacts = {
@@ -3591,6 +3611,10 @@ def test_windows_installer_identity_sentinel_failure_detection(tmp_path) -> None
     assert 'SystemRoot' in env or sys.platform != 'win32'
 
 
+def _empty_snapshot(guard):
+    return guard.AuthoritySnapshot(shortcuts=guard.ShortcutInventory([], [], []), registry=[])
+
+
 def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
@@ -3610,6 +3634,8 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
     monkeypatch.setattr(guard, 'install', fake_install)
     monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
     monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: _empty_snapshot(guard))
+    monkeypatch.setattr(guard, 'verify_authority_unchanged', lambda before, after: None)
     monkeypatch.setattr(guard, 'verify_no_authority_remains', lambda: None)
 
     guard.run_scenario(scenario, 'abcdef123456')
@@ -3632,6 +3658,7 @@ def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(m
     monkeypatch.setattr(guard, 'install', fake_install)
     monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
     monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: _empty_snapshot(guard))
     with pytest.raises(guard.InstallerIdentityError, match='current installer failed'):
         guard.run_scenario(guard.Scenario('cross-nsis-to-msi', current, previous), 'abcdef123456')
 
@@ -3652,9 +3679,172 @@ def test_windows_installer_identity_requires_postconditions_for_competing_reject
     monkeypatch.setattr(guard, 'install', fake_install)
     monkeypatch.setattr(guard, '_sentinel_dir', lambda root: root / 'sentinel')
     monkeypatch.setattr(guard, '_safe_env', lambda sentinel, log: {'PATH': str(sentinel), 'TOKENPLACE_SENTINEL_LOG': str(log)})
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: _empty_snapshot(guard))
+    monkeypatch.setattr(guard, 'verify_authority_unchanged', lambda before, after: None)
     monkeypatch.setattr(guard, 'verify_no_authority_remains', lambda: (_ for _ in ()).throw(guard.InstallerIdentityError('ambiguous second shortcut')))
     with pytest.raises(guard.InstallerIdentityError, match='ambiguous second shortcut'):
         guard.run_scenario(guard.Scenario('cross-nsis-to-msi', current, previous), 'abcdef123456')
+
+
+def test_windows_installer_identity_verify_authority_unchanged_detects_drift() -> None:
+    guard = _load_windows_installer_identity()
+    before = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(Path('a.lnk'), Path('C:/prev/token.place.exe'))],
+            existing_targets=[Path('C:/prev/token.place.exe')],
+            missing_targets=[],
+        ),
+        registry=[guard.RegistryEntry('key', 'token.place desktop', '', '', False, '')],
+    )
+    unchanged = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(Path('a.lnk'), Path('C:/prev/token.place.exe'))],
+            existing_targets=[Path('C:/PREV/TOKEN.PLACE.EXE')],
+            missing_targets=[],
+        ),
+        registry=[guard.RegistryEntry('key', 'token.place desktop', '', '', False, '')],
+    )
+    guard.verify_authority_unchanged(before, unchanged)
+
+    drifted = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(Path('a.lnk'), Path('C:/prev/token.place.exe')), guard.Shortcut(Path('b.lnk'), Path('C:/new/token.place.exe'))],
+            existing_targets=[Path('C:/prev/token.place.exe'), Path('C:/new/token.place.exe')],
+            missing_targets=[],
+        ),
+        registry=[guard.RegistryEntry('key', 'token.place desktop', '', '', False, '')],
+    )
+    with pytest.raises(guard.InstallerIdentityError, match='changed authority state'):
+        guard.verify_authority_unchanged(before, drifted)
+
+
+def test_windows_installer_identity_verify_authority_removed_detects_residuals(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    lingering_exe = tmp_path / 'token.place.exe'
+    lingering_exe.write_text('exe', encoding='utf-8')
+    snapshot = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory([], [], []),
+        registry=[],
+    )
+    snapshot_with_target = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(tmp_path / 'a.lnk', lingering_exe)],
+            existing_targets=[lingering_exe],
+            missing_targets=[],
+        ),
+        registry=[],
+    )
+
+    monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [guard.RegistryEntry('key', 'token.place desktop', '', '', False, '')])
+    monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
+    with pytest.raises(guard.InstallerIdentityError, match='registry entries are not empty'):
+        guard.verify_authority_removed(snapshot)
+
+    monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [])
+    monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([guard.Shortcut(tmp_path / 'a.lnk', lingering_exe)], [], []))
+    with pytest.raises(guard.InstallerIdentityError, match='shortcut/executable inventory is not empty'):
+        guard.verify_authority_removed(snapshot)
+
+    monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
+    with pytest.raises(guard.InstallerIdentityError, match='still present after uninstall'):
+        guard.verify_authority_removed(snapshot_with_target)
+
+    lingering_exe.unlink()
+    monkeypatch.setattr(guard, '_verify_no_authority_processes', lambda: (_ for _ in ()).throw(guard.InstallerIdentityError('process authority remains after uninstall: token.place')))
+    with pytest.raises(guard.InstallerIdentityError, match='process authority remains'):
+        guard.verify_authority_removed(snapshot_with_target)
+
+
+def test_split_uninstall_command_handles_quoted_and_unquoted_forms() -> None:
+    guard = _load_windows_installer_identity()
+    assert guard.split_uninstall_command(
+        r'"C:\Program Files\token.place desktop\Uninstall token.place desktop.exe" /S'
+    ) == (r'C:\Program Files\token.place desktop\Uninstall token.place desktop.exe', '/S')
+    assert guard.split_uninstall_command(
+        r'MsiExec.exe /X{8FA1D2C0-0000-0000-0000-000000000000}'
+    ) == ('MsiExec.exe', r'/X{8FA1D2C0-0000-0000-0000-000000000000}')
+    assert guard.split_uninstall_command(r'C:\tools\uninstall.exe') == (r'C:\tools\uninstall.exe', '')
+    with pytest.raises(guard.InstallerIdentityError, match='unparsable quoted uninstall command'):
+        guard.split_uninstall_command('"unterminated quote')
+    with pytest.raises(guard.InstallerIdentityError, match='empty uninstall command'):
+        guard.split_uninstall_command('   ')
+
+
+def test_build_uninstall_invocation_for_msi_uses_product_code_directly() -> None:
+    guard = _load_windows_installer_identity()
+    entry = guard.RegistryEntry(
+        key_path='HKLM:\\...',
+        display_name='token.place desktop',
+        uninstall_string='MsiExec.exe /I{8FA1D2C0-0000-0000-0000-000000000000}',
+        quiet_uninstall_string='',
+        windows_installer=True,
+        product_code='{8FA1D2C0-0000-0000-0000-000000000000}',
+    )
+    invocation = guard.build_uninstall_invocation(entry)
+    assert invocation[0] == guard._msiexec()
+    assert invocation[1:] == ['/x', '{8FA1D2C0-0000-0000-0000-000000000000}', '/qn', '/norestart']
+
+
+def test_build_uninstall_invocation_for_nsis_appends_silent_flag() -> None:
+    guard = _load_windows_installer_identity()
+    entry = guard.RegistryEntry(
+        key_path='HKLM:\\...',
+        display_name='token.place desktop',
+        uninstall_string=r'"C:\Program Files\token.place desktop\Uninstall token.place desktop.exe"',
+        quiet_uninstall_string='',
+        windows_installer=False,
+        product_code='',
+    )
+    assert guard.build_uninstall_invocation(entry) == [
+        r'C:\Program Files\token.place desktop\Uninstall token.place desktop.exe',
+        '/S',
+    ]
+
+    already_silent = guard.RegistryEntry(
+        key_path='HKLM:\\...',
+        display_name='token.place desktop',
+        uninstall_string=r'"C:\Program Files\token.place desktop\Uninstall token.place desktop.exe" /S',
+        quiet_uninstall_string='',
+        windows_installer=False,
+        product_code='',
+    )
+    assert guard.build_uninstall_invocation(already_silent) == [
+        r'C:\Program Files\token.place desktop\Uninstall token.place desktop.exe',
+        '/S',
+    ]
+
+
+def test_build_uninstall_invocation_requires_command() -> None:
+    guard = _load_windows_installer_identity()
+    entry = guard.RegistryEntry('HKLM:\\...', 'token.place desktop', '', '', False, '')
+    with pytest.raises(guard.InstallerIdentityError, match='has no uninstall command'):
+        guard.build_uninstall_invocation(entry)
+
+
+def test_assert_runtime_requires_valid_matching_provenance(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    install_dir = tmp_path / 'token.place desktop'
+    runtime_dir = install_dir / 'python-runtime'
+    runtime_dir.mkdir(parents=True)
+    exe = install_dir / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    python_exe = runtime_dir / 'python.exe'
+    python_exe.write_text('python', encoding='utf-8')
+    provenance = runtime_dir / 'tokenplace-runtime-provenance.json'
+
+    with pytest.raises(guard.InstallerIdentityError, match='missing'):
+        guard._assert_runtime(exe)
+
+    provenance.write_text('{not valid json', encoding='utf-8')
+    with pytest.raises(guard.InstallerIdentityError, match='not valid JSON'):
+        guard._assert_runtime(exe)
+
+    provenance.write_text(json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu999'}), encoding='utf-8')
+    with pytest.raises(guard.InstallerIdentityError, match='unexpected or missing runtime id'):
+        guard._assert_runtime(exe)
+
+    provenance.write_text(json.dumps({'runtime_id': guard.EXPECTED_RUNTIME_ID}), encoding='utf-8')
+    guard._assert_runtime(exe)
 
 
 def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomplete() -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ SENTINELS = ("py", "python", "python3", "pip", "cmake", "ninja", "msbuild", "cl.
 CONFIG_NAME = "desktop_tauri_config.json"
 TAURI_IDENTIFIER = "place.token.desktop"
 APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
+ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
+_SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,26 @@ class ShortcutInventory:
         for target in self.existing_targets:
             distinct[str(target).lower()] = target
         return list(distinct.values())
+
+
+@dataclass(frozen=True)
+class RegistryEntry:
+    key_path: str
+    display_name: str
+    uninstall_string: str
+    quiet_uninstall_string: str
+    windows_installer: bool
+    product_code: str
+
+
+@dataclass(frozen=True)
+class AuthoritySnapshot:
+    shortcuts: ShortcutInventory
+    registry: list[RegistryEntry]
+
+    @property
+    def canonical_targets(self) -> list[Path]:
+        return self.shortcuts.distinct_existing_targets
 
 
 class InstallerIdentityError(AssertionError):
@@ -128,6 +151,23 @@ def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previou
     msi = classify_installer(previous_msi, previous_version)
     if nsis.kind != "nsis" or msi.kind != "msi" or nsis.path == msi.path:
         raise InstallerIdentityError("expected exactly one previous NSIS and one distinct previous MSI artifact")
+
+
+def immediate_prior_version(version: str) -> str:
+    """Return the immediate prior stable patch release for a semantic version string.
+
+    For '0.1.3' this returns '0.1.2'; for a future '0.1.4' it returns '0.1.3'.
+    """
+    match = _SEMVER_RE.match(version)
+    if not match:
+        raise InstallerIdentityError(f"expected a semantic version X.Y.Z, got {version!r}")
+    major, minor, patch = (int(part) for part in match.groups())
+    if patch <= 0:
+        raise InstallerIdentityError(
+            f"version {version!r} has no immediate prior patch release; a non-patch predecessor "
+            "must be selected explicitly via --previous-version"
+        )
+    return f"{major}.{minor}.{patch - 1}"
 
 
 def _powershell() -> str:
@@ -217,6 +257,70 @@ $items | ConvertTo-Json -Depth 3
     return ShortcutInventory(shortcuts, existing, missing)
 
 
+def inventory_registry_entries() -> list[RegistryEntry]:
+    script = r'''
+$roots = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall")
+$items = @()
+foreach ($root in $roots) {
+  if (Test-Path $root) {
+    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+      if ($p.DisplayName -match "token\.place|tokenplace|token-place") {
+        $items += [pscustomobject]@{
+          KeyPath = $_.PSPath
+          DisplayName = $p.DisplayName
+          UninstallString = $p.UninstallString
+          QuietUninstallString = $p.QuietUninstallString
+          WindowsInstaller = ($p.WindowsInstaller -eq 1)
+          ProductCode = $p.PSChildName
+        }
+      }
+    }
+  }
+}
+$items | ConvertTo-Json -Depth 3
+'''
+    result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=60)
+    raw = result.stdout.strip()
+    data = json.loads(raw) if raw else []
+    if isinstance(data, dict):
+        data = [data]
+    entries: list[RegistryEntry] = []
+    for item in data:
+        display_name = item.get("DisplayName")
+        if not display_name:
+            continue
+        entries.append(
+            RegistryEntry(
+                key_path=str(item.get("KeyPath") or ""),
+                display_name=str(display_name),
+                uninstall_string=str(item.get("UninstallString") or ""),
+                quiet_uninstall_string=str(item.get("QuietUninstallString") or ""),
+                windows_installer=bool(item.get("WindowsInstaller")),
+                product_code=str(item.get("ProductCode") or ""),
+            )
+        )
+    return entries
+
+
+def capture_authority_snapshot() -> AuthoritySnapshot:
+    return AuthoritySnapshot(shortcuts=inventory_shortcuts(), registry=inventory_registry_entries())
+
+
+def _authority_signature(snapshot: AuthoritySnapshot) -> tuple:
+    targets = tuple(sorted(str(target).lower() for target in snapshot.canonical_targets))
+    registry = tuple(sorted((entry.display_name, entry.product_code) for entry in snapshot.registry))
+    return targets, registry
+
+
+def verify_authority_unchanged(before: AuthoritySnapshot, after: AuthoritySnapshot) -> None:
+    if _authority_signature(before) != _authority_signature(after):
+        raise InstallerIdentityError(
+            "competing-installer rejection changed authority state; expected the existing "
+            "installation's shortcut/executable/registry authority to remain exactly unchanged"
+        )
+
+
 def resolve_authoritative_shortcut() -> Shortcut:
     inventory = inventory_shortcuts()
     if not inventory.shortcuts:
@@ -273,62 +377,97 @@ def install(installer: Installer, log_path: Path | None = None) -> subprocess.Co
     return _run([str(installer.path), "/S"], timeout=300, check=False, log_path=log_path)
 
 
+def split_uninstall_command(command: str) -> tuple[str, str]:
+    """Split a QuietUninstallString/UninstallString registry value into (executable, args).
+
+    Handles the common Windows uninstall-string forms: a double-quoted executable
+    path followed by arguments, or an unquoted executable path followed by
+    whitespace-separated arguments.
+    """
+    command = command.strip()
+    if not command:
+        raise InstallerIdentityError("empty uninstall command")
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        if end < 0:
+            raise InstallerIdentityError(f"unparsable quoted uninstall command: {command!r}")
+        return command[1:end], command[end + 1 :].strip()
+    parts = command.split(None, 1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def build_uninstall_invocation(entry: RegistryEntry) -> list[str]:
+    """Return the argv to run for a silent uninstall of the given registry entry."""
+    if entry.windows_installer and entry.product_code:
+        return [_msiexec(), "/x", entry.product_code, "/qn", "/norestart"]
+    command = entry.quiet_uninstall_string or entry.uninstall_string
+    if not command:
+        raise InstallerIdentityError(f"registry entry {entry.display_name!r} has no uninstall command")
+    exe, raw_args = split_uninstall_command(command)
+    args = raw_args.split() if raw_args else []
+    lower_exe = exe.lower()
+    if lower_exe.endswith("msiexec.exe") or lower_exe == "msiexec":
+        if not any(arg.lower() in ("/x", "/uninstall") for arg in args):
+            args = ["/x", *args]
+        if not any(arg.lower() in ("/qn", "/quiet") for arg in args):
+            args = [*args, "/qn", "/norestart"]
+    else:
+        if not any(arg.lower() in ("/s", "/quiet", "/qn") for arg in args):
+            args = [*args, "/S"]
+    return [exe, *args]
+
+
 def uninstall_best_effort(log_path: Path | None = None) -> None:
     if sys.platform != "win32":
         return
-    script = r'''
-function Split-UninstallCommand([string]$command) {
-  $command = $command.Trim()
-  if ($command.StartsWith('"')) {
-    $end = $command.IndexOf('"', 1)
-    if ($end -lt 0) { throw "unparsable quoted uninstall command" }
-    return @($command.Substring(1, $end - 1), $command.Substring($end + 1).Trim())
-  }
-  $parts = $command -split '\\s+', 2
-  if ($parts.Count -eq 1) { return @($parts[0], '') }
-  return @($parts[0], $parts[1])
-}
-$errors = @()
-$roots = @("HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
-foreach ($root in $roots) {
-  if (Test-Path $root) {
-    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
-      $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
-      if ($p.DisplayName -match "token\\.place|tokenplace|token-place") {
-        if ($p.WindowsInstaller -eq 1 -and $p.PSChildName) {
-          $proc = Start-Process -FilePath "$env:SystemRoot\\System32\\msiexec.exe" -ArgumentList @("/x", $p.PSChildName, "/qn", "/norestart") -Wait -PassThru
-        } else {
-          $uninstall = $p.QuietUninstallString
-          if (-not $uninstall) { $uninstall = $p.UninstallString }
-          if (-not $uninstall) { $errors += "missing uninstall command"; return }
-          $split = Split-UninstallCommand $uninstall
-          $exe = $split[0]
-          $args = $split[1]
-          if ($exe -match 'msiexec(\\.exe)?$' -and $args -notmatch '(/x|/uninstall)') { $args = "/x " + $args }
-          if ($exe -notmatch 'msiexec(\\.exe)?$' -and $args -notmatch '(/S|/quiet|/qn)') { $args = ($args + " /S").Trim() }
-          $proc = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
-        }
-        if ($proc.ExitCode -notin @(0, 1605, 1614, 3010)) { $errors += "uninstaller exit $($proc.ExitCode)" }
-      }
-    }
-  }
-}
-Start-Sleep -Seconds 1
-foreach ($root in $roots) {
-  if (Test-Path $root) {
-    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
-      $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
-      if ($p.DisplayName -match "token\\.place|tokenplace|token-place") { $errors += "registry authority remains" }
-    }
-  }
-}
-$shortcutRoots = @([Environment]::GetFolderPath("Programs"), [Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("CommonPrograms"), [Environment]::GetFolderPath("CommonDesktopDirectory"))
-foreach ($root in $shortcutRoots) { if ($root -and (Test-Path $root)) { Get-ChildItem $root -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "token\\.place|tokenplace|token-place" } | Remove-Item -Force -ErrorAction SilentlyContinue } }
-foreach ($name in @("token.place", "tokenplace", "token-place")) { if (Get-Process -Name $name -ErrorAction SilentlyContinue) { $errors += "process remains" } }
-if ($errors.Count -gt 0) { Write-Output ($errors -join "; "); exit 20 }
-'''
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=180, check=True, log_path=log_path)
+    snapshot = capture_authority_snapshot()
+    for entry in snapshot.registry:
+        invocation = build_uninstall_invocation(entry)
+        result = _run(invocation, timeout=180, check=False, log_path=log_path)
+        if result.returncode not in ACCEPTABLE_UNINSTALL_EXIT_CODES:
+            raise InstallerIdentityError(
+                f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
+            )
+    time.sleep(1)
+    verify_authority_removed(snapshot)
+
+
+def _verify_no_authority_processes() -> None:
+    for name in APP_PROCESS_NAMES:
+        result = _run(
+            [
+                _powershell(),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ exit 9 }}",
+            ],
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 9:
+            raise InstallerIdentityError(f"process authority remains after uninstall: {name}")
+
+
+def verify_no_authority_remains() -> None:
+    inventory = inventory_shortcuts()
+    if inventory.shortcuts or inventory.existing_targets or inventory.missing_targets:
+        raise InstallerIdentityError("authority remains: shortcut/executable inventory is not empty")
+    registry = inventory_registry_entries()
+    if registry:
+        names = ", ".join(entry.display_name for entry in registry)
+        raise InstallerIdentityError(f"authority remains: registry entries are not empty ({names})")
+
+
+def verify_authority_removed(before: AuthoritySnapshot) -> None:
     verify_no_authority_remains()
+    for target in before.canonical_targets:
+        if target.exists():
+            raise InstallerIdentityError(f"installed executable still present after uninstall: {target.name}")
+    _verify_no_authority_processes()
 
 
 def _assert_runtime(exe: Path) -> None:
@@ -341,11 +480,15 @@ def _assert_runtime(exe: Path) -> None:
             raise InstallerIdentityError("expected installed resources to contain python-runtime/python.exe")
         python_exe = found[0]
     provenance = python_exe.parent / "tokenplace-runtime-provenance.json"
-    if provenance.exists():
+    if not provenance.exists():
+        raise InstallerIdentityError(f"expected runtime provenance file at {provenance.name}, but it is missing")
+    try:
         data = json.loads(provenance.read_text(encoding="utf-8"))
-        runtime_id = data.get("runtime_id") or data.get("build_profile")
-        if runtime_id and runtime_id != EXPECTED_RUNTIME_ID:
-            raise InstallerIdentityError(f"unexpected runtime id {runtime_id!r}")
+    except json.JSONDecodeError as exc:
+        raise InstallerIdentityError(f"runtime provenance file is not valid JSON: {provenance.name}") from exc
+    runtime_id = data.get("runtime_id") or data.get("build_profile")
+    if runtime_id != EXPECTED_RUNTIME_ID:
+        raise InstallerIdentityError(f"unexpected or missing runtime id in provenance: {runtime_id!r}")
 
 
 def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expected_build_id: str) -> dict[str, object]:
@@ -400,12 +543,6 @@ def is_actionable_competing_installer_rejection(result: subprocess.CompletedProc
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def verify_no_authority_remains() -> None:
-    inventory = inventory_shortcuts()
-    if inventory.shortcuts or inventory.existing_targets or inventory.missing_targets:
-        raise InstallerIdentityError("competing-installer rejection left shortcut/executable authority behind")
-
-
 def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
     _terminate_processes()
     uninstall_best_effort()
@@ -421,12 +558,16 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                 if previous.returncode != 0:
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
                 config_path = seed_config(seeded)
+            is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
+            authority_before = capture_authority_snapshot() if is_cross_kind else None
             current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None)
             if current.returncode != 0:
-                if scenario.previous and scenario.previous.kind != scenario.current.kind and is_actionable_competing_installer_rejection(current):
-                    verify_no_authority_remains()
+                if is_cross_kind and is_actionable_competing_installer_rejection(current):
+                    authority_after = capture_authority_snapshot()
+                    verify_authority_unchanged(authority_before, authority_after)
                     _terminate_processes()
                     uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
+                    verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
@@ -471,15 +612,20 @@ def main() -> int:
     parser.add_argument("--windows-msi", type=Path, required=True)
     parser.add_argument("--previous-windows-nsis", type=Path, required=True)
     parser.add_argument("--previous-windows-msi", type=Path, required=True)
-    parser.add_argument("--previous-version", default=EXPECTED_PREVIOUS_VERSION)
+    parser.add_argument(
+        "--previous-version",
+        default=None,
+        help="Immediate prior stable release version. Defaults to the semver-derived predecessor of --expected-version.",
+    )
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
-    validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)
-    scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, args.previous_version)
+    previous_version = args.previous_version or immediate_prior_version(args.expected_version)
+    validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
+    scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)
     if sys.platform != "win32":
         print("validated Windows installer scenario contract; real installs run only on hosted Windows")
         return 0

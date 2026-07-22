@@ -285,6 +285,12 @@ def _strip_windows_extended_path_prefix(path_text):
 def _safe_resolve_path_text(path_text):
     return os.path.realpath(os.path.abspath(_strip_windows_extended_path_prefix(str(path_text))))
 
+def _desktop_platform():
+    simulated_platform = os.environ.get("TOKENPLACE_DESKTOP_SIMULATED_PLATFORM", "").strip()
+    if simulated_platform:
+        return simulated_platform.lower()
+    return str(getattr(sys, "platform", sys.platform)).lower()
+
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
     sys.path.insert(0, python_root)

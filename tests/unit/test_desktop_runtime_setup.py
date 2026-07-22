@@ -3328,6 +3328,28 @@ def test_actual_probe_snippet_with_fake_llama_cpp_package(monkeypatch, tmp_path)
     assert probe.error is None
 
 
+def test_actual_probe_snippet_uses_simulated_platform_for_gpu_offload_fallback(monkeypatch, tmp_path):
+    target = tmp_path / 'managed_site'
+    package = target / 'llama_cpp'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text(
+        "__version__ = '0.3.32+local'\n"
+        "def llama_supports_gpu_offload():\n    return True\n"
+        "class Llama:\n"
+        "    def __init__(self, **kwargs):\n"
+        "        pass\n",
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(target))
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'Darwin')
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+
+    assert probe.backend == 'metal'
+    assert probe.gpu_offload_supported is True
+    assert probe.error is None
+
+
 def test_probe_result_frame_validation_failures_return_safe_errors(monkeypatch, tmp_path):
     class ProbeProcess:
         pid = 65432

@@ -461,6 +461,7 @@ def _run_layout_parity(
         layout_label=layout_label,
         session_index=2,
         turns=1,
+        simulated_platform=simulated_platform,
     )
     restarted.stop()
     assert restarted.process.returncode == 0, f"bridge restart exited {restarted.process.returncode}: {restarted.log_path}"

@@ -6526,3 +6526,58 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
     finally:
         release_inference.set()
         worker.join(timeout=2.0)
+
+
+def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri'
+        / 'scripts'
+        / 'test_desktop_relay_operator_parity_e2e.py'
+    )
+    spec = importlib.util.spec_from_file_location('desktop_relay_operator_parity_e2e', module_path)
+    parity = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(parity)
+
+    calls = []
+
+    class Process:
+        returncode = 0
+
+    class Bridge:
+        process = Process()
+        log_path = tmp_path / 'bridge.log'
+
+        def stop(self):
+            return None
+
+    def fake_run_operator_session(*args, **kwargs):
+        calls.append(kwargs)
+        return Bridge()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {'public_key': 'relay-public-key'}
+
+    monkeypatch.setattr(parity, '_run_operator_session', fake_run_operator_session)
+    monkeypatch.setattr(parity.requests, 'get', lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(parity, '_wait_for_no_registered_nodes', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(parity, '_assert_relay_observed_api_v1_success', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(parity, '_assert_no_facade_early_exit_regression', lambda *_args, **_kwargs: None)
+
+    parity._run_layout_parity(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        tmp_path / 'resources',
+        'http://127.0.0.1:1',
+        tmp_path / 'relay.log',
+        object(),
+        layout_label='macOS Contents/Resources',
+        simulated_platform='Darwin',
+    )
+
+    assert [call['simulated_platform'] for call in calls] == ['Darwin', 'Darwin']

@@ -56,12 +56,15 @@ may intentionally differ:
 
 ## Pre-promotion gates
 
-- [ ] Confirm PR CI checks are green, including the Linux and macOS `run_all_tests.sh` PR checks.
+- [ ] Confirm PR CI checks are green, including the Linux `run_all_tests.sh` full-suite PR check.
 - [ ] Confirm the staging deployment image, chart, and release artifact are exactly the ones intended
       for production promotion; prefer immutable image tags and chart versions, plus a digest where
       available.
 - [ ] Confirm desktop releases for Windows and macOS install successfully and register as compute
-      nodes against staging.
+      nodes against staging. The canonical desktop release action is pushing a new immutable
+      `desktop-vX.Y.Z` tag, which builds, validates, and publishes Windows and macOS artifacts.
+      Do not also manually dispatch the same release unless intentionally retrying or rebuilding
+      that tag; never force-move or reuse release tags during promotion.
 - [ ] Confirm production secrets and relay registration tokens are set for the production target.
 - [ ] Confirm rate-limit storage and production environment settings are configured for production,
       not in-memory or development defaults unless an approved temporary launch exception is recorded.

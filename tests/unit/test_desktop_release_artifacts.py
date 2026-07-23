@@ -4234,6 +4234,9 @@ def test_windows_installer_identity_operator_record_requires_exact_context_tier_
         'n_ctx': 65536,
         'api_v1_readiness_yarn_requested_context_tokens': 65536,
         'api_v1_readiness_yarn_rope_supported': True,
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 300000,
     }), expected_tier='64k-full')
     with pytest.raises(guard.InstallerIdentityError, match='mismatched context tier'):
         guard.assert_operator_record(json.dumps({**base, 'context_tier': '8k-fast', 'effective_n_ctx': 65536, 'n_ctx': 65536}), expected_tier='8k-fast')
@@ -5084,13 +5087,29 @@ def test_windows_installer_identity_operator_record_rejects_readiness_and_runtim
         'context_fallback': False,
         'api_v1_readiness_yarn_requested_context_tokens': 65536,
         'api_v1_readiness_yarn_rope_supported': True,
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 300000,
     }
     with pytest.raises(guard.InstallerIdentityError, match='bridge-command preflight'):
         guard.assert_operator_record(json.dumps({**base, 'bridge_preflight': 'missing'}), expected_tier='64k-full')
     with pytest.raises(guard.InstallerIdentityError, match='model artifact inspection'):
         guard.assert_operator_record(json.dumps({**base, 'model_artifact_inspect': 'missing'}), expected_tier='64k-full')
-    with pytest.raises(guard.InstallerIdentityError, match='safe model artifact filename'):
-        guard.assert_operator_record(json.dumps({**base, 'model_artifact_filename': 'C:/Users/operator/model.gguf'}), expected_tier='64k-full')
+    for unsafe_filename in [
+        'C:/Users/operator/model.gguf',
+        r'C:\Users\operator\model.gguf',
+        '/home/operator/model.gguf',
+        'qwen3.bin',
+    ]:
+        with pytest.raises(guard.InstallerIdentityError, match='safe model artifact filename'):
+            guard.assert_operator_record(
+                json.dumps({**base, 'model_artifact_filename': unsafe_filename}),
+                expected_tier='64k-full',
+            )
+    accepted = guard.assert_operator_record(json.dumps(base), expected_tier='64k-full')
+    assert accepted['model_artifact_filename'] == 'qwen3.gguf'
+    assert 'C:' not in json.dumps(accepted)
+    assert '/home/' not in json.dumps(accepted)
     with pytest.raises(guard.InstallerIdentityError, match='Qwen3'):
         guard.assert_operator_record(json.dumps({**base, 'selected_model_profile': 'other'}), expected_tier='64k-full')
     with pytest.raises(guard.InstallerIdentityError, match='bounded ready'):

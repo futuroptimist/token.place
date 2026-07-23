@@ -89,20 +89,21 @@ fn resolve_model_bridge_script_path(interpreter: Option<&str>) -> Result<PathBuf
 fn configure_runtime_pythonpath_for(
     command: &mut std::process::Command,
     bridge_script: &Path,
+    exe_path: Option<&Path>,
     manifest_dir: &Path,
+    resource_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     python_runtime::disable_python_user_site(command);
     let import_root =
         python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        let current_exe = std::env::current_exe().ok();
         let (_resource_root, layout) = python_runtime::describe_resource_layout(
             bridge_script,
-            current_exe.as_deref(),
+            exe_path,
             manifest_dir,
-            None,
+            resource_dir,
         );
-        let packaged = python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+        let packaged = python_runtime::is_packaged_execution(exe_path, manifest_dir);
         python_runtime::configure_python_subprocess_env_for_layout(
             command,
             import_root,
@@ -122,7 +123,9 @@ fn configure_runtime_pythonpath(
     configure_runtime_pythonpath_for(
         command,
         bridge_script,
+        std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
+        None,
     )
 }
 
@@ -203,9 +206,14 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
         resource_dir.as_deref(),
         Some(&launcher.program),
     )?;
-    let mut bridge_command =
-        launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
-    let import_root = configure_runtime_pythonpath(&mut bridge_command, &bridge_script);
+    let mut bridge_command = launcher.command_for_script_blocking(&bridge_script);
+    let import_root = configure_runtime_pythonpath_for(
+        &mut bridge_command,
+        &bridge_script,
+        exe_path.as_deref(),
+        manifest_dir,
+        resource_dir.as_deref(),
+    );
     let (selected_resource_root, selected_layout) = python_runtime::describe_resource_layout(
         &bridge_script,
         exe_path.as_deref(),
@@ -991,7 +999,8 @@ mod tests {
         let manifest_dir = temp.path().join("missing-manifest");
         let mut command = std::process::Command::new("python");
 
-        let import_root = configure_runtime_pythonpath_for(&mut command, &bridge, &manifest_dir);
+        let import_root =
+            configure_runtime_pythonpath_for(&mut command, &bridge, None, &manifest_dir, None);
 
         assert!(import_root.is_none());
         assert_eq!(

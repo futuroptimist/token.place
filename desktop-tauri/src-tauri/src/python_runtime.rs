@@ -65,14 +65,20 @@ impl PythonLauncher {
         cmd
     }
 
-    pub fn command_for_script(&self, script_path: &str) -> tokio::process::Command {
+    pub fn command_for_script<P>(&self, script_path: P) -> tokio::process::Command
+    where
+        P: AsRef<std::ffi::OsStr>,
+    {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg(script_path);
         cmd
     }
 
-    pub fn command_for_script_blocking(&self, script_path: &str) -> Command {
+    pub fn command_for_script_blocking<P>(&self, script_path: P) -> Command
+    where
+        P: AsRef<std::ffi::OsStr>,
+    {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg(script_path);

@@ -31,6 +31,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
+const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "qwen3.gguf";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
     pub model_path: String,
@@ -490,40 +492,52 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn script_path_arg(path: &Path, label: &str) -> anyhow::Result<String> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("{label}: resolved script path is not valid UTF-8"))
-}
-
 fn safe_model_artifact_filename(filename: &str) -> Option<&str> {
     (!filename.is_empty()
+        && filename == EXPECTED_MODEL_ARTIFACT_FILENAME
         && filename.ends_with(".gguf")
         && !filename.contains('/')
-        && !filename.contains('\\'))
+        && !filename.contains('\\')
+        && Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(filename))
     .then_some(filename)
+}
+
+fn inspect_model_artifact_filename(inspect_json: &Value) -> anyhow::Result<String> {
+    if inspect_json.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("model_artifact_inspect_failed: inspect did not return ok");
+    }
+    inspect_json
+        .get("payload")
+        .and_then(|payload| payload.get("filename"))
+        .and_then(Value::as_str)
+        .and_then(safe_model_artifact_filename)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model_artifact_inspect_failed: inspect did not report the expected basename-only .gguf model filename"
+            )
+        })
 }
 
 fn configure_runtime_pythonpath<C>(
     command: &mut C,
     manifest_dir: &Path,
-    bridge_script: &str,
+    bridge_script: &Path,
+    exe_path: Option<&Path>,
+    resource_dir: Option<&Path>,
 ) -> Option<std::path::PathBuf>
 where
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
+    let import_root = resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        let (_, layout) = describe_resource_layout(
-            Path::new(bridge_script),
-            std::env::current_exe().ok().as_deref(),
-            manifest_dir,
-            None,
-        );
-        let current_exe = std::env::current_exe().ok();
-        let packaged =
-            crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+        let (_, layout) =
+            describe_resource_layout(bridge_script, exe_path, manifest_dir, resource_dir);
+        let packaged = crate::python_runtime::is_packaged_execution(exe_path, manifest_dir);
         configure_python_subprocess_env_for_layout(command, import_root, layout, packaged);
     }
     import_root
@@ -1584,13 +1598,13 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         Some(&launcher.program),
     )
     .map_err(anyhow::Error::msg)?;
-    let model_bridge_script_arg =
-        script_path_arg(&model_bridge_script, "model_artifact_inspect_failed")?;
-    let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script_arg);
+    let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script);
     configure_runtime_pythonpath(
         &mut model_inspect_command,
         manifest_dir,
-        &model_bridge_script_arg,
+        &model_bridge_script,
+        current_exe.as_deref(),
+        None,
     );
     model_inspect_command.arg("inspect");
     let model_inspect_output = model_inspect_command.output()?;
@@ -1599,20 +1613,15 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     }
     let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
     let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
-    let model_artifact_filename = model_inspect_json
-        .get("payload")
-        .and_then(|payload| payload.get("filename"))
-        .and_then(Value::as_str)
-        .and_then(safe_model_artifact_filename)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "model_artifact_inspect_failed: inspect did not report a basename-only .gguf model filename"
-            )
-        })?
-        .to_string();
+    let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
     let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
-    let import_root =
-        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    let import_root = configure_runtime_pythonpath(
+        &mut bridge_command,
+        manifest_dir,
+        Path::new(&bridge_script),
+        current_exe.as_deref(),
+        None,
+    );
     configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
     let (selected_resource_root, selected_layout) = describe_resource_layout(
         Path::new(&bridge_script),
@@ -1849,8 +1858,13 @@ pub async fn start_compute_node(
         manifest_dir,
         resource_dir.as_deref(),
     );
-    let import_root =
-        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    let import_root = configure_runtime_pythonpath(
+        &mut bridge_command,
+        manifest_dir,
+        Path::new(&bridge_script),
+        exe_path.as_deref(),
+        resource_dir.as_deref(),
+    );
     let interpreter = bridge_command
         .as_std()
         .get_program()
@@ -2946,11 +2960,8 @@ mod tests {
         let manifest_dir = temp.path().join("missing-manifest");
         let mut command = Command::new("python");
 
-        let import_root = configure_runtime_pythonpath(
-            &mut command,
-            &manifest_dir,
-            bridge.to_str().expect("bridge path should be UTF-8"),
-        );
+        let import_root =
+            configure_runtime_pythonpath(&mut command, &manifest_dir, &bridge, None, None);
 
         assert!(import_root.is_none());
         assert_eq!(
@@ -5938,9 +5949,10 @@ mod tests {
     #[test]
     fn safe_model_artifact_filename_requires_basename_gguf() {
         assert_eq!(
-            safe_model_artifact_filename("token-place-0.1.4.gguf"),
-            Some("token-place-0.1.4.gguf")
+            safe_model_artifact_filename(EXPECTED_MODEL_ARTIFACT_FILENAME),
+            Some(EXPECTED_MODEL_ARTIFACT_FILENAME)
         );
+        assert_eq!(safe_model_artifact_filename("token-place-0.1.4.gguf"), None);
         assert_eq!(safe_model_artifact_filename("token-place.bin"), None);
         assert_eq!(
             safe_model_artifact_filename("models/token-place.gguf"),
@@ -5951,6 +5963,34 @@ mod tests {
             None
         );
         assert_eq!(safe_model_artifact_filename(""), None);
+    }
+
+    #[test]
+    fn inspect_model_artifact_filename_requires_ok_and_safe_expected_basename() {
+        let accepted = serde_json::json!({
+            "ok": true,
+            "payload": {"filename": EXPECTED_MODEL_ARTIFACT_FILENAME}
+        });
+        assert_eq!(
+            inspect_model_artifact_filename(&accepted).expect("accepted inspect"),
+            EXPECTED_MODEL_ARTIFACT_FILENAME
+        );
+
+        for rejected in [
+            serde_json::json!({"ok": false, "payload": {"filename": EXPECTED_MODEL_ARTIFACT_FILENAME}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "qwen3.bin"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models/qwen3.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models\\qwen3.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "/home/operator/qwen3.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "C:\\Users\\operator\\qwen3.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "other.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": ""}}),
+        ] {
+            assert!(
+                inspect_model_artifact_filename(&rejected).is_err(),
+                "rejected inspect payload should fail: {rejected}"
+            );
+        }
     }
 
     #[test]

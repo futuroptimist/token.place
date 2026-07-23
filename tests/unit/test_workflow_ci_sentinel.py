@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -52,6 +53,31 @@ def _run_all_tests_jobs() -> dict[str, dict]:
         for job_id, job in jobs.items()
         if isinstance(job, dict) and "run_all_tests.sh" in str(job.get("name", ""))
     }
+
+
+def _workflow_step_by_name(job: dict, name: str) -> dict:
+    matches = [step for step in _job_steps(job) if step.get("name") == name]
+    assert len(matches) == 1, f"expected exactly one step named {name!r}"
+    return matches[0]
+
+
+def _macos_metal_detector_regex() -> re.Pattern[str]:
+    workflow_data = _run_all_tests_workflow()
+    detector = workflow_data["jobs"].get("macos-metal-change-detector")
+    assert isinstance(detector, dict), "run-all-tests-pr.yml must define a detector job"
+    run_script = str(
+        _workflow_step_by_name(
+            detector, "Detect desktop runtime or packaging changes"
+        ).get("run", "")
+    )
+    match = re.search(r"grep -Eq '([^']+)'", run_script)
+    assert match, "detector must keep an explicit grep -E path-selection contract"
+    return re.compile(match.group(1))
+
+
+def _macos_metal_requested_for(paths: list[str]) -> bool:
+    pattern = _macos_metal_detector_regex()
+    return any(pattern.search(path) for path in paths)
 
 
 def _job_steps(job: dict) -> list[dict]:
@@ -479,21 +505,46 @@ def test_linux_run_all_tests_pr_job_invokes_the_full_suite() -> None:
 
 def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     workflow_data = _run_all_tests_workflow()
-    job = workflow_data["jobs"].get("macos-metal-runtime-bootstrap")
+    jobs = workflow_data["jobs"]
+    detector = jobs.get("macos-metal-change-detector")
+    job = jobs.get("macos-metal-runtime-bootstrap")
+
+    assert detector, "A cheap Linux detector must decide whether macOS Metal is needed."
+    assert detector["runs-on"] == "ubuntu-latest"
+    assert detector["timeout-minutes"] == "5"
+    assert detector["permissions"] == {"contents": "read"}
+    assert detector["outputs"]["run_macos_metal"] == (
+        "${{ steps.changes.outputs.run_macos_metal }}"
+    )
+
+    detector_text = yaml.dump(detector, sort_keys=True)
+    assert "desktop-tauri/src-tauri/python/" in detector_text
+    assert "desktop-tauri/scripts/prepare_.*python_runtime" in detector_text
+    assert _macos_metal_requested_for(["requirements.txt"])
+    assert _macos_metal_requested_for([".github/workflows/run-all-tests-pr.yml"])
+    assert "workflow_dispatch" in detector_text
+    assert "run_macos_metal=true" in detector_text
 
     assert job, (
         "Desktop Python runtime or packaging changes need a focused macOS Metal "
         "bootstrap guardrail now that the duplicate macOS full-suite job is removed."
     )
+    assert job["name"] == "macOS Metal desktop runtime bootstrap"
+    assert job["needs"] == "macos-metal-change-detector"
+    assert job["if"] == (
+        "needs.macos-metal-change-detector.outputs.run_macos_metal == 'true'"
+    )
     assert job["runs-on"] == "macos-26"
     job_text = yaml.dump(job, sort_keys=True)
-    assert "desktop-tauri/src-tauri/python/" in job_text
-    assert "requirements.txt" in job_text
     assert "CMAKE_ARGS" in job_text
     assert "-DGGML_METAL=on" in job_text
     assert "FORCE_CMAKE" in job_text
+    assert 'test "$(uname -m)" = "arm64"' in job_text
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
-    assert "steps.changes.outputs.run == 'true'" in job_text
+    assert "test -x src-tauri/python-runtime/bin/python3" in job_text
+    assert "src-tauri/python-runtime/bin/python3 -m pip check" in job_text
+    assert "steps.changes.outputs.run" not in job_text
+    assert "Summarize skipped Metal bootstrap" not in job_text
 
     checkout_steps = [
         step
@@ -502,7 +553,56 @@ def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     ]
     assert len(checkout_steps) == 1
     assert checkout_steps[0]["uses"] == "actions/checkout@v5"
-    assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0"
+
+
+def test_run_all_tests_pr_linux_job_is_independent_of_macos_gate() -> None:
+    workflow_data = _run_all_tests_workflow()
+    linux_job = workflow_data["jobs"]["linux-run-all-tests"]
+
+    assert "needs" not in linux_job, (
+        "linux-run-all-tests should start independently and must not wait for the "
+        "macOS Metal detector or gated macOS job."
+    )
+
+
+def test_run_all_tests_pr_macos_metal_detector_path_contract() -> None:
+    assert not _macos_metal_requested_for(["docs/README.md", "relay.py"])
+
+    relevant_paths = [
+        "desktop-tauri/src-tauri/python/requirements.txt",
+        "desktop-tauri/src-tauri/python/runtime_bootstrap.py",
+        "desktop-tauri/scripts/prepare_embedded_python_runtime.py",
+        "desktop-tauri/scripts/prepare_macos_python_runtime.sh",
+        "requirements.txt",
+        ".github/workflows/run-all-tests-pr.yml",
+    ]
+    for path in relevant_paths:
+        assert _macos_metal_requested_for([path]), f"{path} must request macOS Metal"
+
+
+def test_run_all_tests_pr_macos_metal_manual_dispatch_requests_macos() -> None:
+    workflow_data = _run_all_tests_workflow()
+    detector = workflow_data["jobs"]["macos-metal-change-detector"]
+    run_script = str(
+        _workflow_step_by_name(
+            detector, "Detect desktop runtime or packaging changes"
+        ).get("run", "")
+    )
+
+    manual_branch = run_script.split(
+        'if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then', 1
+    )[1].split("fi", 1)[0]
+    assert "run_macos_metal=true" in manual_branch
+    assert "exit 0" in manual_branch
+
+
+def test_run_all_tests_pr_removed_macos_side_skip_detection() -> None:
+    workflow_data = _run_all_tests_workflow()
+    macos_job = workflow_data["jobs"]["macos-metal-runtime-bootstrap"]
+    macos_step_names = {str(step.get("name", "")) for step in _job_steps(macos_job)}
+
+    assert "Detect desktop runtime or packaging changes" not in macos_step_names
+    assert "Summarize skipped Metal bootstrap" not in macos_step_names
 
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:

@@ -13,25 +13,30 @@ on:
 
 jobs:
   claude:
+    # Trust is based on immutable workflow configuration: the repository owner
+    # plus optional comma-separated logins in repository variable
+    # CLAUDE_TRUSTED_ACTORS. Do not use PR-controlled files or broad
+    # author_association values as authorization. This job-level gate runs
+    # before checkout or any step that receives Claude secrets.
     if: |
       (github.event_name == 'issue_comment' &&
         contains(github.event.comment.body, '@claude') &&
         !contains(github.event.comment.body, '@claude-exec') &&
-        github.event.comment.author_association == 'OWNER') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.comment.user.login))) ||
       (github.event_name == 'pull_request_review_comment' &&
         contains(github.event.comment.body, '@claude') &&
         !contains(github.event.comment.body, '@claude-exec') &&
-        github.event.comment.author_association == 'OWNER') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.comment.user.login))) ||
       (github.event_name == 'pull_request_review' &&
         contains(github.event.review.body, '@claude') &&
         !contains(github.event.review.body, '@claude-exec') &&
-        github.event.review.author_association == 'OWNER') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.review.user.login))) ||
       (github.event_name == 'issues' &&
         (contains(github.event.issue.body, '@claude') ||
          contains(github.event.issue.title, '@claude')) &&
         !contains(github.event.issue.body, '@claude-exec') &&
         !contains(github.event.issue.title, '@claude-exec') &&
-        github.event.issue.author_association == 'OWNER')
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.issue.user.login)))
 
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -130,11 +135,15 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        uses: anthropics/claude-code-action@48698f76cceef03bcc3a54a17497fbfdd60d95fb
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           use_commit_signing: true
-          include_comments_by_actor: "futuroptimist"
+          include_comments_by_actor: "${{ github.repository_owner }},${{ vars.CLAUDE_TRUSTED_ACTORS }}"
+          display_report: false
+          show_full_output: false
 
           # Scope Claude's OIDC-issued GitHub App token. The normal @claude path
           # can edit ordinary repository files through GitHub MCP/API commits,
@@ -177,29 +186,28 @@ jobs:
             --setting-sources user
             --strict-mcp-config
             --max-turns 120
-            --append-system-prompt "When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable."
+            --append-system-prompt "When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable. For validation, use only approved fixed wrappers when Bash is available: dependency-compatibility, lint, formatting-check, typecheck, unit-tests, build, repository-tests, and env-network-check. Prefer existing GitHub Actions check results/logs for full repository validation when execution belongs in credentialless CI. Never request generic Bash, npm, npx, node, python interpreter wildcards, curl, wget, gh, git, or unsandboxed commands. If an approved wrapper is unavailable or denied, report that validation could not be performed instead of repeatedly requesting prohibited commands."
             --allowedTools "Read,Edit,Write,Glob,Grep"
             --disallowedTools "Bash,WebFetch,WebSearch"
 
   claude-exec:
+    # Same trusted-actor gate as the ordinary @claude path; protected
+    # environment approval remains an additional control for this privileged
+    # workflow-editing path.
     if: |
       (github.event_name == 'issue_comment' &&
         contains(github.event.comment.body, '@claude-exec') &&
-        github.event.comment.author_association == 'OWNER' &&
-        github.event.comment.user.login == 'futuroptimist') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.comment.user.login))) ||
       (github.event_name == 'pull_request_review_comment' &&
         contains(github.event.comment.body, '@claude-exec') &&
-        github.event.comment.author_association == 'OWNER' &&
-        github.event.comment.user.login == 'futuroptimist') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.comment.user.login))) ||
       (github.event_name == 'pull_request_review' &&
         contains(github.event.review.body, '@claude-exec') &&
-        github.event.review.author_association == 'OWNER' &&
-        github.event.review.user.login == 'futuroptimist') ||
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.review.user.login))) ||
       (github.event_name == 'issues' &&
         (contains(github.event.issue.body, '@claude-exec') ||
          contains(github.event.issue.title, '@claude-exec')) &&
-        github.event.issue.author_association == 'OWNER' &&
-        github.event.issue.user.login == 'futuroptimist')
+        contains(format(',{0},{1},', github.repository_owner, vars.CLAUDE_TRUSTED_ACTORS), format(',{0},', github.event.issue.user.login)))
 
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -333,17 +341,29 @@ jobs:
           command_name="$1"
 
           case "${command_name}" in
-            python-dependency-compatibility)
+            dependency-compatibility)
               cap=2
               fixed_command=(python scripts/validate_dependencies.py)
               ;;
-            python-tests)
+            unit-tests)
               cap=2
-              fixed_command=(python -m pytest -q tests)
+              fixed_command=(python -m pytest tests/unit/ -v)
               ;;
-            frontend-lint)
+            lint)
               cap=2
               fixed_command=(npm run lint -- --quiet)
+              ;;
+            formatting-check)
+              cap=2
+              fixed_command=(git diff --check --)
+              ;;
+            typecheck)
+              cap=2
+              fixed_command=(npm run type-check --)
+              ;;
+            build)
+              cap=2
+              fixed_command=(npm run build --)
               ;;
             repository-tests)
               cap=1
@@ -418,34 +438,64 @@ jobs:
               -- "${fixed_command[@]}"
           SANDBOX
 
-          cat >"${WRAPPER_DIR}/python-dependency-compatibility" <<'WRAPPER'
+          cat >"${WRAPPER_DIR}/dependency-compatibility" <<'WRAPPER'
           #!/usr/bin/env bash
           set -euo pipefail
           if [[ "$#" -ne 0 ]]; then
             echo "This fixed validation wrapper accepts no arguments." >&2
             exit 64
           fi
-          exec "$(dirname "$0")/_sandbox" python-dependency-compatibility
+          exec "$(dirname "$0")/_sandbox" dependency-compatibility
           WRAPPER
 
-          cat >"${WRAPPER_DIR}/python-tests" <<'WRAPPER'
+          cat >"${WRAPPER_DIR}/unit-tests" <<'WRAPPER'
           #!/usr/bin/env bash
           set -euo pipefail
           if [[ "$#" -ne 0 ]]; then
             echo "This fixed validation wrapper accepts no arguments." >&2
             exit 64
           fi
-          exec "$(dirname "$0")/_sandbox" python-tests
+          exec "$(dirname "$0")/_sandbox" unit-tests
           WRAPPER
 
-          cat >"${WRAPPER_DIR}/frontend-lint" <<'WRAPPER'
+          cat >"${WRAPPER_DIR}/lint" <<'WRAPPER'
           #!/usr/bin/env bash
           set -euo pipefail
           if [[ "$#" -ne 0 ]]; then
             echo "This fixed validation wrapper accepts no arguments." >&2
             exit 64
           fi
-          exec "$(dirname "$0")/_sandbox" frontend-lint
+          exec "$(dirname "$0")/_sandbox" lint
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/formatting-check" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" formatting-check
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/typecheck" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" typecheck
+          WRAPPER
+
+          cat >"${WRAPPER_DIR}/build" <<'WRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$#" -ne 0 ]]; then
+            echo "This fixed validation wrapper accepts no arguments." >&2
+            exit 64
+          fi
+          exec "$(dirname "$0")/_sandbox" build
           WRAPPER
 
           cat >"${WRAPPER_DIR}/repository-tests" <<'WRAPPER'
@@ -469,7 +519,7 @@ jobs:
           WRAPPER
 
           # PreToolUse hook backing Bash for this job: allow only an exact,
-          # zero-argument match against one of the five wrapper paths above.
+          # zero-argument match against one of the fixed wrapper paths above.
           # This is deliberately stricter than glob-based --allowedTools
           # matching -- it rejects shell indirection ("bash -c ..."),
           # environment-variable prefixes, pipelines/chains, and appended
@@ -493,7 +543,7 @@ jobs:
             Bash)
               command="$(printf '%s' "${payload}" | jq -r '.tool_input.command // empty')"
               case "${command}" in
-                "${self_dir}/python-dependency-compatibility"|"${self_dir}/python-tests"|"${self_dir}/frontend-lint"|"${self_dir}/repository-tests"|"${self_dir}/env-network-check")
+                "${self_dir}/dependency-compatibility"|"${self_dir}/lint"|"${self_dir}/formatting-check"|"${self_dir}/typecheck"|"${self_dir}/unit-tests"|"${self_dir}/build"|"${self_dir}/repository-tests"|"${self_dir}/env-network-check")
                   ;;
                 *)
                   deny "Only the fixed validation wrappers may run via Bash; rejected: ${command}"
@@ -533,11 +583,15 @@ jobs:
 
       - name: Run Claude Code with isolated validation wrappers
         id: claude-exec
-        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        uses: anthropics/claude-code-action@48698f76cceef03bcc3a54a17497fbfdd60d95fb
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_EXEC }}
           use_commit_signing: true
-          include_comments_by_actor: "futuroptimist"
+          include_comments_by_actor: "${{ github.repository_owner }},${{ vars.CLAUDE_TRUSTED_ACTORS }}"
+          display_report: false
+          show_full_output: false
           trigger_phrase: "@claude-exec"
 
           # workflows: write is available only after the protected environment
@@ -546,7 +600,7 @@ jobs:
             actions: read
             workflows: write
 
-          # Exec path: PreToolUse is authoritative for the exact five-wrapper
+          # Exec path: PreToolUse is authoritative for the exact fixed-wrapper
           # Bash gate. JSON/CLI rules deny web and direct-git tools, while
           # Bubblewrap, a cleared environment, no-network isolation, and wrapper
           # counters enforce runtime isolation. The hook is not a catch-all
@@ -571,7 +625,7 @@ jobs:
               }
             }
 
-          # This path may run only the five immutable validation wrappers.
+          # This path may run only the fixed immutable validation wrappers.
           # Keep NotebookEdit out of the explicit allow-list because this repo
           # has no tracked notebooks; guard it defensively above in case
           # upstream/base-tool semantics expose notebook edits. Native signed
@@ -580,6 +634,6 @@ jobs:
             --setting-sources user
             --strict-mcp-config
             --max-turns 120
-            --append-system-prompt "When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable."
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(${{ steps.wrappers.outputs.dir }}/python-dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/python-tests),Bash(${{ steps.wrappers.outputs.dir }}/frontend-lint),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
+            --append-system-prompt "When the triggering request asks for repository changes, producing a remote commit is a required deliverable unless a concrete correctness or security blocker prevents it. Make and push the first coherent, reviewable checkpoint commit early: after focused validation or syntax checks, before lengthy/full validation, and before the final third of the session. Use the action native signed commit/push mechanism. Never use Bash for git add, git commit, or git push. Continue with follow-up commits as necessary; do not hold all work locally until every possible test finishes. A failure caused by the new code must be fixed before finalizing. A pre-existing, environmental, unavailable, or timed-out check should be reported honestly but should not cause otherwise coherent and safe requested changes to disappear. Reserve the final ten turns for reviewing the diff, checking status, running the narrowest remaining verification, committing/pushing, and reporting results. Before ending, inspect the working tree and either commit/push the requested safe changes or state the exact blocker. Do not fabricate commits for analysis-only requests or no-op work, and never commit secrets, temporary debugging, generated junk, or code known to be broken. A checkpoint commit does not make failing CI mergeable. For validation, use only approved fixed wrappers when Bash is available: dependency-compatibility, lint, formatting-check, typecheck, unit-tests, build, repository-tests, and env-network-check. Prefer existing GitHub Actions check results/logs for full repository validation when execution belongs in credentialless CI. Never request generic Bash, npm, npx, node, python interpreter wildcards, curl, wget, gh, git, or unsandboxed commands. If an approved wrapper is unavailable or denied, report that validation could not be performed instead of repeatedly requesting prohibited commands."
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(${{ steps.wrappers.outputs.dir }}/dependency-compatibility),Bash(${{ steps.wrappers.outputs.dir }}/lint),Bash(${{ steps.wrappers.outputs.dir }}/formatting-check),Bash(${{ steps.wrappers.outputs.dir }}/typecheck),Bash(${{ steps.wrappers.outputs.dir }}/unit-tests),Bash(${{ steps.wrappers.outputs.dir }}/build),Bash(${{ steps.wrappers.outputs.dir }}/repository-tests),Bash(${{ steps.wrappers.outputs.dir }}/env-network-check)"
             --disallowedTools "WebFetch,WebSearch,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git rm:*),Bash(gh:*)"

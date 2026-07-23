@@ -54,6 +54,46 @@ def _run_all_tests_jobs() -> dict[str, dict]:
     }
 
 
+def _run_all_tests_workflow_jobs() -> dict:
+    jobs = _run_all_tests_workflow().get("jobs", {})
+    assert isinstance(jobs, dict), "run-all-tests-pr.yml must define jobs"
+    return jobs
+
+
+def _run_all_tests_macos_detector_job() -> dict:
+    jobs = _run_all_tests_workflow_jobs()
+    job = jobs.get("detect-macos-metal-runtime-changes")
+    assert isinstance(job, dict), (
+        "run-all-tests-pr.yml must define a Linux macOS Metal detector job"
+    )
+    return job
+
+
+def _run_all_tests_macos_job() -> dict:
+    jobs = _run_all_tests_workflow_jobs()
+    job = jobs.get("macos-metal-runtime-bootstrap")
+    assert isinstance(job, dict), (
+        "run-all-tests-pr.yml must define the focused macOS Metal job"
+    )
+    return job
+
+
+def _macos_detector_requests_metal(event_name: str, changed_files: list[str]) -> bool:
+    if event_name == "workflow_dispatch":
+        return True
+    relevant_prefixes = ("desktop-tauri/src-tauri/python/",)
+    relevant_exact = {"requirements.txt", ".github/workflows/run-all-tests-pr.yml"}
+    return any(
+        path.startswith(relevant_prefixes)
+        or path in relevant_exact
+        or (
+            path.startswith("desktop-tauri/scripts/prepare_")
+            and "python_runtime" in path.removeprefix("desktop-tauri/scripts/prepare_")
+        )
+        for path in changed_files
+    )
+
+
 def _job_steps(job: dict) -> list[dict]:
     steps = job.get("steps", [])
     assert isinstance(steps, list), "workflow job steps must be a list"
@@ -477,32 +517,75 @@ def test_linux_run_all_tests_pr_job_invokes_the_full_suite() -> None:
     )
 
 
-def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
-    workflow_data = _run_all_tests_workflow()
-    job = workflow_data["jobs"].get("macos-metal-runtime-bootstrap")
+def test_run_all_tests_pr_has_linux_macos_metal_detector_output() -> None:
+    detector = _run_all_tests_macos_detector_job()
 
-    assert job, (
-        "Desktop Python runtime or packaging changes need a focused macOS Metal "
-        "bootstrap guardrail now that the duplicate macOS full-suite job is removed."
-    )
+    assert detector["runs-on"] == "ubuntu-latest"
+    assert detector["timeout-minutes"] == "5"
+    assert detector["permissions"] == {"contents": "read"}
+    assert detector["outputs"]["run_macos_metal"] == "${{ steps.detect.outputs.run_macos_metal }}"
+    detector_text = yaml.dump(detector, sort_keys=True)
+    assert "fetch-depth: '0'" in detector_text
+    assert "github.event.pull_request.base.sha" in detector_text
+    assert "github.event.pull_request.head.sha" in detector_text
+    assert "run_macos_metal=true" in detector_text
+    assert "workflow_dispatch" in detector_text
+
+
+def test_run_all_tests_pr_has_job_gated_macos_metal_bootstrap() -> None:
+    job = _run_all_tests_macos_job()
+
+    assert job["name"] == "macOS Metal desktop runtime bootstrap"
     assert job["runs-on"] == "macos-26"
+    assert job["needs"] == "detect-macos-metal-runtime-changes"
+    assert job["if"] == "needs.detect-macos-metal-runtime-changes.outputs.run_macos_metal == 'true'"
     job_text = yaml.dump(job, sort_keys=True)
-    assert "desktop-tauri/src-tauri/python/" in job_text
-    assert "requirements.txt" in job_text
     assert "CMAKE_ARGS" in job_text
     assert "-DGGML_METAL=on" in job_text
     assert "FORCE_CMAKE" in job_text
+    assert "test \"$(uname -m)\" = \"arm64\"" in job_text
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
-    assert "steps.changes.outputs.run == 'true'" in job_text
+    assert "test -x src-tauri/python-runtime/bin/python3" in job_text
+    assert "src-tauri/python-runtime/bin/python3 -m pip check" in job_text
+    assert "steps.changes.outputs.run" not in job_text
 
-    checkout_steps = [
-        step
-        for step in _job_steps(job)
-        if str(step.get("uses", "")).startswith("actions/checkout@")
-    ]
-    assert len(checkout_steps) == 1
-    assert checkout_steps[0]["uses"] == "actions/checkout@v5"
-    assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0"
+
+def test_run_all_tests_pr_linux_full_suite_stays_independent() -> None:
+    linux_job = _run_all_tests_workflow_jobs()["linux-run-all-tests"]
+
+    assert "needs" not in linux_job
+
+
+def test_run_all_tests_pr_macos_detector_path_contract() -> None:
+    assert not _macos_detector_requests_metal(
+        "pull_request",
+        [
+            "README.md",
+            "desktop-tauri/src-tauri/src/main.rs",
+            "desktop-tauri/scripts/prepare_release_notes.py",
+        ],
+    )
+    for path in (
+        "desktop-tauri/src-tauri/python/requirements.txt",
+        "desktop-tauri/src-tauri/python/tokenplace_runtime/server.py",
+        "desktop-tauri/scripts/prepare_embedded_python_runtime.py",
+        "desktop-tauri/scripts/prepare_macos_python_runtime.sh",
+        "requirements.txt",
+        ".github/workflows/run-all-tests-pr.yml",
+    ):
+        assert _macos_detector_requests_metal("pull_request", [path]), path
+    assert _macos_detector_requests_metal("workflow_dispatch", [])
+
+
+def test_run_all_tests_pr_removed_macos_side_detection_and_skip_summary() -> None:
+    job = _run_all_tests_macos_job()
+    step_names = {str(step.get("name", "")) for step in _job_steps(job)}
+    job_text = yaml.dump(job, sort_keys=True)
+
+    assert "Detect desktop runtime or packaging changes" not in step_names
+    assert "Summarize skipped Metal bootstrap" not in step_names
+    assert "No desktop Python runtime" not in job_text
+    assert "steps.changes.outputs.run" not in job_text
 
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:

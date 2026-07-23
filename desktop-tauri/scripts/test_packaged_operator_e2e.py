@@ -1077,6 +1077,7 @@ def run_macos_mock_metal_packaged_registration_probe(
             "PYTHONPATH": os.pathsep.join(
                 [str(fake_metal_site), str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKENPLACE_DESKTOP_SIMULATED_PLATFORM": "darwin",
         },
     )
     sentinel_identity = __import__("hashlib").sha256(
@@ -1113,6 +1114,7 @@ def run_macos_gpu_failure_blocks_registration_probe(
             "PYTHONPATH": os.pathsep.join(
                 [str(broken_site), str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKENPLACE_DESKTOP_SIMULATED_PLATFORM": "darwin",
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -1243,7 +1245,7 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
-                if probe_resources_root == mac_resources_root and sys.platform == "darwin":
+                if probe_resources_root == mac_resources_root:
                     run_macos_mock_metal_packaged_registration_probe(
                         tmp_path,
                         probe_script,

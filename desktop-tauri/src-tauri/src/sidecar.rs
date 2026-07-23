@@ -392,6 +392,9 @@ mod runtime_bootstrap_tests {
 
     #[test]
     fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
+        let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
+            .lock()
+            .expect("runtime bootstrap env test lock");
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
 
@@ -408,6 +411,9 @@ mod runtime_bootstrap_tests {
 
     #[test]
     fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
+        let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
+            .lock()
+            .expect("runtime bootstrap env test lock");
         let mut cpu_command = Command::new("python");
         configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
         assert_eq!(
@@ -415,7 +421,7 @@ mod runtime_bootstrap_tests {
             None
         );
 
-        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+        let disable_key = crate::python_runtime::DISABLE_RUNTIME_BOOTSTRAP_ENV;
         let previous = std::env::var(disable_key).ok();
         // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
         unsafe {

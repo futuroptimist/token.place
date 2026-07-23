@@ -161,15 +161,17 @@
     "lifecycle_coverage": [
         {
             "id": "macos_packaged_operator_lifecycle_parity",
-            "tracking_context": "macOS packaged operator lifecycle parity is validated through the shared desktop parity runner used by the macOS packaged CI job.",
-            "platform": "darwin",
+            "tracking_context": "Platform-neutral macOS .app/Contents/Resources packaged-layout and mock Metal parity execute on Linux through the shared desktop operator PR workflow.",
+            "platform": "darwin-simulated-on-linux",
             "scope": "packaged_operator_lifecycle_e2e",
-            "status": "covered_by_shared_entrypoint",
+            "status": "covered_by_linux_shared_entrypoint",
             "shared_entrypoint": "desktop-tauri/scripts/run_desktop_parity_checks.py",
             "workflow": ".github/workflows/desktop-operator-e2e.yml",
             "covered_checks": [
                 "packaged_resource_resolution",
                 "dependency_isolation",
+                "mock_metal_registration",
+                "mock_metal_failure_blocks_registration",
                 "warm_load",
                 "register",
                 "multi_turn_api_v1_relay_chat",
@@ -180,6 +182,20 @@
             "required_scripts": [
                 "desktop-tauri/scripts/test_packaged_operator_e2e.py",
                 "desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py"
+            ]
+        },
+        {
+            "id": "macos_native_no_relay_lifecycle_smoke",
+            "tracking_context": "Native Darwin process-launch and no-relay app lifecycle validation stays on a targeted macOS Apple Silicon smoke workflow that is scheduled, main-push, and manual only.",
+            "platform": "darwin-native",
+            "scope": "native_no_relay_application_lifecycle",
+            "status": "covered_by_targeted_macos_smoke",
+            "workflow": ".github/workflows/desktop-macos-smoke.yml",
+            "covered_checks": [
+                "debug_tauri_app_build_no_bundle",
+                "native_process_launch",
+                "no_relay_autostart",
+                "shutdown"
             ]
         }
     ]

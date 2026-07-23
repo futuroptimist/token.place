@@ -285,6 +285,12 @@ def _strip_windows_extended_path_prefix(path_text):
 def _safe_resolve_path_text(path_text):
     return os.path.realpath(os.path.abspath(_strip_windows_extended_path_prefix(str(path_text))))
 
+def _desktop_platform():
+    simulated_platform = os.environ.get("TOKENPLACE_DESKTOP_SIMULATED_PLATFORM", "").strip()
+    if simulated_platform:
+        return simulated_platform.lower()
+    return str(getattr(sys, "platform", sys.platform)).lower()
+
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
     sys.path.insert(0, python_root)
@@ -354,7 +360,7 @@ try:
         gpu_offload_supported = backend in {"cuda", "metal"}
 
     if gpu_offload_supported and backend == "cpu":
-        backend = "metal" if sys.platform == "darwin" else "cuda"
+        backend = "metal" if _desktop_platform() == "darwin" else "cuda"
 
     Llama = getattr(llama_cpp, "Llama", None)
     constructor_signature_inspectable = False
@@ -1659,6 +1665,9 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
 
 
 def _desktop_platform() -> str:
+    simulated_platform = os.environ.get("TOKENPLACE_DESKTOP_SIMULATED_PLATFORM")
+    if simulated_platform:
+        return simulated_platform.strip().lower()
     return str(getattr(sys, "platform", sys.platform)).lower()
 
 

@@ -495,6 +495,16 @@ def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
     assert "steps.changes.outputs.run == 'true'" in job_text
 
+    checkout_steps = [
+        step
+        for step in _job_steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["uses"] == "actions/checkout@v5"
+    assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0"
+
+
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():
         assert "continue-on-error" not in job, (
@@ -539,3 +549,77 @@ def test_run_all_tests_pr_tiny_gguf_path_is_absolute_workspace_path() -> None:
         assert "scripts/provision-ci-tiny-gguf.sh" in _step_runs(
             job
         ), f"{job_name} must provision the tiny real GGUF before run_all_tests.sh."
+
+
+def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_inspect() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    jobs = workflow_data["jobs"]
+
+    assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
+    assert "pull_request.number" in workflow_data["concurrency"]["group"]
+    assert not [
+        job_id
+        for job_id, job in jobs.items()
+        if isinstance(job, dict) and "macos" in str(job.get("runs-on", "")).lower()
+    ], "ordinary desktop-operator PR validation must not start macOS jobs"
+    assert "desktop-operator-packaged-inspect-python39-linux" in jobs
+    python39_job = jobs["desktop-operator-packaged-inspect-python39-linux"]
+    assert python39_job["runs-on"] == "ubuntu-latest"
+    assert "3.9" == python39_job["steps"][1]["with"]["python-version"]
+    assert "TOKEN_PLACE_INSPECT_ONLY" in yaml.dump(python39_job, sort_keys=True)
+
+    linux_runs = _step_runs(jobs["desktop-operator-e2e"])
+    assert linux_runs.count("test_packaged_operator_e2e.py") == 1
+    assert "run_desktop_parity_checks.py --skip-packaged" in linux_runs
+    assert "test_desktop_no_relay_autostart_e2e.py" not in linux_runs
+
+
+def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-macos-smoke.yml")
+    on_block = _workflow_on_block(workflow_data, "desktop-macos-smoke.yml")
+
+    assert "pull_request" not in on_block
+    assert sorted(on_block) == ["push", "schedule", "workflow_dispatch"]
+    assert on_block["push"]["branches"] == ["main"]
+    push_paths = set(on_block["push"].get("paths", []))
+    assert push_paths, "macOS smoke push trigger must stay narrowly path-filtered"
+    required_push_paths = {
+        ".github/workflows/desktop-macos-smoke.yml",
+        "desktop-tauri/package.json",
+        "desktop-tauri/package-lock.json",
+        "desktop-tauri/src/**",
+        "desktop-tauri/src-tauri/Cargo.toml",
+        "desktop-tauri/src-tauri/Cargo.lock",
+        "desktop-tauri/src-tauri/build.rs",
+        "desktop-tauri/src-tauri/capabilities/**",
+        "desktop-tauri/src-tauri/src/**",
+        "desktop-tauri/src-tauri/python/**",
+        "desktop-tauri/src-tauri/tauri.conf.json",
+        "desktop-tauri/index.html",
+        "desktop-tauri/vite.config.ts",
+        "desktop-tauri/tsconfig.json",
+        "desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py",
+    }
+    assert required_push_paths <= push_paths
+    assert len(on_block["schedule"]) == 1
+    assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
+
+    job = workflow_data["jobs"]["native-macos-no-relay-smoke"]
+    assert job["runs-on"] == "macos-26"
+    checkout_steps = [
+        step
+        for step in _job_steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["uses"] == "actions/checkout@v5"
+    assert int(job["timeout-minutes"]) <= 10
+    runs = _step_runs(job)
+    assert "npm run tauri build -- --debug --no-bundle" in runs
+    assert "test_desktop_no_relay_autostart_e2e.py" in runs
+    forbidden = ("run_all_tests.sh", "run_desktop_parity_checks.py", "tauri build", "--bundles", "prepare_embedded_python_runtime.py")
+    for fragment in forbidden:
+        if fragment == "tauri build":
+            assert "npm run tauri build -- --debug --no-bundle" in runs
+            continue
+        assert fragment not in runs

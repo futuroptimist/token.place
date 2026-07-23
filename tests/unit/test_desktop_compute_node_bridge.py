@@ -522,7 +522,7 @@ def _load_desktop_operator_parity_matrix():
     return json.loads(matrix_path.read_text(encoding='utf-8'))
 
 
-def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
+def test_macos_packaged_operator_lifecycle_parity_uses_linux_shared_entrypoint():
     matrix = _load_desktop_operator_parity_matrix()
     assert all(
         item.get('id') != 'macos_packaged_operator_lifecycle_parity'
@@ -534,15 +534,14 @@ def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
         for item in matrix.get('lifecycle_coverage', [])
         if item.get('id') == 'macos_packaged_operator_lifecycle_parity'
     )
-    assert coverage['platform'] == 'darwin'
-    assert coverage['status'] == 'covered_by_shared_entrypoint'
-    assert (
-        coverage['shared_entrypoint']
-        == 'desktop-tauri/scripts/run_desktop_parity_checks.py'
-    )
+    assert coverage['platform'] == 'darwin-simulated-on-linux'
+    assert coverage['status'] == 'covered_by_linux_shared_entrypoint'
+    assert coverage['workflow'] == '.github/workflows/desktop-operator-e2e.yml'
     assert coverage['covered_checks'] == [
         'packaged_resource_resolution',
         'dependency_isolation',
+        'mock_metal_registration',
+        'mock_metal_failure_blocks_registration',
         'warm_load',
         'register',
         'multi_turn_api_v1_relay_chat',
@@ -557,27 +556,38 @@ def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
         / 'workflows'
         / 'desktop-operator-e2e.yml'
     )
-    workflow = yaml.load(
-        workflow_path.read_text(encoding='utf-8'),
-        Loader=yaml.BaseLoader,
-    )
-    macos_job = workflow['jobs']['desktop-operator-packaged-e2e-macos']
-    macos_run_commands = [
+    workflow = yaml.load(workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+    assert all('macos' not in str(job.get('runs-on', '')).lower() for job in workflow['jobs'].values())
+    linux_run_commands = [
         step.get('run', '')
-        for step in macos_job['steps']
+        for step in workflow['jobs']['desktop-operator-e2e']['steps']
         if isinstance(step, dict)
     ]
-    runner_path = Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']
-    runner = runner_path.read_text(encoding='utf-8')
-
-    assert macos_job['runs-on'] == 'macos-latest'
-    assert f"python {coverage['shared_entrypoint']}" in macos_run_commands
-    assert any(
-        'test_desktop_no_relay_autostart_e2e.py' in command
-        for command in macos_run_commands
-    )
+    assert 'python desktop-tauri/scripts/test_packaged_operator_e2e.py' in linux_run_commands
+    assert 'python desktop-tauri/scripts/run_desktop_parity_checks.py --skip-packaged' in linux_run_commands
+    runner = (Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']).read_text(encoding='utf-8')
     for script in coverage['required_scripts']:
         assert Path(script).name in runner
+
+
+def test_native_macos_lifecycle_parity_uses_targeted_smoke_workflow():
+    matrix = _load_desktop_operator_parity_matrix()
+    coverage = next(
+        item
+        for item in matrix.get('lifecycle_coverage', [])
+        if item.get('id') == 'macos_native_no_relay_lifecycle_smoke'
+    )
+    assert coverage['platform'] == 'darwin-native'
+    assert coverage['status'] == 'covered_by_targeted_macos_smoke'
+    workflow_path = Path(__file__).resolve().parents[2] / coverage['workflow']
+    workflow = yaml.load(workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+    job = workflow['jobs']['native-macos-no-relay-smoke']
+    commands = [step.get('run', '') for step in job['steps'] if isinstance(step, dict)]
+    assert job['runs-on'] == 'macos-26'
+    assert 'npm run tauri build -- --debug --no-bundle' in commands
+    assert any('test_desktop_no_relay_autostart_e2e.py' in command for command in commands)
+    assert not any('run_desktop_parity_checks.py' in command for command in commands)
+    assert not any('run_all_tests.sh' in command for command in commands)
 
 
 class RestartTrackingRuntime(FakeRuntime):
@@ -6516,3 +6526,195 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
     finally:
         release_inference.set()
         worker.join(timeout=2.0)
+
+
+
+
+def _load_desktop_relay_operator_parity_module():
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri'
+        / 'scripts'
+        / 'test_desktop_relay_operator_parity_e2e.py'
+    )
+    spec = importlib.util.spec_from_file_location('desktop_relay_operator_parity_e2e', module_path)
+    parity = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(parity)
+    return parity
+
+
+def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode():
+    parity = _load_desktop_relay_operator_parity_module()
+
+    assert parity._bridge_compute_mode(simulated_platform='Darwin') == 'cpu'
+    assert parity._bridge_compute_mode(simulated_platform='macOS') == 'cpu'
+
+
+def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
+    parity = _load_desktop_relay_operator_parity_module()
+
+    parity._assert_ready_runtime_fields(
+        {
+            'requested_mode': 'auto',
+            'effective_mode': 'cpu',
+            'backend_available': 'missing',
+            'backend_selected': 'cpu',
+            'backend_used': 'cpu',
+            'fallback_reason': 'mock LLM mode uses CPU for deterministic relay parity',
+            'warm_load_enabled': True,
+            'warm_load_state': 'ready',
+            'warm_load_duration_ms': 7,
+        },
+        layout_label='macOS Contents/Resources',
+    )
+
+
+def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
+    parity = _load_desktop_relay_operator_parity_module()
+    modes = []
+
+    class Process:
+        stdout = iter(())
+        stdin = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kwargs):
+        modes.append(args[args.index('--mode') + 1])
+        return Process()
+
+    monkeypatch.setattr(parity.subprocess, 'Popen', fake_popen)
+
+    bridge = parity._start_bridge(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        tmp_path / 'resources',
+        'http://127.0.0.1:1',
+        layout_label='macOS Contents/Resources',
+        session_index=1,
+        simulated_platform='Darwin',
+    )
+    bridge._thread.join(timeout=1)
+
+    assert modes == ['cpu']
+
+
+def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
+    parity = _load_desktop_relay_operator_parity_module()
+
+    calls = []
+
+    class Process:
+        returncode = 0
+
+    class Bridge:
+        process = Process()
+        log_path = tmp_path / 'bridge.log'
+
+        def stop(self):
+            return None
+
+    def fake_run_operator_session(*args, **kwargs):
+        calls.append(kwargs)
+        return Bridge()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {'public_key': 'relay-public-key'}
+
+    monkeypatch.setattr(parity, '_run_operator_session', fake_run_operator_session)
+    monkeypatch.setattr(parity.requests, 'get', lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(parity, '_wait_for_no_registered_nodes', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(parity, '_assert_relay_observed_api_v1_success', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(parity, '_assert_no_facade_early_exit_regression', lambda *_args, **_kwargs: None)
+
+    parity._run_layout_parity(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        tmp_path / 'resources',
+        'http://127.0.0.1:1',
+        tmp_path / 'relay.log',
+        object(),
+        layout_label='macOS Contents/Resources',
+        simulated_platform='Darwin',
+    )
+
+    assert [call['simulated_platform'] for call in calls] == ['Darwin', 'Darwin']
+
+
+def _load_packaged_operator_e2e_module():
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri'
+        / 'scripts'
+        / 'test_packaged_operator_e2e.py'
+    )
+    spec = importlib.util.spec_from_file_location('desktop_packaged_operator_e2e', module_path)
+    packaged = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(packaged)
+    return packaged
+
+
+def test_macos_mock_metal_packaged_probe_simulates_darwin_platform(monkeypatch, tmp_path):
+    packaged = _load_packaged_operator_e2e_module()
+    captured = {}
+
+    def fake_create_fake_metal_site(tmp_root, layout_label):
+        fake_site = tmp_root / 'fake-metal-site'
+        (fake_site / 'llama_cpp').mkdir(parents=True)
+        (fake_site / 'llama_cpp' / '__init__.py').write_text('', encoding='utf-8')
+        return fake_site
+
+    def fake_startup_probe(*args, **kwargs):
+        captured.update(kwargs)
+        return (
+            '"registered": true\n'
+            'runtime_action=metal_already_supported\n'
+            'warm_load_state ready\n'
+            '"api_v1_readiness_result": "passed"\n'
+            '"api_v1_readiness_yarn_rope_scaling_type_source": "top_level_enum"\n'
+        )
+
+    monkeypatch.setattr(packaged, 'create_fake_metal_llama_cpp_site', fake_create_fake_metal_site)
+    monkeypatch.setattr(packaged, 'run_compute_bridge_startup_probe', fake_startup_probe)
+
+    packaged.run_macos_mock_metal_packaged_registration_probe(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        relay_port=12345,
+        resources_root=tmp_path / 'resources',
+    )
+
+    assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'
+
+
+def test_macos_gpu_failure_packaged_probe_simulates_darwin_platform(monkeypatch, tmp_path):
+    packaged = _load_packaged_operator_e2e_module()
+    captured = {}
+
+    def fake_packaged_env(tmp_root, resources_root, *, extra_env=None):
+        captured['extra_env'] = extra_env
+        return {'PYTHONPATH': extra_env['PYTHONPATH']}
+
+    class Result:
+        returncode = 1
+        stdout = 'GPU provisioning failed for desktop macOS launch\n'
+        stderr = ''
+
+    monkeypatch.setattr(packaged, '_packaged_env', fake_packaged_env)
+    monkeypatch.setattr(packaged.subprocess, 'run', lambda *args, **kwargs: Result())
+
+    packaged.run_macos_gpu_failure_blocks_registration_probe(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        relay_port=12345,
+        resources_root=tmp_path / 'resources',
+    )
+
+    assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'

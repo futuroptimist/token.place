@@ -567,14 +567,11 @@ fn canonical_resource_root(root: &Path) -> PathBuf {
 }
 
 fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Option<PythonLauncher> {
-    let root_candidates = if let Some(resource_dir) = opts.tauri_resource_dir {
-        vec![ResourceRootCandidate {
-            root: resource_dir.to_path_buf(),
-            layout: ResourceLayoutKind::TauriResourceDir,
-        }]
-    } else {
-        resource_root_candidates(opts.current_exe_path, opts.manifest_dir, None)
-    };
+    let root_candidates = resource_root_candidates(
+        opts.current_exe_path,
+        opts.manifest_dir,
+        opts.tauri_resource_dir,
+    );
 
     let mut valid_roots: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -582,11 +579,8 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
         if !bundled_runtime_layout_is_eligible(&candidate.layout, opts.packaged) {
             continue;
         }
-        if !candidate
-            .root
-            .join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
-            .is_file()
-        {
+        let runtime = candidate.root.join(BUNDLED_RUNTIME_RELATIVE_PYTHON);
+        if !runtime.is_file() {
             continue;
         }
         let canonical = canonical_resource_root(&candidate.root);
@@ -644,7 +638,7 @@ pub fn resolve_python_launcher_resource_aware(
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_bundled_required_platform || is_macos {
+    if opts.packaged || is_bundled_required_platform || is_macos {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -1584,6 +1578,100 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
+    fn bundled_runtime_candidate_uses_exe_relative_runtime_when_tauri_hint_is_stale() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp
+            .path()
+            .join("app")
+            .join("token-place-desktop-tauri.exe");
+        std::fs::create_dir_all(exe.parent().expect("exe parent")).expect("create exe dir");
+        std::fs::write(&exe, b"exe").expect("write exe");
+        let stale_resource_dir = temp.path().join("stale-resources");
+        std::fs::create_dir_all(&stale_resource_dir).expect("create stale resource dir");
+        let expected_runtime = write_bundled_runtime(exe.parent().expect("exe parent"));
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let opts = PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&stale_resource_dir),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest_dir,
+            packaged: true,
+        };
+
+        let launcher = bundled_runtime_candidate(&opts).expect("runtime candidate");
+
+        assert_eq!(Path::new(&launcher.program), expected_runtime.as_path());
+    }
+
+    #[test]
+    fn bundled_runtime_candidate_deduplicates_equivalent_canonical_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let app_dir = temp.path().join("app");
+        let exe = app_dir.join("token-place-desktop-tauri.exe");
+        std::fs::create_dir_all(&app_dir).expect("create app dir");
+        std::fs::write(&exe, b"exe").expect("write exe");
+        let expected_runtime = write_bundled_runtime(&app_dir);
+        let alias = app_dir.join(".");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let opts = PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: Some(&alias),
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest_dir,
+            packaged: true,
+        };
+
+        let launcher = bundled_runtime_candidate(&opts).expect("deduplicated runtime candidate");
+
+        assert_eq!(Path::new(&launcher.program), expected_runtime.as_path());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn bundled_runtime_candidate_selects_windows_python_exe_layout() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp
+            .path()
+            .join("app")
+            .join("token-place-desktop-tauri.exe");
+        std::fs::create_dir_all(exe.parent().expect("exe parent")).expect("create exe dir");
+        std::fs::write(&exe, b"exe").expect("write exe");
+        let expected_runtime = exe
+            .parent()
+            .expect("exe parent")
+            .join("python-runtime")
+            .join("python.exe");
+        std::fs::create_dir_all(expected_runtime.parent().expect("runtime parent"))
+            .expect("create runtime dir");
+        std::fs::write(&expected_runtime, b"python").expect("write runtime");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let opts = PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: None,
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest_dir,
+            packaged: true,
+        };
+
+        let launcher = bundled_runtime_candidate(&opts).expect("windows runtime candidate");
+
+        assert_eq!(Path::new(&launcher.program), expected_runtime.as_path());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
     fn bundled_runtime_candidate_is_fail_closed_for_distinct_installed_roots() {
         let temp = TempDir::new().expect("tempdir");
         let exe = temp
@@ -2030,7 +2118,8 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11,13],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"{}","executable":"{}","prefix":"{}"}}"#,
+            expected_runtime_arch(),
             py.display(),
             runtime_root.display()
         );

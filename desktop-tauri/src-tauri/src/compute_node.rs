@@ -1559,6 +1559,34 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         Some(&launcher.program),
     )
     .map_err(anyhow::Error::msg)?;
+    let model_bridge_script = resolve_bridge_script_path(
+        "model_bridge.py",
+        current_exe.as_deref(),
+        manifest_dir,
+        None,
+        Some(&launcher.program),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut model_inspect_command =
+        launcher.command_for_script_blocking(model_bridge_script.to_str().unwrap_or_default());
+    model_inspect_command.arg("inspect");
+    let model_inspect_output = model_inspect_command.output()?;
+    if !model_inspect_output.status.success() {
+        anyhow::bail!("model_artifact_inspect_failed: bundled interpreter could not inspect packaged model artifact");
+    }
+    let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
+    let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
+    let model_artifact_filename = model_inspect_json
+        .get("payload")
+        .and_then(|payload| payload.get("filename"))
+        .and_then(Value::as_str)
+        .filter(|filename| !filename.contains('/') && !filename.contains('\\'))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model_artifact_inspect_failed: inspect did not report a safe model filename"
+            )
+        })?
+        .to_string();
     let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
     let import_root =
         configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
@@ -1603,6 +1631,8 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "context_tier": config.context_tier.as_str(),
         "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
         "bridge_preflight": "ok",
+        "model_artifact_inspect": "ok",
+        "model_artifact_filename": model_artifact_filename,
     });
     if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
         for (key, value) in probe_map {
@@ -3083,7 +3113,7 @@ mod tests {
     ) {
         let summary = summarize_bridge_stdout_payload(&serde_json::json!({
             "type": "status",
-            "app_version": "0.1.3",
+            "app_version": "0.1.4",
             "build_id": "abcdef012345",
             "target_triple": "x86_64-pc-windows-msvc",
             "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
@@ -3113,7 +3143,7 @@ mod tests {
         assert!(summary.len() <= 3500);
         assert_eq!(
             payload.get("app_version").and_then(Value::as_str),
-            Some("0.1.3")
+            Some("0.1.4")
         );
         assert_eq!(
             payload.get("build_id").and_then(Value::as_str),

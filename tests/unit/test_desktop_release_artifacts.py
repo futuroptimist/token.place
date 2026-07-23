@@ -4853,3 +4853,286 @@ def test_windows_installer_identity_install_and_run_log_failure_contract(monkeyp
     with pytest.raises(guard.InstallerIdentityError, match='command failed'):
         original_run(['bad-command'], log_path=tmp_path / 'failed.log')
     assert 'exit=9' in (tmp_path / 'failed.log').read_text(encoding='utf-8')
+
+
+def test_windows_installer_identity_platform_helpers_and_noop_paths(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setenv('SystemRoot', str(tmp_path / 'Windows'))
+    assert guard._powershell().endswith('Windows/System32/WindowsPowerShell/v1.0/powershell.exe')
+    assert guard._msiexec().endswith('Windows/System32/msiexec.exe')
+
+    monkeypatch.setattr(guard.sys, 'platform', 'linux')
+    calls: list[object] = []
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: calls.append((args, kwargs)))
+    guard._terminate_processes()
+    guard.uninstall_best_effort()
+    assert calls == []
+
+
+def test_windows_installer_identity_terminate_processes_runs_stop_and_verify(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    guard._terminate_processes()
+
+    assert len(calls) == 2
+    assert 'Stop-Process -Force' in calls[0][-1]
+    assert 'exit 9' in calls[1][-1]
+
+
+def test_windows_installer_identity_canonical_path_falls_back_on_resolve_error(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    class BrokenPath(type(Path())):
+        def resolve(self, *args, **kwargs):
+            raise OSError('synthetic resolve failure')
+
+    broken = BrokenPath(tmp_path / 'Token.Place.EXE')
+    assert guard._canonical_path(broken).endswith('token.place.exe')
+
+
+def test_windows_installer_identity_resolve_authority_zero_and_missing_targets(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, 'inventory_shortcuts', lambda: guard.ShortcutInventory([], [], []))
+    with pytest.raises(guard.InstallerIdentityError, match='found 0'):
+        guard.resolve_authoritative_shortcut()
+
+    missing = tmp_path / 'missing.exe'
+    monkeypatch.setattr(
+        guard,
+        'inventory_shortcuts',
+        lambda: guard.ShortcutInventory([guard.Shortcut(tmp_path / 'app.lnk', missing)], [], [missing]),
+    )
+    with pytest.raises(guard.InstallerIdentityError, match='missing/stale'):
+        guard.resolve_authoritative_shortcut()
+
+    monkeypatch.setattr(
+        guard,
+        'inventory_shortcuts',
+        lambda: guard.ShortcutInventory([guard.Shortcut(tmp_path / 'app.lnk', missing)], [], []),
+    )
+    with pytest.raises(guard.InstallerIdentityError, match='zero existing'):
+        guard.resolve_authoritative_shortcut()
+
+
+def test_windows_installer_identity_uninstall_best_effort_rejects_bad_exit(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    entry = guard.RegistryEntry('key', 'token.place desktop', str(tmp_path / 'uninstall.exe'), '', False, '')
+    snapshot = guard.AuthoritySnapshot(guard.ShortcutInventory([], [], []), [entry])
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 99, 'bad uninstall')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    with pytest.raises(guard.InstallerIdentityError, match='uninstaller exit 99'):
+        guard.uninstall_best_effort(tmp_path / 'uninstall.log')
+    assert calls[0][-1] == '/S'
+
+
+def test_windows_installer_identity_verify_process_authority_helper(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'token.place.exe'
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [str(target)])
+    with pytest.raises(guard.InstallerIdentityError, match='process authority remains'):
+        guard._verify_no_authority_processes([target])
+
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
+    guard._verify_no_authority_processes([target])
+
+
+def test_windows_installer_identity_runtime_recursive_lookup_and_missing_runtime(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe_dir = tmp_path / 'extract'
+    nested_runtime = exe_dir / 'deep' / 'resources' / 'python-runtime'
+    nested_runtime.mkdir(parents=True)
+    exe = exe_dir / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (nested_runtime / 'python.exe').write_text('python', encoding='utf-8')
+    (nested_runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(json.dumps({'build_profile': guard.EXPECTED_RUNTIME_ID}), encoding='utf-8')
+    guard._assert_runtime(exe)
+
+    (nested_runtime / 'python.exe').unlink()
+    with pytest.raises(guard.InstallerIdentityError, match='python-runtime/python.exe'):
+        guard._assert_runtime(exe)
+
+
+def test_windows_installer_identity_probe_and_launch_failure_edges(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    outputs = iter([
+        subprocess.CompletedProcess([str(exe)], 0, 'not json 0.1.3 abcdef123456'),
+    ])
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: next(outputs))
+    assert guard.probe_identity(exe, {}, '0.1.3', 'abcdef123456')['raw'].startswith('not json')
+
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: subprocess.CompletedProcess([str(exe)], 1, 'boom from smoke'))
+    with pytest.raises(guard.InstallerIdentityError, match='operator-session smoke launch failed'):
+        guard.launch_for_operator_record(exe, {})
+
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: subprocess.CompletedProcess([str(exe)], 0, 'wrong version'))
+    with pytest.raises(guard.InstallerIdentityError, match='did not report expected'):
+        guard.probe_identity(exe, {}, '0.1.3', 'abcdef123456')
+
+
+def test_windows_installer_identity_operator_record_rejects_readiness_and_runtime_mutation() -> None:
+    guard = _load_windows_installer_identity()
+    base = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'selected_model_profile': 'qwen3-8b-q4',
+        'context_tier': '64k-full',
+        'effective_n_ctx': 65536,
+        'n_ctx': 65536,
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+        'api_v1_readiness_yarn_requested_context_tokens': 65536,
+        'api_v1_readiness_yarn_rope_supported': True,
+    }
+    with pytest.raises(guard.InstallerIdentityError, match='bridge-command preflight'):
+        guard.assert_operator_record(json.dumps({**base, 'bridge_preflight': 'missing'}), expected_tier='64k-full')
+    with pytest.raises(guard.InstallerIdentityError, match='Qwen3'):
+        guard.assert_operator_record(json.dumps({**base, 'selected_model_profile': 'other'}), expected_tier='64k-full')
+    with pytest.raises(guard.InstallerIdentityError, match='bounded ready'):
+        guard.assert_operator_record(json.dumps({**base, 'startup_phase': 'provisioning', 'startup_result': 'ready', 'startup_deadline_ms': 1}), expected_tier='64k-full')
+    with pytest.raises(guard.InstallerIdentityError, match='ready or a terminal'):
+        guard.assert_operator_record(json.dumps({**base, 'startup_phase': 'starting', 'startup_result': 'unknown', 'startup_deadline_ms': 1}), expected_tier='64k-full')
+    with pytest.raises(guard.InstallerIdentityError, match='runtime mutation'):
+        guard.assert_operator_record(
+            json.dumps({**base, 'startup_phase': 'ready', 'startup_result': 'ready', 'startup_deadline_ms': 1, 'runtime_action': 'failed'}),
+            expected_tier='64k-full',
+            launch_number=2,
+        )
+
+
+def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_drift(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
+    monkeypatch.setattr(guard, 'capture_installed_resource_manifest', lambda target: guard.InstalledResourceManifest(()))
+    monkeypatch.setattr(guard, 'assert_manifest_unchanged', lambda before, after, phase: None)
+    monkeypatch.setattr(guard, 'verify_config_preserved', lambda config_path, expected: None)
+
+    launches = 0
+    def fake_launch_runtime_drift(path, env, log_path=None):
+        nonlocal launches
+        launches += 1
+        tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
+        n_ctx = 65536 if tier == '64k-full' else 8192
+        return json.dumps({
+            'record': 'desktop.compute_node.session.layout',
+            'launcher_source': 'bundled',
+            'interpreter_basename': 'python.exe',
+            'runtime_id': 'different-runtime' if launches == 2 else guard.EXPECTED_RUNTIME_ID,
+            'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'bridge_preflight': 'ok',
+            'selected_model_profile': 'qwen3-8b-q4',
+            'model_profile_identifier': 'qwen3-8b-q4-k-m',
+            'context_tier': tier,
+            'effective_n_ctx': n_ctx,
+            'n_ctx': n_ctx,
+            'startup_phase': 'ready',
+            'startup_result': 'ready',
+            'startup_deadline_ms': 1,
+            'fallback_reason': None,
+            'backend_fallback': False,
+            'model_fallback': False,
+            'context_fallback': False,
+            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
+            'api_v1_readiness_yarn_rope_supported': True,
+        })
+
+    monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch_runtime_drift)
+    with pytest.raises(guard.InstallerIdentityError, match='runtime_id|installed bundled runtime|changed bundled runtime identity'):
+        guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+
+    launches = 0
+    def fake_launch_profile_drift(path, env, log_path=None):
+        nonlocal launches
+        launches += 1
+        tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
+        n_ctx = 65536 if tier == '64k-full' else 8192
+        return json.dumps({
+            'record': 'desktop.compute_node.session.layout',
+            'launcher_source': 'bundled',
+            'interpreter_basename': 'python.exe',
+            'runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'bridge_preflight': 'ok',
+            'selected_model_profile': 'qwen3-8b-q4',
+            'model_profile_identifier': 'changed-profile' if launches == 2 else 'qwen3-8b-q4-k-m',
+            'context_tier': tier,
+            'effective_n_ctx': n_ctx,
+            'n_ctx': n_ctx,
+            'startup_phase': 'ready',
+            'startup_result': 'ready',
+            'startup_deadline_ms': 1,
+            'fallback_reason': None,
+            'backend_fallback': False,
+            'model_fallback': False,
+            'context_fallback': False,
+            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
+            'api_v1_readiness_yarn_rope_supported': True,
+        })
+
+    monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch_profile_drift)
+    with pytest.raises(guard.InstallerIdentityError, match='changed canonical model profile'):
+        guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+
+
+def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.2-x64.msi'
+    for path in (current_nsis, current_msi, previous_nsis, previous_msi):
+        path.write_text('artifact', encoding='utf-8')
+
+    scenarios = [guard.Scenario('clean-nsis-0.1.3', guard.Installer(current_nsis, 'nsis', '0.1.3'))]
+    artifacts_seen = []
+    def fake_runner(scenario, build_id):
+        artifacts_seen.append((scenario.name, build_id))
+
+    guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
+    assert artifacts_seen == [('clean-nsis-0.1.3', 'abcdef123456')]
+
+    old_argv = sys.argv
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'run_all_scenarios', lambda scenarios, expected_build_id, artifact_root=None: None)
+    try:
+        sys.argv = [
+            'prog',
+            '--windows-nsis', str(current_nsis),
+            '--windows-msi', str(current_msi),
+            '--previous-windows-nsis', str(previous_nsis),
+            '--previous-windows-msi', str(previous_msi),
+            '--expected-build-id', 'abcdef123456',
+            '--artifact-dir', str(tmp_path / 'artifacts'),
+        ]
+        assert guard.main() == 0
+    finally:
+        sys.argv = old_argv
+    output = capsys.readouterr().out
+    assert 'validated 6 clean/upgrade Windows installer scenarios' in output
+    assert 'CUDA/GPU execution was not validated' in output

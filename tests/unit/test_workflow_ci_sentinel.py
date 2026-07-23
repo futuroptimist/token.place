@@ -702,6 +702,7 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     }
     assert required_push_paths <= push_paths
     assert len(on_block["schedule"]) == 1
+    assert on_block["schedule"][0]["cron"] == "37 9 * * 1"
     assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
 
     job = workflow_data["jobs"]["native-macos-no-relay-smoke"]
@@ -723,3 +724,41 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
             assert "npm run tauri build -- --debug --no-bundle" in runs
             continue
         assert fragment not in runs
+
+    upload_steps = [
+        step
+        for step in _job_steps(job)
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(upload_steps) == 1
+    assert upload_steps[0].get("with", {}).get("name") == "desktop-macos-smoke-logs"
+    assert upload_steps[0].get("with", {}).get("retention-days") == "7"
+
+
+def test_retired_electron_desktop_workflow_is_not_active_tag_packaging() -> None:
+    retired_workflow_path = WORKFLOW_DIR / "desktop.yml"
+    assert not retired_workflow_path.exists(), (
+        "The retired Electron desktop packaging workflow must not be restored as "
+        "an active v* tag-triggered macOS/Windows workflow. Use desktop-release.yml "
+        "with desktop-v* tags for supported Tauri releases instead."
+    )
+
+    for workflow_path in WORKFLOW_DIR.glob("*.yml"):
+        workflow_data = _load_workflow(workflow_path)
+        on_block = _workflow_on_block(workflow_data, workflow_path.name)
+        push_block = on_block.get("push", {})
+        tags = push_block.get("tags", []) if isinstance(push_block, dict) else []
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        restores_legacy_electron_packaging = (
+            "Legacy Electron Desktop Package" in workflow_text
+            or (
+                "v*" in tags
+                and "working-directory: desktop" in workflow_text
+                and "npm run package:mac" in workflow_text
+                and "npm run package:win" in workflow_text
+            )
+        )
+        assert not restores_legacy_electron_packaging, (
+            f"{workflow_path} must not revive broad v* Electron desktop packaging; "
+            "supported desktop releases use desktop-release.yml and desktop-v* tags."
+        )

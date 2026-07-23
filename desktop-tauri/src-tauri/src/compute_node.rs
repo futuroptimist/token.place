@@ -1575,6 +1575,40 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
+    let inspect_output = launcher
+        .command_for_script_blocking(&bridge_script)
+        .arg("inspect")
+        .output()?;
+    if !inspect_output.status.success() {
+        anyhow::bail!(
+            "model_artifact_inspect_failed: bundled interpreter inspect exited unsuccessfully"
+        );
+    }
+    let inspect_stdout = String::from_utf8_lossy(&inspect_output.stdout);
+    let inspect_response: Value = serde_json::from_str(inspect_stdout.trim())?;
+    if inspect_response.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "model_artifact_inspect_failed: bundled interpreter inspect returned an error"
+        );
+    }
+    let inspected_model_filename = inspect_response
+        .get("payload")
+        .and_then(|payload| payload.get("filename"))
+        .and_then(Value::as_str)
+        .filter(|filename| {
+            !filename.is_empty()
+                && Path::new(filename)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(*filename)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model_artifact_inspect_failed: inspect did not report a safe model filename"
+            )
+        })?
+        .to_string();
+
     let mut context_probe_command = launcher.command_for_script_blocking(&bridge_script);
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
@@ -1603,6 +1637,8 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "context_tier": config.context_tier.as_str(),
         "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
         "bridge_preflight": "ok",
+        "model_artifact_inspect": "ok",
+        "model_artifact_filename": inspected_model_filename,
     });
     if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
         for (key, value) in probe_map {

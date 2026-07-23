@@ -567,14 +567,11 @@ fn canonical_resource_root(root: &Path) -> PathBuf {
 }
 
 fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Option<PythonLauncher> {
-    let root_candidates = if let Some(resource_dir) = opts.tauri_resource_dir {
-        vec![ResourceRootCandidate {
-            root: resource_dir.to_path_buf(),
-            layout: ResourceLayoutKind::TauriResourceDir,
-        }]
-    } else {
-        resource_root_candidates(opts.current_exe_path, opts.manifest_dir, None)
-    };
+    let root_candidates = resource_root_candidates(
+        opts.current_exe_path,
+        opts.manifest_dir,
+        opts.tauri_resource_dir,
+    );
 
     let mut valid_roots: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -644,7 +641,7 @@ pub fn resolve_python_launcher_resource_aware(
             .current_exe_path
             .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
             .unwrap_or(false);
-    if is_bundled_required_platform || is_macos {
+    if is_bundled_required_platform || is_macos || opts.packaged {
         if let Some(candidate) = bundled_runtime_candidate(&opts) {
             if !Path::new(&candidate.program).exists() {
                 if opts.packaged {
@@ -2030,7 +2027,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11,13],"machine":"arm64","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"x86_64","executable":"{}","prefix":"{}"}}"#,
             py.display(),
             runtime_root.display()
         );

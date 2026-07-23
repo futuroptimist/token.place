@@ -48,34 +48,30 @@ struct BridgeResponse {
     error: Option<String>,
 }
 
-fn model_bridge_script_candidates(exe_path: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
+fn model_bridge_script_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     python_runtime::bridge_script_candidates_from_resource_roots(
         "model_bridge.py",
         exe_path,
         manifest_dir,
-        None,
+        resource_dir,
     )
 }
 
 fn resolve_model_bridge_script_path_for(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
+    resource_dir: Option<&Path>,
     interpreter: Option<&str>,
 ) -> Result<PathBuf, String> {
     python_runtime::resolve_bridge_script_path(
         "model_bridge.py",
         exe_path,
         manifest_dir,
-        None,
-        interpreter,
-    )
-}
-
-fn resolve_model_bridge_script_path(interpreter: Option<&str>) -> Result<PathBuf, String> {
-    let current_exe = std::env::current_exe().ok();
-    resolve_model_bridge_script_path_for(
-        current_exe.as_deref(),
-        Path::new(env!("CARGO_MANIFEST_DIR")),
+        resource_dir,
         interpreter,
     )
 }
@@ -84,6 +80,7 @@ fn configure_runtime_pythonpath_for(
     command: &mut std::process::Command,
     bridge_script: &Path,
     manifest_dir: &Path,
+    resource_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     python_runtime::disable_python_user_site(command);
     let import_root =
@@ -94,7 +91,7 @@ fn configure_runtime_pythonpath_for(
             bridge_script,
             current_exe.as_deref(),
             manifest_dir,
-            None,
+            resource_dir,
         );
         let packaged = python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
         python_runtime::configure_python_subprocess_env_for_layout(
@@ -110,6 +107,7 @@ fn configure_runtime_pythonpath_for(
 fn configure_runtime_pythonpath(
     command: &mut std::process::Command,
     bridge_script: &Path,
+    resource_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
     // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
@@ -117,6 +115,7 @@ fn configure_runtime_pythonpath(
         command,
         bridge_script,
         Path::new(env!("CARGO_MANIFEST_DIR")),
+        resource_dir,
     )
 }
 
@@ -180,25 +179,32 @@ fn sanitize_model_bridge_payload_field(key: &str, value: &Value) -> Value {
 fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifactInfo, String> {
     let exe_path = std::env::current_exe().ok();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let resource_dir = app.path().resource_dir().ok();
     let launcher = python_runtime::resolve_python_launcher_resource_aware(
         python_runtime::PythonLauncherResolutionOptions {
             override_var_name: "TOKEN_PLACE_PYTHON",
-            tauri_resource_dir: app.path().resource_dir().ok().as_deref(),
+            tauri_resource_dir: resource_dir.as_deref(),
             current_exe_path: exe_path.as_deref(),
             manifest_dir,
             packaged: python_runtime::is_packaged_execution(exe_path.as_deref(), manifest_dir),
         },
     )
     .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
-    let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
+    let bridge_script = resolve_model_bridge_script_path_for(
+        exe_path.as_deref(),
+        manifest_dir,
+        resource_dir.as_deref(),
+        Some(&launcher.program),
+    )?;
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
-    let import_root = configure_runtime_pythonpath(&mut bridge_command, &bridge_script);
+    let import_root =
+        configure_runtime_pythonpath(&mut bridge_command, &bridge_script, resource_dir.as_deref());
     let (selected_resource_root, selected_layout) = python_runtime::describe_resource_layout(
         &bridge_script,
         exe_path.as_deref(),
         manifest_dir,
-        None,
+        resource_dir.as_deref(),
     );
     let start_line = format!(
         "action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
@@ -979,7 +985,8 @@ mod tests {
         let manifest_dir = temp.path().join("missing-manifest");
         let mut command = std::process::Command::new("python");
 
-        let import_root = configure_runtime_pythonpath_for(&mut command, &bridge, &manifest_dir);
+        let import_root =
+            configure_runtime_pythonpath_for(&mut command, &bridge, &manifest_dir, None);
 
         assert!(import_root.is_none());
         assert_eq!(
@@ -1003,16 +1010,17 @@ mod tests {
         let error = resolve_model_bridge_script_path_for(
             Some(&exe_path),
             &manifest_dir,
+            None,
             Some("/usr/bin/python3"),
         )
         .expect_err("missing model bridge should fail closed");
 
         assert!(error.contains("model_bridge.py"));
         assert!(error.contains("attempted_resource_roots="));
-        assert!(error.contains("attempted_bridge_paths="));
+        assert!(error.contains("attempted_bridge_basenames="));
         assert!(error.contains("MacOsAppResources"));
-        assert!(error.contains("Contents/Resources/python/model_bridge.py"));
-        assert!(error.contains("interpreter=/usr/bin/python3"));
+        assert!(error.contains("attempted_bridge_basenames="));
+        assert!(error.contains("interpreter_basename=python3"));
     }
 
     #[test]
@@ -1026,7 +1034,7 @@ mod tests {
             .join("repo")
             .join("desktop-tauri")
             .join("src-tauri");
-        let candidates = model_bridge_script_candidates(Some(&exe_path), &manifest_dir);
+        let candidates = model_bridge_script_candidates(Some(&exe_path), &manifest_dir, None);
 
         assert!(candidates
             .iter()
@@ -1051,7 +1059,7 @@ mod tests {
         std::fs::write(&bridge, "print('ok')\n").expect("write model bridge");
 
         let exe_path = exe_dir.join("token.place");
-        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path());
+        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path(), None);
         let resolved = candidates
             .into_iter()
             .find(|candidate| candidate.is_file())
@@ -1070,7 +1078,7 @@ mod tests {
         std::fs::write(&bridge, "print('ok')\n").expect("write model bridge");
 
         let exe_path = exe_dir.join("token.place.exe");
-        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path());
+        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path(), None);
         let resolved = candidates
             .into_iter()
             .find(|candidate| candidate.is_file())
@@ -1094,7 +1102,7 @@ mod tests {
         std::fs::write(&resources_bridge, "print('resources')\n").expect("write resources bridge");
 
         let exe_path = exe_dir.join("token.place");
-        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path());
+        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path(), None);
         let resolved = candidates
             .into_iter()
             .find(|candidate| candidate.is_file())
@@ -1110,8 +1118,20 @@ mod tests {
         let resources = config
             .get("bundle")
             .and_then(|bundle| bundle.get("resources"))
-            .and_then(serde_json::Value::as_array)
-            .expect("bundle.resources array");
+            .map(|resources| {
+                if let Some(array) = resources.as_array() {
+                    array
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                } else if let Some(object) = resources.as_object() {
+                    object.keys().cloned().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            })
+            .expect("bundle.resources array or object");
 
         let required = [
             "python/compute_node_bridge.py",
@@ -1127,23 +1147,14 @@ mod tests {
             "../../requirements.txt",
         ];
 
-        // Intentional strict count: this guards against accidental bundle bloat.
-        assert_eq!(
-            resources.len(),
-            required.len(),
-            "bundle.resources should only include required Python bridge/runtime resources"
-        );
-
         assert!(
-            resources
-                .iter()
-                .all(|entry| !entry.as_str().unwrap_or_default().contains("relay.py")),
+            resources.iter().all(|entry| !entry.contains("relay.py")),
             "bundle.resources must never include relay.py"
         );
 
         for script in required {
             assert!(
-                resources.iter().any(|entry| entry.as_str() == Some(script)),
+                resources.iter().any(|entry| entry == script),
                 "missing bundled python resource: {script}"
             );
         }

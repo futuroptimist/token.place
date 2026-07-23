@@ -981,8 +981,8 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => !pythonBridgeUnavailable && Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
-    [pythonBridgeUnavailable, config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
+    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
   const operatorControlsDisabled = useMemo(
     () => (isStartingComputeNode && !computeStatus.running) || isStoppingComputeNode,

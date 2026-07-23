@@ -571,7 +571,26 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     assert "pull_request" not in on_block
     assert sorted(on_block) == ["push", "schedule", "workflow_dispatch"]
     assert on_block["push"]["branches"] == ["main"]
-    assert on_block["push"].get("paths"), "macOS smoke push trigger must stay narrowly path-filtered"
+    push_paths = set(on_block["push"].get("paths", []))
+    assert push_paths, "macOS smoke push trigger must stay narrowly path-filtered"
+    required_push_paths = {
+        ".github/workflows/desktop-macos-smoke.yml",
+        "desktop-tauri/package.json",
+        "desktop-tauri/package-lock.json",
+        "desktop-tauri/src/**",
+        "desktop-tauri/src-tauri/Cargo.toml",
+        "desktop-tauri/src-tauri/Cargo.lock",
+        "desktop-tauri/src-tauri/build.rs",
+        "desktop-tauri/src-tauri/capabilities/**",
+        "desktop-tauri/src-tauri/src/**",
+        "desktop-tauri/src-tauri/python/**",
+        "desktop-tauri/src-tauri/tauri.conf.json",
+        "desktop-tauri/index.html",
+        "desktop-tauri/vite.config.ts",
+        "desktop-tauri/tsconfig.json",
+        "desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py",
+    }
+    assert required_push_paths <= push_paths
     assert len(on_block["schedule"]) == 1
     assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
 

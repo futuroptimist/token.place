@@ -7,6 +7,8 @@ use crate::backend::ComputeMode;
 
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+#[cfg(test)]
+pub static RUNTIME_BOOTSTRAP_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub const BUNDLED_RUNTIME_RELATIVE_PYTHON: &str = if cfg!(target_os = "windows") {
     "python-runtime/python.exe"
 } else {

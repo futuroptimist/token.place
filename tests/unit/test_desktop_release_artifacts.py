@@ -3285,7 +3285,8 @@ def test_publish_job_checks_out_immutable_tag_before_downloading_artifacts() -> 
     verify_index = names.index('Verify immutable tag, release absence, and artifact provenance')
     create_index = names.index('Create immutable GitHub Release')
 
-    assert resolve_index < checkout_index < macos_index < windows_index < verify_index < create_index
+    assert checkout_index == resolve_index + 1
+    assert checkout_index < macos_index < windows_index < verify_index < create_index
 
     checkout_step = steps[checkout_index]
     assert checkout_step['uses'] == 'actions/checkout@v5'

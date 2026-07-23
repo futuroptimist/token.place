@@ -55,6 +55,58 @@ def _run_all_tests_jobs() -> dict[str, dict]:
     }
 
 
+def _workflow_files() -> list[Path]:
+    return sorted(
+        path
+        for pattern in ("*.yml", "*.yaml")
+        for path in WORKFLOW_DIR.glob(pattern)
+    )
+
+
+def _push_tag_patterns(on_block: dict) -> list[str]:
+    push = on_block.get("push")
+    if not isinstance(push, dict):
+        return []
+    tags = push.get("tags", [])
+    if isinstance(tags, str):
+        return [tags]
+    if isinstance(tags, list):
+        return [str(tag) for tag in tags]
+    return []
+
+
+def _run_working_directory(container: dict) -> str:
+    defaults = container.get("defaults", {})
+    if not isinstance(defaults, dict):
+        return ""
+    run_defaults = defaults.get("run", {})
+    if not isinstance(run_defaults, dict):
+        return ""
+    return str(run_defaults.get("working-directory", ""))
+
+
+def _is_desktop_working_directory(value: str) -> bool:
+    normalized = value.strip().rstrip("/")
+    return normalized == "desktop" or normalized.startswith("desktop/")
+
+
+def _runs_legacy_electron_packaging_from_desktop(
+    run: str, working_directory: str
+) -> bool:
+    package_pattern = re.compile(
+        r"(?:^|\s)(?:npm|yarn|pnpm)\s+(?:run\s+)?"
+        r"package:(?:mac|win|all)(?:\s|$)"
+    )
+    packaging_command = bool(package_pattern.search(run)) or "electron-builder" in run
+    if not packaging_command:
+        return False
+    if _is_desktop_working_directory(working_directory):
+        return True
+    return bool(
+        re.search(r"(?:^|[;&|()\n]\s*)cd\s+desktop(?:\s|$|[;&|()])", run)
+    )
+
+
 def _workflow_step_by_name(job: dict, name: str) -> dict:
     matches = [step for step in _job_steps(job) if step.get("name") == name]
     assert len(matches) == 1, f"expected exactly one step named {name!r}"
@@ -674,6 +726,48 @@ def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_ins
     assert "test_desktop_no_relay_autostart_e2e.py" not in linux_runs
 
 
+def test_retired_legacy_electron_desktop_packaging_workflow_stays_removed() -> None:
+    legacy_workflow = WORKFLOW_DIR / "desktop.yml"
+    assert not legacy_workflow.exists(), (
+        "The retired Electron desktop packaging workflow must not be restored; "
+        "ordinary v* tags must not trigger legacy macOS/Windows packaging."
+    )
+
+    release_workflow = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
+    release_on = _workflow_on_block(release_workflow, "desktop-release.yml")
+    assert release_on["push"]["tags"] == ["desktop-v*"]
+
+    offenders: list[str] = []
+    for workflow_path in _workflow_files():
+        workflow_data = _load_workflow(workflow_path)
+        on_block = _workflow_on_block(workflow_data, workflow_path.name)
+        if "v*" not in _push_tag_patterns(on_block):
+            continue
+
+        jobs = workflow_data.get("jobs", {})
+        assert isinstance(jobs, dict), f"{workflow_path} must define jobs as a mapping"
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            job_working_directory = _run_working_directory(job)
+            for step in _job_steps(job):
+                step_working_directory = str(
+                    step.get("working-directory", job_working_directory)
+                )
+                if _runs_legacy_electron_packaging_from_desktop(
+                    str(step.get("run", "")), step_working_directory
+                ):
+                    offenders.append(
+                        f"{workflow_path.name}:{job_name}:"
+                        f"{step.get('name', '<unnamed step>')}"
+                    )
+
+    assert not offenders, (
+        "Ordinary v* tag workflows must not recreate retired Electron packaging "
+        "from desktop/ via package:mac, package:win, package:all, or electron-builder: "
+        + ", ".join(offenders)
+    )
+
 def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-macos-smoke.yml")
     on_block = _workflow_on_block(workflow_data, "desktop-macos-smoke.yml")
@@ -702,6 +796,7 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     }
     assert required_push_paths <= push_paths
     assert len(on_block["schedule"]) == 1
+    assert on_block["schedule"][0]["cron"] == "37 9 * * 1"
     assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
 
     job = workflow_data["jobs"]["native-macos-no-relay-smoke"]
@@ -713,11 +808,21 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     ]
     assert len(checkout_steps) == 1
     assert checkout_steps[0]["uses"] == "actions/checkout@v5"
-    assert int(job["timeout-minutes"]) <= 10
+    assert int(job["timeout-minutes"]) == 10
     runs = _step_runs(job)
     assert "npm run tauri build -- --debug --no-bundle" in runs
     assert "test_desktop_no_relay_autostart_e2e.py" in runs
-    forbidden = ("run_all_tests.sh", "run_desktop_parity_checks.py", "tauri build", "--bundles", "prepare_embedded_python_runtime.py")
+    upload_logs = _workflow_step_by_name(job, "Upload desktop smoke logs on failure")
+    assert upload_logs["if"] == "failure()"
+    assert upload_logs["with"]["name"] == "desktop-macos-smoke-logs"
+    assert upload_logs["with"]["retention-days"] == "7"
+    forbidden = (
+        "run_all_tests.sh",
+        "run_desktop_parity_checks.py",
+        "tauri build",
+        "--bundles",
+        "prepare_embedded_python_runtime.py",
+    )
     for fragment in forbidden:
         if fragment == "tauri build":
             assert "npm run tauri build -- --debug --no-bundle" in runs

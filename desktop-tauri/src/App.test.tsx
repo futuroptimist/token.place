@@ -2389,6 +2389,34 @@ describe('desktop Python runtime error normalization', () => {
     });
   });
 
+
+
+  it.each([
+    'desktop_python_runtime_missing: bundled runtime unavailable',
+    'desktop_python_runtime_invalid: bundled runtime failed metadata probe',
+  ])('keeps Start operator enabled after mount-time bridge inspection failure: %s', async (bridgeError) => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'detect_backend') return Promise.resolve({ platform_label: 'windows-x64', preferred_mode: 'gpu', available_backend: 'cuda', availability_label: 'CUDA-capable platform (Windows x64)' });
+      if (command === 'load_config') return Promise.resolve({ model_path: 'C:\\Models\\qwen.gguf', relay_base_url: 'https://token.place', preferred_mode: 'gpu' });
+      if (command === 'get_compute_node_status') return Promise.resolve({ running: false, registered: false, active_relay_url: '', requested_mode: 'gpu', effective_mode: null, backend_available: 'cuda', backend_selected: null, backend_used: null, fallback_reason: null, model_path: '', last_error: null, relay_runtime_state: 'idle', runtime_provisioning_state: 'idle', startup_phase: null });
+      if (command === 'inspect_model_artifact') return Promise.reject(new Error(bridgeError));
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+    await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
+    expect(document.body.textContent ?? '').toContain(bridgeError.split(':')[0]);
+    const startInferenceButton = (await screen.findByText('Start local inference')) as HTMLButtonElement;
+    const downloadButton = (await screen.findByText('Download')) as HTMLButtonElement;
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    expect(startInferenceButton.disabled).toBe(true);
+    expect(downloadButton.disabled).toBe(true);
+
+    fireEvent.click(startOperatorButton);
+    await waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(true));
+  });
+
   it('hides raw xcode-select launcher diagnostics and disables Python-dependent actions', async () => {
     const rawFailure = "no usable Python 3 interpreter found for desktop Python subprocess (consulted override env var: TOKEN_PLACE_SIDECAR_PYTHON); tried: python3 -> status=1 stdout='' stderr='xcode-select: note: No developer tools were found, requesting install. If developer tools are located at a non-default location on disk, use sudo xcode-select --switch /Applications/Xcode.app. /Users/daniel/private'; python -> spawn failed: missing";
     invokeMock.mockImplementation((command: string) => {
@@ -2415,7 +2443,7 @@ describe('desktop Python runtime error normalization', () => {
     expect(body).not.toContain('TOKEN_PLACE_SIDECAR_PYTHON');
     expect(body).not.toContain('/Users/daniel');
     expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
-    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(false);
     expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
   });
 });

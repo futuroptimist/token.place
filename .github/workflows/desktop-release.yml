@@ -705,6 +705,12 @@ jobs:
             exit 1
           fi
 
+      - name: Check out repository for immutable tag verification
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
       - name: Download macOS artifacts
         uses: actions/download-artifact@v5
         with:
@@ -716,12 +722,6 @@ jobs:
         with:
           name: windows-x64-bundles
           path: release-assets/windows
-
-      - name: Check out repository for immutable tag verification
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          fetch-depth: 0
 
       - name: Verify immutable tag, release absence, and artifact provenance
         env:

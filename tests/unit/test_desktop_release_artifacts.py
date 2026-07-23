@@ -3295,12 +3295,31 @@ def test_publish_uploads_assets_via_captured_upload_url_without_clobber() -> Non
     create_step = _load_publish_step('Create immutable GitHub Release')
     script = create_step['run']
     assert 'upload_url="$(jq -r \'.upload_url\' /tmp/release-create.json)"' in script
-    assert 'release_id="$(jq -r \'.id\' /tmp/release-create.json)"' in script
+    assert 'created_release_id="$(jq -r \'.id\' /tmp/release-create.json)"' in script
     assert 'GitHub did not return a release id for ${TAG_NAME}.' in script
     assert 'GitHub did not return an upload URL for release ${TAG_NAME}.' in script
+    assert "encoded_asset_name=\"$(jq -rn --arg value \"${asset_name}\" '$value | @uri')\"" in script
+    assert '"${upload_url}?name=${encoded_asset_name}"' in script
+    assert '"${upload_url}?name=${asset_name}"' not in script
     assert 'Content-Type: application/octet-stream' in script
     assert 'No release assets were uploaded for ${TAG_NAME}.' in script
     assert '--clobber' not in script
+
+
+def test_publish_upload_url_encodes_notice_asset_names() -> None:
+    create_step = _load_publish_step('Create immutable GitHub Release')
+    script = create_step['run']
+    assert 'README BEFORE OPENING.txt' in WORKFLOW.read_text(encoding='utf-8')
+    assert "'$value | @uri'" in script
+    encoded = subprocess.run(
+        ['jq', '-rn', '--arg', 'value', 'README BEFORE OPENING.txt', '$value | @uri'],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert encoded == 'README%20BEFORE%20OPENING.txt'
+    assert '"${upload_url}?name=${encoded_asset_name}"' in script
+    assert '"${upload_url}?name=${asset_name}"' not in script
 
 
 def test_publish_manifest_provenance_requires_exact_two_target_manifests_in_source() -> None:

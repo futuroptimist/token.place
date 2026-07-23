@@ -875,11 +875,12 @@ jobs:
           for asset in release-assets/macos/* release-assets/windows/*; do
             [ -f "${asset}" ] || continue
             asset_name="$(basename "${asset}")"
+            encoded_asset_name="$(jq -rn --arg value "${asset_name}" '$value | @uri')"
             echo "Uploading ${asset_name} to draft release ${release_id}..."
             gh api --method POST \
               -H "Content-Type: application/octet-stream" \
               --input "${asset}" \
-              "${upload_url}?name=${asset_name}" >/dev/null
+              "${upload_url}?name=${encoded_asset_name}" >/dev/null
             uploaded_count=$((uploaded_count + 1))
           done
           if [ "${uploaded_count}" -eq 0 ]; then

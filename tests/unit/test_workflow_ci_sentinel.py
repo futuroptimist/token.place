@@ -189,6 +189,25 @@ def test_desktop_release_temporary_artifacts_expire_after_seven_days() -> None:
         )
 
 
+def test_retired_electron_desktop_workflow_stays_removed_from_v_tag_packaging() -> None:
+    legacy_workflow = WORKFLOW_DIR / "desktop.yml"
+
+    assert not legacy_workflow.exists(), (
+        "The retired Electron desktop packaging workflow must not be restored; "
+        "ordinary v* tags should not trigger legacy macOS/Windows packaging."
+    )
+
+    active_tagged_workflows = []
+    for workflow_path in WORKFLOW_DIR.glob("*.yml"):
+        workflow_data = _load_workflow(workflow_path)
+        on_block = _workflow_on_block(workflow_data, workflow_path.name)
+        push_tags = on_block.get("push", {}).get("tags", [])
+        if "v*" in push_tags:
+            active_tagged_workflows.append(workflow_path.name)
+
+    assert "desktop.yml" not in active_tagged_workflows
+
+
 def test_image_workflow_keeps_pull_request_validate_only() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "ci-image.yml")
     on_block = _workflow_on_block(workflow_data, "ci-image.yml")
@@ -702,6 +721,7 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     }
     assert required_push_paths <= push_paths
     assert len(on_block["schedule"]) == 1
+    assert on_block["schedule"][0]["cron"] == "37 9 * * 1"
     assert workflow_data.get("concurrency", {}).get("cancel-in-progress") == "true"
 
     job = workflow_data["jobs"]["native-macos-no-relay-smoke"]
@@ -717,6 +737,8 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
     runs = _step_runs(job)
     assert "npm run tauri build -- --debug --no-bundle" in runs
     assert "test_desktop_no_relay_autostart_e2e.py" in runs
+    upload_step = _workflow_step_by_name(job, "Upload desktop smoke logs on failure")
+    assert upload_step.get("with", {}).get("retention-days") == "7"
     forbidden = ("run_all_tests.sh", "run_desktop_parity_checks.py", "tauri build", "--bundles", "prepare_embedded_python_runtime.py")
     for fragment in forbidden:
         if fragment == "tauri build":

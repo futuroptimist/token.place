@@ -4723,3 +4723,133 @@ def test_installed_context_smoke_fails_on_wrong_constructor_n_ctx(monkeypatch) -
 
     with pytest.raises(RuntimeError, match='constructor_n_ctx_mismatch'):
         module.installed_context_smoke_payload('8k-fast', '1')
+
+
+def test_windows_installer_identity_classifies_artifacts_and_sanitizes_log_paths(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
+    msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    unsupported = tmp_path / 'token.place-desktop-0.1.3-x64.zip'
+    wrong_version = tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe'
+    for path in (nsis, msi, unsupported, wrong_version):
+        path.write_text('artifact', encoding='utf-8')
+
+    assert guard.classify_installer(nsis, '0.1.3').kind == 'nsis'
+    assert guard.classify_installer(msi, '0.1.3').kind == 'msi'
+    with pytest.raises(guard.InstallerIdentityError, match='unsupported Windows installer type'):
+        guard.classify_installer(unsupported, '0.1.3')
+    with pytest.raises(guard.InstallerIdentityError, match='filename must include 0.1.3'):
+        guard.classify_installer(wrong_version, '0.1.3')
+    with pytest.raises(guard.InstallerIdentityError, match='installer does not exist'):
+        guard.classify_installer(tmp_path / 'missing-0.1.3-setup.exe', '0.1.3')
+
+    artifact_dir = guard.ScenarioArtifactDir(tmp_path / 'logs')
+    log_path = artifact_dir.path(r'cross\nsis/to-msi', 'operator-smoke')
+    assert log_path.parent.name == 'cross-nsis-to-msi'
+    assert log_path.name == 'operator-smoke.log'
+    assert log_path.parent.exists()
+
+
+def test_windows_installer_identity_inventory_shortcuts_parses_single_dict_and_missing_targets(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    existing_target = tmp_path / 'token.place.exe'
+    existing_target.write_text('exe', encoding='utf-8')
+    payload = {
+        'Shortcut': str(tmp_path / 'Token Place.lnk'),
+        'Target': str(existing_target),
+        'ResolvedTarget': str(existing_target),
+        'Exists': True,
+    }
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(json.dumps(payload)))
+
+    inventory = guard.inventory_shortcuts()
+
+    assert inventory.shortcuts == [guard.Shortcut(tmp_path / 'Token Place.lnk', existing_target)]
+    assert inventory.distinct_existing_targets == [existing_target.resolve()]
+    assert inventory.missing_targets == []
+
+    missing_target = tmp_path / 'removed' / 'token.place.exe'
+    payload = [
+        {'Shortcut': str(tmp_path / 'missing.lnk'), 'Target': str(missing_target), 'ResolvedTarget': str(missing_target), 'Exists': False},
+        {'Shortcut': str(tmp_path / 'blank.lnk'), 'Target': '', 'ResolvedTarget': '', 'Exists': False},
+    ]
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(json.dumps(payload)))
+
+    inventory = guard.inventory_shortcuts()
+
+    assert inventory.shortcuts == [guard.Shortcut(tmp_path / 'missing.lnk', missing_target)]
+    assert inventory.existing_targets == []
+    assert inventory.missing_targets == [missing_target]
+
+
+def test_windows_installer_identity_registry_inventory_and_authority_signature(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    payload = {
+        'KeyPath': r'HKLM:\Software\TokenPlace',
+        'DisplayName': 'token.place desktop',
+        'UninstallString': r'"C:\Program Files\token.place\uninstall.exe"',
+        'QuietUninstallString': r'"C:\Program Files\token.place\uninstall.exe" /S',
+        'WindowsInstaller': False,
+        'ProductCode': '',
+    }
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: _process_completed(json.dumps([payload, {'DisplayName': ''}])))
+
+    entries = guard.inventory_registry_entries()
+
+    assert entries == [
+        guard.RegistryEntry(
+            key_path=r'HKLM:\Software\TokenPlace',
+            display_name='token.place desktop',
+            uninstall_string=r'"C:\Program Files\token.place\uninstall.exe"',
+            quiet_uninstall_string=r'"C:\Program Files\token.place\uninstall.exe" /S',
+            windows_installer=False,
+            product_code='',
+        )
+    ]
+    snapshot = guard.AuthoritySnapshot(
+        shortcuts=guard.ShortcutInventory(
+            shortcuts=[guard.Shortcut(Path('C:/Users/Public/Desktop/token.place.lnk'), Path('C:/Program Files/token.place/token.place.exe'))],
+            existing_targets=[Path('C:/Program Files/TOKEN.PLACE/token.place.exe')],
+            missing_targets=[Path('C:/stale/token.place.exe')],
+        ),
+        registry=entries,
+    )
+    signature = guard._authority_signature(snapshot)
+    assert 'c:/users/public/desktop/token.place.lnk' in signature[0][0][0]
+    assert 'c:/stale/token.place.exe' in signature[1][0]
+    assert 'hklm:\\software\\tokenplace' in signature[3][0][0]
+
+
+def test_windows_installer_identity_install_and_run_log_failure_contract(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    nsis = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
+    msi = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    for installer in (nsis, msi):
+        installer.path.write_text('installer', encoding='utf-8')
+    calls = []
+    original_run = guard._run
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if kwargs.get('log_path') is not None:
+            kwargs['log_path'].write_text(f"$ {cmd[0]}\nexit=0\nok", encoding='utf-8')
+        return subprocess.CompletedProcess(cmd, 0, 'ok')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+
+    guard.install(nsis, tmp_path / 'nsis.log')
+    guard.install(msi, tmp_path / 'msi.log')
+
+    assert calls[0][0] == [str(nsis.path), '/S']
+    assert calls[1][0] == [guard._msiexec(), '/i', str(msi.path), '/qn', '/norestart']
+    assert (tmp_path / 'nsis.log').read_text(encoding='utf-8').endswith('ok')
+
+    def failing_subprocess(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 9, 'boom')
+
+    monkeypatch.setattr(guard.subprocess, 'run', failing_subprocess)
+    with pytest.raises(guard.InstallerIdentityError, match='command failed'):
+        original_run(['bad-command'], log_path=tmp_path / 'failed.log')
+    assert 'exit=9' in (tmp_path / 'failed.log').read_text(encoding='utf-8')

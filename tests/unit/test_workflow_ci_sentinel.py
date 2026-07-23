@@ -495,6 +495,16 @@ def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
     assert "steps.changes.outputs.run == 'true'" in job_text
 
+    checkout_steps = [
+        step
+        for step in _job_steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["uses"] == "actions/checkout@v5"
+    assert checkout_steps[0].get("with", {}).get("fetch-depth") == "0"
+
+
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():
         assert "continue-on-error" not in job, (

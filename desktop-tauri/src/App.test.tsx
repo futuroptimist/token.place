@@ -2374,6 +2374,34 @@ describe('desktop app start failure handling', () => {
     expect(contextSelect.disabled).toBe(true);
   });
 
+
+  it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
+    'keeps Start operator enabled when mount-time model inspection reports %s',
+    async (code) => {
+      invokeMock.mockImplementation((command: string) => {
+        if (command === 'detect_backend') return Promise.resolve({ platform_label: 'windows', preferred_mode: 'auto', available_backend: 'cuda', availability_label: 'CUDA-capable platform (Windows x64)' });
+        if (command === 'load_config') return Promise.resolve({ model_path: 'C:\\Models\\qwen.gguf', relay_base_url: 'https://token.place', relay_base_urls: ['https://token.place'], preferred_mode: 'gpu' });
+        if (command === 'get_compute_node_status') return Promise.resolve({ running: false, registered: false, active_relay_url: '', requested_mode: 'gpu', effective_mode: null, backend_available: 'cuda', backend_selected: 'cuda', backend_used: null, fallback_reason: null, model_path: '', last_error: null, relay_runtime_state: 'idle', runtime_provisioning_state: 'idle', startup_phase: null });
+        if (command === 'inspect_model_artifact') return Promise.reject(new Error(`${code}: bundled runtime failed`));
+        if (command === 'start_compute_node') return Promise.resolve(undefined);
+        return Promise.resolve(undefined);
+      });
+
+      render(<App />);
+
+      await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
+      expect(document.body.textContent ?? '').toContain(`Diagnostic code: ${code}`);
+      expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
+      expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
+      const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+      expect(startOperatorButton.disabled).toBe(false);
+
+      fireEvent.click(startOperatorButton);
+
+      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('start_compute_node', expect.any(Object)));
+    }
+  );
+
 });
 
 describe('desktop Python runtime error normalization', () => {
@@ -2415,7 +2443,7 @@ describe('desktop Python runtime error normalization', () => {
     expect(body).not.toContain('TOKEN_PLACE_SIDECAR_PYTHON');
     expect(body).not.toContain('/Users/daniel');
     expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
-    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(false);
     expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
   });
 });

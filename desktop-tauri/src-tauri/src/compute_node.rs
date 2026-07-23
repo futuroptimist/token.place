@@ -1580,6 +1580,33 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     context_probe_command
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
+    let mut inspect_command = launcher.command_for_script_blocking(&bridge_script);
+    inspect_command.arg("inspect");
+    let inspect_output = inspect_command.output()?;
+    if !inspect_output.status.success() {
+        anyhow::bail!(
+            "model_artifact_inspect_failed: bundled interpreter model inspection exited unsuccessfully"
+        );
+    }
+    let inspect_stdout = String::from_utf8_lossy(&inspect_output.stdout);
+    let inspect_payload: Value = serde_json::from_str(inspect_stdout.trim())?;
+    let inspected_filename = inspect_payload
+        .get("payload")
+        .and_then(|payload| payload.get("filename"))
+        .and_then(Value::as_str)
+        .filter(|filename| {
+            Path::new(filename)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(*filename)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("model_artifact_inspect_failed: missing safe model filename")
+        })?;
+    if inspect_payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("model_artifact_inspect_failed: inspect did not report ok");
+    }
+
     let context_probe_output = context_probe_command.output()?;
     if !context_probe_output.status.success() {
         anyhow::bail!(
@@ -1603,6 +1630,8 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "context_tier": config.context_tier.as_str(),
         "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
         "bridge_preflight": "ok",
+        "model_artifact_inspect": "ok",
+        "model_artifact_filename": inspected_filename,
     });
     if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
         for (key, value) in probe_map {
@@ -3083,7 +3112,7 @@ mod tests {
     ) {
         let summary = summarize_bridge_stdout_payload(&serde_json::json!({
             "type": "status",
-            "app_version": "0.1.3",
+            "app_version": "0.1.4",
             "build_id": "abcdef012345",
             "target_triple": "x86_64-pc-windows-msvc",
             "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
@@ -3113,7 +3142,7 @@ mod tests {
         assert!(summary.len() <= 3500);
         assert_eq!(
             payload.get("app_version").and_then(Value::as_str),
-            Some("0.1.3")
+            Some("0.1.4")
         );
         assert_eq!(
             payload.get("build_id").and_then(Value::as_str),

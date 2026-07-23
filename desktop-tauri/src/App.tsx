@@ -981,8 +981,13 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => !pythonBridgeUnavailable && Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode && !isStoppingComputeNode,
-    [pythonBridgeUnavailable, config.model_path, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
+    () =>
+      Boolean(config.model_path.trim()) &&
+      normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).length > 0 &&
+      !computeStatus.running &&
+      !isStartingComputeNode &&
+      !isStoppingComputeNode,
+    [config.model_path, config.relay_base_url, config.relay_base_urls, computeStatus.running, isStartingComputeNode, isStoppingComputeNode]
   );
   const operatorControlsDisabled = useMemo(
     () => (isStartingComputeNode && !computeStatus.running) || isStoppingComputeNode,

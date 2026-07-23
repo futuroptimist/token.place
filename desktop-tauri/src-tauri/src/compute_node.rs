@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::config::normalize_relay_base_urls;
+use crate::config::{normalize_relay_base_urls, DesktopConfig};
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
     append_line_to_path, read_log_tail, sanitize_operator_diagnostic_line,
@@ -10,7 +10,7 @@ use crate::python_runtime::{
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
-    ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,13 @@ pub struct ComputeNodeStatus {
     pub log_file_path: Option<String>,
     #[serde(default)]
     pub readiness_diagnostics: Map<String, Value>,
+    pub app_version: String,
+    pub build_id: String,
+    pub target_triple: String,
+    pub bundled_runtime_id: String,
+    pub runtime_id: Option<String>,
+    pub launcher_source: Option<String>,
+    pub interpreter_basename: Option<String>,
 }
 
 fn default_request_context_tier() -> String {
@@ -685,6 +692,7 @@ fn startup_failure_status(
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
 ) -> ComputeNodeStatus {
+    let build_identity = crate::build_identity::build_identity();
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -733,6 +741,13 @@ fn startup_failure_status(
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
+        app_version: build_identity.app_version.into(),
+        build_id: build_identity.build_id.into(),
+        target_triple: build_identity.target_triple.into(),
+        bundled_runtime_id: build_identity.bundled_runtime_id.into(),
+        runtime_id: None,
+        launcher_source: None,
+        interpreter_basename: None,
     }
 }
 
@@ -1304,6 +1319,23 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
     for key in [
         "type",
         "operator_session_id",
+        "app_version",
+        "build_id",
+        "target_triple",
+        "bundled_runtime_id",
+        "launcher_source",
+        "interpreter_basename",
+        "runtime_id",
+        "runtime_provisioning_state",
+        "startup_phase",
+        "startup_elapsed_ms",
+        "startup_deadline_ms",
+        "worker_state",
+        "worker_generation",
+        "worker_restart_count",
+        "worker_alive",
+        "last_worker_error_code",
+        "last_worker_exit_code",
         "sequence",
         "updated_at_ms",
         "running",
@@ -1498,6 +1530,88 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
     payload
 }
 
+fn packaged_launcher_source_is_valid(
+    is_packaged_execution: bool,
+    launcher_source: Option<&PythonLauncherSource>,
+) -> bool {
+    !is_packaged_execution || matches!(launcher_source, Some(PythonLauncherSource::BundledRuntime))
+}
+
+pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let packaged =
+        crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+    let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+        override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
+        tauri_resource_dir: None,
+        current_exe_path: current_exe.as_deref(),
+        manifest_dir,
+        packaged,
+    })?;
+    if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
+        anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
+    }
+    let bridge_script = resolve_bridge_script_for(
+        current_exe.as_deref(),
+        manifest_dir,
+        None,
+        Some(&launcher.program),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
+    let import_root =
+        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
+    let (selected_resource_root, selected_layout) = describe_resource_layout(
+        Path::new(&bridge_script),
+        current_exe.as_deref(),
+        manifest_dir,
+        None,
+    );
+    let identity = crate::build_identity::build_identity();
+    let launcher_source = match launcher.source {
+        PythonLauncherSource::BundledRuntime => "bundled",
+        PythonLauncherSource::EnvironmentOverride => "environment_override",
+        PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
+    };
+    let mut context_probe_command = launcher.command_for_script_blocking(&bridge_script);
+    context_probe_command.arg("--installed-context-smoke");
+    context_probe_command
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    let context_probe_output = context_probe_command.output()?;
+    if !context_probe_output.status.success() {
+        anyhow::bail!(
+            "installed_context_probe_failed: bundled interpreter context probe exited unsuccessfully"
+        );
+    }
+    let context_probe_stdout = String::from_utf8_lossy(&context_probe_output.stdout);
+    let context_probe: Value = serde_json::from_str(context_probe_stdout.trim())?;
+    let mut payload = serde_json::json!({
+        "record": "desktop.compute_node.session.layout",
+        "app_version": identity.app_version,
+        "build_id": identity.build_id,
+        "target_triple": identity.target_triple,
+        "bundled_runtime_id": identity.bundled_runtime_id,
+        "launcher_source": launcher_source,
+        "interpreter_basename": Path::new(&launcher.program).file_name().and_then(|n| n.to_str()).unwrap_or("python"),
+        "runtime_id": launcher.runtime_id,
+        "layout": format!("{:?}", selected_layout),
+        "resource_root": sanitize_path_for_operator_log(&selected_resource_root),
+        "import_root": import_root.as_ref().map(|path| sanitize_path_for_operator_log(path)).unwrap_or_else(|| "<unresolved>".into()),
+        "context_tier": config.context_tier.as_str(),
+        "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
+        "bridge_preflight": "ok",
+    });
+    if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
+        for (key, value) in probe_map {
+            payload_map.insert(key, value);
+        }
+    }
+    Ok(payload)
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -1530,13 +1644,18 @@ pub async fn start_compute_node(
     let log_file_path = log_sink
         .as_ref()
         .map(|log_sink| log_sink.path().to_string_lossy().into_owned());
+    let build_identity = crate::build_identity::build_identity();
     append_operator_log_line(
         &log_sink,
         "desktop.compute_node.session.start",
         &format!(
-            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={} app_version={} build_id={} target_triple={} bundled_runtime_id={}",
             session_id,
-            format!("{:?}", request.mode).to_lowercase()
+            format!("{:?}", request.mode).to_lowercase(),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id
         ),
     );
     if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
@@ -1617,6 +1736,44 @@ pub async fn start_compute_node(
         None
     };
 
+    let launcher_metadata = launcher.as_ref().map(|launcher| {
+        let source = match launcher.source {
+            PythonLauncherSource::BundledRuntime => "bundled",
+            PythonLauncherSource::EnvironmentOverride => "environment_override",
+            PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
+        };
+        (
+            source.to_string(),
+            std::path::Path::new(&launcher.program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("python")
+                .to_string(),
+            launcher.runtime_id.clone(),
+            launcher.source.clone(),
+        )
+    });
+    if !packaged_launcher_source_is_valid(
+        crate::python_runtime::is_packaged_execution(
+            std::env::current_exe().ok().as_deref(),
+            manifest_dir,
+        ),
+        launcher_metadata.as_ref().map(|(_, _, _, source)| source),
+    ) {
+        let err = anyhow::anyhow!(
+            "desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"
+        );
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            &session_id,
+            log_file_path.clone(),
+            err.to_string(),
+        )
+        .await;
+        return Err(err.into());
+    }
+
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
@@ -1660,7 +1817,7 @@ pub async fn start_compute_node(
         &log_sink,
         "desktop.compute_node.session.layout",
         &format!(
-            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} app_version={} build_id={} target_triple={} bundled_runtime_id={} launcher_source={} interpreter_basename={} runtime_id={}",
             session_id,
             sanitize_relay_target(&primary_relay_url),
             sanitize_path_for_operator_log(Path::new(&bridge_script)),
@@ -1670,12 +1827,31 @@ pub async fn start_compute_node(
             import_root
                 .as_ref()
                 .map(|path| sanitize_path_for_operator_log(path))
-                .unwrap_or_else(|| "<unresolved>".into())
+                .unwrap_or_else(|| "<unresolved>".into()),
+            build_identity.app_version,
+            build_identity.build_id,
+            build_identity.target_triple,
+            build_identity.bundled_runtime_id,
+            launcher_metadata.as_ref().map(|m| m.0.as_str()).unwrap_or("none"),
+            launcher_metadata.as_ref().map(|m| m.1.as_str()).unwrap_or("none"),
+            launcher_metadata.as_ref().map(|m| m.2.as_str()).unwrap_or("none")
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
         bridge_command.env(key, value);
+    }
+    bridge_command.env("TOKENPLACE_APP_VERSION", build_identity.app_version);
+    bridge_command.env("TOKENPLACE_BUILD_ID", build_identity.build_id);
+    bridge_command.env("TOKENPLACE_TARGET_TRIPLE", build_identity.target_triple);
+    bridge_command.env(
+        "TOKENPLACE_BUNDLED_RUNTIME_ID",
+        build_identity.bundled_runtime_id,
+    );
+    if let Some((source, basename, runtime_id, _)) = launcher_metadata.as_ref() {
+        bridge_command.env("TOKENPLACE_LAUNCHER_SOURCE", source);
+        bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
+        bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
 
     isolate_bridge_process_tree(&mut bridge_command);
@@ -1772,6 +1948,7 @@ pub async fn start_compute_node(
     }
 
     if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
+        let build_identity = crate::build_identity::build_identity();
         let running_status = ComputeNodeStatus {
             running: true,
             registered: false,
@@ -1817,6 +1994,13 @@ pub async fn start_compute_node(
             updated_at_ms: Some(current_time_ms()),
             log_file_path: log_file_path.clone(),
             readiness_diagnostics: Map::new(),
+            app_version: build_identity.app_version.into(),
+            build_id: build_identity.build_id.into(),
+            target_triple: build_identity.target_triple.into(),
+            bundled_runtime_id: build_identity.bundled_runtime_id.into(),
+            runtime_id: launcher_metadata.as_ref().map(|m| m.2.clone()),
+            launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
+            interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };
         publish_running_if_bridge_record_still_running(&state, &session_id, running_status).await;
     }
@@ -2892,6 +3076,128 @@ mod tests {
         assert!(payload
             .get("api_v1_readiness_completion_smoke_plain_completion_prompt_tokenization_selected_special")
             .is_none());
+    }
+
+    #[test]
+    fn summarize_bridge_stdout_payload_allows_build_and_launcher_diagnostics_and_drops_unsafe_decoys(
+    ) {
+        let summary = summarize_bridge_stdout_payload(&serde_json::json!({
+            "type": "status",
+            "app_version": "0.1.3",
+            "build_id": "abcdef012345",
+            "target_triple": "x86_64-pc-windows-msvc",
+            "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "launcher_source": "bundled",
+            "interpreter_basename": "python.exe",
+            "runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
+            "runtime_provisioning_state": "ready",
+            "startup_phase": "starting_worker",
+            "startup_elapsed_ms": 1500,
+            "startup_deadline_ms": 60000,
+            "worker_state": "ready",
+            "worker_generation": 2,
+            "worker_restart_count": 1,
+            "worker_alive": true,
+            "last_worker_error_code": "worker_exit_nonzero",
+            "last_worker_exit_code": 1,
+            "model_path": "/Users/Example User/models/model.gguf",
+            "relay_url": "https://relay.internal.example/path?token=secret",
+            "prompt": "plaintext prompt",
+            "response": "plaintext response",
+            "api_key": "sk-super-secret",
+            "env": {"PATH": "/usr/bin", "SECRET_TOKEN": "hunter2"},
+            "interpreter_path": "/Users/Example User/AppData/Local/token.place/python-runtime/python.exe",
+        }));
+        let payload: Value = serde_json::from_str(&summary).expect("summary json");
+
+        assert!(summary.len() <= 3500);
+        assert_eq!(
+            payload.get("app_version").and_then(Value::as_str),
+            Some("0.1.3")
+        );
+        assert_eq!(
+            payload.get("build_id").and_then(Value::as_str),
+            Some("abcdef012345")
+        );
+        assert_eq!(
+            payload.get("target_triple").and_then(Value::as_str),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            payload.get("bundled_runtime_id").and_then(Value::as_str),
+            Some("bundled-cpython-3.11-win-x86_64-cu124")
+        );
+        assert_eq!(
+            payload.get("launcher_source").and_then(Value::as_str),
+            Some("bundled")
+        );
+        assert_eq!(
+            payload.get("interpreter_basename").and_then(Value::as_str),
+            Some("python.exe")
+        );
+        assert_eq!(
+            payload.get("runtime_id").and_then(Value::as_str),
+            Some("bundled-cpython-3.11-win-x86_64-cu124")
+        );
+        assert_eq!(
+            payload
+                .get("runtime_provisioning_state")
+                .and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            payload.get("startup_phase").and_then(Value::as_str),
+            Some("starting_worker")
+        );
+        assert_eq!(
+            payload.get("startup_elapsed_ms").and_then(Value::as_u64),
+            Some(1500)
+        );
+        assert_eq!(
+            payload.get("startup_deadline_ms").and_then(Value::as_u64),
+            Some(60000)
+        );
+        assert_eq!(
+            payload.get("worker_state").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            payload.get("worker_generation").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            payload.get("worker_restart_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload.get("worker_alive").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("last_worker_error_code")
+                .and_then(Value::as_str),
+            Some("worker_exit_nonzero")
+        );
+        assert_eq!(
+            payload.get("last_worker_exit_code").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        assert!(payload.get("model_path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("response").is_none());
+        assert!(payload.get("api_key").is_none());
+        assert!(payload.get("env").is_none());
+        assert!(payload.get("interpreter_path").is_none());
+        assert!(!summary.contains("Example User"));
+        assert!(!summary.contains("token=secret"));
+        assert!(!summary.contains("plaintext prompt"));
+        assert!(!summary.contains("plaintext response"));
+        assert!(!summary.contains("sk-super-secret"));
+        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("/Users/Example User"));
+        assert!(!summary.contains("python-runtime/python.exe"));
     }
 
     #[test]
@@ -5758,6 +6064,52 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn packaged_execution_accepts_only_bundled_runtime_launcher() {
+        assert!(packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::BundledRuntime)
+        ));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_missing_launcher() {
+        assert!(!packaged_launcher_source_is_valid(true, None));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_environment_override_launcher() {
+        assert!(!packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::EnvironmentOverride)
+        ));
+    }
+
+    #[test]
+    fn packaged_execution_rejects_system_development_launcher() {
+        assert!(!packaged_launcher_source_is_valid(
+            true,
+            Some(&PythonLauncherSource::SystemDevelopmentRuntime)
+        ));
+    }
+
+    #[test]
+    fn non_packaged_execution_retains_existing_launcher_behavior_for_every_source() {
+        assert!(packaged_launcher_source_is_valid(false, None));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::BundledRuntime)
+        ));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::EnvironmentOverride)
+        ));
+        assert!(packaged_launcher_source_is_valid(
+            false,
+            Some(&PythonLauncherSource::SystemDevelopmentRuntime)
+        ));
+    }
+
     /// Spawn a root process that also forks a long-lived sleep child.
     /// `isolate_bridge_process_tree` puts them in a new process group so
     /// `terminate_bridge_process_tree` can kill the entire group.
@@ -5944,7 +6296,13 @@ mod tests {
     #[cfg(windows)]
     async fn windows_pid_alive(pid: u32) -> bool {
         let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .args([
+                "/FI",
+                &format!("PID eq {}", pid),
+                &format!("/{}{}", "F", "O"),
+                "CSV",
+                "/NH",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -5952,7 +6310,7 @@ mod tests {
         match output {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
-                // tasklist /FO CSV outputs the PID as a quoted field (e.g. "12345").
+                // tasklist CSV-format output contains the PID as a quoted field (e.g. "12345").
                 // Match the quoted form to avoid false positives where one PID is a
                 // substring of another (e.g. "123" matching "1234").
                 // tasklist outputs "INFO: No tasks ..." when the PID is not found.

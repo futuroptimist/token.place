@@ -345,7 +345,7 @@ def test_main_forwards_context_tier_to_runtime_and_bridge(monkeypatch, tmp_path)
 
 
 def test_launch_materialized_child_materializes_once_reexecs_canonical_and_cleans(monkeypatch, tmp_path):
-    installer = tmp_path / 'Token.Place_0.1.2_x64-setup.exe'
+    installer = tmp_path / 'Token.Place_0.1.3_x64-setup.exe'
     installer.write_text('installer', encoding='utf-8')
     materialized: list[Path] = []
     cleaned: list[Path] = []
@@ -614,7 +614,7 @@ def test_nsis_uninstaller_noop_and_invocation(monkeypatch, tmp_path):
 
 
 def test_launch_materialized_child_cleanup_failure_propagates(monkeypatch, tmp_path):
-    installer = tmp_path / 'Token.Place_0.1.2_x64-setup.exe'
+    installer = tmp_path / 'Token.Place_0.1.3_x64-setup.exe'
     installer.write_text('installer', encoding='utf-8')
 
     def fake_materialize(_path, install_root):

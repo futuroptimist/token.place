@@ -6528,7 +6528,9 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
         worker.join(timeout=2.0)
 
 
-def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
+
+
+def _load_desktop_relay_operator_parity_module():
     module_path = (
         Path(__file__).resolve().parents[2]
         / 'desktop-tauri'
@@ -6539,6 +6541,68 @@ def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(mo
     parity = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(parity)
+    return parity
+
+
+def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode():
+    parity = _load_desktop_relay_operator_parity_module()
+
+    assert parity._bridge_compute_mode(simulated_platform='Darwin') == 'cpu'
+    assert parity._bridge_compute_mode(simulated_platform='macOS') == 'cpu'
+
+
+def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
+    parity = _load_desktop_relay_operator_parity_module()
+
+    parity._assert_ready_runtime_fields(
+        {
+            'requested_mode': 'auto',
+            'effective_mode': 'cpu',
+            'backend_available': 'missing',
+            'backend_selected': 'cpu',
+            'backend_used': 'cpu',
+            'fallback_reason': 'mock LLM mode uses CPU for deterministic relay parity',
+            'warm_load_enabled': True,
+            'warm_load_state': 'ready',
+            'warm_load_duration_ms': 7,
+        },
+        layout_label='macOS Contents/Resources',
+    )
+
+
+def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
+    parity = _load_desktop_relay_operator_parity_module()
+    modes = []
+
+    class Process:
+        stdout = iter(())
+        stdin = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kwargs):
+        modes.append(args[args.index('--mode') + 1])
+        return Process()
+
+    monkeypatch.setattr(parity.subprocess, 'Popen', fake_popen)
+
+    bridge = parity._start_bridge(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        tmp_path / 'resources',
+        'http://127.0.0.1:1',
+        layout_label='macOS Contents/Resources',
+        session_index=1,
+        simulated_platform='Darwin',
+    )
+    bridge._thread.join(timeout=1)
+
+    assert modes == ['cpu']
+
+
+def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
+    parity = _load_desktop_relay_operator_parity_module()
 
     calls = []
 
@@ -6581,3 +6645,76 @@ def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(mo
     )
 
     assert [call['simulated_platform'] for call in calls] == ['Darwin', 'Darwin']
+
+
+def _load_packaged_operator_e2e_module():
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / 'desktop-tauri'
+        / 'scripts'
+        / 'test_packaged_operator_e2e.py'
+    )
+    spec = importlib.util.spec_from_file_location('desktop_packaged_operator_e2e', module_path)
+    packaged = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(packaged)
+    return packaged
+
+
+def test_macos_mock_metal_packaged_probe_simulates_darwin_platform(monkeypatch, tmp_path):
+    packaged = _load_packaged_operator_e2e_module()
+    captured = {}
+
+    def fake_create_fake_metal_site(tmp_root, layout_label):
+        fake_site = tmp_root / 'fake-metal-site'
+        (fake_site / 'llama_cpp').mkdir(parents=True)
+        (fake_site / 'llama_cpp' / '__init__.py').write_text('', encoding='utf-8')
+        return fake_site
+
+    def fake_startup_probe(*args, **kwargs):
+        captured.update(kwargs)
+        return (
+            '"registered": true\n'
+            'runtime_action=metal_already_supported\n'
+            'warm_load_state ready\n'
+            '"api_v1_readiness_result": "passed"\n'
+            '"api_v1_readiness_yarn_rope_scaling_type_source": "top_level_enum"\n'
+        )
+
+    monkeypatch.setattr(packaged, 'create_fake_metal_llama_cpp_site', fake_create_fake_metal_site)
+    monkeypatch.setattr(packaged, 'run_compute_bridge_startup_probe', fake_startup_probe)
+
+    packaged.run_macos_mock_metal_packaged_registration_probe(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        relay_port=12345,
+        resources_root=tmp_path / 'resources',
+    )
+
+    assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'
+
+
+def test_macos_gpu_failure_packaged_probe_simulates_darwin_platform(monkeypatch, tmp_path):
+    packaged = _load_packaged_operator_e2e_module()
+    captured = {}
+
+    def fake_packaged_env(tmp_root, resources_root, *, extra_env=None):
+        captured['extra_env'] = extra_env
+        return {'PYTHONPATH': extra_env['PYTHONPATH']}
+
+    class Result:
+        returncode = 1
+        stdout = 'GPU provisioning failed for desktop macOS launch\n'
+        stderr = ''
+
+    monkeypatch.setattr(packaged, '_packaged_env', fake_packaged_env)
+    monkeypatch.setattr(packaged.subprocess, 'run', lambda *args, **kwargs: Result())
+
+    packaged.run_macos_gpu_failure_blocks_registration_probe(
+        tmp_path,
+        tmp_path / 'bridge.py',
+        relay_port=12345,
+        resources_root=tmp_path / 'resources',
+    )
+
+    assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'

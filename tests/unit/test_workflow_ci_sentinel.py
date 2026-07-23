@@ -606,6 +606,13 @@ def test_desktop_macos_smoke_is_targeted_and_not_release_or_full_suite() -> None
 
     job = workflow_data["jobs"]["native-macos-no-relay-smoke"]
     assert job["runs-on"] == "macos-26"
+    checkout_steps = [
+        step
+        for step in _job_steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["uses"] == "actions/checkout@v5"
     assert int(job["timeout-minutes"]) <= 10
     runs = _step_runs(job)
     assert "npm run tauri build -- --debug --no-bundle" in runs

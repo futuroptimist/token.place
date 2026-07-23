@@ -9,8 +9,8 @@ use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
-    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    should_enable_runtime_bootstrap, PythonEnvCommand, PythonLauncher,
+    PythonLauncherResolutionOptions, PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -490,11 +490,28 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn configure_runtime_pythonpath(
-    command: &mut Command,
+fn script_path_arg(path: &Path, label: &str) -> anyhow::Result<String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{label}: resolved script path is not valid UTF-8"))
+}
+
+fn safe_model_artifact_filename(filename: &str) -> Option<&str> {
+    (!filename.is_empty()
+        && filename.ends_with(".gguf")
+        && !filename.contains('/')
+        && !filename.contains('\\'))
+    .then_some(filename)
+}
+
+fn configure_runtime_pythonpath<C>(
+    command: &mut C,
     manifest_dir: &Path,
     bridge_script: &str,
-) -> Option<std::path::PathBuf> {
+) -> Option<std::path::PathBuf>
+where
+    C: PythonEnvCommand,
+{
     disable_python_user_site(command);
     let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
@@ -1567,8 +1584,14 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         Some(&launcher.program),
     )
     .map_err(anyhow::Error::msg)?;
-    let mut model_inspect_command =
-        launcher.command_for_script_blocking(model_bridge_script.to_str().unwrap_or_default());
+    let model_bridge_script_arg =
+        script_path_arg(&model_bridge_script, "model_artifact_inspect_failed")?;
+    let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script_arg);
+    configure_runtime_pythonpath(
+        &mut model_inspect_command,
+        manifest_dir,
+        &model_bridge_script_arg,
+    );
     model_inspect_command.arg("inspect");
     let model_inspect_output = model_inspect_command.output()?;
     if !model_inspect_output.status.success() {
@@ -1580,10 +1603,10 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         .get("payload")
         .and_then(|payload| payload.get("filename"))
         .and_then(Value::as_str)
-        .filter(|filename| !filename.contains('/') && !filename.contains('\\'))
+        .and_then(safe_model_artifact_filename)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "model_artifact_inspect_failed: inspect did not report a safe model filename"
+                "model_artifact_inspect_failed: inspect did not report a basename-only .gguf model filename"
             )
         })?
         .to_string();
@@ -5910,6 +5933,24 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), resources_bridge);
+    }
+
+    #[test]
+    fn safe_model_artifact_filename_requires_basename_gguf() {
+        assert_eq!(
+            safe_model_artifact_filename("token-place-0.1.4.gguf"),
+            Some("token-place-0.1.4.gguf")
+        );
+        assert_eq!(safe_model_artifact_filename("token-place.bin"), None);
+        assert_eq!(
+            safe_model_artifact_filename("models/token-place.gguf"),
+            None
+        );
+        assert_eq!(
+            safe_model_artifact_filename("models\\token-place.gguf"),
+            None
+        );
+        assert_eq!(safe_model_artifact_filename(""), None);
     }
 
     #[test]

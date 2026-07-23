@@ -3271,6 +3271,43 @@ def _load_publish_manifest_provenance_source() -> str:
     return script[start:end]
 
 
+def test_publish_job_checks_out_immutable_tag_before_downloading_artifacts() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['publish']['steps']
+    names = [step.get('name') for step in steps]
+
+    resolve_index = names.index('Resolve release tag')
+    checkout_index = names.index('Check out repository for immutable tag verification')
+    macos_index = names.index('Download macOS artifacts')
+    windows_index = names.index('Download Windows artifacts')
+    verify_index = names.index('Verify immutable tag, release absence, and artifact provenance')
+    create_index = names.index('Create immutable GitHub Release')
+
+    assert resolve_index < checkout_index < macos_index < windows_index < verify_index < create_index
+
+    checkout_step = steps[checkout_index]
+    assert checkout_step['uses'] == 'actions/checkout@v5'
+    assert checkout_step['with']['ref'] == '${{ steps.tag.outputs.tag }}'
+    assert checkout_step['with']['fetch-depth'] == 0
+    assert 'clean' not in checkout_step.get('with', {})
+
+    macos_step = steps[macos_index]
+    assert macos_step['uses'] == 'actions/download-artifact@v5'
+    assert macos_step['with'] == {
+        'name': 'macos-arm64-bundles',
+        'path': 'release-assets/macos',
+    }
+
+    windows_step = steps[windows_index]
+    assert windows_step['uses'] == 'actions/download-artifact@v5'
+    assert windows_step['with'] == {
+        'name': 'windows-x64-bundles',
+        'path': 'release-assets/windows',
+    }
+
+
 def test_publish_release_creation_is_create_only_with_no_overwrite_path() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'softprops/action-gh-release' not in text

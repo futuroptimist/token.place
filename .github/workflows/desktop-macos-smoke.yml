@@ -20,7 +20,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
   schedule:
-    - cron: '37 9 * * *'
+    - cron: '37 9 * * 1'
   workflow_dispatch:
 
 concurrency:
@@ -82,3 +82,4 @@ jobs:
           path: .desktop-e2e-logs/
           include-hidden-files: true
           if-no-files-found: warn
+          retention-days: 7

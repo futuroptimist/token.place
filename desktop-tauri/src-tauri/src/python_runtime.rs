@@ -672,6 +672,138 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
     ))
 }
 
+pub(crate) fn coherent_packaged_resource_roots(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf, ResourceLayoutKind)> {
+    let mut coherent = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for candidate in resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir) {
+        if !bundled_runtime_layout_is_eligible(&candidate.layout, true) {
+            continue;
+        }
+        let Some(bridge) =
+            bridge_script_candidates_from_candidates(script_name, std::slice::from_ref(&candidate))
+                .into_iter()
+                .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        if !candidate
+            .root
+            .join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
+            .is_file()
+        {
+            continue;
+        }
+        let canonical = canonical_resource_root(&candidate.root);
+        if seen.insert(canonical.clone()) {
+            coherent.push((
+                canonical,
+                bridge.canonicalize().unwrap_or(bridge),
+                candidate.layout,
+            ));
+        }
+    }
+    coherent
+}
+
+pub(crate) fn resolve_bundled_python_launcher_at_root(
+    root: &Path,
+    packaged: bool,
+) -> Result<PythonLauncher, PythonLauncherError> {
+    let candidate = PythonLauncher::new(
+        root.join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
+            .to_string_lossy()
+            .to_string(),
+        vec![],
+        PythonLauncherSource::BundledRuntime,
+        bundled_runtime_id(),
+    );
+    validate_bundled_runtime_candidate(candidate, packaged)
+}
+
+fn validate_bundled_runtime_candidate(
+    candidate: PythonLauncher,
+    packaged: bool,
+) -> Result<PythonLauncher, PythonLauncherError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&candidate.program)
+            .map(|m| m.permissions().mode() & 0o111 == 0)
+            .unwrap_or(true)
+        {
+            return Err(launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                PythonLauncherCategory::BundledRuntimeNotExecutable,
+                Some(&candidate),
+                packaged,
+                None,
+            ));
+        }
+    }
+    match candidate.command_for_metadata_probe().output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::AppleDeveloperToolsStub,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
+            let runtime_root =
+                bundled_runtime_root_from_candidate(&candidate).ok_or_else(|| {
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                        Some(&candidate),
+                        packaged,
+                        output_status_code(&output),
+                    )
+                })?;
+            metadata_probe_is_valid(&stdout, &runtime_root, expected_runtime_arch()).map_err(
+                |category| {
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        category,
+                        Some(&candidate),
+                        packaged,
+                        output_status_code(&output),
+                    )
+                },
+            )?;
+            if cfg!(target_os = "windows") && !bundled_windows_provenance_is_valid(&runtime_root) {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::BundledRuntimeProbeFailed,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
+            Ok(candidate)
+        }
+        Err(_) => Err(launcher_error(
+            if packaged {
+                DESKTOP_PYTHON_RUNTIME_INVALID
+            } else {
+                DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING
+            },
+            PythonLauncherCategory::BundledRuntimeProbeFailed,
+            Some(&candidate),
+            packaged,
+            None,
+        )),
+    }
+}
+
 fn has_confirmed_unbundled_dev_source_tree(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
     if opts.packaged
         || classify_python_execution_layout(opts.current_exe_path, opts.manifest_dir)
@@ -720,85 +852,7 @@ pub fn resolve_python_launcher_resource_aware(
                     ));
                 }
             } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if std::fs::metadata(&candidate.program)
-                        .map(|m| m.permissions().mode() & 0o111 == 0)
-                        .unwrap_or(true)
-                    {
-                        return Err(launcher_error(
-                            DESKTOP_PYTHON_RUNTIME_INVALID,
-                            PythonLauncherCategory::BundledRuntimeNotExecutable,
-                            Some(&candidate),
-                            opts.packaged,
-                            None,
-                        ));
-                    }
-                }
-                return match candidate.command_for_metadata_probe().output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
-                            return Err(launcher_error(
-                                DESKTOP_PYTHON_RUNTIME_INVALID,
-                                PythonLauncherCategory::AppleDeveloperToolsStub,
-                                Some(&candidate),
-                                opts.packaged,
-                                output_status_code(&output),
-                            ));
-                        }
-                        let runtime_root = bundled_runtime_root_from_candidate(&candidate)
-                            .ok_or_else(|| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    PythonLauncherCategory::BundledRuntimeProbeFailed,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })?;
-                        match metadata_probe_is_valid(
-                            &stdout,
-                            &runtime_root,
-                            expected_runtime_arch(),
-                        ) {
-                            Ok(()) => {
-                                if cfg!(target_os = "windows")
-                                    && !bundled_windows_provenance_is_valid(&runtime_root)
-                                {
-                                    return Err(launcher_error(
-                                        DESKTOP_PYTHON_RUNTIME_INVALID,
-                                        PythonLauncherCategory::BundledRuntimeProbeFailed,
-                                        Some(&candidate),
-                                        opts.packaged,
-                                        output_status_code(&output),
-                                    ));
-                                }
-                                Ok(candidate.clone())
-                            }
-                            Err(category) => Err(launcher_error(
-                                DESKTOP_PYTHON_RUNTIME_INVALID,
-                                category,
-                                Some(&candidate),
-                                opts.packaged,
-                                output_status_code(&output),
-                            )),
-                        }
-                    }
-                    Err(_) => Err(launcher_error(
-                        if opts.packaged {
-                            DESKTOP_PYTHON_RUNTIME_INVALID
-                        } else {
-                            DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING
-                        },
-                        PythonLauncherCategory::BundledRuntimeProbeFailed,
-                        Some(&candidate),
-                        opts.packaged,
-                        None,
-                    )),
-                };
+                return validate_bundled_runtime_candidate(candidate, opts.packaged);
             }
         } else if opts.packaged {
             return Err(launcher_error(

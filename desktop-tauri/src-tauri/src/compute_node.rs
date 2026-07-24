@@ -6,12 +6,13 @@ use crate::operator_logs::{
     sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
-    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
-    describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
+    bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
+    configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
+    resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
     PythonLauncherCategory, PythonLauncherError, PythonLauncherResolutionOptions,
-    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    PythonLauncherSource, ResourceLayoutKind, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -1612,6 +1613,39 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
 pub(crate) struct OperatorBridgeLaunchPreparation {
     pub bridge_script: String,
     pub launcher: Option<PythonLauncher>,
+    resource_root: std::path::PathBuf,
+    import_root: std::path::PathBuf,
+    layout: ResourceLayoutKind,
+}
+
+impl OperatorBridgeLaunchPreparation {
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &self.import_root,
+            self.layout.clone(),
+            matches!(
+                self.launcher.as_ref().map(|launcher| &launcher.source),
+                Some(PythonLauncherSource::BundledRuntime)
+            ),
+        );
+        Ok(command)
+    }
+
+    fn blocking_command(&self) -> anyhow::Result<std::process::Command> {
+        let launcher = self.launcher.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
+        })?;
+        let mut command = launcher.command_for_script_blocking(&self.bridge_script);
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &self.import_root,
+            self.layout.clone(),
+            launcher.source == PythonLauncherSource::BundledRuntime,
+        );
+        Ok(command)
+    }
 }
 
 #[derive(Debug)]
@@ -1672,6 +1706,42 @@ impl std::error::Error for OperatorBridgeLaunchPreparationError {}
 pub(crate) fn prepare_operator_bridge_launch(
     context: &BridgeResourceContext<'_>,
 ) -> Result<OperatorBridgeLaunchPreparation, OperatorBridgeLaunchPreparationError> {
+    if context.packaged() {
+        let roots = coherent_packaged_resource_roots(
+            "compute_node_bridge.py",
+            context.exe_path,
+            context.manifest_dir,
+            context.tauri_resource_dir,
+        );
+        let (resource_root, bridge_script, layout) = match roots.as_slice() {
+            [selection] => selection.clone(),
+            [] => {
+                return Err(OperatorBridgeLaunchPreparationError::new(
+                    "bundled_runtime_resolution",
+                    "desktop_python_runtime_missing",
+                    "bundled_runtime_missing",
+                    "no coherent packaged resource root",
+                ))
+            }
+            _ => {
+                return Err(OperatorBridgeLaunchPreparationError::new(
+                    "bundled_runtime_resolution",
+                    "desktop_python_runtime_invalid",
+                    "bundled_runtime_ambiguous",
+                    "multiple coherent packaged resource roots",
+                ))
+            }
+        };
+        let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
+            .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        return Ok(OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(launcher),
+            import_root: resource_root.clone(),
+            resource_root,
+            layout,
+        });
+    }
     let bridge_script = resolve_bridge_script_for(
         context.exe_path,
         context.manifest_dir,
@@ -1703,9 +1773,16 @@ pub(crate) fn prepare_operator_bridge_launch(
     } else {
         None
     };
+    let bridge_path = Path::new(&bridge_script);
+    let (resource_root, layout) = context.describe_resource_layout(bridge_path);
+    let import_root = resolve_runtime_import_root(Some(bridge_path), context.manifest_dir)
+        .unwrap_or_else(|| resource_root.clone());
     Ok(OperatorBridgeLaunchPreparation {
         bridge_script,
         launcher,
+        resource_root,
+        import_root,
+        layout,
     })
 }
 
@@ -1765,9 +1842,9 @@ fn operator_session_smoke_record_from_preparation(
     let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
     let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
     let bridge_script_path = Path::new(&bridge_script);
-    let (selected_resource_root, selected_layout) =
-        context.describe_resource_layout(bridge_script_path);
-    let import_root = resolve_runtime_import_root(Some(bridge_script_path), context.manifest_dir);
+    let selected_resource_root = preparation.resource_root.clone();
+    let selected_layout = preparation.layout.clone();
+    let import_root = Some(preparation.import_root.clone());
     let identity = crate::build_identity::build_identity();
     let launcher_source = match launcher.source {
         PythonLauncherSource::BundledRuntime => "bundled",
@@ -1827,14 +1904,8 @@ pub(crate) fn operator_start_preflight_record(
         tauri_resource_dir: resource_dir.as_deref(),
     };
     let preparation = prepare_operator_bridge_launch(&context)?;
-    let launcher = preparation
-        .launcher
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator preflight"))?;
-    let bridge_script_path = Path::new(&preparation.bridge_script);
-
-    let mut command =
-        build_installed_context_probe_command(launcher, bridge_script_path, &context, config);
+    let mut command = preparation.blocking_command()?;
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
     command.arg("--operator-preflight-controlled-ready");
     command
         .arg("--context-tier")
@@ -1975,6 +2046,26 @@ pub async fn start_compute_node(
             return Err(err.into());
         }
     };
+    let mut bridge_command = match preparation.command() {
+        Ok(command) => command,
+        Err(err) => {
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                err.to_string(),
+                "command_build",
+                "bridge_command_build_failed",
+                "command_build",
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    let selected_resource_root = preparation.resource_root.clone();
+    let selected_layout = preparation.layout.clone();
+    let import_root = Some(preparation.import_root.clone());
     let bridge_script = preparation.bridge_script;
     let launcher = preparation.launcher;
 
@@ -2019,38 +2110,6 @@ pub async fn start_compute_node(
         return Err(err.into());
     }
 
-    let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
-        Ok(command) => command,
-        Err(err) => {
-            complete_no_child_startup_failure(
-                &state,
-                &request,
-                &session_id,
-                log_file_path.clone(),
-                err.to_string(),
-                "command_build",
-                "bridge_command_build_failed",
-                "command_build",
-            )
-            .await;
-            return Err(err.into());
-        }
-    };
-    let exe_path = std::env::current_exe().ok();
-    let resource_dir = app.path().resource_dir().ok();
-    let (selected_resource_root, selected_layout) = describe_resource_layout(
-        Path::new(&bridge_script),
-        exe_path.as_deref(),
-        manifest_dir,
-        resource_dir.as_deref(),
-    );
-    let import_root = configure_runtime_pythonpath(
-        &mut bridge_command,
-        manifest_dir,
-        Path::new(&bridge_script),
-        exe_path.as_deref(),
-        resource_dir.as_deref(),
-    );
     let interpreter = bridge_command
         .as_std()
         .get_program()
@@ -6285,6 +6344,81 @@ mod tests {
                 )
             )
         }));
+    }
+
+    #[cfg(unix)]
+    fn write_coherent_test_resource_root(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let python_dir = root.join("python");
+        let runtime = root.join(crate::python_runtime::BUNDLED_RUNTIME_RELATIVE_PYTHON);
+        std::fs::create_dir_all(&python_dir).expect("create bridge directory");
+        std::fs::create_dir_all(runtime.parent().unwrap()).expect("create runtime directory");
+        std::fs::write(python_dir.join("compute_node_bridge.py"), "# bridge\n")
+            .expect("write bridge");
+        let machine = std::env::consts::ARCH;
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,0],\"machine\":\"{machine}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
+                runtime.display(),
+                root.join("python-runtime").display()
+            ),
+        )
+        .expect("write runtime");
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(runtime, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_operator_bridge_launch_selects_one_coherent_canonical_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("resources");
+        write_coherent_test_resource_root(&root);
+        let alias = temp.path().join("resource-alias");
+        std::os::unix::fs::symlink(&root, &alias).expect("resource alias");
+        let exe = temp.path().join("bin").join("token.place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&alias),
+        };
+
+        let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
+        assert_eq!(preparation.resource_root, root.canonicalize().unwrap());
+        assert!(Path::new(&preparation.bridge_script).starts_with(&root));
+        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&root));
+        assert_eq!(preparation.import_root, preparation.resource_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_runtime_ambiguous_for_distinct_coherent_packaged_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let tauri_root = temp.path().join("tauri-resources");
+        let exe_dir = temp.path().join("installed");
+        let sibling_root = exe_dir.join("resources");
+        write_coherent_test_resource_root(&tauri_root);
+        write_coherent_test_resource_root(&sibling_root);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("token.place");
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&tauri_root),
+        };
+
+        let err = prepare_operator_bridge_launch(&context).unwrap_err();
+        assert_eq!(err.metadata().2, "bundled_runtime_ambiguous");
+        assert!(!err
+            .to_string()
+            .contains(temp.path().to_string_lossy().as_ref()));
     }
 
     #[test]

@@ -706,7 +706,14 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             raise InstallerIdentityError("operator-session smoke did not select the Qwen3 8B Q4 profile")
         if data.get("startup_phase") == "provisioning" or data.get("startup_deadline_ms") is None:
             raise InstallerIdentityError("operator-session smoke did not report a bounded ready/terminal startup phase")
-        if data.get("startup_result") not in ("ready", "terminal_actionable_error"):
+        if data.get("operator_start_preflight") == "ok":
+            if data.get("resource_context_source") != "tauri_app_handle":
+                raise InstallerIdentityError("operator-start preflight did not use the real Tauri AppHandle resource context")
+            if data.get("bridge_child_spawned") is not True or data.get("bridge_event_received") is not True:
+                raise InstallerIdentityError("operator-start preflight did not observe a spawned child and parsed bridge event")
+            if data.get("controlled_ready") is not True or data.get("startup_result") != "ready":
+                raise InstallerIdentityError("operator-start preflight did not observe controlled ready; terminal_actionable_error is not success")
+        elif data.get("startup_result") not in ("ready", "terminal_actionable_error"):
             raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
         if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
@@ -715,6 +722,16 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
                 raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
     assert_no_probe_attempt_counters(data)
+    for key in (
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ):
+        if data.get(key, 0) not in (0, None):
+            raise InstallerIdentityError(f"operator-start preflight reported forbidden action counter {key}")
     if launch_number == 2 and data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
         raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
     return data

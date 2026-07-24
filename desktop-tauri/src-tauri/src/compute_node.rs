@@ -1773,7 +1773,58 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     Ok(payload)
 }
 
-pub(crate) fn operator_start_preflight_record(config: &DesktopConfig) -> anyhow::Result<Value> {
+pub(crate) fn operator_start_preflight_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator preflight"))?;
+    let bridge_script_path = Path::new(&preparation.bridge_script);
+
+    let mut command =
+        build_installed_context_probe_command(launcher, bridge_script_path, &context, config);
+    command.arg("--operator-preflight-controlled-ready");
+    command
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    use std::io::BufRead;
+    let read = reader.read_line(&mut line)?;
+    let status = child.wait()?;
+    if read == 0 {
+        anyhow::bail!("operator_preflight_event_missing: controlled bridge emitted no event");
+    }
+    if !status.success() {
+        anyhow::bail!("operator_preflight_child_failed: controlled bridge exited unsuccessfully");
+    }
+    let event = parse_compute_node_event_line(line.trim())?;
+    let startup_result = event
+        .get("startup_result")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if startup_result != "ready" {
+        anyhow::bail!("operator_preflight_not_ready: controlled bridge did not report ready");
+    }
+
     let mut payload = operator_session_smoke_record(config)?;
     if let Value::Object(map) = &mut payload {
         map.insert(
@@ -1782,12 +1833,15 @@ pub(crate) fn operator_start_preflight_record(config: &DesktopConfig) -> anyhow:
         );
         map.insert(
             "resource_context_source".into(),
-            Value::String("cli_current_exe".into()),
+            Value::String("tauri_app_handle".into()),
         );
         map.insert("bridge_child_spawned".into(), Value::Bool(true));
         map.insert("bridge_event_received".into(), Value::Bool(true));
-        map.entry("startup_result".into())
-            .or_insert_with(|| Value::String("ready".into()));
+        map.insert(
+            "startup_result".into(),
+            Value::String(startup_result.into()),
+        );
+        map.insert("controlled_ready".into(), Value::Bool(true));
     }
     Ok(payload)
 }

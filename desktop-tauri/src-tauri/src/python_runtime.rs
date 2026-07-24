@@ -557,6 +557,55 @@ pub fn is_unbundled_development_execution(
         == PythonExecutionLayout::UnbundledDevelopment
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BridgeResourceContext<'a> {
+    pub exe_path: Option<&'a Path>,
+    pub manifest_dir: &'a Path,
+    pub tauri_resource_dir: Option<&'a Path>,
+}
+
+impl<'a> BridgeResourceContext<'a> {
+    pub fn packaged(&self) -> bool {
+        is_packaged_execution(self.exe_path, self.manifest_dir)
+    }
+
+    pub fn launcher_options(
+        &self,
+        override_var_name: &'a str,
+    ) -> PythonLauncherResolutionOptions<'a> {
+        PythonLauncherResolutionOptions {
+            override_var_name,
+            tauri_resource_dir: self.tauri_resource_dir,
+            current_exe_path: self.exe_path,
+            manifest_dir: self.manifest_dir,
+            packaged: self.packaged(),
+        }
+    }
+
+    pub fn resolve_bridge_script_path(
+        &self,
+        script_name: &str,
+        interpreter: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        resolve_bridge_script_path(
+            script_name,
+            self.exe_path,
+            self.manifest_dir,
+            self.tauri_resource_dir,
+            interpreter,
+        )
+    }
+
+    pub fn describe_resource_layout(&self, script_path: &Path) -> (PathBuf, ResourceLayoutKind) {
+        describe_resource_layout(
+            script_path,
+            self.exe_path,
+            self.manifest_dir,
+            self.tauri_resource_dir,
+        )
+    }
+}
+
 pub fn is_packaged_execution(current_exe_path: Option<&Path>, manifest_dir: &Path) -> bool {
     !is_unbundled_development_execution(current_exe_path, manifest_dir)
 }
@@ -1914,6 +1963,94 @@ mod tests {
         assert!(compute_candidates.iter().any(|candidate| {
             candidate.ends_with("Contents/Resources/python/compute_node_bridge.py")
         }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_bridge_resource_context_resolves_packaged_launcher_and_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        let exe_dir = temp.path().join("installed").join("bin");
+        let resource_root = exe_dir.join("resources");
+        let python_dir = resource_root.join("python");
+        let runtime_bin = resource_root.join("python-runtime").join("bin");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        let model_script = python_dir.join("model_bridge.py");
+        let compute_script = python_dir.join("compute_node_bridge.py");
+        std::fs::write(&model_script, "# model bridge\n").expect("write model bridge");
+        std::fs::write(&compute_script, "# compute bridge\n").expect("write compute bridge");
+        let launcher_path = runtime_bin.join("python3");
+        let machine = expected_runtime_arch();
+        let launcher_body = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '{{\"version\":[3,11,13],\"machine\":\"{}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}\\n'; exit 0; fi\nexit 0\n",
+            machine,
+            launcher_path.display(),
+            resource_root.join("python-runtime").display()
+        );
+        std::fs::write(&launcher_path, launcher_body).expect("write launcher");
+        let mut perms = std::fs::metadata(&launcher_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&launcher_path, perms).unwrap();
+        let exe_path = exe_dir.join("token.place");
+        std::fs::write(&exe_path, "").expect("write exe");
+
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe_path),
+            manifest_dir: &manifest_dir,
+            tauri_resource_dir: Some(&resource_root),
+        };
+        let launcher = resolve_python_launcher_resource_aware(
+            context.launcher_options("TOKEN_PLACE_TEST_UNUSED_PYTHON"),
+        )
+        .expect("packaged launcher");
+        let resolved_model = context
+            .resolve_bridge_script_path("model_bridge.py", Some(&launcher.program))
+            .expect("model script");
+        let resolved_compute = context
+            .resolve_bridge_script_path("compute_node_bridge.py", Some(&launcher.program))
+            .expect("compute script");
+        let (model_root, model_layout) = context.describe_resource_layout(&resolved_model);
+        let (compute_root, compute_layout) = context.describe_resource_layout(&resolved_compute);
+        let mut command = launcher.command_for_script_blocking(&resolved_model);
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &resource_root,
+            model_layout,
+            context.packaged(),
+        );
+
+        assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
+        assert_eq!(Path::new(&launcher.program), launcher_path.as_path());
+        assert_eq!(resolved_model, model_script);
+        assert_eq!(resolved_compute, compute_script);
+        assert_eq!(model_root, resource_root);
+        assert_eq!(compute_root, model_root);
+        assert_eq!(compute_layout, model_layout);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(model_script.to_str().unwrap())
+        );
+        assert_eq!(
+            std_command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+            Some(resource_root.to_str().unwrap())
+        );
+        assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
     }
 
     #[test]

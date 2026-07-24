@@ -9,7 +9,7 @@ use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, PythonEnvCommand, PythonLauncher,
+    should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
     PythonLauncherResolutionOptions, PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
@@ -31,7 +31,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
-const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "qwen3.gguf";
+const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -1571,40 +1571,35 @@ fn packaged_launcher_source_is_valid(
 pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let current_exe = std::env::current_exe().ok();
-    let packaged =
-        crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
-    let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
-        override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
-        tauri_resource_dir: None,
-        current_exe_path: current_exe.as_deref(),
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
         manifest_dir,
-        packaged,
-    })?;
+        tauri_resource_dir: None,
+    };
+    let packaged = context.packaged();
+    let launcher = resolve_python_launcher_resource_aware(
+        context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
+    )?;
     if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
         anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
     }
     let bridge_script = resolve_bridge_script_for(
-        current_exe.as_deref(),
-        manifest_dir,
-        None,
+        context.exe_path,
+        context.manifest_dir,
+        context.tauri_resource_dir,
         Some(&launcher.program),
     )
     .map_err(anyhow::Error::msg)?;
-    let model_bridge_script = resolve_bridge_script_path(
-        "model_bridge.py",
-        current_exe.as_deref(),
-        manifest_dir,
-        None,
-        Some(&launcher.program),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let model_bridge_script = context
+        .resolve_bridge_script_path("model_bridge.py", Some(&launcher.program))
+        .map_err(anyhow::Error::msg)?;
     let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script);
     configure_runtime_pythonpath(
         &mut model_inspect_command,
         manifest_dir,
         &model_bridge_script,
-        current_exe.as_deref(),
-        None,
+        context.exe_path,
+        context.tauri_resource_dir,
     );
     model_inspect_command.arg("inspect");
     let model_inspect_output = model_inspect_command.output()?;
@@ -1619,16 +1614,12 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         &mut bridge_command,
         manifest_dir,
         Path::new(&bridge_script),
-        current_exe.as_deref(),
-        None,
+        context.exe_path,
+        context.tauri_resource_dir,
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
-    let (selected_resource_root, selected_layout) = describe_resource_layout(
-        Path::new(&bridge_script),
-        current_exe.as_deref(),
-        manifest_dir,
-        None,
-    );
+    let (selected_resource_root, selected_layout) =
+        context.describe_resource_layout(Path::new(&bridge_script));
     let identity = crate::build_identity::build_identity();
     let launcher_source = match launcher.source {
         PythonLauncherSource::BundledRuntime => "bundled",
@@ -5979,10 +5970,10 @@ mod tests {
         for rejected in [
             serde_json::json!({"ok": false, "payload": {"filename": EXPECTED_MODEL_ARTIFACT_FILENAME}}),
             serde_json::json!({"ok": true, "payload": {"filename": "qwen3.bin"}}),
-            serde_json::json!({"ok": true, "payload": {"filename": "models/qwen3.gguf"}}),
-            serde_json::json!({"ok": true, "payload": {"filename": "models\\qwen3.gguf"}}),
-            serde_json::json!({"ok": true, "payload": {"filename": "/home/operator/qwen3.gguf"}}),
-            serde_json::json!({"ok": true, "payload": {"filename": "C:\\Users\\operator\\qwen3.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models/Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models\\Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "/home/operator/Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "C:\\Users\\operator\\Qwen3-8B-Q4_K_M.gguf"}}),
             serde_json::json!({"ok": true, "payload": {"filename": "other.gguf"}}),
             serde_json::json!({"ok": true, "payload": {"filename": ""}}),
         ] {

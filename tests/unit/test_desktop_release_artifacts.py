@@ -3726,7 +3726,7 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'context_tier': guard.seeded_config_values()['context_tier'],
         'preferred_mode': guard.seeded_config_values()['preferred_mode'],
     }))
@@ -4081,7 +4081,7 @@ def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomp
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
     }))
     with pytest.raises(guard.InstallerIdentityError, match='did not emit JSON'):
         guard.assert_operator_record('launcher_source=bundled interpreter_basename=python.exe')
@@ -4215,7 +4215,7 @@ def test_windows_installer_identity_operator_record_requires_exact_context_tier_
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'selected_model_profile': 'qwen3-8b-q4',
         'startup_phase': 'ready',
         'startup_result': 'ready',
@@ -4254,7 +4254,7 @@ def test_windows_installer_identity_second_launch_rejects_repair_or_provisioning
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'selected_model_profile': 'qwen3-8b-q4',
         'context_tier': '8k-fast',
         'effective_n_ctx': 8192,
@@ -4292,7 +4292,7 @@ def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(m
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
-            'model_artifact_filename': 'qwen3.gguf',
+            'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
             'selected_model_profile': 'qwen3-8b-q4',
             'context_tier': tier,
             'effective_n_ctx': n_ctx,
@@ -4433,7 +4433,7 @@ def test_windows_installer_identity_second_launch_requires_observed_zero_counter
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'selected_model_profile': 'qwen3-8b-q4',
         'model_profile_identifier': 'qwen3-8b-q4-k-m',
         'context_tier': '8k-fast',
@@ -4599,7 +4599,7 @@ def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
     }))
     real_sentinel_dir = guard._sentinel_dir
 
@@ -4686,7 +4686,7 @@ def test_windows_installer_identity_operator_record_accepts_64k_ready_contract()
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'context_tier': '64k-full',
         'effective_n_ctx': 65536,
         'n_ctx': 65536,
@@ -4724,7 +4724,7 @@ def test_windows_installer_identity_operator_record_rejects_multiline_or_fallbac
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
     }
 
     with pytest.raises(guard.InstallerIdentityError, match='exactly one'):
@@ -5076,7 +5076,7 @@ def test_windows_installer_identity_operator_record_rejects_readiness_and_runtim
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
-        'model_artifact_filename': 'qwen3.gguf',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
         'selected_model_profile': 'qwen3-8b-q4',
         'context_tier': '64k-full',
         'effective_n_ctx': 65536,
@@ -5100,6 +5100,7 @@ def test_windows_installer_identity_operator_record_rejects_readiness_and_runtim
         r'C:\Users\operator\model.gguf',
         '/home/operator/model.gguf',
         'qwen3.bin',
+        'other-safe-model.gguf',
     ]:
         with pytest.raises(guard.InstallerIdentityError, match='safe model artifact filename'):
             guard.assert_operator_record(
@@ -5107,7 +5108,7 @@ def test_windows_installer_identity_operator_record_rejects_readiness_and_runtim
                 expected_tier='64k-full',
             )
     accepted = guard.assert_operator_record(json.dumps(base), expected_tier='64k-full')
-    assert accepted['model_artifact_filename'] == 'qwen3.gguf'
+    assert accepted['model_artifact_filename'] == 'Qwen3-8B-Q4_K_M.gguf'
     assert 'C:' not in json.dumps(accepted)
     assert '/home/' not in json.dumps(accepted)
     with pytest.raises(guard.InstallerIdentityError, match='Qwen3'):
@@ -5147,7 +5148,7 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
-            'model_artifact_filename': 'qwen3.gguf',
+            'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
             'selected_model_profile': 'qwen3-8b-q4',
             'model_profile_identifier': 'qwen3-8b-q4-k-m',
             'context_tier': tier,
@@ -5182,7 +5183,7 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
-            'model_artifact_filename': 'qwen3.gguf',
+            'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
             'selected_model_profile': 'qwen3-8b-q4',
             'model_profile_identifier': 'changed-profile' if launches == 2 else 'qwen3-8b-q4-k-m',
             'context_tier': tier,

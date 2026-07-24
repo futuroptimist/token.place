@@ -67,13 +67,12 @@ fn resolve_model_bridge_script_path_for(
     resource_dir: Option<&Path>,
     interpreter: Option<&str>,
 ) -> Result<PathBuf, String> {
-    python_runtime::resolve_bridge_script_path(
-        "model_bridge.py",
+    let context = python_runtime::BridgeResourceContext {
         exe_path,
         manifest_dir,
-        resource_dir,
-        interpreter,
-    )
+        tauri_resource_dir: resource_dir,
+    };
+    context.resolve_bridge_script_path("model_bridge.py", interpreter)
 }
 
 fn resolve_model_bridge_script_path(interpreter: Option<&str>) -> Result<PathBuf, String> {
@@ -93,22 +92,21 @@ fn configure_runtime_pythonpath_for(
     manifest_dir: &Path,
     resource_dir: Option<&Path>,
 ) -> Option<PathBuf> {
+    let context = python_runtime::BridgeResourceContext {
+        exe_path,
+        manifest_dir,
+        tauri_resource_dir: resource_dir,
+    };
     python_runtime::disable_python_user_site(command);
     let import_root =
-        python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir);
+        python_runtime::resolve_runtime_import_root(Some(bridge_script), context.manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        let (_resource_root, layout) = python_runtime::describe_resource_layout(
-            bridge_script,
-            exe_path,
-            manifest_dir,
-            resource_dir,
-        );
-        let packaged = python_runtime::is_packaged_execution(exe_path, manifest_dir);
+        let (_resource_root, layout) = context.describe_resource_layout(bridge_script);
         python_runtime::configure_python_subprocess_env_for_layout(
             command,
             import_root,
             layout,
-            packaged,
+            context.packaged(),
         );
     }
     import_root
@@ -190,14 +188,13 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
     let exe_path = std::env::current_exe().ok();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let resource_dir = app.path().resource_dir().ok();
+    let context = python_runtime::BridgeResourceContext {
+        exe_path: exe_path.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
     let launcher = python_runtime::resolve_python_launcher_resource_aware(
-        python_runtime::PythonLauncherResolutionOptions {
-            override_var_name: "TOKEN_PLACE_PYTHON",
-            tauri_resource_dir: resource_dir.as_deref(),
-            current_exe_path: exe_path.as_deref(),
-            manifest_dir,
-            packaged: python_runtime::is_packaged_execution(exe_path.as_deref(), manifest_dir),
-        },
+        context.launcher_options("TOKEN_PLACE_PYTHON"),
     )
     .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path_for(
@@ -214,12 +211,8 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
         manifest_dir,
         resource_dir.as_deref(),
     );
-    let (selected_resource_root, selected_layout) = python_runtime::describe_resource_layout(
-        &bridge_script,
-        exe_path.as_deref(),
-        manifest_dir,
-        resource_dir.as_deref(),
-    );
+    let (selected_resource_root, selected_layout) =
+        context.describe_resource_layout(&bridge_script);
     let start_line = format!(
         "action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
         action,

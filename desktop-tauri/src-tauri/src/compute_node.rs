@@ -6313,8 +6313,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn isolate_and_terminate_bridge_process_tree_unix_stops_root_and_descendant() {
+        let tmp_dir = TempDir::new().expect("create temp dir");
+        let pid_path = tmp_dir.path().join("descendant_pid.txt");
+        let script = format!(
+            "sleep 30 & printf '%s\n' \"$!\" > {}; wait",
+            pid_path.display()
+        );
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30 & wait"]);
+        cmd.args(["-c", &script]);
         isolate_bridge_process_tree(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::null())
@@ -6323,59 +6329,99 @@ mod tests {
             .spawn()
             .expect("spawn root");
         let root_pid = child.id().expect("root pid");
+        let pgid = root_pid as i32;
 
-        // Give the shell time to fork the sleep child.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Terminate the isolated process group (SIGTERM then SIGKILL to -pgid).
-        terminate_bridge_process_tree(root_pid).await;
-
-        // Boundedly prove root stopped.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let root_stopped = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break true,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        // Force cleanup to avoid CI leak before failing.
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        break false;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(_) => break true,
+        let cleanup_group = |pgid: i32| {
+            // SAFETY: test cleanup sends SIGKILL to the isolated process group.
+            unsafe {
+                kill(-pgid, SIGKILL);
             }
         };
-        assert!(
-            root_stopped,
-            "root process did not stop after terminate_bridge_process_tree"
-        );
-
-        // Boundedly prove the process group is gone by polling kill(-pgid, 0).
-        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no actual signal is delivered.
-        let pgid = root_pid as i32;
-        let pg_deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            // SAFETY: sending signal 0 only checks for process group existence.
-            let result = unsafe { kill(-pgid, 0) };
-            if result == -1 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                // ESRCH = 3: process group does not exist — descendant cleaned up.
-                // EPERM means the group still exists but we lack permission (same-user
-                // spawned processes should not hit this; treat it as still-alive).
-                if errno == 3 {
-                    break;
-                }
-                // Any other errno (e.g., EPERM) means the group is still present.
+        let pid_stopped = |pid: i32| -> bool {
+            // SAFETY: sending signal 0 only checks process existence.
+            if unsafe { kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(3)
+            {
+                return true;
             }
-            if Instant::now() >= pg_deadline {
-                // Force-kill any survivor before failing.
-                // SAFETY: sending SIGKILL to the process group for cleanup.
-                unsafe {
-                    kill(-pgid, SIGKILL);
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.split(')')
+                        .nth(1)
+                        .map(str::trim_start)
+                        .map(str::to_owned)
+                })
+                .and_then(|after_name| after_name.chars().next())
+                == Some('Z')
+        };
+        let process_group_has_live_member = |pgid: i32| -> bool {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                let Some(after_name) = stat.split(')').nth(1).map(str::trim_start) else {
+                    continue;
+                };
+                let mut fields = after_name.split_whitespace();
+                let state = fields.next();
+                let _ppid = fields.next();
+                let pgrp = fields.next().and_then(|field| field.parse::<i32>().ok());
+                if pgrp == Some(pgid) && state != Some("Z") {
+                    return true;
                 }
-                panic!("descendant in isolated process group still alive after terminate");
+            }
+            false
+        };
+
+        let readiness_deadline = Instant::now() + Duration::from_secs(3);
+        let descendant_pid = loop {
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = pid_text.trim().parse::<i32>() {
+                    if pid > 0 {
+                        // SAFETY: sending signal 0 only checks process existence.
+                        if unsafe { kill(pid, 0) } == 0 {
+                            break pid;
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= readiness_deadline {
+                cleanup_group(pgid);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("descendant pid was not published before termination");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        terminate_bridge_process_tree(root_pid).await;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let root_done = match child.try_wait() {
+                Ok(Some(_)) | Err(_) => true,
+                Ok(None) => false,
+            };
+            let descendant_done = pid_stopped(descendant_pid);
+            let group_done = !process_group_has_live_member(pgid);
+
+            if root_done && descendant_done && group_done {
+                break;
+            }
+            if Instant::now() >= deadline {
+                cleanup_group(pgid);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!(
+                    "isolated process tree still alive after terminate: root_done={root_done} descendant_done={descendant_done} group_done={group_done}"
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

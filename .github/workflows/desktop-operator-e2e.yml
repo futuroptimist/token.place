@@ -164,7 +164,7 @@ jobs:
       - name: Run Windows packaged-start preflight with poisoned host Python state
         shell: pwsh
         env:
-          PATH: C:\Windows\System32
+          TOKEN_PLACE_SENTINEL_PATH: C:\Windows\System32
           PYTHONHOME: C:\token-place-poison\pythonhome
           PYTHONPATH: C:\token-place-poison\pythonpath
           PYTHONUSERBASE: C:\token-place-poison\userbase
@@ -176,7 +176,10 @@ jobs:
           TOKEN_PLACE_SIDECAR_PYTHON: C:\token-place-poison\python.exe
           TOKEN_PLACE_PYTHON_IMPORT_ROOT: C:\token-place-poison\import-root
         run: |
-          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch bundled metadata_probe startup_failure
+          $env:PATH = "$env:TOKEN_PLACE_SENTINEL_PATH;$env:PATH"
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_state
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py

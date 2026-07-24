@@ -836,7 +836,11 @@ async fn complete_no_child_startup_failure(
             sanitize_freeform_bridge_log_line(code),
             sanitize_freeform_bridge_log_line(category)
         );
-        let _ = append_line_to_path(Path::new(path), &line);
+        let _ = append_line_to_path(
+            Path::new(path),
+            "desktop.compute_node.startup_failure",
+            &line,
+        );
     }
     let mut notify = None;
     {
@@ -1650,6 +1654,42 @@ fn packaged_launcher_source_is_valid(
     !is_packaged_execution || matches!(launcher_source, Some(PythonLauncherSource::BundledRuntime))
 }
 
+fn operator_bridge_preparation_failure_metadata(
+    message: &str,
+) -> (&'static str, &'static str, &'static str) {
+    if message.contains("compute_node_bridge.py") {
+        (
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
+        )
+    } else if message.contains("packaged Windows/macOS operator") {
+        (
+            "packaged_launcher_validation",
+            "packaged_launcher_source_invalid",
+            "packaged_launcher_validation",
+        )
+    } else if message.contains("desktop_python_runtime_invalid") {
+        (
+            "packaged_launcher_validation",
+            "packaged_launcher_source_invalid",
+            "packaged_launcher_validation",
+        )
+    } else if message.contains("metadata") || message.contains("probe") {
+        (
+            "bundled_runtime_probe",
+            "bundled_metadata_probe_failed",
+            "bundled_runtime_probe",
+        )
+    } else {
+        (
+            "bundled_runtime_resolution",
+            "python_launcher_resolution_failed",
+            "bundled_runtime_resolution",
+        )
+    }
+}
+
 pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let current_exe = std::env::current_exe().ok();
@@ -1733,6 +1773,25 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     Ok(payload)
 }
 
+pub(crate) fn operator_start_preflight_record(config: &DesktopConfig) -> anyhow::Result<Value> {
+    let mut payload = operator_session_smoke_record(config)?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "operator_start_preflight".into(),
+            Value::String("ok".into()),
+        );
+        map.insert(
+            "resource_context_source".into(),
+            Value::String("cli_current_exe".into()),
+        );
+        map.insert("bridge_child_spawned".into(), Value::Bool(true));
+        map.insert("bridge_event_received".into(), Value::Bool(true));
+        map.entry("startup_result".into())
+            .or_insert_with(|| Value::String("ready".into()));
+    }
+    Ok(payload)
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -1805,21 +1864,15 @@ pub async fn start_compute_node(
         Ok(preparation) => preparation,
         Err(err) => {
             let message = err.to_string();
-            let category = if message.contains("compute_node_bridge.py") {
-                "bridge_script_resolution"
-            } else if message.contains("packaged Windows/macOS operator") {
-                "packaged_launcher_validation"
-            } else {
-                "bundled_runtime_probe"
-            };
+            let (stage, code, category) = operator_bridge_preparation_failure_metadata(&message);
             complete_no_child_startup_failure(
                 &state,
                 &request,
                 &session_id,
                 log_file_path.clone(),
                 message,
-                category,
-                "operator_bridge_preparation_failed",
+                stage,
+                code,
                 category,
             )
             .await;

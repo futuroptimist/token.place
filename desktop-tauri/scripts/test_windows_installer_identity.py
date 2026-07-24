@@ -172,7 +172,7 @@ def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previou
 def immediate_prior_version(version: str) -> str:
     """Return the immediate prior stable patch release for a semantic version string.
 
-    For '0.1.3' this returns '0.1.2'; for a future '0.1.5' it returns '0.1.3'.
+    For '0.1.3' this returns '0.1.2'; for a future '0.1.5' it returns '0.1.4'.
     """
     match = _SEMVER_RE.match(version)
     if not match:

@@ -715,27 +715,8 @@ fn print_operator_session_smoke_json() -> Result<(), String> {
 
 fn print_operator_start_preflight_json() -> Result<(), String> {
     let config = load_config_from_path(&config_path(&cli_config_dir()))?;
-    let mut payload =
-        compute_node::operator_session_smoke_record(&config).map_err(|err| err.to_string())?;
-    if let serde_json::Value::Object(map) = &mut payload {
-        map.insert(
-            "operator_start_preflight".into(),
-            serde_json::Value::String("ok".into()),
-        );
-        map.insert(
-            "resource_context_source".into(),
-            serde_json::Value::String("tauri_app_handle".into()),
-        );
-        map.insert("bridge_child_spawned".into(), serde_json::Value::Bool(true));
-        map.insert(
-            "bridge_event_received".into(),
-            serde_json::Value::Bool(true),
-        );
-        map.insert(
-            "startup_result".into(),
-            serde_json::Value::String("ready".into()),
-        );
-    }
+    let payload =
+        compute_node::operator_start_preflight_record(&config).map_err(|err| err.to_string())?;
     println!("{}", payload);
     Ok(())
 }

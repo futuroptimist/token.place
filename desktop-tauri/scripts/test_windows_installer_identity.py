@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.3"
+EXPECTED_VERSION = "0.1.4"
+EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
 OBSOLETE_RUNTIME_PROVENANCE_NAME = "tokenplace-runtime-" + "provenance.json"
@@ -673,6 +674,17 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
         raise InstallerIdentityError(f"operator-session record missing or mismatched {missing}")
     if data.get("bridge_preflight") != "ok":
         raise InstallerIdentityError("operator-session smoke did not run bridge-command preflight")
+    if data.get("model_artifact_inspect") != "ok":
+        raise InstallerIdentityError("operator-session smoke did not run GUI-equivalent model artifact inspection")
+    model_filename = data.get("model_artifact_filename")
+    if (
+        not isinstance(model_filename, str)
+        or model_filename != EXPECTED_MODEL_ARTIFACT_FILENAME
+        or not model_filename.endswith(".gguf")
+        or "/" in model_filename
+        or "\\" in model_filename
+    ):
+        raise InstallerIdentityError("operator-session smoke did not report the expected safe model artifact filename")
     if expected_tier is not None:
         expected_n_ctx = {"8k-fast": 8192, "64k-full": 65536}.get(expected_tier)
         if data.get("context_tier") != expected_tier or data.get("effective_n_ctx") != expected_n_ctx or data.get("n_ctx") != expected_n_ctx:

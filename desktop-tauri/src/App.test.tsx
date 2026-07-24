@@ -257,6 +257,67 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+
+  it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
+    'keeps Start operator enabled after mount-time %s model inspection failure',
+    async (code) => {
+      invokeMock.mockImplementation((command: string) => {
+        if (command === 'detect_backend') {
+          return Promise.resolve({
+            platform_label: 'windows-x64',
+            preferred_mode: 'gpu',
+            available_backend: 'cuda',
+            availability_label: 'CUDA-capable platform (Windows x64)',
+          });
+        }
+        if (command === 'load_config') {
+          return Promise.resolve({
+            model_path: 'C:\\Users\\operator\\Models\\qwen.gguf',
+            relay_base_url: 'https://token.place',
+            relay_base_urls: ['https://token.place'],
+            preferred_mode: 'gpu',
+          });
+        }
+        if (command === 'get_compute_node_status') {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            relay_runtime_state: 'idle',
+            runtime_provisioning_state: 'idle',
+            startup_phase: null,
+            active_relay_url: '',
+            requested_mode: 'gpu',
+            effective_mode: 'gpu',
+            backend_available: 'cuda',
+            backend_selected: 'cuda',
+            backend_used: 'cuda',
+            fallback_reason: null,
+            model_path: '',
+            last_error: null,
+          });
+        }
+        if (command === 'inspect_model_artifact') {
+          return Promise.reject(new Error(`${code}: bundled runtime could not launch from C:\\Users\\operator\\AppData`));
+        }
+        return Promise.resolve(undefined);
+      });
+
+      render(<App />);
+
+      await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
+      expect(document.body.textContent ?? '').toContain(`Diagnostic code: ${code}`);
+      expect(document.body.textContent ?? '').not.toContain('AppData');
+      expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
+      expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
+      const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+      await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+
+      fireEvent.click(startOperatorButton);
+
+      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('start_compute_node', expect.any(Object)));
+    }
+  );
+
   it('surfaces compute-node start failures in last error', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_compute_node') {
@@ -378,6 +439,78 @@ describe('desktop app start failure handling', () => {
     expect(stopOperatorButton.disabled).toBe(true);
 
     resolveStart?.();
+  });
+
+  it('disables Start operator when the operator is already running on load', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+      model_path: '/tmp/model.gguf',
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('disables Start operator when the model path is empty', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: ['https://token.place'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('disables Start operator after clearing Relay URL 1 to whitespace', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    fireEvent.change(relayInput, { target: { value: '   ' } });
+
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('still enables Start operator using the default relay when legacy config omits relay_base_urls', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: '',
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    await waitFor(() => expect(relayInput.value).toBe('https://token.place'));
+
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
   });
 
   it('keeps model path blank on first launch when config has no persisted model path', async () => {
@@ -2415,7 +2548,7 @@ describe('desktop Python runtime error normalization', () => {
     expect(body).not.toContain('TOKEN_PLACE_SIDECAR_PYTHON');
     expect(body).not.toContain('/Users/daniel');
     expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
-    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(false);
     expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
   });
 });

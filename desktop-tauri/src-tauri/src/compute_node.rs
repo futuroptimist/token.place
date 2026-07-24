@@ -9,15 +9,15 @@ use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, PythonLauncher, PythonLauncherResolutionOptions,
-    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
+    PythonLauncherResolutionOptions, PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -30,6 +30,8 @@ use tokio::process::{Child, ChildStdin, Command};
 #[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
+
+const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -442,6 +444,24 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
+fn build_installed_context_probe_command(
+    launcher: &PythonLauncher,
+    bridge_script: &Path,
+    context: &BridgeResourceContext<'_>,
+    config: &DesktopConfig,
+) -> std::process::Command {
+    let mut command = launcher.command_for_script_blocking(bridge_script);
+    configure_runtime_pythonpath(
+        &mut command,
+        context.manifest_dir,
+        bridge_script,
+        context.exe_path,
+        context.tauri_resource_dir,
+    );
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    command
+}
+
 fn bridge_script_candidates(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
@@ -490,31 +510,63 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn configure_runtime_pythonpath(
-    command: &mut Command,
+fn safe_model_artifact_filename(filename: &str) -> Option<&str> {
+    (!filename.is_empty()
+        && filename == EXPECTED_MODEL_ARTIFACT_FILENAME
+        && filename.ends_with(".gguf")
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(filename))
+    .then_some(filename)
+}
+
+fn inspect_model_artifact_filename(inspect_json: &Value) -> anyhow::Result<String> {
+    if inspect_json.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("model_artifact_inspect_failed: inspect did not return ok");
+    }
+    inspect_json
+        .get("payload")
+        .and_then(|payload| payload.get("filename"))
+        .and_then(Value::as_str)
+        .and_then(safe_model_artifact_filename)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model_artifact_inspect_failed: inspect did not report the expected basename-only .gguf model filename"
+            )
+        })
+}
+
+fn configure_runtime_pythonpath<C>(
+    command: &mut C,
     manifest_dir: &Path,
-    bridge_script: &str,
-) -> Option<std::path::PathBuf> {
+    bridge_script: &Path,
+    exe_path: Option<&Path>,
+    resource_dir: Option<&Path>,
+) -> Option<std::path::PathBuf>
+where
+    C: PythonEnvCommand,
+{
     disable_python_user_site(command);
-    let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
+    let import_root = resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
-        let (_, layout) = describe_resource_layout(
-            Path::new(bridge_script),
-            std::env::current_exe().ok().as_deref(),
-            manifest_dir,
-            None,
-        );
-        let current_exe = std::env::current_exe().ok();
-        let packaged =
-            crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
+        let (_, layout) =
+            describe_resource_layout(bridge_script, exe_path, manifest_dir, resource_dir);
+        let packaged = crate::python_runtime::is_packaged_execution(exe_path, manifest_dir);
         configure_python_subprocess_env_for_layout(command, import_root, layout, packaged);
     }
     import_root
 }
 
-fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
+fn configure_runtime_bootstrap_env<C>(command: &mut C, mode: &ComputeMode)
+where
+    C: PythonEnvCommand,
+{
     if should_enable_runtime_bootstrap(mode) {
-        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+        command.set_env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
     }
 }
 
@@ -526,6 +578,22 @@ fn command_env_value(command: &Command, key: &str) -> Option<String> {
         .find_map(|(env_key, value)| (env_key == key).then_some(value))
         .flatten()
         .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<String> {
+    command
+        .get_envs()
+        .find_map(|(env_key, value)| (env_key == key).then_some(value))
+        .flatten()
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+fn std_command_env_removed(command: &std::process::Command, key: &str) -> bool {
+    command
+        .get_envs()
+        .any(|(env_key, value)| env_key == key && value.is_none())
 }
 
 fn sanitize_relay_target(relay_url: &str) -> String {
@@ -1540,42 +1608,56 @@ fn packaged_launcher_source_is_valid(
 pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let current_exe = std::env::current_exe().ok();
-    let packaged =
-        crate::python_runtime::is_packaged_execution(current_exe.as_deref(), manifest_dir);
-    let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
-        override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
-        tauri_resource_dir: None,
-        current_exe_path: current_exe.as_deref(),
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
         manifest_dir,
-        packaged,
-    })?;
+        tauri_resource_dir: None,
+    };
+    let packaged = context.packaged();
+    let launcher = resolve_python_launcher_resource_aware(
+        context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
+    )?;
     if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
         anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
     }
     let bridge_script = resolve_bridge_script_for(
-        current_exe.as_deref(),
-        manifest_dir,
-        None,
+        context.exe_path,
+        context.manifest_dir,
+        context.tauri_resource_dir,
         Some(&launcher.program),
     )
     .map_err(anyhow::Error::msg)?;
-    let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
-    let import_root =
-        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
-    configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
-    let (selected_resource_root, selected_layout) = describe_resource_layout(
-        Path::new(&bridge_script),
-        current_exe.as_deref(),
+    let model_bridge_script = context
+        .resolve_bridge_script_path("model_bridge.py", Some(&launcher.program))
+        .map_err(anyhow::Error::msg)?;
+    let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script);
+    configure_runtime_pythonpath(
+        &mut model_inspect_command,
         manifest_dir,
-        None,
+        &model_bridge_script,
+        context.exe_path,
+        context.tauri_resource_dir,
     );
+    model_inspect_command.arg("inspect");
+    let model_inspect_output = model_inspect_command.output()?;
+    if !model_inspect_output.status.success() {
+        anyhow::bail!("model_artifact_inspect_failed: bundled interpreter could not inspect packaged model artifact");
+    }
+    let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
+    let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
+    let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
+    let bridge_script_path = Path::new(&bridge_script);
+    let (selected_resource_root, selected_layout) =
+        context.describe_resource_layout(bridge_script_path);
+    let import_root = resolve_runtime_import_root(Some(bridge_script_path), context.manifest_dir);
     let identity = crate::build_identity::build_identity();
     let launcher_source = match launcher.source {
         PythonLauncherSource::BundledRuntime => "bundled",
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
-    let mut context_probe_command = launcher.command_for_script_blocking(&bridge_script);
+    let mut context_probe_command =
+        build_installed_context_probe_command(&launcher, bridge_script_path, &context, config);
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
@@ -1603,6 +1685,8 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "context_tier": config.context_tier.as_str(),
         "preferred_mode": format!("{:?}", config.preferred_mode).to_lowercase(),
         "bridge_preflight": "ok",
+        "model_artifact_inspect": "ok",
+        "model_artifact_filename": model_artifact_filename,
     });
     if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
         for (key, value) in probe_map {
@@ -1796,8 +1880,13 @@ pub async fn start_compute_node(
         manifest_dir,
         resource_dir.as_deref(),
     );
-    let import_root =
-        configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    let import_root = configure_runtime_pythonpath(
+        &mut bridge_command,
+        manifest_dir,
+        Path::new(&bridge_script),
+        exe_path.as_deref(),
+        resource_dir.as_deref(),
+    );
     let interpreter = bridge_command
         .as_std()
         .get_program()
@@ -2893,11 +2982,8 @@ mod tests {
         let manifest_dir = temp.path().join("missing-manifest");
         let mut command = Command::new("python");
 
-        let import_root = configure_runtime_pythonpath(
-            &mut command,
-            &manifest_dir,
-            bridge.to_str().expect("bridge path should be UTF-8"),
-        );
+        let import_root =
+            configure_runtime_pythonpath(&mut command, &manifest_dir, &bridge, None, None);
 
         assert!(import_root.is_none());
         assert_eq!(
@@ -3083,7 +3169,7 @@ mod tests {
     ) {
         let summary = summarize_bridge_stdout_payload(&serde_json::json!({
             "type": "status",
-            "app_version": "0.1.3",
+            "app_version": "0.1.4",
             "build_id": "abcdef012345",
             "target_triple": "x86_64-pc-windows-msvc",
             "bundled_runtime_id": "bundled-cpython-3.11-win-x86_64-cu124",
@@ -3113,7 +3199,7 @@ mod tests {
         assert!(summary.len() <= 3500);
         assert_eq!(
             payload.get("app_version").and_then(Value::as_str),
-            Some("0.1.3")
+            Some("0.1.4")
         );
         assert_eq!(
             payload.get("build_id").and_then(Value::as_str),
@@ -5883,6 +5969,110 @@ mod tests {
     }
 
     #[test]
+    fn safe_model_artifact_filename_requires_basename_gguf() {
+        assert_eq!(
+            safe_model_artifact_filename(EXPECTED_MODEL_ARTIFACT_FILENAME),
+            Some(EXPECTED_MODEL_ARTIFACT_FILENAME)
+        );
+        assert_eq!(safe_model_artifact_filename("token-place-0.1.4.gguf"), None);
+        assert_eq!(safe_model_artifact_filename("token-place.bin"), None);
+        assert_eq!(
+            safe_model_artifact_filename("models/token-place.gguf"),
+            None
+        );
+        assert_eq!(
+            safe_model_artifact_filename("models\\token-place.gguf"),
+            None
+        );
+        assert_eq!(safe_model_artifact_filename(""), None);
+    }
+
+    #[test]
+    fn installed_context_probe_helper_configures_executed_command_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let exe_dir = temp.path().join("installed").join("bin");
+        let resource_root = exe_dir.join("resources");
+        let python_dir = resource_root.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resource_root.join("utils")).expect("create import utils dir");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        std::fs::create_dir_all(&exe_dir).expect("create exe dir");
+        let bridge_script = python_dir.join("compute_node_bridge.py");
+        std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        let exe_path = exe_dir.join("token.place");
+        std::fs::write(&exe_path, "").expect("write exe");
+        let launcher = PythonLauncher {
+            program: "python3".into(),
+            args: Vec::new(),
+            source: PythonLauncherSource::BundledRuntime,
+            runtime_id: "test-runtime".into(),
+        };
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe_path),
+            manifest_dir: &manifest_dir,
+            tauri_resource_dir: Some(&resource_root),
+        };
+        let config = DesktopConfig::default();
+
+        let command =
+            build_installed_context_probe_command(&launcher, &bridge_script, &context, &config);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(bridge_script.to_str().unwrap())
+        );
+        assert!(!args.first().unwrap().is_empty());
+        assert_eq!(
+            std_command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+            Some(resource_root.to_str().unwrap())
+        );
+        assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
+        assert!(std_command_env_removed(&command, "PYTHONHOME"));
+        assert!(std_command_env_removed(&command, "PYTHONUSERBASE"));
+    }
+
+    #[test]
+    fn inspect_model_artifact_filename_requires_ok_and_safe_expected_basename() {
+        let accepted = serde_json::json!({
+            "ok": true,
+            "payload": {"filename": EXPECTED_MODEL_ARTIFACT_FILENAME}
+        });
+        assert_eq!(
+            inspect_model_artifact_filename(&accepted).expect("accepted inspect"),
+            EXPECTED_MODEL_ARTIFACT_FILENAME
+        );
+
+        for rejected in [
+            serde_json::json!({"ok": false, "payload": {"filename": EXPECTED_MODEL_ARTIFACT_FILENAME}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "qwen3.bin"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models/Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "models\\Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "/home/operator/Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "C:\\Users\\operator\\Qwen3-8B-Q4_K_M.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": "other.gguf"}}),
+            serde_json::json!({"ok": true, "payload": {"filename": ""}}),
+        ] {
+            assert!(
+                inspect_model_artifact_filename(&rejected).is_err(),
+                "rejected inspect payload should fail: {rejected}"
+            );
+        }
+    }
+
+    #[test]
     fn bridge_script_candidates_include_runtime_resource_and_windows_updater_paths() {
         let temp = TempDir::new().expect("tempdir");
         let resource_dir = temp.path().join("runtime-resources");
@@ -6123,8 +6313,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn isolate_and_terminate_bridge_process_tree_unix_stops_root_and_descendant() {
+        let tmp_dir = TempDir::new().expect("create temp dir");
+        let pid_path = tmp_dir.path().join("descendant_pid.txt");
+        let script = format!(
+            "sleep 30 & printf '%s\n' \"$!\" > {}; wait",
+            pid_path.display()
+        );
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30 & wait"]);
+        cmd.args(["-c", &script]);
         isolate_bridge_process_tree(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::null())
@@ -6133,59 +6329,99 @@ mod tests {
             .spawn()
             .expect("spawn root");
         let root_pid = child.id().expect("root pid");
+        let pgid = root_pid as i32;
 
-        // Give the shell time to fork the sleep child.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Terminate the isolated process group (SIGTERM then SIGKILL to -pgid).
-        terminate_bridge_process_tree(root_pid).await;
-
-        // Boundedly prove root stopped.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let root_stopped = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break true,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        // Force cleanup to avoid CI leak before failing.
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        break false;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(_) => break true,
+        let cleanup_group = |pgid: i32| {
+            // SAFETY: test cleanup sends SIGKILL to the isolated process group.
+            unsafe {
+                kill(-pgid, SIGKILL);
             }
         };
-        assert!(
-            root_stopped,
-            "root process did not stop after terminate_bridge_process_tree"
-        );
-
-        // Boundedly prove the process group is gone by polling kill(-pgid, 0).
-        // SAFETY: kill(-pgid, 0) is a signal-existence probe; no actual signal is delivered.
-        let pgid = root_pid as i32;
-        let pg_deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            // SAFETY: sending signal 0 only checks for process group existence.
-            let result = unsafe { kill(-pgid, 0) };
-            if result == -1 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                // ESRCH = 3: process group does not exist — descendant cleaned up.
-                // EPERM means the group still exists but we lack permission (same-user
-                // spawned processes should not hit this; treat it as still-alive).
-                if errno == 3 {
-                    break;
-                }
-                // Any other errno (e.g., EPERM) means the group is still present.
+        let pid_stopped = |pid: i32| -> bool {
+            // SAFETY: sending signal 0 only checks process existence.
+            if unsafe { kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(3)
+            {
+                return true;
             }
-            if Instant::now() >= pg_deadline {
-                // Force-kill any survivor before failing.
-                // SAFETY: sending SIGKILL to the process group for cleanup.
-                unsafe {
-                    kill(-pgid, SIGKILL);
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.split(')')
+                        .nth(1)
+                        .map(str::trim_start)
+                        .map(str::to_owned)
+                })
+                .and_then(|after_name| after_name.chars().next())
+                == Some('Z')
+        };
+        let process_group_has_live_member = |pgid: i32| -> bool {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                let Some(after_name) = stat.split(')').nth(1).map(str::trim_start) else {
+                    continue;
+                };
+                let mut fields = after_name.split_whitespace();
+                let state = fields.next();
+                let _ppid = fields.next();
+                let pgrp = fields.next().and_then(|field| field.parse::<i32>().ok());
+                if pgrp == Some(pgid) && state != Some("Z") {
+                    return true;
                 }
-                panic!("descendant in isolated process group still alive after terminate");
+            }
+            false
+        };
+
+        let readiness_deadline = Instant::now() + Duration::from_secs(3);
+        let descendant_pid = loop {
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = pid_text.trim().parse::<i32>() {
+                    if pid > 0 {
+                        // SAFETY: sending signal 0 only checks process existence.
+                        if unsafe { kill(pid, 0) } == 0 {
+                            break pid;
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= readiness_deadline {
+                cleanup_group(pgid);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("descendant pid was not published before termination");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        terminate_bridge_process_tree(root_pid).await;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let root_done = match child.try_wait() {
+                Ok(Some(_)) | Err(_) => true,
+                Ok(None) => false,
+            };
+            let descendant_done = pid_stopped(descendant_pid);
+            let group_done = !process_group_has_live_member(pgid);
+
+            if root_done && descendant_done && group_done {
+                break;
+            }
+            if Instant::now() >= deadline {
+                cleanup_group(pgid);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!(
+                    "isolated process tree still alive after terminate: root_done={root_done} descendant_done={descendant_done} group_done={group_done}"
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

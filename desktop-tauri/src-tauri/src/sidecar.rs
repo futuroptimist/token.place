@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 
@@ -528,7 +528,8 @@ mod tests {
             .join("python")
             .join("inference_sidecar.py");
 
-        let mut child = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg(sidecar_script)
             .arg("--model")
             .arg(model.path())
@@ -537,20 +538,63 @@ mod tests {
             .arg("--prompt")
             .arg("hello world")
             .env("USE_MOCK_LLM", "1")
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONUSERBASE")
+            .env_remove("TOKEN_PLACE_DESKTOP_PYTHON")
+            .env_remove("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET")
+            .env_remove("TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP")
+            .env_remove("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD")
+            .env_remove("FORCE_CMAKE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn bridge sidecar");
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().expect("spawn bridge sidecar");
 
         let stdout = child.stdout.take().expect("stdout");
-        let events = collect_events_from_stdout(stdout)
+        let stderr = child.stderr.take().expect("stderr");
+        let events_result = collect_events_from_stdout(stdout);
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr_text = String::new();
+            let mut reader = BufReader::new(stderr);
+            reader
+                .read_to_string(&mut stderr_text)
+                .await
+                .map(|_| stderr_text)
+        });
+
+        let events = match events_result.await {
+            Ok(events) => events,
+            Err(err) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("collect events: {err}");
+            }
+        };
+        let status = child.wait().await.expect("wait bridge sidecar");
+        let stderr_text = stderr_task
             .await
-            .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SidecarEvent::Token { .. })));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+            .expect("stderr task")
+            .expect("read stderr");
+
+        assert!(
+            events.iter().any(|e| matches!(e, SidecarEvent::Started)),
+            "missing Started event; stderr={stderr_text}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SidecarEvent::Token { .. })),
+            "missing Token event; stderr={stderr_text}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, SidecarEvent::Done)),
+            "missing Done event; stderr={stderr_text}"
+        );
+        assert!(
+            status.success(),
+            "bridge sidecar exited with {status}; stderr={stderr_text}"
+        );
     }
 
     #[tokio::test]

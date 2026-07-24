@@ -118,6 +118,9 @@ jobs:
           pip install -r config/requirements_codex_verification.txt
           pip install selenium
 
+      - name: Run full Rust suite
+        run: cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
+
       - name: Run desktop operator UI e2e
         run: xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py
 
@@ -166,8 +169,7 @@ jobs:
           python -m pytest tests/unit/test_desktop_runtime_setup.py -q
           python -m pytest tests/unit/test_model_manager.py -q
           python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
-          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml operator_logs
-          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml compute_node
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
 
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()
